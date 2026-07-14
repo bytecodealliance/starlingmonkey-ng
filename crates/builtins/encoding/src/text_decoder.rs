@@ -7,6 +7,9 @@ use js::error::{ExnThrown, OutOfMemory, RangeError, ThrowException};
 use js::gc::scope::Scope;
 use js::{ArrayBuffer, ArrayBufferView, JSString};
 
+use crate::decoder_common::new_decoder;
+use crate::decoder_common::TextDecoderOptions;
+
 /// <https://encoding.spec.whatwg.org/#textdecoder>
 #[webidl_interface]
 pub struct TextDecoder {
@@ -172,16 +175,6 @@ enum Decoded {
     Utf16(Result<Vec<u16>, DecodeError>),
 }
 
-/// A new decoder of `encoding`, which removes a byte order mark at the start of its input unless
-/// `ignore_bom` is true.
-fn new_decoder(encoding: &'static encoding_rs::Encoding, ignore_bom: bool) -> encoding_rs::Decoder {
-    if ignore_bom {
-        encoding.new_decoder_without_bom_handling()
-    } else {
-        encoding.new_decoder_with_bom_removal()
-    }
-}
-
 /// Why [`decode_to_utf16`] failed.
 enum DecodeError {
     /// The input is malformed, in the "fatal" error mode.
@@ -247,13 +240,4 @@ pub enum ArrayBufferViewOrArrayBuffer<'a> {
 pub struct TextDecodeOptions {
     #[webidl(default = false)]
     pub stream: bool,
-}
-
-#[webidl_dictionary]
-#[derive(Default)]
-pub struct TextDecoderOptions {
-    #[webidl(default = false)]
-    pub fatal: bool,
-    #[webidl(default = false, name = "ignoreBOM")]
-    pub ignore_bom: bool,
 }

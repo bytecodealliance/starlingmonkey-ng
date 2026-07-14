@@ -171,15 +171,29 @@ impl TransformStream {
 
     /// <https://streams.spec.whatwg.org/#ts-readable>
     #[getter]
-    fn readable<'r>(&self, scope: &'r Scope<'_>) -> ReadableStream<'r> {
+    pub fn readable<'r>(&self, scope: &'r Scope<'_>) -> ReadableStream<'r> {
         // Step 1: Return `this`.`[[readable]]`.
         self.data().readable.get(scope)
     }
 
     /// <https://streams.spec.whatwg.org/#ts-writable>
     #[getter]
-    fn writable<'r>(&self, scope: &'r Scope<'_>) -> WritableStream<'r> {
+    pub fn writable<'r>(&self, scope: &'r Scope<'_>) -> WritableStream<'r> {
         // Step 1: Return `this`.`[[writable]]`.
         self.data().writable.get(scope)
+    }
+}
+
+/// Helpers for the encoding crate — not part of the WebIDL interface.
+impl TransformStream<'_> {
+    /// Enqueue a chunk into the readable side of this TransformStream.
+    pub fn enqueue(&self, scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<(), ExnThrown> {
+        let ctrl = self
+            .data()
+            .controller
+            .as_ref()
+            .expect("controller must be set")
+            .get(scope);
+        algorithms::transform_stream_default_controller_enqueue(scope, &ctrl, chunk)
     }
 }
