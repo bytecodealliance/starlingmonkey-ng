@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:fetch-streams;
+
+// `stream<u8>` values meeting `fetch`: a lifted stream as an outgoing request's
+// body, and an incoming response's body returned as a stream. See
+// `fetch_streams.js`.
+
+interface fetching {
+  // POSTs `body` and returns the text of the response, whose body the host
+  // echoes from the request's.
+  post-stream: async func(body: stream<u8>) -> string;
+  // Returns the body of a GET response as a stream.
+  get-body: async func() -> stream<u8>;
+  // POSTs `body` and returns the response's body as a stream.
+  post-and-stream: async func(body: stream<u8>) -> stream<u8>;
+  // Stores two GET responses unread for `sync-read-messages`.
+  hold-responses: async func();
+  // Starts reading the responses `hold-responses` stored, one with `text()` and
+  // one through its body's reader, which a sync export has no event loop for.
+  // Returns the rejection messages previous calls recorded.
+  sync-read-messages: func() -> list<string>;
+}
+
+world fetch-streams {
+  export fetching;
+}

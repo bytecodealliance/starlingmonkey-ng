@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:streams;
+
+// Streams, futures and error classes.
+//
+// A `stream<T>` the guest receives renders as a `ReadableStream<T>`, and one it
+// hands to the runtime also as an async or sync iterable of `T`. `stream<u8>`
+// reads `Uint8Array` chunks and takes any `ArrayBufferView` or `ArrayBuffer`, as
+// does a stream of an alias of `u8`. A
+// `future<T>` the guest receives renders as a `Promise<T>`, and one it hands over
+// as a `T` or a promise of one. A `future<result<T, E>>` settles with `T`.
+//
+// The exports receive their arguments and hand over their results. The imports
+// are the other way around.
+//
+// The imported `lookup` fails with a named `failure`, so its module exports a
+// `Failure` class extending `ComponentError`.
+
+interface storage {
+  variant failure {
+    denied,
+    not-found(string),
+  }
+
+  lookup: async func(key: string) -> result<string, failure>;
+  upload: async func(body: stream<u8>) -> future<result<u32, failure>>;
+  download: async func(key: string) -> stream<u8>;
+}
+
+interface echoes {
+  record point {
+    x: u32,
+    y: u32,
+  }
+
+  // A guest-owned resource carrying a string, streamed as `stream<thing>`.
+  resource thing {
+    constructor(value: string);
+    get: func() -> string;
+  }
+
+  type byte = u8;
+
+  echo-stream-u8: async func(s: stream<u8>) -> stream<u8>;
+  echo-stream-byte: async func(s: stream<byte>) -> stream<byte>;
+  echo-future-string: async func(f: future<string>) -> future<string>;
+  echo-stream-point: async func(s: stream<point>) -> stream<point>;
+  echo-stream-thing: async func(s: stream<thing>) -> stream<thing>;
+  settle: async func(f: future<result<string, string>>) -> future<result<string, string>>;
+}
+
+world streams {
+  import storage;
+  export echoes;
+}

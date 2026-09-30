@@ -168,9 +168,15 @@ pub async fn run_main_export(invocation: &OwnedInvocation, main: MainModule) -> 
         }
     }
 
-    // Phase 3: read the now-settled result off the stack.
+    // Phase 3: read the result off the stack. `run_until` also returns when the
+    // loop goes idle, so the promise can still be pending.
     let outcome = main.with_namespace(|scope, _ns| {
         match as_promise(scope, stack.pop_value()) {
+            Some(promise) if promise.is_pending() => RunOutcome::Failed(
+                "run() did not settle: the event loop went idle while the promise it returned \
+                 was still pending"
+                    .to_string(),
+            ),
             Some(promise) if promise.is_rejected() => {
                 let reason = promise
                     .result(scope)

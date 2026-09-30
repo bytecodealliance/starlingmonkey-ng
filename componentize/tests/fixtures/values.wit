@@ -1,0 +1,242 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:values;
+
+// Value shapes the sync suite's echoes do not reach: flags of every width,
+// escaped keyword identifiers, variants whose payloads pun the same flat
+// slots, a `list<variant>`, `result<string, list<u8>>` in both directions,
+// sixteen `u64` arguments and a twenty-string record, a plain string
+// export for large payloads and repeated calls, and checks of the values the
+// guest passes and returns.
+//
+// Every interface but `errors`, `strings` and `checks` is imported and
+// exported: the guest forwards each call to the host import and adds its own
+// change on the way back, so the value crosses the boundary in both
+// directions.
+
+interface %flags {
+  flags flag1 {
+    b0,
+  }
+
+  flags flag2 {
+    b0, b1,
+  }
+
+  flags flag4 {
+    b0, b1, b2, b3,
+  }
+
+  flags flag8 {
+    b0, b1, b2, b3, b4, b5, b6, b7,
+  }
+
+  flags flag16 {
+    b0, b1, b2, b3, b4, b5, b6, b7,
+    b8, b9, b10, b11, b12, b13, b14, b15,
+  }
+
+  flags flag32 {
+    b0, b1, b2, b3, b4, b5, b6, b7,
+    b8, b9, b10, b11, b12, b13, b14, b15,
+    b16, b17, b18, b19, b20, b21, b22, b23,
+    b24, b25, b26, b27, b28, b29, b30, b31,
+  }
+
+  // Each round trip sets the width's highest bit on the host and `b0` in the
+  // guest. `roundtrip-flag32` sets `b31` in the guest and `b0` on the host.
+  roundtrip-flag1: func(x: flag1) -> flag1;
+  roundtrip-flag2: func(x: flag2) -> flag2;
+  roundtrip-flag4: func(x: flag4) -> flag4;
+  roundtrip-flag8: func(x: flag8) -> flag8;
+  roundtrip-flag16: func(x: flag16) -> flag16;
+  roundtrip-flag32: func(x: flag32) -> flag32;
+}
+
+// Imported only: wasmtime's bindgen cannot name an export after `type`, so
+// the guest reaches this function from `keywords.%func`.
+interface keyword-imports {
+  type %flags = s32;
+
+  // The host adds one.
+  %type: func(v: u32) -> %flags;
+}
+
+interface keywords {
+  use keyword-imports.{%flags};
+
+  record %record {
+    %type: u32,
+    %flags: u32,
+  }
+
+  // Calls `keyword-imports.%type` and adds one more.
+  %func: func(v: u32) -> %flags;
+
+  // The host swaps the fields.
+  echo-record: func(%record: %record) -> %record;
+}
+
+interface variants {
+  variant casts1 {
+    a(s32),
+    b(f32),
+  }
+
+  variant casts2 {
+    a(f64),
+    b(f32),
+  }
+
+  variant casts3 {
+    a(f64),
+    b(u64),
+  }
+
+  variant casts4 {
+    a(u32),
+    b(s64),
+  }
+
+  variant casts5 {
+    a(f32),
+    b(s64),
+  }
+
+  variant casts6 {
+    a(tuple<f32, u32>),
+    b(tuple<u32, u32>),
+  }
+
+  casts: func(
+    a: casts1,
+    b: casts2,
+    c: casts3,
+    d: casts4,
+    e: casts5,
+    f: casts6,
+  ) -> tuple<casts1, casts2, casts3, casts4, casts5, casts6>;
+
+  variant v1 {
+    a,
+    b(u32),
+    c(string),
+  }
+
+  // The host reverses the list.
+  echo-list-variant: func(v: list<v1>) -> list<v1>;
+
+  // The host appends "!" to an `ok` string and reverses the bytes of an `err`.
+  echo-result: func(v: result<string, list<u8>>) -> result<string, list<u8>>;
+
+  // The guest throws a `ComponentError` whose payload is `bytes`. The host
+  // import returns it as `err`.
+  fail-with: func(bytes: list<u8>) -> result<string, list<u8>>;
+}
+
+interface many {
+  // The host returns the arguments as a list, so the guest receives a
+  // `BigUint64Array` and lowers it back.
+  many-args: func(
+    a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64,
+    a9: u64, a10: u64, a11: u64, a12: u64, a13: u64, a14: u64, a15: u64, a16: u64,
+  ) -> list<u64>;
+
+  record big-struct {
+    a1: string, a2: string, a3: string, a4: string, a5: string,
+    a6: string, a7: string, a8: string, a9: string, a10: string,
+    a11: string, a12: string, a13: string, a14: string, a15: string,
+    a16: string, a17: string, a18: string, a19: string, a20: string,
+  }
+
+  // The host appends the field name to every field.
+  big-argument: func(x: big-struct) -> big-struct;
+}
+
+interface strings {
+  echo: func(s: string) -> string;
+  hello: func() -> string;
+}
+
+// Types only. The world `use`s `failure`, so its error class is exported from
+// the world-level module, `external`, although the world imports no function
+// of its own.
+interface errors {
+  variant failure {
+    bad(string),
+    worse,
+  }
+
+  enum kv-error {
+    not-found,
+    denied,
+  }
+}
+
+interface checks {
+  record point {
+    x: u8,
+    y: u8,
+  }
+
+  // The guest returns a plain `Array` of the numbers 0 to n - 1, each modulo 256.
+  bytes-from-array: func(n: u32) -> list<u8>;
+
+  // The guest returns `{ x: 310, y: 1 }`, which traps, since `x` does not fit
+  // a `u8`.
+  bad-point: func() -> point;
+
+  // The guest calls `many.big-argument` with a number for `a1`, and returns the
+  // message of the `TypeError` that throws.
+  bad-import-argument: func() -> string;
+
+  // The guest calls `many.big-argument` with a record whose `a1` getter returns
+  // "first" on its first read and a number after that, and returns the `a1` of
+  // the host's result.
+  shifting-import-argument: func() -> string;
+
+  // Implemented as an `async` method, so it returns a promise, which a
+  // function WIT does not declare `async` cannot return.
+  promised: func() -> string;
+
+  // The guest returns, as JSON, members of the objects the `flags` and
+  // `errors` modules export for their flags and enum types, and whether
+  // `external`'s `KvError` is the error class of the world's `kv-error`.
+  enum-objects: func() -> string;
+
+  // Returns "a", a lone high surrogate, "b", a lone low surrogate and "c".
+  lone-surrogates: func() -> string;
+
+  // Returns a lone high surrogate.
+  lone-surrogate-char: func() -> char;
+}
+
+world values {
+  use errors.{failure, kv-error};
+
+  import %flags;
+  export %flags;
+
+  import keyword-imports;
+  import keywords;
+  export keywords;
+
+  import variants;
+  export variants;
+
+  import many;
+  export many;
+
+  export strings;
+  export checks;
+
+  // The guest throws `failure.worse` if `worse` is set, and `failure.bad`
+  // holding "bad" otherwise, as an instance of the `Failure` class.
+  export fallible: func(worse: bool) -> result<u32, failure>;
+
+  // The guest returns `key` for "present", throws an `Error` whose message is
+  // `notFound` for "missing", and throws a `KvError` holding `denied` for
+  // "secret". `lookup-async` rejects the same ways.
+  export lookup: func(key: string) -> result<string, kv-error>;
+  export lookup-async: async func(key: string) -> result<string, kv-error>;
+}

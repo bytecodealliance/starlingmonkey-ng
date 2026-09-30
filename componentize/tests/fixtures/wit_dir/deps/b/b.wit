@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package local:b;
+
+interface foo {
+  record bar {
+    thing: u8,
+  }
+}

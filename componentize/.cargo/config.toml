@@ -1,0 +1,5 @@
+# Share the repository's build directory: the suites read the runtime builds from
+# `target/wasm32-wasip3/release/starling.wasm` and `target/dylib/`, and one directory keeps a
+# single copy of the dependencies both workspaces compile.
+[build]
+target-dir = "../target"

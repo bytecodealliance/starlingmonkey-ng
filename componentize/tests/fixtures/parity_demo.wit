@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:parity-demo;
+
+// The combined-world parity demo.
+//
+// One custom WIT world with an `async` export whose JS handler exercises builtin
+// async/stream surfaces under the ONE per-call event loop the async export
+// drives:
+//
+//   - `await new Promise(r => setTimeout(r, ms))`: a real timer turn (the loop
+//     sleeps on the WASIp3 monotonic clock between turns: a host-async
+//     round-trip, not pure in-process).
+//   - a `ReadableStream` (web-streams builtin, pure JS, no host) constructed
+//     from a literal and drained through a reader.
+//
+// `run` combines both into the returned string, so a bug in either path changes
+// the output the host asserts on. So the demo combines a host-async builtin
+// (timer/clocks) + a pure-JS builtin (streams) + a custom WIT world under one
+// loop.
+//
+// The fetch leg (`await fetch(...)` through the WASIp3 outgoing HTTP client)
+// rounds out the demo: the wasm fetch backend builds its body via wasip3
+// `wit_stream`/`wit_future`, whose CM-stream/future vtable thunks the
+// componentizer's forwarding shim resolves. The test harness wires the
+// p3 `wasi:http` host with a fixed-response hook, so the body round-trips back
+// into `run`'s result.
+//
+// `delayed` `await`s a `setTimeout(ms)`, then returns `tag` and the number of
+// `delayed` calls in flight, itself included. Two calls in flight at once, with
+// equal delays, each return their own `tag`, and the first to finish counts
+// two calls in flight.
+
+interface demo {
+  // The combined-builtins parity export. `ms` is the timer delay, and the handler
+  // sleeps `ms`, drains a literal `ReadableStream`, `fetch`es the harness's
+  // fixed body, and returns a string combining all three results.
+  run: async func(ms: u32) -> string;
+
+  // Sleep `ms`, then return `<tag>:<calls in flight>`.
+  delayed: async func(tag: string, ms: u32) -> string;
+}
+
+world parity-demo {
+  export demo;
+}

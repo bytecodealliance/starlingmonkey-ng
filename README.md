@@ -25,6 +25,7 @@ JS modules, and functions and properties on the global object.
 - [Inheritance](#inheritance)
 - [Promise / Async](#promise--async)
 - [Building and Testing](#building-and-testing)
+  - [Componentizing JavaScript](#componentizing-javascript)
 - [Web Platform Tests (WPT)](#web-platform-tests-wpt)
 - [GC Rooting Checks](#gc-rooting-checks)
 - [Key Design Points](#key-design-points)
@@ -683,10 +684,12 @@ WASM_TARGET=p3 just wpt-test-wasm
 
 `rust-toolchain.toml` pins a toolchain that ships no wasm32-wasip3 std, so `p3` builds through
 `cargo +nightly`, and `p3` needs wasi-sdk 34, the first with a wasm32-wasip3 sysroot. The runtime
-build (`build-runtime`) follows it too.
+build (`build-runtime`) and the componentize suites follow it too, so a componentized guest
+belongs to the target it was built for.
 
-`just build-runtime` and `just test-runtime` default to `p3` rather than `p2`: they build and read
-`target/wasm32-wasip3/release/starling.wasm` unless `WASM_TARGET` selects another target.
+The componentize side defaults to `p3` rather than `p2`: `just build-runtime`, `just test-runtime`
+and the componentize suites build and read `target/wasm32-wasip3/release/starling.wasm` unless
+`WASM_TARGET` selects another target.
 
 The package builds two targets. `cargo build` produces the native binary
 `target/debug/starlingmonkey`. A wasm build produces the component
@@ -697,7 +700,7 @@ still built on wasm targets, where it does nothing.
 
 ### Runtime Builds for Component Linking
 
-`starling-componentize` links the full StarlingMonkey runtime, SpiderMonkey
+`starling-componentize` (below) links the full StarlingMonkey runtime, SpiderMonkey
 included, together with generated bindings for a WIT world, from this build:
 
 **Static runtime.** `just build-runtime` builds the runtime as a
@@ -715,7 +718,7 @@ componentizer needs those copies, so it refuses a `starling.wasm` a plain
 
 Running a script calls no `run` export: the script's top level and the event loop
 it starts are the whole program. The `run` export of the main module is called only
-in a pre-initialized instance, one componentized as a CLI tool or
+in a pre-initialized instance, one componentized as a CLI tool (below) or
 wizened directly with Wizer through the runtime's `wizer-initialize` export:
 
 ```bash
@@ -730,6 +733,566 @@ A snapshot is also refused while the top level has not settled, or has left work
 behind, such as a timer or a `fetch` in flight. A host resource the script keeps
 without pending work, such as the body of a `fetch` response it did not read, is
 not detected. Its handle is not valid in an instance resumed from the snapshot.
+
+### Componentizing JavaScript
+
+`componentize` (`starling-componentize` binary) assembles a JavaScript
+source file and a custom WIT world into a self-contained WebAssembly component
+on top of one of the runtime builds above. The component implements the world's
+exports in JS and calls its imports as ordinary JS functions. No host runtime is
+embedded beyond the component itself.
+
+```bash
+starling-componentize -d <wit-dir> -w <world> componentize <app.js> -o out.wasm
+```
+
+`-d`/`--wit-path` takes a `.wit` file or a directory of them (repeatable) and
+`-w`/`--world` names the world to target, defaulting to the WIT's own default
+world. A directory brings the packages in its `deps` directory along, so
+`-d ./wit` is usually all that is needed. Repeated `-d`s are read in order, so a
+package comes after the packages it uses. A package several of them define is
+merged into one, with the interfaces, types and functions of every definition,
+so libraries can each ship the part of a package they use. The definitions must
+agree on the functions they have in common. `-w` names a world in the last
+package loaded, or any world by its qualified name,
+`namespace:package/world@version`. Repeat it to target several worlds: they are
+merged into one world, `starling:componentize/merged`, which imports and exports
+everything they do. These flags, and the others shown before the subcommand, may
+also follow it. `-p`/`--base-directory` is the directory the application's relative
+`import`s resolve within, and defaults to the input file's directory. A module
+that imports the input file gets the application's main module itself. The
+output (`-o`, default `js.wasm`) is a component you can run directly under
+`wasmtime` or compose with others via `wasm-tools`.
+
+`just componentize <args>` runs `starling-componentize` built from the checkout,
+with the runtime `just build-runtime` last built embedded, in the directory you
+run it from. `just install-componentize` builds the static runtime and installs
+`starling-componentize` with the runtime embedded, so the installed binary needs
+no other file. It is also packaged for npm as
+`@bytecodealliance/starling-componentize`, which installs a prebuilt binary for
+the platform from an optional dependency, one package per platform, and runs it
+as `npx @bytecodealliance/starling-componentize`. Its `binaryPath()` export
+returns the binary's path. `just npm-componentize [VERSION]` assembles the
+packages for the current platform in `target/npm`, and their tarballs in
+`target/npm/tarballs`.
+
+The runtime and `starling-componentize` are released together, under the
+workspace's version in `Cargo.toml`, which `componentize/Cargo.toml` repeats (a
+test checks they agree). The `release` workflow builds `starling.wasm` and
+`starling-componentize` for every platform in `componentize/npm/platforms.json`.
+A `v<version>` tag publishes the npm packages and creates a GitHub release with
+`starling.wasm` and each platform's binary. A manual run publishes nothing
+unless asked to, and takes a version for the npm packages, such as
+`0.3.0-preview.1` for the Spin JS SDK's preview kits. Every run uploads the
+packages' tarballs as the `npm-tarballs` artifact. The Linux binaries link
+against glibc 2.28, through `cargo zigbuild`, so they run on distributions as
+old as that.
+
+The componentizer calls the runtime's `init` export, the interface
+`starling:componentize/init` that `starling/wit/init.wit` declares, and refuses
+a runtime whose version of that interface differs from its own in more than the
+patch number. Any change to the interface needs a new major or minor version of
+its package, which CI checks against the latest release with
+`scripts/check-init-wit.sh`.
+
+A componentizer built without a runtime at
+`target/wasm32-wasip3/release/starling.wasm`, or at the path
+`STARLING_EMBED_RUNTIME` names at build time, embeds none. `--runtime`, or the
+`STARLING_RUNTIME` environment variable, points at another static runtime build,
+relative to the working directory. To link the dynamic library instead, pass
+`--runtime-lib target/dylib/wasm32-wasip2/libstarling_rt.so` (built by
+`just build-dylib`), which takes precedence over `STARLING_RUNTIME`. The wasi-sdk shared sysroot libraries it needs default to
+`$WASI_SDK_PATH/share/wasi-sysroot/lib/wasm32-wasip2`, overridable with
+`--sysroot-libs`.
+
+`--init-location <url>` sets the URL `globalThis.location` reflects while the
+application's top level runs. Without it, reading `location` there throws a
+`TypeError`.
+
+What the application prints while it initializes is shown, unless `-q` is
+given. The compiled component is kept in wasmtime's compilation cache, which
+speeds up componentizing the same world again, unless `--no-cache` is given.
+
+The component's type is exactly the world's: it exports what the world declares
+and nothing else. The runtime's own `wasi:cli/run` and `wasi:http/handler` are
+exported only when the world declares them (or with `--cli` and `--serve`, whose
+built-in worlds do), and the `init` interface the componentizer runs under
+Wizer never survives. Every export is resolved when the snapshot is taken, so a
+guest module missing one fails componentization with a message naming the JS
+export to add, rather than trapping on the first call.
+
+The application's top level runs to completion before the snapshot is taken. Its
+relative and JSON imports are read from the base directory, and a top-level
+`await` may wait on timers and dynamic `import()`s. Exports are resolved once it
+has finished, so an export declared after a top-level `await` is found. A top
+level that throws, rejects, or awaits a promise that never settles fails
+componentization with the reason. A dynamic `import()` of a module the top level
+did not load reads the file when an export calls it, through the component's own
+filesystem imports and relative to the working directory the host gives it, so it
+fails with `--disable filesystem`.
+
+A snapshot holds memory, not a running event loop, so the top level must leave no
+asynchronous work behind when it finishes: no timer or interval still pending, no
+`fetch` it did not await. Componentization fails otherwise, listing each piece of
+work with the stack that created it:
+
+```text
+Error: the application's top level finished evaluating with asynchronous work still pending, [...]
+  - a pending `interval` timer, created at:
+      startPolling@app.js:2:14
+      @app.js:4:1
+  - a host operation in flight, created at:
+      @app.js:6:20
+```
+
+The component opens its own standard streams when it first writes after
+resuming. Calling an import during initialization throws a `TypeError` naming
+it, since the host's imports are not linked while the snapshot is taken, and
+fails componentization unless the application catches it. An `async` import
+returns a promise rejected with that error instead, which fails componentization
+when the top level awaits it.
+
+Some worlds are refused, each with an error naming the function or export:
+
+- a function that uses a `map`, a fixed-length `list` or `error-context`, which the
+  runtime cannot lift or lower yet;
+- a synchronous export that takes or returns a `stream` or `future`, since no event
+  loop drives their transfer (declare it `async`);
+- a world-level import function that takes a `borrow` anywhere in its parameters,
+  such as a method of a resource declared directly in the world rather than in an
+  interface, since the composition step cannot encode a `borrow` outside an
+  interface. `types` still describes such a world;
+- a world that exports `wizer-initialize`, `wasi-http-handler` or the
+  `starling:componentize/init` interface, names the componentizer's own exports
+  take;
+- a world that exports `wasi:cli/run` or `wasi:http/handler` in a version whose
+  major and minor numbers or pre-release suffix differ from the one the runtime
+  provides.
+
+`--disable stdio,random,clocks,http,filesystem` (comma-separated, repeatable)
+leaves the named WASI features out of the component: their interfaces disappear
+from its imports, satisfied instead by stubs that trap when reached, so a world
+that imports no WASI produces a component that imports none beyond
+`wasi:cli/environment`, `wasi:cli/exit` and `wasi:random/insecure-seed`. The
+application's top level still runs with every feature during componentization.
+A disabled clock's `now` is the exception to trapping, since the runtime reads
+it whatever the application does: it reads as zero, so `Date.now()` and
+`performance.now()` return constants, and only waiting on the clock traps.
+`random` leaves out `wasi:random/random` only. SpiderMonkey seeds its hash
+tables from `wasi:random/insecure-seed`, so the component imports it unless
+`--deterministic-insecure-random-seed <SEED>` is given, which makes
+`get-insecure-seed` always return SEED's high and low 64 bits. With the seed,
+an attacker can craft input that collides in those hash tables and slows the
+application down drastically, so use it only with trusted input. `wasi:io` goes with
+the last feature that uses it, and a feature another remaining one uses cannot be
+disabled by itself: `filesystem` uses the clocks' types, so disabling `clocks`
+alone is refused with a message listing every such use and the features to
+disable with it. A trap in a stub names the disabled
+function in the backtrace, as in
+`disabled-features!wasi:random/random@0.3.0#get-random-bytes (disabled)`.
+
+In both modes the world's bindings are generated with `wit-dylib`, a small module
+that lowers and lifts every WIT function through the runtime's `wit_dylib_*`
+intrinsics. With the static runtime, the componentizer takes the core module out
+of `starling.wasm`, reserves room for the bindings' data in its memory and table,
+and links the bindings as a library of it (`componentize/src/static_link.rs`). With the
+dynamic library, every module is a position-independent library resolved by the
+wasm dynamic-linking convention. The componentized snapshot behaves the same
+either way.
+
+#### Export names
+
+The main module provides each function and resource class of an exported
+interface in exactly one of the shapes below. For `greet` in the interface `greeter`
+of the package `test:app@1.0.0`:
+
+```js
+// The package layer: `test-app` in lowerCamelCase, then the interface's name.
+// The version is not part of the name.
+export const testApp = { greeter: { greet } };
+// The interface layer, the shape jco uses.
+export const greeter = { greet };
+// A bare export.
+export function greet(name) { /* … */ }
+```
+
+The interface layer is allowed only when no other exported interface has the
+same name, and a bare export only when no other exported item or world-level
+function has the same name. Where the names of two shapes coincide, the package
+layer's name takes precedence over an interface-layer and a bare name, and an
+interface-layer name over a bare name. A world-level exported function is always
+a bare export, and takes precedence over an interface-layer name. An interface
+the world exports under a plain name (`export local: interface { … }`) has no
+package layer. Functions are lowerCamelCase and resource classes UpperCamelCase.
+A reserved word such as `default` or `new` is exported with an export clause
+(`export { make as new }`).
+
+Two versions of one interface have the same package-layer and interface-layer
+names, so each is provided only by the export named by its full WIT name. A
+TypeScript build needs `"module": "es2022"` or later for such a name:
+
+```js
+export { v1 as "local:hello/hello@1.0.0", v2 as "local:hello/hello@2.0.0" };
+```
+
+An item the main module provides in more than one shape, or in none, fails
+componentization with a message listing the shapes it may take.
+
+#### HTTP servers
+
+For an HTTP server, pass `--serve` (or declare
+`export wasi:http/handler@0.3.0;` in your own world), and the component exports
+`wasi:http/handler`. With `-d`, `--serve` merges the world `-w` selects with a
+world exporting the interface, so the application can import the interfaces its
+WIT declares as well. The application serves it in one of two ways:
+
+- Register a listener with `addEventListener('fetch', …)`. The runtime dispatches
+  each request as a `fetch` event.
+- Export its own `handle`, in the shapes of `wasi:http/handler`'s exports:
+  `wasiHttp.handler.handle`, `handler.handle` or a bare `handle`. `handle`
+  takes a `wasi:http/types` request and returns a response: a `Response`
+  object, such as the one `fetch` resolved to, whose body is then passed on
+  without being read, or a `wasi:http/types` one. `fetch` takes the
+  `wasi:http/types` request as its input, so `return fetch(request)` forwards a
+  request unchanged. The request can't be used after `fetch` took it.
+
+```js
+export async function handle(request) {
+  if (request.getPathWithQuery() === "/proxy") {
+    return fetch(request);
+  }
+  return new Response(`hello from ${request.getPathWithQuery()}`);
+}
+```
+
+Which one the application uses is decided when the snapshot is taken. An
+application that does both, or neither, fails componentization with a message
+saying so. A world that declares the `wasi:http` interfaces itself must agree
+with the runtime on every item both declare, or leave `wasi:http/handler` empty
+(`interface handler {}`).
+
+The `wasi:http/types` resources a `handle` receives have the methods the
+runtime's builtins use, since the component imports nothing beyond them. A world
+that imports `wasi:http/types` itself, with `-d`/`-w`, adds the functions it
+declares, for example `fields`' `get` and `has`.
+
+#### CLI tools (`wasi:cli/run`)
+
+A command-line tool needs no WIT of its own. Pass `--cli`, which with `-d` merges
+the selected world with one exporting `wasi:cli/run`, and have the application
+`export` a `run` function:
+
+```bash
+starling-componentize --cli componentize <app.js> -o cli.wasm
+wasmtime run -Sinherit-env=y,http=y,p3=y -Wcomponent-model-async=y cli.wasm
+```
+
+```js
+// app.js
+export async function run() {
+  console.log("hello from a componentized CLI tool");
+}
+```
+
+The resulting component exports `wasi:cli/run`, and invoking it calls the
+JavaScript `run` export. An `async` `run` may `await` timers, `fetch` and
+imports, which the call's event loop drives. Timers still pending once `run`'s
+promise has settled are dropped without running. Running the module as a plain script
+evaluates its top level without calling `run`. Componentizing a module without a
+`run` function as a CLI tool fails, naming the export to add.
+
+#### Components that serve and run
+
+`--cli` and `--serve` combine, alone or with `-d`, into one component exporting
+both `wasi:cli/run` and `wasi:http/handler`. The application then has to do what
+each asks of it: export `run`, and register a `fetch` listener or export
+`handle`. The host picks the export it calls, so `wasmtime run` calls `run` and
+`wasmtime serve` serves requests, each in instances of its own resumed from the
+same snapshot:
+
+```bash
+starling-componentize --cli --serve componentize <app.js> -o app.wasm
+```
+
+#### The interfaces the runtime imports
+
+The targeted world also imports every interface the runtime imports, whether
+it comes from `-d`, `--cli` or `--serve`: `wasi:cli`'s environment, exit,
+standard streams and terminals, `wasi:clocks`, `wasi:filesystem`,
+`wasi:random`, `wasi:http/types` and `wasi:http/client`. Each has the functions
+the runtime itself imports, so the application can import them without adding
+to what the component imports:
+
+```js
+import { getEnvironment } from "wasi:cli/environment@0.3.0";
+```
+
+`--disable` leaves out the interfaces of the features it names. An interface of
+a disabled feature that a remaining one uses stays, and componentization then
+refuses it with a message naming both.
+
+#### WIT values in JavaScript
+
+Every synchronous WIT type works today: all scalars (`u64` and `s64` are always
+BigInts, like the elements of a `BigUint64Array`), `string`, `list` (numeric
+lists as typed arrays, `list<u64>` and `list<s64>` as `BigUint64Array` and
+`BigInt64Array`, and a numeric list also takes a plain `Array`), `record`,
+`tuple`, `variant`, `enum`, `option`, `result`, `flags`, and `resource`s, with
+constructors, methods, static methods, and borrows. Imports are surfaced as ES
+modules the guest can `import`. Every imported resource has a class, including
+one that no constructor, method or static function names. An imported resource
+wrapper has a `[Symbol.dispose]()` method that releases the host handle early (so
+`using` works, and a second call does nothing). Disposing of a wrapper an `async`
+import call still borrows releases the handle once that call returns. A guest
+class implementing an exported resource may define `[Symbol.dispose]()`, which
+the runtime calls when the host drops the resource. Its methods are looked up on
+the instance, so a subclass's override runs. This is validated
+end-to-end by a 43-test round-trip suite over a WIT world exercising the whole
+type system, with imported and guest-owned resources each covered end-to-end by
+a suite of their own.
+
+A variant's tag and a record's fields are their WIT names in lowerCamelCase
+(`db-null` is `dbNull`). An `enum` crosses as its case index, and a `flags` set
+as an int32 of its bits, the bit of the n-th flag being `1 << n`. The module of
+the interface defining an enum or flags type, and of each interface that `use`s
+it, exports a frozen object under the type's name in that interface, in
+UpperCamelCase, as a TypeScript enum's object would be: it maps each case's
+lowerCamelCase name to its value and each value back to the name
+(`Qos.atLeastOnce` is `1`, `Qos[1]` is `"atLeastOnce"`). An error class of the
+same name takes the name instead. An interface whose functions the world only
+exports has no module, so the guest cannot import objects for its types.
+
+An import argument that does not match its WIT type throws a `TypeError` naming
+the argument, the part of it that failed and its value, such as
+``argument 1 of `bigArgument` `.a1`: expected a string, got 5``. The arguments
+of one call are also checked together: a resource wrapper passed as an `own`
+must not appear anywhere else in them, a wrapper the guest received as a
+`borrow`, or one an `async` import call still borrows, cannot be passed as an
+`own`, and a `ReadableStream` must be unlocked and passed only once. An export result that does not match traps the call, and
+the message printed on stderr names the export and the part of the result the
+same way.
+
+A synchronous export runs without an event loop. The microtasks it queues run
+before it returns. A timer it starts throws a `TypeError` naming the export.
+A `fetch`, an `async` import, or a read of a response body or of a stream from
+the host it starts returns a promise rejected with one. Passing a stream or a
+future to an import throws one too, since nothing would transfer it. A value it
+writes to a stream or future that an earlier asynchronous call returned, such as
+by settling a promise lowered to a future, is written in the next asynchronous
+call.
+
+Asynchronous WIT works too. `async` exported functions return a JS `Promise`
+that the component lifts into a WASIp3 async return. `async` imports are called
+as ordinary `async` JS functions and `await`ed. Their arguments are checked and
+lowered when the call starts, so a change to an argument after the call, such as
+to a typed array's elements, has no effect on what the host receives. An `async`
+export whose promise is still pending once its call's event loop has nothing left
+to run traps, even if a later call could settle the promise.
+
+Streams and futures are web streams and promises:
+
+- A `stream<T>` the guest receives is a `ReadableStream`. A `stream<u8>` is a
+  readable byte stream of `Uint8Array` chunks, so BYOB readers work, and any
+  other `stream<T>` has one chunk per element. The stream reads from the host
+  only when something reads it, and cancelling it drops it.
+- A `stream<T>` the guest hands over may be a `ReadableStream` or any async or
+  sync iterable, such as an async generator or an array of chunks. A
+  `stream<u8>` takes `ArrayBufferView` and `ArrayBuffer` chunks. A source that
+  errors, or produces a chunk or element that does not match the stream's type,
+  ends the stream early and logs why on stderr. After the host stops reading,
+  the source is cancelled when it produces its next chunk. It is also cancelled
+  when the call's event loop runs out of other work while the source produces
+  nothing more. An imported resource the host does not read as a stream
+  element goes back to the wrapper the guest holds. One nested in a record,
+  tuple, option or list does not, and the guest's wrapper holds no handle
+  afterwards. A stream the guest received and returns unread goes back to the
+  host as it is.
+- A `future<T>` the guest receives is a `Promise`. Its value is read whether or
+  not the guest uses the promise. A `future<T>` the guest hands over may be a promise or any other value.
+  A promise that never settles does not keep the call running, and its value
+  is still written if it settles later. An `async` import the call started and
+  did not await does keep it running until the import returns, so one whose
+  host side waits on such a future never lets the call finish.
+  An `async` export returning a `future<T>` returns it as the promise it
+  produces, so the call completes before the future does.
+
+Streams work with `fetch` in both directions: a received `stream<u8>` can be a
+request body (`fetch(url, { method: "POST", body, duplex: "half" })`), and a
+response's `body` can be returned as a `stream<u8>`.
+
+The `err` arm of a `result` crosses as an error. An import's `err`, or a rejected
+`future<result<T, E>>`, throws or rejects with an instance of `E`'s class when
+`E` is a named type other than a resource, and a `ComponentError` otherwise.
+`E`'s class is named after the type, extends `ComponentError`, and holds the
+payload as `payload`. It is exported from the module of the interface whose
+function names the type, under the name that interface uses for it, or from
+`external` for a type the world names (`import { ErrorCode } from
+"wasi:http/types@0.3.0"`). An interface the world only exports has no module, so
+a type it `use`s from another interface has that interface's class. An export
+failing, or a promise the guest hands over as a `future<result<T, E>>`
+rejecting, produces an `err` from:
+
+- a `ComponentError` or an instance of a class extending it: its `payload`,
+- any other `Error`: its `message`, if `E` is a `string`, or an `enum` or
+  `variant` with a payload-less case whose JS (camelCase) name it is,
+- any other value: the value itself.
+
+Anything else traps, as does a rejection where the WIT type has no `err` arm. An
+`err` arm without a payload takes any thrown or rejected value, and logs it to
+stderr. A synchronous export cannot take or return a `stream` or `future`, since
+nothing would drive them after it returns, so componentizing one fails.
+
+Each call to an `async` export runs its own event loop, which drives guest
+promises, imported-function calls, and the builtins' work (`fetch`, timers, web
+streams). A guest can `await fetch(...)` and a `setTimeout` callback in the same
+call. The call finishes once its promise has settled and its imports, streams
+and futures are done. Timers still pending then are dropped without running.
+
+In the dynamic link mode, a world-level export named after a libc symbol, such
+as `random`, collides with that symbol: the dynamic link puts `libc.so`'s exports
+and the world's in one symbol namespace, so `wit-component`'s linker rejects the
+duplicate.
+
+#### Bundling and build caching
+
+`imports` prints the module specifiers the guest may import for the selected
+world, one per line: each imported interface's WIT name, and `external` for the
+world's own imports. A module is listed only if the runtime registers it, which
+it does if the module exports a function, a resource class, an error class, or
+an enum or flags object. A bundler leaves these unresolved.
+It takes the same WIT flags as `componentize`, and a world exporting
+`wasi:http/handler` includes the `wasi:http` interfaces the runtime's handler
+uses:
+
+```bash
+starling-componentize -d wit -w app --serve imports
+```
+
+`--version` (`-V`) prints the componentizer's version and the version of the
+`init` interface it calls, and for the runtime in `$STARLING_RUNTIME`, or else
+the embedded one, the SHA-256 digest of its module and the version of the
+interface it implements. A build tool can tell from it when a rebuild would
+produce a different component.
+
+#### TypeScript declarations for a world
+
+To scaffold (or type-check) the guest module a world expects, generate a
+TypeScript declaration (`.d.ts`) from the WIT:
+
+```bash
+just ts-bindings <wit-path> <world>     # print the .d.ts to stdout
+just ts-bindings --cli ''               # the built-in wasi:cli/run world
+just ts-bindings --serve ''             # the built-in serve world
+
+# or directly, with -o to write a file:
+starling-componentize -d <wit-dir> -w <world> types -o world.d.ts
+```
+
+Add the generated file to the TypeScript program (a `files` or `include` entry in
+`tsconfig.json`, or a `/// <reference path=…/>`). It declares nothing at file
+level, which makes each `declare module` in it an ambient module declaration the
+guest can import from:
+
+- `starling:types/<world>`, where `<world>` is the world's qualified name (for
+  example `starling:types/wasi:http/proxy@0.3.0`), declares every WIT type the
+  world uses, a class per resource, and an error class per `err` type that has
+  one. It is named after the world so declarations generated for different
+  worlds can be part of one program. They live in a module rather
+  than at file level so a WIT type named `permissions` or `response` cannot
+  collide with the standard library. A name that several types share is
+  qualified there with the interface's name, then also with the package's
+  (`AThing`, `WasiHttpTypesErrorCode`). An interface the world both imports and
+  exports has two classes per resource there, the host's and the guest's
+  (`Item` and `ExportedItem`).
+- One module per WIT interface the world imports, named by its WIT name, plus
+  `external` for the world-level imports. Each declares the interface's
+  functions and re-exports the types, resource classes and error classes the
+  interface defines or `use`s under their WIT names, so
+  `import { ErrorCode } from 'wasi:filesystem/types@0.3.0'` is the filesystem
+  one. The runtime registers no module for an interface without functions,
+  resources, error classes, enums or flags, so only the types of such a module
+  are usable.
+- `starling:guest` declares what the guest module exports. Reference it to have
+  the compiler check the guest:
+
+  ```ts
+  import type * as Guest from 'starling:guest';
+  export const greeter: typeof Guest.greeter = { /* … */ };
+  ```
+
+`starling:guest` declares every shape the world allows for each item (see
+[Export names](#export-names)). `types` fails for a world whose exports cannot
+all be named: a world-level function with a package layer's name.
+
+The WIT→TypeScript types match the runtime's own value mapping. Numeric `list`s
+are typed arrays (`list<u8>` is `Uint8Array`, `list<u64>` is `BigUint64Array`),
+`u64`/`s64` are `bigint`, and a record's `option` field is an optional key.
+`result<T, E>` on a return type is unwrapped to its `ok` payload (errors are
+thrown), while a `result` parameter is the `{ tag, val }` union. `enum` is an
+`enum` numbered from zero, and `flags` an `enum` of its bits plus a `number`
+alias for a set of them. A set crosses as an int32, matching the result of `|`,
+so the member for bit 31 is `1 << 31`. Each is imported from its interface's
+module, which exports the object, so builds that compile files one at a time
+(`isolatedModules`, as esbuild, swc, tsx and Bun do) can use them. A type of an
+interface the world only exports has no module, and is a `const enum`, whose
+members `tsc` inlines.
+
+The two command worlds get bespoke declarations. `wasi:cli/run` is
+`export function run(): void | Promise<void>`. For `wasi:http/handler`, the guest
+either registers an `addEventListener('fetch', …)` listener, whose `FetchEvent`
+the file declares, or implements `handle` as `wasiHttp.handler.handle`,
+`handler.handle` or a bare `handle`. `handle` receives the WIT `request` and
+returns a `Response`, or the WIT `response` resource when the world declares
+one, or a promise of either. The file declares an overload of `fetch` taking the
+WIT `request` when the world imports `wasi:http/types@0.3.x`. `types` takes the
+interface's declaration from the runtime, the one `--runtime` or
+`STARLING_RUNTIME` names or the embedded one, as componentizing does. Without a
+runtime, the request in the built-in serve world, which declares no
+`wasi:http/types`, is `unknown`.
+
+A resource renders as a class with the constructor, methods and statics its WIT
+declares. An imported resource's class declares `[Symbol.dispose](): void`, has a
+private member so that no other object type-checks as one of its handles, and has
+a private constructor when the WIT declares none. An exported resource's class
+declares `[Symbol.dispose]` as optional, and is also a member of its interface
+object (`Counter: typeof Counter`), since the runtime looks it up there.
+
+Where the guest receives them, `stream<T>` renders as the DOM library's
+`ReadableStream<T>` (`ReadableStream<Uint8Array>` for `stream<u8>`) and
+`future<T>` as `Promise<T>`. Where the guest hands them over, they render as what
+it may pass. The error class of an `err` type extends the global
+`ComponentError`, which the file always declares. It is exported from the module
+of the interface whose functions name the type, under the name they use, so a
+`use`d or renamed type's class is exported by the interface that `use`s it. That
+module does not re-export the payload type under the class's name. Name it as
+`ErrorCode['payload']` instead.
+
+The generated declarations are snapshot-tested, and each is type-checked with
+`tsc --noEmit --strict` together with a consumer module that imports from every
+module it declares and with hand-written guest modules for the naming shapes,
+error classes and the serve worlds. That needs a TypeScript compiler: `npm ci` at
+the workspace root installs the pinned one, and the test fails without it.
+
+The componentizer's end-to-end suites build a runtime once, then componentize JS
+apps and run them under wasmtime:
+
+```bash
+just test-componentize        # build the static runtime, run every suite against it
+just test-componentize-only   # run the suites against a prebuilt runtime, without building one
+just test-componentize-only echo_stream_u8   # one suite (name filter forwarded to libtest)
+```
+
+`test-componentize-only` picks the mode from `STARLING_LINK_MODE` (`static`, the
+default, or `dynamic`) and the runtime from `STARLING_RUNTIME` or
+`STARLING_DYLIB`. Each suite componentizes its own WIT world with Wizer. Against
+the static runtime that takes a few seconds per world. Against the dylib it is
+about 3.5 minutes for all of them, and about 1.5 once the compilation cache is
+warm, since a world's bindings are linked into the component before it is
+compiled and a cached compilation is reused by a rerun of that same world against
+the same runtime build. When iterating on the tests, `test-componentize-only`
+with a name filter runs just the world you care about and never rebuilds the
+runtime.
+
 
 ---
 

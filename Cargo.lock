@@ -3362,8 +3362,6 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 [[package]]
 name = "wit-bindgen"
 version = "0.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53cb4b5556c3a791e86838ea287782bdafa704d55b0e68b5b81a3a16b9ea5f4b"
 dependencies = [
  "bitflags",
  "futures",
@@ -3373,8 +3371,6 @@ dependencies = [
 [[package]]
 name = "wit-bindgen-core"
 version = "0.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72ad22a37ecbc0e1fdca34d2b670ba41368cb0920735643e00fdf39a16ee5431"
 dependencies = [
  "anyhow",
  "heck",
@@ -3384,8 +3380,6 @@ dependencies = [
 [[package]]
 name = "wit-bindgen-rust"
 version = "0.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84ba5213d4332c260a0d4e69e34b0f7e4b85ddae10b6ebfbac00d9c185ba628a"
 dependencies = [
  "anyhow",
  "heck",
@@ -3400,8 +3394,6 @@ dependencies = [
 [[package]]
 name = "wit-bindgen-rust-macro"
 version = "0.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f19d63da8e478a370ef8192d90ccb517965b7747d6b46cd2d831dd0ef4d2541"
 dependencies = [
  "anyhow",
  "macro-string",

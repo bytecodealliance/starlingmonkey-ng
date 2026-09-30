@@ -59,6 +59,10 @@ web-streams = { path = "crates/builtins/web-streams" }
 web-url = { path = "crates/builtins/web-url" }
 cpp-builtins = { path = "crates/builtins/cpp-builtins" }
 
+# `block_on_detached` for the debugger's pause on wasm. The fork is wit-bindgen 0.62.0 plus that
+# function. Replace the path with a git dependency on the pushed branch before merging.
+[patch.crates-io]
+wit-bindgen = { path = "../wit-bindgen-block-on/crates/guest-rust" }
 
 [profile.release]
 lto = "thin"

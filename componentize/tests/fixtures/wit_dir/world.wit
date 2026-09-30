@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:wit-dir;
+
+// A WIT directory with `deps/`: two versions of `local:hello/hello` imported
+// and exported at once, the interface name `hello` from a third package, and
+// a world-level `use` of a dependency package's record.
+
+world versions {
+  use local:b/foo.{bar};
+
+  import local:hello/hello@1.0.0;
+  export local:hello/hello@1.0.0;
+  import local:hello/hello@2.0.0;
+  export local:hello/hello@2.0.0;
+  import local:other/hello;
+
+  export exports: interface {
+    // "hello" and "other" select the import that `world` is forwarded to.
+    // Any other name is echoed with "unknown".
+    hello: func(name: string) -> string;
+  }
+
+  export make-bar: func() -> bar;
+}

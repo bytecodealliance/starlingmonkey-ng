@@ -52,6 +52,30 @@ jobs:
         run: just clippy --all
 
   # ---------------------------------------------------------------------------
+  # The `init` interface between the runtime and the componentizer
+  # (`starling/wit/init.wit`) changes only with a new major or minor version, compared with the
+  # latest release, since the componentizer accepts runtimes that differ only in its patch number.
+  # ---------------------------------------------------------------------------
+  init-wit:
+    name: init.wit versioning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release tags the check compares with.
+          fetch-depth: 0
+
+      - name: Install wasm-tools
+        run: |
+          mkdir -p "$HOME/.wasm-tools/bin"
+          curl -sSfL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz" \
+            | tar xz --strip-components=1 -C "$HOME/.wasm-tools/bin" "wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux/wasm-tools"
+          echo "$HOME/.wasm-tools/bin" >> "$GITHUB_PATH"
+
+      - name: Check init.wit's version
+        run: ./scripts/check-init-wit.sh
+
+  # ---------------------------------------------------------------------------
   # Cargo tests: {native, wasm32-wasip2, wasm32-wasip3} × {debug+debugmozjs, release}
   # The wasm recipes also run the serve end-to-end suite (`just test-serve-wasm`).
   # ---------------------------------------------------------------------------
@@ -91,11 +115,12 @@ jobs:
         run: just ${{ matrix.recipe }} --examples
 
   # ---------------------------------------------------------------------------
-  # The static runtime component: scripts and Wizer snapshots run with it. The runtime is built
-  # for wasm32-wasip3, so this job installs nightly and a wasi-sdk with a sysroot for it.
+  # Componentization suites against the static runtime (`just test-componentize`).
+  # That recipe builds the runtime for wasm32-wasip3, the target the componentizer
+  # links against, so this job installs nightly and a wasi-sdk with a sysroot for it.
   # ---------------------------------------------------------------------------
-  runtime:
-    name: Runtime component
+  componentize:
+    name: Componentize (static runtime)
     runs-on: ubuntu-latest
     env:
       WASMTIME_BACKTRACE_DETAILS: '1'
@@ -107,6 +132,17 @@ jobs:
         with:
           target: wasm32-wasip3
           wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      # `--tests` includes the `wit_to_ts` suite, which type-checks its output.
+      - name: Install the TypeScript compiler
+        run: npm ci
+
+      - name: Build the static runtime and run the componentization suites
+        run: just test-componentize
 
       # Runs scripts and a late-rejecting top level with the runtime component itself.
       - name: Run scripts with the runtime component

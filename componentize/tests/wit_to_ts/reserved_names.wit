@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// WIT identifiers escaped with `%` can mangle to JavaScript reserved words.
+// The runtime looks members up under their mangled names, so the mangled
+// name has to stay as it is: only the way the declaration spells it changes. A
+// member of an object type needs nothing except `new`, which would otherwise
+// parse as a construct signature, and a binding needs the
+// `function new_(…); export { new_ as new }` form.
+package test:reserved-names;
+
+interface keywords {
+  // `new` in an object type literal is a construct signature unless quoted.
+  %new: func(start: u32) -> u32;
+  // Every other reserved word is an ordinary property name.
+  %for: func(v: u32) -> u32;
+  %class: func() -> string;
+}
+
+world reserved-names {
+  export keywords;
+  // A world-level function is a binding, which no reserved word can be.
+  export %default: func() -> string;
+  import %import: func() -> u32;
+}

@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:cli-run;
+
+// The fixed CLI world for the componentize pipeline.
+//
+// A componentized CLI tool's world exports `wasi:cli/run`, and the runtime's
+// own builtin `wasi:cli/run` (`starling/src/lib.rs` `wasm_entry`) serves it:
+// against a baked snapshot that builtin dispatches to the
+// application's JavaScript `run` export. The componentizer drops the export from
+// this world before generating the wit-dylib bindings (see
+// `componentize::remove_world_export`), so the builtin stands alone. Left in, a
+// world exporting cli/run plus the dylib's builtin cli/run makes
+// `wit_component::Linker::encode` abort on the duplicate component export.
+//
+// `run` has no `use` clauses, so a `wasi:cli` package carrying only that
+// interface pulls in no transitive WIT deps. The version must have the major
+// and minor numbers of the one the dylib's builtin exports, because the
+// component exports that builtin.
+world command {
+  export wasi:cli/run@0.3.0;
+}
+
+package wasi:cli@0.3.0 {
+  interface run {
+    run: async func() -> result;
+  }
+}

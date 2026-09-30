@@ -1,0 +1,240 @@
+# SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+# Release the runtime and `starling-componentize` together, under the workspace's version in the
+# repository's `Cargo.toml`, which `componentize/Cargo.toml` repeats. Build the static runtime,
+# `starling-componentize` for every platform of `componentize/npm/platforms.json` with that runtime
+# embedded, and the npm packages `componentize/npm/package.mjs` assembles from them.
+#
+# A `v<version>` tag, which must name the workspace's version, publishes the npm packages and
+# creates a GitHub release with `starling.wasm` and each platform's `starling-componentize`. A
+# manual run publishes the npm packages only with `publish` set, and otherwise runs
+# `npm publish --dry-run`. Every run uploads the packages' tarballs as the `npm-tarballs`
+# artifact, which the Spin JS SDK's preview kits are built from.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the packages to npm, rather than doing a dry run
+        type: boolean
+        default: false
+      version:
+        description: >-
+          The npm packages' version, such as 0.3.0-preview.1. Defaults to the workspace's
+          version in Cargo.toml
+        type: string
+        default: ""
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  WASI_SDK_VERSION: "34"
+  WASMTIME_VERSION: "49.0.0"
+  WASM_TOOLS_VERSION: "1.258.0"
+  STARLING_NIGHTLY: nightly-2026-09-24
+  RUSTC_WRAPPER: sccache
+  CCACHE: sccache
+  SCCACHE_GHA_VERSION: 1
+
+jobs:
+  runtime:
+    name: Build the runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release tags `check-init-wit.sh` compares with.
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup
+        with:
+          target: wasm32-wasip3
+          wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
+
+      - name: Check the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          componentize=$(sed -n 's/^version = "\(.*\)"$/\1/p' componentize/Cargo.toml | head -1)
+          if [ "$componentize" != "$version" ]; then
+            echo "componentize/Cargo.toml has version $componentize, the workspace $version" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "The tag ${GITHUB_REF_NAME} does not name the workspace's version $version" >&2
+            exit 1
+          fi
+          ./scripts/check-init-wit.sh
+
+      - name: Build the static runtime
+        run: just build-runtime
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime
+          path: target/wasm32-wasip3/release/starling.wasm
+          if-no-files-found: error
+
+  binaries:
+    name: Build for ${{ matrix.platform }}
+    needs: runtime
+    strategy:
+      matrix:
+        include:
+          # The Linux binaries link against glibc 2.28, through `cargo zigbuild`, so they run on
+          # distributions as old as that rather than only on the runner's.
+          - { platform: linux-x64, os: ubuntu-latest, zigbuild: x86_64-unknown-linux-gnu }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm, zigbuild: aarch64-unknown-linux-gnu }
+          - { platform: darwin-arm64, os: macos-latest }
+          - { platform: darwin-x64, os: macos-15-intel }
+          - { platform: win32-x64, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    env:
+      # The per-platform builds share no cache with the runtime build.
+      RUSTC_WRAPPER: ""
+      CCACHE: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: rustup show
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime
+          path: runtime
+
+      - name: Install zig and cargo-zigbuild
+        if: matrix.zigbuild
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install ziglang
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild
+
+      - name: Build starling-componentize
+        working-directory: componentize
+        env:
+          STARLING_EMBED_RUNTIME: ${{ github.workspace }}/runtime/starling.wasm
+          ZIGBUILD_TARGET: ${{ matrix.zigbuild }}
+        run: |
+          if [ -n "$ZIGBUILD_TARGET" ]; then
+            rustup target add "$ZIGBUILD_TARGET"
+            cargo zigbuild --release --locked --bin starling-componentize \
+              --target "$ZIGBUILD_TARGET.2.28"
+            mkdir -p ../target/release
+            cp "../target/$ZIGBUILD_TARGET/release/starling-componentize" ../target/release/
+          else
+            cargo build --release --locked --bin starling-componentize
+          fi
+
+      - name: Check the binary runs
+        run: |
+          exe=target/release/starling-componentize
+          if [ "${{ runner.os }}" = Windows ]; then exe="$exe.exe"; fi
+          "$exe" --version
+          mkdir -p out
+          cp "$exe" out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    name: Publish the npm packages
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # For npm's provenance statement.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+
+      - name: Assemble the packages
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          version=${INPUT_VERSION:-$version}
+          binaries=()
+          for dir in binaries/binary-*; do
+            platform=${dir#binaries/binary-}
+            binaries+=("$platform=$(ls "$dir"/starling-componentize*)")
+          done
+          node componentize/npm/package.mjs --version "$version" --out npm "${binaries[@]}"
+          mkdir -p npm-tarballs
+          for dir in npm/*; do
+            (cd "$dir" && npm pack --pack-destination ../../npm-tarballs)
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs
+          path: npm-tarballs/
+          if-no-files-found: error
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          dry_run=--dry-run
+          if [ "${GITHUB_REF_TYPE}" = tag ] || [ "${{ inputs.publish }}" = true ]; then
+            dry_run=
+          fi
+          # The platform packages go first, so the package depending on them never
+          # names an unpublished version.
+          for dir in npm/starling-componentize-* npm/starling-componentize; do
+            (cd "$dir" && npm publish --provenance $dry_run)
+          done
+
+  github-release:
+    name: Create the GitHub release
+    if: github.ref_type == 'tag'
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime
+          path: assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for dir in binaries/binary-*; do
+            platform=${dir#binaries/binary-}
+            for exe in "$dir"/starling-componentize*; do
+              name=$(basename "$exe")
+              cp "$exe" "assets/starling-componentize-${platform}${name#starling-componentize}"
+            done
+          done
+          gh release create "$GITHUB_REF_NAME" --title "StarlingMonkey $GITHUB_REF_NAME" \
+            --generate-notes assets/*

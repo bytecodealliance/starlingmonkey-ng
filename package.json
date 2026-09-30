@@ -1,0 +1,8 @@
+{
+  "name": "starling-ng-dev",
+  "private": true,
+  "description": "Development-only TypeScript compiler, used by the `wit_to_ts` test's compile gate to type-check the generated .d.ts files and a consumer that imports from them.",
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package componentize-js:tests;
+
+// The sync subset of the componentize test suite.
+//
+// Restricted to what the sync
+// sync interpreter supports. Every WIT value type, exported and imported
+// resources, and sync imports are exercised through the real componentize
+// pipeline.
+//
+// EXCLUDED (async, streams and futures):
+//   - `simple-async-export`, `simple-async-import-and-export`
+//   - `echoes`' `echo-stream` / `echo-future`
+//   - the whole `streams-and-futures` interface
+//   - `host-thing-interface`'s methods are declared sync here, since this world
+//     covers the synchronous path only.
+
+interface simple-export {
+  foo: func(v: u32) -> u32;
+}
+
+interface simple-import-and-export {
+  foo: func(v: u32) -> u32;
+}
+
+interface types {
+  resource resource-type { }
+
+  record record-type {
+    a: u32,
+    b: string,
+    c: result<u32, u64>,
+  }
+
+  enum enum-type {
+    a,
+    b,
+    c
+  }
+
+  flags flags-type {
+    a,
+    b,
+    c
+  }
+
+  variant variant-type {
+    a(u32),
+    b(string),
+    c(result<u32, u64>),
+    d
+  }
+}
+
+interface echoes {
+  use types.{resource-type, record-type, enum-type, flags-type, variant-type};
+
+  echo-nothing: func();
+  echo-bool: func(v: bool) -> bool;
+  echo-u8: func(v: u8) -> u8;
+  echo-s8: func(v: s8) -> s8;
+  echo-u16: func(v: u16) -> u16;
+  echo-s16: func(v: s16) -> s16;
+  echo-u32: func(v: u32) -> u32;
+  echo-s32: func(v: s32) -> s32;
+  echo-char: func(v: char) -> char;
+  echo-u64: func(v: u64) -> u64;
+  echo-s64: func(v: s64) -> s64;
+  echo-f32: func(v: f32) -> f32;
+  echo-f64: func(v: f64) -> f64;
+  echo-string: func(v: string) -> string;
+  echo-list-bool: func(v: list<bool>) -> list<bool>;
+  echo-list-u8: func(v: list<u8>) -> list<u8>;
+  echo-list-s8: func(v: list<s8>) -> list<s8>;
+  echo-list-u16: func(v: list<u16>) -> list<u16>;
+  echo-list-s16: func(v: list<s16>) -> list<s16>;
+  echo-list-u32: func(v: list<u32>) -> list<u32>;
+  echo-list-s32: func(v: list<s32>) -> list<s32>;
+  echo-list-char: func(v: list<char>) -> list<char>;
+  echo-list-u64: func(v: list<u64>) -> list<u64>;
+  echo-list-s64: func(v: list<s64>) -> list<s64>;
+  echo-list-f32: func(v: list<f32>) -> list<f32>;
+  echo-list-f64: func(v: list<f64>) -> list<f64>;
+  echo-list-string: func(v: list<string>) -> list<string>;
+  echo-list-list-u8: func(v: list<list<u8>>) -> list<list<u8>>;
+  echo-list-list-list-u8: func(v: list<list<list<u8>>>) -> list<list<list<u8>>>;
+  echo-option-u8: func(v: option<u8>) -> option<u8>;
+  echo-option-option-u8: func(v: option<option<u8>>) -> option<option<u8>>;
+  echo-result-u8-u8: func(v: result<u8, u8>) -> result<u8, u8>;
+  echo-result-result-u8-u8-u8: func(v: result<result<u8, u8>, u8>) -> result<result<u8, u8>, u8>;
+  echo-many: func(v1: bool, v2: u8, v3: u16, v4: u32, v5: u64, v6: s8, v7: s16, v8: s32, v9: s64, v10: f32, v11: f64, v12: char, v13: string, v14: list<bool>, v15: list<u8>, v16: list<u16>) -> tuple<bool, u8, u16, u32, u64, s8, s16, s32, s64, f32, f64, char, string, list<bool>, list<u8>, list<u16>>;
+  echo-resource: func(v: resource-type) -> resource-type;
+  accept-borrow: func(v: borrow<resource-type>);
+  echo-record: func(v: record-type) -> record-type;
+  echo-enum: func(v: enum-type) -> enum-type;
+  echo-flags: func(v: flags-type) -> flags-type;
+  echo-variant: func(v: variant-type) -> variant-type;
+}
+
+interface host-thing-interface {
+  resource host-thing {
+    constructor(s: string);
+    get: func() -> string;
+    get-static: static func(v: borrow<host-thing>) -> string;
+  }
+}
+
+// Sync driver for the imported `host-thing` resource. This small sync exported
+// interface drives the imported resource's
+// constructor / instance method / static method / borrow through the real
+// import-synthesis path.
+interface host-thing-driver {
+  use host-thing-interface.{host-thing};
+
+  // Construct a `host-thing` from `s`, call `.get()`, then `HostThing.getStatic`
+  // on it, and return both results joined as "<get>|<get-static>".
+  drive: func(s: string) -> string;
+}
+
+world sync-suite {
+  export simple-export;
+
+  import simple-import-and-export;
+  export simple-import-and-export;
+
+  import echoes;
+  export echoes;
+
+  import host-thing-interface;
+  export host-thing-driver;
+}

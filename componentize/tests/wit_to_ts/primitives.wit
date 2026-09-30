@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// Primitive WIT scalar mapping. Exercises every numeric kind (8/16/32-bit
+// integers and floats -> number; 64-bit integers -> bigint), bool, char, and
+// string, both as parameters and as the function return.
+package test:primitives;
+
+interface scalars {
+  echo-bool: func(v: bool) -> bool;
+  echo-u8: func(v: u8) -> u8;
+  echo-u16: func(v: u16) -> u16;
+  echo-u32: func(v: u32) -> u32;
+  echo-u64: func(v: u64) -> u64;
+  echo-s8: func(v: s8) -> s8;
+  echo-s16: func(v: s16) -> s16;
+  echo-s32: func(v: s32) -> s32;
+  echo-s64: func(v: s64) -> s64;
+  echo-f32: func(v: f32) -> f32;
+  echo-f64: func(v: f64) -> f64;
+  echo-char: func(v: char) -> char;
+  echo-string: func(v: string) -> string;
+  no-result: func();
+}
+
+world primitives {
+  export scalars;
+}

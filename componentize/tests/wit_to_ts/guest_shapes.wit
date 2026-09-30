@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// Shapes in positions where the guest hands a value over. The exported
+// resource `session` has no constructor, and an async method and an async
+// static. The guest's `Session` class takes constructor arguments, which the
+// runtime never passes, since it constructs no `session` itself. The guest
+// hands over a variant case with an `option` payload and no `val`, a `null`
+// option and a `Uint8ClampedArray` for a `list<u8>`.
+package test:guest-shapes;
+
+interface host {
+  record payload {
+    data: list<u8>,
+    body: stream<u8>,
+  }
+
+  variant failure {
+    internal(option<string>),
+    other,
+  }
+
+  send: func(p: payload);
+  bytes: func(b: list<u8>) -> u32;
+  maybe: func(v: option<u32>) -> bool;
+}
+
+interface api {
+  use host.{failure};
+
+  resource session {
+    get: func() -> u32;
+    later: async func() -> u32;
+    open-count: static async func() -> u32;
+  }
+
+  record nested {
+    inner: option<option<u32>>,
+  }
+
+  open: func(id: u32) -> session;
+  check: func(n: nested) -> failure;
+}
+
+world guest-shapes {
+  import host;
+  export api;
+}

@@ -1,2 +1,5 @@
 /target
+# Only written by a cargo run from outside `componentize/`, which bypasses its `.cargo/config.toml`.
+/componentize/target
 /deps/wpt
+/node_modules

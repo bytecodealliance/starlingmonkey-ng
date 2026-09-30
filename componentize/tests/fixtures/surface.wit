@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:surface;
+
+// The surface world: what a componentized custom world exports and imports.
+//
+// `run` is the sanity call, and `random` reads `Math.random`, which reaches
+// `wasi:random`, so a build with `random` disabled traps in it. `now` reads
+// `Date.now()`, which a build with `clocks` disabled reads as zero.
+world surface {
+  import log: func(msg: string);
+  export run: func(n: u32) -> u32;
+  export random: func() -> f64;
+  export now: func() -> f64;
+}

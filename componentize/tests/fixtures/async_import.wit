@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:async-import;
+
+// The async-import-and-export world.
+//
+// One componentization that proves an async-declared WIT import called from a
+// guest JS handler suspends through the host and resumes with the result:
+//
+//   - `host.bar` is an `async` WIT import. The componentizer binds it async (the
+//     `AsyncFilterSet` default respects the WIT `async` attribute), so its
+//     synthesized JS import function returns a Promise. Calling it spawns a Rust
+//     future on the active per-call event loop (the same `__spawn_promise`
+//     machinery `fetch` uses) that drives the host subtask via wit-dylib's
+//     `call_import_async` and settles the Promise with the lifted result.
+//   - `runner.foo` is an `async` WIT export. The runtime drives its per-call
+//     event loop until the returned promise settles, and that loop is exactly
+//     what drives the async import's future, so the import is attributed to it.
+//
+// The guest's `foo(v)` does `await bar(v)` then returns the awaited value `+ 3`.
+// The host's `bar(x)` yields (a real host-side suspension) then returns `x + 2`.
+// So `foo(42)` => `bar(42)` => 44, `+ 3` => 47: the host asserts `42 -> 47`, and
+// because the host's `bar` genuinely suspends before answering, the round-trip
+// proves the import drove a real subtask through the loop rather than completing
+// inline.
+
+interface host {
+  // The async host import. `x + 2`, but only after a host-side yield, so the
+  // guest's `await bar(x)` cannot complete synchronously.
+  bar: async func(x: u32) -> u32;
+  // The `result`-typed async host import: `ok(x)` becomes `ok(x + 2)` and
+  // `err(x)` becomes `err(x + 3)`, after the same host-side yield.
+  baz: async func(v: result<u32, u32>) -> result<u32, u32>;
+}
+
+interface runner {
+  // The async export: `await bar(v)` then `+ 3`.
+  foo: async func(v: u32) -> u32;
+  // The `result`-typed async export: `await baz(v)`, then `+ 3` on whichever
+  // arm came back. An `err` arrives in the guest as a rejection with a
+  // `ComponentError` and leaves it as a thrown `ComponentError`.
+  qux: async func(v: result<u32, u32>) -> result<u32, u32>;
+  // A sync export: calls `bar`, whose promise rejects without an event loop,
+  // and returns the rejection's message a previous call recorded, or "none".
+  bar-message: func() -> string;
+}
+
+world async-import {
+  import host;
+  export runner;
+}

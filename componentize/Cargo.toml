@@ -1,0 +1,81 @@
+[package]
+name = "componentize"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0 WITH LLVM-exception"
+authors = ["The StarlingMonkey project contributors"]
+repository = "https://github.com/bytecodealliance/starlingmonkey"
+
+# A workspace of its own: the componentizer is a host tool whose dependencies (wasmtime, Wizer,
+# wit-component) are disjoint from the runtime's, so they do not take part in the runtime
+# workspace's resolution. `.cargo/config.toml` points its build directory at the repository's
+# `target/`.
+[workspace]
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+
+# Optimize every dependency in dev and test builds, leaving this crate at debug for fast
+# iteration. The host tests drive wasmtime and Wizer to compile and snapshot a ~200 MB component.
+# Unoptimized that takes minutes per world and gets killed by test timeouts. Optimized it takes a
+# few seconds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[[bin]]
+name = "starling-componentize"
+path = "src/bin/starling-componentize.rs"
+
+# Native-only: the componentizer is a host tool. On wasm targets this crate compiles to an
+# empty lib.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4.5.60", features = ["derive", "env"] }
+heck = "0.5"
+tokio = { version = "1", features = ["rt"] }
+# `wac-graph` composes the stub component of the finalize pass in for disabled
+# WASI features.
+indexmap = "2"
+wac-graph = "0.11"
+wasm-encoder = "0.259"
+wasmparser = "0.259"
+# `version` prints the SHA-256 digest of the runtime.
+sha2 = "0.10"
+# `--init-location` is checked to be a URL.
+url = "2"
+wasmtime = { version = "49", features = ["cache"] }
+# `p3` enables the WASIp3 linker (`wasmtime_wasi::p3`): the async-export test
+# satisfies the guest's `wasi:clocks/monotonic-clock@0.3.0` import
+# with it, so the event loop's `setTimeout` sleep reaches a real host clock
+# instead of a trapping stub.
+wasmtime-wasi = { version = "49", features = ["p3"] }
+wasmtime-wizer = { version = "49", features = ["component-model", "wasmtime"] }
+wit-component = "0.259"
+wit-dylib = "0.259"
+wit-parser = "0.259"
+
+# The suites use `#[tokio::test]`, which requires tokio's `macros` feature on top
+# of the runtime features above. The sync suite adds property-based round-trips
+# (`proptest`) and decodes a fixed seed from `COMPONENTIZE_JS_TEST_SEED` (`hex`).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+proptest = "1.11"
+hex = "0.4"
+# The parity demo's `await fetch(...)` reaches the guest's WASIp3 outgoing HTTP
+# client import (`wasi:http/client@0.3.0`, bound by the platform's
+# wasm fetch backend). The test harness satisfies it with the p3 `wasi:http`
+# host. `default-features = false` drops `default-send-request` so no real
+# network egress is possible: the harness supplies a `WasiHttpHooks::send_request`
+# that returns a fixed in-memory response, keeping the test hermetic.
+wasmtime-wasi-http = { version = "49", features = ["p3"], default-features = false }
+# The fixed-response `send_request` hook builds an `http::Response` with an
+# in-memory `Full` body, boxed as the `UnsyncBoxBody` the hook returns.
+http = "1"
+http-body-util = "0.1"
+# `futures` drives two async export calls concurrently in the
+# attribution test (`futures::join!`).
+futures = "0.3"
+
+[lints]
+workspace = true

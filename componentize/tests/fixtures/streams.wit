@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:streams;
+
+// The streams and futures world. A `stream<T>` crosses into JS as a
+// `ReadableStream` and a `future<T>` as a `Promise`, in both directions. See
+// `streams.js` for what each export does with them.
+
+interface host-thing-interface {
+  resource host-thing {
+    constructor(s: string);
+    get: func() -> string;
+    get-static: static func(v: borrow<host-thing>) -> string;
+  }
+}
+
+interface failing {
+  variant failure {
+    denied,
+    not-found(string),
+  }
+
+  // Fails with `not-found(key)` unless `key` is "present".
+  lookup: async func(key: string) -> result<string, failure>;
+}
+
+// Imported functions that take and return streams and futures.
+interface transfers {
+  // Returns the sum of the stream's elements.
+  sum: async func(s: stream<u32>) -> u32;
+  // Returns a stream of the numbers from 0 up to `n`, exclusive.
+  count: async func(n: u32) -> stream<u32>;
+  // Returns a future that delivers `v`.
+  later: async func(v: u32) -> future<u32>;
+  // Returns the future's value plus one.
+  plus-one: async func(f: future<u32>) -> u32;
+}
+
+interface echoes {
+  use host-thing-interface.{host-thing};
+  use failing.{failure};
+
+  record point {
+    x: u32,
+    y: u32,
+  }
+
+  type byte = u8;
+
+  resource thing {
+    constructor(value: string);
+    get: func() -> string;
+  }
+
+  // Pipes the incoming stream through a `TransformStream`.
+  echo-stream-u8: async func(s: stream<u8>) -> stream<u8>;
+  // Returns the incoming stream as it is.
+  pass-stream-u8: async func(s: stream<u8>) -> stream<u8>;
+  // Awaits the incoming future and returns its value.
+  echo-future-string: async func(f: future<string>) -> future<string>;
+  echo-future-u32: async func(f: future<u32>) -> future<u32>;
+  // Re-yield every element of the incoming stream from an async generator.
+  echo-stream-string: async func(s: stream<string>) -> stream<string>;
+  echo-stream-point: async func(s: stream<point>) -> stream<point>;
+  echo-stream-thing: async func(s: stream<thing>) -> stream<thing>;
+
+  // Reads the stream with a BYOB reader and returns its bytes as a string.
+  byob-read: async func(s: stream<u8>) -> string;
+  // Returns `count` one-byte chunks, each produced after a timer.
+  timed-chunks: async func(count: u32) -> stream<u8>;
+  // Reads the first chunk, then returns the rest of the stream.
+  after-first-chunk: async func(s: stream<u8>) -> stream<u8>;
+  // Reads one chunk, cancels the stream, and returns how many bytes it read.
+  cancel-after-first-chunk: async func(s: stream<u8>) -> u32;
+  // Returns a stream that produces chunks until it is cancelled.
+  endless: async func() -> stream<u8>;
+  // Whether the stream `endless` returned was cancelled.
+  endless-cancelled: async func() -> bool;
+  // Return 50 strings, 50 `list<u32>`s and, after a timer, a string, for the
+  // host to drop the reader of while a write is pending.
+  many-strings: async func() -> stream<string>;
+  many-lists: async func() -> stream<list<u32>>;
+  string-later: async func() -> future<string>;
+  // Returns `s` followed by its length, after a timer.
+  ping: async func(s: string) -> string;
+  // Returns a stream of two `ArrayBuffer` chunks holding 1, 2 and 3.
+  array-buffer-chunks: async func() -> stream<u8>;
+  // Returns a stream holding 1, 2 and 3, with empty `Uint8Array` and
+  // `ArrayBuffer` chunks before, between and after them.
+  empty-chunks: async func() -> stream<u8>;
+  // Returns a `ReadableStream` a reader has locked.
+  locked-stream: async func() -> stream<u8>;
+  // Passes the number 41, not a promise, to `transfers.plus-one` as its future.
+  plus-one-plain: async func() -> u32;
+  // Returns a stream whose chunks are strings, which a `stream<u8>` cannot hold.
+  wrong-chunks: async func() -> stream<u8>;
+  // Returns a value that is not a stream.
+  not-a-stream: async func() -> stream<u8>;
+
+  // Fulfills with `value` if `ok`, and otherwise rejects with `new Error(value)`.
+  future-result: async func(ok: bool, value: string) -> future<result<string, string>>;
+  // Rejects with the bare string `value`.
+  future-result-bare: async func(value: string) -> future<result<string, string>>;
+  // Awaits the future and describes how it settled.
+  describe-future-result: async func(f: future<result<string, string>>) -> string;
+  // Awaits a future whose `err` is a `failure`, and describes how it settled.
+  describe-failure-future: async func(f: future<result<string, failure>>) -> string;
+
+  // Calls `failing.lookup(key)` and describes how it failed.
+  describe-lookup: async func(key: string) -> string;
+  // Fails with the error `lookup(key)` fails with.
+  forward-lookup: async func(key: string) -> result<string, failure>;
+  // Rejects with `new Error("denied")`, which names a case of `failure`.
+  future-denied: async func() -> future<result<string, failure>>;
+
+  // Reads every host thing, checks each, then returns them all as a stream.
+  short-reads-host: async func(s: stream<host-thing>) -> stream<host-thing>;
+
+  // Calls every function of `transfers` and describes the results.
+  use-transfers: async func() -> string;
+  // Returns a stream of two points, the second with a string for `x`.
+  wrong-points: async func() -> stream<point>;
+  // Returns a stream of one point whose `x` getter returns 1 on its first read
+  // and a string after that.
+  shifting-points: async func() -> stream<point>;
+  // Returns a future that delivers `v` after a timer.
+  slow-future: async func(v: u32) -> future<u32>;
+  // Returns a future whose promise rejects after a timer, which a `future<u32>`
+  // has no way to deliver.
+  rejected-future: async func() -> future<u32>;
+  // Returns a future whose promise rejects with an `Error` after a timer, which
+  // a `u32` `err` cannot hold.
+  rejected-result-future: async func() -> future<result<u32, u32>>;
+  // Returns a future that delivers a new `thing` holding `value`.
+  thing-future: async func(value: string) -> future<thing>;
+  // Starts reading the stream, cancels the read after a timer, and returns the
+  // reason the cancel was for.
+  cancel-pending-read: async func(s: stream<u8>) -> string;
+  // Returns the incoming stream as a stream of `byte`, a type the incoming one
+  // is not.
+  pass-as-bytes: async func(s: stream<u8>) -> stream<byte>;
+  // Returns a stream with one byte whose source never produces another.
+  idle-stream: async func() -> stream<u8>;
+  // Whether the stream `idle-stream` returned was cancelled.
+  idle-cancelled: async func() -> bool;
+
+  // Passes 5, `{}` and a locked `ReadableStream` to `transfers.sum`, and
+  // returns the message of each `TypeError` it rejects with, or "no error".
+  // Then returns the sum of a `Set` of 1 and 2 passed as the stream.
+  stream-misuse-messages: async func() -> list<string>;
+  // Stores the stream unread for `sync-stream-message`.
+  hold-stream: async func(s: stream<u8>);
+  // Starts reading the stream `hold-stream` stored, which a sync export has no
+  // event loop for, and returns the rejection's message a previous call
+  // recorded, or "none".
+  sync-stream-message: func() -> string;
+
+  // Returns a future whose promise never settles.
+  never-future: async func() -> future<u32>;
+  // Returns a future that delivers a host thing holding `value`, which a timer
+  // disposes of once the promise fulfilled.
+  disposed-thing-future: async func(value: string) -> future<host-thing>;
+
+  // Returns a future whose promise a later call to one of the two below
+  // fulfills with `value`.
+  held-future: async func() -> future<u32>;
+  settle-held-future: func(value: u32);
+  settle-held-future-async: async func(value: u32);
+}
+
+world streams {
+  import host-thing-interface;
+  import failing;
+  import transfers;
+  export echoes;
+}

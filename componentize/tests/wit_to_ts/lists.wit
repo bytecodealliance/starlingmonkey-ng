@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// list<T> mapping. Numeric element types, including `u64` and `s64`, map to the
+// matching typed array (following value.rs's `list_uses_typed_array`).
+// Non-numeric element types stay `T[]`, and nested lists nest the element form.
+// An alias of a numeric type maps as that type does.
+package test:lists;
+
+interface seqs {
+  type byte = u8;
+  list-byte: func(v: list<byte>) -> list<byte>;
+  list-u8: func(v: list<u8>) -> list<u8>;
+  list-s8: func(v: list<s8>) -> list<s8>;
+  list-u16: func(v: list<u16>) -> list<u16>;
+  list-s16: func(v: list<s16>) -> list<s16>;
+  list-u32: func(v: list<u32>) -> list<u32>;
+  list-s32: func(v: list<s32>) -> list<s32>;
+  list-f32: func(v: list<f32>) -> list<f32>;
+  list-f64: func(v: list<f64>) -> list<f64>;
+  list-u64: func(v: list<u64>) -> list<u64>;
+  list-s64: func(v: list<s64>) -> list<s64>;
+  list-bool: func(v: list<bool>) -> list<bool>;
+  list-string: func(v: list<string>) -> list<string>;
+  list-char: func(v: list<char>) -> list<char>;
+  list-list-u8: func(v: list<list<u8>>) -> list<list<u8>>;
+  list-list-string: func(v: list<list<string>>) -> list<list<string>>;
+}
+
+world lists {
+  export seqs;
+}

@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package local:hello@2.0.0;
+
+interface hello {
+  hello: func(name: option<string>) -> option<string>;
+}

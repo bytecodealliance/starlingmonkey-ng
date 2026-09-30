@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:smoke;
+
+// The first end-to-end componentization smoke world.
+//
+// One world-level sync import (`log`) and one world-level sync export (`run`).
+// World-level imports are synthesized into the `external` ES module by the
+// component-model interpreter, so the guest imports `log` from there. World-level
+// exports resolve directly against the main module's namespace, so the guest's
+// `run` export is just a named export of the main module.
+//
+// `run` exercises a u32 round-trip (host -> guest argument, guest -> host
+// result) and `log` exercises string lowering (guest -> host), so together they
+// gate argument lifting, result lowering, export resolution, import resolution,
+// and string marshalling across the value boundary.
+world smoke {
+  import log: func(msg: string);
+  export run: func(n: u32) -> u32;
+}
