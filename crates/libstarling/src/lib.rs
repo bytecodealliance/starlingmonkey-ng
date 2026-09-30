@@ -41,7 +41,7 @@ pub fn register_builtins() {
 /// from `--init-location`, and the WPT test globals from `--wpt-mode`. Shared between the native
 /// and wasm32 entry points, and between the CLI and HTTP ones — a WPT run under `--serve` needs
 /// the same globals a command-mode run does.
-fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), String> {
+pub fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), String> {
     if let Some(location) = config.init_location.as_deref() {
         let url = url::Url::parse(location)
             .map_err(|e| format!("Invalid --init-location URL {location:?}: {e}"))?;

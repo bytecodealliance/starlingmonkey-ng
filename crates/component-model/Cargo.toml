@@ -1,0 +1,48 @@
+[package]
+name = "component-model"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[features]
+debugmozjs = ['js/debugmozjs']
+
+[dependencies]
+core-runtime.workspace = true
+platform.workspace = true
+smallvec.workspace = true
+heck.workspace = true
+js.workspace = true
+web-streams.workspace = true
+
+# Only the wasm-only interpreter glue names `wit-dylib-ffi`. Native builds and
+# tests never touch it. The rev is a `wasm-tools` 1.259.0 commit, matching the
+# `wit-dylib` 0.259 the componentizer uses, so both sides agree on the wit-dylib
+# ABI.
+#
+# `async-runtime` selects wit-dylib-ffi's wit-bindgen-backed async path: the
+# generated `export!` glue routes async-declared exports through
+# `wit_bindgen::rt::async_support::{start_task, callback}` (the same executor the
+# wasip3 builtins run on) and the `Interpreter` trait gains `export_call_async`.
+#
+# wasm32-wasip3 requires wit-bindgen 0.61 or later. Earlier versions keep the
+# async task state in task context slot 0, which on that target holds the shadow
+# stack pointer, so an async-lifted export fails wit-bindgen's
+# `assert!(context_get().is_null())`. From 0.61 the task state lives in a
+# thread-local, which wasm32-wasip3 gives each task.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-dylib-ffi = { git = "https://github.com/bytecodealliance/wasm-tools/", rev = "fe12b7d36b0ec7c79ff6a51e838617a0a2ae25cc", features = [
+    "async-runtime",
+] }
+# The CM stream/future bridge (`src/streams.rs`) builds wit-bindgen's
+# `StreamVtable`/`FutureVtable` from the wit-dylib `Stream`/`Future` metadata
+# fn-pointers and drives the async reads/writes through wit-bindgen's
+# `StreamReader`/`StreamWriter`/`FutureReader`/`FutureWriter` on the same
+# executor the async exports/imports run on. wit-dylib-ffi depends on the same
+# wit-bindgen version, so the linked component holds one copy.
+wit-bindgen = { workspace = true, features = ["async-spawn"] }
+
+[lints]
+workspace = true

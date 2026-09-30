@@ -682,7 +682,11 @@ WASM_TARGET=p3 just wpt-test-wasm
 ```
 
 `rust-toolchain.toml` pins a toolchain that ships no wasm32-wasip3 std, so `p3` builds through
-`cargo +nightly`, and `p3` needs wasi-sdk 34, the first with a wasm32-wasip3 sysroot.
+`cargo +nightly`, and `p3` needs wasi-sdk 34, the first with a wasm32-wasip3 sysroot. The runtime
+build (`build-runtime`) follows it too.
+
+`just build-runtime` and `just test-runtime` default to `p3` rather than `p2`: they build and read
+`target/wasm32-wasip3/release/starling.wasm` unless `WASM_TARGET` selects another target.
 
 The package builds two targets. `cargo build` produces the native binary
 `target/debug/starlingmonkey`. A wasm build produces the component
@@ -690,6 +694,42 @@ The package builds two targets. `cargo build` produces the native binary
 not the wasm entry point, because a binary links `crt1-command.o`, which exports
 `wasi:cli/run` itself and collides with the component's own export on wasm32-wasip3. It is
 still built on wasm targets, where it does nothing.
+
+### Runtime Builds for Component Linking
+
+`starling-componentize` links the full StarlingMonkey runtime, SpiderMonkey
+included, together with generated bindings for a WIT world, from this build:
+
+**Static runtime.** `just build-runtime` builds the runtime as a
+`wasm32-wasip3` component, `target/wasm32-wasip3/release/starling.wasm`, with
+SpiderMonkey, libc and libc++ statically linked and dead-code eliminated. It is
+about 19 MB and needs nightly Rust and a wasi-sdk 34 or later. `WASM_TARGET=p2`
+builds it for `wasm32-wasip2` from the stable toolchain and an older SDK instead.
+The same component runs scripts under `wasmtime run`, serves under
+`wasmtime serve`, and is the runtime the componentizer links against. The
+script links the core module, copies its `component-type` sections under
+`starling:`-prefixed names, and wraps it with `wasm-tools component new`. The
+componentizer needs those copies, so it refuses a `starling.wasm` a plain
+`cargo build` wrote. `just test-runtime` runs a JS hello-world (console output,
+`setTimeout`) with it under wasmtime.
+
+Running a script calls no `run` export: the script's top level and the event loop
+it starts are the whole program. The `run` export of the main module is called only
+in a pre-initialized instance, one componentized as a CLI tool or
+wizened directly with Wizer through the runtime's `wizer-initialize` export:
+
+```bash
+wasmtime wizer --keep-init-func=true --dir=. -Scli=y,http=y,p3=y -Wcomponent-model-async=y \
+    --env STARLINGMONKEY_CONFIG=app.js target/wasm32-wasip3/release/starling.wasm -o tool.wasm
+wasmtime run -Shttp=y,p3=y -Wcomponent-model-async=y tool.wasm
+```
+
+A snapshot whose main module registers no `fetch` listener and exports no `run`
+function is refused, since it can neither serve nor run.
+A snapshot is also refused while the top level has not settled, or has left work
+behind, such as a timer or a `fetch` in flight. A host resource the script keeps
+without pending work, such as the body of a `fetch` response it did not read, is
+not detected. Its handle is not valid in an instance resumed from the snapshot.
 
 ---
 

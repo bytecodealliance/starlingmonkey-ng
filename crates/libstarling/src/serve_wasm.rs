@@ -77,6 +77,17 @@ fn install_runtime(pair: (Rc<Runtime>, *mut js::native::RawJSContext, ServeTimeo
     RUNTIME.with(|cell| *cell.borrow_mut() = Some(pair));
 }
 
+/// The runtime this instance holds and its context, or `None` if it holds none. A runtime is
+/// installed by [`pre_initialize`] for a `wizer-initialize` snapshot, whose main module has then
+/// finished evaluating, by [`adopt_runtime`], or by the first request the instance serves.
+pub fn installed_runtime() -> Option<(Rc<Runtime>, *mut js::native::RawJSContext)> {
+    RUNTIME.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|(runtime, raw_cx, _)| (Rc::clone(runtime), *raw_cx))
+    })
+}
+
 /// Get the runtime and its context, creating them on first use: run the content script
 /// (registering `fetch` handlers) and enter the global realm persistently. Synchronous (no
 /// `await`), so concurrent first requests can't race into two runtimes.
@@ -141,6 +152,203 @@ fn start_runtime(
     Ok(pair)
 }
 
+/// Serve requests against a runtime bootstrapped elsewhere, instead of the one [`runtime`] would
+/// create from `STARLINGMONKEY_CONFIG`. Called by the componentizer's `init` export: it
+/// evaluates the application's modules itself, so by the time a request arrives there is a global
+/// with `fetch` listeners on it and no content script left to run.
+///
+/// `raw_cx` must be a context whose default global's realm is entered for the process lifetime,
+/// and `runtime` must outlive the process's requests. The application's top level must have
+/// finished evaluating and left no work on its event loop. `config` supplies the serve timeouts.
+///
+/// A component that exports `wasi:http/handler` checks its application with
+/// [`select_http_handler`] first.
+pub fn adopt_runtime(
+    runtime: Rc<Runtime>,
+    raw_cx: *mut js::native::RawJSContext,
+    config: &RuntimeConfig,
+) -> Result<(), String> {
+    config.validate_serve_timeouts()?;
+    let timeouts = ServeTimeouts::from_config(config);
+    install_runtime((runtime, raw_cx, timeouts));
+    Ok(())
+}
+
+/// The implementation that serves a componentized application's `wasi:http/handler` export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpHandler {
+    /// The runtime's builtin, which dispatches each request as a `fetch` event.
+    FetchEvent,
+    /// The application's own export of the interface.
+    Raw,
+}
+
+/// A componentized application's own export of `wasi:http/handler`.
+pub struct RawHttpHandler<'a> {
+    /// The JS paths the main module may provide the interface's `handle` under,
+    /// such as `handler.handle`.
+    pub paths: &'a [String],
+    /// Whether the main module provides `handle`.
+    pub provided: bool,
+}
+
+/// Select the [`HttpHandler`] of a componentized application whose component exports
+/// `wasi:http/handler`, once its top level has finished evaluating.
+///
+/// Fails if the application both provides `raw` and registers a `fetch` listener, or does
+/// neither.
+///
+/// `raw_cx` must be a context whose default global's realm is entered.
+pub fn select_http_handler(
+    raw_cx: *mut js::native::RawJSContext,
+    raw: RawHttpHandler<'_>,
+) -> Result<HttpHandler, String> {
+    // SAFETY: the caller keeps the default global's realm entered.
+    let scope = unsafe { js::gc::scope::RootScope::from_current_realm(raw_cx) };
+    let listener = fetch_event::fetch_event::FetchEvent::has_listener(&scope);
+    let paths = raw
+        .paths
+        .iter()
+        .map(|path| format!("`{path}`"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    match (raw.provided, listener) {
+        (true, false) => Ok(HttpHandler::Raw),
+        (false, true) => Ok(HttpHandler::FetchEvent),
+        (true, true) => Err(format!(
+            "the application both exports a `wasi:http/handler` implementation as {paths} and \
+             registers a `fetch` listener. The component's `wasi:http/handler` export is served \
+             by exactly one of them, so remove the other."
+        )),
+        (false, false) => Err(format!(
+            "the application neither exports a `wasi:http/handler` implementation as {paths} \
+             nor registers a `fetch` listener, so the component's `wasi:http/handler` export \
+             could not serve any request. Export `handle(request)`, or register a listener \
+             with `addEventListener('fetch', …)`."
+        )),
+    }
+}
+
+/// The `wasi:http/types` interface of the `wasi:http` version the runtime links:
+/// the one its `wasip3` bindings target.
+pub const WASI_HTTP_TYPES: &str = "wasi:http/types@0.3.0";
+
+/// A `Request` with the method, URL, headers and body of the incoming
+/// [`WASI_HTTP_TYPES`] `request` `handle`, which it takes ownership of. The body
+/// is not read until the `Request`'s body is. Throws a `TypeError` for a request
+/// whose fields `http` cannot represent.
+pub fn request_from_handle<'s>(
+    scope: &'s js::gc::scope::Scope<'_>,
+    handle: u32,
+) -> Result<web_fetch::request::Request<'s>, js::error::ExnThrown> {
+    // SAFETY: the caller transfers ownership of `handle`, a handle of this type.
+    let request = unsafe { WasiRequest::from_handle(handle) };
+    let (method, url, headers, body) =
+        platform::http::read_incoming_request(request).map_err(|code| {
+            js::error::ThrowException::throw(
+                js::error::TypeError(format!("the request cannot be read: {code:?}")),
+                scope,
+            )
+        })?;
+    let (has_body, content_length) = body_framing(&method, &headers);
+    let controller = web_globals::signals::abort_controller::AbortController::new(scope)?;
+    web_fetch::request::Request::from_incoming(
+        scope,
+        &method,
+        &url,
+        crate::serve_common::header_list(&headers),
+        has_body.then_some(body),
+        content_length,
+        controller.signal(scope),
+    )
+}
+
+/// The handle of a new `wasi:http/types` `response` carrying `value`'s status,
+/// headers and body, if `value` is a `Response`, and `None` otherwise.
+///
+/// Registered as the componentized runtime's adapter for owned `response`
+/// handles, so an application's own `wasi:http/handler` export can return a
+/// `Response`, such as one `fetch` resolved to. The headers and body go through
+/// the same checks as a `fetch` event's response, and a body `fetch` received is
+/// handed to the host without being read. A `Response` whose body was read or is
+/// locked throws a `TypeError`.
+///
+/// The body is sent as a pending send of the active event loop (see
+/// [`core_runtime::event_loop::PendingSend`]), within the `response_body` serve
+/// timeout.
+pub fn response_handle(
+    scope: &js::gc::scope::Scope<'_>,
+    value: js::prelude::HandleValue<'_>,
+) -> Result<Option<u32>, js::error::ExnThrown> {
+    use js::conversion::FromJSVal;
+    use js::error::ThrowException;
+
+    // Checked before the body is taken, which locks it.
+    match response_accepts(scope, value) {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(reason) => return Err(js::error::TypeError(reason).throw(scope)),
+    }
+    let response = web_fetch::response::Response::from_jsval(scope, value, ())
+        .expect("`response_accepts` accepted a `Response`");
+    // Marks the body read, so the same `Response` is not accepted a second time.
+    response.reserve_body_for_sending(scope)?;
+    let headers = response.headers_list(scope);
+    let status = crate::serve_common::normalize_http_status(response.status());
+    let body = response.take_send_body(scope, true);
+    let crate::serve_common::WireResponse {
+        status,
+        mut headers,
+        body,
+        declared_length,
+    } = crate::serve_common::prepare_wire_response(false, status, headers, body);
+    if let Some(length) = declared_length {
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from(length),
+        );
+    }
+    let timeout = RUNTIME.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|(_, _, timeouts)| timeouts.response_body)
+    });
+    let (response, body_done, abandon) =
+        platform::http::build_outgoing_response(status, headers, body, timeout, declared_length);
+    // A body read from a `ReadableStream` is fed by JS the event loop runs.
+    let send = core_runtime::event_loop::PendingSend {
+        done: Box::pin(async move {
+            body_done.await;
+        }),
+        abandon: Box::new(move || abandon.abandon()),
+    };
+    core_runtime::event_loop::with_active_event_loop(|el| el.register_pending_send(send))
+        .expect("the event loop checked above is still active");
+    Ok(Some(response.take_handle()))
+}
+
+/// The check of [`response_handle`]: `Ok(true)` for a `Response` it can send,
+/// `Ok(false)` for a value that is not a `Response`, and `Err` with the reason
+/// for a `Response` whose body was read or is locked, or one returned where no
+/// event loop is active to send its body. Takes nothing from `value`.
+pub fn response_accepts(
+    scope: &js::gc::scope::Scope<'_>,
+    value: js::prelude::HandleValue<'_>,
+) -> Result<bool, String> {
+    use js::conversion::FromJSVal;
+
+    let Ok(response) = web_fetch::response::Response::from_jsval(scope, value, ()) else {
+        return Ok(false);
+    };
+    if response.is_body_unusable(scope) {
+        return Err("the Response has an unusable body: it was read, or is locked".to_string());
+    }
+    if core_runtime::event_loop::with_active_event_loop(|_| ()).is_none() {
+        return Err("a Response can only be sent where an event loop sends its body".to_string());
+    }
+    Ok(true)
+}
+
 /// Prepare this instance's state to be captured in a Wizer snapshot. Every caller is a Wizer
 /// entry point, and calls this last.
 ///
@@ -179,8 +387,8 @@ pub fn prepare_for_snapshot() {
 ///
 /// This entails initializing the JS runtime, registering builtins, running the top-level script to
 /// completion, including a top-level `await`, and checking whether the result is a valid snapshot
-/// input state. The script must register a `fetch` listener, and must leave no asynchronous work
-/// behind once its top level has finished.
+/// input state. The script must register a `fetch` listener or have its main module export a `run`
+/// function, and must leave no asynchronous work behind once its top level has finished.
 pub async fn pre_initialize() -> Result<(), String> {
     let (_runtime, raw_cx, _) = runtime_for(true)?;
     let Startup::Pending(invocation, evaluation) =
@@ -195,12 +403,18 @@ pub async fn pre_initialize() -> Result<(), String> {
     // The loop is driven only while the top level is unfinished, so work it merely queued, such
     // as a timer, is refused below rather than run under Wizer.
     if !evaluation.is_finished(&scope) {
-        drive_startup(raw_cx, invocation.state().event_loop(), &evaluation).await;
+        // SAFETY: `runtime` entered the default global's realm for the process lifetime, and keeps
+        // the context alive in a process-lifetime thread-local.
+        unsafe { drive_startup(raw_cx, invocation.state().event_loop(), &evaluation).await };
     }
     evaluation.settled(&scope, "Script evaluation failed")?;
-    // Throw an error instead of creating a snapshot that can't possibly serve requests.
-    if evaluated_without_listener(&scope, &evaluation) {
-        return Err(crate::serve_common::NO_FETCH_LISTENER.to_string());
+    // Throw an error instead of creating a snapshot that can neither serve requests nor run as a
+    // CLI tool.
+    if evaluated_without_listener(&scope, &evaluation) && !exports_run(&scope) {
+        return Err(format!(
+            "{}, and the main module exports no `run` function",
+            crate::serve_common::NO_FETCH_LISTENER
+        ));
     }
     invocation.state().event_loop().ensure_idle_for_snapshot()?;
     // Define every standard class the global has not resolved yet, so the snapshot holds them
@@ -222,12 +436,23 @@ fn evaluated_without_listener(
     evaluation.is_finished(scope) && !fetch_event::fetch_event::FetchEvent::has_listener(scope)
 }
 
-/// Some state, such as process time origins, needs fixing up after snapshot resumption.
+/// Whether the main module exports a `run` function, which `wasi:cli/run` calls in an instance
+/// resumed from the snapshot.
+fn exports_run(scope: &js::gc::scope::Scope<'_>) -> bool {
+    core_runtime::module::entry_namespace(scope)
+        .and_then(|namespace| namespace.get_property(scope, c"run").ok())
+        .and_then(|run| js::Object::from_value(scope, run).ok())
+        .is_some_and(|run| run.is_callable())
+}
+
+/// Some state, such as process time origins, needs fixing up after snapshot resumption. Every
+/// export of a resumed instance calls this before running any JS. It is a no-op outside a resumed
+/// instance and after the first call.
 ///
 /// The monotonic clock comes first: its offset puts the timestamps the snapshot holds in the
 /// resumed instance's past, and both the engine's timing and every fixup below read the clock
 /// through it.
-fn fix_up_after_resume() {
+pub fn fix_up_after_resume() {
     if RESUMED_FROM_SNAPSHOT.with(|resumed| resumed.replace(false)) {
         js::clock::advance_monotonic_clock(platform::clock::resume_from_snapshot());
         core_runtime::runtime::run_resume_fixups();
@@ -293,7 +518,9 @@ async fn ensure_started(raw_cx: *mut js::native::RawJSContext) -> Result<(), Sta
                     pending: Some((invocation, evaluation)),
                 };
                 let (invocation, evaluation) = driving.pending.as_mut().expect("just set");
-                drive_startup(raw_cx, invocation.state().event_loop(), evaluation).await;
+                // SAFETY: `runtime` entered the default global's realm for the process
+                // lifetime, and keeps the context alive in a process-lifetime thread-local.
+                unsafe { drive_startup(raw_cx, invocation.state().event_loop(), evaluation).await };
                 // SAFETY: `runtime` entered the default global's realm for the process lifetime.
                 let scope = unsafe { js::gc::scope::RootScope::from_current_realm(raw_cx) };
                 let failed = evaluation.rejection(&scope, "Script evaluation failed");
@@ -331,15 +558,19 @@ async fn ensure_started(raw_cx: *mut js::native::RawJSContext) -> Result<(), Sta
 }
 
 /// Drive the content script's event loop until the script has finished evaluating. Whatever it
-/// started along the way (a timer, an unawaited `fetch`) is left running, on the task
-/// [`keep_startup_loop_running`] spawns.
-async fn drive_startup(
+/// started along the way (a timer, an unawaited `fetch`) stays on `event_loop` for the caller to
+/// keep driving.
+///
+/// # Safety
+///
+/// `raw_cx` must be a context whose default global's realm is entered, and which stays valid for
+/// the duration of the returned future.
+pub async unsafe fn drive_startup(
     raw_cx: *mut js::native::RawJSContext,
     event_loop: &EventLoop,
     evaluation: &core_runtime::ScriptEvaluation,
 ) {
-    // SAFETY: `raw_cx` is valid for the duration of this await, since the runtime outlives the
-    // request.
+    // SAFETY: guaranteed by this function's caller.
     unsafe {
         run_until_evaluated(raw_cx, event_loop, platform::clock::sleep, evaluation).await;
     }
@@ -347,8 +578,8 @@ async fn drive_startup(
 
 /// Report, once evaluation completes, that the content script registered no `fetch` listener, so
 /// the 500s every request will get have a stated reason. We can't decline to serve
-/// at all, since the host owns the instance's lifecycle. Only applies to non-snapshot configs,
-/// since [`pre_initialize`] refuses to snapshot a script without a listener.
+/// at all, since the host owns the instance's lifecycle. In a snapshot, this only applies to a
+/// script that exports `run`, since [`pre_initialize`] refuses one with neither.
 fn report_missing_fetch_listener(
     raw_cx: *mut js::native::RawJSContext,
     evaluation: &core_runtime::ScriptEvaluation,

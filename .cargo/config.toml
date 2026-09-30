@@ -2,11 +2,11 @@
 runner = 'wasmtime run --dir=.::/cwd --dir=. --dir=/tmp -Sinherit-env=y,inherit-network=y,http=y,tcp=y,udp=y -C native-unwind-info=n'
 
 [target.wasm32-wasip2]
-# Keep in sync with the RUSTFLAGS overrides in scripts/build-runtime.sh and scripts/build-dylib.sh.
+# Keep in sync with the RUSTFLAGS override in scripts/build-dylib.sh.
 rustflags = ["-C", "target-feature=+simd128"]
 runner = 'wasmtime run --dir=.::/cwd --dir=. --dir=/tmp -Sinherit-env=y,inherit-network=y,http=y,tcp=y,udp=y -C native-unwind-info=n'
 
 [target.wasm32-wasip3]
-# Keep in sync with the RUSTFLAGS overrides in scripts/build-runtime.sh and scripts/build-dylib.sh.
+# Keep in sync with the RUSTFLAGS override in scripts/build-dylib.sh.
 rustflags = ["-C", "target-feature=+simd128"]
 runner = 'wasmtime run --dir=.::/cwd --dir=. --dir=/tmp -Sinherit-env=y,inherit-network=y,http=y,tcp=y,udp=y -C native-unwind-info=n'

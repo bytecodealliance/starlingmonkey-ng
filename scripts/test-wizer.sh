@@ -32,6 +32,9 @@ else
 fi
 COMPONENT="${CARGO_TARGET_DIR:-target}/$TARGET/debug/starling.wasm"
 WASI_FLAGS=(-Scli=y,inherit-env=y,http=y)
+if [ "$TARGET" = wasm32-wasip3 ]; then
+    WASI_FLAGS+=(-Sp3=y -Wcomponent-model-async=y)
+fi
 
 if [[ "${1:-}" != "--no-build" ]]; then
     "${CARGO[@]}" build --target "$TARGET" --features debugmozjs -p starlingmonkey
@@ -232,6 +235,39 @@ snapshot snap-clock-awaited.wasm "clock-awaited.mjs" >/dev/null
 check "post-await startup code reads a sane clock on both sides of a snapshot" \
     "afterAwait=sane now=sane" \
     "$(serve_and_get snap-clock-awaited.wasm "clock-awaited.mjs" 18355)"
+
+echo "# CLI tools"
+
+# A snapshot of a main module that exports `run` and registers no `fetch` listener is a CLI tool:
+# `wasi:cli/run` calls `run` in the resumed instance, whose top level ran once, under Wizer.
+cat >tool.mjs <<'JS'
+globalThis.evaluations = (globalThis.evaluations ?? 0) + 1;
+await new Promise((resolve) => setTimeout(resolve, 10));
+export async function run() {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  console.log('run called after ' + globalThis.evaluations + ' evaluation(s)');
+}
+JS
+snapshot snap-tool.wasm "tool.mjs" >/dev/null
+check "a snapshot's wasi:cli/run calls the main module's run export" \
+    "run called after 1 evaluation(s)" \
+    "$(wasmtime run --dir=. "${WASI_FLAGS[@]}" snap-tool.wasm 2>&1)"
+
+# The same holds for an `-e` module, which has no file.
+snapshot snap-eval-tool.wasm "-e 'export function run() { console.log(\"eval run called\"); }'" >/dev/null
+check "a snapshot of an -e module calls its run export" \
+    "eval run called" \
+    "$(wasmtime run --dir=. "${WASI_FLAGS[@]}" snap-eval-tool.wasm 2>&1)"
+
+# Running the same module as a plain script evaluates its top level and calls no export.
+plain_output="$(wasmtime run --dir=. "${WASI_FLAGS[@]}" "$COMPONENT" tool.mjs 2>&1)"
+if [[ "$plain_output" == *"run called"* ]]; then
+    echo "FAIL - a plain script's run export is not called"
+    echo "         got: $plain_output"
+    failures=$((failures + 1))
+else
+    echo "ok   - a plain script's run export is not called"
+fi
 
 echo
 if (( failures > 0 )); then

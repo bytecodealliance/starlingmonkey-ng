@@ -1,0 +1,44 @@
+/// The interface between the runtime and `starling-componentize`, which calls
+/// `init` under Wizer. Its version changes whenever the interface does, and the
+/// componentizer accepts a runtime whose version of it differs only in the
+/// patch number.
+package starling:componentize@0.1.0;
+
+interface init {
+  /// `main` is the source of the application's main module, and `main-name` is
+  /// the name it is compiled under, which stack traces and error messages show
+  /// for it.
+  ///
+  /// `main-path` is the path of the file `main` was read from, relative to the
+  /// base directory, or `none` for a source from no file there. A module
+  /// importing that file gets the main module.
+  ///
+  /// `cli` is set for a component that exports `wasi:cli/run`, whose main module
+  /// must export a `run` function.
+  ///
+  /// `raw-http-handler` is `none` for a component that does not export
+  /// `wasi:http/handler`. Otherwise it names the export the application implements
+  /// instead of registering a `fetch` listener, and the result is whether that
+  /// export serves requests rather than the runtime's builtin, which dispatches
+  /// each request as a `fetch` event. The interface declares no types, so the
+  /// component's type holds none of its own.
+  ///
+  /// `init-location` is the URL `globalThis.location` reflects while the main
+  /// module's top level evaluates, or `none` to leave it unset, which makes
+  /// reading `location` throw.
+  ///
+  /// `init` returns once the main module's top level, including a top-level
+  /// `await`, has finished evaluating.
+  init: async func(
+    main: string,
+    main-name: string,
+    main-path: option<string>,
+    cli: bool,
+    raw-http-handler: option<string>,
+    init-location: option<string>,
+  ) -> result<bool, string>;
+}
+
+world runtime {
+  export init;
+}

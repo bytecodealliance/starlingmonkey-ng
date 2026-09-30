@@ -217,3 +217,11 @@ wpt-test-all *PATTERN:
     @just wpt-test-wasm {{PATTERN}}
     @just wpt-test-wasm-serve {{PATTERN}}
     @just wpt-test-serve {{PATTERN}}
+
+# Build the statically linked runtime component (starling.wasm).
+build-runtime:
+    ./scripts/build-runtime.sh
+
+# End-to-end test of the static runtime (build, run scripts under wasmtime).
+test-runtime:
+    ./scripts/test-runtime.sh

@@ -20,9 +20,11 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   WASI_SDK_VERSION: "34"
-  # The wasmtime CLI the wasm tests run under, and the nightly toolchain wasm32-wasip3 builds use.
-  # Both are pinned, so a new release changes nothing until these are bumped.
+  # The wasmtime CLI the wasm tests run under, the wasm-tools CLI `scripts/build-runtime.sh` wraps
+  # the runtime with, and the nightly toolchain wasm32-wasip3 builds use. All are pinned, so a new
+  # release changes nothing until these are bumped.
   WASMTIME_VERSION: "49.0.0"
+  WASM_TOOLS_VERSION: "1.258.0"
   STARLING_NIGHTLY: nightly-2026-09-24
   RUSTC_WRAPPER: sccache
   CCACHE: sccache
@@ -79,6 +81,7 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           target: ${{ matrix.target }}
+          wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
 
       - name: Run tests
         run: just ${{ matrix.recipe }}
@@ -86,6 +89,32 @@ jobs:
       - name: Run example tests
         if: matrix.target != 'native'
         run: just ${{ matrix.recipe }} --examples
+
+  # ---------------------------------------------------------------------------
+  # The static runtime component: scripts and Wizer snapshots run with it. The runtime is built
+  # for wasm32-wasip3, so this job installs nightly and a wasi-sdk with a sysroot for it.
+  # ---------------------------------------------------------------------------
+  runtime:
+    name: Runtime component
+    runs-on: ubuntu-latest
+    env:
+      WASMTIME_BACKTRACE_DETAILS: '1'
+      RUST_BACKTRACE: 'full'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          target: wasm32-wasip3
+          wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
+
+      # Runs scripts and a late-rejecting top level with the runtime component itself.
+      - name: Run scripts with the runtime component
+        run: WASM_TARGET=p3 just test-runtime
+
+      # Snapshots with `wizer-initialize`, including CLI tools whose `run` export a snapshot calls.
+      - name: Test Wizer snapshots
+        run: WASM_TARGET=p3 just test-wizer
 
   # ---------------------------------------------------------------------------
   # WPT suite: {native, wasm32-wasip2, wasm32-wasip3}
@@ -107,6 +136,7 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           target: ${{ matrix.target }}
+          wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
 
       - uses: actions/setup-node@v4
         with:

@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 name: Setup build environment
-description: Install system deps, Rust toolchain, WASI SDK, wasmtime, and configure sccache.
+description: Install system deps, Rust toolchain, WASI SDK, wasmtime, wasm-tools, and configure sccache.
 
 inputs:
   target:
     description: 'Build target: "native", "wasm32-wasip2" or "wasm32-wasip3"'
     required: true
+  wasi-sdk-version:
+    description: Major version of the WASI SDK to install. wasm32-wasip3 needs 34 or later,
+      the first with a sysroot for it.
+    required: false
+    default: "34"
 
 runs:
   using: composite
@@ -46,9 +51,11 @@ runs:
     - name: Install WASI SDK
       if: inputs.target != 'native'
       shell: bash
+      env:
+        SDK_VERSION: ${{ inputs.wasi-sdk-version }}
       run: |
         sudo mkdir -p /opt/wasi-sdk
-        curl -sSfL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz" \
+        curl -sSfL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${SDK_VERSION}/wasi-sdk-${SDK_VERSION}.0-x86_64-linux.tar.gz" \
           | sudo tar xz --strip-components=1 -C /opt/wasi-sdk
         echo "WASI_SDK_PATH=/opt/wasi-sdk" >> "$GITHUB_ENV"
 
@@ -58,6 +65,15 @@ runs:
       run: |
         curl -sSf https://wasmtime.dev/install.sh | bash -s -- --version "v$WASMTIME_VERSION"
         echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+    - name: Install wasm-tools
+      if: inputs.target != 'native'
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.wasm-tools/bin"
+        curl -sSfL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz" \
+          | tar xz --strip-components=1 -C "$HOME/.wasm-tools/bin" "wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux/wasm-tools"
+        echo "$HOME/.wasm-tools/bin" >> "$GITHUB_PATH"
 
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9

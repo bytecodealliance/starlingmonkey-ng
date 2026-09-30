@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+#
+# WIT names and the JavaScript names `mangle_name` and `mangle_resource_name`
+# give them, one per line: the WIT name, the member name, the class name. The
+# componentizer's `.d.ts` generator has its own copies of both functions and is
+# tested against this file too (`componentize/src/wit_to_ts.rs`).
+foo foo Foo
+echo-list-u8 echoListU8 EchoListU8
+a-b-c aBC ABC
+get-static getStatic GetStatic
+resource-type resourceType ResourceType
+host-thing hostThing HostThing
+R r R
+wasi:http/types@0.3.0 wasiHttpTypes030 WasiHttpTypes030
+[method]thing.get methodThingGet MethodThingGet
+[constructor]host-thing constructorHostThing ConstructorHostThing
+x2y x2y X2y

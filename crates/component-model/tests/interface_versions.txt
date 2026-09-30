@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+#
+# Pairs of interface names and whether `same_interface` matches them, one per
+# line: the two names, then `same` or `different`. The componentizer has its own
+# copy of `same_interface` and is tested against this file too
+# (`componentize/src/lib.rs`).
+wasi:http/types@0.3.0 wasi:http/types@0.3.0 same
+wasi:http/types@0.3.0 wasi:http/types@0.3.7 same
+wasi:http/types@0.3.0 wasi:http/types@0.4.0 different
+wasi:http/types@0.3.0 wasi:http/types@1.3.0 different
+wasi:http/types@0.3.0 wasi:http/handler@0.3.0 different
+wasi:http/types@0.3.0-rc.1 wasi:http/types@0.3.2-rc.1 same
+wasi:http/types@0.3.0-rc.1 wasi:http/types@0.3.0 different
+wasi:http/types@0.3.0-rc.1 wasi:http/types@0.3.0-rc.2 different
+wasi:http/types@0.3.0+build.1 wasi:http/types@0.3.0 same
+wasi:http/types wasi:http/types same
+wasi:http/types wasi:http/types@0.3.0 different
+wasi:http/types@0.3 wasi:http/types@0.3 same
+wasi:http/types@0.3 wasi:http/types@0.3.0 different
+wasi:http/types@0.3.0.1 wasi:http/types@0.3.0.2 different
+logger logger same
+logger other different
