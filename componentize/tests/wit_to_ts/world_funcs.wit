@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// World-level functions (not behind an interface). An exported world-level
+// function is a flat `export function`, and an imported world-level function lands
+// in the `external` module. This is the `ns.baz` / flat-export convention
+// (exports.rs) versus the interface-member `ns.<iface>.baz` form.
+package test:world-funcs;
+
+world world-funcs {
+  export greet: func(name: string) -> string;
+  export add: func(a: u32, b: u32) -> u32;
+  import clock: func() -> u64;
+}

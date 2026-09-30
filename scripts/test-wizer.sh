@@ -16,23 +16,12 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+. scripts/wasm-target.sh
 
-case "${WASM_TARGET:-p2}" in
-    p2) TARGET=wasm32-wasip2 ;;
-    p3) TARGET=wasm32-wasip3 ;;
-    *) TARGET="${WASM_TARGET}" ;;
-esac
-# The pinned toolchain ships no wasm32-wasip3 std.
-if [ "$TARGET" = wasm32-wasip3 ]; then
-    CARGO=(cargo "+${STARLING_NIGHTLY:-nightly}")
-else
-    CARGO=(cargo)
-fi
+TARGET="$(wasm_target "${WASM_TARGET:-p2}")"
+read -r -a CARGO <<<"$(wasm_cargo "$TARGET")"
 COMPONENT="${CARGO_TARGET_DIR:-target}/$TARGET/debug/starling.wasm"
 WASI_FLAGS=(-Scli=y,inherit-env=y,http=y)
-if [ "$TARGET" = wasm32-wasip3 ]; then
-    WASI_FLAGS+=(-Sp3=y -Wcomponent-model-async=y)
-fi
 
 if [[ "${1:-}" != "--no-build" ]]; then
     "${CARGO[@]}" build --target "$TARGET" --features debugmozjs -p starlingmonkey

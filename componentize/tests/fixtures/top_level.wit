@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:top-level;
+
+// The top-level world: what the main module's top level may do before the
+// component is wizened.
+//
+// `greeting` returns what the top level computed: a value from a module it
+// imports by relative path, and one a top-level `await` waited on a timer for.
+// `log-event` is never called: a top-level call of it fails componentization.
+world top-level {
+  import log-event: func(event: string);
+
+  export greeting: func() -> string;
+}

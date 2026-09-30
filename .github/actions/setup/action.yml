@@ -6,15 +6,14 @@ inputs:
   target:
     description: 'Build target: "native", "wasm32-wasip2" or "wasm32-wasip3"'
     required: true
-  wasi-sdk-version:
-    description: Major version of the WASI SDK to install. wasm32-wasip3 needs 34 or later,
-      the first with a sysroot for it.
-    required: false
-    default: "34"
 
 runs:
   using: composite
   steps:
+    - name: Add the tool versions to the environment
+      shell: bash
+      run: grep -v '^#' "${{ github.action_path }}/../../tool-versions.env" >>"$GITHUB_ENV"
+
     - name: Install system dependencies
       shell: bash
       run: |
@@ -24,7 +23,7 @@ runs:
     # `install-tool.sh` checks each download's SHA-256 digest.
     - name: Install just
       shell: bash
-      run: ${{ github.action_path }}/install-tool.sh just 1.58.0
+      run: ${{ github.action_path }}/install-tool.sh just
 
     - name: Install Rust toolchain
       shell: bash
@@ -36,29 +35,30 @@ runs:
       run: rustup target add wasm32-wasip2
 
     # The pinned toolchain ships no wasm32-wasip3 std, so the justfile builds that target with the
-    # nightly toolchain `STARLING_NIGHTLY` names. The pinned toolchain is still needed for the
+    # beta toolchain `STARLING_BETA` names. The pinned toolchain is still needed for the
     # host-side test harnesses.
-    - name: Install nightly Rust toolchain with the wasm32-wasip3 target
+    - name: Install beta Rust toolchain with the wasm32-wasip3 target
       if: inputs.target == 'wasm32-wasip3'
       shell: bash
       run: |
-        rustup toolchain install "$STARLING_NIGHTLY" --profile minimal --target wasm32-wasip3
-        rustc "+$STARLING_NIGHTLY" --version
+        rustup toolchain install "$STARLING_BETA" --profile minimal --component clippy \
+          --target wasm32-wasip3
+        rustc "+$STARLING_BETA" --version
 
     - name: Install WASI SDK
       if: inputs.target != 'native'
       shell: bash
-      run: ${{ github.action_path }}/install-tool.sh wasi-sdk "${{ inputs.wasi-sdk-version }}"
+      run: ${{ github.action_path }}/install-tool.sh wasi-sdk
 
     - name: Install wasmtime
       if: inputs.target != 'native'
       shell: bash
-      run: ${{ github.action_path }}/install-tool.sh wasmtime "$WASMTIME_VERSION"
+      run: ${{ github.action_path }}/install-tool.sh wasmtime
 
     - name: Install wasm-tools
       if: inputs.target != 'native'
       shell: bash
-      run: ${{ github.action_path }}/install-tool.sh wasm-tools "$WASM_TOOLS_VERSION"
+      run: ${{ github.action_path }}/install-tool.sh wasm-tools
 
     - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11

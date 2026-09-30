@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:lowering;
+
+// Values whose state JavaScript can change after an import call starts: resource
+// wrappers, streams and typed arrays. See `lowering.js`.
+
+interface host {
+  resource thing {
+    constructor(v: u32);
+  }
+  // A resource with no constructor, method or static function.
+  resource bare;
+  make-bare: func() -> bare;
+  bare-value: func(b: borrow<bare>) -> u32;
+  // Returns the thing's value, after a yield, and drops it.
+  consume: async func(t: thing) -> u32;
+  // Returns the thing's value, after a yield.
+  peek: async func(t: borrow<thing>) -> u32;
+  // Returns the sum of the stream's elements.
+  drain: async func(s: stream<u32>) -> u32;
+  // Drops the stream unread, and returns the thing's value.
+  take-two: func(s: stream<u32>, t: thing) -> u32;
+  // Keeps the future for the host to read.
+  accept: func(f: future<u32>);
+  // Returns the list's first element.
+  first-byte: async func(data: list<u8>) -> u32;
+}
+
+interface runner {
+  use host.{thing};
+
+  // Runs the case named `which`, and describes its result.
+  run: async func(which: string) -> string;
+  // Returns a stream holding one `thing` twice: with `together`, from a source
+  // that enqueues both at once, and otherwise from an array.
+  things: async func(together: bool) -> stream<thing>;
+  // Passes a future to `accept`, and describes the result.
+  give: func() -> string;
+
+  resource widget {
+    get: func() -> u32;
+    // Returns a `Widget`, or with `sub` an instance of a subclass whose `get`
+    // returns 2.
+    make: static func(sub: bool) -> widget;
+  }
+}
+
+world lowering {
+  import host;
+  export runner;
+}

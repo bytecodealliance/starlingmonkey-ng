@@ -22,15 +22,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  WASI_SDK_VERSION: "34"
-  # The wasmtime CLI the wasm tests run under, the wasm-tools CLI `scripts/build-runtime.sh` wraps
-  # the runtime with, and the nightly toolchain wasm32-wasip3 builds use. All are pinned, so a new
-  # release changes nothing until these are bumped.
-  WASMTIME_VERSION: "49.0.0"
-  WASM_TOOLS_VERSION: "1.258.0"
-  STARLING_NIGHTLY: nightly-2026-09-24
-  # The Node.js version that the jobs needing Node.js install.
-  NODE_VERSION: "24.21.0"
+  # The setup action adds the tool versions of `.github/tool-versions.env`.
   RUSTC_WRAPPER: sccache
   CCACHE: sccache
   # Bump to purge the sccache GHA cache.
@@ -44,7 +36,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup
         with:
@@ -56,9 +48,33 @@ jobs:
       - name: Run clippy
         run: just clippy --all
 
+      - name: Run the componentizer's unit tests
+        run: just test-componentize-unit
+
+  # ---------------------------------------------------------------------------
+  # The `init` interface between the runtime and the componentizer
+  # (`starling/wit/init.wit`) changes only with a version not compatible with the latest
+  # release's, since the componentizer accepts runtimes with a compatible version.
+  # ---------------------------------------------------------------------------
+  init-wit:
+    name: init.wit versioning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The release tags the check compares with.
+          fetch-depth: 0
+
+      - name: Install wasm-tools
+        run: ./.github/actions/setup/install-tool.sh wasm-tools
+
+      - name: Check init.wit's version
+        run: ./scripts/check-init-wit.sh
+
   # ---------------------------------------------------------------------------
   # Cargo tests: {native, wasm32-wasip2, wasm32-wasip3} × {debug+debugmozjs, release}
-  # The wasm recipes also run the serve end-to-end suite (`just test-serve-wasm`).
+  # The wasm recipes also run the serve end-to-end suite (`just test-serve-wasm`). The debug wasm
+  # jobs first lint the code each wasm target compiles (`just clippy-wasm`).
   # ---------------------------------------------------------------------------
   test:
     name: Test (${{ matrix.target }}, ${{ matrix.profile }})
@@ -81,12 +97,15 @@ jobs:
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup
         with:
           target: ${{ matrix.target }}
-          wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
+
+      - name: Run clippy for the wasm target
+        if: matrix.target != 'native' && matrix.profile == 'debug'
+        run: just clippy-wasm
 
       - name: Run tests
         run: just ${{ matrix.recipe }}
@@ -96,26 +115,37 @@ jobs:
         run: just ${{ matrix.recipe }} --examples
 
   # ---------------------------------------------------------------------------
-  # The static runtime component: scripts and Wizer snapshots run with it. The runtime is built
-  # for wasm32-wasip3, so this job installs nightly and a wasi-sdk with a sysroot for it.
+  # Componentization suites against the debug runtime (`just test-componentize`).
+  # That recipe builds the runtime for wasm32-wasip3, the target the componentizer
+  # links against, so this job installs beta and a wasi-sdk with a sysroot for it.
   # ---------------------------------------------------------------------------
-  runtime:
-    name: Runtime component
+  componentize:
+    name: Componentize
     runs-on: ubuntu-latest
     env:
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup
         with:
           target: wasm32-wasip3
-          wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
 
-      # Runs scripts and a late-rejecting top level with the runtime component itself.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # `--tests` includes the `wit_to_ts` suite, which type-checks its output.
+      - name: Install the TypeScript compiler
+        run: npm ci
+
+      - name: Build the debug runtime and run the componentization suites
+        run: just test-componentize
+
+      # Runs scripts and a late-rejecting top level with the debug runtime component itself.
       - name: Run scripts with the runtime component
-        run: WASM_TARGET=p3 just test-runtime
+        run: just test-runtime
 
       # Snapshots with `wizer-initialize`, including CLI tools whose `run` export a snapshot calls.
       - name: Test Wizer snapshots
@@ -136,14 +166,13 @@ jobs:
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup
         with:
           target: ${{ matrix.target }}
-          wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -174,7 +203,7 @@ jobs:
     env:
       RUST_BACKTRACE: full
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # `just check-gc` also checks the wasm32-wasip2 build, which needs the target's std and the
       # WASI SDK, and runs crown's own tests.
@@ -182,7 +211,7 @@ jobs:
         with:
           target: wasm32-wasip2
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
 

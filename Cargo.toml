@@ -64,7 +64,6 @@ web-streams = { path = "crates/builtins/web-streams" }
 web-url = { path = "crates/builtins/web-url" }
 cpp-builtins = { path = "crates/builtins/cpp-builtins" }
 
-
 [profile.release]
 lto = "thin"
 strip = "symbols"

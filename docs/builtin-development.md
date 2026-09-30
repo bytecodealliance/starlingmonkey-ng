@@ -144,15 +144,18 @@ Run targeted tests while iterating, and the slow suites once per coarse batch of
   by hand. A subtest whose result varies between runs is marked `FLAKY` in its expectation file,
   and updates keep that marker. Before calling a failure a regression, run it again and against
   the previous binary.
+- The componentization suites (`just test-componentize`) when the runtime's component exports,
+  the WIT bridge (`wit-bridge`) or the componentizer change.
 - Crown (`just check-gc`, see [rooting.md](rooting.md#enforcing-proper-rooting-at-the-type-system-level-the-crown-static-analysis-lint))
   and the GC zeal tests (`just gc-zeal`).
 - `just clippy`, which fails on any warning.
 
-`just check-all` runs the formatting check, clippy, the examples' tests, crown and the GC zeal
-tests of `js` and `core-runtime`. The other crates' tests need `just test`.
+`just check-all` runs the formatting check, clippy, the examples' tests, the componentizer's unit
+tests, crown and the quick GC zeal modes over `js`, `core-runtime`, `wit-bridge` and the
+builtin crates. The other crates' tests need `just test`.
 
-Run heavy jobs one at a time. Wasm builds, harness runs and benchmarks running at once exhaust
-memory, and their timings are meaningless.
+Run heavy jobs one at a time. Wasm builds, componentize runs, harness runs and benchmarks running
+at once exhaust memory, and their timings are meaningless.
 
 For performance work, measure server CPU time per request rather than requests per second alone,
 alternate the old and new binaries, and repeat each measurement. Profile before optimizing.

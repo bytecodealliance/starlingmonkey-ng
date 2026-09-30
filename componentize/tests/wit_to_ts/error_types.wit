@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// Error classes, which the runtime keys on the interface and name the `result`
+// uses for its `err` type.
+//
+// - `user` `use`s `e`, and renames `code` to `failure`, so its module exports
+//   the classes `E` and `Failure`.
+// - `user`'s `fetch` returns `errs`'s `res`, whose `err` type is `errs`'s own
+//   `e`, so `errs`'s module exports a class `E` too. `errs` has no functions.
+// - The world's own `werr` has its class in `external`.
+// - `svc` is exported, so its `oops` has no class, but is still declared.
+package test:errors;
+
+interface errs {
+  variant e {
+    bad(string),
+    worse,
+  }
+
+  enum code {
+    a,
+    b,
+  }
+
+  type res = result<string, e>;
+}
+
+interface user {
+  use errs.{e, code as failure, res};
+
+  get: func() -> result<u32, e>;
+  check: func() -> result<_, failure>;
+  fetch: func() -> res;
+  later: async func() -> future<result<string, failure>>;
+}
+
+// An `err` type an export-only interface `use`s has the class of the interface
+// that defines it, which the world imports through the `use`.
+interface shared-errs {
+  variant my-err {
+    a,
+    b(string),
+  }
+}
+
+interface api {
+  use shared-errs.{my-err};
+
+  do-it: func() -> result<u32, my-err>;
+}
+
+interface svc {
+  enum oops {
+    broken,
+    missing,
+  }
+
+  run: func() -> result<_, oops>;
+}
+
+world error-types {
+  import user;
+  export svc;
+  export api;
+
+  enum werr {
+    one,
+    two,
+  }
+
+  import world-op: func() -> result<_, werr>;
+  export world-run: func() -> result<u32, werr>;
+}

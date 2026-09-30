@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// Imports: an imported interface becomes a `declare module '<wit-name>'` block
+// (the specifier is the interface's WIT name verbatim, members camelCased).
+// World-level imported functions are grouped into the `external` module.
+// Also covers an interface that is both imported and exported (the host call
+// the guest forwards to).
+package test:imports;
+
+interface logger {
+  log: func(msg: string);
+  level: func() -> u32;
+}
+
+interface backend {
+  fetch-data: func(key: string) -> list<u8>;
+}
+
+// An interface whose only item is a resource without functions still has a
+// module, which exports the resource's class.
+interface tokens {
+  resource token;
+}
+
+// A record named like the set alias of the flags `perms` takes that name, so the
+// alias is not re-exported.
+interface access {
+  flags perms {
+    read,
+    write,
+  }
+
+  record perms-set {
+    bits: u32,
+  }
+
+  check: func(p: perms, s: perms-set) -> bool;
+}
+
+world imports {
+  import logger;
+  import backend;
+  import access;
+  import tokens;
+  export backend;
+
+  // A world-level imported function -> the `external` module.
+  import now: func() -> u64;
+}

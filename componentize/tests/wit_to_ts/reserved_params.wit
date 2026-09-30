@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// Parameters named after reserved words. A parameter is not looked up by name,
+// so it is renamed with `_` appended. `this` would otherwise declare the type of
+// the receiver rather than an argument, and `%in`, `%default` and `%new` would
+// be syntax errors.
+package test:reserved-params;
+
+interface body-ops {
+  resource request {
+    consume-body: static func(this: request, %in: u32) -> string;
+    %new: static func(%default: u32) -> request;
+  }
+
+  take: func(%in: u32, %default: string, %new: bool, arguments: u32, eval: u32, global-this: u32) -> u32;
+}
+
+interface handlers {
+  handle: func(this: u32, %static: string, %let: bool) -> u32;
+}
+
+world reserved-params {
+  import body-ops;
+  export handlers;
+}

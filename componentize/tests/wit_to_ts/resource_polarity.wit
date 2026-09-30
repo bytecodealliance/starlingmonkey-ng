@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// An imported resource reached only through an exported interface's
+// signatures. Its class is the host's, so its members are rendered as imports:
+// the guest hands a `stream<u8>` argument over, receives a `stream<u8>` result,
+// and an async method returns a `Promise`. It has no constructor, so the class
+// declares a private one.
+package test:polarity;
+
+interface host {
+  resource body {
+    write: async func(data: stream<u8>) -> result;
+    read: func() -> stream<u8>;
+    finish: async func() -> u32;
+  }
+}
+
+interface guest-api {
+  use host.{body};
+
+  take: func(b: body) -> u32;
+  give: async func() -> body;
+}
+
+world resource-polarity {
+  export guest-api;
+}

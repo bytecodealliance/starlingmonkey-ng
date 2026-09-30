@@ -604,7 +604,7 @@ const WASMTIME_CODEGEN_FLAGS = ["-C", "native-unwind-info=n"];
 
 // The WASI capabilities the runtime needs: environment (its configuration arrives there in serve
 // mode), and the network/HTTP stack the `fetch` tests exercise.
-const WASI_FLAGS = "inherit-env=y,inherit-network=y,http=y,tcp=y,udp=y,p3=y";
+const WASI_FLAGS = "inherit-env=y,inherit-network=y,http=y,tcp=y,udp=y";
 
 // Pre-initialize the wasm runtime with Wizer, with the serve-mode WPT harness and its
 // configuration in the snapshot. Rebuilt whenever the runtime or the configuration changes.
@@ -631,7 +631,6 @@ function ensureWizenedRuntime() {
       [
         "wizer",
         `-S${WASI_FLAGS},cli=y`,
-        "-Wcomponent-model-async=y",
         // The component type still declares `wizer-initialize` after the snapshot, so dropping the
         // core function would make the component unloadable.
         "--keep-init-func=true",
@@ -684,8 +683,6 @@ function ensurePrecompiledRuntime() {
       [
         "compile",
         ...WASMTIME_CODEGEN_FLAGS,
-        "-W",
-        "component-model-async=y",
         runtime,
         "-o",
         output,
@@ -788,7 +785,6 @@ function testCommand(scriptFile, { optimized = true } = {}) {
       "--dir=.",
       "--dir=/tmp",
       `-S${WASI_FLAGS}`,
-      "-Wcomponent-model-async=y",
       precompiled ?? config.runtime,
       ...runtimeArgs.slice(0, -1),
       wasiPath,
@@ -940,7 +936,6 @@ function serveCommand() {
       "--dir=.",
       "--dir=/tmp",
       `-S${WASI_FLAGS},cli=y`,
-      "-Wcomponent-model-async=y",
       ...(wizened
         ? []
         : [

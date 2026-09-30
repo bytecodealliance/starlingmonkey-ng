@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:exported-resource;
+
+// A world that exports a guest-owned resource. The guest implements
+// `counters.counter` in JavaScript and returns counters to the host, which calls
+// their methods through its handles and finally drops them.
+//
+// `read-later` is the one async export: it takes a borrow and reads it after a
+// timer turn.
+
+interface counters {
+  resource counter {
+    // Construct a counter starting at `start`.
+    constructor(start: u32);
+    // Add `by` to the running value and return the new value.
+    bump: func(by: u32) -> u32;
+    // The current running value.
+    value: func() -> u32;
+    // How many counters the guest has constructed so far (process-global).
+    total-created: static func() -> u32;
+    // How many counters are still live: constructed minus dropped. The guest
+    // decrements this from its `[Symbol.dispose]`, so the host observes a
+    // host-side drop as `live-count` falling.
+    live-count: static func() -> u32;
+    // How many times the guest's `[Symbol.dispose]` has run, so a host-side
+    // drop is observed to run it exactly once.
+    dispose-calls: static func() -> u32;
+  }
+
+  // A freestanding export returning a guest-owned resource.
+  make-counter: func(start: u32) -> counter;
+  // Returns a counter that `Object.preventExtensions` made non-extensible.
+  make-sealed-counter: func(start: u32) -> counter;
+
+  // Waits for a timer turn, then returns the value of the borrowed counter.
+  read-later: async func(c: borrow<counter>) -> u32;
+}
+
+world exported-resource {
+  export counters;
+}

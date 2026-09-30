@@ -1,0 +1,8 @@
+{
+  "name": "starling-ng-dev",
+  "private": true,
+  "description": "Development-only TypeScript compiler, which the `wit_to_ts` tests of `componentize` run to type-check the generated .d.ts files, a consumer that imports from them, and the suites' guests.",
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

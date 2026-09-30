@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 # The wasm target the `-wasm` recipes build for. `WASM_TARGET=p3 just test-wasm` retargets them;
-# `p2`, `p3` and full triples are all accepted. The pinned toolchain in `rust-toolchain.toml`
-# ships no wasm32-wasip3 std, so that target builds through the toolchain `STARLING_NIGHTLY` names,
-# `nightly` by default.
-_wasm_target_arg := env_var_or_default("WASM_TARGET", "p2")
-WASM_TARGET := if _wasm_target_arg == "p2" { "wasm32-wasip2" } else if _wasm_target_arg == "p3" { "wasm32-wasip3" } else { _wasm_target_arg }
-NIGHTLY := env_var_or_default("STARLING_NIGHTLY", "nightly")
-_wasm_cargo := if WASM_TARGET == "wasm32-wasip3" { "cargo +" + NIGHTLY } else { "cargo" }
+# `p2`, `p3` and full triples are all accepted. `scripts/wasm-target.sh` maps the names to triples
+# and picks the toolchain.
+WASM_TARGET := `. ./scripts/wasm-target.sh && wasm_target "${WASM_TARGET:-p2}"`
+_wasm_cargo := `. ./scripts/wasm-target.sh && wasm_cargo "$(wasm_target "${WASM_TARGET:-p2}")"`
 
 # The cargo build directory, as a shell expression.
 _target := "${CARGO_TARGET_DIR:-" + justfile_directory() + "/target}"
 _wasm_out := _target + "/" + WASM_TARGET
+
+# The wasm target of the runtime `scripts/build-runtime.sh` builds, which the componentizer embeds
+# and its suites link against. `RUNTIME_TARGET` retargets it, and it defaults to wasm32-wasip3.
+RUNTIME_TARGET := `. ./scripts/wasm-target.sh && wasm_target "${RUNTIME_TARGET:-p3}"`
+_runtime_out := _target + "/" + RUNTIME_TARGET
+
+# Cargo for the `componentize` workspace, which is separate from the runtime's. Run from inside
+# its directory: cargo reads `componentize/.cargo/config.toml`, which points the build directory
+# at the repository's `target/`, only from there.
+_componentize := "cd " + justfile_directory() + "/componentize && cargo"
 
 # Build in debug mode.
 build *TARGET:
@@ -84,16 +91,25 @@ wpt-update-permissive *PATTERN:
 # Format all code.
 fmt:
     cargo fmt
+    {{_componentize}} fmt --all
     cargo fmt --manifest-path crown/Cargo.toml
 
-# Check formatting without modifying files.
+# Check formatting without modifying files. ARGS go to the runtime workspace's `cargo fmt`.
 fmt-check *ARGS:
     cargo fmt --check {{ARGS}}
+    {{_componentize}} fmt --all --check
     cargo fmt --manifest-path crown/Cargo.toml --check
 
-# Run clippy lints, failing on any warning.
+# Run clippy lints, failing on any warning. ARGS go to the runtime workspace's `cargo clippy`.
 clippy *ARGS:
     cargo clippy --features debugmozjs --all-targets {{ARGS}} -- -D warnings
+    {{_componentize}} clippy --workspace --all-targets -- -D warnings
+
+# Run clippy lints for the wasm target (`WASM_TARGET`), failing on any warning. ARGS go to
+# `cargo clippy`.
+clippy-wasm *ARGS:
+    {{_wasm_cargo}} clippy --target {{WASM_TARGET}} --features debugmozjs --workspace \
+        --lib --bins --tests --examples {{ARGS}} -- -D warnings
 
 # Without arguments, it runs the quick zeal modes over `js`, `core-runtime`, `wit-bridge` and
 # the builtin crates. `scripts/test-gc-zeal.sh` documents the arguments.
@@ -112,11 +128,12 @@ check-gc:
     ./scripts/check-crown.sh -p starlingmonkey --target wasm32-wasip2
     cd crown && RUSTC_BOOTSTRAP=1 cargo test
 
-# Run basic checks: formatting, clippy, tests.
+# Run basic checks: formatting, clippy, tests, and the componentizer's unit tests.
 check:
     just fmt-check --all
     just clippy --all
     just test --examples
+    just test-componentize-unit
 
 # Run most checks: `check` + `check-gc` + `gc-zeal`.
 check-all:
@@ -127,7 +144,7 @@ check-all:
 # Run basic checks: formatting, clippy, and the tests on the wasm target.
 check-wasm:
     just fmt-check --all
-    just clippy --all
+    just clippy-wasm
     just test-wasm --examples
 
 # Build for the wasm target (`WASM_TARGET`, default wasm32-wasip2).
@@ -218,10 +235,95 @@ wpt-test-all *PATTERN:
     @just wpt-test-wasm-serve {{PATTERN}}
     @just wpt-test-serve {{PATTERN}}
 
-# Build the statically linked runtime component (starling.wasm).
+# Build the runtime component (starling.wasm) that releases ship, in release mode.
 build-runtime:
     ./scripts/build-runtime.sh
 
-# End-to-end test of the static runtime (build, run scripts under wasmtime).
+# The componentize suites and `test-runtime` run against this build.
+#
+# Build the runtime component (starling.wasm) in debug mode, with `debugmozjs`.
+build-runtime-debug:
+    ./scripts/build-runtime.sh --debug
+
+# Build the release runtime, then install `starling-componentize` with it embedded.
+install-componentize:
+    ./scripts/build-runtime.sh
+    export STARLING_EMBED_RUNTIME="{{_runtime_out}}/release/starling.wasm" && \
+        {{_componentize}} install --path . --locked
+
+# The componentizer is built from this checkout, and embeds the wasm32-wasip3 runtime
+# `just build-runtime` writes, or none if there is no such build. ARGS are passed through
+# unchanged, and it runs in the directory `just` was invoked from, so relative paths in them
+# resolve there. For example:
+#
+#   just componentize --export-http componentize app.js -o app.wasm
+#   just componentize -w wit -n app types -o app.d.ts
+#
+# Run `starling-componentize` with ARGS.
+[no-cd]
+[positional-arguments]
+componentize *ARGS:
+    @{{_componentize}} build -q --bin starling-componentize
+    @"{{_target}}/debug/starling-componentize" "$@"
+
+# The packages are the one that resolves the binary and the one for this platform, which holds a
+# release build with the release runtime embedded. `componentize/npm/package.mjs` documents the
+# layout, and `.github/workflows/release.yml` builds and publishes every platform's packages.
+# VERSION defaults to the workspace's version, in `Cargo.toml`. The packages' tarballs go to
+# `target/npm/tarballs`.
+#
+# Assemble the npm packages of `starling-componentize` for this platform in `target/npm`.
+npm-componentize VERSION="":
+    ./scripts/build-runtime.sh
+    export STARLING_EMBED_RUNTIME="{{_runtime_out}}/release/starling.wasm" && \
+        {{_componentize}} build --release --locked --bin starling-componentize
+    rm -rf "{{_target}}/npm"
+    node componentize/npm/package.mjs {{ if VERSION == "" { "" } else { "--version " + VERSION } }} \
+        --out "{{_target}}/npm" --pack "{{_target}}/npm/tarballs" \
+        "$(node -p 'process.platform + "-" + process.arch')={{_target}}/release/starling-componentize"
+
+# End-to-end test of the debug runtime component (build, run scripts under wasmtime).
 test-runtime:
     ./scripts/test-runtime.sh
+
+# Each suite is a test target in `componentize/tests/`, and each file's head comment describes
+# what it covers. `componentize` is a workspace of its own (see its `Cargo.toml`), so its recipes
+# run cargo from its directory rather than with `-p`. ARGS go to `test-componentize-only`.
+#
+# Build the debug runtime, then run every componentization suite against it.
+test-componentize *ARGS:
+    just build-runtime-debug
+    just test-componentize-only {{ARGS}}
+
+# The suites use the runtime build STARLING_RUNTIME names, by default the one
+# `just build-runtime-debug` writes, and this recipe never rebuilds it, so editing a test rebuilds
+# neither the runtime nor SpiderMonkey. A missing runtime build fails the suites with its path.
+# ARGS go to libtest, so `just test-componentize-only echo_stream` runs only the matching tests
+# and componentizes only the `streams` world. `scripts/test-componentize.sh` runs several suites
+# at a time and describes how many.
+#
+# Run the componentization suites against a prebuilt runtime (no runtime build).
+test-componentize-only *ARGS:
+    export STARLING_RUNTIME="${STARLING_RUNTIME:-{{_runtime_out}}/debug/starling.wasm}" && \
+        ./scripts/test-componentize.sh --nocapture {{ARGS}}
+
+# Run the unit tests of the componentizer's workspace. They need no runtime build.
+test-componentize-unit:
+    {{_componentize}} test --workspace --lib
+
+# For a world exporting `wasi:http/handler`, the interface's declarations come from the runtime
+# build STARLING_RUNTIME names, or else from the one the componentizer embeds.
+#
+#   just ts-bindings <wit-path> [<world>]   # print the .d.ts to stdout
+#   just ts-bindings --export-cli           # the built-in cli/run world
+#   just ts-bindings --export-http          # the built-in serve world
+#   just ts-bindings componentize/tests/wit_to_ts/primitives.wit primitives
+#
+# Omitting <world> selects the only world of the last package the WIT path loads.
+#
+# Print the TypeScript declaration (`.d.ts`) of the guest JS module a WIT world expects.
+[no-cd]
+ts-bindings WIT WORLD="":
+    @just --justfile "{{justfile()}}" componentize \
+        {{ if WIT == "--export-cli" { "--export-cli" } else if WIT == "--export-http" { "--export-http" } else { "-w '" + WIT + "'" + if WORLD == "" { "" } else { " -n '" + WORLD + "'" } } }} \
+        types
