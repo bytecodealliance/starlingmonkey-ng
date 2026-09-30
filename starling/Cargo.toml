@@ -41,8 +41,8 @@ js.workspace = true
 libstarling.workspace = true
 wasip3.workspace = true
 # The workspace pins `wit-bindgen` to the version `wasip3` uses, so the component contains one
-# wit-bindgen. Each version generates its own `run_ctors_once` guard. `__wrap___wasm_call_ctors`
-# in `lib.rs` makes the C++ constructors run once.
+# wit-bindgen, and so one `run_ctors_once` guard. `__wrap___wasm_call_ctors` in `lib.rs` makes the
+# C++ constructors run once.
 #
 # `inter-task-wakeup` lets one wit task wake another through plain Rust wakers, which the serve
 # path needs: the response-body writer task parks on a Rust channel the request's event-loop
@@ -51,6 +51,10 @@ wasip3.workspace = true
 # response such as server-sent events.
 wit-bindgen = { workspace = true, features = ["macros", "inter-task-wakeup"] }
 libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bridge.workspace = true
+web-fetch.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempfile = "3"

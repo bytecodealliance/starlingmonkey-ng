@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 name: Setup build environment
-description: Install system deps, Rust toolchain, WASI SDK, wasmtime, and configure sccache.
+description: Install system deps, Rust toolchain, WASI SDK, wasmtime, wasm-tools, and configure sccache.
 
 inputs:
   target:
     description: 'Build target: "native", "wasm32-wasip2" or "wasm32-wasip3"'
     required: true
+  wasi-sdk-version:
+    description: Major version of the WASI SDK to install. wasm32-wasip3 needs 34 or later,
+      the first with a sysroot for it.
+    required: false
+    default: "34"
 
 runs:
   using: composite
@@ -43,12 +48,17 @@ runs:
     - name: Install WASI SDK
       if: inputs.target != 'native'
       shell: bash
-      run: ${{ github.action_path }}/install-tool.sh wasi-sdk "$WASI_SDK_VERSION"
+      run: ${{ github.action_path }}/install-tool.sh wasi-sdk "${{ inputs.wasi-sdk-version }}"
 
     - name: Install wasmtime
       if: inputs.target != 'native'
       shell: bash
       run: ${{ github.action_path }}/install-tool.sh wasmtime "$WASMTIME_VERSION"
+
+    - name: Install wasm-tools
+      if: inputs.target != 'native'
+      shell: bash
+      run: ${{ github.action_path }}/install-tool.sh wasm-tools "$WASM_TOOLS_VERSION"
 
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9

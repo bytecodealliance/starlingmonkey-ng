@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+[package]
+name = "wit-name-mapping"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+# Both `wit-bridge` and the separate `componentize` workspace depend on this crate, so it
+# depends on no runtime crate.
+
+[dependencies]
+heck.workspace = true
+semver.workspace = true
+wasmparser.workspace = true
+
+[lints]
+workspace = true
