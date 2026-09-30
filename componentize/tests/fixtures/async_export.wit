@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:async-export;
+
+// The async-export world.
+//
+// Two exported interfaces in one component, so a single componentization shows
+// that sync and async exports coexist on the same runtime. Both `foo`s return
+// `v + 3`. The async one awaits a `setTimeout` first, so the runtime must drive
+// its per-call event loop through a timer turn before the promise settles.
+
+interface simple-export {
+  foo: func(v: u32) -> u32;
+
+  // Calls `setTimeout` and returns the message of the `TypeError` it throws,
+  // since a sync export runs without an event loop.
+  timer-message: func() -> string;
+
+  // Calls `fetch`, whose promise rejects without an event loop, and returns
+  // the rejection's message a previous call recorded, or "none".
+  fetch-message: func() -> string;
+
+  // Queues a microtask that increments a counter, and returns the counter's
+  // value from before the call. The microtask runs before the call returns, so
+  // each call returns the number of calls before it.
+  drained-microtasks: func() -> u32;
+}
+
+interface simple-async-export {
+  foo: async func(v: u32) -> u32;
+
+  // A deadlocking async export: it `await`s a promise that never resolves and
+  // schedules no timer/loop work, so the per-call event loop goes idle while the
+  // returned promise is still pending. The driver must surface this as a clean
+  // trap (host-observable `Err`), not a panic that aborts the process.
+  hang: async func() -> u32;
+
+  // An async export that delivers its result but leaves a perpetual
+  // `setInterval` running. The result settles normally (so `task-return` lowers
+  // it), but the per-call event loop stays non-idle forever. The interval is not
+  // a canonical-ABI waitable, so the export's subtask does not wait for it: the
+  // driver completes the call (returning the result) and abandons the timer,
+  // and never waits on it (which would hang the host's `task.block`).
+  perpetual: async func(v: u32) -> u32;
+
+  // Rejects with an `Error` holding `message` after a timer turn. The rejection
+  // becomes the `err` string, and is not reported as an unhandled rejection.
+  fail: async func(message: string) -> result<u32, string>;
+
+  // Waits for the host's `release` to return, then returns how many
+  // `drained-microtasks` microtasks ran while it waited.
+  parked: async func() -> u32;
+}
+
+interface host {
+  // Returns once the host releases it.
+  release: async func();
+}
+
+world async-export {
+  import host;
+  export simple-export;
+  export simple-async-export;
+}

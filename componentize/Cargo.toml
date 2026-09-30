@@ -1,0 +1,66 @@
+[package]
+name = "componentize"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0 WITH LLVM-exception"
+authors = ["The StarlingMonkey project contributors"]
+repository = "https://github.com/bytecodealliance/starlingmonkey"
+
+# A workspace of its own: its dependencies (wasmtime, Wizer, wac-graph, and the versions of the
+# wasm-tools crates they depend on) are resolved in `componentize/Cargo.lock`, apart from the
+# runtime workspace's. `.cargo/config.toml` points its build directory at the repository's
+# `target/`.
+[workspace]
+members = ["preserve-component-type"]
+
+# Optimize every dependency in dev and test builds, leaving this crate at debug for fast
+# iteration. The host tests drive wasmtime and Wizer to compile and snapshot a ~200 MB component.
+# Unoptimized that takes minutes per world and gets killed by test timeouts. Optimized it takes a
+# few seconds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[[bin]]
+name = "starling-componentize"
+path = "src/bin/starling-componentize.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4.5.60", features = ["derive", "env"] }
+wit-name-mapping = { path = "../crates/wit-name-mapping" }
+tokio = { version = "1", features = ["rt"] }
+indexmap = "2"
+preserve-component-type = { path = "preserve-component-type" }
+# `wac-graph` composes the stub component of the finalize pass in for disabled
+# WASI features.
+wac-graph = "0.12"
+wasm-encoder = "0.262"
+wasmparser = "0.262"
+# `version` prints the SHA-256 digest of the runtime.
+hex = "0.4"
+sha2 = "0.11"
+# `--init-location` is checked to be a URL.
+url = "2"
+wasmtime = { version = "50", features = ["cache"] }
+# `p3` enables the WASIp3 host (`wasmtime_wasi::p3`), which `add_wasi` adds.
+wasmtime-wasi = { version = "50", features = ["p3"] }
+wasmtime-wizer = { version = "50", features = ["component-model", "wasmtime"] }
+wit-component = "0.262"
+wit-dylib = "0.262"
+wit-parser = "0.262"
+
+# musl builds use mimalloc as the global allocator. With musl's allocator, componentizing takes
+# about three times as long.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1.52"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+proptest = "1.11"
+# `default-features = false` drops `default-send-request`, so no request reaches a real network.
+wasmtime-wasi-http = { version = "50", features = ["p3"], default-features = false }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+futures = "0.3"

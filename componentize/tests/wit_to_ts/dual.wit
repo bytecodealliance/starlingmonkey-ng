@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// An interface both imported and exported. The host's `item` class is exported
+// from the interface's module, and the guest exports a class of its own for the
+// same resource. The record `entry` holds an `item`, so it is declared once for
+// each side, while the enum `kind` is declared once.
+package test:dual;
+
+interface store {
+  resource item {
+    constructor(v: u32);
+    value: func() -> u32;
+  }
+
+  record entry {
+    item: item,
+    tag: string,
+  }
+
+  enum kind {
+    a,
+    b,
+  }
+
+  get: func(k: kind) -> entry;
+}
+
+world dual {
+  import store;
+  export store;
+}

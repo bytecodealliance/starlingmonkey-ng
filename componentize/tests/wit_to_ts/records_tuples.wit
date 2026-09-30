@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// record -> object type with mangled field names, and tuple -> fixed-length array.
+// Named records become top-level `export type` declarations referenced by name.
+// An `option` field is an optional key, since a missing key reads as `none`.
+package test:records-tuples;
+
+interface shapes {
+  record point {
+    x: f64,
+    y: f64,
+  }
+
+  record kitchen-sink {
+    a-flag: bool,
+    big-num: u64,
+    label: string,
+    nested: point,
+    items: list<string>,
+    note: option<string>,
+  }
+
+  echo-point: func(v: point) -> point;
+  echo-sink: func(v: kitchen-sink) -> kitchen-sink;
+  swap: func(v: tuple<u32, string>) -> tuple<string, u32>;
+  triple: func(v: tuple<bool, point, list<u8>>) -> tuple<bool, point, list<u8>>;
+}
+
+world records-tuples {
+  export shapes;
+}

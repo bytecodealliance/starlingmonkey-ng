@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// Types with the same name in several interfaces. `thing` and `error-code` of
+// `a` and `b` are qualified with their interface's name, and the `error-code`
+// of `test:dup/a` and `test:other/a` also with their package's. Each module
+// re-exports its own types under their WIT names.
+package test:dup;
+
+interface a {
+  resource thing {
+    constructor();
+    name: func() -> string;
+  }
+
+  variant error-code {
+    denied,
+    other(string),
+  }
+
+  do-a: func(t: borrow<thing>) -> result<string, error-code>;
+}
+
+interface b {
+  resource thing {
+    get: func() -> u32;
+  }
+
+  variant error-code {
+    timeout,
+  }
+
+  do-b: func() -> result<thing, error-code>;
+}
+
+world duplicate-names {
+  import a;
+  import b;
+  import test:other/a;
+}
+
+package test:other {
+  interface a {
+    variant error-code {
+      gone,
+    }
+
+    do-other: func() -> result<_, error-code>;
+  }
+}

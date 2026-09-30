@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// variant -> discriminated union keyed by `tag`, where a payload case also has
+// `val` and a payloadless case has only `tag`. enum -> a `const enum` numbered
+// from zero, the case index `push_enum` lifts. flags -> a `const enum` of powers
+// of two plus a `number` alias for a set of them, the bit set `push_flags` lifts.
+// A set crosses as an int32, so the member for bit 31 is `1 << 31`.
+package test:variant-enum-flags;
+
+interface choices {
+  variant shape {
+    circle(f64),
+    rectangle(tuple<f64, f64>),
+    point,
+  }
+
+  enum color {
+    red,
+    green,
+    blue,
+  }
+
+  flags permissions {
+    read,
+    write,
+    execute,
+  }
+
+  flags wide {
+    b0,
+    b1,
+    b2,
+    b3,
+    b4,
+    b5,
+    b6,
+    b7,
+    b8,
+    b9,
+    b10,
+    b11,
+    b12,
+    b13,
+    b14,
+    b15,
+    b16,
+    b17,
+    b18,
+    b19,
+    b20,
+    b21,
+    b22,
+    b23,
+    b24,
+    b25,
+    b26,
+    b27,
+    b28,
+    b29,
+    b30,
+    b31,
+  }
+
+  echo-shape: func(v: shape) -> shape;
+  echo-color: func(v: color) -> color;
+  echo-permissions: func(v: permissions) -> permissions;
+  echo-wide: func(v: wide) -> wide;
+}
+
+world variant-enum-flags {
+  export choices;
+}

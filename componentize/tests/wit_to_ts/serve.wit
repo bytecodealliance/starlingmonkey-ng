@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// A world that exports `wasi:http/handler` and declares the `wasi:http`
+// interfaces itself, against a minimal stub of `wasi:http/types`.
+//
+// The guest either registers a `fetch` listener or implements `handle` under
+// `wasiHttp.handler`, under `handler`, or as a bare export. `handle` receives a `Request` and
+// returns a `Response` or the `response` resource the WIT declares, and fails
+// with the `ErrorCode` class of `wasi:http/types`.
+package test:serve;
+
+world serve {
+  import wasi:http/types@0.3.0;
+  export wasi:http/handler@0.3.0;
+}
+
+package wasi:http@0.3.0 {
+  interface types {
+    variant error-code {
+      internal-error(option<string>),
+    }
+
+    resource request {
+      path: func() -> string;
+    }
+
+    resource response {
+      constructor(status: u16);
+      send: func() -> result<_, error-code>;
+    }
+  }
+
+  interface handler {
+    use types.{request, response, error-code};
+
+    handle: async func(request: request) -> result<response, error-code>;
+  }
+}

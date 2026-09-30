@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// The naming shapes of `starling:guest`. An item of an exported interface is
+// provided as `<package>.<interface>.<item>`, `<interface>.<item>` or a bare
+// `<item>`, and the latter two only where no other export has the same name.
+package test:naming;
+
+interface api {
+  greet: func(name: string) -> string;
+
+  resource counter {
+    constructor(start: u32);
+    get: func() -> u32;
+  }
+}
+
+interface left {
+  greet: func(name: string) -> string;
+  only-left: func() -> u32;
+}
+
+interface right {
+  greet: func(name: string) -> string;
+}
+
+interface %default {
+  %new: func() -> u32;
+}
+
+// Every shape is allowed.
+world naming-unique {
+  export api;
+}
+
+// Two `api` interfaces leave only the package layer for `api`, and three
+// `greet`s leave no bare `greet` but the world-level one.
+world naming-ambiguous {
+  export api;
+  export test:other/api;
+  export left;
+  export right;
+  export greet: func() -> string;
+}
+
+// Reserved words as the interface-layer name and as bare names, and an
+// interface without a package layer.
+world naming-reserved {
+  export %default;
+  export local: interface {
+    %for: func() -> u32;
+  }
+}
+
+// Two versions of one interface, provided under their full WIT names.
+world naming-versions {
+  export test:versioned/api@1.0.0;
+  export test:versioned/api@2.0.0;
+}
+
+package test:other {
+  interface api {
+    greet: func(name: string) -> string;
+  }
+}
+
+package test:versioned@1.0.0 {
+  interface api {
+    greet: func(name: string) -> string;
+  }
+}
+
+package test:versioned@2.0.0 {
+  interface api {
+    greet: func(name: string) -> string;
+    wave: func() -> string;
+  }
+}

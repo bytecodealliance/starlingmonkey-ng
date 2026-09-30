@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// Imported resources, at both interface and world level.
+//
+// A class can only be exported from a module it is declared in, so the class
+// itself lives in `starling:types` and each module block imports it before
+// re-exporting it under the resource's name.
+//
+// A world-level resource joins the `external` group, the module the
+// interpreter's `synthesize_interface_module` registers it in: that group is
+// keyed on an import with no interface.
+package test:imported-resources;
+
+interface store {
+  resource bucket {
+    constructor(name: string);
+    get: func(key: string) -> option<string>;
+    put: func(key: string, value: string);
+    count: static func() -> u32;
+  }
+
+  open: func(name: string) -> bucket;
+}
+
+interface consumer {
+  use store.{bucket};
+
+  // An exported interface signature naming an imported resource, which is why
+  // the class cannot live inside the importing module's own block.
+  describe: func(b: borrow<bucket>) -> string;
+}
+
+world imported-resources {
+  import store;
+  // A world-level resource, reached through `external`.
+  resource ticket {
+    constructor(id: u32);
+    id: func() -> u32;
+  }
+  import issue: func() -> ticket;
+  export consumer;
+}

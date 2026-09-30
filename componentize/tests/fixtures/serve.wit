@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:serve;
+
+// The serve world for the componentize pipeline.
+//
+// The runtime already has a native `wasi:http/handler` export, StarlingMonkey's
+// web-platform serve path, which dispatches each incoming request as a `fetch`
+// event to the application's `addEventListener('fetch', …)` listeners. The
+// world declares that export so the finalized component keeps it. The
+// componentizer drops it from the world before generating the bindings (the
+// same handling as `wasi:cli/run`) and merges in the runtime's own `wasi:http`
+// package, so only the version has to match the builtin's. The interface is
+// empty because a declaration of it must match the runtime's on every item
+// both declare.
+//
+// The componentizer also adds an export the application can implement instead
+// of registering a listener (see `fixtures/serve_raw.js`). The component
+// exports whichever of the two the application provides as
+// `wasi:http/handler`.
+world serve {
+  export wasi:http/handler@0.3.0;
+}
+
+package wasi:http@0.3.0 {
+  interface handler {}
+}

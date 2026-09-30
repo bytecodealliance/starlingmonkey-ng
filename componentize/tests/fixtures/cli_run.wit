@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:cli-run;
+
+// A CLI world. The runtime's builtin `wasi:cli/run` serves the export by calling the
+// application's JavaScript `run` export. The world's version of `wasi:cli/run` is compatible with
+// the builtin's, and has a patch number that differs from it.
+world command {
+  export wasi:cli/run@0.3.5;
+}
+
+package wasi:cli@0.3.5 {
+  interface run {
+    run: async func() -> result;
+  }
+}

@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:resources;
+
+// Resource handles in every position the Component Model allows them.
+//
+// `aggregates` nests `own` and `borrow` handles inside records, tuples,
+// variants, options, results and lists. `borrow-in-record` returns a
+// `list<thing>` built from borrows inside records. `alias1`/`alias2` share one
+// resource type through `use` and `use ... as`. `import-and-export` is one
+// interface imported and exported at once, so the guest class wraps the host
+// class of the same name. The world declares its own resource `counter` and
+// `use`s `alias1.thing` for a world-level export.
+//
+// Every interface but `counters` is both imported (the host owns the
+// resources) and exported (the guest wraps each host resource in a class of
+// its own).
+
+interface aggregates {
+  resource thing {
+    constructor(v: u32);
+  }
+
+  record r1 {
+    thing: thing,
+  }
+
+  record r2 {
+    thing: borrow<thing>,
+  }
+
+  record r3 {
+    thing1: borrow<thing>,
+    thing2: thing,
+  }
+
+  type t1 = tuple<thing, r1>;
+
+  type t2 = tuple<borrow<thing>>;
+
+  variant v1 {
+    thing(thing),
+  }
+
+  variant v2 {
+    thing(borrow<thing>),
+  }
+
+  type l1 = list<thing>;
+
+  type l2 = list<borrow<thing>>;
+
+  // Sum every nested thing's value, plus a constant, so a handle that lifted
+  // or lowered wrongly changes the result.
+  foo: func(
+    r1: r1,
+    r2: r2,
+    r3: r3,
+    t1: t1,
+    t2: t2,
+    v1: v1,
+    v2: v2,
+    l1: l1,
+    l2: l2,
+    o1: option<thing>,
+    o2: option<borrow<thing>>,
+    result1: result<thing>,
+    result2: result<borrow<thing>>,
+  ) -> u32;
+}
+
+interface borrow-in-record {
+  resource thing {
+    constructor(s: string);
+    get: func() -> string;
+  }
+
+  record foo {
+    thing: borrow<thing>,
+  }
+
+  test: func(a: list<foo>) -> list<thing>;
+}
+
+interface alias1 {
+  resource thing {
+    constructor(s: string);
+    get: func() -> string;
+  }
+
+  record foo {
+    thing: thing,
+  }
+
+  a: func(f: foo) -> list<thing>;
+}
+
+interface alias2 {
+  use alias1.{thing, foo as bar};
+
+  record foo {
+    thing: thing,
+  }
+
+  b: func(f: foo, g: bar) -> list<thing>;
+}
+
+interface import-and-export {
+  resource thing {
+    constructor(v: u32);
+    foo: func() -> u32;
+    bar: func(v: u32);
+    baz: static func(a: thing, b: thing) -> thing;
+  }
+}
+
+// A host resource the guest reaches only through the borrows the world-level
+// exports receive.
+interface counters {
+  resource counter {
+    constructor(v: u32);
+    get: func() -> u32;
+    set: func(v: u32);
+  }
+
+  // Fails with `c` as the error.
+  reject: func(c: counter) -> result<u32, counter>;
+}
+
+world resources {
+  use alias1.{thing};
+  use counters.{counter};
+
+  import counters;
+
+  import aggregates;
+  export aggregates;
+
+  import borrow-in-record;
+  export borrow-in-record;
+
+  import alias1;
+  import alias2;
+  export alias1;
+  export alias2;
+
+  import import-and-export;
+  export import-and-export;
+
+  // Add one to the counter through its `get` and `set` methods.
+  export bump: func(c: borrow<counter>);
+
+  // Return the received host things unchanged.
+  export test: func(things: list<thing>) -> list<thing>;
+
+  // Read the counter, then call `[Symbol.dispose]()` on the borrowed wrapper
+  // before returning. The borrow is also released at call end, and that
+  // release must not drop the handle a second time.
+  export dispose-early: func(c: borrow<counter>) -> u32;
+  // Calls the `[Symbol.dispose]` of `c`'s class on objects that are not
+  // wrappers: a plain object, and an object with `c`'s prototype. Returns the
+  // message of each `TypeError` that throws, or "no error".
+  export forged-dispose-messages: func(c: borrow<counter>) -> list<string>;
+
+  // Reads the owned counter inside a `using` block, which disposes of it, then
+  // disposes of it again, and returns the value read.
+  export using-owned: func(c: counter) -> u32;
+
+  // Passes `c` to `counters.reject`, and describes the error that throws: its
+  // class, whether its payload is a `Counter`, and the payload's value.
+  export describe-resource-error: func(c: counter) -> string;
+
+  // Throws an `Error`, which the payload-less `err` takes, logging it.
+  export fail-quietly: func() -> result;
+
+  // Passes a plain object to `counters.reject` for its `counter`, and returns
+  // whether that throws a `TypeError`, and its message.
+  export plain-object-for-resource: func() -> string;
+
+  // Passes resources to imports in ways that do not lower, and returns the
+  // message of each `TypeError` that throws, or "no error": one wrapper for
+  // both `own` parameters of `thing.baz`, one wrapper in both records `b`
+  // takes, the borrowed `c` to `counters.reject`, and to `b` a record whose
+  // getter disposes of the resource the first record holds. Then returns the
+  // number of things `borrow-in-record.test` returns for one wrapper borrowed
+  // twice, and whether `thing.baz` then takes the wrapper of the first case.
+  export resource-misuse-messages: func(c: borrow<counter>) -> list<string>;
+}

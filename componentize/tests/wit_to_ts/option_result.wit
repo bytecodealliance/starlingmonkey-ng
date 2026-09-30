@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// option<T> and result<T, E> mapping, including the two subtleties:
+//   - `option<option<T>>` wraps the inner option in `{ val }` so `some(none)`
+//     is distinguishable from `none` (value.rs `push_option`).
+//   - `result<T, E>` is position-dependent: as a function's direct return it is
+//     unwrapped to its `ok` payload (errors are thrown), but as a parameter or
+//     nested it is the `{ tag, val? }` union. The `pass-result` / `make-result`
+//     pair covers both forms. `result` arms with and without payloads are
+//     covered.
+package test:option-result;
+
+// A `result` behind a named type alias, pulled into `opts` with `use`. The
+// runtime's `type_shape` follows the alias to the underlying `result`, so the
+// generator must too (via `canonical`), so an aliased `result` in return position
+// is unwrapped to its ok payload, not rendered as the `{ tag, val? }` union.
+interface aliases {
+  type my-result = result<u32, string>;
+}
+
+interface opts {
+  use aliases.{my-result};
+
+  echo-option: func(v: option<u32>) -> option<u32>;
+  echo-option-option: func(v: option<option<u32>>) -> option<option<u32>>;
+  echo-option-string: func(v: option<string>) -> option<string>;
+
+  // `result` in return position -> unwrapped to the ok payload (`number`).
+  make-result: func() -> result<u32, string>;
+  // `result` with no payloads at all -> `void` return.
+  make-result-empty: func() -> result;
+  // `result` with only an err payload -> `void` return (err is thrown).
+  make-result-no-ok: func() -> result<_, string>;
+  // `result` as a parameter -> the `{ tag, val? }` union.
+  pass-result: func(v: result<u32, string>);
+  // nested `result` in a return -> outer unwrapped, inner stays a union.
+  nested-result: func() -> result<result<u32, string>, string>;
+  // a `use`-aliased `result` in return position -> still unwrapped (canonical).
+  make-aliased-result: func() -> my-result;
+  // the same aliased `result` as a parameter -> the `{ tag, val? }` union.
+  pass-aliased-result: func(v: my-result);
+}
+
+world option-result {
+  export opts;
+}

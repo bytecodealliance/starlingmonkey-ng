@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// WIT types named after the globals the declarations refer to. Inside
+// `starling:types` each such declaration shadows the global, so references to
+// the global there are written `globalThis.<name>`.
+package test:global-names;
+
+interface names {
+  record promise {
+    v: u32,
+  }
+
+  resource symbol {
+    constructor();
+    name: func() -> string;
+  }
+
+  type readable-stream = list<string>;
+
+  record uint8-array {
+    len: u32,
+  }
+
+  variant component-error {
+    broken,
+  }
+
+  record holder {
+    body: stream<u8>,
+    done: future<u32>,
+    bytes: list<u8>,
+    p: promise,
+  }
+
+  wait: async func(p: promise) -> result<symbol, component-error>;
+  hold: func(h: holder) -> readable-stream;
+}
+
+world global-names {
+  import names;
+}

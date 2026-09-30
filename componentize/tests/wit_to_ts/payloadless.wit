@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:payloadless;
+
+// A `stream` and a `future` without a payload type. The guest receives the
+// stream as a `ReadableStream<undefined>` and hands it over also as an async or
+// sync iterable of `undefined`. It receives the future as a `Promise<void>` and
+// hands it over as `undefined` or a promise of it.
+
+interface signals {
+  type tick-stream = stream;
+
+  ticks: async func(n: u32) -> tick-stream;
+  count: async func(s: stream) -> u32;
+  done: async func() -> future;
+  wait: async func(f: future) -> bool;
+}
+
+interface relay {
+  use signals.{tick-stream};
+
+  echo-ticks: async func(s: stream) -> stream;
+  echo-done: async func(f: future) -> future;
+  count-ticks: async func(s: tick-stream) -> u32;
+}
+
+world payloadless {
+  import signals;
+  export relay;
+}

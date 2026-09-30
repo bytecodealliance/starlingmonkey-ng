@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:async-import;
+
+// The async-import-and-export world.
+//
+// `host.bar` is an `async` WIT import, so its JS function returns a Promise
+// that settles once the host subtask completes. `runner.foo` is an `async` WIT
+// export, whose per-call event loop drives the import's future. The guest's
+// `foo(v)` does `await bar(v)` then returns the awaited value `+ 3`, and the
+// host's `bar(x)` yields before returning `x + 2`, so `foo(42)` is 47.
+
+interface host {
+  // The async host import. `x + 2`, but only after a host-side yield, so the
+  // guest's `await bar(x)` cannot complete synchronously.
+  bar: async func(x: u32) -> u32;
+  // The `result`-typed async host import: `ok(x)` becomes `ok(x + 2)` and
+  // `err(x)` becomes `err(x + 3)`, after the same host-side yield.
+  baz: async func(v: result<u32, u32>) -> result<u32, u32>;
+}
+
+interface runner {
+  // The async export: `await bar(v)` then `+ 3`.
+  foo: async func(v: u32) -> u32;
+  // The `result`-typed async export: `await baz(v)`, then `+ 3` on whichever
+  // arm came back. An `err` arrives in the guest as a rejection with a
+  // `ComponentError` and leaves it as a thrown `ComponentError`.
+  qux: async func(v: result<u32, u32>) -> result<u32, u32>;
+  // A sync export: calls `bar`, whose promise rejects without an event loop,
+  // and returns the rejection's message a previous call recorded, or "none".
+  bar-message: func() -> string;
+}
+
+world async-import {
+  import host;
+  export runner;
+}

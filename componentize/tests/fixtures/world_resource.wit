@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:world-resource;
+
+// A resource declared directly in the world, with methods. The guest never
+// constructs one: its only export receives a borrow and drives the resource
+// through `get` and `set`.
+
+world world-resource {
+  resource thing {
+    constructor(v: u32);
+    get: func() -> u32;
+    set: func(v: u32);
+  }
+
+  // Add one to the thing through its `get` and `set` methods.
+  export f: func(thing: borrow<thing>);
+}
