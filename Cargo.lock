@@ -387,6 +387,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "wit-name-mapping",
 ]
 
 [[package]]
@@ -571,7 +572,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2065,7 +2066,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2244,7 +2245,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2301,7 +2302,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2547,7 +2548,9 @@ dependencies = [
  "libstarling",
  "tempfile",
  "wasip3",
+ "web-fetch",
  "wit-bindgen",
+ "wit-bridge",
 ]
 
 [[package]]
@@ -2640,7 +2643,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3007,7 +3010,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1d0246511d901aacf25d2dc9111f0054947de5e093fe662099e709ff7530dc3"
 dependencies = [
  "leb128fmt",
- "wasmparser",
+ "wasmparser 0.259.0",
 ]
 
 [[package]]
@@ -3019,7 +3022,7 @@ dependencies = [
  "anyhow",
  "indexmap",
  "wasm-encoder",
- "wasmparser",
+ "wasmparser 0.259.0",
 ]
 
 [[package]]
@@ -3044,6 +3047,16 @@ dependencies = [
  "bitflags",
  "hashbrown 0.17.1",
  "indexmap",
+ "semver",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.262.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "974d643b125b272607e2fff8012ea14a8328acd7621e4bafa7afb32500052b1b"
+dependencies = [
+ "bitflags",
  "semver",
 ]
 
@@ -3139,7 +3152,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3401,6 +3414,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bridge"
+version = "0.3.0"
+dependencies = [
+ "core-runtime",
+ "js",
+ "platform",
+ "slab",
+ "smallvec",
+ "web-streams",
+ "wit-bindgen",
+ "wit-dylib-ffi",
+ "wit-name-mapping",
+]
+
+[[package]]
 name = "wit-component"
 version = "0.259.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3415,8 +3443,25 @@ dependencies = [
  "serde_json",
  "wasm-encoder",
  "wasm-metadata",
- "wasmparser",
+ "wasmparser 0.259.0",
  "wit-parser",
+]
+
+[[package]]
+name = "wit-dylib-ffi"
+version = "0.1.0"
+source = "git+https://github.com/bytecodealliance/wasm-tools/?rev=e22db44da4eaf17a0e46ec55b911c7539589a3cc#e22db44da4eaf17a0e46ec55b911c7539589a3cc"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "wit-name-mapping"
+version = "0.3.0"
+dependencies = [
+ "heck",
+ "semver",
+ "wasmparser 0.262.0",
 ]
 
 [[package]]
@@ -3435,7 +3480,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "unicode-ident",
- "wasmparser",
+ "wasmparser 0.259.0",
 ]
 
 [[package]]

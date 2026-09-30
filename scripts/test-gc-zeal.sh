@@ -5,12 +5,16 @@
 # SpiderMonkey's GC zeal is controlled by the JS_GC_ZEAL environment variable:
 #   JS_GC_ZEAL="mode,frequency" or "mode1;mode2,frequency"
 #
+# Without package arguments, the tests of `js`, `core-runtime`, `wit-bridge` and the builtin
+# crates run. `libstarling` is left out: its serve tests have wall-clock timeouts that GC zeal
+# exceeds.
+#
 # Usage:
-#   ./scripts/test-gc-zeal.sh                             # Defaults: quick zeal, js and core-runtime tests
-#   ./scripts/test-gc-zeal.sh quick -p js -p core-runtime # Same as above
-#   ./scripts/test-gc-zeal.sh full                        # Full set of zeal modes, quite slow indeed
-#   ./scripts/test-gc-zeal.sh "2,1"                       # Specific zeal setting
-#   ./scripts/test-gc-zeal.sh full --workspace --examples # All the modes, all the tests, none of the quickness
+#   ./scripts/test-gc-zeal.sh                     # Quick zeal modes, the default packages
+#   ./scripts/test-gc-zeal.sh full                # Full set of zeal modes, quite slow indeed
+#   ./scripts/test-gc-zeal.sh full --shard 2/3    # Every third mode of the full set, from the second
+#   ./scripts/test-gc-zeal.sh "2,1"               # Specific zeal setting
+#   ./scripts/test-gc-zeal.sh quick -p js         # Quick zeal modes, the `js` tests only
 set -euo pipefail
 
 # Zeal configurations, ordered from fastest to slowest.
@@ -38,6 +42,7 @@ FULL_CONFIGS=(
 # to `cargo test`. The mode is recognized as `--zeal <mode>`, as a bare
 # `quick`/`full`, or as a bare JS_GC_ZEAL string such as "2,1" or "1;2;4,1".
 MODE="quick"
+SHARD=""
 CARGO_ARGS=()
 
 # A zeal string is `mode[;mode...],frequency`. Cargo test filters and flags
@@ -46,6 +51,10 @@ ZEAL_RE='^[0-9]+(;[0-9]+)*,[0-9]+$'
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --shard)
+            SHARD="${2:?--shard requires a value such as 1/3}"
+            shift 2
+            ;;
         --zeal)
             MODE="${2:?--zeal requires a value (quick, full, or a JS_GC_ZEAL string)}"
             shift 2
@@ -65,7 +74,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Select the js and core-runtime packages unless the caller selected packages
+# Select the default packages (see the top of this file) unless the caller selected packages
 # themselves.
 PACKAGE_SELECTED=false
 for arg in ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}; do
@@ -78,7 +87,11 @@ for arg in ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}; do
 done
 
 if [[ "$PACKAGE_SELECTED" == false ]]; then
-    CARGO_ARGS=(-p js -p core-runtime ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"})
+    CARGO_ARGS=(
+        -p js -p core-runtime -p wit-bridge
+        -p cpp-builtins -p fetch-event -p web-fetch -p web-globals -p web-streams -p web-url
+        ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
+    )
 fi
 
 # Ensure debugmozjs is enabled for GC zeal testing
@@ -95,6 +108,24 @@ elif [[ "$MODE" == "full" ]]; then
 else
     # User-provided zeal setting
     CONFIGS=("$MODE")
+fi
+
+# `--shard I/N` keeps every Nth configuration, starting with the Ith.
+if [[ -n "$SHARD" ]]; then
+    if [[ ! "$SHARD" =~ ^([0-9]+)/([0-9]+)$ ]] ||
+        (( BASH_REMATCH[1] < 1 || BASH_REMATCH[1] > BASH_REMATCH[2] )); then
+        echo "--shard takes I/N with 1 <= I <= N, got '$SHARD'" >&2
+        exit 2
+    fi
+    SHARD_INDEX=${BASH_REMATCH[1]}
+    SHARD_COUNT=${BASH_REMATCH[2]}
+    SHARD_CONFIGS=()
+    for i in "${!CONFIGS[@]}"; do
+        if (( i % SHARD_COUNT == SHARD_INDEX - 1 )); then
+            SHARD_CONFIGS+=("${CONFIGS[$i]}")
+        fi
+    done
+    CONFIGS=(${SHARD_CONFIGS[@]+"${SHARD_CONFIGS[@]}"})
 fi
 
 echo "Running tests with ${#CONFIGS[@]} GC zeal configuration(s)..."

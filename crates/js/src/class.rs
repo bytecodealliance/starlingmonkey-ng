@@ -2555,6 +2555,32 @@ pub fn get_or_init_shared_object<'s>(
     Ok(obj)
 }
 
+crate::instance_local! {
+    /// The names [`static_property_name`] returned, by their text.
+    static STATIC_PROPERTY_NAMES: RefCell<HashMap<Box<str>, &'static CStr>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Returns `name` as a NUL-terminated string that is never freed, the same one for every call with
+/// the same `name`, for property names known only at runtime that [`get_or_init_property_id`]
+/// interns.
+///
+/// Each distinct `name` is allocated once, so pass only names from a bounded set, such as the
+/// field names of a WIT world.
+///
+/// # Panics
+///
+/// Panics if `name` contains a NUL character.
+pub fn static_property_name(name: &str) -> &'static CStr {
+    if let Some(interned) = STATIC_PROPERTY_NAMES.with(|names| names.borrow().get(name).copied()) {
+        return interned;
+    }
+    let owned = CString::new(name).expect("property names contain no NUL character");
+    let interned: &'static CStr = Box::leak(owned.into_boxed_c_str());
+    STATIC_PROPERTY_NAMES.with(|names| names.borrow_mut().insert(name.into(), interned));
+    interned
+}
+
 /// Return, and create on the first call in a given global, an interned property key for `name`.
 ///
 /// # Panics

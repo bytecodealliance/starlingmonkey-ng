@@ -217,13 +217,13 @@ times, so they're not enabled for the entire test suite.
 `just gc-zeal` runs them, and `scripts/test-gc-zeal.sh` lists the zeal modes and arguments:
 
 ```bash
-just gc-zeal                               # quick mode, covering the `js` and `core-runtime` crates
-just gc-zeal full                          # exhaustive checks for the same crates, takes a few minutes
-just gc-zeal full --workspace --examples   # every mode over the examples' tests
+just gc-zeal                      # quick mode, over `js`, `core-runtime`, `wit-bridge` and the builtins
+just gc-zeal full                 # every mode over the same crates, takes several minutes
+just gc-zeal full --shard 1/3     # every third mode, as each of CI's three GC zeal jobs runs them
+just gc-zeal quick -p web-fetch   # one crate's tests
 ```
 
-Crown suffices for most code outside the `js` and `core-runtime` crates. A failure the dynamic
-checks find outside those crates indicates a bug in one of them.
+`libstarling` isn't covered, since its serve tests have wall-clock timeouts that GC zeal exceeds.
 
 Test GC-sensitive builtins with the debug engine, which `just build` and `just test` enable through
 the `debugmozjs` feature. For a thorough check, also run them under GC zeal: `JS_GC_ZEAL=14,1` runs

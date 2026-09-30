@@ -159,7 +159,7 @@ pub(crate) async unsafe fn drain_lifetime_work<S, F>(
 /// Map a `Response`'s status to a value the HTTP wire can represent, replacing
 /// anything outside the valid status-code range (e.g. `Response.error()`'s `0`)
 /// with `500`. RFC 9110 status codes are three digits in `100..=599`.
-fn normalize_http_status(status: u16) -> u16 {
+pub(crate) fn normalize_http_status(status: u16) -> u16 {
     if (100..=599).contains(&status) {
         status
     } else {
@@ -215,7 +215,7 @@ pub(crate) fn signal_request_abort(
 
 /// The request's header fields as the list a `Headers` object holds. The fetch spec stores those
 /// as ordered name/value pairs, not as a map, so the fields are flattened back out here.
-fn header_list(headers: &http::HeaderMap) -> Vec<(String, String)> {
+pub(crate) fn header_list(headers: &http::HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(name, value)| {
@@ -476,9 +476,9 @@ where
             } else if !FetchEvent::has_listener(scope) {
                 // The script never registered a handler at all. The startup paths refuse that
                 // outright where they can (see [`NO_FETCH_LISTENER`]), so reaching here means they
-                // couldn't: a per-request evaluation under `--serve-isolated`, a script still
-                // evaluating when the snapshot was taken, or a host that owns the instance's
-                // lifecycle and leaves the guest no way to decline.
+                // couldn't: a per-request evaluation under `--serve-isolated`, a snapshot of a
+                // script that exports `run` instead, or a host that owns the instance's lifecycle
+                // and leaves the guest no way to decline.
                 eprintln!("serve: {NO_FETCH_LISTENER}; answering with a network error");
             } else {
                 eprintln!(

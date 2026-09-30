@@ -1,0 +1,35 @@
+[package]
+name = "wit-bridge"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[features]
+debugmozjs = ['js/debugmozjs']
+
+[dependencies]
+wit-name-mapping.workspace = true
+core-runtime.workspace = true
+platform.workspace = true
+slab.workspace = true
+smallvec.workspace = true
+js.workspace = true
+web-streams.workspace = true
+
+# Only the wasm-only modules name `wit-dylib-ffi`. The rev is a `wasm-tools`
+# 1.262.0 commit, matching the `wit-dylib` 0.262 the componentizer uses, so both
+# sides agree on the wit-dylib ABI. `async-runtime` runs async-declared exports
+# on wit-bindgen's executor, the one the wasip3 builtins run on.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-dylib-ffi = { git = "https://github.com/bytecodealliance/wasm-tools/", rev = "e22db44da4eaf17a0e46ec55b911c7539589a3cc", features = [
+    "async-runtime",
+] }
+# `src/streams.rs` reads and writes streams and futures through wit-bindgen's
+# readers and writers. wit-dylib-ffi depends on the same wit-bindgen version, so
+# the linked component holds one copy.
+wit-bindgen = { workspace = true, features = ["async-spawn"] }
+
+[lints]
+workspace = true

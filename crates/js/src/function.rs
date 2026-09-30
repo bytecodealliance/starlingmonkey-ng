@@ -363,7 +363,7 @@ impl<'s> Stack<'s, Function> {
     /// function carries `JSFUN_CONSTRUCTOR`, so `new f(...)` runs the callback as
     /// a constructor. A constructor callback whose return value is an object has
     /// that object adopted as the constructed instance; a non-object return yields a freshly
-    /// allocated `this`. The component-model interpreter uses this to synthesize
+    /// allocated `this`. The `wit-bridge` interpreter uses this to synthesize
     /// imported-resource constructors.
     pub fn new_constructor_callback(
         scope: &'s Scope<'_>,

@@ -95,8 +95,8 @@ fmt-check *ARGS:
 clippy *ARGS:
     cargo clippy --features debugmozjs --all-targets {{ARGS}} -- -D warnings
 
-# Defaults to quick tests on the `js` and `core-runtime` packages. `scripts/test-gc-zeal.sh`
-# documents the arguments.
+# Without arguments, it runs the quick zeal modes over `js`, `core-runtime`, `wit-bridge` and
+# the builtin crates. `scripts/test-gc-zeal.sh` documents the arguments.
 #
 # Run GC zeal stress tests.
 gc-zeal *ARGS:
@@ -217,3 +217,11 @@ wpt-test-all *PATTERN:
     @just wpt-test-wasm {{PATTERN}}
     @just wpt-test-wasm-serve {{PATTERN}}
     @just wpt-test-serve {{PATTERN}}
+
+# Build the statically linked runtime component (starling.wasm).
+build-runtime:
+    ./scripts/build-runtime.sh
+
+# End-to-end test of the static runtime (build, run scripts under wasmtime).
+test-runtime:
+    ./scripts/test-runtime.sh

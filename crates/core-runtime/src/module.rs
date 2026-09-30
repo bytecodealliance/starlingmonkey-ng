@@ -165,6 +165,22 @@ fn cached_module<'s>(scope: &'s Scope<'_>, key: &str) -> Option<Object<'s>> {
     })
 }
 
+/// The module the registry holds under a versioned WIT interface name compatible
+/// with `specifier`'s (see [`wit_name_mapping::same_interface`]), at the highest
+/// version if it holds several. `None` if `specifier` has no version.
+fn compatible_cached_module<'s>(scope: &'s Scope<'_>, specifier: &str) -> Option<Object<'s>> {
+    if !specifier.contains('@') {
+        return None;
+    }
+    registry(|reg| {
+        let reg = reg.borrow();
+        reg.iter()
+            .filter(|(key, _)| wit_name_mapping::same_interface(key, specifier))
+            .max_by_key(|(key, _)| wit_name_mapping::interface_version(key))
+            .map(|(_, entry)| entry.module_obj.get(scope))
+    })
+}
+
 /// Hold `module` in the registry under `key`.
 fn cache_module(key: String, module: Object<'_>) {
     registry(|reg| {
@@ -335,11 +351,13 @@ unsafe extern "C" fn module_load_hook(
         }
     };
 
-    // 1. Check the module registry for an exact match. The `json:`-prefixed keys
-    // hold JSON modules, which a JavaScript import never gets.
+    // 1. Check the module registry for an exact match, then for a compatible
+    // version of a versioned WIT interface name. The `json:`-prefixed
+    // keys hold JSON modules, which a JavaScript import never gets.
     let cached = match kind {
         ModuleKind::JavaScript if !specifier.starts_with("json:") => {
             cached_module(&scope, &specifier)
+                .or_else(|| compatible_cached_module(&scope, &specifier))
         }
         ModuleKind::JavaScript | ModuleKind::Json => None,
     };
@@ -784,7 +802,7 @@ fn link_evaluate_and_get_env<'s>(scope: &'s Scope<'_>, module: Object<'_>) -> Op
 ///
 /// This generalizes [`register_module`] for callers that synthesize a module's
 /// exports at runtime rather than from a static [`NativeModule`] type: the
-/// component-model interpreter builds one such module per imported WIT interface,
+/// `wit-bridge` interpreter builds one such module per imported WIT interface,
 /// keyed by the interface's WIT specifier (e.g. `"test:iface/x@0.2.0"`), with
 /// the import functions and resource classes as exports.
 ///
@@ -871,14 +889,6 @@ pub unsafe fn evaluate_module<'s>(
     source: &str,
     filename: &str,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let c_filename = CString::new(filename).unwrap();
-    let options = js::compile::options(scope, c_filename, 1);
-
-    let mut src = transform_str_to_source_text(source);
-    // SAFETY: `options` and `src` are live locals.
-    let module = unsafe { js::module::compile_module(scope, options.ptr, &mut src) }
-        .map_err(|_| ExnThrown)?;
-
     // If the filename is a path in an existing directory, or a file in the
     // current directory, register the entry as that file's module. Other entries
     // (eval scripts, synthetic filenames) are recorded as the entry only, and
@@ -888,10 +898,42 @@ pub unsafe fn evaluate_module<'s>(
         Some(parent) if !parent.as_os_str().is_empty() => parent.exists(),
         _ => path.is_file(),
     };
-    if is_path {
-        register_entry_module(scope, module, path)?;
-    } else {
-        record_entry_module(module, filename);
+    // SAFETY: the caller guarantees the module loader was initialized.
+    unsafe { evaluate_entry_module(scope, source, filename, is_path.then_some(path)) }
+}
+
+/// Evaluate `source` as the entry module, compiled under `name`, which stack
+/// traces and error messages show for it.
+///
+/// With a `path`, the module is registered as the module of that file (see
+/// [`register_entry_module`]). Without one, it is recorded as the entry under
+/// `name` only, and its relative imports resolve against the loader's base path.
+/// Either way, [`entry_namespace`] reads its namespace afterwards.
+///
+/// # Panics
+///
+/// Panics if `name` contains a NUL character.
+///
+/// # Safety
+///
+/// [`init_module_loader`] must have been called first.
+pub unsafe fn evaluate_entry_module<'s>(
+    scope: &'s Scope<'_>,
+    source: &str,
+    name: &str,
+    path: Option<&Path>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let c_name = CString::new(name).expect("module names contain no NUL character");
+    let options = js::compile::options(scope, c_name, 1);
+
+    let mut src = transform_str_to_source_text(source);
+    // SAFETY: `options` and `src` are live locals.
+    let module = unsafe { js::module::compile_module(scope, options.ptr, &mut src) }
+        .map_err(|_| ExnThrown)?;
+
+    match path {
+        Some(path) => register_entry_module(scope, module, path)?,
+        None => record_entry_module(module, name),
     }
 
     js::module::load_requested_modules(scope, module).map_err(|_| ExnThrown)?;
@@ -1161,6 +1203,57 @@ mod tests {
                 "entry.mjs",
             );
             assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn versioned_specifier_resolves_to_a_compatible_version() {
+        let rt = test_runtime();
+        let scope = rt.default_global();
+        for (name, version) in [
+            ("test:pkg/iface@0.2.3", 3),
+            ("test:pkg/iface@0.2.9", 9),
+            ("test:pkg/major@1.10.0", 10),
+            ("test:pkg/major@1.2.0", 2),
+        ] {
+            let value = scope.root_value(js::value::from_u32(version));
+            register_synthetic_module(&scope, name, &[("version", value)])
+                .expect("registering the module");
+        }
+        unsafe {
+            evaluate_module(
+                &scope,
+                r#"import { version } from "test:pkg/iface@0.2.12";
+                   globalThis._patchVersion = version;"#,
+                "entry.mjs",
+            )
+            .expect("a patch version the registry lacks resolves to a compatible one");
+            assert_eq!(read_global_f64(&scope, "globalThis._patchVersion"), 9.0);
+            evaluate_module(
+                &scope,
+                r#"import { version } from "test:pkg/iface@0.2";
+                   globalThis._minorVersion = version;"#,
+                "no-patch.mjs",
+            )
+            .expect("a version without a patch number resolves to a compatible one");
+            assert_eq!(read_global_f64(&scope, "globalThis._minorVersion"), 9.0);
+            evaluate_module(
+                &scope,
+                r#"import { version } from "test:pkg/major@1";
+                   globalThis._majorVersion = version;"#,
+                "major.mjs",
+            )
+            .expect("a canonical major version resolves to the highest compatible one");
+            assert_eq!(read_global_f64(&scope, "globalThis._majorVersion"), 10.0);
+            let result = evaluate_module(
+                &scope,
+                r#"import { version } from "test:pkg/iface@0.3.0";"#,
+                "minor.mjs",
+            );
+            assert!(
+                result.is_err(),
+                "a different minor version must not resolve"
+            );
         }
     }
 
