@@ -1,0 +1,17 @@
+{
+  "name": "starling-debug-adapter",
+  "private": true,
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit && eslint src",
+    "bundle": "esbuild src/main.ts --bundle --format=iife --platform=neutral --target=es2022 --charset=utf8 --legal-comments=none \"--banner:js=// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception\" --outfile=dist/adapter.js"
+  },
+  "devDependencies": {
+    "@vscode/debugprotocol": "1.68.0",
+    "esbuild": "0.28.2",
+    "eslint": "10.11.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.0"
+  }
+}

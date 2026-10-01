@@ -53,18 +53,45 @@ pub fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), Strin
     Ok(())
 }
 
+/// Canonicalize the entry script's path. The entry script's filename becomes its URL in the
+/// debugger, which maps only absolute paths to client paths. A path that cannot be canonicalized
+/// is kept as given. Does nothing for a `-e` script.
+fn canonicalize_script_path(config: &mut config::RuntimeConfig) {
+    if config.eval_script.is_some() {
+        return;
+    }
+    if let Some(path) = std::fs::canonicalize(&config.script_path)
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+    {
+        config.script_path = path;
+    }
+}
+
 /// Run a JavaScript script or module on native targets.
 ///
-/// Registers all builtin globals and then delegates to [`core_runtime::run()`]
-/// with a tokio-based event loop driver.
+/// Registers all builtin globals and then delegates to [`serve_native::serve`] with `--serve`, and
+/// to [`core_runtime::run()`] with a tokio-based event loop driver otherwise.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn run(config: config::RuntimeConfig) -> Result<(), String> {
+pub fn run(mut config: config::RuntimeConfig) -> Result<(), String> {
     apply_pre_init_config(&config)?;
     register_builtins();
-    if let Some(port) = config.serve {
-        return serve_native::serve(config, port);
+    let debugging = config.debug.is_some();
+    if debugging {
+        canonicalize_script_path(&mut config);
+        match config.serve {
+            Some(_) => debugger::register_for_serve(),
+            None => debugger::register(),
+        }
     }
-    core_runtime::run(config, drive_event_loop_native)
+    let result = match config.serve {
+        Some(port) => serve_native::serve(config, port),
+        None => core_runtime::run(config, drive_event_loop_native),
+    };
+    if debugging {
+        debugger::finish(&result);
+    }
+    result
 }
 
 /// Run a JavaScript script or module on wasm32 targets.
@@ -75,10 +102,24 @@ pub fn run(config: config::RuntimeConfig) -> Result<(), String> {
 /// async-lifted task. The cdylib in the `starling` package provides such a
 /// task via `wasip3::cli::command::export!`.
 #[cfg(target_arch = "wasm32")]
-pub async fn run(config: config::RuntimeConfig) -> Result<(), String> {
+pub async fn run(mut config: config::RuntimeConfig) -> Result<(), String> {
     apply_pre_init_config(&config)?;
     register_builtins();
+    let debugging = config.debug.is_some();
+    if debugging {
+        canonicalize_script_path(&mut config);
+        debugger::register();
+    }
+    let result = run_wasm(config).await;
+    if debugging {
+        debugger::finish(&result);
+    }
+    result
+}
 
+/// The body of the wasm32 [`run`], after the builtins are registered.
+#[cfg(target_arch = "wasm32")]
+async fn run_wasm(config: config::RuntimeConfig) -> Result<(), String> {
     // `--serve` has no meaning for this entry point. Serving on wasm is the `wasi:http/handler`
     // export (see `serve_wasm`), which the host invokes directly — the component exports both, and
     // running it as a command is the host having picked the other one. Say so rather than running
@@ -113,12 +154,21 @@ pub async fn run(config: config::RuntimeConfig) -> Result<(), String> {
     let raw_cx = unsafe { scope.raw_cx_no_gc() };
     let el = invocation.event_loop();
 
-    // SAFETY: `raw_cx` is valid for the duration of the await — `scope`
-    // keeps the `Runtime` alive and the realm entered.
-    unsafe {
-        evaluation
-            .run_to_completion(raw_cx, el, platform::clock::sleep)
-            .await;
+    {
+        // SAFETY: `raw_cx` is valid for the duration of the await. `scope`
+        // keeps the `Runtime` alive and the realm entered.
+        let content = std::pin::pin!(unsafe {
+            evaluation.run_to_completion(raw_cx, el, platform::clock::sleep)
+        });
+        // SAFETY: as above.
+        let debugger = std::pin::pin!(unsafe {
+            debugger::serve_while_running(
+                raw_cx,
+                debugger::RunningLoop::Content(el),
+                platform::clock::sleep,
+            )
+        });
+        futures_util::future::select(content, debugger).await;
     }
 
     let settled = evaluation.settled(&scope, "Script evaluation failed");
@@ -158,15 +208,21 @@ fn drive_event_loop_native(
     let el = invocation.event_loop();
 
     tokio_rt.block_on(async {
-        // SAFETY: the scope (and its Runtime) must outlive this future.
-        // Since the caller owns both and `block_on` runs synchronously on
-        // the same thread, this is guaranteed.
+        // SAFETY: the scope (and its Runtime) outlives this future. Since the caller owns both
+        // and `block_on` runs synchronously on the same thread, this is guaranteed.
         let raw_cx = unsafe { scope.raw_cx_no_gc() };
-        unsafe {
-            evaluation
-                .run_to_completion(raw_cx, el, tokio::time::sleep)
-                .await
-        }
+        // SAFETY: as above, and `scope` keeps the default realm entered while either future runs.
+        let content =
+            std::pin::pin!(unsafe { evaluation.run_to_completion(raw_cx, el, tokio::time::sleep) });
+        // SAFETY: as above.
+        let debugger = std::pin::pin!(unsafe {
+            debugger::serve_while_running(
+                raw_cx,
+                debugger::RunningLoop::Content(el),
+                tokio::time::sleep,
+            )
+        });
+        futures_util::future::select(content, debugger).await;
     });
 
     drop(scope);

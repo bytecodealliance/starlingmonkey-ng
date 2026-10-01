@@ -132,6 +132,27 @@ async fn top_level_call_of_a_throwing_export_fails_componentization() {
     );
 }
 
+/// A main module named by the host path of a file in the base directory is
+/// compiled under that file's path relative to the base directory, so its stack
+/// traces show no host path.
+#[tokio::test]
+async fn main_module_is_named_by_its_path_in_the_base_directory() {
+    let host_path = base_directory().join("main.js");
+    let err = build(componentize::JsSource {
+        name: host_path.to_str().expect("a UTF-8 fixture path"),
+        text: "throw new Error(`stack: ${new Error().stack}`);",
+    })
+    .await
+    .expect_err("a guest whose top level throws must not componentize");
+    let message = format!("{err:#}");
+    assert!(message.contains("stack: @/main.js:1:"), "{message}");
+    let base = base_directory();
+    assert!(
+        !message.contains(base.to_str().expect("a UTF-8 fixture path")),
+        "{message}"
+    );
+}
+
 /// A top-level `await` on a promise nothing settles fails componentization
 /// once the event loop has no work left.
 #[tokio::test]
@@ -268,6 +289,7 @@ async fn init_output_is_returned() -> anyhow::Result<()> {
         &runtime,
         &[],
         None,
+        false,
         None,
         None,
         true,
@@ -306,6 +328,7 @@ async fn top_level_reads_the_init_location() -> anyhow::Result<()> {
             &runtime,
             &[],
             None,
+            false,
             None,
             init_location,
             true,

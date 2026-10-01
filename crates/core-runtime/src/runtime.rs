@@ -115,6 +115,65 @@ pub fn clear_global_initializers() {
 }
 
 // ---------------------------------------------------------------------------
+// Before-content and shutdown hooks
+// ---------------------------------------------------------------------------
+
+/// Callback type for work that runs after the runtime is initialized and before the content
+/// script is evaluated.
+type BeforeContentFn = fn(&Runtime, &RuntimeConfig) -> Result<(), String>;
+
+js::instance_local! {
+    static BEFORE_CONTENT_HOOKS: RefCell<Vec<BeforeContentFn>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Register a function to run after [`Runtime::init`] and before the content script is read and
+/// evaluated. An `Err` aborts the run with that message, and the content script does not run.
+///
+/// Registration is idempotent.
+pub fn register_before_content_hook(hook: BeforeContentFn) {
+    BEFORE_CONTENT_HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        if !hooks.contains(&hook) {
+            hooks.push(hook);
+        }
+    });
+}
+
+/// Run every hook registered with [`register_before_content_hook`], in registration order,
+/// stopping at the first `Err`.
+pub fn run_before_content_hooks(runtime: &Runtime, config: &RuntimeConfig) -> Result<(), String> {
+    let hooks = BEFORE_CONTENT_HOOKS.with(|hooks| hooks.borrow().clone());
+    hooks.into_iter().try_for_each(|hook| hook(runtime, config))
+}
+
+/// Callback type for work that runs when a runtime is dropped, while its context is alive.
+type ShutdownFn = fn(&Runtime);
+
+js::instance_local! {
+    static SHUTDOWN_HOOKS: RefCell<Vec<ShutdownFn>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Register a function to run first in `Runtime`'s `Drop`, while the context and the default
+/// global are alive. Use it to release GC things held outside the runtime.
+///
+/// Registration is idempotent.
+pub fn register_shutdown_hook(hook: ShutdownFn) {
+    SHUTDOWN_HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        if !hooks.contains(&hook) {
+            hooks.push(hook);
+        }
+    });
+}
+
+/// Clear all registered before-content and shutdown hooks (used between tests that need
+/// disjoint hook sets).
+pub fn clear_runtime_hooks() {
+    BEFORE_CONTENT_HOOKS.with(|hooks| hooks.borrow_mut().clear());
+    SHUTDOWN_HOOKS.with(|hooks| hooks.borrow_mut().clear());
+}
+
+// ---------------------------------------------------------------------------
 // Engine singleton
 // ---------------------------------------------------------------------------
 
@@ -302,7 +361,8 @@ impl Runtime {
     }
 
     /// Create a new global object (and realm), install all registered global initializers on it,
-    /// and return a scope entered into it.
+    /// fire the `onNewGlobalObject` hook of every `Debugger` for it, and return a scope entered
+    /// into it.
     ///
     /// The first global created becomes the runtime's default global (see
     /// [`default_global`](Self::default_global)), later ones are additional realms and leave the
@@ -335,6 +395,7 @@ impl Runtime {
         for init in inits {
             init(&scope, scope.global());
         }
+        js::class::fire_on_new_global_object(&scope, scope.global().handle());
 
         scope
     }
@@ -464,10 +525,15 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        let hooks = SHUTDOWN_HOOKS.with(|hooks| hooks.borrow().clone());
+        for hook in hooks {
+            hook(self);
+        }
         // SAFETY: stopping the recording has no precondition.
         unsafe { js::stack::record_origins(None) };
-        // The tracked promises are rooted, so they go while the context is alive.
+        // The tracked promises and held jobs are rooted, so they go while the context is alive.
         js::jobs::clear_unhandled_rejections();
+        js::jobs::clear_held_jobs();
         // Futures left by loops that were never canceled, and those spawned with no loop active,
         // have to go while the context is alive.
         js::promise::cancel_all_pending_futures();

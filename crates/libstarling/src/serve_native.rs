@@ -111,7 +111,9 @@ pub fn serve_with_shutdown(
     // its side effects) one extra time, in a global that goes on to serve nothing, so that mode
     // only sets up the runtime itself.
     let (runtime, startup) = if config.serve_isolated {
-        (Runtime::init(&config)?, None)
+        let runtime = Runtime::init(&config)?;
+        core_runtime::runtime::run_before_content_hooks(&runtime, &config)?;
+        (runtime, None)
     } else {
         let (runtime, invocation, evaluation) = core_runtime::setup_for_serve(config.clone())?;
         (runtime, Some((invocation, evaluation)))
@@ -198,6 +200,12 @@ async fn run_server(
     let background_loop = background
         .as_mut()
         .map(|(invocation, _)| invocation.state().event_loop());
+    // SAFETY: `raw_cx` is valid for the server's life, and `in_default_realm` enters the default
+    // global's realm for every poll. An isolated request holds its own realm entered across
+    // awaits, so the realm current between polls is not always the default one.
+    let mut debugger = std::pin::pin!(in_default_realm(&runtime, unsafe {
+        debugger::serve_while_running(raw_cx, debugger::RunningLoop::Debugger, tokio::time::sleep)
+    }));
 
     // We clone rather than move the caller's handle. `server_realm` points into this runtime, and
     // a local holding the last reference would free the runtime on the way out ahead of
@@ -224,7 +232,8 @@ async fn run_server(
     let mut work: FuturesUnordered<BackgroundWork> = FuturesUnordered::new();
 
     // Each iteration races the shutdown signal, a new connection, the registered request work,
-    // an in-flight connection finishing and the script's background work, so all make progress.
+    // an in-flight connection finishing, the script's background work and the debugger, so all
+    // make progress.
     let mut in_flight = FuturesUnordered::new();
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -281,18 +290,27 @@ async fn run_server(
                             in_flight.next().await;
                             Step::ConnectionDone
                         },
-                        async {
-                            // Keep the content script's own loop running alongside serving, so a
-                            // `setInterval` it left running actually fires. This arm never yields
-                            // a `Step`: it runs for as long as the server does, and its timers
-                            // wake this task when they come due.
-                            // TODO: same as in wasm: should reconsider this and abort work not
-                            // added to waitUntil.
-                            if let Some(event_loop) = background_loop {
-                                run_background_work(raw_cx, event_loop).await;
-                            }
-                            std::future::pending::<Step>().await
-                        },
+                        futures_lite::future::or(
+                            async {
+                                // Keep the content script's own loop running alongside serving,
+                                // so a `setInterval` it left running actually fires. This arm
+                                // never yields a `Step`: it runs for as long as the server does,
+                                // and its timers wake this task when they come due.
+                                // TODO: same as in wasm: should reconsider this and abort work
+                                // not added to waitUntil.
+                                if let Some(event_loop) = background_loop {
+                                    run_background_work(raw_cx, event_loop).await;
+                                }
+                                std::future::pending::<Step>().await
+                            },
+                            async {
+                                // Pass debugger messages that arrive while no request is paused
+                                // to the adapter, and drive the debugger's event loop. The future
+                                // never completes.
+                                debugger.as_mut().await;
+                                std::future::pending::<Step>().await
+                            },
+                        ),
                     ),
                 ),
             ),
@@ -303,7 +321,8 @@ async fn run_server(
                 // The script's own loop is abandoned here with whatever it still had in flight
                 // (e.g. a pending `fetch` or a timer), so it is released while the JSContext is
                 // alive rather than at thread teardown. See [`RequestLoop`] for what that means.
-                // The requests' loops release themselves as `work` and `in_flight` drop.
+                // The requests' loops release themselves as `work` and `in_flight` drop, and the
+                // debugger releases its loop when the runtime is dropped.
                 if let Some(event_loop) = background_loop {
                     event_loop.cancel_pending_futures();
                 }
@@ -336,6 +355,17 @@ async fn run_server(
 async fn run_background_work(raw_cx: *mut js::native::RawJSContext, event_loop: &EventLoop) {
     // SAFETY: `raw_cx` is valid, with the serve loop's realm entered, for the server's life.
     unsafe { run_to_completion(raw_cx, event_loop, tokio::time::sleep).await };
+}
+
+/// Poll `future` with the default global's realm entered. The realm is entered at the start of
+/// each poll and left before the poll returns.
+async fn in_default_realm<F: Future>(runtime: &Runtime, future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let _realm = runtime.default_global();
+        future.as_mut().poll(cx)
+    })
+    .await
 }
 
 /// A request's event loop, released once all work related to the request is done or abandoned.
@@ -510,6 +540,10 @@ async fn serve_request<'a>(
         // A declared length over the cap is refused here, before the handler runs.
         Err(status) => return Ok(status_response(status)),
     };
+
+    // In a `connect` debug session without a client, this connects and waits until the client
+    // is configured. That wait does not count towards the request's deadline.
+    debugger::before_request(&context.runtime);
 
     // Everything from here on (isolated mode's startup, the dispatch, the response) is this
     // request's own work, so its end-to-end deadline starts here.

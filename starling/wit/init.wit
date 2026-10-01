@@ -27,6 +27,9 @@ interface init {
   /// module's top level evaluates, or `none` to leave it unset, which makes
   /// reading `location` throw.
   ///
+  /// `debug` lets instances resumed from the snapshot start a debug session from
+  /// the `STARLING_DEBUG` environment variable.
+  ///
   /// `init` returns once the main module's top level, including a top-level
   /// `await`, has finished evaluating.
   init: async func(
@@ -36,6 +39,7 @@ interface init {
     cli: bool,
     raw-http-handler: option<string>,
     init-location: option<string>,
+    debug: bool,
   ) -> result<bool, string>;
 }
 

@@ -31,6 +31,7 @@ wpt-support.workspace = true
 web-streams.workspace = true
 web-url.workspace = true
 cpp-builtins.workspace = true
+debugger.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures-channel.workspace = true

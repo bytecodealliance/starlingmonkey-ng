@@ -128,6 +128,16 @@ gc-zeal *ARGS:
 check-gc:
     ./scripts/check-crown.sh --workspace --all --examples
 
+# Type-check, lint and bundle the debugger's DAP adapter into `crates/debugger/adapter/dist`.
+# Needs Node and npm.
+build-debugger-adapter:
+    cd crates/debugger/adapter && npm ci --silent && npm run --silent check && npm run --silent bundle
+
+# Fail if the committed adapter bundle differs from a fresh build of its source.
+check-debugger-adapter:
+    just build-debugger-adapter
+    git diff --exit-code -- crates/debugger/adapter/dist/adapter.js
+
 # Run basic checks: formatting, clippy, tests.
 check:
     just fmt-check --all
@@ -136,6 +146,7 @@ check:
 
 # Run most checks: `check` + `check-gc` + `gc-zeal`.
 check-all:
+    just check-debugger-adapter
     just check
     just check-gc
     just gc-zeal
@@ -184,6 +195,25 @@ test-serve-wasm-release *ARGS:
     @just build-wasm-release -p starlingmonkey
     STARLING_WASM_COMPONENT="{{_wasm_out}}/release/starling.wasm" \
         cargo test -p serve-test-support --test serve_wasm_e2e {{ARGS}}
+
+# Run the wasm debugger tests: a DAP client debugs the p3 component under `wasmtime run` over
+# stdio and TCP. Builds the component first. Needs wasmtime on PATH, and `WASI_SDK_PATH` naming a
+# wasi-sdk that builds p3.
+test-debugger-wasm *ARGS:
+    @WASM_TARGET=p3 just build-wasm -p starlingmonkey
+    STARLING_WASM_COMPONENT="${CARGO_TARGET_DIR:-{{justfile_directory()}}/target}/wasm32-wasip3/debug/starling.wasm" \
+        cargo test --features debugmozjs -p starlingmonkey --test debugger_wasm {{ARGS}}
+
+# Build the `starling-dap-relay` component for wasm32-wasip3 in release mode.
+build-dap-relay:
+    cargo +{{NIGHTLY}} build -p dap-relay --target wasm32-wasip3 --release
+
+# Run the relay tests: a DAP client debugs a native debuggee through the relay component under
+# `wasmtime run`. Builds the relay first. Needs wasmtime on PATH.
+test-dap-relay *ARGS:
+    @just build-dap-relay
+    STARLING_DAP_RELAY="${CARGO_TARGET_DIR:-{{justfile_directory()}}/target}/wasm32-wasip3/release/dap_relay.wasm" \
+        cargo test --features debugmozjs -p starlingmonkey --test debugger_relay {{ARGS}}
 
 # Run WPT tests against the wasm binary.
 [group('wpt')]

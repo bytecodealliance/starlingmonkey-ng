@@ -33,7 +33,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Formatting and clippy lints.
+  # Formatting, clippy lints, and the debugger adapter bundle check.
   # ---------------------------------------------------------------------------
   lint:
     name: Lint
@@ -50,6 +50,13 @@ jobs:
 
       - name: Run clippy
         run: just clippy --all
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+
+      - name: Check the debugger adapter bundle
+        run: just check-debugger-adapter
 
   # ---------------------------------------------------------------------------
   # The `init` interface between the runtime and the componentizer
@@ -113,6 +120,16 @@ jobs:
       - name: Run example tests
         if: matrix.target != 'native'
         run: just ${{ matrix.recipe }} --examples
+
+      # A DAP client debugs the p3 component under `wasmtime run` and `wasmtime serve`.
+      - name: Run the wasm debugger tests
+        if: matrix.target == 'wasm32-wasip3' && matrix.profile == 'debug'
+        run: just test-debugger-wasm
+
+      # A DAP client debugs a native debuggee through the relay component.
+      - name: Run the DAP relay tests
+        if: matrix.target == 'wasm32-wasip3' && matrix.profile == 'debug'
+        run: just test-dap-relay
 
   # ---------------------------------------------------------------------------
   # Componentization suites against the static runtime (`just test-componentize`).

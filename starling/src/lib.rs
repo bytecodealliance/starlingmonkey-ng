@@ -129,7 +129,7 @@ mod static_init {
 /// The two differ only in where their configuration comes from. The CLI export is handed argv;
 /// the HTTP export is not (`wasmtime serve` passes none), so it reads `STARLINGMONKEY_CONFIG`.
 mod wasm_entry {
-    use component_model::run::{report_run_outcome, run_main_export, MainModule};
+    use component_model::run::{run_main_export, MainModule};
     use core_runtime::invocation::{InvocationState, OwnedInvocation};
     use libstarling::config::RuntimeConfig;
 
@@ -162,8 +162,11 @@ mod wasm_entry {
             // any, so `run` starts on a fresh loop, after the resume fixups have repaired the
             // clocks.
             libstarling::serve_wasm::fix_up_after_resume();
+            debugger::start_after_resume(&runtime);
             let invocation = OwnedInvocation::new(runtime, InvocationState::new());
-            report_run_outcome(run_main_export(&invocation, main).await)
+            let outcome = run_main_export(&invocation, main).await.into_result();
+            debugger::finish(&outcome);
+            outcome.map_err(|message| eprintln!("{message}"))
         }
     }
 
@@ -283,6 +286,9 @@ mod init_export {
         ///
         /// `init_location` is the URL `globalThis.location` reflects during
         /// initialization, if any.
+        ///
+        /// With `debug`, instances resumed from the snapshot start a debug
+        /// session from `STARLING_DEBUG`.
         async fn init(
             main: String,
             main_name: String,
@@ -290,7 +296,11 @@ mod init_export {
             cli: bool,
             raw_http_handler: Option<String>,
             init_location: Option<String>,
+            debug: bool,
         ) -> Result<bool, String> {
+            if debug {
+                debugger::allow_debugging_in_snapshot();
+            }
             // Registered before `initialize_runtime` calls `Runtime::init`, which
             // fires every global initializer on the default global.
             libstarling::register_builtins();

@@ -51,19 +51,13 @@ mod shared;
 use shared::HttpCtx as Ctx;
 
 use {
-    bytes::Bytes,
-    futures::future::{select, Either},
-    http_body_util::{BodyExt as _, Collected, Full},
-    std::{path::PathBuf, pin::pin},
+    std::path::PathBuf,
     tokio::sync::OnceCell,
     wasmtime::{
         component::{Component, Linker},
         Engine, Store,
     },
-    wasmtime_wasi_http::{
-        p3::bindings::{http::types::ErrorCode, Service},
-        p3::Request,
-    },
+    wasmtime_wasi_http::p3::bindings::{http::types::ErrorCode, Service},
 };
 
 /// The body of the harness's response to every outgoing request.
@@ -124,21 +118,6 @@ fn store() -> Store<Ctx> {
     shared::http_store(&ENGINE, UPSTREAM_BODY)
 }
 
-/// Build a linker for the serve component: the p2 WASI surface (the runtime
-/// imports `wasi:io/poll@0.2.x`, `wasi:cli/*@0.2.x`, … for its non-async paths),
-/// the p3 surface (the event-loop sleep awaits the p3 monotonic clock), the p3
-/// `wasi:http` host (the serve handler's request/response resources cross the
-/// boundary through it), plus trapping stubs for the runtime's other transitive
-/// imports this serve app never calls.
-fn linker(component: &Component) -> Linker<Ctx> {
-    let mut linker = Linker::new(&ENGINE);
-    componentize::add_wasi(&mut linker).expect("wasi linker");
-    wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("wasi:http p3 linker");
-    componentize::trap_unsatisfied_imports(&ENGINE, component, &mut linker, &["wasi:http/"])
-        .expect("trap-stub unknown imports");
-    linker
-}
-
 /// Drive `wasi:http/handler.handle()` on a fresh instance of a component with a
 /// bodyless `method` request to `path`. Returns the response status and the
 /// collected body as a string, or the `error-code` the handler returned.
@@ -148,68 +127,13 @@ async fn handle_request(
     path: &str,
 ) -> anyhow::Result<Result<(u16, String), ErrorCode>> {
     let mut store = store();
-    let service = Service::instantiate_async(&mut store, component, &linker(component)).await?;
-    handle_on(&mut store, &service, method, path, "").await
-}
-
-/// Drive `wasi:http/handler.handle()` on `service`, an instance in `store`, with
-/// a `method` request to `path` whose body is `body`. Returns what
-/// [`handle_request`] returns.
-async fn handle_on(
-    store: &mut Store<Ctx>,
-    service: &Service,
-    method: &str,
-    path: &str,
-    body: &'static str,
-) -> anyhow::Result<Result<(u16, String), ErrorCode>> {
-    // `Full<Bytes>`'s error type is `Infallible`, which `ErrorCode:
-    // From<Infallible>` lifts into the wit stream's element error.
-    let req = http::Request::builder()
-        .method(method)
-        .uri(format!("http://example.com{path}"))
-        .header(http::header::CONTENT_LENGTH, body.len())
-        .body(Full::new(Bytes::from_static(body.as_bytes())))
-        .expect("building the request");
-    let (req, io) = Request::from_http(
-        &mut shared::UpstreamHooks {
-            body: UPSTREAM_BODY,
-        },
-        req,
-    );
-
-    let response: Result<http::Response<Collected<Bytes>>, ErrorCode> = store
-        .run_concurrent(async |store| {
-            // The handler call and the request-body-processing future run
-            // concurrently: `io` resolves once the (empty) request body is
-            // consumed, while `handle` drives the guest to a response. A handler
-            // that responds without consuming the body leaves `io` pending, so the
-            // response is returned without waiting for it.
-            let handled = pin!(async {
-                let res = match service.handle(store, req).await? {
-                    Ok(res) => res,
-                    Err(code) => return anyhow::Ok(Err(code)),
-                };
-                let res = store.with(|store| res.into_http(store, async { Ok(()) }))?;
-                let (parts, body) = res.into_parts();
-                let body = body.collect().await?;
-                anyhow::Ok(Ok(http::Response::from_parts(parts, body)))
-            });
-            let io = pin!(async { io.await.map_err(|e| anyhow::anyhow!("request body: {e:?}")) });
-            match select(handled, io).await {
-                Either::Left((res, _io)) => res,
-                Either::Right((io, handled)) => {
-                    io?;
-                    handled.await
-                }
-            }
-        })
-        .await??;
-
-    Ok(response.map(|response| {
-        let status = response.status().as_u16();
-        let body = String::from_utf8_lossy(&response.into_body().to_bytes()).into_owned();
-        (status, body)
-    }))
+    let service = Service::instantiate_async(
+        &mut store,
+        component,
+        &shared::http_linker(&ENGINE, component),
+    )
+    .await?;
+    shared::handle_on(&mut store, &service, method, path, "").await
 }
 
 /// `--cli` and `--serve` together build one component that serves requests
@@ -269,7 +193,7 @@ async fn cli_and_serve_component_serves_and_runs() -> anyhow::Result<()> {
     let command = wasmtime_wasi::p3::bindings::Command::instantiate_async(
         &mut store,
         &component,
-        &linker(&component),
+        &shared::http_linker(&ENGINE, &component),
     )
     .await?;
     let result = store
@@ -360,6 +284,7 @@ async fn deterministic_insecure_seed_is_returned() -> anyhow::Result<()> {
                 runtime,
                 disabled,
                 insecure_seed,
+                false,
                 None,
                 None,
                 true,
@@ -449,14 +374,19 @@ async fn runtime_imports_world_leaves_out_disabled_features() -> anyhow::Result<
 async fn one_instance_serves_several_requests() -> anyhow::Result<()> {
     let component = listener().await;
     let mut store = store();
-    let service = Service::instantiate_async(&mut store, component, &linker(component)).await?;
+    let service = Service::instantiate_async(
+        &mut store,
+        component,
+        &shared::http_linker(&ENGINE, component),
+    )
+    .await?;
     for expected in ["1", "2"] {
-        let response = handle_on(&mut store, &service, "GET", "/count", "")
+        let response = shared::handle_on(&mut store, &service, "GET", "/count", "")
             .await?
             .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
         assert_eq!(response, (200, expected.to_string()));
     }
-    let response = handle_on(&mut store, &service, "GET", "/hello", "")
+    let response = shared::handle_on(&mut store, &service, "GET", "/hello", "")
         .await?
         .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
     assert_eq!(response, (200, "GET /hello".to_string()));
@@ -468,8 +398,13 @@ async fn one_instance_serves_several_requests() -> anyhow::Result<()> {
 async fn listener_reads_the_request_body() -> anyhow::Result<()> {
     let component = listener().await;
     let mut store = store();
-    let service = Service::instantiate_async(&mut store, component, &linker(component)).await?;
-    let response = handle_on(&mut store, &service, "POST", "/echo-body", "a body")
+    let service = Service::instantiate_async(
+        &mut store,
+        component,
+        &shared::http_linker(&ENGINE, component),
+    )
+    .await?;
+    let response = shared::handle_on(&mut store, &service, "POST", "/echo-body", "a body")
         .await?
         .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
     assert_eq!(response, (200, "a body".to_string()));
@@ -482,10 +417,15 @@ async fn listener_reads_the_request_body() -> anyhow::Result<()> {
 async fn listener_without_respond_with_gets_500() -> anyhow::Result<()> {
     let component = listener().await;
     let mut store = store();
-    let service = Service::instantiate_async(&mut store, component, &linker(component)).await?;
-    let response = handle_on(&mut store, &service, "GET", "/no-response", "").await?;
+    let service = Service::instantiate_async(
+        &mut store,
+        component,
+        &shared::http_linker(&ENGINE, component),
+    )
+    .await?;
+    let response = shared::handle_on(&mut store, &service, "GET", "/no-response", "").await?;
     assert!(matches!(response, Ok((500, _))), "{response:?}");
-    let response = handle_on(&mut store, &service, "GET", "/count", "")
+    let response = shared::handle_on(&mut store, &service, "GET", "/count", "")
         .await?
         .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
     assert_eq!(response, (200, "2".to_string()));
@@ -548,22 +488,31 @@ async fn script_path_serves_like_the_component() -> anyhow::Result<()> {
             },
         },
     );
-    let service = Service::instantiate_async(&mut store, &component, &linker(&component)).await?;
+    let service = Service::instantiate_async(
+        &mut store,
+        &component,
+        &shared::http_linker(&ENGINE, &component),
+    )
+    .await?;
     let mut script = Vec::new();
     let mut componentized = Vec::new();
     for path in ["/hello", "/count", "/count"] {
         script.push(
-            handle_on(&mut store, &service, "GET", path, "")
+            shared::handle_on(&mut store, &service, "GET", path, "")
                 .await?
                 .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?,
         );
     }
     let mut store = self::store();
-    let service =
-        Service::instantiate_async(&mut store, listener().await, &linker(listener().await)).await?;
+    let service = Service::instantiate_async(
+        &mut store,
+        listener().await,
+        &shared::http_linker(&ENGINE, listener().await),
+    )
+    .await?;
     for path in ["/hello", "/count", "/count"] {
         componentized.push(
-            handle_on(&mut store, &service, "GET", path, "")
+            shared::handle_on(&mut store, &service, "GET", path, "")
                 .await?
                 .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?,
         );
@@ -820,8 +769,13 @@ async fn failing_raw_handler_is_named_as_the_handler() -> anyhow::Result<()> {
             },
         },
     );
-    let service = Service::instantiate_async(&mut store, &component, &linker(&component)).await?;
-    let result = handle_on(&mut store, &service, "GET", "/", "").await;
+    let service = Service::instantiate_async(
+        &mut store,
+        &component,
+        &shared::http_linker(&ENGINE, &component),
+    )
+    .await?;
+    let result = shared::handle_on(&mut store, &service, "GET", "/", "").await;
     assert!(
         !matches!(result, Ok(Ok(_))),
         "a throwing handler cannot answer"
@@ -960,7 +914,7 @@ export const handler = {
         },
     );
     let service = Service::instantiate_async(&mut store, &component, &linker).await?;
-    let (status, body) = handle_on(&mut store, &service, "GET", "/", "")
+    let (status, body) = shared::handle_on(&mut store, &service, "GET", "/", "")
         .await?
         .map_err(|code| anyhow::anyhow!("{code:?}: {}", shared::pipe_text(&stderr)))?;
     assert_eq!(status, 200);
@@ -1042,7 +996,7 @@ addEventListener('fetch', (event) => {
         },
     );
     let service = Service::instantiate_async(&mut store, &component, &linker).await?;
-    let (status, _) = handle_on(&mut store, &service, "GET", "/", "")
+    let (status, _) = shared::handle_on(&mut store, &service, "GET", "/", "")
         .await?
         .map_err(|code| anyhow::anyhow!("{code:?}"))?;
     assert_eq!(status, 200);
@@ -1115,8 +1069,13 @@ async fn listener_unhandled_rejection_is_reported() -> anyhow::Result<()> {
             },
         },
     );
-    let service = Service::instantiate_async(&mut store, &component, &linker(&component)).await?;
-    let (status, _) = handle_on(&mut store, &service, "GET", "/", "")
+    let service = Service::instantiate_async(
+        &mut store,
+        &component,
+        &shared::http_linker(&ENGINE, &component),
+    )
+    .await?;
+    let (status, _) = shared::handle_on(&mut store, &service, "GET", "/", "")
         .await?
         .map_err(|code| anyhow::anyhow!("{code:?}"))?;
     assert_eq!(status, 200);

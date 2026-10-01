@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:debuggee;
+
+// A world with an async export, whose calls run through the runtime's
+// `export_call_async`, and a sync one. It imports `wasi:sockets/types` itself,
+// which a component built without debugging keeps. The declaration is empty,
+// and the runtime's own declaration of the interface supplies its items.
+world debuggee {
+  import wasi:sockets/types@0.3.0;
+  export compute: async func(v: u32) -> u32;
+  export twice: func(v: u32) -> u32;
+}
+
+package wasi:sockets@0.3.0 {
+  interface types {}
+}

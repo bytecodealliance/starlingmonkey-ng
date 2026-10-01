@@ -3,3 +3,4 @@
 /componentize/target
 /deps/wpt
 /node_modules
+/crates/debugger/adapter/node_modules

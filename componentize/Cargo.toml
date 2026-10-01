@@ -56,10 +56,11 @@ wit-dylib = "0.259"
 wit-parser = "0.259"
 
 # The suites use `#[tokio::test]`, which requires tokio's `macros` feature on top
-# of the runtime features above. The sync suite adds property-based round-trips
+# of the runtime features above, and the debug suite bounds its requests with
+# `tokio::time::timeout`. The sync suite adds property-based round-trips
 # (`proptest`) and decodes a fixed seed from `COMPONENTIZE_JS_TEST_SEED` (`hex`).
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 proptest = "1.11"
 hex = "0.4"
 # The parity demo's `await fetch(...)` reaches the guest's WASIp3 outgoing HTTP
@@ -76,6 +77,8 @@ http-body-util = "0.1"
 # `futures` drives two async export calls concurrently in the
 # attribution test (`futures::join!`).
 futures = "0.3"
+# The debug suite's DAP client reads and writes the protocol's JSON messages.
+serde_json = "1.0.151"
 
 [lints]
 workspace = true

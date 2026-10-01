@@ -40,9 +40,8 @@ js::instance_local! {
     static STARTUP_FAILURE: RefCell<Option<String>> = const { RefCell::new(None) };
 
     /// The content script's startup event loop, holding its top-level async work. [`runtime`]
-    /// creates it undriven, since it must stay synchronous so concurrent first requests can't
-    /// race into two runtimes. The first request drives it to completion via [`ensure_started`]
-    /// before dispatching.
+    /// creates it undriven, since it never yields to another request (see [`runtime`]). The first
+    /// request drives it to completion via [`ensure_started`] before dispatching.
     static STARTUP: RefCell<Startup> = const { RefCell::new(Startup::Done) };
 
     /// Signalled on every [`STARTUP`] transition a waiting request cares about: driven to
@@ -89,17 +88,25 @@ pub fn installed_runtime() -> Option<(Rc<Runtime>, *mut js::native::RawJSContext
 }
 
 /// Get the runtime and its context, creating them on first use: run the content script
-/// (registering `fetch` handlers) and enter the global realm persistently. Synchronous (no
-/// `await`), so concurrent first requests can't race into two runtimes.
+/// (registering `fetch` handlers) and enter the global realm persistently.
+///
+/// No other request runs while this creates the runtime, so concurrent first requests cannot race
+/// into two runtimes. This has no `await`, and the debugger's waits in the before-content hook
+/// block in a synchronous `waitable-set.wait`. wasmtime marks an instance as entered for the
+/// duration of a callback-lifted call, and keeps it marked while the call is suspended in such a
+/// wait, so it starts no other export call and delivers no other event to the instance until the
+/// wait returns.
 ///
 /// A failed startup is final: this returns `Err` on every later call without retrying. The
-/// failure is logged once, by the call that ran into it. It names host paths and the server's own
-/// internals, so it goes to the log rather than to a client.
+/// failure is logged once, by the call that ran into it, and ends the debug session, if any, with
+/// that error. It names host paths and the server's own internals, so it goes to the log and the
+/// debug client rather than to an HTTP client.
 fn runtime() -> Result<(Rc<Runtime>, *mut js::native::RawJSContext, ServeTimeouts), StartupFailed> {
     let failed_before = STARTUP_FAILURE.with(|cell| cell.borrow().is_some());
     runtime_for(false).map_err(|message| {
         if !failed_before {
             eprintln!("serve: the runtime could not be started: {message}");
+            debugger::finish(&Err(message));
         }
         StartupFailed
     })
@@ -132,6 +139,10 @@ fn start_runtime(
     config.validate_serve_timeouts()?;
     super::apply_pre_init_config(&config)?;
     crate::register_builtins();
+    if config.debug.is_some() {
+        super::canonicalize_script_path(&mut config);
+        debugger::register_for_serve();
+    }
     let timeouts = ServeTimeouts::from_config(&config);
     let (runtime, invocation, evaluation) = core_runtime::setup_for_serve(config)?;
     // Keep the startup loop (the script's leftover top-level async work) for the first request
@@ -467,8 +478,8 @@ struct StartupFailed;
 /// A request arriving while another is still driving the loop waits for it.
 ///
 /// `Err` means the content script's top-level `await` rejected. The failure is logged once, when
-/// it happens, and the work the script left behind is cancelled. It is final, so every later
-/// request gets `Err` too.
+/// it happens, the debug session, if any, ends with it, and the work the script left behind is
+/// cancelled. It is final, so every later request gets `Err` too.
 async fn ensure_started(raw_cx: *mut js::native::RawJSContext) -> Result<(), StartupFailed> {
     /// Restores `Startup::Pending` if driving is cancelled mid-way (the host dropped the request
     /// future), so the loop's GC registration stays valid and a later request resumes driving.
@@ -532,6 +543,7 @@ async fn ensure_started(raw_cx: *mut js::native::RawJSContext) -> Result<(), Sta
                             "serve: the content script's top-level `await` rejected: {message}"
                         );
                         STARTUP_FAILURE.with(|cell| *cell.borrow_mut() = Some(message.clone()));
+                        debugger::finish(&Err(message.clone()));
                     }
                 }
                 STARTUP.with(|cell| *cell.borrow_mut() = Startup::Done);
@@ -629,6 +641,12 @@ pub async fn handle(wasi_request: WasiRequest) -> Result<WasiResponse, ErrorCode
     // `await`: that is script code, and it must not observe the state a resume still has to
     // repair.
     fix_up_after_resume();
+    // This starts a debug session in an instance resumed from a snapshot. In a `connect` session
+    // without a client, it connects and waits until the client is configured.
+    //
+    // SAFETY: `runtime` entered the default global's realm for the process lifetime, and keeps
+    // the context alive in a process-lifetime thread-local.
+    unsafe { debugger::before_export(&runtime, raw_cx) };
     if ensure_started(raw_cx).await.is_err() {
         return Ok(error_response(500, "Internal Server Error", None).0);
     }

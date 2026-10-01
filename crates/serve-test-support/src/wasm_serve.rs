@@ -29,7 +29,7 @@ pub const IDLE_TRACE: &str = "starling: event loop idle ";
 /// over a component this size. The cost is that native profilers can no longer unwind through wasm
 /// frames. JS exceptions and wasm traps have their own stacks, so a failure's serve log is
 /// unchanged.
-const CODEGEN_FLAGS: [&str; 2] = ["-C", "native-unwind-info=n"];
+pub const CODEGEN_FLAGS: [&str; 2] = ["-C", "native-unwind-info=n"];
 
 /// How long a request may take before the harness calls the server hung. Generous: every case here
 /// responds in milliseconds unless it is testing a bound of its own.
@@ -138,8 +138,14 @@ impl Serve {
     /// Run the guest's SpiderMonkey under a GC zeal mode (`mode,frequency`, as
     /// `scripts/test-gc-zeal.sh` documents them). Reaches the engine through the environment,
     /// which `-Sinherit-env=y` passes on; only a `debugmozjs` build acts on it.
-    pub fn gc_zeal(mut self, mode: &str) -> Self {
-        self.env.push(("JS_GC_ZEAL".into(), mode.into()));
+    pub fn gc_zeal(self, mode: &str) -> Self {
+        self.env("JS_GC_ZEAL", mode)
+    }
+
+    /// Set the environment variable `name` to `value` for the server, which `-Sinherit-env=y`
+    /// passes on to the guest.
+    pub fn env(mut self, name: &str, value: &str) -> Self {
+        self.env.push((name.into(), value.into()));
         self
     }
 
@@ -442,12 +448,23 @@ pub fn message_body(response: &str) -> String {
 /// skip. Unset, or `wasmtime` not on PATH: skip; `just test-serve-wasm` builds the component and
 /// runs the suite.
 pub fn component() -> Option<PathBuf> {
+    component_for(
+        "STARLING_WASM_COMPONENT",
+        "the wasm serve end-to-end tests",
+        "just test-serve-wasm",
+    )
+}
+
+/// Return the component the environment variable `variable` names, or `None` to skip the suite
+/// `tests`, following the rules [`component`] documents for `STARLING_WASM_COMPONENT`. The skip
+/// note names `tests` and `recipe`, the just recipe that builds the component and runs the suite.
+pub fn component_for(variable: &str, tests: &str, recipe: &str) -> Option<PathBuf> {
     static NOTED: std::sync::Once = std::sync::Once::new();
-    let configured = std::env::var_os("STARLING_WASM_COMPONENT").map(PathBuf::from);
+    let configured = std::env::var_os(variable).map(PathBuf::from);
     if let Some(component) = &configured {
         assert!(
             component.is_file(),
-            "STARLING_WASM_COMPONENT is set, but there is no component at {}",
+            "{variable} is set, but there is no component at {}",
             component.display()
         );
     }
@@ -466,15 +483,15 @@ pub fn component() -> Option<PathBuf> {
         let missing = if configured.is_some() {
             "wasmtime is not on PATH"
         } else {
-            "STARLING_WASM_COMPONENT is not set"
+            &format!("{variable} is not set")
         };
         // Written to `stderr` directly: `eprintln!` inside a test is captured and only shown for
         // a failure, and every test here passes when it skips.
         use std::io::Write;
         let _ = writeln!(
             std::io::stderr(),
-            "SKIPPING the wasm serve end-to-end tests: {missing}\n\
-             Run `just test-serve-wasm` to build the component and run them."
+            "SKIPPING {tests}: {missing}\n\
+             Run `{recipe}` to build the component and run them."
         );
     });
     None
@@ -490,7 +507,7 @@ pub fn component() -> Option<PathBuf> {
 ///
 /// A precompiled artifact loads only into a runtime configured the same way, so the stamp covers
 /// the `wasmtime` version and [`CODEGEN_FLAGS`] alongside the component's own timestamp.
-fn precompiled(component: &Path) -> Option<PathBuf> {
+pub fn precompiled(component: &Path) -> Option<PathBuf> {
     let out = component.with_extension("cwasm");
     let stamp_path = component.with_extension("cwasm.stamp");
     let version = Command::new("wasmtime").arg("--version").output().ok()?;
@@ -507,8 +524,8 @@ fn precompiled(component: &Path) -> Option<PathBuf> {
         return Some(out);
     }
 
-    // One process compiles. The rest wait for it rather than each compiling the same artifact.
-    // Whoever creates the lock is the one that compiles.
+    // One process or thread compiles. The rest wait for it rather than each compiling the same
+    // artifact. Whoever creates the lock is the one that compiles.
     let lock = component.with_extension("cwasm.lock");
     match std::fs::OpenOptions::new()
         .write(true)
@@ -516,15 +533,25 @@ fn precompiled(component: &Path) -> Option<PathBuf> {
         .open(&lock)
     {
         Ok(_) => {
+            // Checked again, since a compile may have finished and released the lock between the
+            // check above and taking it.
+            if current(&stamp) {
+                let _ = std::fs::remove_file(&lock);
+                return Some(out);
+            }
             eprintln!("Precompiling the wasm component (once for this build) ...");
+            // Written next to `out` and renamed over it, so a server never loads a partly
+            // written artifact.
+            let partial = component.with_extension("cwasm.partial");
             let result = Command::new("wasmtime")
                 .arg("compile")
                 .args(CODEGEN_FLAGS)
                 .arg(component)
                 .arg("-o")
-                .arg(&out)
+                .arg(&partial)
                 .output();
-            let compiled = result.is_ok_and(|result| result.status.success());
+            let compiled = result.is_ok_and(|result| result.status.success())
+                && std::fs::rename(&partial, &out).is_ok();
             if compiled {
                 let _ = std::fs::write(&stamp_path, &stamp);
             }
@@ -555,11 +582,12 @@ fn work_dir(port: u16) -> PathBuf {
     dir
 }
 
-/// Snapshot `component`, configured with `config`, into `out`.
+/// Snapshot `component`, configured with `config` and run in `dir`, into `out`. With `no_zeal`,
+/// SpiderMonkey runs under its ordinary GC (see [`Serve::without_gc_zeal`]).
 ///
 /// `--keep-init-func` because dropping the init export — wizer's default — leaves the component
 /// referring to a core export that is no longer there, and the snapshot then fails to load at all.
-fn snapshot_with_wizer(dir: &Path, component: &Path, out: &Path, config: &str, no_zeal: bool) {
+pub fn snapshot_with_wizer(dir: &Path, component: &Path, out: &Path, config: &str, no_zeal: bool) {
     let mut command = Command::new("wasmtime");
     command
         .current_dir(dir)

@@ -570,3 +570,106 @@ pub fn http_store(engine: &wasmtime::Engine, body: &'static str) -> Store<HttpCt
         },
     )
 }
+
+/// A linker for a component that exports `wasi:http/handler`: the WASI host
+/// [`componentize::add_wasi`] adds, the p3 `wasi:http` host, which defines the
+/// handler's request and response resources, and trapping stubs for the
+/// runtime's other imports.
+pub fn http_linker(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+) -> wasmtime::component::Linker<HttpCtx> {
+    let mut linker = wasmtime::component::Linker::new(engine);
+    componentize::add_wasi(&mut linker).expect("wasi linker");
+    wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("wasi:http p3 linker");
+    componentize::trap_unsatisfied_imports(engine, component, &mut linker, &["wasi:http/"])
+        .expect("trap-stub unknown imports");
+    linker
+}
+
+/// Drive `wasi:http/handler.handle()` on `service`, an instance in `store`, with
+/// a `method` request to `path` whose body is `body`. Returns the response status
+/// and the collected body as a string, or the `error-code` the handler returned.
+pub async fn handle_on(
+    store: &mut Store<HttpCtx>,
+    service: &wasmtime_wasi_http::p3::bindings::Service,
+    method: &str,
+    path: &str,
+    body: &'static str,
+) -> anyhow::Result<Result<(u16, String), wasmtime_wasi_http::p3::bindings::http::types::ErrorCode>>
+{
+    use bytes::Bytes;
+    use futures::future::{select, Either};
+    use http_body_util::{BodyExt as _, Collected, Full};
+    use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+
+    // `Full<Bytes>`'s error type is `Infallible`, which `ErrorCode:
+    // From<Infallible>` lifts into the wit stream's element error.
+    let req = http::Request::builder()
+        .method(method)
+        .uri(format!("http://example.com{path}"))
+        .header(http::header::CONTENT_LENGTH, body.len())
+        .body(Full::new(Bytes::from_static(body.as_bytes())))
+        .expect("building the request");
+    let (req, io) = wasmtime_wasi_http::p3::Request::from_http(
+        &mut UpstreamHooks {
+            body: store.data().hooks.body,
+        },
+        req,
+    );
+
+    let response: Result<http::Response<Collected<Bytes>>, ErrorCode> = store
+        .run_concurrent(async |store| {
+            // The handler call and the request-body-processing future run
+            // concurrently: `io` resolves once the request body is consumed,
+            // while `handle` drives the guest to a response. A handler that
+            // responds without consuming the body leaves `io` pending, so the
+            // response is returned without waiting for it.
+            let handled = std::pin::pin!(async {
+                let res = match service.handle(store, req).await? {
+                    Ok(res) => res,
+                    Err(code) => return anyhow::Ok(Err(code)),
+                };
+                let res = store.with(|store| res.into_http(store, async { Ok(()) }))?;
+                let (parts, body) = res.into_parts();
+                let body = body.collect().await?;
+                anyhow::Ok(Ok(http::Response::from_parts(parts, body)))
+            });
+            let io = std::pin::pin!(async {
+                io.await.map_err(|e| anyhow::anyhow!("request body: {e:?}"))
+            });
+            match select(handled, io).await {
+                Either::Left((res, _io)) => res,
+                Either::Right((io, handled)) => {
+                    io?;
+                    handled.await
+                }
+            }
+        })
+        .await??;
+
+    Ok(response.map(|response| {
+        let status = response.status().as_u16();
+        let body = String::from_utf8_lossy(&response.into_body().to_bytes()).into_owned();
+        (status, body)
+    }))
+}
+
+/// The import and export names of a component's world.
+pub fn surface(component: &[u8]) -> (Vec<String>, Vec<String>) {
+    let wit_parser::decoding::DecodedWasm::Component(resolve, world) =
+        wit_parser::decoding::decode(component).expect("decoding the component")
+    else {
+        panic!("not a component");
+    };
+    let names = |items: &indexmap::IndexMap<wit_parser::WorldKey, wit_parser::WorldItem>| {
+        items
+            .keys()
+            .map(|key| resolve.name_world_key(key))
+            .collect::<Vec<_>>()
+    };
+    (
+        names(&resolve.worlds[world].imports),
+        names(&resolve.worlds[world].exports),
+    )
+}

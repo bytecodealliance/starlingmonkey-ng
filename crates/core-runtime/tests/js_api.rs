@@ -675,6 +675,43 @@ fn test_queue_microtask() {
     assert_eq!(joined, "abc");
 }
 
+/// Jobs queued while `hold_jobs_queued_during` runs its closure are held until a `run_jobs` after
+/// it, which runs them behind the jobs queued since.
+#[test]
+fn held_jobs_run_on_the_next_drain_after_the_hold() {
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let order = |tag: char| {
+        let src = format!("() => globalThis.__order.push('{tag}')");
+        let f = js::compile::evaluate(&scope, &src).unwrap();
+        Object::from_value(&scope, f)
+            .unwrap()
+            .cast::<js::Function>()
+            .unwrap()
+    };
+    js::compile::evaluate(&scope, "globalThis.__order = []; 0").unwrap();
+    let held = order('h');
+    let later = order('l');
+
+    js::jobs::hold_jobs_queued_during(&scope, || {
+        js::jobs::queue_microtask(&scope, &held).unwrap();
+    });
+    assert!(js::jobs::has_pending_jobs(&scope));
+
+    // A drain while a hold is in effect leaves held jobs held.
+    js::jobs::hold_jobs_queued_during(&scope, || {
+        assert!(!js::jobs::has_pending_jobs(&scope));
+        js::jobs::run_jobs(&scope);
+    });
+
+    js::jobs::queue_microtask(&scope, &later).unwrap();
+    js::jobs::run_jobs(&scope);
+    assert!(!js::jobs::has_pending_jobs(&scope));
+    let joined = js::compile::evaluate(&scope, "globalThis.__order.join('')").unwrap();
+    let joined = String::from_jsval(&scope, joined, ()).unwrap();
+    assert_eq!(joined, "lh");
+}
+
 /// `ArrayBuffer::transfer` moves the contents into a new buffer and detaches the original, for
 /// empty buffers too.
 #[test]

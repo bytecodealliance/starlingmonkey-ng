@@ -33,9 +33,14 @@ pub struct RuntimeConfig {
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 
-    /// Enable script debugging via socket connection.
-    #[arg(short = 'd', long = "debug")]
-    pub debugging: bool,
+    /// Debug the content script over the Debug Adapter Protocol. The forms are `stdio`,
+    /// `listen:[<addr>:]<port>[,wait]` and `connect:<host>:<port>[,timeout=<ms>]`. `stdio` makes
+    /// the process a DAP adapter on stdin and stdout. `listen` binds `127.0.0.1` unless an address
+    /// is given, and `,wait` holds the content script until a client has attached and sent
+    /// `configurationDone`. `connect` dials the client (1000 ms timeout by default). `stdio` and
+    /// `connect` hold the content script until the client sends `configurationDone`.
+    #[arg(short = 'd', long = "debug", value_name = "TRANSPORT")]
+    pub debug: Option<DebugConfig>,
 
     /// Record the JavaScript stack each promise and async call was created on, and show it as
     /// async parent frames in `Error.stack`.
@@ -248,6 +253,115 @@ impl RuntimeConfig {
         let mut config = Self::from_arg_string(input.trim())?;
         config.pre_initialize = true;
         Ok(config)
+    }
+}
+
+/// How a debug session reaches its DAP client, from `--debug`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugConfig {
+    /// The byte stream the session speaks DAP over.
+    pub transport: DebugTransport,
+}
+
+/// A byte stream a debug session speaks DAP over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DebugTransport {
+    /// The process's stdin and stdout.
+    Stdio,
+    /// A TCP listener. With `wait`, the content script is held until a client has attached and
+    /// sent `configurationDone`.
+    Listen {
+        addr: std::net::IpAddr,
+        port: u16,
+        wait: bool,
+    },
+    /// A TCP connection the process opens to a waiting client. The script is always held until
+    /// the client sends `configurationDone`. `timeout` bounds the connection attempt.
+    Connect {
+        host: String,
+        port: u16,
+        timeout: std::time::Duration,
+    },
+}
+
+/// The `connect` timeout when `--debug` gives none.
+const DEFAULT_DEBUG_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+impl std::str::FromStr for DebugConfig {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (transport, options) = match s.split_once(',') {
+            Some((transport, options)) => (transport, Some(options)),
+            None => (s, None),
+        };
+        let mut transport = if transport == "stdio" {
+            DebugTransport::Stdio
+        } else if let Some(rest) = transport.strip_prefix("listen:") {
+            let (addr, port) = match rest.rsplit_once(':') {
+                Some((addr, port)) => {
+                    // An IPv6 address can be written in brackets, as in `[::1]:9229`.
+                    let bare = addr
+                        .strip_prefix('[')
+                        .and_then(|addr| addr.strip_suffix(']'))
+                        .unwrap_or(addr);
+                    let addr = bare
+                        .parse()
+                        .map_err(|_| format!("invalid debug listen address `{addr}`"))?;
+                    (addr, port)
+                }
+                None => (std::net::Ipv4Addr::LOCALHOST.into(), rest),
+            };
+            let port = port
+                .parse()
+                .map_err(|_| format!("invalid debug listen port `{port}`"))?;
+            DebugTransport::Listen {
+                addr,
+                port,
+                wait: false,
+            }
+        } else if let Some(rest) = transport.strip_prefix("connect:") {
+            let (host, port) = rest
+                .rsplit_once(':')
+                .filter(|(host, _)| !host.is_empty())
+                .ok_or_else(|| {
+                    format!("expected `connect:<host>:<port>`, found `connect:{rest}`")
+                })?;
+            let port = port
+                .parse()
+                .map_err(|_| format!("invalid debug connect port `{port}`"))?;
+            DebugTransport::Connect {
+                host: host.to_owned(),
+                port,
+                timeout: DEFAULT_DEBUG_CONNECT_TIMEOUT,
+            }
+        } else {
+            return Err(format!(
+                "unknown debug transport `{transport}`, expected `stdio`, \
+                 `listen:[<addr>:]<port>` or `connect:<host>:<port>`"
+            ));
+        };
+        for option in options.into_iter().flat_map(|o| o.split(',')) {
+            match (&mut transport, option) {
+                (DebugTransport::Listen { wait, .. }, "wait") => *wait = true,
+                (DebugTransport::Connect { timeout, .. }, _) if option.starts_with("timeout=") => {
+                    let ms = &option["timeout=".len()..];
+                    *timeout = std::time::Duration::from_millis(
+                        ms.parse()
+                            .map_err(|_| format!("invalid debug connect timeout `{ms}`"))?,
+                    );
+                }
+                _ => {
+                    let name = match transport {
+                        DebugTransport::Stdio => "stdio",
+                        DebugTransport::Listen { .. } => "listen",
+                        DebugTransport::Connect { .. } => "connect",
+                    };
+                    return Err(format!("unknown debug option `{option}` for `{name}`"));
+                }
+            }
+        }
+        Ok(Self { transport })
     }
 }
 
@@ -528,9 +642,115 @@ mod tests {
         assert_eq!(config.script_path, "./index.js");
         assert!(config.module_mode());
         assert!(!config.verbose);
-        assert!(!config.debugging);
+        assert!(config.debug.is_none());
         assert!(!config.async_stacks);
         assert!(!config.wpt_mode);
+    }
+
+    #[test]
+    fn debug_flag_selects_the_stdio_transport() {
+        let config = RuntimeConfig::from_arg_string("--debug=stdio main.js").unwrap();
+        assert_eq!(
+            config.debug,
+            Some(DebugConfig {
+                transport: DebugTransport::Stdio
+            })
+        );
+        let short = RuntimeConfig::from_arg_string("-d stdio main.js").unwrap();
+        assert_eq!(short.debug, config.debug);
+        assert_eq!(short.script_path, "main.js");
+    }
+
+    fn debug(s: &str) -> Result<DebugConfig, String> {
+        s.parse::<DebugConfig>()
+    }
+
+    #[test]
+    fn debug_listen_forms() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            debug("listen:9229").unwrap().transport,
+            DebugTransport::Listen {
+                addr: local,
+                port: 9229,
+                wait: false
+            }
+        );
+        assert_eq!(
+            debug("listen:0.0.0.0:9229,wait").unwrap().transport,
+            DebugTransport::Listen {
+                addr: "0.0.0.0".parse().unwrap(),
+                port: 9229,
+                wait: true
+            }
+        );
+        for form in ["listen:[::1]:9229", "listen:::1:9229"] {
+            assert_eq!(
+                debug(form).unwrap().transport,
+                DebugTransport::Listen {
+                    addr: "::1".parse().unwrap(),
+                    port: 9229,
+                    wait: false
+                },
+                "{form}"
+            );
+        }
+        assert!(debug("listen:9229,timeout=5")
+            .unwrap_err()
+            .contains("timeout"));
+        assert!(debug("listen:notaport").unwrap_err().contains("notaport"));
+    }
+
+    #[test]
+    fn debug_listen_accepts_port_zero() {
+        assert!(matches!(
+            debug("listen:0").unwrap().transport,
+            DebugTransport::Listen { port: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn debug_connect_forms() {
+        assert_eq!(
+            debug("connect:localhost:9230").unwrap().transport,
+            DebugTransport::Connect {
+                host: "localhost".into(),
+                port: 9230,
+                timeout: std::time::Duration::from_millis(1000),
+            }
+        );
+        assert_eq!(
+            debug("connect:10.0.0.2:9230,timeout=250")
+                .unwrap()
+                .transport,
+            DebugTransport::Connect {
+                host: "10.0.0.2".into(),
+                port: 9230,
+                timeout: std::time::Duration::from_millis(250),
+            }
+        );
+        assert!(debug("connect:9230").unwrap_err().contains("host"));
+        let err = debug("connect:host").unwrap_err();
+        assert!(
+            err.contains("<port>") && err.contains("connect:host"),
+            "{err}"
+        );
+        assert!(debug("connect:h:1,wait").unwrap_err().contains("wait"));
+    }
+
+    #[test]
+    fn debug_stdio_takes_no_options() {
+        assert!(debug("stdio,wait").unwrap_err().contains("wait"));
+    }
+
+    #[test]
+    fn debug_flag_rejects_unknown_transports() {
+        let err = RuntimeConfig::from_arg_string("--debug=tcp main.js").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown debug transport `tcp`"),
+            "{err}"
+        );
     }
 
     #[test]

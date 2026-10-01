@@ -7,7 +7,10 @@
 //! than an interface-qualified member. [`run_main_export`] resolves and drives
 //! it for the runtime's own `wasi:cli/run` export in an instance whose top level
 //! ran before a snapshot: a componentized command, or a script wizened with
-//! `wizer-initialize`. [`report_run_outcome`] maps the result.
+//! `wizer-initialize`. [`RunOutcome::into_result`] maps the result.
+
+use std::future::Future as _;
+use std::task::Poll;
 
 use core_runtime::event_loop::{run_until, with_event_loop};
 use core_runtime::invocation::OwnedInvocation;
@@ -32,24 +35,18 @@ pub enum RunOutcome {
     Failed(String),
 }
 
-/// Reduce a [`RunOutcome`] to a `wasi:cli/run.run()` result, reporting any
-/// failure on stderr. `NoRunExport` maps to a clean `Err`, so a caller that
-/// instead treats a missing `run` as a plain top-level script must handle it
-/// before calling this.
-///
-/// `Result<(), ()>` is the canonical-ABI shape of `wasi:cli/run.run`'s declared
-/// `result`, which has no payloads, so the `result_unit_err` lint is suppressed.
-#[allow(clippy::result_unit_err)]
-pub fn report_run_outcome(outcome: RunOutcome) -> Result<(), ()> {
-    match outcome {
-        RunOutcome::Ok => Ok(()),
-        RunOutcome::Failed(message) => {
-            eprintln!("{message}");
-            Err(())
-        }
-        RunOutcome::NoRunExport => {
-            eprintln!("this component exports no `run` function and cannot be run as a CLI tool");
-            Err(())
+impl RunOutcome {
+    /// `Ok` for a successful `run()`, and `Err` with the message to report otherwise.
+    /// `NoRunExport` maps to `Err`, so a caller that instead treats a missing `run` as a plain
+    /// top-level script must handle it before calling this.
+    pub fn into_result(self) -> Result<(), String> {
+        match self {
+            RunOutcome::Ok => Ok(()),
+            RunOutcome::Failed(message) => Err(message),
+            RunOutcome::NoRunExport => Err(
+                "this component exports no `run` function and cannot be run as a CLI tool"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -109,7 +106,33 @@ impl MainModule {
 /// event loop, driving the loop until the returned promise settles. Returns
 /// [`RunOutcome::NoRunExport`] when the application exports no `run`, leaving
 /// the caller to decide how to treat that.
+///
+/// While `run` runs, debugger messages that arrive while nothing is paused are
+/// passed to the adapter with `invocation`'s loop active (see
+/// `debugger::serve_while_running`).
 pub async fn run_main_export(invocation: &OwnedInvocation, main: MainModule) -> RunOutcome {
+    let mut run = std::pin::pin!(run_undebugged(invocation, main));
+    // SAFETY: `MainModule` requires the main module's context to stay valid, with its default
+    // global's realm entered, for as long as the run lasts.
+    let mut debugger = std::pin::pin!(unsafe {
+        debugger::serve_while_running(
+            main.raw_cx(),
+            debugger::RunningLoop::Content(invocation.state().event_loop()),
+            platform::clock::sleep,
+        )
+    });
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(outcome) = run.as_mut().poll(cx) {
+            return Poll::Ready(outcome);
+        }
+        let _ = debugger.as_mut().poll(cx);
+        Poll::Pending
+    })
+    .await
+}
+
+/// [`run_main_export`] without the debugger's running-mode dispatch.
+async fn run_undebugged(invocation: &OwnedInvocation, main: MainModule) -> RunOutcome {
     // Keep the value `run` returns alive across the awaits below. `CallStack`
     // registers its boxed interior with the live-stacks tracer, so a compacting
     // GC updates the slot in place. Nothing traces a bare `Heap` local.

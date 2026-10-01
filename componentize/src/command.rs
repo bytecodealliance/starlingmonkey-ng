@@ -94,7 +94,8 @@ pub struct Common {
     ///
     /// The targeted world also imports every interface the runtime imports,
     /// with the functions the runtime imports, except those of the WASI APIs
-    /// `--disable` names.
+    /// `--disable` names and `wasi:sockets`, which the runtime imports for its
+    /// debugger.
     ///
     /// `-d`, `--cli` or `--serve` is required.
     #[arg(short = 'd', long, global = true)]
@@ -157,7 +158,9 @@ pub struct Common {
     /// The output then imports none of the feature's interfaces, and a call
     /// reaching one traps, except that a disabled clock reads as zero. A feature
     /// whose interfaces a remaining interface uses cannot be disabled alone. The
-    /// error names the other feature to disable with it.
+    /// error names the other feature to disable with it. Without `--debug`,
+    /// `sockets` is disabled, except for the interfaces the world imports
+    /// itself.
     #[arg(long, global = true, value_delimiter = ',', value_enum)]
     pub disable: Vec<crate::finalize::WASIAPISet>,
 }
@@ -221,6 +224,16 @@ pub struct Componentize {
     /// Keep the compiled component out of wasmtime's global compilation cache.
     #[arg(long)]
     pub no_cache: bool,
+
+    /// Build a debuggable component: it starts a debug session from the
+    /// `STARLING_DEBUG` environment variable, for example
+    /// `STARLING_DEBUG=listen:9229,wait`, and imports the `wasi:sockets`
+    /// interfaces the debug connection uses. A component built without it
+    /// ignores the variable and imports no `wasi:sockets` interface the world
+    /// does not import itself. Needs the static runtime, so it cannot be
+    /// combined with --runtime-lib.
+    #[arg(long, conflicts_with = "runtime_lib")]
+    pub debug: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -550,6 +563,7 @@ fn componentize(
             &runtime,
             &common.disable,
             componentize.deterministic_insecure_random_seed,
+            componentize.debug,
             None,
             componentize.init_location.as_ref().map(url::Url::as_str),
             !componentize.no_cache,
@@ -641,6 +655,40 @@ mod tests {
         // the option.
         assert_eq!(c.runtime.static_runtime.runtime, None);
         assert_eq!(c.runtime.runtime_lib, None);
+        assert!(!c.debug);
+    }
+
+    #[test]
+    fn debug_flag_parses() {
+        let options = Options::try_parse_from([
+            "starling-componentize",
+            "--serve",
+            "componentize",
+            "app.js",
+            "--debug",
+        ])
+        .unwrap();
+        let Some(Command::Componentize(c)) = &options.command else {
+            panic!("expected the componentize subcommand");
+        };
+        assert!(c.debug);
+    }
+
+    /// Debugging needs the static runtime, so `--debug` with `--runtime-lib` is
+    /// rejected.
+    #[test]
+    fn debug_conflicts_with_runtime_lib() {
+        let error = Options::try_parse_from([
+            "starling-componentize",
+            "--serve",
+            "componentize",
+            "app.js",
+            "--debug",
+            "--runtime-lib",
+            "b.so",
+        ])
+        .expect_err("--debug with --runtime-lib should be rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// The seed is a 128-bit number in decimal or `0x`-prefixed hex.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 pub mod config;
+pub mod diagnostics;
 pub mod event_loop;
 pub mod finalization;
 pub mod invocation;
@@ -235,6 +236,7 @@ fn init_and_eval(
     String,
 > {
     let runtime = Runtime::init(&config)?;
+    runtime::run_before_content_hooks(&runtime, &config)?;
 
     let (source, filename) = content_script(&config)?;
 

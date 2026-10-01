@@ -48,3 +48,13 @@ pub fn define_profiling_functions(scope: &Scope<'_>, obj: HandleObject) -> Resul
     let ok = unsafe { wrappers2::JS_DefineProfilingFunctions(scope.cx(), obj) };
     ExnThrown::check(ok)
 }
+
+/// Realm options for a global that holds a `Debugger`. The realm gets a new compartment in the
+/// system zone, and no `Debugger` can add it as a debuggee, including one created in it.
+pub fn debugger_realm_options() -> crate::engine::RealmOptions {
+    let mut options = crate::engine::RealmOptions::default();
+    options.creationOptions_.compSpec_ =
+        mozjs::jsapi::JS::CompartmentSpecifier::NewCompartmentInSystemZone;
+    options.creationOptions_.invisibleToDebugger_ = true;
+    options
+}

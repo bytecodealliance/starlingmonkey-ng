@@ -299,6 +299,7 @@ dependencies = [
  "http-body-util",
  "indexmap",
  "proptest",
+ "serde_json",
  "sha2",
  "tokio",
  "url",

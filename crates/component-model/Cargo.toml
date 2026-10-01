@@ -43,6 +43,7 @@ wit-dylib-ffi = { git = "https://github.com/bytecodealliance/wasm-tools/", rev =
 # executor the async exports/imports run on. wit-dylib-ffi depends on the same
 # wit-bindgen version, so the linked component holds one copy.
 wit-bindgen = { workspace = true, features = ["async-spawn"] }
+debugger.workspace = true
 
 [lints]
 workspace = true

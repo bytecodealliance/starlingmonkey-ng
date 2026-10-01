@@ -7,7 +7,7 @@
 // link by default. `just test-componentize` builds it and runs every suite.
 //
 // One world (`fixtures/surface.wit` + `fixtures/surface.js`), componentized
-// twice: with every WASI feature enabled, and with every feature disabled. The
+// twice: with no feature given to disable, and with every feature disabled. The
 // first proves the component exports exactly the world's exports, without the
 // runtime's `init`, `wasi:cli/run` and `wasi:http/handler`. The second proves
 // the disabled features' interfaces are gone from the imports, that the
@@ -30,7 +30,6 @@ use {
         Engine, Store,
     },
     wasmtime_wasi::{WasiCtxView, WasiView},
-    wit_parser::{decoding::DecodedWasm, Resolve, WorldId},
 };
 
 wasmtime::component::bindgen!({
@@ -76,24 +75,6 @@ async fn build_js(js: &str, disabled: &[WASIAPISet]) -> anyhow::Result<Vec<u8>> 
     .await
 }
 
-/// The decoded world of a component, and its import and export names.
-fn surface(component: &[u8]) -> (Resolve, WorldId, Vec<String>, Vec<String>) {
-    let DecodedWasm::Component(resolve, world) =
-        wit_parser::decoding::decode(component).expect("decoding the component")
-    else {
-        panic!("not a component");
-    };
-    let names = |items: &indexmap::IndexMap<wit_parser::WorldKey, wit_parser::WorldItem>| {
-        items
-            .keys()
-            .map(|key| resolve.name_world_key(key))
-            .collect::<Vec<_>>()
-    };
-    let imports = names(&resolve.worlds[world].imports);
-    let exports = names(&resolve.worlds[world].exports);
-    (resolve, world, imports, exports)
-}
-
 async fn instantiate(component: &[u8]) -> anyhow::Result<(Store<Ctx>, Surface)> {
     let component = Component::new(&ENGINE, component)?;
     let mut linker = Linker::new(&ENGINE);
@@ -113,11 +94,12 @@ async fn instantiate(component: &[u8]) -> anyhow::Result<(Store<Ctx>, Surface)> 
 }
 
 /// With nothing disabled the component exports the world's two functions and
-/// nothing else, and still imports the runtime's WASI surface.
+/// nothing else, and still imports the runtime's WASI surface other than
+/// `wasi:sockets`.
 #[tokio::test]
 async fn exports_are_exactly_the_worlds() -> anyhow::Result<()> {
     let component = build(&[]).await?;
-    let (_, _, imports, exports) = surface(&component);
+    let (imports, exports) = shared::surface(&component);
     assert_eq!(exports, ["run", "random", "now"]);
     assert!(
         imports.iter().any(|i| i.starts_with("wasi:random/")),
@@ -153,9 +135,10 @@ async fn disabled_features_are_stubbed() -> anyhow::Result<()> {
         WASIAPISet::Clocks,
         WASIAPISet::Http,
         WASIAPISet::Filesystem,
+        WASIAPISet::Sockets,
     ])
     .await?;
-    let (_, _, imports, exports) = surface(&component);
+    let (imports, exports) = shared::surface(&component);
     assert_eq!(exports, ["run", "random", "now"]);
     let (wasi, own): (Vec<&String>, Vec<&String>) =
         imports.iter().partition(|i| i.starts_with("wasi:"));
@@ -296,7 +279,7 @@ async fn features_select_gated_exports() -> anyhow::Result<()> {
     let base_only = "export const base = () => 1;";
     let both = "export const base = () => 1;\nexport const extra = () => 2;";
 
-    let (_, _, _, exports) = surface(&build_gated(base_only, &[], false).await?);
+    let (_, exports) = shared::surface(&build_gated(base_only, &[], false).await?);
     assert_eq!(exports, ["base"]);
 
     let err = build_gated(base_only, &["extra".to_string()], false)
@@ -308,7 +291,7 @@ async fn features_select_gated_exports() -> anyhow::Result<()> {
     );
 
     for (features, all) in [(vec!["extra".to_string()], false), (vec![], true)] {
-        let (_, _, _, exports) = surface(&build_gated(both, &features, all).await?);
+        let (_, exports) = shared::surface(&build_gated(both, &features, all).await?);
         assert_eq!(
             exports,
             ["base", "extra"],
@@ -330,8 +313,9 @@ async fn single_features_are_disabled_alone() -> anyhow::Result<()> {
         (WASIAPISet::Random, &["wasi:random/random"]),
         (WASIAPISet::Http, &["wasi:http/"]),
         (WASIAPISet::Filesystem, &["wasi:filesystem/"]),
+        (WASIAPISet::Sockets, &["wasi:sockets/"]),
     ] {
-        let (_, _, imports, _) = surface(&build(&[feature]).await?);
+        let (imports, _) = shared::surface(&build(&[feature]).await?);
         assert!(
             !imports
                 .iter()

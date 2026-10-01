@@ -1,5 +1,6 @@
 #include "console.h"
 #include "encode.h"
+#include <atomic>
 #include <chrono>
 #include <map>
 
@@ -405,10 +406,24 @@ JS::Result<mozilla::Ok> ToSource(JSContext *cx, std::string &sourceOut, JS::Hand
 
 namespace builtins::web::console {
 
+namespace {
+// Set by `starling_set_console_sink`. While set, console messages go to it instead of stdout and
+// stderr.
+std::atomic<void (*)(uint8_t level, const char *msg)> console_sink{nullptr};
+} // namespace
+
+extern "C" void starling_set_console_sink(void (*sink)(uint8_t level, const char *msg)) {
+  console_sink.store(sink, std::memory_order_relaxed);
+}
+
 // `log`, `info` and `debug` print the bare message on stdout. `warn` and `error` print it on
 // stderr, prefixed with the level.
 __attribute__((weak))
 void builtin_impl_console_log(Console::LogType log_ty, const char *msg) {
+  if (auto sink = console_sink.load(std::memory_order_relaxed)) {
+    sink(static_cast<uint8_t>(log_ty), msg);
+    return;
+  }
   switch (log_ty) {
   case Console::LogType::Warn:
     fprintf(stderr, "Warn: %s\n", msg);

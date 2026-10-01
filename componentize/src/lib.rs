@@ -19,7 +19,7 @@ use {
     wasmtime_wizer::{WasmtimeWizerComponent, Wizer},
     wit_component::metadata,
     wit_dylib::{AsyncFilterSet, DylibOpts, StackPointer},
-    wit_parser::{Resolve, WorldId, WorldKey},
+    wit_parser::{Resolve, WorldId, WorldItem, WorldKey},
 };
 
 /// Host bindings of the runtime's `init` interface, `starling/wit/init.wit`.
@@ -458,7 +458,9 @@ pub fn load_world<'a>(
 const RUNTIME_IMPORTS_PACKAGE: &str = "starling:runtime-imports";
 
 /// A world that imports every interface the runtime imports, except those of
-/// the `disabled` features, and the interfaces they `use`. Each has only the
+/// the `disabled` features and of [`finalize::WASIAPISet::Sockets`], and the
+/// interfaces they `use`. The runtime imports `wasi:sockets` only for its
+/// debugger. Each has only the
 /// functions the runtime's core module imports, so bindings generated from the
 /// world import nothing the runtime does not.
 ///
@@ -509,6 +511,7 @@ pub fn runtime_imports_world(
         .into_iter()
         .filter(|name| known.contains(name))
         .filter(|name| !disabled.iter().any(|feature| feature.owns(name)))
+        .filter(|name| !finalize::WASIAPISet::Sockets.owns(name))
         .map(|name| format!("  import {name};\n"))
         .collect();
     let package = resolve.push_str(
@@ -585,11 +588,12 @@ pub fn load_world_for_types<'a>(
 /// The component is then instantiated, its `init` export is called with `js`,
 /// the resulting heap is wizened, and the snapshot is wrapped by
 /// [`finalize::finalize`] so the output exports exactly the world's exports and
-/// imports nothing from the interfaces of `disabled`.
+/// imports nothing from the interfaces of `disabled` or of
+/// [`finalize::WASIAPISet::Sockets`].
 ///
 /// The compiled component is cached in wasmtime's global compilation cache. See
-/// [`componentize_with_output`] to leave it out, and for what the application
-/// printed while it initialized.
+/// [`componentize_with_output`] to leave it out, to build a debuggable
+/// component, and for what the application printed while it initialized.
 #[expect(clippy::type_complexity)]
 pub async fn componentize(
     wit: Wit<'_, impl AsRef<Path>>,
@@ -612,6 +616,7 @@ pub async fn componentize(
         runtime,
         disabled,
         None,
+        false,
         add_to_linker,
         None,
         true,
@@ -635,6 +640,15 @@ pub struct Componentized {
 /// component imports no `wasi:random/insecure-seed`, and `get-insecure-seed`
 /// always returns the seed (see [`finalize::finalize`]). The compiled component
 /// is cached in wasmtime's global compilation cache only with `cache`.
+///
+/// With `debug`, instances resumed from the snapshot start a debug session from
+/// the `STARLING_DEBUG` environment variable, and the component keeps the
+/// `wasi:sockets` imports the debug connection uses. `debug` needs a
+/// [`Runtime::Static`], and `disabled` cannot contain
+/// [`finalize::WASIAPISet::Sockets`] with it.
+///
+/// Without `debug`, [`finalize::WASIAPISet::Sockets`] is disabled, except for the
+/// `wasi:sockets` interfaces the world imports itself.
 #[expect(clippy::type_complexity)]
 pub async fn componentize_with_output(
     wit: Wit<'_, impl AsRef<Path>>,
@@ -646,15 +660,48 @@ pub async fn componentize_with_output(
     runtime: &Runtime,
     disabled: &[finalize::WASIAPISet],
     insecure_seed: Option<u128>,
+    debug: bool,
     add_to_linker: Option<&dyn Fn(&mut Linker<Ctx>) -> anyhow::Result<()>>,
     init_location: Option<&str>,
     cache: bool,
 ) -> anyhow::Result<Componentized> {
+    if debug && matches!(runtime, Runtime::Dynamic(_)) {
+        anyhow::bail!(
+            "a debuggable component needs the static runtime, which targets wasm32-wasip3, and \
+             cannot be linked against the runtime dylib"
+        );
+    }
     check_runtime_interface(runtime)?;
     let (mut resolve, world) = load_world(wit, world, features, all_features)?;
     supported::check_supported_types(&resolve, world)?;
     supported::reject_world_level_borrows(&resolve, world)?;
     check_export_names(&resolve, world)?;
+
+    let mut disabled = disabled.to_vec();
+    let mut kept_imports = Vec::new();
+    match (debug, disabled.contains(&finalize::WASIAPISet::Sockets)) {
+        (true, true) => anyhow::bail!(
+            "a debuggable component needs `wasi:sockets` for its debug connection, so the \
+             `sockets` feature cannot be disabled"
+        ),
+        (false, false) => {
+            disabled.push(finalize::WASIAPISet::Sockets);
+            // The `wasi:sockets` interfaces the world imports itself stay.
+            kept_imports = resolve.worlds[world]
+                .imports
+                .iter()
+                .filter(|(_, item)| matches!(item, WorldItem::Interface { .. }))
+                .map(|(key, _)| resolve.name_world_key(key))
+                .filter(|name| name.starts_with("wasi:sockets/"))
+                .collect();
+        }
+        _ => {}
+    }
+    let required: &[finalize::WASIAPISet] = if debug {
+        &[finalize::WASIAPISet::Sockets]
+    } else {
+        &[]
+    };
 
     // The finalized component exports what the world declares, including the
     // two builtins removed from the world below, under the names the world gave
@@ -787,6 +834,10 @@ pub async fn componentize_with_output(
     let main_path = js_base_directory
         .as_ref()
         .and_then(|base| path_in(Path::new(js.name), base.as_ref()));
+    let main_name = match &main_path {
+        Some(path) => format!("/{path}"),
+        None => js.name.to_string(),
+    };
     let mut wasi = WasiCtxBuilder::new();
     if let Some(dir) = js_base_directory {
         // `init` only reads the application's dependency modules.
@@ -856,11 +907,12 @@ pub async fn componentize_with_output(
                     .call_init(
                         accessor,
                         js.text.to_string(),
-                        js.name.to_string(),
+                        main_name,
                         main_path,
                         cli,
                         raw_http_handler,
                         init_location.map(str::to_string),
+                        debug,
                     )
                     .await
             })
@@ -909,7 +961,14 @@ pub async fn componentize_with_output(
         )
         .await?;
 
-    let component = finalize::finalize(&snapshot, &keep_exports, disabled, insecure_seed)?;
+    let component = finalize::finalize(
+        &snapshot,
+        &keep_exports,
+        &disabled,
+        insecure_seed,
+        &kept_imports,
+        required,
+    )?;
     Ok(Componentized {
         component,
         init_output,
@@ -959,7 +1018,9 @@ fn path_in(file: &Path, base: &Path) -> Option<String> {
 /// show for it. A plain `&str` converts to a source named `main.js`.
 ///
 /// A name that is the path of a file inside the base directory makes the
-/// source that file's module, so a module importing the file gets it.
+/// source that file's module, so a module importing the file gets it. Stack
+/// traces and error messages then show the file's path relative to the base
+/// directory, prefixed with `/`.
 #[derive(Clone, Copy, Debug)]
 pub struct JsSource<'a> {
     pub name: &'a str,

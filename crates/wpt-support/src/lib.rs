@@ -101,7 +101,7 @@ unsafe extern "C" fn eval_script_native(
             true
         }
         Err(_) => {
-            println!("Eval failed");
+            eprintln!("Eval failed");
             false
         }
     }

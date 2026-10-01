@@ -881,4 +881,69 @@ fn test_event_loop() {
         assert!(!el.has_interest());
         assert!(el.is_empty());
     }
+
+    // ---- Test: a suspended loop runs no tasks ----
+    {
+        let el = EventLoop::new();
+        let counter = Rc::new(Cell::new(0u32));
+        el.queue_ready(Box::new(CounterTask {
+            counter: counter.clone(),
+            label: "suspended",
+        }));
+
+        core_runtime::event_loop::set_suspended(true);
+        assert!(core_runtime::event_loop::is_suspended());
+        assert_eq!(el.step(&scope), StepOutcome::Idle);
+        assert_eq!(counter.get(), 0);
+
+        core_runtime::event_loop::set_suspended(false);
+        assert!(!core_runtime::event_loop::is_suspended());
+        assert_eq!(el.step(&scope), StepOutcome::Progressed);
+        assert_eq!(counter.get(), 1);
+
+        // A suspended loop with nothing left reports Done.
+        core_runtime::event_loop::set_suspended(true);
+        assert_eq!(el.step(&scope), StepOutcome::Done);
+        core_runtime::event_loop::set_suspended(false);
+    }
+
+    // ---- Test: run_until waits out a suspension ----
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let el = EventLoop::new();
+        let counter = Rc::new(Cell::new(0u32));
+        el.queue_ready(Box::new(CounterTask {
+            counter: counter.clone(),
+            label: "run-until-suspended",
+        }));
+        // SAFETY: the scope (and its Runtime) outlives the future, which is driven to completion
+        // on this thread below.
+        let raw_cx = unsafe { scope.raw_cx_no_gc() };
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio_rt.block_on(async {
+            core_runtime::event_loop::set_suspended(true);
+            let run = unsafe {
+                core_runtime::event_loop::run_until(raw_cx, &el, tokio::time::sleep, |_| false)
+            };
+            let mut run = std::pin::pin!(run);
+            assert!(futures_lite::future::poll_once(&mut run).await.is_none());
+            assert_eq!(counter.get(), 0);
+
+            core_runtime::event_loop::set_suspended(false);
+            run.await;
+            assert_eq!(counter.get(), 1);
+        });
+    }
+}
+
+#[test]
+fn blocking_is_not_allowed_without_an_event_loop() {
+    assert!(core_runtime::event_loop::blocking_allowed());
+    core_runtime::event_loop::without_event_loop("a test reason", || {
+        assert!(!core_runtime::event_loop::blocking_allowed());
+    });
+    assert!(core_runtime::event_loop::blocking_allowed());
 }

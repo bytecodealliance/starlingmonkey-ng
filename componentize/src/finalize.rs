@@ -61,6 +61,9 @@ pub enum WASIAPISet {
     Http,
     /// `wasi:filesystem/*`: module loading from disk.
     Filesystem,
+    /// `wasi:sockets/*`: the debugger's TCP connection. Disabled unless the
+    /// component is built for debugging.
+    Sockets,
 }
 
 impl WASIAPISet {
@@ -78,6 +81,7 @@ impl WASIAPISet {
             WASIAPISet::Clocks => &["wasi:clocks/"],
             WASIAPISet::Http => &["wasi:http/"],
             WASIAPISet::Filesystem => &["wasi:filesystem/"],
+            WASIAPISet::Sockets => &["wasi:sockets/"],
         }
     }
 
@@ -96,6 +100,7 @@ impl WASIAPISet {
             WASIAPISet::Clocks => "clocks",
             WASIAPISet::Http => "http",
             WASIAPISet::Filesystem => "filesystem",
+            WASIAPISet::Sockets => "sockets",
         }
     }
 }
@@ -145,9 +150,17 @@ impl KeptExport {
 }
 
 /// Wrap `snapshot` so the result exports exactly `keep_exports` and imports
-/// nothing from the interfaces of `disabled`. With `insecure_seed`, it imports
-/// no `wasi:random/insecure-seed` either, and `get-insecure-seed` returns the
+/// nothing from the interfaces of `disabled`, except those named in
+/// `kept_imports`. With `insecure_seed`, it imports no
+/// `wasi:random/insecure-seed` either, and `get-insecure-seed` returns the
 /// seed's high and low 64 bits, in that order.
+///
+/// `kept_imports` are interface names as the snapshot imports them, such as
+/// `wasi:sockets/types@0.3.0`. The interfaces of the same feature they use are
+/// kept as well.
+///
+/// `required` are the features a debuggable component needs. A conflict with
+/// one of them is reported as unsupported rather than with a hint to disable it.
 ///
 /// A [`KeptExport::snapshot_name`] the snapshot does not export is an error.
 pub fn finalize(
@@ -155,6 +168,8 @@ pub fn finalize(
     keep_exports: &[KeptExport],
     disabled: &[WASIAPISet],
     insecure_seed: Option<u128>,
+    kept_imports: &[String],
+    required: &[WASIAPISet],
 ) -> anyhow::Result<Vec<u8>> {
     let DecodedWasm::Component(mut resolve, world) =
         wit_parser::decoding::decode(snapshot).context("decoding the snapshot's world")?
@@ -168,6 +183,8 @@ pub fn finalize(
         keep_exports,
         disabled,
         insecure_seed.is_some(),
+        kept_imports,
+        required,
     )?;
     let stub_names: Vec<String> = stubbed
         .iter()
@@ -209,8 +226,9 @@ pub fn finalize(
         .context("encoding the finalized component")
 }
 
-/// The imported interfaces to stub: every interface of a disabled feature,
-/// `wasi:random/insecure-seed` with `seeded`, plus the dependency-only ones
+/// The imported interfaces to stub: every interface of a disabled feature
+/// except the kept ones (see [`finalize`]), `wasi:random/insecure-seed` with
+/// `seeded`, plus the dependency-only ones
 /// nothing remaining uses.
 fn stub_set(
     resolve: &Resolve,
@@ -218,6 +236,8 @@ fn stub_set(
     keep_exports: &[KeptExport],
     disabled: &[WASIAPISet],
     seeded: bool,
+    kept_imports: &[String],
+    required: &[WASIAPISet],
 ) -> anyhow::Result<IndexSet<InterfaceId>> {
     let imports: Vec<InterfaceId> = resolve.worlds[world]
         .imports
@@ -251,9 +271,24 @@ fn stub_set(
         seeded && interface_name(resolve, world, id).starts_with(INSECURE_SEED_INTERFACE)
     };
 
+    let mut kept: IndexSet<InterfaceId> = imports
+        .iter()
+        .copied()
+        .filter(|id| kept_imports.contains(&interface_name(resolve, world, *id)))
+        .collect();
+    let mut pending: Vec<InterfaceId> = kept.iter().copied().collect();
+    while let Some(id) = pending.pop() {
+        for dep in resolve.interface_direct_deps(id) {
+            if owner(dep).is_some() && owner(dep) == owner(id) && kept.insert(dep) {
+                pending.push(dep);
+            }
+        }
+    }
+
     let mut stubbed: IndexSet<InterfaceId> = imports
         .iter()
         .copied()
+        .filter(|id| !kept.contains(id))
         .filter(|id| owner(*id).is_some() || dependency_only(*id) || insecure_seed(*id))
         .collect();
 
@@ -347,27 +382,35 @@ fn stub_set(
                     )
                 }))
                 .collect();
-            // The features to disable as well: those of the remaining imports that use a
-            // disabled feature, and not a feature that is disabled already.
-            let mut also: Vec<&str> = conflicts
+            // The features of the remaining imports that use a disabled feature,
+            // other than a feature that is disabled already. A required one makes
+            // the combination unsupported, and the others are to be disabled as well.
+            let mut users: Vec<WASIAPISet> = conflicts
                 .iter()
                 .filter(|(_, _, user)| !kept_exports.contains(user))
                 .filter_map(|(_, _, user)| feature_of(*user))
                 .filter(|feature| !disabled.contains(feature))
-                .map(|feature| feature.name())
                 .collect();
-            also.sort_unstable();
-            also.dedup();
-            let hint = if also.is_empty() {
-                String::new()
-            } else {
+            users.sort_unstable_by_key(|feature| feature.name());
+            users.dedup();
+            let names = |features: &[&WASIAPISet]| {
+                features
+                    .iter()
+                    .map(|feature| format!("`{}`", feature.name()))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            };
+            let (needed, also): (Vec<&WASIAPISet>, Vec<&WASIAPISet>) =
+                users.iter().partition(|feature| required.contains(feature));
+            let hint = if !needed.is_empty() {
                 format!(
-                    " Disable {} as well.",
-                    also.iter()
-                        .map(|name| format!("`{name}`"))
-                        .collect::<Vec<_>>()
-                        .join(" and ")
+                    " Debugging needs {}, so this combination is unsupported.",
+                    names(&needed)
                 )
+            } else if !also.is_empty() {
+                format!(" Disable {} as well.", names(&also))
+            } else {
+                String::new()
             };
             bail!(
                 "cannot disable these features while interfaces that stay enabled use them: {}.{hint}",
@@ -880,6 +923,128 @@ package wasi:random@0.3.0 {
         );
     }
 
+    /// A world importing sockets interfaces whose types use a clock's.
+    const SOCKETS_WIT: &str = "\
+package test:sockets;
+
+world uses {
+  import wasi:sockets/ip-name-lookup@0.3.0;
+  import wasi:sockets/types@0.3.0;
+  import wasi:clocks/types@0.3.0;
+}
+
+package wasi:clocks@0.3.0 {
+  interface types {
+    type duration = u64;
+  }
+}
+
+package wasi:sockets@0.3.0 {
+  interface types {
+    use wasi:clocks/types@0.3.0.{duration};
+    type timeout = duration;
+  }
+  interface ip-name-lookup {
+    use types.{timeout};
+    lookup: func(t: timeout);
+  }
+}
+";
+
+    fn sockets_world() -> (Resolve, WorldId) {
+        let mut resolve = Resolve::default();
+        let package = resolve.push_str("sockets.wit", SOCKETS_WIT).unwrap();
+        let world = resolve.select_world(&[package], Some("uses")).unwrap();
+        (resolve, world)
+    }
+
+    fn names(resolve: &Resolve, world: WorldId, ids: &IndexSet<InterfaceId>) -> Vec<String> {
+        ids.iter()
+            .map(|id| interface_name(resolve, world, *id))
+            .collect()
+    }
+
+    /// A kept import stays with the interfaces of its feature it uses, and the
+    /// feature's other interfaces are stubbed.
+    #[test]
+    fn kept_imports_keep_what_they_use() {
+        let (resolve, world) = sockets_world();
+        let kept = ["wasi:sockets/ip-name-lookup@0.3.0".to_string()];
+        let stubbed = stub_set(
+            &resolve,
+            world,
+            &[],
+            &[WASIAPISet::Sockets],
+            false,
+            &kept,
+            &[],
+        )
+        .unwrap();
+        assert!(stubbed.is_empty(), "{:?}", names(&resolve, world, &stubbed));
+
+        let kept = ["wasi:sockets/types@0.3.0".to_string()];
+        let stubbed = stub_set(
+            &resolve,
+            world,
+            &[],
+            &[WASIAPISet::Sockets],
+            false,
+            &kept,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            names(&resolve, world, &stubbed),
+            ["wasi:sockets/ip-name-lookup@0.3.0"]
+        );
+
+        let stubbed = stub_set(
+            &resolve,
+            world,
+            &[],
+            &[WASIAPISet::Sockets],
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            names(&resolve, world, &stubbed),
+            [
+                "wasi:sockets/types@0.3.0",
+                "wasi:sockets/ip-name-lookup@0.3.0"
+            ]
+        );
+    }
+
+    /// A conflict with a required feature is reported as unsupported, and the
+    /// feature is not suggested for disabling.
+    #[test]
+    fn conflicts_with_required_features_are_unsupported() {
+        let (resolve, world) = sockets_world();
+        let message = stub_set(&resolve, world, &[], &[WASIAPISet::Clocks], false, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("Disable `sockets` as well."), "{message}");
+
+        let message = stub_set(
+            &resolve,
+            world,
+            &[],
+            &[WASIAPISet::Clocks],
+            false,
+            &[],
+            &[WASIAPISet::Sockets],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("Debugging needs `sockets`, so this combination is unsupported."),
+            "{message}"
+        );
+        assert!(!message.contains("Disable"), "{message}");
+    }
+
     #[test]
     fn every_feature_has_a_name_and_prefixes() {
         for feature in [
@@ -888,6 +1053,7 @@ package wasi:random@0.3.0 {
             WASIAPISet::Clocks,
             WASIAPISet::Http,
             WASIAPISet::Filesystem,
+            WASIAPISet::Sockets,
         ] {
             assert!(!feature.name().is_empty());
             assert!(!feature.prefixes().is_empty());

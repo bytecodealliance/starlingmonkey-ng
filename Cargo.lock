@@ -362,6 +362,7 @@ name = "component-model"
 version = "0.3.0"
 dependencies = [
  "core-runtime",
+ "debugger",
  "heck",
  "js",
  "platform",
@@ -454,6 +455,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "dap-relay"
+version = "0.3.0"
+dependencies = [
+ "wasip3",
+]
+
+[[package]]
 name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,6 +480,21 @@ name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
+
+[[package]]
+name = "debugger"
+version = "0.3.0"
+dependencies = [
+ "core-runtime",
+ "cpp-builtins",
+ "event-listener",
+ "js",
+ "libc",
+ "platform",
+ "serde_json",
+ "wasip3",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "diplomat"
@@ -1515,6 +1538,7 @@ dependencies = [
  "bytes",
  "core-runtime",
  "cpp-builtins",
+ "debugger",
  "event-listener",
  "fetch-event",
  "futures-channel",
@@ -2556,9 +2580,12 @@ version = "0.3.0"
 dependencies = [
  "component-model",
  "core-runtime",
+ "debugger",
  "js",
  "libc",
  "libstarling",
+ "serde_json",
+ "serve-test-support",
  "tempfile",
  "wasip3",
  "web-fetch",

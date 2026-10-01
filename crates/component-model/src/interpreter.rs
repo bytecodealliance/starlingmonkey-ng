@@ -152,6 +152,10 @@ pub struct StreamElement {
 }
 
 js::instance_local! {
+    /// The reason a synchronous export runs without an event loop, per export index, built on
+    /// first use.
+    static NO_EVENT_LOOP_REASONS: RefCell<Vec<Option<Rc<str>>>> = const { RefCell::new(Vec::new()) };
+
     /// The [`FuturePayload`] of each `future` type index, built on first use.
     static FUTURE_PAYLOADS: RefCell<Vec<Option<Rc<FuturePayload>>>> =
         const { RefCell::new(Vec::new()) };
@@ -159,6 +163,26 @@ js::instance_local! {
     /// The [`StreamElement`] of each `stream` type index, built on first use.
     static STREAM_ELEMENTS: RefCell<Vec<Option<Rc<StreamElement>>>> =
         const { RefCell::new(Vec::new()) };
+}
+
+/// The reason the synchronous export `func`, whose index is `index`, runs without an event loop.
+fn no_event_loop_reason(index: usize, func: ExportFunction) -> Rc<str> {
+    NO_EVENT_LOOP_REASONS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() <= index {
+            cache.resize(index + 1, None);
+        }
+        cache[index]
+            .get_or_insert_with(|| {
+                format!(
+                    "the synchronous export `{}` runs without one. Declare the export `async` in \
+                     WIT to use timers and async imports",
+                    wit_function_name(func.interface(), func.name())
+                )
+                .into()
+            })
+            .clone()
+    })
 }
 
 /// The element type of the `stream<T>` with type index `index`.
@@ -524,11 +548,7 @@ impl Interpreter for StarlingInterpreter {
         init::before_export();
         let index = func.index();
         let result = crate::exports::with_export_table(|table| table.result(index));
-        let reason = format!(
-            "the synchronous export `{}` runs without one. Declare the export `async` in WIT \
-             to use timers and async imports",
-            wit_function_name(func.interface(), func.name())
-        );
+        let reason = no_event_loop_reason(index, func);
 
         init::with_scope(|scope| {
             // Drain the arguments and dispatch to the JS export, leaving the JS
@@ -574,6 +594,11 @@ impl Interpreter for StarlingInterpreter {
     /// Each call gets its own [`OwnedInvocation`], so timers, `fetch` and async
     /// imports are tagged with this loop's id and concurrent calls stay isolated.
     ///
+    /// Before any JS runs, the debugger starts a session in an instance resumed
+    /// from a snapshot, or connects a `connect` session's client (see
+    /// `debugger::before_export`). [`Self::export_call`] does neither, since a
+    /// synchronous export cannot block.
+    ///
     /// No [`Scope`] can be held across an `await`, so the returned promise stays
     /// alive on the owned [`CallStack`] instead, whose slots a compacting GC
     /// updates in place.
@@ -589,6 +614,9 @@ impl Interpreter for StarlingInterpreter {
     ) -> impl std::future::Future<Output = ()> {
         async move {
             init::before_export();
+            // SAFETY: `initialize_runtime` left the default global's realm entered for the
+            // process, and keeps its runtime and context alive for the process.
+            unsafe { debugger::before_export(&init::runtime(), init::raw_cx()) };
             let mut cx = cx;
             let _ = wit;
             let index = func.index();

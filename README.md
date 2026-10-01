@@ -12,6 +12,7 @@ JS modules, and functions and properties on the global object.
 ## Contents
 
 - [Running JavaScript](#running-javascript)
+- [Debugging](#debugging)
 - [Built-in APIs](#built-in-apis)
 - [CLI Reference](#cli-reference)
 - [Extending with Custom Builtins](#extending-with-custom-builtins)
@@ -82,6 +83,162 @@ starlingmonkey --legacy-script old-code.js
 
 ---
 
+## Debugging
+
+`starlingmonkey --debug=stdio main.js` runs as a [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/)
+adapter on stdin and stdout. The script starts once the client sends `configurationDone`, so
+breakpoints set during configuration apply to its first line. Console output and the runtime's
+own diagnostics appear in the client's debug console.
+
+Supported: line breakpoints (bound when their module loads), `debugger;` statements, pausing,
+stepping (including over `await`), call stacks, scopes, variables and `setVariable`, evaluation
+while paused or running, and source text for code without a file path. A `fetch` or timer an
+`evaluate` starts while paused makes progress once the debuggee resumes. A promise reaction it
+queues while paused, as in `Promise.resolve().then(f)`, runs at the next microtask checkpoint
+after the debuggee resumes. An `evaluate` before `configurationDone` can start timers and `fetch`,
+but only serve modes run them (see [Serving](#serving)).
+
+### Transports
+
+`--debug` takes one of these forms:
+
+- `stdio`: the process is the adapter, on stdin and stdout.
+- `listen:<port>` or `listen:<addr>:<port>`: a TCP listener on `<addr>`, or on `127.0.0.1` without
+  one. Once bound, it prints `debugger listening on <addr>:<port>` to stderr, and port `0` picks a
+  free port. It serves one client at a time, and accepts the next client after one disconnects.
+  With `,wait` (`listen:9229,wait`), the script starts once a client has attached and sent
+  `configurationDone`. Without it, the script starts at once and a client can attach at any time.
+- `connect:<host>:<port>`: a TCP connection to a client listening on `<host>`. The connection
+  attempt times out after 1000 ms, or after `<ms>` with `,timeout=<ms>`
+  (`connect:127.0.0.1:9230,timeout=250`). If no client accepts it, the failure is printed to
+  stderr and the script runs without debugging.
+
+`stdio` and `connect` start the script once the client sends `configurationDone`. An IPv6 address
+is written without brackets (`listen:::1:9229`, `connect:::1:9230`), and `listen` needs a port
+after it. The `debugger listening on` line prints an IPv6 address in brackets (`[::1]:9229`).
+
+A debug session can evaluate arbitrary code in the debuggee, and the connection is unauthenticated
+plain TCP. Bind `listen` to a loopback address unless everyone who can reach the port is trusted,
+and reach a remote instance through an SSH tunnel or a similar private channel. `connect` trusts
+whatever answers at the configured host. A component that `starling-componentize` builds without
+`--debug` cannot be debugged.
+
+### Serving
+
+`--debug` also works with `--serve`:
+
+- `stdio` starts the session before the content script, and the server starts once the client
+  sends `configurationDone`.
+- `listen:<port>,wait` waits for a client to attach and configure the session before the server
+  starts. Without `,wait`, the server starts at once and a client can attach at any time.
+- `connect:<host>:<port>` connects at startup. After a client disconnects, the next request
+  connects again and waits until the new client is configured. If nothing listens, requests are
+  served without debugging, and the failure is reported once until a connection succeeds again.
+  While no client is connected, each request makes one attempt. A target that drops packets
+  rather than refusing the connection adds up to the connect timeout to every request, and
+  resolving a host name takes extra time the timeout does not cover.
+- With `--serve-isolated`, each request's global is a debuggee, so breakpoints bind when the
+  request evaluates the script. An `evaluate` while nothing is paused runs in the default global,
+  so it cannot see the state the script sets up in a request's global.
+
+A pause stops the whole server: requests in flight wait until the debuggee resumes. Promise
+reactions an `evaluate` queues while paused run at the next microtask checkpoint after the resume,
+which can belong to another request. Timers and `fetch` an `evaluate` starts before
+`configurationDone` run once the session is configured.
+
+### WebAssembly
+
+The wasm32-wasip3 component supports `--debug` when it runs a script under `wasmtime run`.
+Script paths are the ones the component sees. `listen` and `connect` need the host network
+(`-Sinherit-network=y`), and `connect` to a host name needs name lookup
+(`-Sallow-ip-name-lookup=y`):
+
+```sh
+wasmtime run -Shttp=y,inherit-network=y,allow-ip-name-lookup=y,p3=y -Wcomponent-model-async=y \
+    --dir .::/ starling.wasm --debug=stdio /main.js
+```
+
+On wasm, `stdio` sends only `console` output to the client. Other writes to stdout, such as
+`process.stdout.write`, go to the component's stdout between the protocol messages and break the
+session. Debug scripts that write to stdout directly with `listen` or `connect`.
+
+Under `wasmtime serve`, `--debug` goes in `STARLINGMONKEY_CONFIG`. The session starts with the
+first request, since no guest code runs before it, and with `listen:<port>,wait` that request
+waits until a client has configured the session. The debug socket needs `-Scli=y` and the host
+network:
+
+```sh
+STARLINGMONKEY_CONFIG="--debug=listen:9229,wait /main.js" \
+    wasmtime serve -Scli=y,inherit-env=y,inherit-network=y,http=y,p3=y -Wcomponent-model-async=y \
+    --max-instance-reuse-count 100000 --dir .::/ starling.wasm
+```
+
+A session ends with the instance that runs it. `wasmtime serve` retires an instance after
+`--max-instance-reuse-count` requests (128 by default), and `-W timeout` ends an instance that
+long after its last response, so debug with a high `--max-instance-reuse-count` and without
+`-W timeout`. Each instance binds its own listener: when the host runs a second instance, its
+bind fails, the failure is logged, and that instance serves without debugging.
+
+A snapshot taken by `wasmtime wizer` with `--debug` in its `STARLINGMONKEY_CONFIG` reads the
+transport from `STARLING_DEBUG` when its first export runs, for example with
+`--env STARLING_DEBUG=listen:9229,wait`. A snapshot taken without `--debug` ignores the variable.
+A component built with `starling-componentize --debug` reads `STARLING_DEBUG` when its first
+export runs, and one built without `--debug` ignores the variable (see
+[Componentizing JavaScript](#componentizing-javascript)). Top-level code in a snapshot ran when
+the snapshot was taken, so it cannot be debugged there.
+
+### The relay for `connect`
+
+DAP clients do not accept connections from an adapter, so a debuggee started with `connect` needs
+a listener on the client side. The `starling-dap-relay` component is that listener.
+`just build-dap-relay` builds it as `target/wasm32-wasip3/release/dap_relay.wasm`, and a client
+runs it as its adapter command:
+
+```sh
+wasmtime run -Sinherit-network=y dap_relay.wasm [--instance <addr>:<port>] [--client <port>]
+```
+
+The relay listens for debuggees on `--instance` (default `127.0.0.1:9230`, so
+`--debug=connect:127.0.0.1:9230` reaches it) and talks to the client on stdio. `--instance` takes
+a socket address, with an IPv6 address in brackets (`[::1]:9230`). With `--client <port>`, the
+relay accepts the client on `127.0.0.1:<port>` instead. Once listening, it prints
+`relay listening for instances on <addr>:<port>` and, with `--client`,
+`relay listening for the client on 127.0.0.1:<port>` to stderr. It bridges the first debuggee that
+connects and closes later connections, whose instances run without debugging. When the debuggee
+disconnects, the relay sends the client a `terminated` event and exits.
+
+### Clients
+
+With nvim-dap, the `starling` adapter runs a script over stdio, `starling_relay` waits for a
+debuggee started with `--debug=connect:127.0.0.1:9230`, and `starling_listen` attaches to one
+started with `--debug=listen:9229`:
+
+```lua
+local dap = require("dap")
+dap.adapters.starling = function(callback, config)
+  callback({ type = "executable", command = "starlingmonkey", args = { "--debug=stdio", config.program } })
+end
+dap.adapters.starling_relay = {
+  type = "executable",
+  command = "wasmtime",
+  args = { "run", "-Sinherit-network=y", "/path/to/dap_relay.wasm" },
+}
+dap.adapters.starling_listen = { type = "server", host = "127.0.0.1", port = 9229 }
+dap.configurations.javascript = {
+  { type = "starling", request = "launch", name = "Debug with Starling", program = "${file}" },
+  { type = "starling_relay", request = "attach", name = "Attach through the relay" },
+  { type = "starling_listen", request = "attach", name = "Attach to port 9229" },
+}
+```
+
+`launch` and `attach` accept `stopOnEntry`, and `localRoot`/`remoteRoot` to map paths inside the
+runtime to paths on the client. Under `--debug`, the entry script's path is canonicalized, and
+imported modules are named by their canonical paths too, so `remoteRoot` has to be a canonical
+path: on macOS, `/private/tmp/app` rather than `/tmp/app`. Without them, a client path and a
+script path match when one ends with the other at a path segment boundary.
+
+---
+
 ## Built-in APIs
 
 StarlingMonkey's suite of builtins is a work in progress for now.
@@ -112,7 +269,7 @@ Options:
   -i, --initializer-script <PATH>    Run an init script (classic, synchronous) before the content script
       --legacy-script                Run as a classic script instead of an ES module
   -v, --verbose                      Enable verbose logging
-  -d, --debug                        Enable script debugging via socket
+  -d, --debug <TRANSPORT>            Debug over the Debug Adapter Protocol (`stdio`, `listen:[<addr>:]<port>[,wait]`, `connect:<host>:<port>[,timeout=<ms>]`)
       --async-stacks                 Show async parent frames in Error.stack (always on under a debugger)
       --wpt-mode                     Enable WPT (Web Platform Tests) mode
       --init-location <URL>          Override the location URL for initialization
@@ -869,7 +1026,7 @@ Some worlds are refused, each with an error naming the function or export:
   major and minor numbers or pre-release suffix differ from the one the runtime
   provides.
 
-`--disable stdio,random,clocks,http,filesystem` (comma-separated, repeatable)
+`--disable stdio,random,clocks,http,filesystem,sockets` (comma-separated, repeatable)
 leaves the named WASI features out of the component: their interfaces disappear
 from its imports, satisfied instead by stubs that trap when reached, so a world
 that imports no WASI produces a component that imports none beyond
@@ -890,6 +1047,30 @@ alone is refused with a message listing every such use and the features to
 disable with it. A trap in a stub names the disabled
 function in the backtrace, as in
 `disabled-features!wasi:random/random@0.3.0#get-random-bytes (disabled)`.
+Without `--debug`, `sockets` is disabled, except for the `wasi:sockets`
+interfaces the world imports itself.
+
+`componentize --debug` builds a debuggable component: an instance starts a debug
+session from the `STARLING_DEBUG` environment variable when its first
+`wasi:cli/run`, `wasi:http/handler` or async export call runs, with the
+transports `--debug` takes (see [Debugging](#debugging)), and the component
+imports the `wasi:sockets` interfaces the `listen` and `connect` transports use.
+A synchronous export never starts a session, and a breakpoint hit in one is
+skipped with a message in the client's debug console. The entry module is named
+by its path in the guest, `/` followed by its path relative to the base
+directory, so breakpoints set on the file bind. An input outside the base
+directory keeps the name it was given on the command line, and breakpoints bind
+to it only if that name is an absolute path, so pass a `--base-directory` that
+contains it. A component built without `--debug` ignores
+`STARLING_DEBUG` and imports only the `wasi:sockets` interfaces its world
+imports. `--debug` needs the static runtime, so it cannot be combined with
+`--runtime-lib`, and it cannot be combined with `--disable sockets`.
+
+```sh
+starling-componentize --serve componentize --debug app.js -o app.wasm
+wasmtime serve -Scli=y,inherit-network=y,p3=y -Wcomponent-model-async=y \
+    --env STARLING_DEBUG=listen:9229,wait app.wasm
+```
 
 In both modes the world's bindings are generated with `wit-dylib`, a small module
 that lowers and lifts every WIT function through the runtime's `wit_dylib_*`
@@ -1016,12 +1197,13 @@ starling-componentize --cli --serve componentize <app.js> -o app.wasm
 
 #### The interfaces the runtime imports
 
-The targeted world also imports every interface the runtime imports, whether
-it comes from `-d`, `--cli` or `--serve`: `wasi:cli`'s environment, exit,
-standard streams and terminals, `wasi:clocks`, `wasi:filesystem`,
-`wasi:random`, `wasi:http/types` and `wasi:http/client`. Each has the functions
-the runtime itself imports, so the application can import them without adding
-to what the component imports:
+Whether the targeted world comes from `-d`, `--cli` or `--serve`, it also
+imports every interface the runtime imports except `wasi:sockets`, which the
+runtime imports for its debugger: `wasi:cli`'s environment, exit, standard
+streams and terminals, `wasi:clocks`, `wasi:filesystem`, `wasi:random`,
+`wasi:http/types` and `wasi:http/client`. Each has the functions the runtime
+itself imports, so the application can import them without adding to what the
+component imports:
 
 ```js
 import { getEnvironment } from "wasi:cli/environment@0.3.0";

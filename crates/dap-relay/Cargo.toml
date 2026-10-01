@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+[package]
+name = "dap-relay"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+# Declared without the workspace entry's `http-compat` feature, which the relay does not use.
+[target.'cfg(all(target_arch = "wasm32", target_env = "p3"))'.dependencies]
+wasip3 = "0.9.0"
+
+[lints]
+workspace = true

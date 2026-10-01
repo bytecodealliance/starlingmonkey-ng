@@ -115,7 +115,34 @@ pub fn with_event_loop<R>(event_loop: &EventLoop, f: impl FnOnce(&EventLoop) -> 
 js::instance_local! {
     /// Why no event loop is active, set by [`without_event_loop`] for the
     /// duration of its closure.
-    static NO_LOOP_REASON: RefCell<Option<String>> = const { RefCell::new(None) };
+    static NO_LOOP_REASON: RefCell<Option<Rc<str>>> = const { RefCell::new(None) };
+}
+
+/// Whether code running now may block the current task: false inside [`without_event_loop`],
+/// which runs sync-lifted exports.
+pub fn blocking_allowed() -> bool {
+    NO_LOOP_REASON.with(|cell| cell.borrow().is_none())
+}
+
+js::instance_local! {
+    /// Set while the debugger holds the debuggee paused.
+    static SUSPENDED: Cell<bool> = const { Cell::new(false) };
+    /// Notified when [`set_suspended`] clears the flag.
+    static SUSPENSION_ENDED: Event = const { Event::new() };
+}
+
+/// Suspend or resume every event loop. While suspended, [`EventLoop::step`] runs no task and
+/// [`run_until`] waits for the suspension to end before it steps or polls futures.
+pub fn set_suspended(suspended: bool) {
+    SUSPENDED.with(|cell| cell.set(suspended));
+    if !suspended {
+        SUSPENSION_ENDED.with(|event| event.notify(usize::MAX));
+    }
+}
+
+/// Whether [`set_suspended`] last suspended the event loops.
+pub fn is_suspended() -> bool {
+    SUSPENDED.with(Cell::get)
 }
 
 /// Run `f` with no active event loop, and `reason` as the explanation
@@ -124,11 +151,11 @@ js::instance_local! {
 ///
 /// This is mainly useful for running code in sync exports, which mustn't block, and hence
 /// can't perform async operations.
-pub fn without_event_loop<R>(reason: String, f: impl FnOnce() -> R) -> R {
+pub fn without_event_loop<R>(reason: impl Into<Rc<str>>, f: impl FnOnce() -> R) -> R {
     /// Restores the previous active loop and reason.
     struct Restore {
         prev_loop: Option<*const EventLoop>,
-        prev_reason: Option<String>,
+        prev_reason: Option<Rc<str>>,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -138,7 +165,7 @@ pub fn without_event_loop<R>(reason: String, f: impl FnOnce() -> R) -> R {
     }
 
     let prev_loop = CURRENT_EVENT_LOOP.with(|el| el.replace(None));
-    let prev_reason = NO_LOOP_REASON.with(|cell| cell.borrow_mut().replace(reason));
+    let prev_reason = NO_LOOP_REASON.with(|cell| cell.borrow_mut().replace(reason.into()));
     let _restore = Restore {
         prev_loop,
         prev_reason,
@@ -1045,7 +1072,21 @@ pub async unsafe fn run_until<S, F>(
     S: Fn(Duration) -> F,
     F: std::future::Future<Output = ()>,
 {
+    // Completions that arrived as a suspension began, settled once it ends.
+    let mut held: Vec<js::promise::CompletedFuture> = Vec::new();
     loop {
+        if is_suspended() {
+            let ended = SUSPENSION_ENDED.with(Event::listen);
+            if is_suspended() {
+                ended.await;
+            }
+            continue;
+        }
+        if !held.is_empty() {
+            // SAFETY: guaranteed by this function's caller.
+            unsafe { settle_completed_futures(raw_cx, event_loop, std::mem::take(&mut held)) };
+        }
+
         // Create a fresh rooting scope each iteration — the same
         // technique JSNative trampolines use. It is dropped before any
         // await point so GC roots don't span a suspension.
@@ -1086,6 +1127,9 @@ pub async unsafe fn run_until<S, F>(
                 // one poll before re-stepping; completions settle with the
                 // loop active, same as in the await arm.
                 futures_lite::future::yield_now().await;
+                if is_suspended() {
+                    continue;
+                }
                 let completed = std::future::poll_fn(|cx| {
                     std::task::Poll::Ready(with_event_loop(event_loop, |_| {
                         js::promise::poll_pending_futures(owner, cx)
@@ -1118,7 +1162,19 @@ pub async unsafe fn run_until<S, F>(
                 // A poll that left jobs queued completes this branch as well, so they are drained
                 // below, since the jobs can start work, such as a write, that the futures wait on.
                 let mut completed = Vec::new();
+                let mut suspension_ended: Option<EventListener> = None;
                 let drive_futures = std::future::poll_fn(|cx| {
+                    // While suspended, poll nothing and wait for the suspension to end.
+                    if is_suspended() {
+                        let ended = suspension_ended
+                            .get_or_insert_with(|| SUSPENSION_ENDED.with(Event::listen));
+                        if std::future::Future::poll(std::pin::Pin::new(ended), cx).is_ready() {
+                            suspension_ended = None;
+                            cx.waker().wake_by_ref();
+                        }
+                        return std::task::Poll::Pending;
+                    }
+                    suspension_ended = None;
                     let (done, jobs) = with_event_loop(event_loop, |_| {
                         let done = js::promise::poll_pending_futures(owner, cx);
                         // SAFETY: guaranteed by this function's caller.
@@ -1142,6 +1198,10 @@ pub async unsafe fn run_until<S, F>(
                 )
                 .await;
 
+                if is_suspended() {
+                    held.append(&mut completed);
+                    continue;
+                }
                 // SAFETY: guaranteed by this function's caller.
                 unsafe { settle_completed_futures(raw_cx, event_loop, completed) };
             }
@@ -1155,14 +1215,14 @@ pub async unsafe fn run_until<S, F>(
 
 /// Handle and clear a pending JS exception.
 ///
-/// Prints the exception to stderr as `Uncaught` followed by its message,
-/// location and stack, and clears the pending state, allowing the event loop to
-/// continue. This is called by [`EventLoop::step`] when a task or microtask
-/// throws.
+/// Reports the exception as `Uncaught` followed by its message, location and
+/// stack (see [`crate::diagnostics`]), and clears the pending state, allowing
+/// the event loop to continue. This is called by [`EventLoop::step`] when a
+/// task or microtask throws.
 fn handle_and_clear_exception(scope: &Scope<'_>) {
     if js::exception::is_pending(scope) {
         let captured = js::error::ExnThrown::capture(scope);
-        eprintln!("Uncaught {}", captured.to_string().trim_end());
+        crate::diagnostics::report(&format!("Uncaught {}", captured.to_string().trim_end()));
     }
 }
 
@@ -1179,6 +1239,13 @@ impl EventLoop {
             !js::exception::is_pending(scope),
             "Pending JS exception detected"
         );
+        if is_suspended() {
+            return if self.is_alive() {
+                StepOutcome::Idle
+            } else {
+                StepOutcome::Done
+            };
+        }
         self.advance_timers();
 
         // One batch per step: a task that becomes ready while the batch runs — a zero-delay
@@ -1270,7 +1337,8 @@ impl Default for EventLoop {
 ///
 /// Any `FinalizationRegistry` cleanup a collection queued runs first, so a
 /// callback's own microtasks are drained in the same turn. A promise rejected
-/// with no handler attached by the end of the drain is reported on stderr.
+/// with no handler attached by the end of the drain is reported by
+/// [`report_unhandled_rejections`].
 pub fn run_microtasks(scope: &Scope<'_>) {
     debug_assert!(
         !js::exception::is_pending(scope),
@@ -1282,8 +1350,8 @@ pub fn run_microtasks(scope: &Scope<'_>) {
     report_unhandled_rejections(scope);
 }
 
-/// Report each promise that was rejected with no handler attached, and still has none, on
-/// stderr, with the rejection reason's message and stack.
+/// Report each promise that was rejected with no handler attached, and still has none, with the
+/// rejection reason's message and stack (see [`crate::diagnostics`]).
 pub fn report_unhandled_rejections(scope: &Scope<'_>) {
     for promise in jobs::take_unhandled_rejections(scope) {
         let Some(reason) = promise.result(scope) else {
@@ -1291,6 +1359,9 @@ pub fn report_unhandled_rejections(scope: &Scope<'_>) {
         };
         js::exception::set_pending(scope, reason, js::native::ExceptionStackBehavior::Capture);
         let captured = js::error::ExnThrown::capture(scope);
-        eprintln!("Uncaught (in promise) {}", captured.to_string().trim_end());
+        crate::diagnostics::report(&format!(
+            "Uncaught (in promise) {}",
+            captured.to_string().trim_end()
+        ));
     }
 }
