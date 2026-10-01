@@ -1076,14 +1076,14 @@ fn a_client_that_leaves_mid_startup_does_not_strand_the_instance() {
     );
 }
 
-/// A snapshotted instance serves many requests, so the repairs a resumed instance needs — the
-/// monotonic clock's origin above all, anchored to the process the snapshot was taken in — have to
-/// happen exactly once, on the first of them. Running them again on a later request would rebase
+/// A wizened instance serves many requests, so the repairs a resumed instance needs have to happen
+/// exactly once, on the first of them. The main one rebases the monotonic clock's origin, which is
+/// anchored to the process the snapshot was taken in. Running them again on a later request would rebase
 /// the clock under a handler that had already read it, so `performance.now()` is checked for going
 /// forwards across requests rather than merely being plausible on the first. The shared global
 /// carries across requests here exactly as it does without a snapshot.
 #[test]
-fn a_snapshotted_instance_keeps_its_clock_and_global_across_requests() {
+fn a_wizened_instance_keeps_its_clock_and_global_across_requests() {
     const HANDLER: &str = r#"const atStartup = performance.now();
     globalThis.served = 0;
     addEventListener('fetch', (event) => {
@@ -2751,7 +2751,7 @@ fn nothing_but_wait_until_extends_the_event_lifetime() {
 /// mid-evaluation and the resumed instance's first request drives the rest (`test-wizer.sh`'s
 /// `awaited.mjs` case, extended here with the ordering the marker pins).
 #[test]
-fn a_snapshotted_instance_waits_for_the_scripts_top_level_await() {
+fn a_wizened_instance_waits_for_the_scripts_top_level_await() {
     // The ordering is recorded in a global and reported in the response rather than through the
     // usual stderr markers: writing to stdio before the snapshot is taken leaves the resumed
     // instance with a stale stream handle, and every later write traps (see the wizer item in

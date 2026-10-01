@@ -31,7 +31,7 @@ fn pending_work_is_reported_with_its_origin() {
     let scope = rt.default_global();
     install_timer_globals(&scope, scope.global());
 
-    // A loop that holds nothing can be snapshotted.
+    // A loop that holds nothing can be wizened.
     assert!(EventLoop::new().ensure_idle_for_snapshot().is_ok());
 
     // A timer is reported with the stack that created it, and clearing it leaves the loop idle.
