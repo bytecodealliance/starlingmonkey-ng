@@ -746,7 +746,7 @@ function ensureWizenedRuntime() {
     writeFileSync(stamp, want);
     return output;
   } catch (e) {
-    console.warn(`  Wizening failed, serving the un-snapshotted runtime: ${e.message}`);
+    console.warn(`  Wizening failed, serving the un-wizened runtime: ${e.message}`);
     return null;
   }
 }

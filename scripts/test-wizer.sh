@@ -123,7 +123,7 @@ await new Promise((resolve) => setTimeout(resolve, 50));
 addEventListener('fetch', (event) => event.respondWith(new Response('after-await')));
 JS
 snapshot snap-awaited.wasm "awaited.mjs" >/dev/null
-check "a top-level await is snapshotted rather than refused" \
+check "a top-level await finishes before the snapshot rather than being refused" \
     "after-await" \
     "$(serve_and_get snap-awaited.wasm "awaited.mjs" 18352)"
 

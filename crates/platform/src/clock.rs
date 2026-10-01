@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static OFFSET_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The reading [`record_snapshot_reading`] took, carried into the snapshot for
-/// [`resume_from_snapshot`] to apply. Zero for an instance that was never snapshotted.
+/// [`resume_from_snapshot`] to apply. Zero for an instance that was never wizened.
 static SNAPSHOT_NS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_arch = "wasm32")]
@@ -86,7 +86,7 @@ pub fn coarse_monotonic_ns() -> u64 {
 
 /// Record where the clock stood as a snapshot was made.
 ///
-/// Must be the last thing an instance being snapshotted does, since a reading taken afterwards
+/// Must be the last thing an instance being wizened does, since a reading taken afterwards
 /// would sit past the recorded one and so still be in a resumed instance's future.
 pub fn record_snapshot_reading() {
     SNAPSHOT_NS.store(host_monotonic_ns(), Ordering::Relaxed);
@@ -113,7 +113,7 @@ pub async fn sleep(duration: std::time::Duration) {
 /// A monotonic clock reading, for deadlines that outlive a Wizer snapshot.
 ///
 /// `std::time::Instant` reads the host clock directly, so a deadline taken before a snapshot sits
-/// in the resumed instance's future by however long the snapshotted instance ran. This reads
+/// in the resumed instance's future by however long the wizened instance ran. This reads
 /// [`monotonic_ns`] instead, whose offset makes a resumed instance continue the timeline the
 /// snapshot ended on, so such a deadline is already past when the instance resumes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
