@@ -389,3 +389,151 @@ async fn top_level_reads_the_init_location() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// With `node_compat`, the top level can use the `node:` builtin modules, the `process` global
+/// and `require`, and what it computes is in the snapshot. Without it, `node:` modules don't
+/// resolve.
+#[tokio::test]
+async fn node_compat_enables_node_builtins() -> anyhow::Result<()> {
+    const MAIN: &str = "\
+        import path from 'node:path';\n\
+        import { createRequire } from 'node:module';\n\
+        const require = createRequire(import.meta.url);\n\
+        const value = require('./lib/value.cjs').value;\n\
+        const summary = `${path.join('a', 'b')} ${typeof process.nextTick} ${value}`;\n\
+        export const greeting = () => summary;";
+    let runtime = shared::runtime().expect("reading the runtime build");
+    // Named by its path in the base directory, so the main module is that file's module and has
+    // an `import.meta.url` to `createRequire` from.
+    let name = base_directory().join("main.js").display().to_string();
+    let init = componentize::InitEnvironment::default();
+    let build = |node_compat| {
+        componentize::componentize_with_output(
+            componentize::Wit::<PathBuf>::String(include_str!("fixtures/top_level.wit")),
+            Some("top-level"),
+            &[],
+            false,
+            componentize::JsSource {
+                name: &name,
+                text: MAIN,
+            },
+            Some(base_directory()),
+            &runtime,
+            &[],
+            None,
+            false,
+            node_compat,
+            None,
+            false,
+            None,
+            true,
+            &init,
+        )
+    };
+    let error = build(false)
+        .await
+        .err()
+        .expect("without node_compat, node:path must not resolve");
+    assert!(
+        format!("{error:#}").contains("No such built-in module: node:path"),
+        "{error:#}"
+    );
+
+    let component = Component::new(&ENGINE, build(true).await?.component)?;
+    let mut linker = Linker::new(&ENGINE);
+    componentize::add_wasi(&mut linker)?;
+    componentize::trap_unsatisfied_imports(&ENGINE, &component, &mut linker, &[])?;
+    let mut store = shared::store(&ENGINE);
+    let instance = TopLevelPre::new(linker.instantiate_pre(&component)?)?
+        .instantiate_async(&mut store)
+        .await?;
+    assert_eq!(
+        instance.call_greeting(&mut store).await?,
+        "a/b function commonjs"
+    );
+    Ok(())
+}
+
+/// With `node_compat`, a component that doesn't export `wasi:http/handler` fails to build when its
+/// top level calls `http.Server.listen()`, since nothing would serve the server's requests.
+#[tokio::test]
+async fn node_compat_listen_needs_an_http_handler() -> anyhow::Result<()> {
+    const MAIN: &str = "\
+        import http from 'node:http';\n\
+        http.createServer(() => {}).listen(3000);\n\
+        export const greeting = () => 'unreachable';";
+    let runtime = shared::runtime().expect("reading the runtime build");
+    let name = base_directory().join("main.js").display().to_string();
+    let error = componentize::componentize_with_output(
+        componentize::Wit::<PathBuf>::String(include_str!("fixtures/top_level.wit")),
+        Some("top-level"),
+        &[],
+        false,
+        componentize::JsSource {
+            name: &name,
+            text: MAIN,
+        },
+        Some(base_directory()),
+        &runtime,
+        &[],
+        None,
+        false,
+        true,
+        None,
+        false,
+        None,
+        true,
+        &componentize::InitEnvironment::default(),
+    )
+    .await
+    .err()
+    .expect("listen() must fail without a wasi:http/handler export");
+    assert!(
+        format!("{error:#}").contains("ERR_SERVE_MODE_REQUIRED")
+            || format!("{error:#}").contains("componentize it with --serve"),
+        "{error:#}"
+    );
+    Ok(())
+}
+
+/// With `node_compat`, a CommonJS entry runs through the CommonJS loader, and the component exports
+/// the properties of its `module.exports`.
+#[tokio::test]
+async fn node_compat_runs_commonjs_entries() -> anyhow::Result<()> {
+    let runtime = shared::runtime().expect("reading the runtime build");
+    let path = base_directory().join("commonjs_main.cjs");
+    let name = path.display().to_string();
+    let component = componentize::componentize_with_output(
+        componentize::Wit::<PathBuf>::String(include_str!("fixtures/top_level.wit")),
+        Some("top-level"),
+        &[],
+        false,
+        componentize::JsSource {
+            name: &name,
+            text: include_str!("fixtures/top_level/commonjs_main.cjs"),
+        },
+        Some(base_directory()),
+        &runtime,
+        &[],
+        None,
+        false,
+        true,
+        None,
+        false,
+        None,
+        true,
+        &componentize::InitEnvironment::default(),
+    )
+    .await?
+    .component;
+    let component = Component::new(&ENGINE, component)?;
+    let mut linker = Linker::new(&ENGINE);
+    componentize::add_wasi(&mut linker)?;
+    componentize::trap_unsatisfied_imports(&ENGINE, &component, &mut linker, &[])?;
+    let mut store = shared::store(&ENGINE);
+    let instance = TopLevelPre::new(linker.instantiate_pre(&component)?)?
+        .instantiate_async(&mut store)
+        .await?;
+    assert_eq!(instance.call_greeting(&mut store).await?, "a/b commonjs");
+    Ok(())
+}

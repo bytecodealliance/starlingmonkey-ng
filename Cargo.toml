@@ -94,6 +94,7 @@ web-globals = { path = "crates/builtins/web-globals" }
 web-streams = { path = "crates/builtins/web-streams" }
 web-url = { path = "crates/builtins/web-url" }
 web-websocket = { path = "crates/builtins/web-websocket" }
+node-builtins = { path = "crates/builtins/node" }
 cpp-builtins = { path = "crates/builtins/cpp-builtins" }
 
 # `block_on_detached` for the debugger's pause on wasm. The fork is wit-bindgen 0.62.0 plus that

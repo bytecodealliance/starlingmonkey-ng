@@ -1106,3 +1106,32 @@ fn zero_based_lines_and_columns_are_converted() {
     dap.request("continue", json!({ "threadId": 1 }));
     assert_eq!(dap.run_to_end().output, "1\n");
 }
+
+#[test]
+fn process_exit_ends_the_session_with_its_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_script(
+        dir.path(),
+        "main.js",
+        &["console.log('done');", "process.exit(3);"],
+    );
+    let mut dap = Dap::spawn_with_args(&["--node-compat", script.to_str().unwrap()]);
+    dap.start(json!({}));
+    dap.request("configurationDone", json!({}));
+    let finished = dap.run_to_end();
+    assert_eq!(finished.output, "done\n");
+    assert_eq!(finished.exit_code, Some(3));
+    assert_eq!(finished.status.code(), Some(3));
+}
+
+#[test]
+fn exited_reports_process_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_script(dir.path(), "main.js", &["process.exitCode = 4;"]);
+    let mut dap = Dap::spawn_with_args(&["--node-compat", script.to_str().unwrap()]);
+    dap.start(json!({}));
+    dap.request("configurationDone", json!({}));
+    let finished = dap.run_to_end();
+    assert_eq!(finished.exit_code, Some(4));
+    assert_eq!(finished.status.code(), Some(4));
+}

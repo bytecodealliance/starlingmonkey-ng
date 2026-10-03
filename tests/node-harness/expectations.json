@@ -1,0 +1,5347 @@
+{
+  "test-assert-async.js": {
+    "status": "FAIL"
+  },
+  "test-assert-calltracker-calls.js": {
+    "status": "PASS"
+  },
+  "test-assert-calltracker-getCalls.js": {
+    "status": "FAIL"
+  },
+  "test-assert-calltracker-report.js": {
+    "status": "PASS"
+  },
+  "test-assert-calltracker-verify.js": {
+    "status": "PASS"
+  },
+  "test-assert-checktag.js": {
+    "status": "FAIL"
+  },
+  "test-assert-class-destructuring.js": {
+    "status": "FAIL"
+  },
+  "test-assert-class.js": {
+    "status": "FAIL"
+  },
+  "test-assert-deep-with-error.js": {
+    "status": "FAIL"
+  },
+  "test-assert-deep.js": {
+    "status": "FAIL"
+  },
+  "test-assert-esm-cjs-message-verify.js": {
+    "status": "FAIL"
+  },
+  "test-assert-fail-deprecation.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-assert-fail.js": {
+    "status": "FAIL"
+  },
+  "test-assert-first-line.js": {
+    "status": "FAIL"
+  },
+  "test-assert-if-error.js": {
+    "status": "FAIL"
+  },
+  "test-assert-myers-diff.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-assert-partial-deep-equal.js": {
+    "status": "FAIL"
+  },
+  "test-assert-typedarray-deepequal.js": {
+    "status": "FAIL"
+  },
+  "test-assert.js": {
+    "status": "FAIL"
+  },
+  "test-async-local-storage-bind.js": {
+    "status": "PASS"
+  },
+  "test-async-local-storage-contexts.js": {
+    "status": "FAIL"
+  },
+  "test-async-local-storage-deep-stack.js": {
+    "status": "FAIL"
+  },
+  "test-async-local-storage-enter-with.js": {
+    "status": "PASS"
+  },
+  "test-async-local-storage-exit-does-not-leak.js": {
+    "status": "PASS"
+  },
+  "test-async-local-storage-http-agent.js": {
+    "status": "FAIL"
+  },
+  "test-async-local-storage-http-multiclients.js": {
+    "status": "FAIL"
+  },
+  "test-async-local-storage-http-parser-leak.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-async-local-storage-isolation.js": {
+    "status": "FAIL"
+  },
+  "test-async-local-storage-run-scope.js": {
+    "status": "FAIL"
+  },
+  "test-async-local-storage-snapshot.js": {
+    "status": "PASS"
+  },
+  "test-async-local-storage-weak-asyncwrap-leak.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-alloc-unsafe-is-initialized-with-zero-fill-flag.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-alloc-unsafe-is-uninitialized.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-alloc.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-arraybuffer.js": {
+    "status": "PASS"
+  },
+  "test-buffer-ascii.js": {
+    "status": "PASS"
+  },
+  "test-buffer-backing-arraybuffer.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-badhex.js": {
+    "status": "PASS"
+  },
+  "test-buffer-bigint64.js": {
+    "status": "PASS"
+  },
+  "test-buffer-bytelength.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-compare-offset.js": {
+    "status": "PASS"
+  },
+  "test-buffer-compare.js": {
+    "status": "PASS"
+  },
+  "test-buffer-concat.js": {
+    "status": "PASS"
+  },
+  "test-buffer-constants.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-constructor-deprecation-error.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-constructor-node-modules-paths.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-buffer-constructor-node-modules.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-constructor-outside-node-modules.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-copy.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-equals.js": {
+    "status": "PASS"
+  },
+  "test-buffer-failed-alloc-typed-arrays.js": {
+    "status": "PASS"
+  },
+  "test-buffer-fakes.js": {
+    "status": "PASS"
+  },
+  "test-buffer-fill.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-from.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-generic-methods.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-includes.js": {
+    "status": "PASS"
+  },
+  "test-buffer-indexof.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-inheritance.js": {
+    "status": "PASS"
+  },
+  "test-buffer-inspect.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-isascii.js": {
+    "status": "PASS"
+  },
+  "test-buffer-isencoding.js": {
+    "status": "PASS"
+  },
+  "test-buffer-isutf8-isascii-fast.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-isutf8.js": {
+    "status": "PASS"
+  },
+  "test-buffer-iterator.js": {
+    "status": "PASS"
+  },
+  "test-buffer-new.js": {
+    "status": "PASS"
+  },
+  "test-buffer-no-negative-allocation.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-nopendingdep-map.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-of-no-deprecation.js": {
+    "status": "PASS"
+  },
+  "test-buffer-over-max-length.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-parent-property.js": {
+    "status": "PASS"
+  },
+  "test-buffer-pending-deprecation.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-pool-untransferable.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-buffer-prototype-inspect.js": {
+    "status": "PASS"
+  },
+  "test-buffer-read.js": {
+    "status": "PASS"
+  },
+  "test-buffer-readdouble.js": {
+    "status": "PASS"
+  },
+  "test-buffer-readfloat.js": {
+    "status": "PASS"
+  },
+  "test-buffer-readint.js": {
+    "status": "PASS"
+  },
+  "test-buffer-readuint.js": {
+    "status": "PASS"
+  },
+  "test-buffer-resizable.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-safe-unsafe.js": {
+    "status": "PASS"
+  },
+  "test-buffer-set-inspect-max-bytes.js": {
+    "status": "PASS"
+  },
+  "test-buffer-sharedarraybuffer.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-slice.js": {
+    "status": "PASS"
+  },
+  "test-buffer-slow.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-swap-fast.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-swap.js": {
+    "status": "PASS"
+  },
+  "test-buffer-tojson.js": {
+    "status": "PASS"
+  },
+  "test-buffer-tostring-4gb.js": {
+    "status": "FAIL",
+    "wasm_status": "SKIP"
+  },
+  "test-buffer-tostring-range.js": {
+    "status": "PASS"
+  },
+  "test-buffer-tostring-rangeerror.js": {
+    "status": "FAIL"
+  },
+  "test-buffer-tostring.js": {
+    "status": "PASS"
+  },
+  "test-buffer-write-fast.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-write.js": {
+    "status": "PASS"
+  },
+  "test-buffer-writedouble.js": {
+    "status": "PASS"
+  },
+  "test-buffer-writefloat.js": {
+    "status": "PASS"
+  },
+  "test-buffer-writeint.js": {
+    "status": "PASS"
+  },
+  "test-buffer-writeuint.js": {
+    "status": "PASS"
+  },
+  "test-buffer-zero-fill-cli.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-buffer-zero-fill-reset.js": {
+    "status": "PASS"
+  },
+  "test-buffer-zero-fill.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-bind-store.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-child-process.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-diagnostics-channel-gc-maintains-subcriptions.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-diagnostics-channel-gc-race-condition.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-diagnostics-channel-has-subscribers.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-http-server-start.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-http.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-http2-client-stream-body-multiple-buffers-and-strings.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-body-multiple-buffers.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-body-no-chunks.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-body-single-buffer.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-body-single-string.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-close-error.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-close.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-created.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-error.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-finish.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-client-stream-start.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-server-stream-close-error.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-server-stream-close.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-server-stream-created-start-timing.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-server-stream-created.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-server-stream-error.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-server-stream-finish.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-http2-server-stream-start.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-many-channels.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-memory-leak.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-diagnostics-channel-module-import-error.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-module-import.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-module-require-error.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-module-require.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-net-client-socket-tls.js": {
+    "status": "SKIP"
+  },
+  "test-diagnostics-channel-net.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-object-channel-pub-sub.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-process.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-diagnostics-channel-pub-sub.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-safe-subscriber-errors.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-symbol-named.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-sync-unsubscribe.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-args-types.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-tracing-channel-callback-early-exit.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-callback-error.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-callback-run-stores.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-callback.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-has-subscribers.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-promise-early-exit.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-promise-error.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-promise-run-stores.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-promise-unhandled.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-promise.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-sync-early-exit.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-sync-error.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-sync-run-stores.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-tracing-channel-sync.js": {
+    "status": "PASS"
+  },
+  "test-diagnostics-channel-udp.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-web-locks.js": {
+    "status": "FAIL"
+  },
+  "test-diagnostics-channel-worker-threads.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-dns-lookup-promises-options-deprecated.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-dns-lookup-promises.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-dns-lookup.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-dns-lookupService-promises.js": {
+    "status": "FAIL"
+  },
+  "test-dns-lookupService.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-event-emitter-add-listeners.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-check-listener-leaks.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-emit-context.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-error-monitor.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-errors.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-get-max-listeners.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-invalid-listener.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-listener-count.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-listeners-side-effects.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-listeners.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-max-listeners-warning-for-null.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-event-emitter-max-listeners-warning-for-symbol.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-event-emitter-max-listeners-warning.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-event-emitter-max-listeners.js": {
+    "status": "FAIL"
+  },
+  "test-event-emitter-method-names.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-modify-in-emit.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-no-error-provided-to-error-event.js": {
+    "status": "FAIL"
+  },
+  "test-event-emitter-num-args.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-once.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-prepend.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-remove-all-listeners.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-remove-listeners.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-set-max-listeners-side-effects.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-special-event-names.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-subclass.js": {
+    "status": "PASS"
+  },
+  "test-event-emitter-symbols.js": {
+    "status": "PASS"
+  },
+  "test-events-add-abort-listener.mjs": {
+    "status": "FAIL"
+  },
+  "test-events-customevent.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-events-getmaxlisteners.js": {
+    "status": "FAIL"
+  },
+  "test-events-list.js": {
+    "status": "PASS"
+  },
+  "test-events-listener-count-with-listener.js": {
+    "status": "PASS"
+  },
+  "test-events-on-async-iterator.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-events-once.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-events-static-geteventlisteners.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-events-uncaught-exception-stack.js": {
+    "status": "FAIL"
+  },
+  "test-fs-access.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-append-file-flush.js": {
+    "status": "FAIL"
+  },
+  "test-fs-append-file-sync.js": {
+    "status": "PASS"
+  },
+  "test-fs-append-file.js": {
+    "status": "PASS"
+  },
+  "test-fs-assert-encoding-error.js": {
+    "status": "FAIL"
+  },
+  "test-fs-buffer.js": {
+    "status": "PASS"
+  },
+  "test-fs-buffertype-writesync.js": {
+    "status": "PASS"
+  },
+  "test-fs-chmod-mask.js": {
+    "status": "FAIL"
+  },
+  "test-fs-chmod.js": {
+    "status": "FAIL"
+  },
+  "test-fs-chown-negative-one.js": {
+    "status": "PASS",
+    "wasm_status": "PASS"
+  },
+  "test-fs-chown-type-check.js": {
+    "status": "PASS"
+  },
+  "test-fs-close-errors.js": {
+    "status": "FAIL"
+  },
+  "test-fs-close.js": {
+    "status": "PASS"
+  },
+  "test-fs-constants.js": {
+    "status": "FAIL"
+  },
+  "test-fs-copyfile-respect-permissions.js": {
+    "status": "SKIP"
+  },
+  "test-fs-copyfile.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-cp-async-async-filter-function.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-copy-non-directory-symlink.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-dereference-force-false-silent-fail.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-dereference-symlink.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-dest-symlink-points-to-src-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-dir-exists-error-on-exist.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-dir-to-file.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-error-on-exist.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-file-to-dir.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-file-to-file.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-file-url.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-filter-child-folder.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-filter-function.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-identical-src-dest.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-invalid-mode-range.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-invalid-options-type.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-nested-files-folders.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-no-errors-force-false.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-no-recursive.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-overwrites-force-true.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-preserve-timestamps-readonly-file.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-preserve-timestamps.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-same-dir-twice.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-skip-validation-when-filtered.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-socket.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-cp-async-subdirectory-of-self.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-symlink-dest-points-to-src.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-symlink-over-file.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-symlink-points-to-dest.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-verbatim-dir-symlinks-with-filter.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-async-with-mode-flags.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-promises-async-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-promises-file-url.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-promises-invalid-mode.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-promises-mode-flags.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-promises-nested-folder-recursive.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-promises-options-validation.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-apply-filter-function.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-async-filter-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-copy-directory-to-file-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-copy-directory-without-recursive-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-copy-file-to-directory-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-copy-file-to-file-path.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-copy-socket-error.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-cp-sync-copy-symlink-not-pointing-to-folder.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-copy-symlink-over-file-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-copy-symlinks-to-existing-symlinks.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-copy-to-subdirectory-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-dereference-directory.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-dereference-file.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-dereference-twice.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-dereference.js": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-dest-name-prefix-match.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-dest-parent-name-prefix-match.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-directory-not-exist-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-error-on-exist.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-file-url.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-filename-too-long-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-incompatible-options-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-mode-flags.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-mode-invalid.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-nested-files-folders.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-no-overwrite-force-false.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-options-invalid-type-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-overwrite-force-true.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-parent-symlink-dest-points-to-src-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-preserve-timestamps-readonly.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-preserve-timestamps.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-resolve-relative-symlinks-default.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-resolve-relative-symlinks-false.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-src-dest-identical-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-src-parent-of-dest-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-symlink-dest-points-to-src-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-symlink-points-to-dest-error.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-unicode-dest.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-unicode-folder-names.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-verbatim-dir-symlinks-with-filter.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-verbatim-symlinks-invalid.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-cp-sync-verbatim-symlinks-true.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-empty-readStream.js": {
+    "status": "PASS"
+  },
+  "test-fs-error-messages.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-exists.js": {
+    "status": "FAIL"
+  },
+  "test-fs-existssync-false.js": {
+    "status": "PASS"
+  },
+  "test-fs-existssync-memleak-longpath.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-fchmod.js": {
+    "status": "FAIL"
+  },
+  "test-fs-fchown-negative-one.js": {
+    "status": "PASS",
+    "wasm_status": "PASS"
+  },
+  "test-fs-fchown.js": {
+    "status": "FAIL"
+  },
+  "test-fs-filehandle-use-after-close.js": {
+    "status": "PASS"
+  },
+  "test-fs-filehandle.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-fmap.js": {
+    "status": "PASS"
+  },
+  "test-fs-fsync.js": {
+    "status": "PASS"
+  },
+  "test-fs-glob-throw.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-glob.mjs": {
+    "status": "SKIP",
+    "reason": "uses Node.js internals"
+  },
+  "test-fs-internal-assertencoding.js": {
+    "status": "FAIL"
+  },
+  "test-fs-lchmod.js": {
+    "status": "FAIL",
+    "wasm_status": "SKIP"
+  },
+  "test-fs-lchown-negative-one.js": {
+    "status": "FAIL"
+  },
+  "test-fs-lchown.js": {
+    "status": "FAIL"
+  },
+  "test-fs-link.js": {
+    "status": "PASS"
+  },
+  "test-fs-long-path.js": {
+    "status": "SKIP"
+  },
+  "test-fs-make-callback.js": {
+    "status": "PASS"
+  },
+  "test-fs-makeStatsCallback.js": {
+    "status": "PASS"
+  },
+  "test-fs-mkdir-mode-mask.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-mkdir-recursive-eaccess.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-mkdir-rmdir.js": {
+    "status": "PASS"
+  },
+  "test-fs-mkdir.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-fs-mkdtemp-prefix-check.js": {
+    "status": "PASS"
+  },
+  "test-fs-mkdtemp.js": {
+    "status": "FAIL"
+  },
+  "test-fs-mkdtempDisposableSync.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-fs-negative-zero.js": {
+    "status": "FAIL"
+  },
+  "test-fs-non-number-arguments-throw.js": {
+    "status": "PASS"
+  },
+  "test-fs-null-bytes.js": {
+    "status": "FAIL"
+  },
+  "test-fs-open-flags.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-open-mode-mask.js": {
+    "status": "PASS"
+  },
+  "test-fs-open-no-close.js": {
+    "status": "PASS"
+  },
+  "test-fs-open-numeric-flags.js": {
+    "status": "PASS"
+  },
+  "test-fs-open.js": {
+    "status": "PASS"
+  },
+  "test-fs-opendir.js": {
+    "status": "FAIL"
+  },
+  "test-fs-operations-with-surrogate-pairs.js": {
+    "status": "FAIL"
+  },
+  "test-fs-options-immutable.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-appendfile.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-exists.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-file-handle-aggregate-errors.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-file-handle-append-file.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-file-handle-chmod.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-promises-file-handle-close-errors.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-file-handle-close.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-file-handle-dispose.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-file-handle-op-errors.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-file-handle-pull.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-file-handle-pullsync.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-file-handle-read-worker.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-fs-promises-file-handle-read.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-file-handle-readFile.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-file-handle-readLines.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-file-handle-stat.js": {
+    "status": "PASS"
+  },
+  "test-fs-promises-file-handle-stream.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-file-handle-sync.js": {
+    "status": "PASS"
+  },
+  "test-fs-promises-file-handle-truncate.js": {
+    "status": "PASS"
+  },
+  "test-fs-promises-file-handle-write.js": {
+    "status": "PASS"
+  },
+  "test-fs-promises-file-handle-writeFile.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-file-handle-writer.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-mkdtempDisposable.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-fs-promises-readfile-buffer-option.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-readfile-empty.js": {
+    "status": "PASS"
+  },
+  "test-fs-promises-readfile-with-fd.js": {
+    "status": "PASS"
+  },
+  "test-fs-promises-readfile.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-promises-statfs-validate-path.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-watch-ignore-function.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-watch-ignore-glob.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-watch-ignore-invalid.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-watch-ignore-mixed.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-watch-ignore-regexp.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-watch-iterator.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-watch.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises-write-optional-params.js": {
+    "status": "PASS"
+  },
+  "test-fs-promises-writefile.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promises.js": {
+    "status": "FAIL"
+  },
+  "test-fs-promisified.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-empty-buffer.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-file-assert-encoding.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-file-sync-hostname.js": {
+    "status": "SKIP",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-read-file-sync.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-offset-null.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-optional-params.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-position-validation.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-read-promises-optional-params.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-promises-position-validation.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-read-stream-autoClose.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-stream-concurrent-reads.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-stream-double-close.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-stream-encoding.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-stream-err.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-stream-fd-leak.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-stream-fd.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-stream-file-handle.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-stream-inherit.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-stream-patch-open.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-stream-pos.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-stream-resume.js": {
+    "status": "PASS"
+  },
+  "test-fs-read-stream-throw-type-error.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-stream.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-read-type.js": {
+    "status": "FAIL"
+  },
+  "test-fs-read-zero-length.js": {
+    "status": "PASS"
+  },
+  "test-fs-read.js": {
+    "status": "FAIL"
+  },
+  "test-fs-readdir-buffer.js": {
+    "status": "PASS",
+    "wasm_status": "SKIP"
+  },
+  "test-fs-readdir-pipe.js": {
+    "status": "SKIP"
+  },
+  "test-fs-readdir-recursive.js": {
+    "status": "FAIL"
+  },
+  "test-fs-readdir-stack-overflow.js": {
+    "status": "FAIL"
+  },
+  "test-fs-readdir-types-symlinks.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-readdir-types.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-readdir-ucs2.js": {
+    "status": "SKIP",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-readdir.js": {
+    "status": "PASS"
+  },
+  "test-fs-readfile-buffer-option.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-readfile-empty.js": {
+    "status": "PASS"
+  },
+  "test-fs-readfile-eof.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-readfile-error.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-readfile-fd.js": {
+    "status": "PASS"
+  },
+  "test-fs-readfile-flags.js": {
+    "status": "PASS"
+  },
+  "test-fs-readfile-pipe-large.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-readfile-pipe.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-readfile-unlink.js": {
+    "status": "PASS"
+  },
+  "test-fs-readfile-zero-byte-liar.js": {
+    "status": "PASS"
+  },
+  "test-fs-readfile.js": {
+    "status": "FAIL"
+  },
+  "test-fs-readfilesync-enoent.js": {
+    "status": "SKIP"
+  },
+  "test-fs-readfilesync-pipe-large.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-readfilesync-utf8-sizes.js": {
+    "status": "PASS"
+  },
+  "test-fs-readlink-type-check.js": {
+    "status": "PASS"
+  },
+  "test-fs-readSync-optional-params.js": {
+    "status": "FAIL"
+  },
+  "test-fs-readSync-position-validation.mjs": {
+    "status": "PASS"
+  },
+  "test-fs-readv-promises.js": {
+    "status": "FAIL"
+  },
+  "test-fs-readv-promisify.js": {
+    "status": "FAIL"
+  },
+  "test-fs-readv-sync.js": {
+    "status": "FAIL"
+  },
+  "test-fs-readv.js": {
+    "status": "FAIL"
+  },
+  "test-fs-ready-event-stream.js": {
+    "status": "PASS"
+  },
+  "test-fs-realpath-async-stale-stat-values.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-realpath-buffer-encoding.js": {
+    "status": "PASS"
+  },
+  "test-fs-realpath-namespaced-drive-win.js": {
+    "status": "SKIP"
+  },
+  "test-fs-realpath-native.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-realpath-on-substed-drive.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-realpath-pipe.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-realpath-stale-stat-values.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-realpath.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-fs-rename-type-check.js": {
+    "status": "PASS"
+  },
+  "test-fs-rm.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-rmdir-recursive-sync-warns-not-found.js": {
+    "status": "FAIL"
+  },
+  "test-fs-rmdir-recursive-sync-warns-on-file.js": {
+    "status": "FAIL"
+  },
+  "test-fs-rmdir-recursive-throws-not-found.js": {
+    "status": "PASS"
+  },
+  "test-fs-rmdir-recursive-throws-on-file.js": {
+    "status": "PASS"
+  },
+  "test-fs-rmdir-recursive-warns-not-found.js": {
+    "status": "FAIL"
+  },
+  "test-fs-rmdir-recursive-warns-on-file.js": {
+    "status": "FAIL"
+  },
+  "test-fs-rmdir-recursive.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-rmdir-type-check.js": {
+    "status": "PASS"
+  },
+  "test-fs-rmSync-eperm-retries.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-rmSync-special-char.js": {
+    "status": "PASS"
+  },
+  "test-fs-sir-writes-alot.js": {
+    "status": "PASS"
+  },
+  "test-fs-stat-abort-test.js": {
+    "status": "FAIL"
+  },
+  "test-fs-stat-bigint.js": {
+    "status": "FAIL"
+  },
+  "test-fs-stat-date.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-stat.js": {
+    "status": "FAIL"
+  },
+  "test-fs-statfs.js": {
+    "status": "FAIL"
+  },
+  "test-fs-stream-construct-compat-error-read.js": {
+    "status": "FAIL"
+  },
+  "test-fs-stream-construct-compat-error-write.js": {
+    "status": "FAIL"
+  },
+  "test-fs-stream-construct-compat-graceful-fs.js": {
+    "status": "FAIL"
+  },
+  "test-fs-stream-construct-compat-old-node.js": {
+    "status": "FAIL"
+  },
+  "test-fs-stream-destroy-emit-error.js": {
+    "status": "PASS"
+  },
+  "test-fs-stream-double-close.js": {
+    "status": "PASS"
+  },
+  "test-fs-stream-fs-options.js": {
+    "status": "FAIL"
+  },
+  "test-fs-stream-options.js": {
+    "status": "PASS"
+  },
+  "test-fs-stream-windows-handle.js": {
+    "status": "FAIL"
+  },
+  "test-fs-symlink-buffer-path.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-symlink-dir-junction-relative.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-symlink-dir-junction.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-symlink-dir.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-symlink-longpath.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-symlink.js": {
+    "status": "FAIL"
+  },
+  "test-fs-sync-fd-leak.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-syncwritestream.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-timestamp-parsing-error.js": {
+    "status": "FAIL"
+  },
+  "test-fs-truncate-clear-file-zero.js": {
+    "status": "PASS"
+  },
+  "test-fs-truncate-sync.js": {
+    "status": "PASS"
+  },
+  "test-fs-truncate.js": {
+    "status": "FAIL"
+  },
+  "test-fs-unlink-type-check.js": {
+    "status": "PASS"
+  },
+  "test-fs-util-validateoffsetlength.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-utils-get-dirents.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-utimes-y2K38.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-utimes.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-abort-signal.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-watch-close-when-destroyed.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-encoding.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-enoent.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-watch-file-enoent-after-deletion.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-function.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-glob.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-invalid.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-mixed.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-recursive-glob-subdirectories.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-recursive-glob.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-recursive-mixed.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-recursive-regexp.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ignore-regexp.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-add-file-to-existing-subfolder.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-add-file-to-new-folder.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-add-file-with-url.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-add-file.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-add-folder.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-assert-leaks.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-delete-race.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-watch-recursive-delete.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-linux-parallel-remove.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-watch-recursive-prefix-sibling.js": {
+    "status": "SKIP",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-watch-recursive-promise.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-symlink.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-sync-write.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-update-file.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-recursive-validate.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-watch-recursive-watch-file.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-ref-unref.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-stop-async.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch-stop-sync.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watch.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watchfile-bigint.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-watchfile-ref-unref.js": {
+    "status": "FAIL"
+  },
+  "test-fs-watchfile.js": {
+    "status": "FAIL"
+  },
+  "test-fs-whatwg-url.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-fs-write-buffer-large.js": {
+    "status": "FAIL",
+    "wasm_status": "SKIP"
+  },
+  "test-fs-write-buffer.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-file-buffer.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-file-flush.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-file-invalid-path.js": {
+    "status": "SKIP"
+  },
+  "test-fs-write-file-sync.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-fs-write-file-typedarrays.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-file.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-negativeoffset.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-no-fd.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-optional-params.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-reuse-callback.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-write-sigxfsz.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-write-stream-autoclose-option.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-change-open.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-close-without-callback.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-stream-double-close.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-stream-eagain.mjs": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-encoding.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-end.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-stream-err.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-file-handle-2.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-file-handle.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-flush.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-fs.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream-patch-open.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-fs-write-stream-throw-type-error.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-stream.js": {
+    "status": "FAIL"
+  },
+  "test-fs-write-sync-optional-params.js": {
+    "status": "PASS"
+  },
+  "test-fs-write-sync.js": {
+    "status": "PASS"
+  },
+  "test-fs-write.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-fs-writefile-with-fd.js": {
+    "status": "FAIL"
+  },
+  "test-fs-writestream-open-write.js": {
+    "status": "PASS"
+  },
+  "test-fs-writesync-crash.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-fs-writev-promises.js": {
+    "status": "FAIL"
+  },
+  "test-fs-writev-sync.js": {
+    "status": "FAIL"
+  },
+  "test-fs-writev.js": {
+    "status": "FAIL"
+  },
+  "test-http-1.0-keep-alive.js": {
+    "status": "FAIL"
+  },
+  "test-http-1.0.js": {
+    "status": "FAIL"
+  },
+  "test-http-abort-before-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-abort-client.js": {
+    "status": "FAIL"
+  },
+  "test-http-abort-queued.js": {
+    "status": "FAIL"
+  },
+  "test-http-abort-stream-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-aborted.js": {
+    "status": "FAIL"
+  },
+  "test-http-addrequest-localaddress.js": {
+    "status": "FAIL"
+  },
+  "test-http-after-connect.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-abort-controller.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-close.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-destroyed-socket.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-domain-reused-gc.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-agent-error-on-idle.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-false.js": {
+    "status": "PASS"
+  },
+  "test-http-agent-free-socket-data-guard.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-getname.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-highwatermark-reuse.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-keep-alive-timeout-buffer.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-keepalive-delay.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-keepalive.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-keylog-existing-sockets.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-maxsockets-respected.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-maxsockets.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-maxtotalsockets.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-no-protocol.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-null.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-remove.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-reuse-drained-socket-only.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-scheduling.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-timeout-option.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-uninitialized-with-handle.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent-uninitialized.js": {
+    "status": "FAIL"
+  },
+  "test-http-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-allow-content-length-304.js": {
+    "status": "FAIL"
+  },
+  "test-http-allow-req-after-204-res.js": {
+    "status": "FAIL"
+  },
+  "test-http-automatic-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-autoselectfamily.js": {
+    "status": "FAIL"
+  },
+  "test-http-bind-twice.js": {
+    "status": "FAIL"
+  },
+  "test-http-blank-header.js": {
+    "status": "FAIL"
+  },
+  "test-http-buffer-sanity.js": {
+    "status": "FAIL"
+  },
+  "test-http-byteswritten.js": {
+    "status": "FAIL"
+  },
+  "test-http-catch-uncaughtexception.js": {
+    "status": "FAIL"
+  },
+  "test-http-chunk-extensions-limit.js": {
+    "status": "FAIL"
+  },
+  "test-http-chunk-problem.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-http-chunked-304.js": {
+    "status": "FAIL"
+  },
+  "test-http-chunked-smuggling.js": {
+    "status": "FAIL"
+  },
+  "test-http-chunked.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort-event.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort-keep-alive-destroy-res.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort-keep-alive-queued-tcp-socket.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort-keep-alive-queued-unix-socket.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort-no-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort-response-event.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort-unix-socket.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort2.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-abort3.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-aborted-event.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-agent-abort-close-event.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-agent-end-close-event.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-check-http-token.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-close-event.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-close-with-default-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-default-headers-exist.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-defaults.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-encoding.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-error-rawbytes.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-finished.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-get-url.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-headers-array.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-headers-host-array.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-highwatermark.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-client-immediate-error.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-client-incomingmessage-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-input-function.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-insecure-http-parser-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-invalid-path.js": {
+    "status": "PASS"
+  },
+  "test-http-client-keep-alive-hint.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-keep-alive-release-before-finish.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-leaky-with-double-response.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-client-null-prototype-options.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-override-global-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-parse-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-path-toctou.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-pipe-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-race-2.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-race.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-read-in-error.js": {
+    "status": "PASS"
+  },
+  "test-http-client-readable.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-reject-chunked-with-content-length.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-reject-cr-no-lf.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-reject-unexpected-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-req-error-dont-double-fire.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-request-listeners-leak.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-request-options.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-res-destroyed.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-response-domain.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-response-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-set-timeout-after-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-set-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-spurious-aborted.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-timeout-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-timeout-connect-listener.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-timeout-event.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-timeout-on-connect.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-client-timeout-option-listeners.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-timeout-option-with-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-timeout-option.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-timeout-with-data.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-unescaped-path.js": {
+    "status": "PASS"
+  },
+  "test-http-client-upload-buf.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-upload.js": {
+    "status": "FAIL"
+  },
+  "test-http-client-with-create-connection.js": {
+    "status": "FAIL"
+  },
+  "test-http-common.js": {
+    "status": "PASS"
+  },
+  "test-http-conn-reset.js": {
+    "status": "PASS"
+  },
+  "test-http-connect-req-res.js": {
+    "status": "FAIL"
+  },
+  "test-http-connect.js": {
+    "status": "FAIL"
+  },
+  "test-http-content-length-mismatch.js": {
+    "status": "FAIL"
+  },
+  "test-http-content-length.js": {
+    "status": "FAIL"
+  },
+  "test-http-contentLength0.js": {
+    "status": "FAIL"
+  },
+  "test-http-correct-hostname.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-createConnection.js": {
+    "status": "FAIL"
+  },
+  "test-http-date-header.js": {
+    "status": "FAIL"
+  },
+  "test-http-debug.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-http-decoded-auth.js": {
+    "status": "FAIL"
+  },
+  "test-http-default-encoding.js": {
+    "status": "FAIL"
+  },
+  "test-http-default-port.js": {
+    "status": "SKIP"
+  },
+  "test-http-destroyed-socket-write2.js": {
+    "status": "FAIL"
+  },
+  "test-http-dns-error.js": {
+    "status": "SKIP"
+  },
+  "test-http-dont-set-default-headers-with-set-header.js": {
+    "status": "FAIL"
+  },
+  "test-http-dont-set-default-headers-with-setHost.js": {
+    "status": "FAIL"
+  },
+  "test-http-dont-set-default-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-double-content-length.js": {
+    "status": "FAIL"
+  },
+  "test-http-dummy-characters-smuggling.js": {
+    "status": "FAIL"
+  },
+  "test-http-dump-req-when-res-ends.js": {
+    "status": "FAIL"
+  },
+  "test-http-early-hints-invalid-argument.js": {
+    "status": "FAIL"
+  },
+  "test-http-early-hints.js": {
+    "status": "FAIL"
+  },
+  "test-http-end-throw-socket-handling.js": {
+    "status": "FAIL"
+  },
+  "test-http-eof-on-connect.js": {
+    "status": "FAIL"
+  },
+  "test-http-exceptions.js": {
+    "status": "FAIL"
+  },
+  "test-http-expect-continue-reuse-race.js": {
+    "status": "FAIL"
+  },
+  "test-http-expect-continue.js": {
+    "status": "FAIL"
+  },
+  "test-http-expect-handling.js": {
+    "status": "FAIL"
+  },
+  "test-http-extra-response.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-http-flush-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-flush-response-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-full-response.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-http-generic-streams.js": {
+    "status": "FAIL"
+  },
+  "test-http-get-pipeline-problem.js": {
+    "status": "FAIL"
+  },
+  "test-http-head-request.js": {
+    "status": "FAIL"
+  },
+  "test-http-head-response-has-no-body-end-implicit-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-head-response-has-no-body-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-head-response-has-no-body.js": {
+    "status": "FAIL"
+  },
+  "test-http-head-throw-on-response-body-write.js": {
+    "status": "FAIL"
+  },
+  "test-http-header-badrequest.js": {
+    "status": "FAIL"
+  },
+  "test-http-header-obstext.js": {
+    "status": "FAIL"
+  },
+  "test-http-header-overflow.js": {
+    "status": "FAIL"
+  },
+  "test-http-header-owstext.js": {
+    "status": "FAIL"
+  },
+  "test-http-header-read.js": {
+    "status": "FAIL"
+  },
+  "test-http-header-validators.js": {
+    "status": "PASS"
+  },
+  "test-http-header-value-relaxed.js": {
+    "status": "FAIL"
+  },
+  "test-http-headers-distinct-proto.js": {
+    "status": "FAIL"
+  },
+  "test-http-hex-write.js": {
+    "status": "FAIL"
+  },
+  "test-http-highwatermark.js": {
+    "status": "FAIL"
+  },
+  "test-http-host-header-ipv6-fail.js": {
+    "status": "FAIL"
+  },
+  "test-http-host-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-hostname-typechecking.js": {
+    "status": "FAIL"
+  },
+  "test-http-import-websocket.js": {
+    "status": "FAIL"
+  },
+  "test-http-incoming-matchKnownFields.js": {
+    "status": "FAIL"
+  },
+  "test-http-incoming-message-connection-setter.js": {
+    "status": "FAIL"
+  },
+  "test-http-incoming-message-destroy.js": {
+    "status": "PASS"
+  },
+  "test-http-incoming-message-options.js": {
+    "status": "FAIL"
+  },
+  "test-http-incoming-pipelined-socket-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-http-information-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-information-processing.js": {
+    "status": "FAIL"
+  },
+  "test-http-insecure-parser-per-stream.js": {
+    "status": "FAIL"
+  },
+  "test-http-insecure-parser.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-invalid-path-chars.js": {
+    "status": "PASS"
+  },
+  "test-http-invalid-te.js": {
+    "status": "FAIL"
+  },
+  "test-http-invalid-urls.js": {
+    "status": "PASS"
+  },
+  "test-http-invalidheaderfield.js": {
+    "status": "FAIL"
+  },
+  "test-http-invalidheaderfield2.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-close-on-header.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-drop-requests.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-empty-line.mjs": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-max-requests.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-pipeline-max-requests.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-timeout-buffer.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-timeout-custom.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-timeout-race-condition.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-keep-alive.js": {
+    "status": "FAIL"
+  },
+  "test-http-keepalive-client.js": {
+    "status": "FAIL"
+  },
+  "test-http-keepalive-free.js": {
+    "status": "FAIL"
+  },
+  "test-http-keepalive-override.js": {
+    "status": "FAIL"
+  },
+  "test-http-keepalive-request.js": {
+    "status": "FAIL"
+  },
+  "test-http-listening.js": {
+    "status": "FAIL"
+  },
+  "test-http-localaddress-bind-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-localaddress.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-malformed-request.js": {
+    "status": "FAIL"
+  },
+  "test-http-many-ended-pipelines.js": {
+    "status": "FAIL"
+  },
+  "test-http-max-header-size-per-stream.js": {
+    "status": "FAIL"
+  },
+  "test-http-max-header-size.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-http-max-headers-count-overflow.js": {
+    "status": "FAIL"
+  },
+  "test-http-max-headers-count.js": {
+    "status": "FAIL"
+  },
+  "test-http-max-http-headers.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-max-sockets.js": {
+    "status": "FAIL"
+  },
+  "test-http-methods.js": {
+    "status": "PASS"
+  },
+  "test-http-missing-header-separator-cr.js": {
+    "status": "FAIL"
+  },
+  "test-http-missing-header-separator-lf.js": {
+    "status": "FAIL"
+  },
+  "test-http-multi-line-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-multiple-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-mutable-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-no-content-length.js": {
+    "status": "PASS"
+  },
+  "test-http-no-read-no-dump.js": {
+    "status": "FAIL"
+  },
+  "test-http-nodelay.js": {
+    "status": "FAIL"
+  },
+  "test-http-odd-hex-write.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-buffer.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-destroyed.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-drain-writable-length.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-end-cork.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-end-multiple.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-end-types.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-finish-writable.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-finish.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-finished.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-first-chunk-singlebyte-encoding.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-flush-drain.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-message-capture-rejection.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-message-inheritance.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-message-write-callback.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-properties.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-proto.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-renderHeaders.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-outgoing-settimeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-writableFinished.js": {
+    "status": "FAIL"
+  },
+  "test-http-outgoing-write-types.js": {
+    "status": "FAIL"
+  },
+  "test-http-parser-bad-ref.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-parser-finish-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-parser-free.js": {
+    "status": "FAIL"
+  },
+  "test-http-parser-freed-before-upgrade.js": {
+    "status": "FAIL"
+  },
+  "test-http-parser-freed-during-execute.js": {
+    "status": "FAIL"
+  },
+  "test-http-parser-lazy-loaded.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-parser-max-header-pairs-cache.js": {
+    "status": "FAIL"
+  },
+  "test-http-parser-memory-retention.js": {
+    "status": "FAIL"
+  },
+  "test-http-parser-multiple-execute.js": {
+    "status": "FAIL"
+  },
+  "test-http-parser-timeout-reset.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-parser.js": {
+    "status": "FAIL"
+  },
+  "test-http-pause-no-dump.js": {
+    "status": "FAIL"
+  },
+  "test-http-pause-resume-one-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-pause.js": {
+    "status": "FAIL"
+  },
+  "test-http-perf_hooks.js": {
+    "status": "FAIL"
+  },
+  "test-http-pipe-fs.js": {
+    "status": "FAIL"
+  },
+  "test-http-pipeline-assertionerror-finish.js": {
+    "status": "FAIL"
+  },
+  "test-http-pipeline-flood.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-http-pipeline-outgoing-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-http-pipeline-requests-connection-leak.js": {
+    "status": "FAIL"
+  },
+  "test-http-pipeline-socket-parser-typeerror.js": {
+    "status": "FAIL"
+  },
+  "test-http-proxy.js": {
+    "status": "FAIL"
+  },
+  "test-http-raw-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-readable-data-event.js": {
+    "status": "FAIL"
+  },
+  "test-http-remove-connection-header-persists-connection.js": {
+    "status": "FAIL"
+  },
+  "test-http-remove-header-stays-removed.js": {
+    "status": "FAIL"
+  },
+  "test-http-req-close-robust-from-tampering.js": {
+    "status": "FAIL"
+  },
+  "test-http-req-res-close.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-agent.js": {
+    "status": "SKIP"
+  },
+  "test-http-request-arguments.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-dont-override-options.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-end-twice.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-host-header.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-invalid-method-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-join-authorization-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-large-payload.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-lookup-error-catchable.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-method-delete-payload.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-methods.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-signal.js": {
+    "status": "FAIL"
+  },
+  "test-http-request-smuggling-content-length.js": {
+    "status": "FAIL"
+  },
+  "test-http-res-write-after-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-res-write-end-dont-take-array.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-add-header-after-sent.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-close.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-cork.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-drain-cork.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-multi-content-length.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-multiheaders.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-no-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-readable.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-remove-header-after-sent.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-setheaders.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-splitting.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-status-message.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-statuscode.js": {
+    "status": "FAIL"
+  },
+  "test-http-response-writehead-returns-this.js": {
+    "status": "FAIL"
+  },
+  "test-http-same-map.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-server-async-dispose.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-capture-rejections.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-clear-timer.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-client-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-close-all.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-close-destroy-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-close-idle-wait-response.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-close-idle.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-connection-list-when-close.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-connections-checking-leak.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-server-consumed-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-de-chunked-trailer.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-delete-parser.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-destroy-socket-on-client-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-drop-connections-in-cluster.js": {
+    "status": "SKIP",
+    "reason": "uses cluster"
+  },
+  "test-http-server-headers-timeout-delayed-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-headers-timeout-interrupted-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-headers-timeout-keepalive.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-headers-timeout-pipelining.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-incomingmessage-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-invalid-headers-timeout-no-abort.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-keep-alive-defaults.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-keep-alive-max-requests-null.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-keep-alive-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-keepalive-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-keepalive-req-gc.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-server-method.query.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-multiheaders.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-multiheaders2.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-multiple-client-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-non-utf8-header.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-optimize-empty-requests.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-options-highwatermark.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-http-server-options-incoming-message.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-options-server-response.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-reject-chunked-with-content-length.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-reject-cr-no-lf.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-request-timeout-delayed-body.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-request-timeout-delayed-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-request-timeout-interrupted-body.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-request-timeout-interrupted-headers.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-request-timeout-keepalive.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-request-timeout-pipelining.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-request-timeout-upgrade.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-response-standalone.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-stale-close.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-http-server-timeouts-validation.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-unconsume-consume.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-unconsume.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-write-after-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-server-write-end-after-end.js": {
+    "status": "FAIL"
+  },
+  "test-http-server.js": {
+    "status": "FAIL"
+  },
+  "test-http-set-cookies.js": {
+    "status": "FAIL"
+  },
+  "test-http-set-header-chain.js": {
+    "status": "FAIL"
+  },
+  "test-http-set-max-idle-http-parser.js": {
+    "status": "FAIL"
+  },
+  "test-http-set-timeout-server.js": {
+    "status": "FAIL"
+  },
+  "test-http-set-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-set-trailers.js": {
+    "status": "FAIL"
+  },
+  "test-http-should-keep-alive.js": {
+    "status": "FAIL"
+  },
+  "test-http-socket-encoding-error.js": {
+    "status": "FAIL"
+  },
+  "test-http-socket-error-listeners.js": {
+    "status": "FAIL"
+  },
+  "test-http-status-code.js": {
+    "status": "FAIL"
+  },
+  "test-http-status-message.js": {
+    "status": "FAIL"
+  },
+  "test-http-status-reason-invalid-chars.js": {
+    "status": "FAIL"
+  },
+  "test-http-sync-write-error-during-continue.js": {
+    "status": "FAIL"
+  },
+  "test-http-timeout-client-warning.js": {
+    "status": "FAIL"
+  },
+  "test-http-timeout-overflow.js": {
+    "status": "FAIL"
+  },
+  "test-http-timeout.js": {
+    "status": "FAIL"
+  },
+  "test-http-transfer-encoding-repeated-chunked.js": {
+    "status": "FAIL"
+  },
+  "test-http-transfer-encoding-smuggling.js": {
+    "status": "FAIL"
+  },
+  "test-http-uncaught-from-request-callback.js": {
+    "status": "FAIL"
+  },
+  "test-http-unix-socket-keep-alive.js": {
+    "status": "FAIL"
+  },
+  "test-http-unix-socket.js": {
+    "status": "FAIL"
+  },
+  "test-http-upgrade-advertise.js": {
+    "status": "FAIL"
+  },
+  "test-http-upgrade-agent.js": {
+    "status": "FAIL"
+  },
+  "test-http-upgrade-binary.js": {
+    "status": "FAIL"
+  },
+  "test-http-upgrade-client.js": {
+    "status": "FAIL"
+  },
+  "test-http-upgrade-client2.js": {
+    "status": "FAIL"
+  },
+  "test-http-upgrade-reconsume-stream.js": {
+    "status": "SKIP"
+  },
+  "test-http-upgrade-server-callback.js": {
+    "status": "FAIL"
+  },
+  "test-http-upgrade-server.js": {
+    "status": "FAIL"
+  },
+  "test-http-upgrade-server2.js": {
+    "status": "FAIL"
+  },
+  "test-http-url.parse-auth-with-header-in-request.js": {
+    "status": "FAIL"
+  },
+  "test-http-url.parse-auth.js": {
+    "status": "FAIL"
+  },
+  "test-http-url.parse-basic.js": {
+    "status": "FAIL"
+  },
+  "test-http-url.parse-https.request.js": {
+    "status": "SKIP"
+  },
+  "test-http-url.parse-only-support-http-https-protocol.js": {
+    "status": "PASS"
+  },
+  "test-http-url.parse-path.js": {
+    "status": "FAIL"
+  },
+  "test-http-url.parse-post.js": {
+    "status": "FAIL"
+  },
+  "test-http-url.parse-search.js": {
+    "status": "FAIL"
+  },
+  "test-http-wget.js": {
+    "status": "FAIL"
+  },
+  "test-http-writable-true-after-close.js": {
+    "status": "FAIL"
+  },
+  "test-http-write-callbacks.js": {
+    "status": "FAIL"
+  },
+  "test-http-write-empty-string.js": {
+    "status": "FAIL"
+  },
+  "test-http-write-head-2.js": {
+    "status": "FAIL"
+  },
+  "test-http-write-head-after-set-header.js": {
+    "status": "FAIL"
+  },
+  "test-http-write-head.js": {
+    "status": "FAIL"
+  },
+  "test-http-write-information.js": {
+    "status": "FAIL"
+  },
+  "test-http-zero-length-write.js": {
+    "status": "FAIL"
+  },
+  "test-http-zerolengthbuffer.js": {
+    "status": "FAIL"
+  },
+  "test-net-access-byteswritten.js": {
+    "status": "SKIP"
+  },
+  "test-net-after-close.js": {
+    "status": "FAIL"
+  },
+  "test-net-allow-half-open-async-iter.js": {
+    "status": "PASS"
+  },
+  "test-net-allow-half-open.js": {
+    "status": "PASS"
+  },
+  "test-net-autoselectfamily-attempt-timeout-cli-option.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-autoselectfamily-attempt-timeout-default-value.js": {
+    "status": "PASS"
+  },
+  "test-net-autoselectfamily-commandline-option.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-autoselectfamily-default.js": {
+    "status": "FAIL"
+  },
+  "test-net-autoselectfamily-ipv4first.js": {
+    "status": "PASS"
+  },
+  "test-net-autoselectfamily.js": {
+    "status": "FAIL"
+  },
+  "test-net-better-error-messages-listen-path.js": {
+    "status": "FAIL"
+  },
+  "test-net-better-error-messages-listen.js": {
+    "status": "PASS"
+  },
+  "test-net-better-error-messages-path.js": {
+    "status": "FAIL"
+  },
+  "test-net-better-error-messages-port-hostname.js": {
+    "status": "FAIL"
+  },
+  "test-net-binary.js": {
+    "status": "PASS"
+  },
+  "test-net-bind-twice.js": {
+    "status": "PASS"
+  },
+  "test-net-blocklist.js": {
+    "status": "FAIL"
+  },
+  "test-net-boundsocket.js": {
+    "status": "FAIL"
+  },
+  "test-net-buffersize.js": {
+    "status": "FAIL"
+  },
+  "test-net-bytes-read.js": {
+    "status": "PASS"
+  },
+  "test-net-bytes-stats.js": {
+    "status": "FAIL"
+  },
+  "test-net-bytes-written-large.js": {
+    "status": "FAIL"
+  },
+  "test-net-can-reset-timeout.js": {
+    "status": "PASS"
+  },
+  "test-net-child-process-connect-reset.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-net-client-bind-twice.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-abort-controller.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-after-destroy.js": {
+    "status": "PASS"
+  },
+  "test-net-connect-buffer.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-buffer2.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-call-socket-connect.js": {
+    "status": "PASS"
+  },
+  "test-net-connect-custom-lookup-non-string-address.mjs": {
+    "status": "FAIL"
+  },
+  "test-net-connect-destroy.js": {
+    "status": "PASS"
+  },
+  "test-net-connect-immediate-destroy.js": {
+    "status": "PASS"
+  },
+  "test-net-connect-immediate-finish.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-keepalive.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-memleak.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-connect-no-arg.js": {
+    "status": "PASS"
+  },
+  "test-net-connect-nodelay.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-options-allowhalfopen.js": {
+    "status": "PASS"
+  },
+  "test-net-connect-options-fd.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-connect-options-invalid.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-options-ipv6.js": {
+    "status": "SKIP"
+  },
+  "test-net-connect-options-path.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-options-port.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-paused-connection.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-reset-after-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-reset-before-connected.js": {
+    "status": "PASS"
+  },
+  "test-net-connect-reset-until-connected.js": {
+    "status": "FAIL"
+  },
+  "test-net-connect-reset.js": {
+    "status": "FAIL"
+  },
+  "test-net-dns-custom-lookup.js": {
+    "status": "FAIL"
+  },
+  "test-net-dns-error.js": {
+    "status": "FAIL"
+  },
+  "test-net-dns-lookup-skip.js": {
+    "status": "PASS"
+  },
+  "test-net-dns-lookup.js": {
+    "status": "FAIL"
+  },
+  "test-net-during-close.js": {
+    "status": "PASS"
+  },
+  "test-net-eaddrinuse.js": {
+    "status": "PASS"
+  },
+  "test-net-end-close.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-end-destroyed.js": {
+    "status": "PASS"
+  },
+  "test-net-end-without-connect.js": {
+    "status": "PASS"
+  },
+  "test-net-error-twice.js": {
+    "status": "FAIL"
+  },
+  "test-net-isip.js": {
+    "status": "PASS"
+  },
+  "test-net-isipv4.js": {
+    "status": "PASS"
+  },
+  "test-net-isipv6.js": {
+    "status": "PASS"
+  },
+  "test-net-keepalive-interval-count.js": {
+    "status": "FAIL"
+  },
+  "test-net-keepalive.js": {
+    "status": "PASS"
+  },
+  "test-net-large-string.js": {
+    "status": "PASS"
+  },
+  "test-net-listen-after-destroying-stdin.js": {
+    "status": "PASS"
+  },
+  "test-net-listen-close-server-callback-is-not-function.js": {
+    "status": "FAIL"
+  },
+  "test-net-listen-close-server.js": {
+    "status": "FAIL"
+  },
+  "test-net-listen-error.js": {
+    "status": "PASS"
+  },
+  "test-net-listen-exclusive-random-ports.js": {
+    "status": "SKIP",
+    "reason": "uses cluster"
+  },
+  "test-net-listen-fd0.js": {
+    "status": "FAIL"
+  },
+  "test-net-listen-handle-in-cluster-1.js": {
+    "status": "SKIP",
+    "reason": "uses cluster"
+  },
+  "test-net-listen-handle-in-cluster-2.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-listen-invalid-port.js": {
+    "status": "FAIL"
+  },
+  "test-net-listen-twice.js": {
+    "status": "SKIP",
+    "reason": "uses cluster"
+  },
+  "test-net-listening.js": {
+    "status": "PASS"
+  },
+  "test-net-local-address-port.js": {
+    "status": "PASS"
+  },
+  "test-net-localerror.js": {
+    "status": "FAIL"
+  },
+  "test-net-negative-zero.js": {
+    "status": "FAIL"
+  },
+  "test-net-normalize-args.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-onread-static-buffer.js": {
+    "status": "FAIL"
+  },
+  "test-net-options-lookup.js": {
+    "status": "FAIL"
+  },
+  "test-net-pause-resume-connecting.js": {
+    "status": "PASS"
+  },
+  "test-net-perf_hooks.js": {
+    "status": "FAIL"
+  },
+  "test-net-persistent-keepalive.js": {
+    "status": "PASS"
+  },
+  "test-net-persistent-nodelay.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-persistent-ref-unref.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-pingpong.js": {
+    "status": "FAIL"
+  },
+  "test-net-pipe-connect-errors.js": {
+    "status": "FAIL"
+  },
+  "test-net-pipe-with-long-path.js": {
+    "status": "FAIL"
+  },
+  "test-net-reconnect.js": {
+    "status": "FAIL"
+  },
+  "test-net-remote-address-port.js": {
+    "status": "PASS"
+  },
+  "test-net-remote-address.js": {
+    "status": "PASS"
+  },
+  "test-net-reuseport.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-async-dispose.mjs": {
+    "status": "FAIL"
+  },
+  "test-net-server-blocklist.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-call-listen-multiple-times.js": {
+    "status": "PASS"
+  },
+  "test-net-server-capture-rejection.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-close-before-calling-lookup-callback.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-close-before-ipc-response.js": {
+    "status": "SKIP",
+    "reason": "uses cluster"
+  },
+  "test-net-server-close.js": {
+    "status": "PASS"
+  },
+  "test-net-server-drop-connections.js": {
+    "status": "PASS"
+  },
+  "test-net-server-keepalive.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-listen-handle.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-server-listen-options-signal.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-listen-options.js": {
+    "status": "PASS"
+  },
+  "test-net-server-listen-path.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-listen-remove-callback.js": {
+    "status": "PASS"
+  },
+  "test-net-server-max-connections-close-makes-more-available.js": {
+    "status": "PASS"
+  },
+  "test-net-server-max-connections.js": {
+    "status": "PASS"
+  },
+  "test-net-server-nodelay.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-options.js": {
+    "status": "PASS"
+  },
+  "test-net-server-pause-on-connect.js": {
+    "status": "PASS"
+  },
+  "test-net-server-reset.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-transfer-worker.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-net-server-try-ports.js": {
+    "status": "PASS"
+  },
+  "test-net-server-unref-persistent.js": {
+    "status": "FAIL"
+  },
+  "test-net-server-unref.js": {
+    "status": "FAIL"
+  },
+  "test-net-settimeout.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-byteswritten.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-close-after-end.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-connect-invalid-autoselectfamily.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-connect-invalid-autoselectfamilyattempttimeout.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-connect-without-cb.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-connecting.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-constructor.js": {
+    "status": "SKIP",
+    "reason": "uses cluster"
+  },
+  "test-net-socket-destroy-send.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-destroy-twice.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-end-before-connect.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-end-callback.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-local-address.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-no-halfopen-enforcer.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-ready-without-cb.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-reset-send.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-reset-twice.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-setnodelay.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-timeout-unref.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-timeout.js": {
+    "status": "PASS"
+  },
+  "test-net-socket-tos.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-transfer-worker-http.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-net-socket-transfer-worker.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-net-socket-unref-timer-parent-chain.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-write-after-close.js": {
+    "status": "FAIL"
+  },
+  "test-net-socket-write-error.js": {
+    "status": "PASS"
+  },
+  "test-net-stream.js": {
+    "status": "PASS"
+  },
+  "test-net-sync-cork.js": {
+    "status": "PASS"
+  },
+  "test-net-throttle.js": {
+    "status": "FAIL"
+  },
+  "test-net-timeout-no-handle.js": {
+    "status": "FAIL"
+  },
+  "test-net-transfer-guards.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-net-unref-timer-parent-undefined.js": {
+    "status": "SKIP"
+  },
+  "test-net-writable.js": {
+    "status": "PASS"
+  },
+  "test-net-write-after-close.js": {
+    "status": "PASS"
+  },
+  "test-net-write-after-end-nt.js": {
+    "status": "FAIL"
+  },
+  "test-net-write-arguments.js": {
+    "status": "PASS"
+  },
+  "test-net-write-cb-on-destroy-before-connect.js": {
+    "status": "FAIL"
+  },
+  "test-net-write-connect-write.js": {
+    "status": "PASS"
+  },
+  "test-net-write-fully-async-buffer.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-write-fully-async-hex-string.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-net-write-slow.js": {
+    "status": "PASS"
+  },
+  "test-os-checked-function.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-os-constants-signals.js": {
+    "status": "FAIL"
+  },
+  "test-os-eol.js": {
+    "status": "FAIL"
+  },
+  "test-os-fast.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-os-homedir-no-envvar.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-os-process-priority.js": {
+    "status": "FAIL"
+  },
+  "test-os-userinfo-handles-getter-errors.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-os.js": {
+    "status": "FAIL"
+  },
+  "test-path-basename.js": {
+    "status": "FAIL"
+  },
+  "test-path-dirname.js": {
+    "status": "FAIL"
+  },
+  "test-path-extname.js": {
+    "status": "FAIL"
+  },
+  "test-path-glob.js": {
+    "status": "FAIL"
+  },
+  "test-path-isabsolute.js": {
+    "status": "FAIL"
+  },
+  "test-path-join.js": {
+    "status": "FAIL"
+  },
+  "test-path-makelong.js": {
+    "status": "FAIL"
+  },
+  "test-path-normalize.js": {
+    "status": "FAIL"
+  },
+  "test-path-parse-format.js": {
+    "status": "FAIL"
+  },
+  "test-path-posix-exists.js": {
+    "status": "PASS"
+  },
+  "test-path-posix-relative-on-windows.js": {
+    "status": "PASS"
+  },
+  "test-path-relative.js": {
+    "status": "FAIL"
+  },
+  "test-path-resolve.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-path-win32-exists.js": {
+    "status": "FAIL"
+  },
+  "test-path-win32-normalize-device-names.js": {
+    "status": "SKIP"
+  },
+  "test-path-zero-length-strings.js": {
+    "status": "FAIL"
+  },
+  "test-process-abort.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-argv-0.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-available-memory.js": {
+    "status": "FAIL"
+  },
+  "test-process-beforeexit-throw-exit.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-beforeexit.js": {
+    "status": "PASS"
+  },
+  "test-process-binding-internalbinding-allowlist.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-binding-util.js": {
+    "status": "FAIL"
+  },
+  "test-process-binding.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-chdir-errormessage.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-chdir.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-config.js": {
+    "status": "FAIL"
+  },
+  "test-process-constants-noatime.js": {
+    "status": "PASS"
+  },
+  "test-process-constrained-memory.js": {
+    "status": "FAIL"
+  },
+  "test-process-cpuUsage.js": {
+    "status": "FAIL"
+  },
+  "test-process-default.js": {
+    "status": "PASS"
+  },
+  "test-process-dlopen-error-message-crash.js": {
+    "status": "FAIL"
+  },
+  "test-process-dlopen-undefined-exports.js": {
+    "status": "PASS"
+  },
+  "test-process-domain-segfault.js": {
+    "status": "PASS"
+  },
+  "test-process-emit.js": {
+    "status": "PASS"
+  },
+  "test-process-emitwarning.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-env-allowed-flags-are-documented.js": {
+    "status": "SKIP"
+  },
+  "test-process-env-allowed-flags.js": {
+    "status": "FAIL"
+  },
+  "test-process-env-delete.js": {
+    "status": "PASS"
+  },
+  "test-process-env-deprecation.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-env-ignore-getter-setter.js": {
+    "status": "FAIL"
+  },
+  "test-process-env-sideeffects.js": {
+    "status": "SKIP",
+    "reason": "uses the inspector"
+  },
+  "test-process-env-symbols.js": {
+    "status": "FAIL"
+  },
+  "test-process-env-tz.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-env-windows-error-reset.js": {
+    "status": "PASS"
+  },
+  "test-process-env.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-euid-egid.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-exception-capture-errors.js": {
+    "status": "PASS"
+  },
+  "test-process-exception-capture-should-abort-on-uncaught-setflagsfromstring.js": {
+    "status": "FAIL"
+  },
+  "test-process-exception-capture-should-abort-on-uncaught.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-exception-capture.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-exec-argv.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-execpath.js": {
+    "status": "FAIL"
+  },
+  "test-process-execve-abort.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-execve-no-args.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-execve-on-exit.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-execve-permission-fail.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-execve-permission-granted.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-execve-socket.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-execve-validation.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-execve-worker-threads.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-execve.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-exit-after-fetch-throw.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-exit-code-validation.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-exit-code.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-exit-from-before-exit.js": {
+    "status": "PASS"
+  },
+  "test-process-exit-handler.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-exit-recursive.js": {
+    "status": "PASS"
+  },
+  "test-process-exit.js": {
+    "status": "PASS"
+  },
+  "test-process-external-stdio-close-spawn.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-external-stdio-close.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-features.js": {
+    "status": "FAIL"
+  },
+  "test-process-finalization.mjs": {
+    "status": "FAIL"
+  },
+  "test-process-get-builtin.mjs": {
+    "status": "PASS"
+  },
+  "test-process-getactivehandles.js": {
+    "status": "FAIL"
+  },
+  "test-process-getactiverequests.js": {
+    "status": "FAIL"
+  },
+  "test-process-getactiveresources-track-active-handles.js": {
+    "status": "FAIL"
+  },
+  "test-process-getactiveresources-track-active-requests.js": {
+    "status": "FAIL"
+  },
+  "test-process-getactiveresources-track-interval-lifetime.js": {
+    "status": "PASS"
+  },
+  "test-process-getactiveresources-track-multiple-timers.js": {
+    "status": "PASS"
+  },
+  "test-process-getactiveresources-track-timer-lifetime.js": {
+    "status": "PASS"
+  },
+  "test-process-getactiveresources.js": {
+    "status": "PASS"
+  },
+  "test-process-getgroups.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-hrtime-bigint.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-hrtime.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-initgroups.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-kill-null.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-kill-pid.js": {
+    "status": "FAIL"
+  },
+  "test-process-load-env-file.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-next-tick.js": {
+    "status": "PASS"
+  },
+  "test-process-no-deprecation.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-ppid.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-prototype.js": {
+    "status": "FAIL"
+  },
+  "test-process-raw-debug.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-really-exit.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-redirect-warnings-env.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-redirect-warnings.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-ref-unref.js": {
+    "status": "FAIL"
+  },
+  "test-process-release.js": {
+    "status": "PASS"
+  },
+  "test-process-remove-all-signal-listeners.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-setgroups.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-setsourcemapsenabled.js": {
+    "status": "FAIL"
+  },
+  "test-process-threadCpuUsage-main-thread.js": {
+    "status": "FAIL"
+  },
+  "test-process-threadCpuUsage-worker-threads.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-title-cli.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-process-uid-gid.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-umask-mask.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-umask.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-process-uncaught-exception-monitor.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-process-uptime.js": {
+    "status": "PASS"
+  },
+  "test-process-versions.js": {
+    "status": "FAIL"
+  },
+  "test-process-warning.js": {
+    "status": "FAIL"
+  },
+  "test-process-warnings.mjs": {
+    "status": "FAIL"
+  },
+  "test-punycode.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-querystring-escape.js": {
+    "status": "PASS"
+  },
+  "test-querystring-maxKeys-non-finite.js": {
+    "status": "PASS"
+  },
+  "test-querystring-multichar-separator.js": {
+    "status": "PASS"
+  },
+  "test-querystring.js": {
+    "status": "FAIL"
+  },
+  "test-readline-async-iterators-backpressure.js": {
+    "status": "FAIL"
+  },
+  "test-readline-async-iterators-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-readline-async-iterators.js": {
+    "status": "FAIL"
+  },
+  "test-readline-carriage-return-between-chunks.js": {
+    "status": "PASS"
+  },
+  "test-readline-csi.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-readline-emit-keypress-events.js": {
+    "status": "FAIL"
+  },
+  "test-readline-input-onerror.js": {
+    "status": "PASS"
+  },
+  "test-readline-interface-escapecodetimeout.js": {
+    "status": "FAIL"
+  },
+  "test-readline-interface-no-trailing-newline.js": {
+    "status": "FAIL"
+  },
+  "test-readline-interface-recursive-writes.js": {
+    "status": "PASS"
+  },
+  "test-readline-interface.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-readline-keys.js": {
+    "status": "FAIL"
+  },
+  "test-readline-line-separators.js": {
+    "status": "FAIL"
+  },
+  "test-readline-position.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-readline-promises-csi.mjs": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-readline-promises-interface.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-readline-promises-tab-complete.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-readline-reopen.js": {
+    "status": "FAIL"
+  },
+  "test-readline-set-raw-mode.js": {
+    "status": "FAIL"
+  },
+  "test-readline-tab-complete.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-readline-undefined-columns.js": {
+    "status": "FAIL"
+  },
+  "test-stream-add-abort-signal.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-aliases-legacy.js": {
+    "status": "PASS"
+  },
+  "test-stream-auto-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream-await-drain-writers-in-synchronously-recursion-write.js": {
+    "status": "PASS"
+  },
+  "test-stream-backpressure.js": {
+    "status": "PASS"
+  },
+  "test-stream-base-prototype-accessors-enumerability.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-big-packet.js": {
+    "status": "PASS"
+  },
+  "test-stream-big-push.js": {
+    "status": "PASS"
+  },
+  "test-stream-catch-rejections.js": {
+    "status": "PASS"
+  },
+  "test-stream-compose.js": {
+    "status": "FAIL"
+  },
+  "test-stream-construct.js": {
+    "status": "PASS"
+  },
+  "test-stream-consumers.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-decoder-objectmode.js": {
+    "status": "PASS"
+  },
+  "test-stream-destroy-event-order.js": {
+    "status": "PASS"
+  },
+  "test-stream-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-stream-drop-take.js": {
+    "status": "FAIL"
+  },
+  "test-stream-duplex-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream-duplex-end.js": {
+    "status": "PASS"
+  },
+  "test-stream-duplex-from.js": {
+    "status": "FAIL"
+  },
+  "test-stream-duplex-props.js": {
+    "status": "PASS"
+  },
+  "test-stream-duplex-readable-end.js": {
+    "status": "PASS"
+  },
+  "test-stream-duplex-readable-writable.js": {
+    "status": "PASS"
+  },
+  "test-stream-duplex-writable-finished.js": {
+    "status": "PASS"
+  },
+  "test-stream-duplex.js": {
+    "status": "FAIL"
+  },
+  "test-stream-duplexpair.js": {
+    "status": "PASS"
+  },
+  "test-stream-end-of-streams.js": {
+    "status": "PASS"
+  },
+  "test-stream-end-paused.js": {
+    "status": "PASS"
+  },
+  "test-stream-err-multiple-callback-construction.js": {
+    "status": "PASS"
+  },
+  "test-stream-error-once.js": {
+    "status": "PASS"
+  },
+  "test-stream-event-names.js": {
+    "status": "FAIL"
+  },
+  "test-stream-events-prepend.js": {
+    "status": "PASS"
+  },
+  "test-stream-filter.js": {
+    "status": "FAIL"
+  },
+  "test-stream-finished.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-flatMap.js": {
+    "status": "FAIL"
+  },
+  "test-stream-forEach.js": {
+    "status": "FAIL"
+  },
+  "test-stream-inheritance.js": {
+    "status": "PASS"
+  },
+  "test-stream-ispaused.js": {
+    "status": "PASS"
+  },
+  "test-stream-iter-broadcast-backpressure.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-broadcast-basic.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-broadcast-coverage.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-broadcast-from.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-consumers-bytes.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-consumers-merge.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-consumers-tap.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-consumers-text.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-cross-realm.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-disabled.js": {
+    "status": "FAIL"
+  },
+  "test-stream-iter-duplex.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-from-async.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-from-coverage.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-from-sync.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-from-writable-cache-options.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-namespace.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-pipeto-edge.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-pipeto-signal.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-pipeto-writev.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-pipeto.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-pull-async.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-pull-sync.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-push-backpressure.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-push-basic.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-push-writer.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-readable-interop-disabled.js": {
+    "status": "FAIL"
+  },
+  "test-stream-iter-readable-interop.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-share-async.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-share-coverage.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-share-from.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-share-sync.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-sharedarraybuffer.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-to-readable.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-transform-compat.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-transform-coverage.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-transform-errors.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-transform-output.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-transform-params.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-transform-roundtrip.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-transform-sync.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-validation.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-writable-from.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iter-writable-interop.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-iterator-helpers-test262-tests.mjs": {
+    "status": "FAIL"
+  },
+  "test-stream-map.js": {
+    "status": "FAIL"
+  },
+  "test-stream-objectmode-undefined.js": {
+    "status": "PASS"
+  },
+  "test-stream-once-readable-pipe.js": {
+    "status": "PASS"
+  },
+  "test-stream-passthrough-drain.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-after-end.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-await-drain-manual-resume.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-await-drain-push-while-write.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-await-drain.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-cleanup-pause.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-cleanup.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-deadlock.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-error-handling.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-error-unhandled.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-event.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-flow-after-unpipe.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-flow.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-manual-resume.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-multiple-pipes.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-needDrain.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-objectmode-to-non-objectmode.js": {
+    "status": "FAIL"
+  },
+  "test-stream-pipe-same-destination-twice.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-unpipe-streams.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipe-without-listenerCount.js": {
+    "status": "FAIL"
+  },
+  "test-stream-pipeline-async-iterator.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipeline-duplex.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipeline-http2.js": {
+    "status": "SKIP"
+  },
+  "test-stream-pipeline-listeners.js": {
+    "status": "FAIL"
+  },
+  "test-stream-pipeline-process.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-stream-pipeline-queued-end-in-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipeline-uncaught.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipeline-with-empty-string.js": {
+    "status": "PASS"
+  },
+  "test-stream-pipeline.js": {
+    "status": "FAIL"
+  },
+  "test-stream-preprocess.js": {
+    "status": "PASS"
+  },
+  "test-stream-promises.js": {
+    "status": "FAIL"
+  },
+  "test-stream-push-order.js": {
+    "status": "PASS"
+  },
+  "test-stream-push-strings.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-aborted.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-add-chunk-during-data.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-async-iter-half-open-duplex.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-async-iterators.js": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-compose.js": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-constructor-set-methods.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-data.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-default-encoding.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-didRead.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-dispose.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-emit-readable-short-stream.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-emittedReadable.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-end-destroyed.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-ended.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-error-end.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-event.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-flow-recursion.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-from-web-termination.js": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-hwm-0-async.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-hwm-0-no-flow-data.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-hwm-0.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-infinite-read.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-invalid-chunk.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-needReadable.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-next-no-null.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-no-unneeded-readable.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-object-multi-push-async.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-pause-and-resume.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-readable-then-resume.js": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-readable.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-reading-readingMore.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-resume-hwm.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-resumeScheduled.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-setEncoding-existing-buffers.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-setEncoding-null.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-strategy-option.js": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-to-web-byob.js": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-to-web-termination-byob.js": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-to-web-termination.js": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-to-web.mjs": {
+    "status": "FAIL"
+  },
+  "test-stream-readable-unpipe-resume.js": {
+    "status": "PASS",
+    "wasm_status": "FAIL"
+  },
+  "test-stream-readable-unshift.js": {
+    "status": "PASS"
+  },
+  "test-stream-readable-with-unimplemented-_read.js": {
+    "status": "PASS"
+  },
+  "test-stream-readableListening-state.js": {
+    "status": "PASS"
+  },
+  "test-stream-reduce.js": {
+    "status": "FAIL"
+  },
+  "test-stream-set-default-hwm.js": {
+    "status": "PASS"
+  },
+  "test-stream-some-find-every.mjs": {
+    "status": "FAIL"
+  },
+  "test-stream-toArray.js": {
+    "status": "FAIL"
+  },
+  "test-stream-toWeb-allows-server-response.js": {
+    "status": "FAIL"
+  },
+  "test-stream-transform-callback-twice.js": {
+    "status": "PASS"
+  },
+  "test-stream-transform-constructor-set-methods.js": {
+    "status": "PASS"
+  },
+  "test-stream-transform-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream-transform-final-sync.js": {
+    "status": "PASS"
+  },
+  "test-stream-transform-final.js": {
+    "status": "PASS"
+  },
+  "test-stream-transform-flush-data.js": {
+    "status": "PASS"
+  },
+  "test-stream-transform-hwm0.js": {
+    "status": "PASS"
+  },
+  "test-stream-transform-objectmode-falsey-value.js": {
+    "status": "PASS"
+  },
+  "test-stream-transform-split-highwatermark.js": {
+    "status": "FAIL"
+  },
+  "test-stream-transform-split-objectmode.js": {
+    "status": "PASS"
+  },
+  "test-stream-typedarray.js": {
+    "status": "PASS"
+  },
+  "test-stream-uint8array.js": {
+    "status": "PASS"
+  },
+  "test-stream-unpipe-event.js": {
+    "status": "PASS"
+  },
+  "test-stream-unshift-empty-chunk.js": {
+    "status": "PASS"
+  },
+  "test-stream-unshift-read-race.js": {
+    "status": "PASS"
+  },
+  "test-stream-wrap-drain.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-wrap-encoding.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-wrap.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-stream-writable-aborted.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-change-default-encoding.js": {
+    "status": "FAIL"
+  },
+  "test-stream-writable-clear-buffer.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-constructor-set-methods.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-decoded-encoding.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-end-cb-error.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-end-cb-uncaught.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-end-multiple.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-ended-state.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-final-async.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-final-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-final-throw.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-finish-destroyed.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-finished-state.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-finished.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-invalid-chunk.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-needdrain-state.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-null.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-properties.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-samecb-singletick.js": {
+    "status": "FAIL"
+  },
+  "test-stream-writable-writable.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-write-cb-error.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-write-cb-twice.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-write-error.js": {
+    "status": "PASS"
+  },
+  "test-stream-writable-write-writev-finish.js": {
+    "status": "PASS"
+  },
+  "test-stream-writableState-ending.js": {
+    "status": "PASS"
+  },
+  "test-stream-writableState-uncorked-bufferedRequestCount.js": {
+    "status": "PASS"
+  },
+  "test-stream-write-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream-write-drain.js": {
+    "status": "PASS"
+  },
+  "test-stream-write-final.js": {
+    "status": "PASS"
+  },
+  "test-stream-writev.js": {
+    "status": "PASS"
+  },
+  "test-stream2-base64-single-char-read-end.js": {
+    "status": "PASS"
+  },
+  "test-stream2-basic.js": {
+    "status": "PASS"
+  },
+  "test-stream2-compatibility.js": {
+    "status": "PASS"
+  },
+  "test-stream2-decode-partial.js": {
+    "status": "PASS"
+  },
+  "test-stream2-finish-pipe-error.js": {
+    "status": "PASS"
+  },
+  "test-stream2-finish-pipe.js": {
+    "status": "PASS"
+  },
+  "test-stream2-httpclient-response-end.js": {
+    "status": "FAIL"
+  },
+  "test-stream2-large-read-stall.js": {
+    "status": "PASS"
+  },
+  "test-stream2-objects.js": {
+    "status": "PASS"
+  },
+  "test-stream2-pipe-error-handling.js": {
+    "status": "PASS"
+  },
+  "test-stream2-pipe-error-once-listener.js": {
+    "status": "PASS"
+  },
+  "test-stream2-push.js": {
+    "status": "PASS"
+  },
+  "test-stream2-read-correct-num-bytes-in-utf8.js": {
+    "status": "PASS"
+  },
+  "test-stream2-read-sync-stack.js": {
+    "status": "PASS"
+  },
+  "test-stream2-readable-empty-buffer-no-eof.js": {
+    "status": "PASS"
+  },
+  "test-stream2-readable-legacy-drain.js": {
+    "status": "PASS"
+  },
+  "test-stream2-readable-non-empty-end.js": {
+    "status": "PASS"
+  },
+  "test-stream2-readable-wrap-destroy.js": {
+    "status": "PASS"
+  },
+  "test-stream2-readable-wrap-empty.js": {
+    "status": "PASS"
+  },
+  "test-stream2-readable-wrap-error.js": {
+    "status": "PASS"
+  },
+  "test-stream2-readable-wrap-proxy-methods.js": {
+    "status": "FAIL"
+  },
+  "test-stream2-readable-wrap.js": {
+    "status": "PASS"
+  },
+  "test-stream2-set-encoding.js": {
+    "status": "PASS"
+  },
+  "test-stream2-transform.js": {
+    "status": "PASS"
+  },
+  "test-stream2-unpipe-drain.js": {
+    "status": "PASS"
+  },
+  "test-stream2-unpipe-leak.js": {
+    "status": "PASS"
+  },
+  "test-stream2-writable.js": {
+    "status": "PASS"
+  },
+  "test-stream3-cork-end.js": {
+    "status": "PASS"
+  },
+  "test-stream3-cork-uncork.js": {
+    "status": "PASS"
+  },
+  "test-stream3-pause-then-read.js": {
+    "status": "PASS"
+  },
+  "test-stream3-pipeline-async-iterator.js": {
+    "status": "PASS"
+  },
+  "test-string-decoder-end.js": {
+    "status": "PASS"
+  },
+  "test-string-decoder-fuzz.js": {
+    "status": "PASS"
+  },
+  "test-string-decoder.js": {
+    "status": "FAIL"
+  },
+  "test-timers-api-refs.js": {
+    "status": "PASS"
+  },
+  "test-timers-args.js": {
+    "status": "PASS"
+  },
+  "test-timers-async-store-leak.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-clear-null-does-not-throw-error.js": {
+    "status": "PASS"
+  },
+  "test-timers-clear-object-does-not-throw-error.js": {
+    "status": "PASS"
+  },
+  "test-timers-clear-timeout-interval-equivalent.js": {
+    "status": "PASS"
+  },
+  "test-timers-clearImmediate-als.js": {
+    "status": "PASS"
+  },
+  "test-timers-clearImmediate.js": {
+    "status": "PASS"
+  },
+  "test-timers-destroyed.js": {
+    "status": "FAIL"
+  },
+  "test-timers-dispose.js": {
+    "status": "FAIL"
+  },
+  "test-timers-fast-calls.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-immediate-promisified.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-immediate-queue-throw.js": {
+    "status": "FAIL"
+  },
+  "test-timers-immediate-queue.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-immediate-unref-nested-once.js": {
+    "status": "FAIL"
+  },
+  "test-timers-immediate-unref-simple.js": {
+    "status": "SKIP",
+    "reason": "uses worker threads"
+  },
+  "test-timers-immediate-unref.js": {
+    "status": "FAIL"
+  },
+  "test-timers-immediate.js": {
+    "status": "PASS"
+  },
+  "test-timers-interval-promisified.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-interval-throw.js": {
+    "status": "PASS"
+  },
+  "test-timers-invalid-clear.js": {
+    "status": "PASS"
+  },
+  "test-timers-linked-list.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-max-duration-warning.js": {
+    "status": "PASS"
+  },
+  "test-timers-nan-duration-emit-once-per-process.js": {
+    "status": "PASS"
+  },
+  "test-timers-nan-duration-warning-promises.js": {
+    "status": "PASS"
+  },
+  "test-timers-nan-duration-warning.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-timers-negative-duration-warning-emit-once-per-process.js": {
+    "status": "PASS"
+  },
+  "test-timers-negative-duration-warning.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-timers-nested.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-next-tick.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-non-integer-delay.js": {
+    "status": "PASS"
+  },
+  "test-timers-not-emit-duration-zero.js": {
+    "status": "PASS"
+  },
+  "test-timers-now.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-ordering.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-process-tampering.js": {
+    "status": "FAIL"
+  },
+  "test-timers-promises-scheduler.js": {
+    "status": "FAIL"
+  },
+  "test-timers-promises.js": {
+    "status": "FAIL"
+  },
+  "test-timers-refresh-in-callback.js": {
+    "status": "PASS"
+  },
+  "test-timers-refresh.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-reset-process-domain-on-throw.js": {
+    "status": "FAIL"
+  },
+  "test-timers-same-timeout-wrong-list-deleted.js": {
+    "status": "PASS"
+  },
+  "test-timers-setimmediate-infinite-loop.js": {
+    "status": "PASS"
+  },
+  "test-timers-socket-timeout-removes-other-socket-unref-timer.js": {
+    "status": "PASS"
+  },
+  "test-timers-this.js": {
+    "status": "PASS"
+  },
+  "test-timers-throw-when-cb-not-function.js": {
+    "status": "PASS"
+  },
+  "test-timers-timeout-promisified.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-timers-timeout-to-interval.js": {
+    "status": "FAIL"
+  },
+  "test-timers-timeout-with-non-integer.js": {
+    "status": "PASS"
+  },
+  "test-timers-to-primitive.js": {
+    "status": "PASS"
+  },
+  "test-timers-uncaught-exception.js": {
+    "status": "PASS"
+  },
+  "test-timers-unenroll-unref-interval.js": {
+    "status": "FAIL"
+  },
+  "test-timers-unref-throw-then-ref.js": {
+    "status": "PASS"
+  },
+  "test-timers-unref.js": {
+    "status": "PASS"
+  },
+  "test-timers-unrefd-interval-still-fires.js": {
+    "status": "PASS"
+  },
+  "test-timers-unrefed-in-beforeexit.js": {
+    "status": "PASS"
+  },
+  "test-timers-unrefed-in-callback.js": {
+    "status": "PASS"
+  },
+  "test-timers-user-call.js": {
+    "status": "PASS"
+  },
+  "test-timers-zero-timeout.js": {
+    "status": "PASS"
+  },
+  "test-timers.js": {
+    "status": "PASS"
+  },
+  "test-url-domain-ascii-unicode.js": {
+    "status": "FAIL"
+  },
+  "test-url-fileurltopath.js": {
+    "status": "FAIL"
+  },
+  "test-url-format-invalid-input.js": {
+    "status": "FAIL"
+  },
+  "test-url-format-whatwg.js": {
+    "status": "FAIL"
+  },
+  "test-url-format.js": {
+    "status": "FAIL"
+  },
+  "test-url-invalid-file-url-path-input.js": {
+    "status": "FAIL"
+  },
+  "test-url-is-url-internal.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-url-parse-deprecation.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-url-parse-format.js": {
+    "status": "FAIL"
+  },
+  "test-url-parse-invalid-input.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-url-parse-query.js": {
+    "status": "PASS"
+  },
+  "test-url-pathtofileurl.js": {
+    "status": "FAIL"
+  },
+  "test-url-relative.js": {
+    "status": "PASS"
+  },
+  "test-url-revokeobjecturl.js": {
+    "status": "FAIL"
+  },
+  "test-url-urltooptions.js": {
+    "status": "PASS"
+  },
+  "test-util-callbackify.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-util-convert-signal-to-exit-code.mjs": {
+    "status": "FAIL"
+  },
+  "test-util-deprecate-invalid-code.js": {
+    "status": "PASS"
+  },
+  "test-util-deprecate.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-emit-experimental-warning.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-exception-with-host-port.js": {
+    "status": "FAIL"
+  },
+  "test-util-format.js": {
+    "status": "FAIL"
+  },
+  "test-util-getcallsites-preparestacktrace.js": {
+    "status": "PASS"
+  },
+  "test-util-getcallsites-sourcemap.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-util-getcallsites.js": {
+    "status": "SKIP",
+    "reason": "spawns child processes"
+  },
+  "test-util-inherits.js": {
+    "status": "FAIL"
+  },
+  "test-util-inspect-getters-accessing-this.js": {
+    "status": "FAIL"
+  },
+  "test-util-inspect-long-running.js": {
+    "status": "FAIL"
+  },
+  "test-util-inspect-namespace.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-inspect-proxy.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-inspect.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-internal.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-isDeepStrictEqual.js": {
+    "status": "FAIL"
+  },
+  "test-util-parse-env.js": {
+    "status": "FAIL"
+  },
+  "test-util-primordial-monkeypatching.js": {
+    "status": "PASS"
+  },
+  "test-util-promisify-custom-names.mjs": {
+    "status": "PASS"
+  },
+  "test-util-promisify.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-sigint-watchdog.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-sleep.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-util-stripvtcontrolcharacters.js": {
+    "status": "FAIL"
+  },
+  "test-util-styletext-hex.js": {
+    "status": "FAIL"
+  },
+  "test-util-styletext.js": {
+    "status": "FAIL"
+  },
+  "test-util-text-decoder.js": {
+    "status": "FAIL"
+  },
+  "test-util-types-exists.js": {
+    "status": "PASS"
+  },
+  "test-util-types.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-zlib-brotli-16GB.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-brotli-dictionary.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-brotli-flush-invalid-kind.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-brotli-flush.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-brotli-from-brotli.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-brotli-from-string.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-brotli-kmaxlength-rangeerror.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-brotli.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-close-after-error.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-close-after-write.js": {
+    "status": "PASS"
+  },
+  "test-zlib-close-in-ondata.js": {
+    "status": "PASS"
+  },
+  "test-zlib-const.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-convenience-methods.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-crc32.js": {
+    "status": "PASS"
+  },
+  "test-zlib-create-raw.js": {
+    "status": "PASS"
+  },
+  "test-zlib-deflate-constructors.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-deflate-raw-inherits.js": {
+    "status": "PASS"
+  },
+  "test-zlib-destroy-pipe.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-destroy.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-dictionary-fail.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-dictionary.js": {
+    "status": "PASS"
+  },
+  "test-zlib-empty-buffer.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-failed-init.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-flush-drain-longblock.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-flush-drain.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-flush-flags.js": {
+    "status": "PASS"
+  },
+  "test-zlib-flush-write-sync-interleaved.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-flush.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-from-concatenated-gzip.js": {
+    "status": "PASS"
+  },
+  "test-zlib-from-gzip-with-trailing-garbage.js": {
+    "status": "PASS"
+  },
+  "test-zlib-from-gzip.js": {
+    "status": "PASS"
+  },
+  "test-zlib-from-string.js": {
+    "status": "PASS"
+  },
+  "test-zlib-invalid-arg-value-brotli-compress.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-invalid-input-memory.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-zlib-invalid-input.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-kmaxlength-rangeerror.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-maxOutputLength.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-negative-zero.js": {
+    "status": "PASS"
+  },
+  "test-zlib-no-stream.js": {
+    "status": "PASS"
+  },
+  "test-zlib-not-string-or-buffer.js": {
+    "status": "PASS"
+  },
+  "test-zlib-object-write.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-params.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-premature-end.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-random-byte-pipes.js": {
+    "status": "SKIP"
+  },
+  "test-zlib-reject-garbage-after-end.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-reset-before-write.js": {
+    "status": "PASS"
+  },
+  "test-zlib-reset-during-write.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-sync-no-event.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-truncated.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-type-error.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-unused-weak.js": {
+    "status": "SKIP",
+    "reason": "needs runtime flags"
+  },
+  "test-zlib-unzip-one-byte-chunks.js": {
+    "status": "PASS"
+  },
+  "test-zlib-write-after-close.js": {
+    "status": "PASS"
+  },
+  "test-zlib-write-after-end.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-write-after-flush.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zero-byte.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zero-windowBits.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zstd-dictionary.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zstd-flush.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zstd-from-string.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zstd-from-zstd.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zstd-kmaxlength-rangeerror.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zstd-pledged-src-size.js": {
+    "status": "FAIL"
+  },
+  "test-zlib-zstd.js": {
+    "status": "FAIL"
+  }
+}

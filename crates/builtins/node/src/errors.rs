@@ -1,0 +1,590 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+//! Node.js errors: JS errors with a `code` property, such as `ERR_INVALID_ARG_TYPE`, and the
+//! argument validation that throws them.
+//!
+//! See <https://nodejs.org/api/errors.html#nodejs-error-codes>.
+
+use std::ffi::CString;
+
+use js::conversion::FromJSVal;
+use js::error::{
+    throw_plain_error, throw_range_error, throw_type_error, ExnThrown, ThrowException,
+};
+use js::gc::scope::Scope;
+use js::prelude::HandleValue;
+use js::Object;
+
+/// The JS error constructor a [`NodeError`] is an instance of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Error,
+    TypeError,
+    RangeError,
+    UriError,
+}
+
+/// A Node.js error: an `Error`, `TypeError`, `RangeError` or `URIError` with a `code` property.
+#[derive(Debug)]
+pub struct NodeError {
+    pub kind: ErrorKind,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl NodeError {
+    pub fn new(kind: ErrorKind, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// `ERR_INVALID_ARG_TYPE`: the argument `name` is `received`, which is not `expected`, a
+    /// description such as "of type string" or "an instance of Buffer".
+    pub fn invalid_arg_type(
+        scope: &Scope<'_>,
+        name: &str,
+        expected: &str,
+        received: HandleValue<'_>,
+    ) -> Self {
+        // Node.js names an argument that is described by its position, such as "first argument",
+        // without quotes.
+        let subject = if name.ends_with(" argument") {
+            name.to_string()
+        } else if name.contains('.') {
+            format!("\"{name}\" property")
+        } else {
+            format!("\"{name}\" argument")
+        };
+        Self::new(
+            ErrorKind::TypeError,
+            "ERR_INVALID_ARG_TYPE",
+            format!(
+                "The {subject} must be {expected}. {}",
+                describe_received(scope, received)
+            ),
+        )
+    }
+
+    /// `ERR_INVALID_ARG_VALUE`: the argument `name` is `received`, which is invalid because of
+    /// `reason`. A `name` with a `.` is called a property.
+    pub fn invalid_arg_value(
+        scope: &Scope<'_>,
+        name: &str,
+        received: HandleValue<'_>,
+        reason: &str,
+    ) -> Self {
+        Self::new(
+            ErrorKind::TypeError,
+            "ERR_INVALID_ARG_VALUE",
+            format!(
+                "The {} '{name}' {reason}. Received {}",
+                if name.contains('.') {
+                    "property"
+                } else {
+                    "argument"
+                },
+                inspect_received(scope, received)
+            ),
+        )
+    }
+
+    /// `ERR_OUT_OF_RANGE`: the value of `name` is `received`, which is not `range`.
+    pub fn out_of_range(name: &str, range: &str, received: &str) -> Self {
+        Self::new(
+            ErrorKind::RangeError,
+            "ERR_OUT_OF_RANGE",
+            format!(
+                "The value of \"{name}\" is out of range. It must be {range}. Received {received}"
+            ),
+        )
+    }
+
+    /// `ERR_METHOD_NOT_IMPLEMENTED`: `what` cannot work in this runtime.
+    pub fn not_implemented(what: &str) -> Self {
+        Self::new(
+            ErrorKind::Error,
+            "ERR_METHOD_NOT_IMPLEMENTED",
+            format!("The {what} method is not implemented"),
+        )
+    }
+}
+
+impl ThrowException for NodeError {
+    fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+        let message = CString::new(self.message.replace('\0', "\\0")).expect("NULs were replaced");
+        match self.kind {
+            ErrorKind::Error => throw_plain_error(scope, &message),
+            ErrorKind::TypeError => throw_type_error(scope, &message),
+            ErrorKind::RangeError => throw_range_error(scope, &message),
+            ErrorKind::UriError => js::error::throw_uri_error(scope, &message),
+        };
+        let Some(error) = js::exception::take_pending(scope) else {
+            return ExnThrown;
+        };
+        if let Ok(object) = Object::from_value(scope, error) {
+            // Only an out-of-memory error can stop this, and that one is then pending instead.
+            if object.set_property(scope, c"code", self.code).is_err() {
+                return ExnThrown;
+            }
+            let internal = self.code.starts_with("ERR_") && !self.code.starts_with("ERR__");
+            if internal && define_to_string(scope, object).is_err() {
+                return ExnThrown;
+            }
+        }
+        js::exception::set_pending(scope, error, js::native::ExceptionStackBehavior::Capture);
+        ExnThrown
+    }
+}
+
+/// Define `error.toString` as a non-enumerable function returning `` `${this.name}
+/// [${this.code}]: ${this.message}` ``, the `toString` of the errors of Node's `ERR_` codes.
+/// Errors with other codes, such as zlib's `Z_DATA_ERROR` and Brotli's `ERR__ERROR_` codes, keep
+/// `Error.prototype.toString`, as in Node.
+fn define_to_string(scope: &Scope<'_>, error: Object<'_>) -> Result<(), ExnThrown> {
+    let function = js::class::get_or_init_shared_function(
+        scope,
+        node_error_to_string as *const () as usize,
+        |scope| js::Function::new_callback(scope, c"toString", 0, node_error_to_string, ()),
+    )?;
+    error.define_property(scope, c"toString", *function, 0)
+}
+
+fn node_error_to_string(
+    scope: &Scope<'_>,
+    args: js::function::CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<js::native::Value, ExnThrown> {
+    let this = Object::from_value_coerce(scope, scope.root_value(args.this()))?;
+    let mut parts = Vec::with_capacity(3);
+    for name in [c"name", c"code", c"message"] {
+        let value = this.get_property(scope, name)?;
+        parts.push(String::from_jsval(scope, value, ()).map_err(|_| ExnThrown)?);
+    }
+    let text = format!("{} [{}]: {}", parts[0], parts[1], parts[2]);
+    js::conversion::ToJSVal::to_jsval_raw_throwing(&js::JSString::from_str(scope, &text)?, scope)
+}
+
+/// The end of an `ERR_INVALID_ARG_TYPE` message describing `value`, such as "Received type number
+/// (42)" or "Received an instance of Object".
+fn describe_received(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
+    if value.is_undefined() {
+        return "Received undefined".into();
+    }
+    if value.is_null() {
+        return "Received null".into();
+    }
+    if let Ok(object) = Object::from_value(scope, value) {
+        if object.is_callable() {
+            let name = object
+                .get_property(scope, c"name")
+                .ok()
+                .and_then(|name| String::from_jsval(scope, name, ()).ok())
+                .unwrap_or_default();
+            return format!("Received function {name}");
+        }
+        let constructor = object
+            .get_property(scope, c"constructor")
+            .ok()
+            .and_then(|ctor| Object::from_value(scope, ctor).ok())
+            .and_then(|ctor| ctor.get_property(scope, c"name").ok())
+            .and_then(|name| String::from_jsval(scope, name, ()).ok())
+            .filter(|name| !name.is_empty());
+        return match constructor {
+            Some(name) => format!("Received an instance of {name}"),
+            None => "Received [object Object]".into(),
+        };
+    }
+    format!(
+        "Received type {} ({})",
+        type_of(value),
+        inspect_short(scope, value)
+    )
+}
+
+/// `value` as Node.js's `determineSpecificType` describes it in an error message, such as "type
+/// number (42)" or "an instance of Object".
+pub fn describe_value(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
+    let received = describe_received(scope, value);
+    received
+        .strip_prefix("Received ")
+        .map(String::from)
+        .unwrap_or(received)
+}
+
+/// The `typeof` of a primitive `value`.
+fn type_of(value: HandleValue<'_>) -> &'static str {
+    if value.is_string() {
+        "string"
+    } else if value.is_number() {
+        "number"
+    } else if value.is_boolean() {
+        "boolean"
+    } else if value.is_symbol() {
+        "symbol"
+    } else if value.is_bigint() {
+        "bigint"
+    } else if value.is_undefined() {
+        "undefined"
+    } else {
+        "object"
+    }
+}
+
+/// A short rendering of `value` for error messages: strings quoted and truncated to 25 characters,
+/// other primitives as `String(value)`.
+/// `util.inspect` of `value`, cut to 128 characters followed by `...` if longer, as Node.js's
+/// `ERR_INVALID_ARG_VALUE` shows the value it received.
+fn inspect_received(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
+    let inspected = crate::inspect::InspectOptions::current(scope)
+        .and_then(|options| crate::inspect::inspect(scope, value, options));
+    let Ok(text) = inspected else {
+        js::exception::clear(scope);
+        return inspect_short(scope, value);
+    };
+    let units: Vec<u16> = text.encode_utf16().collect();
+    if units.len() > 128 {
+        format!("{}...", String::from_utf16_lossy(&units[..128]))
+    } else {
+        text
+    }
+}
+
+fn inspect_short(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
+    if value.is_string() {
+        let string = String::from_jsval(scope, value, ()).unwrap_or_default();
+        let mut chars = string.chars();
+        let head: String = chars.by_ref().take(25).collect();
+        return if chars.next().is_some() {
+            format!("'{head}...'")
+        } else {
+            format!("'{head}'")
+        };
+    }
+    if value.is_symbol() {
+        return "Symbol()".into();
+    }
+    js::JSString::from_value(scope, value)
+        .and_then(|string| string.to_utf8(scope))
+        .unwrap_or_default()
+}
+
+/// `value` as a string, or `ERR_INVALID_ARG_TYPE` naming the argument `name` if it isn't one.
+pub fn validate_string(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+) -> Result<String, NodeError> {
+    if !value.is_string() {
+        return Err(NodeError::invalid_arg_type(
+            scope,
+            name,
+            "of type string",
+            value,
+        ));
+    }
+    String::from_jsval(scope, value, ()).map_err(|_| {
+        NodeError::new(
+            ErrorKind::Error,
+            "ERR_INTERNAL_ASSERTION",
+            "converting a string failed",
+        )
+    })
+}
+
+/// The argument `value`, named `name`, as an integer from `min` to `max`, as Node.js's
+/// `validateInteger` checks it.
+pub fn validate_integer(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+    min: f64,
+    max: f64,
+) -> Result<f64, Thrown> {
+    if !value.is_number() {
+        return Err(NodeError::invalid_arg_type(scope, name, "of type number", value).into());
+    }
+    let number = value.to_number();
+    if !number.is_finite() || number.fract() != 0.0 {
+        return Err(
+            NodeError::out_of_range(name, "an integer", &out_of_range_received(number)).into(),
+        );
+    }
+    if !(min..=max).contains(&number) {
+        return Err(NodeError::out_of_range(
+            name,
+            &format!(
+                ">= {} && <= {}",
+                number_to_string(min),
+                number_to_string(max)
+            ),
+            &out_of_range_received(number),
+        )
+        .into());
+    }
+    Ok(number)
+}
+
+/// `number` as JS's `Number.prototype.toString()` converts it, such as `1e+21` for `1e21` and
+/// `1.5e-7` for `0.00000015`.
+pub fn number_to_string(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".into();
+    }
+    if number == 0.0 {
+        return "0".into();
+    }
+    if number.is_infinite() {
+        return if number > 0.0 {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+        .into();
+    }
+    let sign = if number < 0.0 { "-" } else { "" };
+    // `{:e}` writes the shortest digits that round-trip, as `d.ddde<exponent>`.
+    let scientific = format!("{:e}", number.abs());
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` writes an exponent");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    let n = exponent.parse::<i32>().expect("the exponent is an integer") + 1;
+    let body = if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat((-n) as usize))
+    } else {
+        let exponent = n - 1;
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        let (head, tail) = digits.split_at(1);
+        let fraction = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(".{tail}")
+        };
+        format!("{head}{fraction}e{exponent_sign}{}", exponent.abs())
+    };
+    format!("{sign}{body}")
+}
+
+/// `number` as Node.js's `ERR_OUT_OF_RANGE` message shows a received number: as `inspect` shows
+/// it, with `_` between groups of three digits for an integer above 2**32 in magnitude.
+pub fn out_of_range_received(number: f64) -> String {
+    if number.is_finite() && number.fract() == 0.0 && number.abs() > 4294967296.0 {
+        return add_numerical_separator(&number_to_string(number));
+    }
+    if number == 0.0 && number.is_sign_negative() {
+        return "-0".into();
+    }
+    number_to_string(number)
+}
+
+/// Node.js's `addNumericalSeparator`: `_` inserted before every third character from the end,
+/// after a leading `-`.
+pub(crate) fn add_numerical_separator(text: &str) -> String {
+    let start = usize::from(text.starts_with('-'));
+    let mut end = text.len();
+    let mut groups = Vec::new();
+    while end >= start + 4 {
+        groups.push(&text[end - 3..end]);
+        end -= 3;
+    }
+    let mut out = text[..end].to_string();
+    for group in groups.iter().rev() {
+        out.push('_');
+        out.push_str(group);
+    }
+    out
+}
+
+/// `value` as an object, or `ERR_INVALID_ARG_TYPE` naming the argument `name`, as Node.js's
+/// `validateObject` checks it: `null` and functions are rejected, and arrays too unless
+/// `allow_array`.
+pub fn validate_plain_object<'s>(
+    scope: &'s Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+    allow_array: bool,
+) -> Result<Object<'s>, Thrown> {
+    let invalid = || NodeError::invalid_arg_type(scope, name, "of type object", value);
+    let object = Object::from_value(scope, *value).map_err(|_| invalid())?;
+    if object.is_callable() || (!allow_array && js::Array::is_array(scope, object.handle())?) {
+        return Err(invalid().into());
+    }
+    Ok(object)
+}
+
+/// `value` as an object, or `ERR_INVALID_ARG_TYPE` naming the argument `name` if it isn't one, as
+/// Node.js's `validateObject` checks it with `kValidateObjectAllowObjects`: arrays and functions
+/// are accepted. [`validate_plain_object`] is the check without those flags.
+pub fn validate_object<'s>(
+    scope: &'s Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+) -> Result<Object<'s>, NodeError> {
+    Object::from_value(scope, *value)
+        .map_err(|_| NodeError::invalid_arg_type(scope, name, "of type object", value))
+}
+
+/// `ERR_INVALID_ARG_TYPE` naming the argument `name` unless `value` is `undefined` or an object with
+/// an `aborted` property, as an `AbortSignal` has.
+pub fn validate_abort_signal(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+) -> Result<(), Thrown> {
+    if value.is_undefined() {
+        return Ok(());
+    }
+    let has_aborted = match Object::from_value(scope, *value) {
+        Ok(object) => object.has_property(scope, c"aborted")?,
+        Err(_) => false,
+    };
+    if !has_aborted {
+        return Err(
+            NodeError::invalid_arg_type(scope, name, "an instance of AbortSignal", value).into(),
+        );
+    }
+    Ok(())
+}
+
+/// A new `AbortError`: an instance of a subclass of `Error`, with the message "The operation was
+/// aborted", the own properties `code` (`ABORT_ERR`) and `name` (`AbortError`) in that order, and
+/// `cause` as its non-enumerable `cause` if given.
+pub fn abort_error<'s>(
+    scope: &'s Scope<'_>,
+    cause: Option<HandleValue<'_>>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    throw_plain_error(scope, c"The operation was aborted");
+    let error = js::exception::take_pending_or_undefined(scope);
+    let error = scope.root_value(error.get());
+    let object = Object::from_value(scope, error).map_err(|e| e.throw(scope))?;
+    let proto = abort_error_class::class_constructor(scope)?.get_property(scope, c"prototype")?;
+    let proto = Object::from_value(scope, proto).map_err(|e| e.throw(scope))?;
+    object.set_prototype(scope, proto.handle())?;
+    object.set_property(scope, c"code", "ABORT_ERR")?;
+    object.set_property(scope, c"name", "AbortError")?;
+    if let Some(cause) = cause {
+        object.define_property(scope, c"cause", cause, 0)?;
+    }
+    Ok(error)
+}
+
+#[core_runtime::jsfunction_class(name = "AbortError", class_syntax)]
+pub mod abort_error_class {
+    use super::*;
+
+    /// Node.js's internal `AbortError`: [`abort_error`] with `options.cause`, if `options` is
+    /// an object.
+    #[constructor]
+    pub fn create<'s>(
+        scope: &'s Scope<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        let cause = match options.map(|options| Object::from_value(scope, *options)) {
+            Some(Ok(options)) if options.has_property(scope, c"cause")? => {
+                Some(options.get_property(scope, c"cause")?)
+            }
+            _ => None,
+        };
+        let error = abort_error(scope, cause)?;
+        Object::from_value(scope, error).map_err(|e| e.throw(scope))
+    }
+
+    /// Make `AbortError.prototype` inherit from `Error.prototype`.
+    #[setup]
+    pub fn setup(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
+        let error_ctor = Object::from_value(scope, scope.global().get_property(scope, c"Error")?)
+            .map_err(|e| e.throw(scope))?;
+        let error_proto = Object::from_value(scope, error_ctor.get_property(scope, c"prototype")?)
+            .map_err(|e| e.throw(scope))?;
+        proto.set_prototype(scope, error_proto.handle())?;
+        ctor.set_prototype(scope, error_ctor.handle())
+    }
+}
+
+/// `value` as a callable object, or `ERR_INVALID_ARG_TYPE` naming the argument `name` if it
+/// isn't one.
+pub fn validate_function<'s>(
+    scope: &'s Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+) -> Result<Object<'s>, NodeError> {
+    Object::from_value(scope, *value)
+        .ok()
+        .filter(|object| object.is_callable())
+        .ok_or_else(|| NodeError::invalid_arg_type(scope, name, "of type function", value))
+}
+
+/// An error from a builtin whose body mixes `NodeError`s with JS operations returning
+/// `ExnThrown`: a pending JS exception, or a Node.js error to throw.
+pub enum Thrown {
+    /// A JS exception is pending.
+    Pending,
+    /// A Node.js error to throw.
+    Node(NodeError),
+}
+
+impl From<ExnThrown> for Thrown {
+    fn from(_: ExnThrown) -> Self {
+        Thrown::Pending
+    }
+}
+
+impl From<NodeError> for Thrown {
+    fn from(error: NodeError) -> Self {
+        Thrown::Node(error)
+    }
+}
+
+impl From<js::conversion::ConversionError> for Thrown {
+    fn from(error: js::conversion::ConversionError) -> Self {
+        match error {
+            js::conversion::ConversionError::ExnPending => Thrown::Pending,
+            js::conversion::ConversionError::Failure(message) => Thrown::Node(NodeError::new(
+                ErrorKind::TypeError,
+                "ERR_INVALID_ARG_TYPE",
+                message.to_string_lossy(),
+            )),
+        }
+    }
+}
+
+impl ThrowException for Thrown {
+    fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+        match self {
+            Thrown::Pending => ExnThrown,
+            Thrown::Node(error) => error.throw(scope),
+        }
+    }
+}
+
+/// The Node.js error code, a POSIX errno name, of the I/O error `error`.
+pub fn io_error_code(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind::*;
+    match error.kind() {
+        NotFound => "ENOENT",
+        PermissionDenied => "EACCES",
+        AlreadyExists => "EEXIST",
+        NotADirectory => "ENOTDIR",
+        IsADirectory => "EISDIR",
+        DirectoryNotEmpty => "ENOTEMPTY",
+        ReadOnlyFilesystem => "EROFS",
+        InvalidInput => "EINVAL",
+        ConnectionRefused => "ECONNREFUSED",
+        ConnectionReset => "ECONNRESET",
+        ConnectionAborted => "ECONNABORTED",
+        TimedOut => "ETIMEDOUT",
+        AddrInUse => "EADDRINUSE",
+        AddrNotAvailable => "EADDRNOTAVAIL",
+        BrokenPipe => "EPIPE",
+        Unsupported => "ENOSYS",
+        _ => "EIO",
+    }
+}

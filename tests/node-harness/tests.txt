@@ -1,0 +1,27 @@
+# The Node.js tests run-node-tests.mjs runs, as globs over test/parallel. Each covers a module
+# --node-compat implements. The crypto tests are left out: test/common's `hasCrypto` requires
+# `process.versions.openssl`, so they all skip.
+test-assert*
+test-async-local-storage-*
+test-buffer-*
+test-diagnostics-channel-*
+test-dns-lookup*
+test-event-emitter-*
+test-events-*
+test-fs-*
+test-http-*
+test-net-*
+test-os*
+test-path-*
+test-process-*
+test-punycode*
+test-querystring*
+test-readline-*
+test-stream-*
+test-stream2-*
+test-stream3-*
+test-string-decoder*
+test-timers*
+test-url-*
+test-util-*
+test-zlib-*

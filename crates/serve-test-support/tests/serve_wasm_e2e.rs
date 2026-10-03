@@ -2956,3 +2956,137 @@ fn a_client_hanging_up_mid_body_aborts_the_request_signal() {
         server.log()
     );
 }
+
+/// Requests interleaved in one instance each keep their `AsyncLocalStorage` store across host I/O,
+/// a timer and a settled-promise `await`, with the store they `run` their handler in.
+#[test]
+fn concurrent_requests_keep_their_own_async_local_storage() {
+    let gate = common::start_held_upstream("go");
+    let handler = format!(
+        r#"import {{ AsyncLocalStorage }} from 'node:async_hooks';
+    {INSTANCE_ID}
+    const storage = new AsyncLocalStorage();
+    addEventListener('fetch', (event) => {{
+        const url = new URL(event.request.url);
+        if (url.pathname === '/ready') {{
+            event.respondWith(new Response('ready'));
+            return;
+        }}
+        const tag = url.searchParams.get('tag');
+        event.respondWith(storage.run(tag, async () => {{
+            await fetch('http://127.0.0.1:{gate}/hold');
+            const delay = Number(url.searchParams.get('delay'));
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            await null;
+            return new Response('store=' + storage.getStore() + ' instance=' + globalThis.instance);
+        }}));
+    }});"#,
+        gate = gate.port()
+    );
+    let Some(server) = Serve::new(18478)
+        .reusing_one_instance()
+        .without_gc_zeal()
+        .flags(["--node-compat"])
+        .module("handler.mjs", &handler)
+        .start()
+    else {
+        return;
+    };
+
+    let mut seen = server.idle_so_far();
+    let slow = spawn_request(server.port(), "/?tag=alpha&delay=600");
+    await_admission(&gate, &server, &mut seen, "alpha");
+    let quick = spawn_request(server.port(), "/?tag=beta&delay=100");
+    await_admission(&gate, &server, &mut seen, "beta");
+    gate.release();
+
+    let slow = slow.join().unwrap();
+    let quick = quick.join().unwrap();
+    assert!(slow.contains("store=alpha "), "{slow}");
+    assert!(quick.contains("store=beta "), "{quick}");
+    assert_met_in_one_instance(&[&slow, &quick]);
+}
+
+/// With `--node-compat`, an `http.createServer` server responds to the requests a `wasi:http` host
+/// sends: with the request's method, path and body, and with a response written whole or in
+/// pieces.
+#[test]
+fn node_http_servers_respond_to_wasi_http_requests() {
+    let handler = r#"import http from 'node:http';
+    http.createServer((req, res) => {
+        if (req.url === '/stream') {
+            res.writeHead(201, { 'X-A': '1' });
+            res.write('a');
+            setTimeout(() => res.end('bc'), 10);
+            return;
+        }
+        let body = '';
+        req.setEncoding('utf8');
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', () => res.end(`${req.method} ${req.url} ${body}`));
+    }).listen(8080);"#;
+    let Some(server) = Serve::new(18481)
+        .flags(["--node-compat"])
+        .module("handler.mjs", handler)
+        .start()
+    else {
+        return;
+    };
+    assert_eq!(
+        server.request("POST", "/echo?q=1", "hi"),
+        "POST /echo?q=1 hi"
+    );
+    let stream = server.full_request("GET", "/stream", "");
+    assert!(stream.starts_with("HTTP/1.1 201"), "{stream}");
+    assert!(stream.to_ascii_lowercase().contains("x-a: 1"), "{stream}");
+    assert_eq!(server.request("GET", "/stream", ""), "abc");
+}
+
+/// With `--node-compat`, the callback and promise functions of `node:fs` and `fs.createReadStream`
+/// read files while the component serves requests, where the synchronous functions are refused.
+#[test]
+fn node_fs_reads_files_while_serving() {
+    let handler = r#"import fs from 'node:fs';
+    import fsp from 'node:fs/promises';
+    import http from 'node:http';
+    http.createServer((req, res) => {
+        const fail = (error) => res.end(`error ${error.code}: ${error.message}`);
+        if (req.url === '/callback') {
+            fs.stat('data.txt', (error, stats) => {
+                if (error) return fail(error);
+                fs.readFile('/cwd/data.txt', 'utf8', (error, text) => {
+                    if (error) return fail(error);
+                    res.end(`${stats.size} ${text}`);
+                });
+            });
+        } else if (req.url === '/promise') {
+            fsp.readFile('data.txt', 'utf8').then((text) => res.end(text), fail);
+        } else if (req.url === '/stream') {
+            fs.createReadStream('data.txt', { highWaterMark: 4 }).on('error', fail).pipe(res);
+        } else if (req.url === '/sync') {
+            try {
+                res.end(fs.readFileSync('data.txt', 'utf8'));
+            } catch (error) {
+                fail(error);
+            }
+        } else {
+            res.end('ready');
+        }
+    }).listen(8080);"#;
+    let Some(server) = Serve::new(18482)
+        .flags(["--node-compat"])
+        .module("handler.mjs", handler)
+        .file("data.txt", "file contents")
+        .start()
+    else {
+        return;
+    };
+    assert_eq!(server.request("GET", "/callback", ""), "13 file contents");
+    assert_eq!(server.request("GET", "/promise", ""), "file contents");
+    assert_eq!(server.request("GET", "/stream", ""), "file contents");
+    let refused = server.request("GET", "/sync", "");
+    assert!(
+        refused.starts_with("error ERR_BLOCKING_NOT_ALLOWED"),
+        "{refused}"
+    );
+}

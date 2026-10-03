@@ -3779,3 +3779,265 @@ fn wait_until_work_does_not_hold_a_connection_slot() {
 
     handle.stop();
 }
+
+/// With `--node-compat`, a served request can't block on host I/O, such as a `require` with a
+/// computed specifier that reads a file, or `fs.readFileSync`, unless `--allow-blocking-host-io`
+/// allows it. A `require` with a literal specifier loads the source read while the top level ran.
+/// The content script's top level can block, and `fs.promises` doesn't block natively.
+#[test]
+fn served_requests_cannot_block_on_host_io_by_default() {
+    let dir = std::env::temp_dir().join(format!("starling-serve-blocking-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("early.cjs"), "module.exports = 'early';").unwrap();
+    std::fs::write(dir.join("late.cjs"), "module.exports = 'late';").unwrap();
+    std::fs::write(dir.join("computed.cjs"), "module.exports = 'computed';").unwrap();
+    std::fs::write(
+        dir.join("entry.cjs"),
+        r#"const early = require('./early.cjs');
+        const fs = require('fs');
+        const attempt = (load) => {
+            try {
+                return load();
+            } catch (error) {
+                return error.code;
+            }
+        };
+        addEventListener('fetch', (event) => {
+            const late = attempt(() => require('./late.cjs'));
+            const computed = attempt(() => require('./' + 'computed.cjs'));
+            const sync = attempt(() => fs.readFileSync(__dirname + '/late.cjs', 'utf8').slice(17, 23));
+            event.respondWith(
+                fs.promises.readFile(__dirname + '/late.cjs', 'utf8').then(
+                    (text) => new Response([early, late, computed, sync, text.slice(17, 23)].join(' ')),
+                ),
+            );
+        });
+        "#,
+    )
+    .unwrap();
+
+    for (port, allow, expected) in [
+        (
+            18476,
+            false,
+            "early late ERR_BLOCKING_NOT_ALLOWED ERR_BLOCKING_NOT_ALLOWED 'late'",
+        ),
+        (18477, true, "early late computed 'late' 'late'"),
+    ] {
+        let handle = start_serve_config(
+            RuntimeConfig {
+                script_path: dir.join("entry.cjs").to_string_lossy().into_owned(),
+                serve: Some(port),
+                node_compat: true,
+                allow_blocking_host_io: allow,
+                ..Default::default()
+            },
+            port,
+        );
+        assert_eq!(request(port, "GET", "/", ""), expected, "allow: {allow}");
+        handle.stop();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--node-compat`, a `require` with a string literal that first runs while serving a request
+/// loads the module and JSON file it names, which were read while the top level ran, and a
+/// `require` of a module nothing names that way is refused.
+#[test]
+fn node_requires_named_by_literals_load_while_serving() {
+    let dir = std::env::temp_dir().join(format!("starling-serve-node-lazy-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(
+        dir.join("lib/lazy.js"),
+        "module.exports = () => require('./data.json').value + require('./nested');",
+    )
+    .unwrap();
+    std::fs::write(dir.join("lib/data.json"), r#"{ "value": "json" }"#).unwrap();
+    std::fs::write(dir.join("lib/nested.js"), "module.exports = '+nested';").unwrap();
+    std::fs::write(dir.join("lib/unnamed.js"), "module.exports = 'unnamed';").unwrap();
+    std::fs::write(
+        dir.join("server.cjs"),
+        r#"const http = require('http');
+        http.createServer((req, res) => {
+            if (req.url === '/lazy') {
+                res.end(require('./lib/lazy')());
+                return;
+            }
+            const name = './lib/' + 'unnamed';
+            try {
+                res.end(require(name));
+            } catch (error) {
+                res.end(error.code);
+            }
+        }).listen(0);
+        "#,
+    )
+    .unwrap();
+    let port = 18481;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            script_path: dir.join("server.cjs").to_string_lossy().into_owned(),
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    let lazy = raw_request(
+        port,
+        b"GET /lazy HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(lazy.starts_with("HTTP/1.1 200"), "{lazy}");
+    assert!(lazy.ends_with("json+nested"), "{lazy}");
+
+    let unnamed = raw_request(
+        port,
+        b"GET /unnamed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(unnamed.ends_with("ERR_BLOCKING_NOT_ALLOWED"), "{unnamed}");
+
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--node-compat`, a served request with an `Upgrade` header gets a 501 when the server has
+/// `upgrade` listeners, which have no socket to take over, and goes to the `request` listener
+/// otherwise.
+#[test]
+fn node_upgrade_requests_get_501_with_upgrade_listeners() {
+    let dir = std::env::temp_dir().join(format!(
+        "starling-serve-node-upgrade-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("server.cjs"),
+        r#"const http = require('http');
+        const server = http.createServer((req, res) => res.end('request'));
+        server.on('upgrade', () => { throw new Error('unreachable'); });
+        server.listen(0);
+        "#,
+    )
+    .unwrap();
+    let port = 18482;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            script_path: dir.join("server.cjs").to_string_lossy().into_owned(),
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    let upgrade = raw_request(
+        port,
+        b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nConnection: close\r\n\r\n",
+    );
+    assert!(upgrade.starts_with("HTTP/1.1 501"), "{upgrade}");
+    let plain = raw_request(
+        port,
+        b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(plain.ends_with("request"), "{plain}");
+
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--node-compat`, an `http.createServer` server responds to the served requests: the
+/// request reads as an `IncomingMessage` with Node's header joining and the client's address on
+/// its socket, and the `ServerResponse` sends its status, headers, and the body written whole or in
+/// pieces.
+#[test]
+fn node_http_servers_respond_to_served_requests() {
+    let dir = std::env::temp_dir().join(format!("starling-serve-node-http-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("server.cjs"),
+        r#"const http = require('http');
+        const server = http.createServer((req, res) => {
+            if (req.url.startsWith('/echo')) {
+                let body = '';
+                req.setEncoding('utf8');
+                req.on('data', (chunk) => (body += chunk));
+                req.on('end', () => {
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({
+                        method: req.method,
+                        url: req.url,
+                        cookie: req.headers.cookie,
+                        dup: req.headers['x-dup'],
+                        body,
+                        complete: req.complete,
+                        remote: [req.socket.remoteAddress, req.socket.remoteFamily, typeof req.socket.remotePort],
+                    }));
+                });
+            } else if (req.url === '/stream') {
+                res.writeHead(201, { 'X-A': '1' });
+                res.write('a');
+                setTimeout(() => {
+                    res.write('b');
+                    res.end('c');
+                }, 10);
+            } else {
+                res.statusCode = 404;
+                res.setHeader('Set-Cookie', ['x=1', 'y=2']);
+                res.end();
+            }
+        });
+        server.listen(0);
+        "#,
+    )
+    .unwrap();
+    let port = 18480;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            script_path: dir.join("server.cjs").to_string_lossy().into_owned(),
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    let echo = raw_request(
+        port,
+        b"POST /echo?q=1 HTTP/1.1\r\nHost: x\r\nCookie: a=1\r\nCookie: b=2\r\nX-Dup: 1\r\nX-Dup: 2\r\n\
+          Content-Length: 2\r\nConnection: close\r\n\r\nhi",
+    );
+    assert!(echo.starts_with("HTTP/1.1 200"), "{echo}");
+    assert!(
+        echo.to_ascii_lowercase()
+            .contains("content-type: application/json"),
+        "{echo}"
+    );
+    assert!(
+        echo.ends_with(r#"{"method":"POST","url":"/echo?q=1","cookie":"a=1; b=2","dup":"1, 2","body":"hi","complete":true,"remote":["127.0.0.1","IPv4","number"]}"#),
+        "{echo}"
+    );
+
+    let stream = raw_request(
+        port,
+        b"GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(stream.starts_with("HTTP/1.1 201"), "{stream}");
+    assert!(stream.to_ascii_lowercase().contains("x-a: 1"), "{stream}");
+    let body = &stream[stream.find("\r\n\r\n").unwrap() + 4..];
+    assert_eq!(dechunk(body), "abc", "{stream}");
+
+    let missing = raw_request(
+        port,
+        b"GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+    assert_eq!(
+        missing.to_ascii_lowercase().matches("set-cookie:").count(),
+        2,
+        "{missing}"
+    );
+
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

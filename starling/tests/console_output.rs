@@ -103,3 +103,56 @@ fn top_level_rejection_is_reported_once() {
     assert!(stderr.contains("top level"), "{stderr}");
     assert!(!stderr.contains("Uncaught (in promise)"), "{stderr}");
 }
+
+/// With `--node-compat`, the console formats its arguments with `util.format`, so `%` placeholders
+/// are replaced and objects show as `util.inspect` shows them, and `warn` and `error` print without
+/// a level prefix. `console.assert` calls `warn` with Node's message.
+#[test]
+fn node_compat_console_formats_as_node_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        "console.log('%s=%d', 'n', 42, { a: 'x', b: [1, { c: new Map([[1, 2]]) }] });\n\
+         console.error('err %o', { x: 1 });\n\
+         console.dir({ deep: { deeper: 1 } }, { depth: 0 });\n\
+         console.assert(false, 'msg %d', 5);\n\
+         console.log('100%');",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .arg("--node-compat")
+        .arg(&main)
+        .output()
+        .expect("failed to run starling");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "n=42 { a: 'x', b: [ 1, { c: [Map] } ] }\n{ deep: [Object] }\n100%\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "err { x: 1 }\nAssertion failed: msg 5\n"
+    );
+}
+
+/// `fs.writeSync` to descriptor 1 writes its data before it returns, so output without a line
+/// break appears before what the console prints next.
+#[test]
+fn node_compat_fs_write_sync_to_stdout_is_unbuffered() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        "import fs from 'node:fs';\n\
+         fs.writeSync(1, 'A'); console.log('B'); fs.writeSync(1, 'C\\n');",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .arg("--node-compat")
+        .arg(&main)
+        .output()
+        .expect("failed to run starling");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "AB\nC\n");
+}
