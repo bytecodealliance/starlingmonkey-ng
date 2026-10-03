@@ -1,0 +1,17 @@
+{
+  "It exists and is a function": {
+    "status": "PASS"
+  },
+  "It throws when given non-functions": {
+    "status": "PASS"
+  },
+  "It calls the callback asynchronously": {
+    "status": "PASS"
+  },
+  "It does not pass any arguments": {
+    "status": "PASS"
+  },
+  "It interleaves with promises as expected": {
+    "status": "PASS"
+  }
+}

@@ -4,19 +4,29 @@ use mozjs::rust::HandleObject;
 unsafe extern "C" {
     fn console_install(cx: *mut JSContext, global: *mut JSObject) -> bool;
     fn starling_set_console_sink(sink: Option<ConsoleSink>);
+    fn starling_set_console_level_prefixes(enabled: bool);
 }
 
 /// Receives each console message in place of stdout and stderr. `level` follows the console's
-/// `LogType`: 0 `log`, 1 `info`, 2 `debug`, 3 `warn`, 4 `error`. `message` is the formatted
-/// message without a level prefix. It is NUL-terminated and valid only for the duration of the
-/// call.
-pub type ConsoleSink = unsafe extern "C" fn(level: u8, message: *const std::ffi::c_char);
+/// `LogType`: 0 `log`, 1 `info`, 2 `debug`, 3 `warn`, 4 `error`. `message` points to the `length`
+/// bytes of the formatted message without a level prefix, which can contain NUL bytes. It is valid
+/// only for the duration of the call.
+pub type ConsoleSink =
+    unsafe extern "C" fn(level: u8, message: *const std::ffi::c_char, length: usize);
 
 /// Route console messages to `sink`, or back to stdout and stderr with `None`. The sink is
 /// process-wide.
 pub fn set_console_sink(sink: Option<ConsoleSink>) {
     // SAFETY: the C++ side only stores the pointer.
     unsafe { starling_set_console_sink(sink) }
+}
+
+/// Set whether `console.warn` and `console.error` messages printed to stderr start with `Warn: `
+/// and `Error: `, which they do unless this turns it off. Messages a sink receives have no prefix
+/// either way. The setting is process-wide.
+pub fn set_console_level_prefixes(enabled: bool) {
+    // SAFETY: the C++ side only stores the flag.
+    unsafe { starling_set_console_level_prefixes(enabled) }
 }
 
 /// Install all C++ builtins on the given global object.
@@ -90,24 +100,23 @@ mod tests {
                 const { std::cell::RefCell::new(Vec::new()) };
         }
 
-        unsafe extern "C" fn record(level: u8, message: *const std::ffi::c_char) {
-            // SAFETY: the console passes a NUL-terminated string valid for this call.
-            let message = unsafe { std::ffi::CStr::from_ptr(message) }
-                .to_string_lossy()
-                .into_owned();
+        unsafe extern "C" fn record(level: u8, message: *const std::ffi::c_char, length: usize) {
+            // SAFETY: the console passes `length` bytes at `message`, valid for this call.
+            let bytes = unsafe { std::slice::from_raw_parts(message.cast::<u8>(), length) };
+            let message = String::from_utf8_lossy(bytes).into_owned();
             SUNK.with(|sunk| sunk.borrow_mut().push((level, message)));
         }
 
         #[test]
         fn console_sink_receives_messages_instead_of_the_streams() {
             crate::set_console_sink(Some(record));
-            let evaluated = eval("console.log('a', 1); console.error('b'); true");
+            let evaluated = eval("console.log('a', 1); console.error('b\\0c'); true");
             crate::set_console_sink(None);
             assert!(evaluated);
             SUNK.with(|sunk| {
                 assert_eq!(
                     *sunk.borrow(),
-                    [(0, "a 1".to_string()), (4, "b".to_string())]
+                    [(0, "a 1".to_string()), (4, "b\0c".to_string())]
                 )
             });
         }

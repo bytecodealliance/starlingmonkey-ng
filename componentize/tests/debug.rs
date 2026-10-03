@@ -101,7 +101,9 @@ async fn build(wit: &str, world: &str, name: &str, js: &str, debug: bool) -> Vec
         &[],
         None,
         debug,
+        false,
         None,
+        false,
         None,
         true,
     )
@@ -632,7 +634,9 @@ async fn debug_with_the_runtime_dylib_is_refused() {
         &[],
         None,
         true,
+        false,
         None,
+        false,
         None,
         true,
     )
@@ -664,7 +668,9 @@ async fn debug_with_sockets_disabled_is_refused() {
         &[componentize::finalize::WASIAPISet::Sockets],
         None,
         true,
+        false,
         None,
+        false,
         None,
         true,
     )

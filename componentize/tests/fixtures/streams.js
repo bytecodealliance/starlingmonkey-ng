@@ -354,6 +354,40 @@ function assert(condition, message) {
 /** @type {(value: number) => void} */
 let settleHeld = () => {}
 
+/** @type {WeakRef<Promise<number>> | null} */
+let unreferencedFuture = null
+
+/** A promise that never settles, which only `unreferencedFuture` references. */
+function unreferencedNeverFuture() {
+    const promise = new Promise(() => {})
+    unreferencedFuture = new WeakRef(promise)
+    return promise
+}
+
+/**
+ * Allocate garbage and wait on timers until the promise `unreferencedNeverFuture`
+ * returned is collected, for at most 1000 turns. Returns whether it was. Each
+ * turn's allocation stays referenced into the next turn, so it outlives a minor
+ * collection and the tenured heap grows until a major collection runs. The
+ * allocation comes before the `deref` in each turn, since `deref` keeps the
+ * target alive until the turn ends.
+ */
+async function collectUnreferencedFuture() {
+    const future = unreferencedFuture
+    if (future === null) {
+        throw new Error('unreferencedNeverFuture has not been called')
+    }
+    let retained = null
+    let collected = false
+    for (let turn = 0; turn < 1000 && !collected; turn++) {
+        retained = Array.from({ length: 20000 }, (_, i) => ({ i, s: `garbage ${i}` }))
+        collected = future.deref() === undefined
+        await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    retained = null
+    return collected
+}
+
 export const echoes = {
     Thing,
     echoStreamU8: echoStreamIdiomatic,
@@ -402,6 +436,8 @@ export const echoes = {
     holdStream: async (s) => { heldStream = s },
     syncStreamMessage,
     neverFuture: () => new Promise(() => {}),
+    unreferencedNeverFuture,
+    collectUnreferencedFuture,
     heldFuture: () => new Promise((resolve) => { settleHeld = resolve }),
     /** @param {number} value */
     settleHeldFuture(value) { settleHeld(value) },

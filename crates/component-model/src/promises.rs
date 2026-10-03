@@ -20,7 +20,9 @@
 //! [`core_runtime::event_loop::PendingSend`]), so the call that lowered it
 //! finishes once the value is written, or once the loop has no other work left
 //! that could settle the promise. A promise that settles later still writes its
-//! value.
+//! value. A promise that is garbage-collected without settling leaves the
+//! future's writable end unwritten for the instance's lifetime, which is reported
+//! as a warning.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -39,12 +41,13 @@ use js::prelude::HandleValue;
 use js::promise::{PromiseFuture, PromiseOutcome};
 use js::{Function, Promise};
 use wit_bindgen::rt::async_support::{self, FutureReader, FutureWriteError};
+use wit_dylib_ffi::Type;
 
-use crate::interpreter::{future_payload, trap, trap_message, wit_future};
+use crate::interpreter::{future_payload, trap, trap_message, wit_future, wit_type_name};
 use crate::stack::CallStack;
 use crate::streams::{
-    future_vtable, register_future_writer, spawn_transfer, take_future_writer,
-    with_elem_type_future, ElemType, JsElem, SendDone,
+    future_vtable, future_writer_is_registered, register_future_writer, spawn_transfer,
+    take_future_writer, with_elem_type_future, ElemType, JsElem, SendDone,
 };
 use crate::value::TypeShape;
 
@@ -158,6 +161,20 @@ impl FutureWrite {
         // Internal type, created through `create_instance_with`. This constructor
         // only registers the prototype.
         FutureWriteImpl::default()
+    }
+
+    /// Queue a warning if the writer is still registered when this state is
+    /// finalized. Only the promise's reactions reference this state, so the
+    /// promise was collected without settling.
+    #[destructor]
+    fn warn_if_writer_leaks(&mut self) {
+        if future_writer_is_registered(self.writer) {
+            let ty = wit_type_name(Type::Future(wit_future(self.index as usize)));
+            core_runtime::diagnostics::report_later(format!(
+                "Warning: a promise lowered to a {ty} was garbage-collected without settling, so \
+                 the future's writable end leaks for the instance's lifetime"
+            ));
+        }
     }
 }
 

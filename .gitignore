@@ -2,5 +2,9 @@
 # Only written by a cargo run from outside `componentize/`, which bypasses its `.cargo/config.toml`.
 /componentize/target
 /deps/wpt
+/deps/node
+/deps/node-bin
 /node_modules
 /crates/debugger/adapter/node_modules
+/deps/deno-bin
+/deps/bun-bin

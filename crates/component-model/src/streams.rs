@@ -563,6 +563,14 @@ pub(crate) fn take_future_writer(id: u64) -> Option<FutureWriter<JsElem>> {
     FUTURE_WRITERS.with(|cell| cell.borrow_mut().remove(&id))
 }
 
+/// Whether the future writer `id` is still registered. Returns `false` once
+/// [`FUTURE_WRITERS`] is destroyed.
+pub(crate) fn future_writer_is_registered(id: u64) -> bool {
+    FUTURE_WRITERS
+        .try_with(|cell| cell.borrow().contains_key(&id))
+        .unwrap_or(false)
+}
+
 /// Whether a stream/future element type takes the `stream<u8>` typed-array fast
 /// path. Only `u8`, directly or through aliases, qualifies.
 pub(crate) fn elem_is_u8(mut ty: Option<Type>) -> bool {

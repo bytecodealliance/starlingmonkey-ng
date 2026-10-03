@@ -194,6 +194,10 @@ async fn run_server(
             return Err(crate::serve_common::NO_FETCH_LISTENER.to_string());
         }
     }
+    // Isolated mode serves one request at a time, and evaluates the script for each one.
+    if !config.serve_isolated {
+        core_runtime::event_loop::set_serving_requests();
+    }
     // Borrowed for the rest of the function. `background` is not touched again, only released and
     // dropped on the way out. Isolated mode has none of this: with a per-request global entered
     // for each request, there is no single realm a background loop could be stepped in.
@@ -417,6 +421,8 @@ struct RequestContext<'a> {
     /// Channel to signal when the connection must be closed instead of accepting additional
     /// incoming requests.
     signal_close: UnboundedSender<()>,
+    /// The address of the connection's client.
+    client_address: Option<std::net::SocketAddr>,
 }
 
 /// Serve one connection: hand it to hyper, which reads its requests in sequence and dispatches
@@ -433,6 +439,7 @@ async fn serve_connection<'a>(
         context,
         background_work_sender,
         signal_close,
+        client_address: stream.peer_addr().ok(),
     };
 
     let limits = context.limits;
@@ -583,6 +590,7 @@ async fn serve_request<'a>(
             std::mem::take(&mut head.headers),
             incoming_body,
             content_length,
+            request_context.client_address,
             tokio::time::sleep,
             &clock,
         );

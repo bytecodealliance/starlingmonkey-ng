@@ -1023,6 +1023,21 @@ fn get_prototype<T: 'static>(global: Object) -> Option<*mut JSObject> {
     registry.get(TypeId::of::<T>())
 }
 
+/// The object [`register_realm_object`] registered for the marker type `T` in the current realm.
+///
+/// Classes that are plain constructor functions rather than [`ClassDef`]s, such as the
+/// `#[jsfunction_class]` ones, cache their constructor this way.
+pub fn realm_object<'s, T: 'static>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
+    // SAFETY: the registry holds live objects, which the global's trace keeps alive.
+    get_prototype::<T>(scope.global()).and_then(|object| unsafe { Object::from_raw(scope, object) })
+}
+
+/// Register `object` for the marker type `T` in the current realm, for [`realm_object`] to
+/// return. The realm's global keeps `object` alive.
+pub fn register_realm_object<T: 'static>(scope: &Scope<'_>, object: Object<'_>) {
+    register_prototype::<T>(scope.global(), object.as_raw());
+}
+
 // ============================================================================
 // Custom global class
 // ============================================================================
@@ -1771,6 +1786,48 @@ fn spec_tables_for<T: ClassDef>() -> SpecTables {
         tables.borrow_mut().insert(TypeId::of::<T>(), t);
         t
     })
+}
+
+/// The result of a `class_constructor` function the class macros generate: the constructor, or
+/// an exception if creating it failed.
+pub trait IntoConstructor<'s> {
+    fn into_constructor(self) -> Result<Object<'s>, ExnThrown>;
+}
+
+impl<'s> IntoConstructor<'s> for Object<'s> {
+    fn into_constructor(self) -> Result<Object<'s>, ExnThrown> {
+        Ok(self)
+    }
+}
+
+impl<'s> IntoConstructor<'s> for Result<Object<'s>, ExnThrown> {
+    fn into_constructor(self) -> Result<Object<'s>, ExnThrown> {
+        self
+    }
+}
+
+/// The constructor of class `T` in the current realm.
+///
+/// A class that isn't registered in the realm yet is registered, and its constructor is not
+/// installed on the global object. A class registered before keeps whatever global property it
+/// has.
+///
+/// # Safety
+///
+/// The same as for [`register_class`].
+pub unsafe fn class_constructor<'s, T: ClassDef>(scope: &'s Scope<'s>) -> Object<'s> {
+    let global = scope.global();
+    let registered = get_prototype::<T>(global).is_some();
+    // SAFETY: the caller upholds `register_class`'s requirements.
+    let proto = unsafe { register_class::<T>(scope, global) };
+    if !registered {
+        global
+            .delete_property(scope, T::NAME_CSTR)
+            .expect("deleting a configurable global property succeeds");
+    }
+    // SAFETY: `proto` is a registered class prototype, whose constructor `init_class` installed.
+    let ctor = unsafe { wrappers2::JS_GetConstructor(scope.cx_mut(), proto.handle()) };
+    Object::from_raw(scope, ctor).expect("a registered class has a constructor")
 }
 
 /// Register a class on the global object, making it available as a constructor.
@@ -2810,8 +2867,11 @@ unsafe extern "C" fn error_stack_getter<T: ClassDef>(
         return false;
     }
     let formatted = unsafe { mozjs::jsval::StringValue(&*formatted.get()) };
-    // SAFETY: as above.
-    unsafe { crate::object::set_reserved_slot(obj, ERROR_STACK_SLOT, &formatted) };
+    // SAFETY: as above. `obj` is read again from the rooted `this`, since formatting the stack can
+    // move it.
+    unsafe {
+        crate::object::set_reserved_slot(args.thisv().to_object(), ERROR_STACK_SLOT, &formatted)
+    };
     args.rval().set(formatted);
     true
 }

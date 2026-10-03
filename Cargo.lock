@@ -401,6 +401,7 @@ dependencies = [
  "shlex 2.0.1",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -1998,9 +1999,11 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-lite",
+ "getrandom 0.4.3",
  "http",
  "libc",
  "reqwest",
+ "tokio",
  "url",
  "wasip3",
  "wit-bindgen",

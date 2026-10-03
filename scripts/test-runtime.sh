@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 #
 # End-to-end test of the static runtime: build starling.wasm and run JS scripts
-# with it under wasmtime: a hello-world, and a top level that rejects late.
+# with it under wasmtime: a hello-world, a top level that rejects late, and the
+# Node.js test scripts that use host I/O.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,5 +35,21 @@ if errors=$(run_script tests/dylib/late_rejection.js 2>&1 >/dev/null); then
 fi
 echo "$errors"
 [[ "$errors" == *"late top-level failure"* ]] || { echo "FAIL: missing rejection message"; exit 1; }
+
+# The Node.js test scripts that use host I/O, on wasm.
+for script in crates/builtins/node/tests/js/fs.mjs crates/builtins/node/tests/js/net.mjs; do
+    if ! output=$(run_script --node-compat "$script" 2>&1); then
+        echo "$output"
+        echo "FAIL: $script"
+        exit 1
+    fi
+done
+
+stdin_output=$(printf 'a\nb\n' | run_script --node-compat crates/builtins/node/tests/js/stdin.mjs)
+[[ "$stdin_output" == '{"lines":["a","b"]}' ]] || {
+    echo "$stdin_output"
+    echo "FAIL: process.stdin"
+    exit 1
+}
 
 echo "static runtime e2e OK"

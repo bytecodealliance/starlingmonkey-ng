@@ -13,13 +13,13 @@ core-runtime.workspace = true
 cpp-builtins.workspace = true
 event-listener.workspace = true
 js.workspace = true
+platform.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2.189"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-platform.workspace = true
 wasip3.workspace = true
 wit-bindgen = { workspace = true, features = ["async-spawn"] }
 

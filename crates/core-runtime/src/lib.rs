@@ -5,14 +5,15 @@ pub mod diagnostics;
 pub mod event_loop;
 pub mod finalization;
 pub mod invocation;
+pub mod lifecycle;
 pub mod module;
 pub mod runtime;
 
 pub mod test_util;
 
 pub use js::macros::{
-    jsclass, jsglobals, jsmethods, jsmodule, jsnamespace, webidl_dictionary, webidl_interface,
-    webidl_methods, webidl_namespace, webidl_union, Traceable,
+    jsclass, jsfunction_class, jsglobals, jsmethods, jsmodule, jsnamespace, webidl_dictionary,
+    webidl_interface, webidl_methods, webidl_namespace, webidl_union, Traceable,
 };
 use js::{error::ExnThrown, exception};
 
@@ -57,7 +58,16 @@ pub fn run(
     drive_event_loop(std::rc::Rc::clone(&runtime), invocation, &evaluation)?;
     let settled = evaluation.settled(&runtime.default_global(), "Script evaluation failed");
     drop(evaluation);
-    settled
+    settled?;
+    // The `exit` hook runs with an event loop of its own, whose tasks never run.
+    let invocation = invocation::InvocationState::new();
+    // SAFETY: `invocation` stays at this address until it is unregistered below.
+    unsafe { runtime.register_invocation(&invocation) };
+    event_loop::with_event_loop(invocation.event_loop(), |_| {
+        lifecycle::exit(&runtime.default_global())
+    });
+    runtime.unregister_invocation(&invocation);
+    Ok(())
 }
 
 /// The content script's source and the filename to report it under: the `-e` string when there is
@@ -108,25 +118,42 @@ pub unsafe fn evaluate_content_script(
         }
     });
 
-    let Ok(value) = eval_result else {
-        let exn = ExnThrown::capture(scope);
-        return Err(format!("Script evaluation failed with error {exn}"));
+    let value = match eval_result {
+        Ok(value) if !exception::is_pending(scope) => value,
+        _ => {
+            if let Some(error) = exception::take_pending(scope) {
+                if event_loop::with_event_loop(event_loop, |_| {
+                    lifecycle::uncaught(scope, error, None)
+                }) {
+                    return Ok(ScriptEvaluation::new(None));
+                }
+                exception::set_pending(
+                    scope,
+                    error,
+                    js::native::ExceptionStackBehavior::DoNotCapture,
+                );
+            }
+            let exn = ExnThrown::capture(scope);
+            return Err(format!("Script evaluation failed with error {exn}"));
+        }
     };
-    if exception::is_pending(scope) {
-        let exn = ExnThrown::capture(scope);
-        return Err(format!("Script evaluation failed with error {exn}"));
-    }
 
     event_loop::with_event_loop(event_loop, |_| {
         event_loop::run_microtasks(scope);
     });
 
-    let pending = if module_mode {
-        module::settled_module_evaluation(scope, value, "Script evaluation failed")?
-    } else {
-        None
-    };
-    Ok(ScriptEvaluation::new(pending))
+    if !module_mode {
+        return Ok(ScriptEvaluation::new(None));
+    }
+    let promise = js::Object::from_value(scope, value.get())
+        .ok()
+        .and_then(|object| object.cast::<js::Promise>().ok());
+    let evaluation = ScriptEvaluation::new(
+        promise.filter(|promise| promise.is_pending() || promise.is_rejected()),
+    );
+    event_loop::with_event_loop(event_loop, |_| evaluation.report_rejection(scope));
+    evaluation.rejection(scope, "Script evaluation failed")?;
+    Ok(evaluation)
 }
 
 /// What a content script left running: its evaluation promise, if a top-level `await` means it is
@@ -134,6 +161,8 @@ pub unsafe fn evaluate_content_script(
 /// the script's own work, and not the timers it may have started along the way.
 pub struct ScriptEvaluation {
     pending: Option<js::gc::handle::RootedHeap<js::promise::Promise>>,
+    /// Set once the `uncaught` lifecycle hook handled the rejection of `pending`.
+    rejection_handled: std::cell::Cell<bool>,
 }
 
 impl ScriptEvaluation {
@@ -142,7 +171,25 @@ impl ScriptEvaluation {
     pub fn new(pending: Option<js::Promise<'_>>) -> Self {
         Self {
             pending: pending.map(js::gc::handle::RootedHeap::new),
+            rejection_handled: std::cell::Cell::new(false),
         }
+    }
+
+    /// If the script's top-level `await` rejected, pass the reason to the `uncaught` lifecycle
+    /// hook, once. A rejection the hook handled counts as a fulfillment from then on.
+    fn report_rejection(&self, scope: &js::gc::scope::Scope<'_>) {
+        let Some(promise) = &self.pending else {
+            return;
+        };
+        let promise = promise.get(scope);
+        if !promise.is_rejected() || self.rejection_handled.get() || !lifecycle::has_hooks() {
+            return;
+        }
+        let Some(reason) = promise.result(scope) else {
+            return;
+        };
+        self.rejection_handled
+            .set(lifecycle::uncaught(scope, reason, None));
     }
 
     /// Whether the script has finished evaluating.
@@ -156,7 +203,7 @@ impl ScriptEvaluation {
     /// evaluation was created, and `Ok` otherwise, including while it is still pending.
     pub fn rejection(&self, scope: &js::gc::scope::Scope<'_>, context: &str) -> Result<(), String> {
         match &self.pending {
-            Some(promise) => {
+            Some(promise) if !self.rejection_handled.get() => {
                 let promise = promise.get(scope);
                 if promise.is_rejected() {
                     Err(module::rejection_message(scope, &promise, context))
@@ -164,20 +211,26 @@ impl ScriptEvaluation {
                     Ok(())
                 }
             }
-            None => Ok(()),
+            _ => Ok(()),
         }
     }
 
-    /// Whether the script's top-level `await` rejected.
+    /// Whether the script's top-level `await` rejected, and the `uncaught` lifecycle hook didn't
+    /// handle the rejection.
     pub fn is_rejected(&self, scope: &js::gc::scope::Scope<'_>) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|promise| promise.get(scope).is_rejected())
+        !self.rejection_handled.get()
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|promise| promise.get(scope).is_rejected())
     }
 
     /// Run `event_loop` until it has nothing left, or until the script's top-level `await`
-    /// rejects. A rejection ends the run once the current step finishes, leaving the loop's
-    /// remaining tasks unrun, and cancels its pending futures.
+    /// rejects. A rejection is passed to the `uncaught` lifecycle hook. If the hook doesn't
+    /// handle it, the rejection ends the run once the current step finishes, leaving the loop's
+    /// remaining tasks unrun, and cancels its pending futures. Each time the loop has nothing
+    /// left, the `before_exit` lifecycle hook is called, and the run continues while the work it
+    /// queued keeps the loop alive.
     ///
     /// # Safety
     ///
@@ -192,14 +245,28 @@ impl ScriptEvaluation {
         S: Fn(std::time::Duration) -> F,
         F: std::future::Future<Output = ()>,
     {
-        // SAFETY: guaranteed by this function's caller.
-        unsafe {
-            event_loop::run_until(raw_cx, event_loop, sleep, |scope| self.is_rejected(scope)).await;
-        }
-        // SAFETY: guaranteed by this function's caller.
-        let scope = unsafe { js::gc::scope::RootScope::from_current_realm(raw_cx) };
-        if self.is_rejected(&scope) {
-            event_loop.cancel_pending_futures();
+        loop {
+            // SAFETY: guaranteed by this function's caller.
+            unsafe {
+                event_loop::run_until(raw_cx, event_loop, &sleep, |scope| self.is_rejected(scope))
+                    .await;
+            }
+            // SAFETY: guaranteed by this function's caller.
+            let scope = unsafe { js::gc::scope::RootScope::from_current_realm(raw_cx) };
+            event_loop::with_event_loop(event_loop, |_| self.report_rejection(&scope));
+            if self.is_rejected(&scope) {
+                event_loop.cancel_pending_futures();
+                return;
+            }
+            if self.rejection_handled.get() && event_loop.is_alive() {
+                continue;
+            }
+            // The `before_exit` hook may queue more work, which runs before it is called again.
+            let hooked =
+                event_loop::with_event_loop(event_loop, |_| lifecycle::before_exit(&scope));
+            if !hooked || !event_loop.is_alive() {
+                return;
+            }
         }
     }
 
@@ -279,13 +346,16 @@ fn init_and_eval(
 /// any asynchronous work remains.
 ///
 /// Returns:
-/// - `Ok(Some((runtime, invocation, evaluation)))` if the script left work in
-///   the event loop. The caller must call [`Runtime::register_invocation`] once
-///   the invocation reaches its final (stable) location, drive
-///   [`ScriptEvaluation::run_to_completion`] to completion, then call
-///   [`Runtime::unregister_invocation`] and check
-///   [`ScriptEvaluation::settled`] before dropping the runtime.
-/// - `Ok(None)` if the script completed without scheduling any async work.
+/// - `Ok(Some((runtime, invocation, evaluation)))` if the script, or the
+///   `before_exit` lifecycle hook, left work in the event loop. The caller must
+///   call [`Runtime::register_invocation`] once the invocation reaches its final
+///   (stable) location, drive [`ScriptEvaluation::run_to_completion`] to
+///   completion, then call [`Runtime::unregister_invocation`] and check
+///   [`ScriptEvaluation::settled`] before dropping the runtime. If `settled`
+///   returns `Ok`, the caller then calls [`lifecycle::exit`].
+/// - `Ok(None)` if the script completed without scheduling any async work. The
+///   `before_exit` and `exit` lifecycle hooks were called, and the `exit` hook
+///   may have ended the process.
 /// - `Err(_)` if the script failed to parse, threw during top-level
 ///   evaluation, or awaits a promise that nothing can settle.
 ///
@@ -302,12 +372,30 @@ pub fn setup(
     String,
 > {
     let (runtime, invocation, evaluation) = init_and_eval(config)?;
-    if !invocation.event_loop().is_alive() {
-        let settled = evaluation.settled(&runtime.default_global(), "Script evaluation failed");
-        drop(evaluation);
-        return settled.map(|()| None);
+    if invocation.event_loop().is_alive() {
+        return Ok(Some((runtime, invocation, evaluation)));
     }
-    Ok(Some((runtime, invocation, evaluation)))
+    // SAFETY: `invocation` stays at this address until it is unregistered below, before it is
+    // moved.
+    unsafe { runtime.register_invocation(&invocation) };
+    let scope = runtime.default_global();
+    if !evaluation.is_rejected(&scope) {
+        // The `before_exit` hook may queue work, which the caller then runs.
+        event_loop::with_event_loop(invocation.event_loop(), |_| lifecycle::before_exit(&scope));
+    }
+    if invocation.event_loop().is_alive() {
+        drop(scope);
+        runtime.unregister_invocation(&invocation);
+        return Ok(Some((runtime, invocation, evaluation)));
+    }
+    let settled = evaluation.settled(&scope, "Script evaluation failed");
+    drop(evaluation);
+    if settled.is_ok() {
+        event_loop::with_event_loop(invocation.event_loop(), |_| lifecycle::exit(&scope));
+    }
+    drop(scope);
+    runtime.unregister_invocation(&invocation);
+    settled.map(|()| None)
 }
 
 /// Like [`setup`], but always returns the runtime — for **serve mode**, where the

@@ -17,13 +17,15 @@ futures-lite.workspace = true
 url.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom.workspace = true
 libc = "0.2"
 reqwest.workspace = true
+tokio.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 http.workspace = true
 wasip3.workspace = true
-wit-bindgen.workspace = true
+wit-bindgen = { workspace = true, features = ["async-spawn"] }
 
 [lints]
 workspace = true

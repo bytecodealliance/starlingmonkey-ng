@@ -72,11 +72,19 @@ declare module 'starling:types/starling:cli/command' {
     writeViaStream(data: ReadableStream<ArrayBufferView | ArrayBuffer> | AsyncIterable<ArrayBufferView | ArrayBuffer> | Iterable<ArrayBufferView | ArrayBuffer>, offset: Filesize): Promise<void>;
     appendViaStream(data: ReadableStream<ArrayBufferView | ArrayBuffer> | AsyncIterable<ArrayBufferView | ArrayBuffer> | Iterable<ArrayBufferView | ArrayBuffer>): Promise<void>;
     getFlags(): Promise<DescriptorFlagsSet>;
+    setSize(size: Filesize): Promise<void>;
+    setTimes(dataAccessTimestamp: NewTimestamp, dataModificationTimestamp: NewTimestamp): Promise<void>;
+    readDirectory(): [ReadableStream<DirectoryEntry>, Promise<void>];
+    sync(): Promise<void>;
+    createDirectoryAt(path: string): Promise<void>;
     stat(): Promise<DescriptorStat>;
     statAt(pathFlags: PathFlagsSet, path: string): Promise<DescriptorStat>;
+    linkAt(oldPathFlags: PathFlagsSet, oldPath: string, newDescriptor: Descriptor, newPath: string): Promise<void>;
     openAt(pathFlags: PathFlagsSet, path: string, openFlags: OpenFlagsSet, flags: DescriptorFlagsSet): Promise<Descriptor>;
     readlinkAt(path: string): Promise<string>;
     removeDirectoryAt(path: string): Promise<void>;
+    renameAt(oldPath: string, newDescriptor: Descriptor, newPath: string): Promise<void>;
+    symlinkAt(oldPath: string, newPath: string): Promise<void>;
     unlinkFileAt(path: string): Promise<void>;
     metadataHash(): Promise<MetadataHashValue>;
     metadataHashAt(pathFlags: PathFlagsSet, path: string): Promise<MetadataHashValue>;
@@ -100,9 +108,13 @@ declare module 'starling:types/starling:cli/command' {
   // A set of `DescriptorFlags` members, combined with `|`.
   export type DescriptorFlagsSet = number;
 
-  export type DescriptorStat = { type: DescriptorType; linkCount: LinkCount; size: Filesize; dataAccessTimestamp?: Instant | undefined; dataModificationTimestamp?: Instant | undefined; statusChangeTimestamp?: Instant | undefined; };
+  export type NewTimestamp = { tag: 'noChange' } | { tag: 'now' } | { tag: 'timestamp'; val: Instant };
+
+  export type DirectoryEntry = { type: DescriptorType; name: string; };
 
   export type DescriptorType = { tag: 'blockDevice' } | { tag: 'characterDevice' } | { tag: 'directory' } | { tag: 'fifo' } | { tag: 'symbolicLink' } | { tag: 'regularFile' } | { tag: 'socket' } | { tag: 'other'; val?: string | undefined };
+
+  export type DescriptorStat = { type: DescriptorType; linkCount: LinkCount; size: Filesize; dataAccessTimestamp?: Instant | undefined; dataModificationTimestamp?: Instant | undefined; statusChangeTimestamp?: Instant | undefined; };
 
   export type LinkCount = bigint;
 
@@ -124,10 +136,6 @@ declare module 'starling:types/starling:cli/command' {
   export type OpenFlagsSet = number;
 
   export type MetadataHashValue = { lower: bigint; upper: bigint; };
-
-  export type NewTimestamp = { tag: 'noChange' } | { tag: 'now' } | { tag: 'timestamp'; val: Instant };
-
-  export type DirectoryEntry = { type: DescriptorType; name: string; };
 
   export enum Advice {
     normal = 0,

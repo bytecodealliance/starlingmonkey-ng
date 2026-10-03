@@ -68,6 +68,7 @@ pub fn start_serve_config(config: RuntimeConfig, port: u16) -> ServeHandle {
     let (shutdown_tx, shutdown_rx) = futures_channel::oneshot::channel();
     let thread = std::thread::spawn(move || {
         // `run` does this before serving; the test calls `serve` directly, so register here.
+        libstarling::apply_pre_init_config(&config).expect("valid config");
         libstarling::register_builtins();
         let _ = libstarling::serve_native::serve_with_shutdown(config, port, async {
             let _ = shutdown_rx.await;

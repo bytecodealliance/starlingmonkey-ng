@@ -260,6 +260,14 @@ impl CapturedError {
 /// Format string used to throw JavaScript errors from Rust.
 static ERROR_FORMAT_STRING: &CStr = c"{0}";
 
+/// Format string struct for `Error`.
+static mut ERROR_FMT: JSErrorFormatString = JSErrorFormatString {
+    name: c"RUSTMSG_ERROR".as_ptr(),
+    format: ERROR_FORMAT_STRING.as_ptr(),
+    argCount: 1,
+    exnType: JSExnType::JSEXN_ERR as i16,
+};
+
 /// Format string struct for `TypeError`.
 static mut TYPE_ERROR_FMT: JSErrorFormatString = JSErrorFormatString {
     name: c"RUSTMSG_TYPE_ERROR".as_ptr(),
@@ -292,6 +300,14 @@ static mut SYNTAX_ERROR_FMT: JSErrorFormatString = JSErrorFormatString {
     exnType: JSExnType::JSEXN_SYNTAXERR as i16,
 };
 
+/// Format string struct for `URIError`.
+static mut URI_ERROR_FMT: JSErrorFormatString = JSErrorFormatString {
+    name: c"RUSTMSG_URI_ERROR".as_ptr(),
+    format: ERROR_FORMAT_STRING.as_ptr(),
+    argCount: 1,
+    exnType: JSExnType::JSEXN_URIERR as i16,
+};
+
 /// Callback for [`JS_ReportErrorNumberUTF8`].
 unsafe extern "C" fn get_error_message(
     _user_ref: *mut std::os::raw::c_void,
@@ -299,12 +315,19 @@ unsafe extern "C" fn get_error_message(
 ) -> *const JSErrorFormatString {
     let num: JSExnType = std::mem::transmute(error_number);
     match num {
+        JSExnType::JSEXN_ERR => &raw const ERROR_FMT,
         JSExnType::JSEXN_TYPEERR => &raw const TYPE_ERROR_FMT,
         JSExnType::JSEXN_RANGEERR => &raw const RANGE_ERROR_FMT,
         JSExnType::JSEXN_INTERNALERR => &raw const INTERNAL_ERROR_FMT,
         JSExnType::JSEXN_SYNTAXERR => &raw const SYNTAX_ERROR_FMT,
+        JSExnType::JSEXN_URIERR => &raw const URI_ERROR_FMT,
         _ => panic!("Bad error number: {error_number}"),
     }
+}
+
+/// Throw an `Error` with the given message and return `ExnThrown`.
+pub fn throw_plain_error(scope: &Scope<'_>, error: &CStr) -> ExnThrown {
+    throw_js_error(scope, error, JSExnType::JSEXN_ERR as u32)
 }
 
 /// Throw a `TypeError` with the given message and return `ExnThrown`.
@@ -327,6 +350,11 @@ pub fn throw_internal_error(scope: &Scope<'_>, error: &CStr) -> ExnThrown {
 /// Throw a `SyntaxError` with the given message and return `ExnThrown`.
 pub fn throw_syntax_error(scope: &Scope<'_>, error: &CStr) -> ExnThrown {
     throw_js_error(scope, error, JSExnType::JSEXN_SYNTAXERR as u32)
+}
+
+/// Throw a `URIError` with the given message and return `ExnThrown`.
+pub fn throw_uri_error(scope: &Scope<'_>, error: &CStr) -> ExnThrown {
+    throw_js_error(scope, error, JSExnType::JSEXN_URIERR as u32)
 }
 
 fn throw_js_error(scope: &Scope<'_>, error: &CStr, error_number: u32) -> ExnThrown {

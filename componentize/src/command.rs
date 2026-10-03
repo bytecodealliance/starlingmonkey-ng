@@ -234,6 +234,17 @@ pub struct Componentize {
     /// combined with --runtime-lib.
     #[arg(long, conflicts_with = "runtime_lib")]
     pub debug: bool,
+
+    /// Enable Node.js compatibility: the `node:` builtin modules, the Node
+    /// globals (`process`, `global`), CommonJS modules, and the `node` condition
+    /// in package `exports` resolution.
+    #[arg(long)]
+    pub node_compat: bool,
+
+    /// Allow synchronous host I/O, such as `fs.readFileSync`, to block while the
+    /// component serves requests, as the runtime's `--allow-blocking-host-io` does.
+    #[arg(long)]
+    pub allow_blocking_host_io: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -564,7 +575,9 @@ fn componentize(
             &common.disable,
             componentize.deterministic_insecure_random_seed,
             componentize.debug,
+            componentize.node_compat,
             None,
+            componentize.allow_blocking_host_io,
             componentize.init_location.as_ref().map(url::Url::as_str),
             !componentize.no_cache,
         ))?;

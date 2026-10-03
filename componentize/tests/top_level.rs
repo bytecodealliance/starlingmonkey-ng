@@ -93,7 +93,7 @@ async fn missing_relative_import_fails_componentization() {
             .expect_err("a guest importing a missing module must not componentize");
     let message = format!("{err:#}");
     assert!(
-        message.contains("Cannot resolve module './lib/missing.js'"),
+        message.contains("Cannot find module './lib/missing.js'"),
         "{message}"
     );
 }
@@ -290,7 +290,9 @@ async fn init_output_is_returned() -> anyhow::Result<()> {
         &[],
         None,
         false,
+        false,
         None,
+        false,
         None,
         true,
     )
@@ -329,7 +331,9 @@ async fn top_level_reads_the_init_location() -> anyhow::Result<()> {
             &[],
             None,
             false,
+            false,
             None,
+            false,
             init_location,
             true,
         )

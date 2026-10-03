@@ -4,7 +4,7 @@
 //! adapter evaluated in it, and the state the host functions share.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::{c_char, CStr};
+use std::ffi::c_char;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::ptr::NonNull;
@@ -281,6 +281,7 @@ fn start(runtime: &Runtime, debug: &DebugConfig) -> Result<(), String> {
         undebugged_reported: Cell::new(false),
     });
     SESSION.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&session)));
+    platform::process::set_exit_hook(finish_on_exit);
     STARTED_SINCE_EXPORT.with(|started| started.set(true));
     let debugger_loop = debugger_loop(runtime);
     if let Some(connection) = connection.or_else(|| session.connect()) {
@@ -751,15 +752,14 @@ impl Client {
         }
     }
 
-    /// End the session: send `result`'s error as output, then `exited` and `terminated`, and
-    /// close the connection once they are written.
-    fn end(&self, result: &Result<(), String>) {
+    /// End the session: send `error` as output, then `exited` with `exit_code` and
+    /// `terminated`, and close the connection once they are written.
+    fn end(&self, error: Option<&str>, exit_code: i32) {
         forward_output(false);
         let mut last = Vec::with_capacity(3);
-        if let Err(message) = result {
+        if let Some(message) = error {
             last.push(output_event("stderr", &format!("{message}\n")));
         }
-        let exit_code = i32::from(result.is_err());
         last.push(
             json!({ "type": "event", "event": "exited", "body": { "exitCode": exit_code } })
                 .to_string(),
@@ -808,25 +808,35 @@ pub(crate) fn may_pause() -> bool {
 
 /// End the session as if the process exited successfully, and exit. Held microtasks are dropped.
 pub(crate) fn terminate() -> ! {
-    if let Some(client) = current_client() {
-        client.end(&Ok(()));
-    }
+    end_session(None, 0);
     js::jobs::clear_held_jobs();
-    #[cfg(not(target_arch = "wasm32"))]
-    std::process::exit(0);
-    #[cfg(target_arch = "wasm32")]
-    crate::wasm::exit(0);
+    platform::process::exit(0)
 }
 
 /// End the session: send `result`'s error as output, then `exited` and `terminated`, and wait
-/// until they are written. Does nothing without a session.
+/// until they are written. `exited` reports exit code 1 for an error and 0 otherwise. Does nothing
+/// without a session.
 pub fn finish(result: &Result<(), String>) {
+    end_session(
+        result.as_ref().err().map(String::as_str),
+        i32::from(result.is_err()),
+    );
+}
+
+/// The exit hook a session sets: end the session with the code the process exits with.
+fn finish_on_exit(code: u8) {
+    end_session(None, code.into());
+}
+
+/// End the session: send `error` as output, then `exited` with `exit_code` and `terminated`, and
+/// wait until they are written. Does nothing without a session.
+fn end_session(error: Option<&str>, exit_code: i32) {
     let Some(session) = SESSION.with(|slot| slot.borrow_mut().take()) else {
         return;
     };
     let client = session.client.borrow_mut().take();
     if let Some(client) = client {
-        client.end(result);
+        client.end(error, exit_code);
     }
 }
 
@@ -872,9 +882,10 @@ fn diagnostics_sink(message: &str) {
 
 /// Forwards console messages as `output` events. `warn` and `error` keep the prefixes the
 /// console prints without a session.
-unsafe extern "C" fn console_sink(level: u8, message: *const c_char) {
-    // SAFETY: the console passes a NUL-terminated string valid for this call.
-    let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+unsafe extern "C" fn console_sink(level: u8, message: *const c_char, length: usize) {
+    // SAFETY: the console passes `length` bytes at `message`, valid for this call.
+    let message =
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(message.cast(), length) });
     let (category, prefix) = match level {
         3 => ("stderr", "Warn: "),
         4 => ("stderr", "Error: "),

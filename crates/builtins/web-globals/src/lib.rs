@@ -5,13 +5,16 @@
 //! ## Globals
 //!
 //! - `btoa` and `atob`: [WHATWG Forgiving Base64] encoding/decoding
+//! - `crypto`: [Web Crypto]'s `getRandomValues` and `randomUUID`
 //! - `console`: Basic console logging (`log`, `info`, `debug`, `warn`, `error`)
 //! - `DOMException`: [WebIDL DOMException] interface
 //!
 //! [WHATWG Forgiving Base64]: https://infra.spec.whatwg.org/#forgiving-base64
 //! [WebIDL DOMException]: https://webidl.spec.whatwg.org/#idl-DOMException
+//! [Web Crypto]: https://w3c.github.io/webcrypto/#crypto-interface
 
 pub mod base64;
+pub mod crypto;
 // pub mod console;
 pub mod dom_exception;
 pub mod encoding;
@@ -34,4 +37,5 @@ pub fn add_to_global(scope: &js::prelude::Scope<'_>, global: js::Object<'_>) {
     structured_clone::structured_clone_globals::add_to_global(scope, global);
     worker_location::add_to_global(scope, global);
     navigator::add_to_global(scope, global);
+    crypto::add_to_global(scope, global);
 }

@@ -15,6 +15,8 @@ use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::{HandleValue, OptionHeapExt};
 use js::{value, Function, Promise, PromiseOf};
+use std::cell::Cell;
+use std::net::SocketAddr;
 use std::ops::Deref;
 use web_fetch::request::{Request, RequestImpl};
 use web_fetch::response::{Response, ResponseImpl};
@@ -152,6 +154,28 @@ impl FetchEvent {
     ///
     /// [`Create Fetch Event and Dispatch`]: https://w3c.github.io/ServiceWorker/#create-fetch-event-and-dispatch
     pub fn dispatch(
+        scope: &'s Scope,
+        request: Request,
+        script_stack_state: ScriptStackState,
+    ) -> Result<FetchEvent<'s>, ExnThrown> {
+        Self::dispatch_from(scope, request, script_stack_state, None)
+    }
+
+    /// [`FetchEvent::dispatch`], with the address of the client that sent the request, if the
+    /// transport reports it. [`current_client_address`] returns it while the event is dispatched.
+    pub fn dispatch_from(
+        scope: &'s Scope,
+        request: Request,
+        script_stack_state: ScriptStackState,
+        client_address: Option<SocketAddr>,
+    ) -> Result<FetchEvent<'s>, ExnThrown> {
+        let previous = CLIENT_ADDRESS.replace(client_address);
+        let result = Self::dispatch_inner(scope, request, script_stack_state);
+        CLIENT_ADDRESS.set(previous);
+        result
+    }
+
+    fn dispatch_inner(
         scope: &'s Scope,
         request: Request,
         script_stack_state: ScriptStackState,
@@ -452,4 +476,16 @@ impl<'s> FetchEvent<'s> {
     pub fn abandon_respond(&self) {
         drop(self.data_mut().respond_interest.take());
     }
+}
+
+js::instance_local! {
+    /// The address of the client whose request's `fetch` event is being dispatched, if the
+    /// transport reports it.
+    static CLIENT_ADDRESS: Cell<Option<SocketAddr>> = const { Cell::new(None) };
+}
+
+/// The address of the client whose request's `fetch` event is being dispatched, if the transport
+/// reports it. Native serving reports it, and `wasi:http` doesn't.
+pub fn current_client_address() -> Option<SocketAddr> {
+    CLIENT_ADDRESS.get()
 }

@@ -53,6 +53,36 @@ pub struct RuntimeConfig {
     #[arg(long = "legacy-script")]
     pub legacy_script: bool,
 
+    /// Enable Node.js compatibility: the `node:` builtin modules, the Node globals (`process`,
+    /// `Buffer`, `global`, `setImmediate`, `clearImmediate`), CommonJS modules, and the `node`
+    /// condition in package `exports` resolution.
+    #[arg(long = "node-compat")]
+    pub node_compat: bool,
+
+    /// Accept Node.js runtime flags, such as `--expose-gc` or `--no-warnings`, before the script
+    /// path. Options of this runtime keep their meaning, and every other option before the script
+    /// path is a Node.js flag, written as `--name` or `--name=value`. The flags appear in
+    /// `process.execArgv`. See `docs/node-compat.md` for the flags that take effect, and for those
+    /// that are rejected.
+    #[arg(long = "allow-node-runtime-flags", requires = "node_compat")]
+    pub allow_node_runtime_flags: bool,
+
+    /// The Node.js runtime flags `--allow-node-runtime-flags` accepted, as given.
+    #[arg(skip)]
+    pub node_runtime_flags: Vec<String>,
+
+    /// Let synchronous APIs block on host I/O, such as reading a file, while serving requests.
+    /// Blocking stalls every request the instance serves concurrently, so this is off by default,
+    /// and such calls throw instead.
+    #[arg(long = "allow-blocking-host-io")]
+    pub allow_blocking_host_io: bool,
+
+    /// With `--node-compat`, let `http.Server.listen()` in a script run as a command accept HTTP
+    /// connections on a TCP port, through `net.Server`. Without it, `listen()` emits
+    /// `ERR_SERVE_MODE_REQUIRED` there. Has no effect with `--serve`.
+    #[arg(long = "node-http-listen")]
+    pub node_http_listen: bool,
+
     /// Enable WPT (Web Platform Tests) mode.
     #[arg(long = "wpt-mode")]
     pub wpt_mode: bool,
@@ -227,12 +257,19 @@ impl RuntimeConfig {
     ///
     /// Splits the string on whitespace, respecting single/double quotes.
     pub fn from_arg_string(args: &str) -> Result<Self, clap::Error> {
-        Self::try_parse_from(split_args(args)?)
+        Self::from_args(split_args(args)?)
     }
 
     /// Parse from WASI CLI arguments (as provided by the host).
+    ///
+    /// With `--allow-node-runtime-flags`, the options before the script path that aren't options
+    /// of this runtime become [`node_runtime_flags`](Self::node_runtime_flags) instead of usage
+    /// errors.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self, clap::Error> {
-        Self::try_parse_from(args)
+        let (args, node_flags) = split_node_runtime_flags(args.into_iter().collect());
+        let mut config = Self::try_parse_from(args)?;
+        config.node_runtime_flags = node_flags;
+        Ok(config)
     }
 
     /// Parse from the STARLINGMONKEY_CONFIG environment variable.
@@ -621,6 +658,70 @@ fn serve_timeout(seconds: Option<u64>, wpt_mode: bool) -> Option<Duration> {
 /// is merely slow still reports a result and only a genuinely stuck one is cut off.
 const WPT_SERVE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Split the Node.js runtime flags out of `args`, the program name followed by the command line,
+/// if `--allow-node-runtime-flags` comes before the script path. Returns the remaining arguments
+/// and the Node.js flags in their order. Without `--allow-node-runtime-flags`, returns `args`
+/// unchanged and no flags.
+///
+/// Only the arguments before the first positional argument or `--` are considered. Of those, an
+/// option of [`RuntimeConfig`] stays, together with the next argument if the option requires a
+/// value and wasn't given one with `=`, and every other argument that starts with `-` is a Node.js
+/// flag. A Node.js flag's value therefore has to be given with `=`.
+fn split_node_runtime_flags(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut command = <RuntimeConfig as clap::CommandFactory>::command();
+    command.build();
+    let lookup = |arg: &str| -> Option<bool> {
+        let (long, short) = if let Some(long) = arg.strip_prefix("--") {
+            (
+                Some(long.split_once('=').map_or(long, |(name, _)| name)),
+                None,
+            )
+        } else {
+            let mut chars = arg.chars().skip(1);
+            let short = chars.next()?;
+            // A short option written together with its value, such as `-e1`, has it already.
+            (None, Some((short, chars.next().is_some())))
+        };
+        let option = command.get_arguments().find(|option| match (long, short) {
+            (Some(long), _) => option.get_long() == Some(long),
+            (_, Some((short, _))) => option.get_short() == Some(short),
+            _ => false,
+        })?;
+        let requires_value = option
+            .get_num_args()
+            .is_some_and(|range| range.min_values() > 0);
+        let has_value = long.is_some_and(|_| arg.contains('=')) || short.is_some_and(|(_, v)| v);
+        Some(requires_value && !has_value)
+    };
+
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut node_flags = Vec::new();
+    let mut allowed = false;
+    let mut iter = args.iter().cloned();
+    remaining.extend(iter.next());
+    while let Some(arg) = iter.next() {
+        if arg == "--" || arg == "-" || !arg.starts_with('-') {
+            remaining.push(arg);
+            break;
+        }
+        match lookup(&arg) {
+            Some(takes_next) => {
+                allowed |= arg == "--allow-node-runtime-flags";
+                remaining.push(arg);
+                if takes_next {
+                    remaining.extend(iter.next());
+                }
+            }
+            None => node_flags.push(arg),
+        }
+    }
+    if !allowed {
+        return (args, Vec::new());
+    }
+    remaining.extend(iter);
+    (remaining, node_flags)
+}
+
 /// Split an argument string into individual arguments, respecting quotes.
 fn split_args(s: &str) -> Result<Vec<String>, clap::Error> {
     let mut args = vec!["starling".into()];
@@ -991,6 +1092,72 @@ mod tests {
         assert_eq!(config.script_path, "app.js");
         assert!(config.verbose);
         assert!(!config.module_mode());
+    }
+
+    #[test]
+    fn node_runtime_flags_are_split_out_before_the_script_path() {
+        let config = RuntimeConfig::from_arg_string(
+            "--node-compat --expose-gc --allow-node-runtime-flags -v --title=foo \
+             --init-location http://example.com/ --expose_internals app.js",
+        )
+        .unwrap();
+        assert_eq!(
+            config.node_runtime_flags,
+            ["--expose-gc", "--title=foo", "--expose_internals"]
+        );
+        assert_eq!(config.script_path, "app.js");
+        assert!(config.verbose);
+        assert_eq!(config.init_location.as_deref(), Some("http://example.com/"));
+    }
+
+    #[test]
+    fn node_runtime_flags_are_split_out_around_an_eval_script() {
+        let config = RuntimeConfig::from_arg_string(
+            "--node-compat --allow-node-runtime-flags -e 1+1 --pending-deprecation",
+        )
+        .unwrap();
+        assert_eq!(config.eval_script.as_deref(), Some("1+1"));
+        assert_eq!(config.node_runtime_flags, ["--pending-deprecation"]);
+    }
+
+    #[test]
+    fn node_runtime_flags_end_at_the_script_path_or_a_double_dash() {
+        let config =
+            RuntimeConfig::from_arg_string("--node-compat --allow-node-runtime-flags -- --x")
+                .unwrap();
+        assert_eq!(config.script_path, "--x");
+        assert!(config.node_runtime_flags.is_empty());
+        let error = RuntimeConfig::from_arg_string(
+            "--node-compat --allow-node-runtime-flags app.js --no-warnings",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn node_runtime_flags_are_unknown_options_without_the_option() {
+        let error = RuntimeConfig::from_arg_string("--node-compat --expose-gc app.js").unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        let config = RuntimeConfig::from_arg_string("--node-compat app.js").unwrap();
+        assert!(config.node_runtime_flags.is_empty());
+    }
+
+    #[test]
+    fn node_runtime_flags_require_node_compat() {
+        let error = RuntimeConfig::from_arg_string("--allow-node-runtime-flags --expose-gc app.js")
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn help_is_a_runtime_option_with_node_runtime_flags() {
+        let error =
+            RuntimeConfig::from_arg_string("--node-compat --allow-node-runtime-flags --help")
+                .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     #[test]

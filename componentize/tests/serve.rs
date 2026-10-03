@@ -285,7 +285,9 @@ async fn deterministic_insecure_seed_is_returned() -> anyhow::Result<()> {
                 disabled,
                 insecure_seed,
                 false,
+                false,
                 None,
+                false,
                 None,
                 true,
             )

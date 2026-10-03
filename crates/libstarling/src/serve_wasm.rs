@@ -137,8 +137,8 @@ fn start_runtime(
     let mut config = RuntimeConfig::from_env().map_err(|e| e.to_string())?;
     config.pre_initialize = pre_initialize;
     config.validate_serve_timeouts()?;
-    super::apply_pre_init_config(&config)?;
     crate::register_builtins();
+    super::apply_pre_init_config(&config)?;
     if config.debug.is_some() {
         super::canonicalize_script_path(&mut config);
         debugger::register_for_serve();
@@ -650,6 +650,7 @@ pub async fn handle(wasi_request: WasiRequest) -> Result<WasiResponse, ErrorCode
     if ensure_started(raw_cx).await.is_err() {
         return Ok(error_response(500, "Internal Server Error", None).0);
     }
+    core_runtime::event_loop::set_serving_requests();
     dispatch_request(runtime, raw_cx, wasi_request, timeouts).await
 }
 
@@ -693,6 +694,7 @@ async fn dispatch_request(
         headers,
         body,
         content_length,
+        None,
         platform::clock::sleep,
         &clock,
     )

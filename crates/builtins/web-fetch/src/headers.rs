@@ -138,6 +138,11 @@ impl Headers {
         }
     }
 
+    /// The header list: every header in the order it was added, duplicates included.
+    pub fn list(&self) -> Vec<(String, String)> {
+        self.data().header_list.to_vec()
+    }
+
     /// <https://fetch.spec.whatwg.org/#dom-headers-append>
     #[method]
     pub fn append(

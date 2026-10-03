@@ -289,6 +289,11 @@ mod init_export {
         ///
         /// With `debug`, instances resumed from the snapshot start a debug
         /// session from `STARLING_DEBUG`.
+        ///
+        /// With `node_compat`, the runtime has Node.js compatibility enabled.
+        ///
+        /// With `allow_blocking_host_io`, synchronous host I/O may block while
+        /// the component serves requests.
         async fn init(
             main: String,
             main_name: String,
@@ -297,6 +302,8 @@ mod init_export {
             raw_http_handler: Option<String>,
             init_location: Option<String>,
             debug: bool,
+            node_compat: bool,
+            allow_blocking_host_io: bool,
         ) -> Result<bool, String> {
             if debug {
                 debugger::allow_debugging_in_snapshot();
@@ -320,9 +327,14 @@ mod init_export {
             let config = core_runtime::config::RuntimeConfig {
                 pre_initialize: true,
                 init_location,
+                node_compat,
+                allow_blocking_host_io,
                 ..Default::default()
             };
             libstarling::apply_pre_init_config(&config)?;
+            if raw_http_handler.is_none() {
+                core_runtime::event_loop::set_without_request_handler();
+            }
             // The host's imports are not linked while the snapshot is taken.
             component_model::imports::set_imports_unavailable(true);
             component_model::init::set_before_export(libstarling::serve_wasm::fix_up_after_resume);

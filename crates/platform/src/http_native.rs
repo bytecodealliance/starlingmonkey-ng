@@ -66,7 +66,7 @@ pub async fn send(request: Request) -> Result<Response, Error> {
             }
         }
     }
-    let response = builder.send().await.map_err(|e| Error(e.to_string()))?;
+    let response = builder.send().await.map_err(|e| transport_error(&e))?;
     let status = response.status().as_u16();
     let headers = response
         .headers()
@@ -137,7 +137,7 @@ impl IncomingBody {
     pub async fn read_all(self) -> Result<BodyBytes, Error> {
         match self.0 {
             NativeBody::Transport(response) => {
-                response.bytes().await.map_err(|e| Error(e.to_string()))
+                response.bytes().await.map_err(|e| transport_error(&e))
             }
             NativeBody::Channel(mut receiver) => {
                 let mut buffer = bytes::BytesMut::new();
@@ -153,9 +153,21 @@ impl IncomingBody {
     pub async fn next_chunk(&mut self) -> Result<Option<BodyBytes>, Error> {
         match &mut self.0 {
             NativeBody::Transport(response) => {
-                response.chunk().await.map_err(|e| Error(e.to_string()))
+                response.chunk().await.map_err(|e| transport_error(&e))
             }
             NativeBody::Channel(receiver) => receiver.next().await.transpose(),
         }
     }
+}
+
+/// The transport error for `error`: its message, followed by the messages of its sources.
+fn transport_error(error: &reqwest::Error) -> Error {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    Error(message)
 }

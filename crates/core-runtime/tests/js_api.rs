@@ -608,22 +608,33 @@ fn test_js_api_with_runtime() {
     }
 }
 
-/// `js::jobs::queue_microtask` runs a Rust callback as a microtask.
+/// `js::jobs::queue_microtask` runs a Rust callback as a microtask, with the engine's job queue and
+/// with `js::async_context`'s.
 ///
 /// The job is enqueued as a promise reaction, so it is called with the source
 /// promise's `undefined` result, and a job that throws must not stop the jobs
 /// queued behind it.
 #[test]
 fn test_queue_microtask() {
+    for install in [false, true] {
+        queue_microtask_with(install);
+    }
+}
+
+fn queue_microtask_with(install: bool) {
     use std::cell::Cell;
 
     thread_local! {
         static RAN: Cell<u32> = const { Cell::new(0) };
         static FIRST_ARG_WAS_UNDEFINED: Cell<bool> = const { Cell::new(false) };
     }
+    RAN.with(|n| n.set(0));
 
     let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
     let scope = rt.default_global();
+    if install {
+        js::async_context::install_job_queue(&scope).unwrap();
+    }
 
     let record = js::Function::new_callback(
         &scope,
@@ -676,11 +687,21 @@ fn test_queue_microtask() {
 }
 
 /// Jobs queued while `hold_jobs_queued_during` runs its closure are held until a `run_jobs` after
-/// it, which runs them behind the jobs queued since.
+/// it, which runs them behind the jobs queued since, with the engine's job queue and with
+/// `js::async_context`'s.
 #[test]
 fn held_jobs_run_on_the_next_drain_after_the_hold() {
+    for install in [false, true] {
+        held_jobs_with(install);
+    }
+}
+
+fn held_jobs_with(install: bool) {
     let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
     let scope = rt.default_global();
+    if install {
+        js::async_context::install_job_queue(&scope).unwrap();
+    }
     let order = |tag: char| {
         let src = format!("() => globalThis.__order.push('{tag}')");
         let f = js::compile::evaluate(&scope, &src).unwrap();

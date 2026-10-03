@@ -30,6 +30,15 @@ fn console_levels_write_to_their_streams() {
     assert_eq!(String::from_utf8_lossy(&out.stderr), "Warn: d\nError: e\n");
 }
 
+/// Messages are written whole, including NUL characters in them.
+#[test]
+fn console_messages_keep_nul_characters() {
+    let out = run_module("console.log('a\\0b', 'c'); console.error('d\\0e');");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"a\0b c\n");
+    assert_eq!(out.stderr, b"Error: d\0e\n");
+}
+
 /// `console.assert` prints nothing when its condition holds, and otherwise prints
 /// "Assertion failed" and its data on stderr.
 #[test]

@@ -278,32 +278,44 @@ pub unsafe fn compile_function_utf16_raw<'s>(
         .ok_or(ExnThrown)
 }
 
-/// Compile a function from UTF-8 source.
-///
-/// # Safety
-///
-/// `env_chain`, `options`, `name`, `argnames`, and `src_buf` must be valid.
-pub unsafe fn compile_function_raw<'s>(
+/// Compile `body` as the body of a function named `name` with the parameters `params`, in the
+/// current global's scope, with filename `filename`. The function's one-line header is line
+/// `lineno`, so `body` starts at line `lineno + 1`.
+pub fn compile_function<'s>(
     scope: &'s Scope<'_>,
-    env_chain: *const EnvironmentChain,
-    options: *const ReadOnlyCompileOptions,
-    name: *const std::os::raw::c_char,
-    nargs: std::os::raw::c_uint,
-    argnames: *const *const std::os::raw::c_char,
-    src_buf: *mut SourceText<Utf8Unit>,
-) -> Result<Handle<'s, *mut JSFunction>, ExnThrown> {
-    let fun = wrappers2::CompileFunction1(
+    name: &std::ffi::CStr,
+    params: &[&std::ffi::CStr],
+    body: &str,
+    filename: &str,
+    lineno: u32,
+) -> Result<crate::Function<'s>, ExnThrown> {
+    let chain = mozjs::rust::EnvironmentChain::new(
         scope.cx_mut(),
-        env_chain,
-        options,
-        name,
-        nargs,
-        argnames,
-        src_buf,
+        mozjs::jsapi::JS::SupportUnscopables::No,
     );
-    NonNull::new(fun)
-        .map(|p| scope.root_function(p))
-        .ok_or(ExnThrown)
+    let filename = CString::new(filename.replace('\0', "")).expect("NULs were removed");
+    let options = options(scope, filename, lineno);
+    let argnames: Vec<*const std::os::raw::c_char> = params.iter().map(|p| p.as_ptr()).collect();
+    // SpiderMonkey's function compiler reads UTF-8 source as one Latin-1 character per byte, so the
+    // body goes in as UTF-16.
+    let units: Vec<u16> = body.encode_utf16().collect();
+    let mut source = mozjs::rust::transform_u16_to_source_text(&units);
+    // SAFETY: the chain, options, names and source are live locals.
+    let fun = unsafe {
+        compile_function_utf16_raw(
+            scope,
+            chain.get(),
+            options.ptr,
+            name.as_ptr(),
+            argnames.len() as std::os::raw::c_uint,
+            argnames.as_ptr(),
+            &mut source,
+        )
+    }?;
+    // SAFETY: a compiled function has a function object, which `fun` keeps alive.
+    unsafe {
+        crate::Function::from_mozjs_rval(scope, mozjs::jsapi::JS_GetFunctionObject(fun.get()))
+    }
 }
 
 /// Decompile a script to source text.

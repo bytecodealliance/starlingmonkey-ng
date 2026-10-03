@@ -49,10 +49,10 @@ use js::heap::Trace;
 use js::module::ModuleType;
 use js::module_raw::{transform_str_to_source_text, SetModulePrivate};
 use js::native::{GCHandle, HandleObject, JSNative, JSObject, JSString, JSTracer, Value};
-use js::prelude::{HandleValue, RootScope};
+use js::prelude::{FromJSVal, HandleValue, RootScope};
 use js::{allow_unrooted, Object};
 use oxc_resolver::{ResolveOptions, Resolver};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
@@ -80,6 +80,36 @@ pub enum ModuleExport {
     },
 }
 
+/// What a native module exports as `default`, besides its named exports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DefaultExport {
+    /// No `default` export.
+    None,
+    /// An object with every named export as a property, the shape of a Node.js builtin module's
+    /// CommonJS `module.exports`. A `self_export` is a further named export holding that object,
+    /// which is also one of its properties, such as `node:path`'s `posix`.
+    Namespace { self_export: Option<&'static str> },
+    /// The named export `name`, which must be an object. Every named export, including this one,
+    /// is also set as a property on it, so it has the properties the object `Namespace` gives.
+    /// Node's `events` module, whose `module.exports` is `EventEmitter`, has this shape. A
+    /// `self_export` is as for `Namespace`, such as `node:assert/strict`'s `strict`.
+    Export {
+        name: &'static str,
+        self_export: Option<&'static str>,
+    },
+}
+
+impl DefaultExport {
+    /// The named export holding the `default` export, if there is one besides `default`.
+    pub fn self_export(self) -> Option<&'static str> {
+        match self {
+            DefaultExport::None => None,
+            DefaultExport::Namespace { self_export }
+            | DefaultExport::Export { self_export, .. } => self_export,
+        }
+    }
+}
+
 // ============================================================================
 // NativeModule trait
 // ============================================================================
@@ -92,6 +122,13 @@ pub trait NativeModule: 'static {
     /// The module specifier string used in JS `import` statements.
     /// e.g. `"myMath"` for `import { add } from "myMath";`
     const NAME: &'static str;
+
+    /// The module's `default` export.
+    const DEFAULT_EXPORT: DefaultExport = DefaultExport::None;
+
+    /// Named exports initialized from the properties of the same name on the `default` export,
+    /// after it was created. Only meaningful with a `DEFAULT_EXPORT` other than `None`.
+    const MIRRORED_EXPORTS: &'static [&'static str] = &[];
 
     /// Return the list of exports this module provides.
     fn declarations() -> Vec<ModuleExport>;
@@ -135,6 +172,11 @@ pub struct ModuleState {
     base_path: RefCell<Option<PathBuf>>,
     /// The registry key of the entry module recorded last (see [`entry_namespace`]).
     entry: RefCell<Option<String>>,
+    /// Whether Node.js compatibility is enabled, which adds the `node` resolution condition and
+    /// CommonJS modules.
+    pub(crate) node_compat: Cell<bool>,
+    /// The resolver for `require` calls, with Node.js compatibility.
+    require_resolver: RefCell<Option<Resolver>>,
 }
 
 /// Run `f` against the current runtime's module state.
@@ -148,10 +190,6 @@ fn with_state<R>(f: impl FnOnce(&ModuleState) -> R) -> R {
 
 fn registry<R>(f: impl FnOnce(&RefCell<HashMap<String, ModuleEntry>>) -> R) -> R {
     with_state(|state| f(&state.registry))
-}
-
-fn resolver<R>(f: impl FnOnce(&RefCell<Option<Resolver>>) -> R) -> R {
-    with_state(|state| f(&state.resolver))
 }
 
 fn base_path<R>(f: impl FnOnce(&RefCell<Option<PathBuf>>) -> R) -> R {
@@ -259,6 +297,261 @@ pub(crate) fn rejection_message(
 }
 
 // ============================================================================
+// Builtin modules
+// ============================================================================
+
+/// A builtin module, created the first time a module imports it.
+#[derive(Clone, Copy)]
+pub struct BuiltinModule {
+    /// The specifier the module is registered under, such as `node:fs`.
+    pub name: &'static str,
+    /// Further specifiers that import the module, such as `fs`.
+    pub aliases: &'static [&'static str],
+    /// Register the module in the module registry under `name`, which is passed in, the way
+    /// [`register_module`] does. Returns `false`, with an exception pending, if that failed.
+    pub create: unsafe fn(&Scope<'_>, &'static str) -> bool,
+}
+
+js::instance_local! {
+    static BUILTIN_MODULES: RefCell<Vec<BuiltinModule>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Make `module` importable from every runtime created after this call. A module registered under
+/// the same name before is replaced.
+///
+/// A builtin module's name and aliases take precedence over files: importing one never consults
+/// the resolver.
+pub fn register_builtin_module(module: BuiltinModule) {
+    BUILTIN_MODULES.with(|modules| {
+        let mut modules = modules.borrow_mut();
+        modules.retain(|registered| registered.name != module.name);
+        modules.push(module);
+    });
+}
+
+/// Forget every module [`register_builtin_module`] registered.
+pub fn clear_builtin_modules() {
+    BUILTIN_MODULES.with(|modules| modules.borrow_mut().clear());
+}
+
+/// The builtin module `specifier` names, by its name or one of its aliases.
+pub fn builtin_module(specifier: &str) -> Option<BuiltinModule> {
+    BUILTIN_MODULES.with(|modules| {
+        modules
+            .borrow()
+            .iter()
+            .find(|module| module.name == specifier || module.aliases.contains(&specifier))
+            .copied()
+    })
+}
+
+/// The module object of `builtin`, created and registered on first use.
+fn builtin_module_object<'s>(
+    scope: &'s Scope<'_>,
+    builtin: BuiltinModule,
+) -> Result<Object<'s>, ModuleLoadError> {
+    let lookup = || {
+        registry(|reg| {
+            reg.borrow()
+                .get(builtin.name)
+                .map(|entry| entry.module_obj.get(scope))
+        })
+    };
+    if let Some(module) = lookup() {
+        return Ok(module);
+    }
+    // SAFETY: the module loader is initialized, since its load hook or `require` called this.
+    if !unsafe { (builtin.create)(scope, builtin.name) } {
+        return Err(ModuleLoadError::CompileThrew);
+    }
+    lookup().ok_or_else(|| {
+        ModuleLoadError::Failed(format!(
+            "Builtin module '{}' did not register itself",
+            builtin.name
+        ))
+    })
+}
+
+// ============================================================================
+// CommonJS
+// ============================================================================
+
+/// Runs a CommonJS module for an `import` of it. Given the module's canonical path and its
+/// format, `CommonJs` or `Ambiguous`, returns the module's `module.exports`, or `None` for an
+/// `Ambiguous` file whose source is an ES module.
+pub type CommonJsLoader =
+    for<'s> fn(&'s Scope<'_>, &Path, SourceFormat) -> Result<Option<HandleValue<'s>>, ExnThrown>;
+
+js::instance_local! {
+    static COMMONJS_LOADER: Cell<Option<CommonJsLoader>> = const { Cell::new(None) };
+}
+
+/// Install the loader that runs CommonJS modules ES modules import, in runtimes with Node.js
+/// compatibility. Without one, every module is an ES module.
+pub fn set_commonjs_loader(loader: Option<CommonJsLoader>) {
+    COMMONJS_LOADER.with(|cell| cell.set(loader));
+}
+
+/// The module an ES module gets for importing the CommonJS module at `path`, cached under
+/// `cache_key`: a module whose `default` and `"module.exports"` exports are the CommonJS module's
+/// `module.exports`, and whose other named exports are the own enumerable string-keyed
+/// properties of `module.exports`, if it is an object.
+///
+/// Returns `None` if `path` isn't a CommonJS module: the runtime has no Node.js compatibility or
+/// no CommonJS loader, `format` isn't `CommonJs` or `Ambiguous`, or the loader found an
+/// `Ambiguous` file to be an ES module.
+///
+/// The CommonJS module runs here, while the importing module graph loads, rather than when the
+/// graph evaluates.
+fn commonjs_facade<'s>(
+    scope: &'s Scope<'_>,
+    path: &Path,
+    cache_key: &str,
+    format: SourceFormat,
+) -> Result<Option<Object<'s>>, ModuleLoadError> {
+    if !matches!(format, SourceFormat::CommonJs | SourceFormat::Ambiguous)
+        || !with_state(|state| state.node_compat.get())
+    {
+        return Ok(None);
+    }
+    let Some(loader) = COMMONJS_LOADER.with(Cell::get) else {
+        return Ok(None);
+    };
+    let Some(exports) = loader(scope, path, format).map_err(|_| ModuleLoadError::CompileThrew)?
+    else {
+        return Ok(None);
+    };
+    let mut names = Vec::new();
+    if exports.is_object() {
+        let keys = (|| -> Result<Vec<String>, ExnThrown> {
+            let object = Object::from_value(scope, exports.get()).map_err(|e| e.throw(scope))?;
+            object
+                .own_enumerable_keys(scope)?
+                .into_iter()
+                .map(|key| String::from_jsval(scope, key, ()).map_err(|e| e.throw(scope)))
+                .collect()
+        })()
+        .map_err(|_| ModuleLoadError::CompileThrew)?;
+        names.extend(
+            keys.into_iter()
+                .filter(|name| name != "default" && name != "module.exports"),
+        );
+    }
+    let mut values: Vec<(&str, HandleValue)> =
+        vec![("default", exports), ("module.exports", exports)];
+    for name in &names {
+        let c_name = CString::new(name.as_str()).map_err(|_| "Invalid export name".to_string())?;
+        let object =
+            Object::from_value(scope, exports).map_err(|_| ModuleLoadError::CompileThrew)?;
+        let value = object
+            .get_property(scope, &c_name)
+            .map_err(|_| ModuleLoadError::CompileThrew)?;
+        values.push((name.as_str(), value));
+    }
+    // SAFETY: the module loader is initialized, since its load hook called this, and every value
+    // is rooted.
+    unsafe { register_synthetic_module(scope, cache_key, &values) }
+        .map_err(|_| ModuleLoadError::CompileThrew)?;
+    let module = registry(|reg| {
+        reg.borrow()
+            .get(cache_key)
+            .map(|entry| entry.module_obj.get(scope))
+    });
+    Ok(module)
+}
+
+/// Resolve `specifier` as a `require` call from a module in `base_dir` does, with the `require`
+/// conditions. Returns the resolved file's canonical path and its format.
+pub fn resolve_require(
+    specifier: &str,
+    base_dir: &Path,
+) -> Result<(PathBuf, SourceFormat), String> {
+    let (path, format) = resolve_path_with(specifier, Some(base_dir.to_path_buf()), true)?;
+    Ok((canonical_path(path), format))
+}
+
+/// `path` with symbolic links and `.` and `..` segments resolved, the key the module registry
+/// and `require.cache` use. `path` itself, normalized lexically, if it can't be canonicalized.
+pub fn canonical_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or_else(|_| lexically_normalize(path))
+}
+
+/// The namespace of the builtin module `specifier` names, created if needed, or `None` if it
+/// names none.
+pub fn builtin_namespace<'s>(
+    scope: &'s Scope<'_>,
+    specifier: &str,
+) -> Result<Option<Object<'s>>, ExnThrown> {
+    let Some(builtin) = builtin_module(specifier) else {
+        return Ok(None);
+    };
+    let module = builtin_module_object(scope, builtin).map_err(|error| match error {
+        ModuleLoadError::Failed(message) => js::error::TypeError(message).throw(scope),
+        ModuleLoadError::CompileThrew => ExnThrown,
+    })?;
+    let namespace = js::module::get_namespace(scope, module.handle())?;
+    Ok(Object::from_handle(namespace))
+}
+
+/// Load, link and evaluate the ES module file at `path` synchronously, as `require` of an ES
+/// module does, and return its namespace.
+///
+/// Fails if the module graph uses top-level `await` that doesn't settle synchronously, since
+/// `require` can't wait for it. Loading a module that isn't in the registry yet reads its file,
+/// so it throws an `Error` with the `code` `ERR_BLOCKING_NOT_ALLOWED` where blocking isn't
+/// allowed.
+pub fn require_module<'s>(scope: &'s Scope<'_>, path: &Path) -> Result<Object<'s>, ExnThrown> {
+    let base_dir = path.parent().map(Path::to_path_buf);
+    let specifier = path.to_string_lossy();
+    if let Some(reason) = crate::event_loop::blocking_host_io_refusal() {
+        if !registry(|reg| reg.borrow().contains_key(specifier.as_ref())) {
+            let message = format!("Loading '{specifier}' would block {reason}");
+            let message = CString::new(message.replace('\0', "")).map_err(|_| ExnThrown)?;
+            js::error::throw_plain_error(scope, &message);
+            if let Some(error) = js::exception::take_pending(scope) {
+                if let Ok(object) = Object::from_value(scope, error) {
+                    object.set_property(scope, c"code", "ERR_BLOCKING_NOT_ALLOWED")?;
+                }
+                js::exception::set_pending(
+                    scope,
+                    error,
+                    js::native::ExceptionStackBehavior::Capture,
+                );
+            }
+            return Err(ExnThrown);
+        }
+    }
+    let module = resolve_file_module(scope, &specifier, base_dir, ModuleKind::JavaScript).map_err(
+        |error| match error {
+            ModuleLoadError::Failed(message) => js::error::TypeError(message).throw(scope),
+            ModuleLoadError::CompileThrew => ExnThrown,
+        },
+    )?;
+    js::module::load_requested_modules(scope, module)?;
+    js::module::link(scope, module)?;
+    let evaluation = js::module::evaluate(scope, module)?;
+    if let Ok(promise) = Object::from_value(scope, evaluation.get())
+        .map_err(|_| ())
+        .and_then(|object| object.cast::<js::Promise>().map_err(|_| ()))
+    {
+        if promise.is_pending() {
+            return Err(js::error::TypeError(format!(
+                "require() cannot be used on an ES module that uses top-level await: {}",
+                path.display()
+            ))
+            .throw(scope));
+        }
+        if promise.is_rejected() {
+            let reason = promise.result(scope).unwrap_or(evaluation);
+            js::exception::set_pending(scope, reason, js::native::ExceptionStackBehavior::Capture);
+            return Err(ExnThrown);
+        }
+    }
+    let namespace = js::module::get_namespace(scope, module.handle())?;
+    Object::from_handle(namespace).ok_or(ExnThrown)
+}
+
+// ============================================================================
 // Module load hook
 // ============================================================================
 
@@ -316,34 +609,44 @@ unsafe extern "C" fn module_load_hook(
         }
     };
 
-    // 1. Check the module registry for an exact match. The `json:`-prefixed keys
-    // hold JSON modules, which a JavaScript import never gets.
+    // 1. Check the builtin modules, which only a runtime with Node.js compatibility has, then the
+    // module registry for an exact match. The `json:`-prefixed keys hold JSON modules, which a
+    // JavaScript import never gets.
+    let builtin = match kind {
+        ModuleKind::JavaScript if with_state(|state| state.node_compat.get()) => {
+            builtin_module(&specifier)
+        }
+        ModuleKind::JavaScript | ModuleKind::Json => None,
+    };
     let cached = match kind {
-        ModuleKind::JavaScript if !specifier.starts_with("json:") => registry(|reg| {
-            reg.borrow()
-                .get(&specifier)
-                .map(|entry| entry.module_obj.get(&scope))
-        }),
+        ModuleKind::JavaScript if builtin.is_none() && !specifier.starts_with("json:") => {
+            registry(|reg| {
+                reg.borrow()
+                    .get(&specifier)
+                    .map(|entry| entry.module_obj.get(&scope))
+            })
+        }
         ModuleKind::JavaScript | ModuleKind::Json => None,
     };
 
     // 2. Resolve via filesystem using oxc_resolver, relative to the referrer.
-    let module = match cached {
-        Some(obj) => obj,
-        None => {
+    let loaded = match (builtin, cached) {
+        (Some(builtin), _) => builtin_module_object(&scope, builtin),
+        (None, Some(obj)) => Ok(obj),
+        (None, None) => {
             let base_dir = referrer_base_dir(&scope, referrer);
-            match resolve_file_module(&scope, &specifier, base_dir, kind) {
-                Ok(obj) => obj,
-                Err(ModuleLoadError::Failed(msg)) => {
-                    let c_msg =
-                        CString::new(msg).unwrap_or_else(|_| c"Module resolution failed".into());
-                    js::error::report_error_ascii(&scope, &c_msg);
-                    return false;
-                }
-                // The compile error, with its location, is already pending.
-                Err(ModuleLoadError::CompileThrew) => return false,
-            }
+            resolve_file_module(&scope, &specifier, base_dir, kind)
         }
+    };
+    let module = match loaded {
+        Ok(obj) => obj,
+        Err(ModuleLoadError::Failed(msg)) => {
+            let c_msg = CString::new(msg).unwrap_or_else(|_| c"Module resolution failed".into());
+            js::error::report_error_ascii(&scope, &c_msg);
+            return false;
+        }
+        // The compile error, with its location, is already pending.
+        Err(ModuleLoadError::CompileThrew) => return false,
     };
 
     // SAFETY: SpiderMonkey passes the hook a rooted `payload` handle.
@@ -392,6 +695,173 @@ fn referrer_base_dir(
     base_path(|bp| bp.borrow().clone())
 }
 
+/// The format of a module file, from its extension and the `type` of the nearest
+/// `package.json`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SourceFormat {
+    /// A `.cjs` file, or a `.js` file in a package of `type` `commonjs`.
+    CommonJs,
+    /// A `.mjs` file, or a `.js` file in a package of `type` `module`.
+    Module,
+    /// A `.json` file.
+    Json,
+    /// A `.js` file with no `type` in reach. It is an ES module if its source uses ES module
+    /// syntax, and CommonJS otherwise.
+    Ambiguous,
+    /// Any other file, such as a native addon.
+    Other,
+}
+
+impl SourceFormat {
+    fn from_resolution(module_type: Option<oxc_resolver::ModuleType>, path: &Path) -> Self {
+        use oxc_resolver::ModuleType;
+        match module_type {
+            Some(ModuleType::CommonJs) => SourceFormat::CommonJs,
+            Some(ModuleType::Module) => SourceFormat::Module,
+            Some(ModuleType::Json) => SourceFormat::Json,
+            Some(ModuleType::Wasm | ModuleType::Addon) => SourceFormat::Other,
+            None if path.extension().is_some_and(|ext| ext == "js") => SourceFormat::Ambiguous,
+            None => SourceFormat::Other,
+        }
+    }
+}
+
+/// Resolve `specifier` to a file with `oxc_resolver`, relative to `base_dir`, using the
+/// resolver for `import`s or, with `for_require`, the one for `require` calls.
+fn resolve_path_with(
+    specifier: &str,
+    base_dir: Option<PathBuf>,
+    for_require: bool,
+) -> Result<(PathBuf, SourceFormat), String> {
+    let base_dir = base_dir
+        .ok_or_else(|| format!("Module '{}' not found (no base path configured)", specifier))?;
+    with_state(|state| {
+        let import = state.resolver.borrow();
+        let require = state.require_resolver.borrow();
+        let resolver = match (for_require, require.as_ref()) {
+            (true, Some(require)) => require,
+            _ => import
+                .as_ref()
+                .expect("resolver not initialized — call init_module_loader first"),
+        };
+        resolver
+            .resolve(&base_dir, specifier)
+            .map(|res| {
+                let format = SourceFormat::from_resolution(res.module_type(), res.path());
+                (res.path().to_path_buf(), format)
+            })
+            .map_err(|e| format!("Cannot resolve module '{}': {}", specifier, e))
+    })
+}
+
+/// Resolve `specifier` for an `import`, relative to `base_dir`.
+fn resolve_path(specifier: &str, base_dir: Option<PathBuf>) -> Result<PathBuf, String> {
+    resolve_path_with(specifier, base_dir, false).map(|(path, _)| path)
+}
+
+/// The absolute path a file-backed module was compiled from, which [`resolve_file_module`] and
+/// [`register_entry_module`] store in its module private. `None` for a module without one.
+fn module_path(scope: &Scope<'_>, module: Object<'_>) -> Option<String> {
+    let script = js::module::get_module_script(module)?;
+    let private = js::module::get_script_private(scope, scope.root_script(script));
+    if !private.is_string() {
+        return None;
+    }
+    jsstring_to_string(scope, private.to_string())
+}
+
+/// The `file:` URL of the absolute `path`.
+fn file_url(path: &str) -> String {
+    url::Url::from_file_path(path)
+        .map(String::from)
+        .unwrap_or_else(|()| format!("file://{path}"))
+}
+
+/// The module metadata hook, which populates `import.meta`.
+///
+/// A file-backed module gets `url` (its `file:` URL), `filename`, `dirname`, `resolve` and
+/// `main`. Other modules get `resolve`, resolving against the loader's base path, and `main`.
+/// `main` is `true` for the entry module.
+unsafe extern "C" fn module_metadata_hook(
+    cx: *mut js::native::RawJSContext,
+    module_record: js::native::RawHandle<*mut JSObject>,
+    meta_object: js::native::RawHandle<*mut JSObject>,
+) -> bool {
+    // SAFETY: SpiderMonkey calls the hook with a valid context, with the module's realm entered.
+    let scope = unsafe { RootScope::from_current_realm(cx) };
+    // SAFETY: SpiderMonkey passes the hook rooted handles.
+    let (module, meta) = unsafe {
+        (
+            Object::from_handle(GCHandle::from_raw(module_record)),
+            Object::from_handle(GCHandle::from_raw(meta_object)),
+        )
+    };
+    let (Some(module), Some(meta)) = (module, meta) else {
+        return false;
+    };
+    populate_import_meta(&scope, module, meta).is_ok()
+}
+
+/// The body of [`module_metadata_hook`].
+fn populate_import_meta(
+    scope: &Scope<'_>,
+    module: Object<'_>,
+    meta: Object<'_>,
+) -> Result<(), ExnThrown> {
+    let path = module_path(scope, module);
+    if let Some(path) = &path {
+        let file = Path::new(path);
+        let dirname = file.parent().map(|dir| dir.to_string_lossy().into_owned());
+        meta.set_property(scope, c"url", file_url(path).as_str())?;
+        meta.set_property(scope, c"filename", path.as_str())?;
+        if let Some(dirname) = dirname {
+            meta.set_property(scope, c"dirname", dirname.as_str())?;
+        }
+    }
+
+    let resolve =
+        js::Function::new_callback(scope, c"resolve", 1, import_meta_resolve, path.as_deref())?;
+    meta.set_property(scope, c"resolve", resolve)?;
+
+    let is_main = with_state(|state| state.entry.borrow().clone())
+        .and_then(|key| {
+            registry(|reg| {
+                reg.borrow()
+                    .get(&key)
+                    .map(|entry| entry.module_obj.get(scope))
+            })
+        })
+        .is_some_and(|entry: Object<'_>| entry.as_raw() == module.as_raw());
+    meta.set_property(scope, c"main", is_main)?;
+    Ok(())
+}
+
+/// `import.meta.resolve(specifier)`: the URL `specifier` resolves to from the module whose path
+/// is `payload` (`undefined` for a module without one).
+///
+/// A builtin module resolves to its name, a file to its `file:` URL. Resolution is synchronous
+/// and does not load the module.
+fn import_meta_resolve(
+    scope: &Scope<'_>,
+    args: js::function::CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let specifier = String::from_jsval(scope, args.get(0), ()).map_err(|e| e.throw(scope))?;
+    if let Some(builtin) = builtin_module(&specifier) {
+        return builtin.name.to_jsval_raw_throwing(scope);
+    }
+    let base_dir = if payload.is_string() {
+        jsstring_to_string(scope, payload.to_string())
+            .and_then(|path| Path::new(&path).parent().map(Path::to_path_buf))
+    } else {
+        base_path(|bp| bp.borrow().clone())
+    };
+    match resolve_path(&specifier, base_dir) {
+        Ok(path) => file_url(&path.to_string_lossy()).to_jsval_raw_throwing(scope),
+        Err(message) => Err(js::error::TypeError(message).throw(scope)),
+    }
+}
+
 /// The kinds of module the loader compiles from a file.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModuleKind {
@@ -410,20 +880,7 @@ fn resolve_file_module<'r>(
     base_dir: Option<PathBuf>,
     kind: ModuleKind,
 ) -> Result<Object<'r>, ModuleLoadError> {
-    let base_dir = base_dir
-        .ok_or_else(|| format!("Module '{}' not found (no base path configured)", specifier))?;
-
-    // Resolve using oxc_resolver
-    let resolved_path = resolver(|r| {
-        let borrow = r.borrow();
-        let resolver = borrow
-            .as_ref()
-            .expect("resolver not initialized — call init_module_loader first");
-        resolver
-            .resolve(&base_dir, specifier)
-            .map(|res| res.path().to_path_buf())
-            .map_err(|e| format!("Cannot resolve module '{}': {}", specifier, e))
-    })?;
+    let (resolved_path, format) = resolve_path_with(specifier, base_dir, false)?;
 
     // Key the cache by the canonicalized path, so the same file reached via
     // different specifiers, lexically different paths, or symlinks is one
@@ -462,6 +919,12 @@ fn resolve_file_module<'r>(
     });
     if let Some(obj) = cached {
         return Ok(obj);
+    }
+
+    if kind == ModuleKind::JavaScript {
+        if let Some(facade) = commonjs_facade(scope, &canonical_path, &cache_key, format)? {
+            return Ok(facade);
+        }
     }
 
     // Read source from disk
@@ -556,6 +1019,21 @@ fn record_entry_module(module: Object<'_>, name: &str) {
     with_state(|state| *state.entry.borrow_mut() = Some(name.to_string()));
 }
 
+/// The absolute path of the file the entry module was read from, or `None` for an entry module
+/// with no file, or none at all.
+pub fn entry_path() -> Option<String> {
+    let key = with_state(|state| state.entry.borrow().clone())?;
+    let key = match key.strip_suffix(COMMONJS_ENTRY_SUFFIX) {
+        Some(path) => path.to_string(),
+        None => key,
+    };
+    Path::new(&key).is_absolute().then_some(key)
+}
+
+/// The suffix of the registry key of the module that imports a CommonJS entry, after the entry's
+/// canonical path.
+const COMMONJS_ENTRY_SUFFIX: &str = "#commonjs-entry";
+
 /// The namespace of the entry module [`register_entry_module`] or
 /// `record_entry_module` recorded last, or `None` if there is none. The
 /// namespace is only complete once the module has finished evaluating.
@@ -619,24 +1097,71 @@ fn jsstring_to_string(scope: &Scope<'_>, s: *mut JSString) -> Option<String> {
 // Public API
 // ============================================================================
 
-/// Install the module load hook and configure the filesystem resolver.
+/// The runtime's key in the [WinterTC runtime keys](https://runtime-keys.proposal.wintertc.org/)
+/// sense: the first `package.json` `exports`/`imports` condition module resolution matches.
+pub const RUNTIME_KEY: &str = "starlingmonkey";
+
+/// The `package.json` `exports`/`imports` conditions an ES module import resolves with, in
+/// addition to `default`, which always matches. With Node.js compatibility, `node` is added.
+fn import_conditions(node_compat: bool) -> Vec<String> {
+    let mut conditions = vec![RUNTIME_KEY];
+    if node_compat {
+        conditions.push("node");
+    }
+    conditions.extend(["import", "module-sync"]);
+    conditions.into_iter().map(String::from).collect()
+}
+
+/// Install the module load and metadata hooks and configure the filesystem resolver.
 ///
-/// The load hook is installed on `rt`, and `base` is the directory import
+/// The hooks are installed on `rt`, and `base` is the directory import
 /// specifiers resolve from (typically the directory holding the entry script).
+/// The resolver's conditions depend on whether `rt` has Node.js compatibility enabled.
 ///
 /// This must be called once before any modules are registered or imported.
 pub fn init_module_loader(rt: &crate::Runtime, base: PathBuf) {
     let state = &rt.modules;
     *state.base_path.borrow_mut() = Some(base);
 
-    // SAFETY: `rt` owns the `JSRuntime` the hook is installed on, so it is valid
-    // and outlives the hook.
-    unsafe { js::module::set_module_load_hook(rt.rt(), Some(module_load_hook)) };
+    // SAFETY: `rt` owns the `JSRuntime` the hooks are installed on, so it is valid
+    // and outlives them.
+    unsafe {
+        js::module::set_module_load_hook(rt.rt(), Some(module_load_hook));
+        js::module::set_module_metadata_hook(rt.rt(), Some(module_metadata_hook));
+    }
 
-    *state.resolver.borrow_mut() = Some(Resolver::new(ResolveOptions {
-        extensions: vec![".js".into(), ".mjs".into(), ".json".into()],
+    let resolver = Resolver::new(ResolveOptions {
+        extensions: [".js", ".mjs", ".cjs", ".json"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        condition_names: import_conditions(state.node_compat.get()),
+        module_type: true,
         ..ResolveOptions::default()
-    }));
+    });
+    if state.node_compat.get() {
+        // Shares the import resolver's cache of the filesystem.
+        let require = resolver.clone_with_options(ResolveOptions {
+            extensions: [".js", ".cjs", ".json", ".node"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            condition_names: require_conditions(),
+            module_type: true,
+            ..ResolveOptions::default()
+        });
+        *state.require_resolver.borrow_mut() = Some(require);
+    }
+    *state.resolver.borrow_mut() = Some(resolver);
+}
+
+/// The `package.json` `exports`/`imports` conditions a `require` call resolves with, in addition
+/// to `default`, which always matches.
+fn require_conditions() -> Vec<String> {
+    [RUNTIME_KEY, "node", "require", "module-sync"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 /// Drop the cached module objects. See [`crate::Runtime::clear_module_registry`], the public entry
@@ -660,6 +1185,7 @@ pub(crate) fn clear_module_state(state: &ModuleState) {
     clear_module_registry(state);
     *state.base_path.borrow_mut() = None;
     *state.resolver.borrow_mut() = None;
+    *state.require_resolver.borrow_mut() = None;
     *state.entry.borrow_mut() = None;
 }
 
@@ -676,6 +1202,22 @@ pub(crate) fn clear_module_state(state: &ModuleState) {
 ///
 /// - [`init_module_loader`] must have been called first.
 pub unsafe fn register_module<T: NativeModule>(scope: &Scope<'_>) -> bool {
+    // SAFETY: the caller upholds `register_module_with`'s requirements.
+    unsafe { register_module_with::<T>(scope, &[]) }
+}
+
+/// [`register_module`], with `extra` exports besides the module's declared ones: each
+/// `(name, value)` pair becomes a named export with that value, which is also a property of the
+/// module's `default` export, if it has one.
+///
+/// # Safety
+///
+/// - [`init_module_loader`] must have been called first.
+/// - `extra`'s value handles must be live and rooted for the duration of the call.
+pub unsafe fn register_module_with<T: NativeModule>(
+    scope: &Scope<'_>,
+    extra: &[(&str, HandleValue)],
+) -> bool {
     let declarations = T::declarations();
 
     // 1. Generate JS module source: `export var name1; export var name2; ...`
@@ -686,6 +1228,18 @@ pub unsafe fn register_module<T: NativeModule>(scope: &Scope<'_>) -> bool {
             ModuleExport::Value { js_name } => js_name,
         };
         source.push_str(&format!("export var {};\n", name));
+    }
+    if T::DEFAULT_EXPORT != DefaultExport::None {
+        source.push_str("var __default; export { __default as default };\n");
+    }
+    if let Some(name) = T::DEFAULT_EXPORT.self_export() {
+        source.push_str(&format!("export var {name};\n"));
+    }
+    for name in T::MIRRORED_EXPORTS {
+        source.push_str(&format!("export var {name};\n"));
+    }
+    for (name, _) in extra {
+        source.push_str(&format!("export var {name};\n"));
     }
 
     // 2. Compile module
@@ -716,7 +1270,7 @@ pub unsafe fn register_module<T: NativeModule>(scope: &Scope<'_>) -> bool {
     // remove the registry entry again so a later import of the module fails
     // to resolve instead of finding a half-initialized module whose value
     // exports are undefined.
-    let populated = link_evaluate_and_populate::<T>(scope, module, &declarations);
+    let populated = link_evaluate_and_populate::<T>(scope, module, &declarations, extra);
     if !populated {
         registry(|reg| {
             reg.borrow_mut().remove(T::NAME);
@@ -731,6 +1285,7 @@ fn link_evaluate_and_populate<T: NativeModule>(
     scope: &Scope<'_>,
     module: Object<'_>,
     declarations: &[ModuleExport],
+    extra: &[(&str, HandleValue)],
 ) -> bool {
     let env = match link_evaluate_and_get_env(scope, module) {
         Some(env) => env,
@@ -758,7 +1313,74 @@ fn link_evaluate_and_populate<T: NativeModule>(
 
     // Let the module implementation set value exports
     // SAFETY: `env` is the module's environment object.
-    unsafe { T::evaluate(scope, env.handle()) }
+    if !unsafe { T::evaluate(scope, env.handle()) } {
+        return false;
+    }
+    let mut names: Vec<&str> = declarations
+        .iter()
+        .map(|decl| match decl {
+            ModuleExport::Function { js_name, .. } | ModuleExport::Value { js_name } => *js_name,
+        })
+        .collect();
+    for (name, value) in extra {
+        let Ok(c_name) = CString::new(*name) else {
+            return false;
+        };
+        if env.set_property(scope, &c_name, *value).is_err() {
+            return false;
+        }
+        names.push(name);
+    }
+    set_default_export(scope, env, &names, T::DEFAULT_EXPORT, T::MIRRORED_EXPORTS).is_ok()
+}
+
+/// Set the `default` export of a native module whose environment is `env` and whose named
+/// exports are `names`, as `default_export` describes, then initialize the `mirrored` exports
+/// from it. The named exports are copied onto the default export, except onto an existing object
+/// that has an own property of the name, whose value replaces the named export instead.
+fn set_default_export(
+    scope: &Scope<'_>,
+    env: Object<'_>,
+    names: &[&str],
+    default_export: DefaultExport,
+    mirrored: &[&str],
+) -> Result<(), ExnThrown> {
+    let target = match default_export {
+        DefaultExport::None => return Ok(()),
+        DefaultExport::Namespace { .. } => Object::new_plain(scope)?,
+        DefaultExport::Export { name, .. } => {
+            let c_name = CString::new(name).map_err(|_| ExnThrown)?;
+            let value = env.get_property(scope, &c_name)?;
+            Object::from_value(scope, value.get()).map_err(|_| {
+                js::error::TypeError(format!(
+                    "the default export '{name}' of a native module must be an object"
+                ))
+                .throw(scope)
+            })?
+        }
+    };
+    let keep_existing = matches!(default_export, DefaultExport::Export { .. });
+    for name in names {
+        let c_name = CString::new(*name).map_err(|_| ExnThrown)?;
+        if keep_existing && target.has_own_property(scope, &c_name)? {
+            let value = target.get_property(scope, &c_name)?;
+            env.set_property(scope, &c_name, value)?;
+        } else {
+            let value = env.get_property(scope, &c_name)?;
+            target.set_property(scope, &c_name, value)?;
+        }
+    }
+    if let Some(name) = default_export.self_export() {
+        let c_name = CString::new(name).map_err(|_| ExnThrown)?;
+        target.set_property(scope, &c_name, target)?;
+        env.set_property(scope, &c_name, target)?;
+    }
+    for name in mirrored {
+        let c_name = CString::new(*name).map_err(|_| ExnThrown)?;
+        let value = target.get_property(scope, &c_name)?;
+        env.set_property(scope, &c_name, value)?;
+    }
+    env.set_property(scope, c"__default", target)
 }
 
 /// Steps 4.-5. shared by every synthetic-module path: load the compiled
@@ -796,9 +1418,10 @@ fn link_evaluate_and_get_env<'s>(scope: &'s Scope<'_>, module: Object<'_>) -> Op
 /// keyed by the interface's WIT specifier (e.g. `"test:iface/x@0.2.0"`), with
 /// the import functions and resource classes as exports.
 ///
-/// Each `(name, value)` pair becomes an `export var <name>` binding initialized
-/// to `value`. The module is registered under the owned `name` string, so the
-/// load hook resolves an exact-match `import ... from "<name>"`.
+/// Each `(name, value)` pair becomes an export named `name`, which can be any
+/// string without lone surrogates, including `default`, initialized to `value`.
+/// The module is registered under the owned `name` string, so the load hook
+/// resolves an exact-match `import ... from "<name>"`.
 ///
 /// On any failure the half-registered entry is removed again, matching
 /// [`register_module`]: a later import then fails to resolve rather than finding
@@ -814,13 +1437,15 @@ pub unsafe fn register_synthetic_module(
     name: &str,
     exports: &[(&str, HandleValue)],
 ) -> Result<(), ExnThrown> {
-    // 1. Generate JS module source: `export var name1; export var name2; ...`.
-    // The bindings start out `undefined`; step 6 below assigns each its value.
+    // 1. Generate JS module source: one `var` binding per export, exported under the export's
+    // name, which can be any string. The bindings start out `undefined`, and step 6 below assigns
+    // each its value.
     let mut source = String::new();
-    for (export_name, _) in exports {
-        source.push_str("export var ");
-        source.push_str(export_name);
-        source.push_str(";\n");
+    for (index, (export_name, _)) in exports.iter().enumerate() {
+        let quoted = quote_export_name(export_name);
+        source.push_str(&format!(
+            "var __e{index}; export {{ __e{index} as {quoted} }};\n"
+        ));
     }
 
     // 2. Compile the module.
@@ -854,6 +1479,26 @@ pub unsafe fn register_synthetic_module(
     result
 }
 
+/// `name` as a string literal for an `export { x as "name" }` clause.
+fn quote_export_name(name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for c in name.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\u{2028}' => quoted.push_str("\\u2028"),
+            '\u{2029}' => quoted.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => quoted.push_str(&format!("\\u{:04x}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// Steps 4.-6. of [`register_synthetic_module`]: link and evaluate the compiled
 /// module, then assign each export binding its provided value.
 fn link_evaluate_and_populate_values(
@@ -863,11 +1508,86 @@ fn link_evaluate_and_populate_values(
 ) -> Result<(), ExnThrown> {
     let env = link_evaluate_and_get_env(scope, module).ok_or(ExnThrown)?;
 
-    for (export_name, value) in exports {
-        let c_name = CString::new(*export_name).map_err(|_| ExnThrown)?;
-        env.set_property(scope, &c_name, *value)?;
+    for (index, (_, value)) in exports.iter().enumerate() {
+        let binding = CString::new(format!("__e{index}")).map_err(|_| ExnThrown)?;
+        env.set_property(scope, &binding, *value)?;
     }
     Ok(())
+}
+
+/// Whether the entry script at `path`, whose source is `source`, is a CommonJS module: the
+/// runtime has Node.js compatibility and a CommonJS loader, and the file is a `.cjs` file, a
+/// `.js` file in a package of `type` `commonjs`, or a `.js` file without a package `type` whose
+/// source, without a byte order mark and `#!` line, compiles as a function body without a
+/// `SyntaxError`.
+fn is_commonjs_entry(scope: &Scope<'_>, path: &Path, source: &str) -> bool {
+    if !with_state(|state| state.node_compat.get()) || COMMONJS_LOADER.with(Cell::get).is_none() {
+        return false;
+    }
+    let absolute = std::env::current_dir().unwrap_or_default().join(path);
+    let Some(name) = absolute.file_name() else {
+        return false;
+    };
+    let specifier = format!("./{}", name.to_string_lossy());
+    let format = resolve_path_with(&specifier, absolute.parent().map(Path::to_path_buf), false)
+        .map(|(_, format)| format);
+    match format {
+        Ok(SourceFormat::CommonJs) => true,
+        Ok(SourceFormat::Ambiguous) => {
+            let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+            let source = match source.strip_prefix("#!") {
+                Some(rest) => std::borrow::Cow::Owned(format!("//{rest}")),
+                None => std::borrow::Cow::Borrowed(source),
+            };
+            let compiled =
+                js::compile::compile_function(scope, c"", &[], &source, "commonjs-check", 0)
+                    .is_ok();
+            let syntax_error = !compiled && js::exception::is_syntax_error_pending(scope);
+            js::exception::clear(scope);
+            !syntax_error
+        }
+        _ => false,
+    }
+}
+
+/// Compile the entry script `source`, named `filename`, as the module record to load, link and
+/// evaluate, and register it as the module of the file at `path`, if given. Returns the record,
+/// and whether the entry is a CommonJS module (see [`is_commonjs_entry`]). A CommonJS entry runs
+/// through the CommonJS loader, from a module record that re-exports its exports, which is the
+/// record returned.
+pub fn compile_entry<'s>(
+    scope: &'s Scope<'_>,
+    source: &str,
+    filename: &str,
+    path: Option<&Path>,
+) -> Result<(Object<'s>, bool), ExnThrown> {
+    let c_filename = CString::new(filename).map_err(|_| ExnThrown)?;
+    let options = js::compile::options(scope, c_filename, 1);
+    let is_commonjs = path.is_some_and(|path| is_commonjs_entry(scope, path, source));
+    if let (true, Some(path)) = (is_commonjs, path) {
+        let absolute = std::env::current_dir().unwrap_or_default().join(path);
+        let canonical = canonical_path(absolute);
+        let quoted = quote_export_name(&canonical.to_string_lossy());
+        let shim_source = format!("export * from {quoted}; export {{ default }} from {quoted};");
+        let mut src = transform_str_to_source_text(&shim_source);
+        // SAFETY: `options` and `src` are live locals.
+        let shim = unsafe { js::module::compile_module(scope, options.ptr, &mut src) }
+            .map_err(|_| ExnThrown)?;
+        record_entry_module(
+            shim,
+            &format!("{}{COMMONJS_ENTRY_SUFFIX}", canonical.display()),
+        );
+        return Ok((shim, true));
+    }
+    let mut src = transform_str_to_source_text(source);
+    // SAFETY: `options` and `src` are live locals.
+    let module = unsafe { js::module::compile_module(scope, options.ptr, &mut src) }
+        .map_err(|_| ExnThrown)?;
+    match path {
+        Some(path) => register_entry_module(scope, module, path)?,
+        None => record_entry_module(module, filename),
+    }
+    Ok((module, false))
 }
 
 /// Evaluate a JS script as a module, with access to registered native modules.
@@ -888,14 +1608,6 @@ pub unsafe fn evaluate_module<'s>(
     source: &str,
     filename: &str,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let c_filename = CString::new(filename).unwrap();
-    let options = js::compile::options(scope, c_filename, 1);
-
-    let mut src = transform_str_to_source_text(source);
-    // SAFETY: `options` and `src` are live locals.
-    let module = unsafe { js::module::compile_module(scope, options.ptr, &mut src) }
-        .map_err(|_| ExnThrown)?;
-
     // If the filename is a path in an existing directory, or a file in the
     // current directory, register the entry as that file's module. Other entries
     // (eval scripts, synthetic filenames) are recorded as the entry only, and
@@ -905,15 +1617,16 @@ pub unsafe fn evaluate_module<'s>(
         Some(parent) if !parent.as_os_str().is_empty() => parent.exists(),
         _ => path.is_file(),
     };
-    if is_path {
-        register_entry_module(scope, module, path)?;
-    } else {
-        record_entry_module(module, filename);
-    }
+    let (module, is_commonjs) = compile_entry(scope, source, filename, is_path.then_some(path))?;
 
     js::module::load_requested_modules(scope, module).map_err(|_| ExnThrown)?;
     js::module::link(scope, module).map_err(|_| ExnThrown)?;
-    js::module::evaluate(scope, module).map_err(|_| ExnThrown)
+    let evaluation = js::module::evaluate(scope, module).map_err(|_| ExnThrown)?;
+    if with_state(|state| state.node_compat.get()) && !is_commonjs {
+        // The microtasks an ES module entry queued run before the ticks it queued, as in Node.js.
+        js::jobs::run_microtasks(scope);
+    }
+    Ok(evaluation)
 }
 
 /// Helper to set a value export on a module environment object.
@@ -1563,5 +2276,163 @@ mod tests {
             assert!(read_global_string(&scope, "globalThis._error")
                 .contains("Cannot resolve module './missing.js'"));
         }
+    }
+
+    /// A runtime like [`test_runtime`]'s, with Node.js compatibility enabled.
+    fn node_compat_runtime() -> std::rc::Rc<Runtime> {
+        let config = RuntimeConfig::from_args(
+            ["starling", "--node-compat", "-e", "42"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        Runtime::init(&config).expect("runtime init")
+    }
+
+    /// Package `exports` conditions match in the package's object order: the runtime key wins
+    /// where it comes first, and `node` only matches with Node.js compatibility enabled.
+    #[test]
+    fn exports_conditions_depend_on_node_compat() {
+        let dir = test_tempdir();
+        for (name, exports) in [
+            (
+                "conds",
+                r#"{"node": "./node.js", "import": "./import.js", "default": "./default.js"}"#,
+            ),
+            (
+                "keyed",
+                r#"{"starlingmonkey": "./sm.js", "node": "./node.js", "default": "./default.js"}"#,
+            ),
+        ] {
+            let pkg = dir.path().join("node_modules").join(name);
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                format!(r#"{{"exports": {exports}}}"#),
+            )
+            .unwrap();
+            for file in ["node", "import", "default", "sm"] {
+                std::fs::write(
+                    pkg.join(format!("{file}.js")),
+                    format!("export default '{file}';\n"),
+                )
+                .unwrap();
+            }
+        }
+
+        let runtimes = [
+            (test_runtime as fn() -> std::rc::Rc<Runtime>, "import sm"),
+            (node_compat_runtime, "node sm"),
+        ];
+        for (runtime, expected) in runtimes {
+            let rt = runtime();
+            rt.reset_module_loader(dir.path().to_path_buf());
+            let scope = rt.default_global();
+            unsafe {
+                evaluate_module(
+                    &scope,
+                    "import a from 'conds'; import b from 'keyed'; globalThis._picked = `${a} ${b}`;",
+                    "entry.mjs",
+                )
+                .expect("module evaluation failed");
+            }
+            assert_eq!(read_global_string(&scope, "globalThis._picked"), expected);
+        }
+    }
+
+    /// A file-backed module's `import.meta` has its `file:` URL, path and directory, `main` is
+    /// `true` only for the entry module, and `resolve` resolves relative to the module without
+    /// loading anything.
+    #[test]
+    fn import_meta_describes_the_module() {
+        let dir = test_tempdir();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("target.js"), "throw new Error('loaded');\n").unwrap();
+        std::fs::write(
+            sub.join("meta.js"),
+            "globalThis._meta = { ...import.meta, resolved: import.meta.resolve('./target.js') };\n",
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.mjs");
+
+        let rt = test_runtime();
+        rt.reset_module_loader(dir.path().to_path_buf());
+        let scope = rt.default_global();
+        unsafe {
+            evaluate_module(
+                &scope,
+                "import './sub/meta.js';\n\
+                 globalThis._entryMain = import.meta.main;\n\
+                 try { import.meta.resolve('./missing.js'); } catch (e) { globalThis._error = e.name; }",
+                entry.to_str().unwrap(),
+            )
+            .expect("module evaluation failed");
+        }
+
+        let canonical_sub = std::fs::canonicalize(&sub).unwrap();
+        let meta_path = canonical_sub.join("meta.js");
+        let url_of = |path: &Path| url::Url::from_file_path(path).unwrap().to_string();
+        assert_eq!(read_global_string(&scope, "_meta.url"), url_of(&meta_path));
+        assert_eq!(
+            read_global_string(&scope, "_meta.filename"),
+            meta_path.to_str().unwrap()
+        );
+        assert_eq!(
+            read_global_string(&scope, "_meta.dirname"),
+            canonical_sub.to_str().unwrap()
+        );
+        assert_eq!(
+            read_global_string(&scope, "_meta.resolved"),
+            url_of(&canonical_sub.join("target.js"))
+        );
+        assert_eq!(
+            read_global_string(&scope, "`${_meta.main} ${_entryMain} ${_error}`"),
+            "false true TypeError"
+        );
+    }
+
+    /// A builtin module is created on its first import, by name or alias, and every later import
+    /// gets the same module. It takes precedence over a file the specifier would resolve to.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn builtin_modules_are_created_on_first_import() {
+        thread_local! {
+            static CREATED: Cell<u32> = const { Cell::new(0) };
+        }
+        unsafe fn create(scope: &Scope<'_>, name: &'static str) -> bool {
+            CREATED.with(|created| created.set(created.get() + 1));
+            let value = scope.root_value(js::value::from_i32(7));
+            unsafe { register_synthetic_module(scope, name, &[("value", value)]) }.is_ok()
+        }
+
+        let dir = test_tempdir();
+        let shadow = dir.path().join("node_modules").join("builtin-alias");
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::write(shadow.join("index.js"), "export const value = 'file';\n").unwrap();
+
+        register_builtin_module(BuiltinModule {
+            name: "test:builtin",
+            aliases: &["builtin-alias"],
+            create,
+        });
+        let rt = node_compat_runtime();
+        rt.reset_module_loader(dir.path().to_path_buf());
+        let scope = rt.default_global();
+        unsafe {
+            evaluate_module(
+                &scope,
+                "import { value as a } from 'test:builtin';\n\
+                 import { value as b } from 'builtin-alias';\n\
+                 const c = (await import('builtin-alias')).value;\n\
+                 globalThis._values = `${a} ${b} ${c}`;",
+                "entry.mjs",
+            )
+            .expect("module evaluation failed");
+            crate::event_loop::run_microtasks(&scope);
+        }
+        clear_builtin_modules();
+        assert_eq!(read_global_string(&scope, "globalThis._values"), "7 7 7");
+        assert_eq!(CREATED.with(Cell::get), 1);
     }
 }

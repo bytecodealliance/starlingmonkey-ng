@@ -103,6 +103,12 @@ impl JSType for ArrayBuffer {
     fn js_class() -> *const JSClass {
         crate::class::proto_key_to_class(JSProtoKey::JSProto_ArrayBuffer)
     }
+
+    /// Fixed-length and resizable `ArrayBuffer`s have different classes.
+    #[inline]
+    unsafe fn is_instance(obj: *mut JSObject) -> bool {
+        unsafe { JS::IsArrayBufferObject(obj) }
+    }
 }
 
 impl<'s> Stack<'s, ArrayBuffer> {
@@ -755,6 +761,23 @@ impl<'s> Stack<'s, Uint8Array> {
                 byte_offset,
                 length as i64,
             )
+        };
+        root_or_throw(scope, obj)
+    }
+
+    /// Construct a `Uint8Array` viewing `buffer` from `byte_offset` to its end, without copying.
+    ///
+    /// This is `new Uint8Array(buffer, byteOffset)`: for a resizable `buffer`, the view's length
+    /// follows the buffer's. `byte_offset` must be at most `buffer`'s byte length.
+    pub fn with_buffer_to_end(
+        scope: &'s Scope<'_>,
+        buffer: Stack<'_, ArrayBuffer>,
+        byte_offset: usize,
+    ) -> Result<Self, ExnThrown> {
+        // SAFETY: `buffer` is a live, rooted, non-detached `ArrayBuffer`. A length of -1 views the
+        // buffer to its end.
+        let obj = unsafe {
+            wrappers2::JS_NewUint8ArrayWithBuffer(scope.cx_mut(), buffer.handle(), byte_offset, -1)
         };
         root_or_throw(scope, obj)
     }

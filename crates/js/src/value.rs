@@ -28,10 +28,10 @@
 use std::hint::cold_path;
 
 use mozjs::gc::{Handle, HandleFunction};
-use mozjs::jsapi::{BigInt, JSObject, JSString};
+use mozjs::jsapi::{BigInt, JSObject, JSString, Symbol};
 use mozjs::jsval::{
     BigIntValue, BooleanValue, DoubleValue, Int32Value, JSVal, NullValue, ObjectOrNullValue,
-    ObjectValue, PrivateValue, StringValue, UInt32Value, UndefinedValue,
+    ObjectValue, PrivateValue, StringValue, SymbolValue, UInt32Value, UndefinedValue,
 };
 
 use crate::conversion::ToJSVal;
@@ -117,6 +117,14 @@ pub fn from_bigint(bi: Handle<*mut BigInt>) -> JSVal {
     // SAFETY: the `BigInt` is rooted via the handle, so the reference is valid
     // for the duration of this call.
     unsafe { BigIntValue(&*bi.get()) }
+}
+
+/// Create a value from a rooted symbol handle.
+#[inline]
+pub fn from_symbol(symbol: Handle<*mut Symbol>) -> JSVal {
+    // SAFETY: the symbol is rooted via the handle, so the reference is valid for the duration of
+    // this call.
+    unsafe { SymbolValue(&*symbol.get()) }
 }
 
 /// Create a value from a rooted function handle.

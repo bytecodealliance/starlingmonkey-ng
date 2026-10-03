@@ -247,6 +247,7 @@ pub(crate) async fn dispatch_fetch<'s, S, F>(
     headers: http::HeaderMap,
     incoming_body: Option<platform::http::IncomingBody>,
     content_length: Option<u64>,
+    client_address: Option<std::net::SocketAddr>,
     sleep: S,
     clock: &RequestClock,
 ) -> Option<DispatchedFetch<'s>>
@@ -347,8 +348,12 @@ where
             // `FetchEvent::dispatch`.
             // Step 17.4.1 runs after step 17.4.3 here, since creating the event takes the request
             // object that step 17.4.6 initializes it with.
-            let event = FetchEvent::dispatch(scope, request, ScriptStackState::Empty).ok()?;
-            Some((event, abort_controller))
+            // A request's listeners start without an async context, whatever is current.
+            let previous = js::async_context::Snapshot::default().enter();
+            let event =
+                FetchEvent::dispatch_from(scope, request, ScriptStackState::Empty, client_address);
+            previous.enter();
+            Some((event.ok()?, abort_controller))
         })();
         js::exception::report_and_clear(scope, "serve dispatch");
         event

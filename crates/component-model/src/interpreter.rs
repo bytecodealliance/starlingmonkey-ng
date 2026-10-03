@@ -1835,6 +1835,72 @@ fn wit_function_name(interface: Option<&str>, name: &str) -> String {
     }
 }
 
+/// A WIT type as WIT source spells it, such as `future<list<string>>`. Named
+/// types are spelled by their name, without their interface.
+pub(crate) fn wit_type_name(ty: Type) -> String {
+    let named = |name: Option<&str>, spelled: &dyn Fn() -> String| match name {
+        Some(name) => name.to_string(),
+        None => spelled(),
+    };
+    let optional = |base: &str, ty: Option<Type>| match ty {
+        Some(ty) => format!("{base}<{}>", wit_type_name(ty)),
+        None => base.to_string(),
+    };
+    match ty {
+        Type::U8 => "u8".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::U64 => "u64".to_string(),
+        Type::S8 => "s8".to_string(),
+        Type::S16 => "s16".to_string(),
+        Type::S32 => "s32".to_string(),
+        Type::S64 => "s64".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Char => "char".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::String => "string".to_string(),
+        Type::ErrorContext => "error-context".to_string(),
+        Type::Record(record) => record.name().to_string(),
+        Type::Own(resource) => resource.name().to_string(),
+        Type::Borrow(resource) => format!("borrow<{}>", resource.name()),
+        Type::Flags(flags) => flags.name().to_string(),
+        Type::Enum(e) => e.name().to_string(),
+        Type::Variant(variant) => variant.name().to_string(),
+        Type::Alias(alias) => alias.name().to_string(),
+        Type::Tuple(tuple) => named(tuple.name(), &|| {
+            let types: Vec<String> = tuple.types().map(wit_type_name).collect();
+            format!("tuple<{}>", types.join(", "))
+        }),
+        Type::Option(option) => named(option.name(), &|| {
+            format!("option<{}>", wit_type_name(option.ty()))
+        }),
+        Type::Result(result) => named(result.name(), &|| match (result.ok(), result.err()) {
+            (None, None) => "result".to_string(),
+            (Some(ok), None) => format!("result<{}>", wit_type_name(ok)),
+            (None, Some(err)) => format!("result<_, {}>", wit_type_name(err)),
+            (Some(ok), Some(err)) => {
+                format!("result<{}, {}>", wit_type_name(ok), wit_type_name(err))
+            }
+        }),
+        Type::List(list) => named(list.name(), &|| {
+            format!("list<{}>", wit_type_name(list.ty()))
+        }),
+        Type::Map(map) => named(map.name(), &|| {
+            format!(
+                "map<{}, {}>",
+                wit_type_name(map.key_type()),
+                wit_type_name(map.value_type())
+            )
+        }),
+        Type::FixedLengthList(list) => named(list.name(), &|| {
+            format!("list<{}, {}>", wit_type_name(list.ty()), list.len())
+        }),
+        Type::Future(future) => named(future.name(), &|| optional("future", future.ty())),
+        Type::Stream(stream) => named(stream.name(), &|| optional("stream", stream.ty())),
+    }
+}
+
 js::instance_local! {
     /// The name of the export the application implements `wasi:http/handler`
     /// through, which messages name `wasi:http/handler` (see [`install_exports`]).

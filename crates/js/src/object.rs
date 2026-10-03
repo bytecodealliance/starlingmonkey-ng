@@ -107,6 +107,25 @@ impl<'s> Stack<'s, Object> {
         unsafe { Self::from_mozjs_rval(scope, obj) }
     }
 
+    /// Create a new plain object for a constructor call, whose prototype is `new.target`'s
+    /// `prototype` property, or `Object.prototype` if that isn't an object.
+    pub fn new_plain_for_constructor(
+        scope: &'s Scope<'_>,
+        args: &mozjs::jsapi::CallArgs,
+    ) -> Result<Self, ExnThrown> {
+        let new_target =
+            Self::from_value(scope, args.new_target().get()).map_err(|e| e.throw(scope))?;
+        let proto = new_target.get_property(scope, c"prototype")?;
+        let Ok(proto) = Self::from_value(scope, proto) else {
+            return Self::new_plain(scope);
+        };
+        // A null class makes a plain object.
+        let obj = unsafe {
+            wrappers2::JS_NewObjectWithGivenProto(scope.cx_mut(), std::ptr::null(), proto.handle())
+        };
+        unsafe { Self::from_mozjs_rval(scope, obj) }
+    }
+
     // ---------------------------------------------------------------------------
     // Pointer access
     // ---------------------------------------------------------------------------
@@ -159,6 +178,25 @@ impl<'s> Stack<'s, Object> {
                 scope.cx_mut(),
                 self.handle(),
                 name.as_ptr(),
+                rval.reborrow(),
+            )
+        };
+        ExnThrown::check(ok)?;
+        Ok(rval.handle())
+    }
+
+    /// The result of JS's `ToPrimitive(this, number)`: calls `Symbol.toPrimitive` with `"number"`,
+    /// or else `valueOf` and then `toString`.
+    pub fn to_primitive_number<'a>(
+        &self,
+        scope: &'a Scope<'_>,
+    ) -> Result<HandleValue<'a>, ExnThrown> {
+        let mut rval = scope.root_value_mut(UndefinedValue());
+        let ok = unsafe {
+            wrappers2::ToPrimitive(
+                scope.cx_mut(),
+                self.handle(),
+                mozjs::jsapi::JSType::JSTYPE_NUMBER,
                 rval.reborrow(),
             )
         };
@@ -308,6 +346,78 @@ impl<'s> Stack<'s, Object> {
         };
         ExnThrown::check(ok)?;
         Ok(found)
+    }
+
+    /// Define the accessor property `name` with `getter` and `setter`, either of which can be
+    /// absent, and the property attributes `attrs`.
+    pub fn define_accessor(
+        &self,
+        scope: &Scope<'_>,
+        name: &CStr,
+        getter: Option<Stack<'_, Object>>,
+        setter: Option<Stack<'_, Object>>,
+        attrs: c_uint,
+    ) -> Result<(), ExnThrown> {
+        let getter = getter.map_or(HandleObject::null(), |getter| getter.handle());
+        let setter = setter.map_or(HandleObject::null(), |setter| setter.handle());
+        let ok = unsafe {
+            wrappers2::JS_DefineProperty2(
+                scope.cx_mut(),
+                self.handle(),
+                name.as_ptr(),
+                getter,
+                setter,
+                attrs,
+            )
+        };
+        ExnThrown::check(ok)
+    }
+
+    /// Delete a property by key.
+    pub fn delete_property_by_id(&self, scope: &Scope<'_>, id: HandleId) -> Result<(), ExnThrown> {
+        let ok = unsafe { wrappers2::JS_DeletePropertyById1(scope.cx_mut(), self.handle(), id) };
+        ExnThrown::check(ok)
+    }
+
+    /// The object's own enumerable string keys, as `Object.keys` returns them.
+    pub fn own_enumerable_keys<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+    ) -> Result<Vec<HandleValue<'r>>, ExnThrown> {
+        // SAFETY: as in `own_keys`.
+        unsafe {
+            let mut ids = mozjs::rust::IdVector::new(scope.cx_mut());
+            ExnThrown::check(wrappers2::GetPropertyKeys(
+                scope.cx_mut(),
+                self.handle(),
+                mozjs::jsapi::JSITER_OWNONLY,
+                ids.handle_mut(),
+            ))?;
+            (0..ids.len())
+                .map(|i| crate::id::id_to_value(scope, ids[i]))
+                .collect()
+        }
+    }
+
+    /// This object's own property keys, strings and symbols, in `Reflect.ownKeys` order.
+    pub fn own_keys<'r>(&self, scope: &'r Scope<'_>) -> Result<Vec<HandleValue<'r>>, ExnThrown> {
+        // SAFETY: the vector is rooted for its lifetime, and each id is converted to a rooted value
+        // before the next call that can GC.
+        unsafe {
+            let mut ids = mozjs::rust::IdVector::new(scope.cx_mut());
+            let flags = mozjs::jsapi::JSITER_OWNONLY
+                | mozjs::jsapi::JSITER_HIDDEN
+                | mozjs::jsapi::JSITER_SYMBOLS;
+            ExnThrown::check(wrappers2::GetPropertyKeys(
+                scope.cx_mut(),
+                self.handle(),
+                flags,
+                ids.handle_mut(),
+            ))?;
+            (0..ids.len())
+                .map(|i| crate::id::id_to_value(scope, ids[i]))
+                .collect()
+        }
     }
 
     /// Delete a property by name.

@@ -343,6 +343,44 @@ fn test_event_loop() {
         );
     }
 
+    // ---- Test 8c: unreferenced JS timers don't keep the loop alive ----
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut el = EventLoop::new();
+        let eval = |source: &str| {
+            js::compile::evaluate_with_filename(&scope, source, "<test-unref>", 1).unwrap()
+        };
+        let id = with_event_loop(&el, |_| eval("setTimeout(function() {}, 100000)")).to_number();
+        el.set_js_timer_ref(id as u64, false);
+        assert!(!el.is_alive(), "an unreferenced timer keeps the loop alive");
+        assert!(!el.is_empty(), "unreferencing a timer removed it");
+        el.set_js_timer_ref(id as u64, true);
+        assert!(
+            el.is_alive(),
+            "a re-referenced timer doesn't keep the loop alive"
+        );
+        el.clear_js_timer(id as u64);
+
+        // An unreferenced interval runs, and keeps running across re-queues, while a referenced
+        // timer keeps the loop alive. The referenced timer re-arms itself until the interval ran
+        // twice.
+        let interval = with_event_loop(&el, |_| {
+            eval(
+                "globalThis._unrefTicks = 0; \
+                 (function wait() { if (globalThis._unrefTicks < 2) setTimeout(wait, 1); })(); \
+                 setInterval(function() { globalThis._unrefTicks++; }, 1)",
+            )
+        })
+        .to_number();
+        el.set_js_timer_ref(interval as u64, false);
+        block_on_event_loop(&scope, &mut el);
+        assert!(
+            eval("globalThis._unrefTicks").to_number() >= 2.0,
+            "an unreferenced interval stopped running"
+        );
+        el.clear_js_timer(interval as u64);
+    }
+
     // ---- Test 8b: setTimeout forwards extra arguments to the callback ----
     #[cfg(not(target_arch = "wasm32"))]
     {

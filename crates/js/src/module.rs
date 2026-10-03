@@ -204,6 +204,23 @@ pub unsafe fn set_module_load_hook(
     mozjs::jsapi::SetModuleLoadHook(rt, hook);
 }
 
+/// Install the hook that populates a module's `import.meta` object.
+///
+/// The engine calls `hook` once per module, on the first evaluation of `import.meta` in it, with
+/// the module record and the empty meta object, which the hook defines properties on. Without a
+/// hook, evaluating `import.meta` throws.
+///
+/// # Safety
+///
+/// `rt` must be a valid `JSRuntime` pointer. `hook` must be a valid function pointer (or `None` to
+/// clear the hook).
+pub unsafe fn set_module_metadata_hook(
+    rt: *mut mozjs::jsapi::JSRuntime,
+    hook: mozjs::jsapi::ModuleMetadataHook,
+) {
+    mozjs::jsapi::SetModuleMetadataHook(rt, hook);
+}
+
 /// This module's share of the crate's thread-local state. See [`crate::tls`].
 pub(crate) struct ModuleTls {
     /// Outcome of the innermost in-flight [`load_requested_modules`] call:

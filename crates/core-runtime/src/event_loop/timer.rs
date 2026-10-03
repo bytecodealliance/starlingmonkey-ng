@@ -9,8 +9,9 @@
 //! # Global registration
 //!
 //! Call [`install_timer_globals`] to add `setTimeout`, `setInterval`,
-//! `clearTimeout`, and `clearInterval` to a global object. These functions
-//! interact with the event loop via [`with_active_event_loop`].
+//! `clearTimeout`, `clearInterval`, and `queueMicrotask` to a global object.
+//! The timer functions interact with the event loop via
+//! [`with_active_event_loop`].
 
 use platform::clock::Instant;
 use std::time::Duration;
@@ -30,6 +31,8 @@ use super::{with_active_event_loop, Task, TaskId};
 enum TimerHandler {
     Function {
         callback: RootedTraceableBox<Heap<js::function::Callable>>,
+        /// The `this` the callback is called with, or `None` for the global.
+        this: Option<RootedTraceableBox<Heap<Value>>>,
         /// The `setTimeout`/`setInterval` arguments after the timeout, passed
         /// to the callback on every invocation (HTML timer initialization
         /// steps: "invoke handler given arguments").
@@ -75,6 +78,8 @@ pub struct TimerTask {
     /// The JS-visible timer id this task is registered under in the event
     /// loop's map of setTimeout and setInterval IDs.
     timer_id: u64,
+    /// Whether the nested-timer clamp applies when an interval repeats.
+    clamped: bool,
 }
 
 impl TimerTask {
@@ -89,11 +94,13 @@ impl TimerTask {
         Self {
             handler: TimerHandler::Function {
                 callback: RootedTraceableBox::new(Heap::from(callback)),
+                this: None,
                 args,
             },
             interval,
             nesting_level,
             timer_id,
+            clamped: true,
         }
     }
 
@@ -104,6 +111,7 @@ impl TimerTask {
             interval,
             nesting_level,
             timer_id,
+            clamped: true,
         }
     }
 }
@@ -123,18 +131,28 @@ impl Task for TimerTask {
             interval,
             nesting_level,
             timer_id,
+            clamped,
         } = *self;
 
-        // Run the handler with the global as `this`: call the function, or evaluate the string
-        // as a classic script in the global scope.
+        // Run the handler: call the function with its `this`, or the global if it has none, or
+        // evaluate the string as a classic script in the global scope.
         // Timers the handler schedules nest one level below this task (see
         // `CURRENT_TIMER_NESTING`); restore the previous level afterwards.
         let previous_nesting = CURRENT_TIMER_NESTING.replace(nesting_level);
+        let started = Instant::now();
         let failed = match &handler {
-            TimerHandler::Function { callback, args } => {
+            TimerHandler::Function {
+                callback,
+                this,
+                args,
+            } => {
                 let cb = callback.get(scope);
                 let arg_handles: Vec<_> = args.iter().map(|arg| arg.get(scope)).collect();
-                js::Function::call(scope, scope.global(), cb, &arg_handles).is_err()
+                match this {
+                    Some(this) => js::Function::call(scope, this.get(scope), cb, &arg_handles),
+                    None => js::Function::call(scope, scope.global(), cb, &arg_handles),
+                }
+                .is_err()
             }
             TimerHandler::Code(code) => {
                 js::compile::evaluate_with_filename(scope, code, "<timer>", 1).is_err()
@@ -148,23 +166,31 @@ impl Task for TimerTask {
         // error must not kill the interval. If the ID was cancelled during the run (via
         // clearInterval), requeue_timer skips it. The repeat re-enters the timer initialization
         // steps, so the nested-timer clamp applies with this task's nesting level, and the
-        // re-queued task is one level deeper.
+        // re-queued task is one level deeper. A clamped (HTML) interval is due `delay` after the
+        // handler returned. An unclamped (Node.js) one is due `delay` after the handler started,
+        // as Node.js schedules it.
         if let Some(interval) = interval {
-            let delay = clamp_nested_timeout(nesting_level, interval);
+            let delay = if clamped {
+                clamp_nested_timeout(nesting_level, interval)
+            } else {
+                interval
+            };
             let new_task = TimerTask {
                 handler,
                 interval: Some(interval),
                 nesting_level: nesting_level.saturating_add(1),
                 timer_id,
+                clamped,
             };
+            let from = if clamped { Instant::now() } else { started };
             with_active_event_loop(|el| {
-                el.requeue_js_timer(timer_id, id, Box::new(new_task), Instant::now() + delay);
+                el.requeue_js_timer(timer_id, id, Box::new(new_task), from + delay);
             });
         } else {
             // One-shot: release the timer id, mirroring HTML's "remove
             // global's map of setTimeout and setInterval IDs[id]" substep
             // after the handler ran.
-            with_active_event_loop(|el| el.js_timer_fired(timer_id));
+            with_active_event_loop(|el| el.js_timer_fired(timer_id, id));
         }
 
         if failed {
@@ -180,8 +206,8 @@ impl Task for TimerTask {
 // Timer global functions (setTimeout, setInterval, etc.)
 // ---------------------------------------------------------------------------
 
-/// Install `setTimeout`, `setInterval`, `clearTimeout`, and `clearInterval`
-/// on a global object.
+/// Install `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, and
+/// `queueMicrotask` on a global object.
 pub fn install_timer_globals(scope: &Scope<'_>, global: js::Object<'_>) {
     timer_globals::add_to_global(scope, global);
 }
@@ -193,7 +219,7 @@ pub enum TimerHandlerArg<'a> {
     String(String),
 }
 
-/// The timer methods of `WindowOrWorkerGlobalScope`.
+/// The timer and microtask methods of `WindowOrWorkerGlobalScope`.
 #[js::macros::jsglobals]
 mod timer_globals {
     use js::error::ExnThrown;
@@ -235,6 +261,90 @@ mod timer_globals {
         // `remove` `this`'s `map of setTimeout and setInterval IDs`[_id_].
         super::with_active_event_loop(|el| el.clear_js_timer(id.unwrap_or(0)));
     }
+
+    /// <https://html.spec.whatwg.org/#dom-queuemicrotask>
+    pub fn queue_microtask(scope: &Scope<'_>, callback: js::Callable<'_>) -> Result<(), ExnThrown> {
+        // Queue a microtask to invoke _callback_ with « » and "report".
+        let job = js::Function::new_callback(scope, c"", 0, super::invoke_microtask, *callback)?;
+        js::jobs::queue_microtask(scope, &job)
+    }
+}
+
+/// Report `error` as uncaught in a microtask, as an exception a `queueMicrotask` callback throws is
+/// reported.
+pub fn rethrow_in_microtask(
+    scope: &Scope<'_>,
+    error: js::prelude::HandleValue<'_>,
+) -> Result<(), js::error::ExnThrown> {
+    let thrower = js::Function::new_callback(scope, c"", 0, rethrow, error)?;
+    let job = js::Function::new_callback(scope, c"", 0, invoke_microtask, *thrower)?;
+    js::jobs::queue_microtask(scope, &job)
+}
+
+/// The body of the function [`rethrow_in_microtask`] queues, whose payload is the error it throws.
+fn rethrow(
+    scope: &Scope<'_>,
+    _args: js::function::CallbackArgs<'_>,
+    payload: js::prelude::HandleValue,
+) -> Result<js::native::Value, js::error::ExnThrown> {
+    Err(js::exception::set_pending(
+        scope,
+        payload,
+        js::native::ExceptionStackBehavior::DoNotCapture,
+    ))
+}
+
+/// The body of a microtask `queueMicrotask` queued, whose payload is its callback: invoke the
+/// callback with no arguments, and report an exception it throws.
+fn invoke_microtask(
+    scope: &Scope<'_>,
+    _args: js::function::CallbackArgs<'_>,
+    payload: js::prelude::HandleValue,
+) -> Result<js::native::Value, js::error::ExnThrown> {
+    let undefined = scope.root_value(js::value::undefined());
+    if js::Function::call(scope, undefined, payload, js::function::EmptyArgs).is_err() {
+        super::handle_and_clear_exception(scope);
+    }
+    Ok(js::value::undefined())
+}
+
+/// Start a timer on the active event loop that calls `callback` with `this` and `args` after
+/// `delay`, and every `delay` after that if `repeat`. The nested-timer clamp doesn't apply. The
+/// timer gets the ID `id`, which must not belong to a queued timer, or a new ID if `id` is `None`.
+/// `clearTimeout` and `clearInterval` cancel it by that ID.
+///
+/// Returns the ID, or `None` if no event loop is active.
+pub fn start_timer(
+    scope: &Scope<'_>,
+    callback: js::Callable<'_>,
+    this: HandleValue<'_>,
+    args: &[HandleValue<'_>],
+    delay: Duration,
+    repeat: bool,
+    id: Option<u64>,
+) -> Option<u64> {
+    let nesting_level = CURRENT_TIMER_NESTING.with(|cell| cell.get());
+    let args = args
+        .iter()
+        .map(|arg| RootedTraceableBox::new(Heap::from(arg.get())))
+        .collect();
+    let this = RootedTraceableBox::new(Heap::from(this.get()));
+    let deadline = Instant::now() + delay;
+    with_active_event_loop(|el| {
+        el.queue_js_timer_with_id(scope, id, deadline, |timer_id| {
+            Box::new(TimerTask {
+                handler: TimerHandler::Function {
+                    callback: RootedTraceableBox::new(Heap::from(callback)),
+                    this: Some(this),
+                    args,
+                },
+                interval: repeat.then_some(delay),
+                nesting_level: nesting_level.saturating_add(1),
+                timer_id,
+                clamped: false,
+            })
+        })
+    })
 }
 
 /// <https://html.spec.whatwg.org/#timer-initialisation-steps>, for `setTimeout` (`repeat` false)

@@ -157,6 +157,13 @@ interface echoes {
 
   // Returns a future whose promise never settles.
   never-future: async func() -> future<u32>;
+  // Returns a future whose promise never settles, and which the guest only
+  // references weakly.
+  unreferenced-never-future: async func() -> future<u32>;
+  // Allocates garbage and waits on timers until the promise
+  // `unreferenced-never-future` returned is collected, and returns whether it
+  // was.
+  collect-unreferenced-future: async func() -> bool;
   // Returns a future that delivers a host thing holding `value`, which a timer
   // disposes of once the promise fulfilled.
   disposed-thing-future: async func(value: string) -> future<host-thing>;

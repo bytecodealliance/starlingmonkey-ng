@@ -304,6 +304,8 @@ impl Runtime {
     /// be read, throws, or leaves asynchronous work behind.
     pub fn init(config: &RuntimeConfig) -> Result<Rc<Self>, String> {
         crate::config::set_enforce_fetch_restrictions(config.enforce_fetch_restrictions());
+        event_loop::set_blocking_host_io_while_serving(config.allow_blocking_host_io);
+        event_loop::set_node_http_listen(config.node_http_listen);
         // SAFETY: no parent runtime is given, which is the only condition.
         let mut mozjs_rt =
             unsafe { MozJSRuntime::create_with_internal_job_queues(engine_handle(), None) };
@@ -345,6 +347,7 @@ impl Runtime {
         // Ensure `FinalizationRegistry` callbacks get run.
         crate::finalization::install(rt.mozjs_rt_mut().cx());
 
+        rt.modules.node_compat.set(config.node_compat);
         module::init_module_loader(&rt, config.base_path());
 
         // Create the default global and register builtins.
@@ -531,9 +534,11 @@ impl Drop for Runtime {
         }
         // SAFETY: stopping the recording has no precondition.
         unsafe { js::stack::record_origins(None) };
-        // The tracked promises and held jobs are rooted, so they go while the context is alive.
+        // The tracked promises, held jobs and async contexts are rooted, so they go while the
+        // context is alive.
         js::jobs::clear_unhandled_rejections();
         js::jobs::clear_held_jobs();
+        js::async_context::clear();
         // Futures left by loops that were never canceled, and those spawned with no loop active,
         // have to go while the context is alive.
         js::promise::cancel_all_pending_futures();

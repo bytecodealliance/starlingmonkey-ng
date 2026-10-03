@@ -1472,6 +1472,36 @@ async fn never_settling_future_lets_the_call_finish() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A promise lowered to a `future<u32>` that is garbage-collected without
+/// settling is reported on stderr, since the future's writer then stays
+/// unwritten for the instance's lifetime. The guest has no way to force a
+/// collection, so it allocates garbage until a `WeakRef` to the promise is
+/// cleared.
+#[tokio::test]
+async fn collected_unsettled_future_is_reported() -> anyhow::Result<()> {
+    let (mut store, stderr) = store_capturing_stderr();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    let echoes = instance.test_streams_echoes();
+    let collected = store
+        .run_concurrent(async |store| {
+            let mut future = echoes.call_unreferenced_never_future(store).await?;
+            let collected = echoes.call_collect_unreferenced_future(store).await?;
+            future.close_with(store)?;
+            anyhow::Ok(collected)
+        })
+        .await??;
+    let stderr = shared::pipe_text(&stderr);
+    assert!(collected, "the promise must be collected; stderr: {stderr}");
+    assert!(
+        stderr.contains(
+            "Warning: a promise lowered to a future<u32> was garbage-collected without \
+             settling, so the future's writable end leaks for the instance's lifetime"
+        ),
+        "stderr must report the leaked writer; got: {stderr}"
+    );
+    Ok(())
+}
+
 /// A future's value is lowered when its promise settles, so a wrapper disposed
 /// of right after that is still delivered.
 #[tokio::test]

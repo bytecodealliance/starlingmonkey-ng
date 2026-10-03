@@ -18,6 +18,7 @@
 
 use std::cell::{Cell, RefCell};
 
+use crate::async_context::Snapshot;
 use crate::gc::handle::RootedHeap;
 use crate::gc::scope::{RootScope, Scope};
 use mozjs::jsapi::{JSContext as RawJSContext, PromiseRejectionHandlingState};
@@ -27,9 +28,10 @@ use mozjs_sys::jsval::ObjectValue;
 use super::error::ExnThrown;
 
 crate::instance_local! {
-    /// Promises rejected while no handler was attached, in rejection order, until
-    /// [`take_unhandled_rejections`] takes them. A promise that gets a handler first is removed.
-    static UNHANDLED_REJECTIONS: RefCell<Vec<RootedHeap<crate::promise::Promise>>> =
+    /// Promises rejected while no handler was attached, with the async context current when they
+    /// were rejected, in rejection order, until [`take_unhandled_rejections`] takes them. A promise
+    /// that gets a handler first is removed.
+    static UNHANDLED_REJECTIONS: RefCell<Vec<(RootedHeap<crate::promise::Promise>, Snapshot)>> =
         const { RefCell::new(Vec::new()) };
 
     /// Jobs [`hold_jobs_queued_during`] took out of the job queue, in queue order, until
@@ -39,6 +41,32 @@ crate::instance_local! {
 
     /// Set while [`hold_jobs_queued_during`] runs its closure.
     static HOLDING: Cell<bool> = const { Cell::new(false) };
+
+    /// The queue [`set_tick_queue`] installed.
+    static TICK_QUEUE: Cell<Option<TickQueue>> = const { Cell::new(None) };
+}
+
+/// A queue of callbacks that [`run_jobs`] drains ahead of the microtask queue, such as Node.js's
+/// `process.nextTick` queue.
+#[derive(Clone, Copy)]
+pub struct TickQueue {
+    /// Runs every queued callback, including callbacks queued while it runs, and reports the
+    /// exceptions they throw.
+    pub run: fn(&Scope<'_>),
+    /// Whether `run` would run a callback.
+    pub is_pending: fn(&Scope<'_>) -> bool,
+}
+
+/// Install `queue` as the tick queue, replacing a queue installed before.
+pub fn set_tick_queue(queue: TickQueue) {
+    TICK_QUEUE.with(|cell| cell.set(Some(queue)));
+}
+
+/// Whether the tick queue would run a callback.
+fn has_pending_ticks(scope: &Scope<'_>) -> bool {
+    TICK_QUEUE
+        .with(Cell::get)
+        .is_some_and(|queue| (queue.is_pending)(scope))
 }
 
 /// Enable SpiderMonkey's built-in internal job queue.
@@ -55,23 +83,52 @@ pub fn use_internal_job_queues(scope: &Scope<'_>) -> Result<(), ExnThrown> {
 /// FIFO the engine uses for promise reactions.
 ///
 /// The queue holds only engine-internal job records, so `job` is enqueued as a
-/// fulfillment reaction on an already-resolved promise. It is therefore called
-/// with one argument, that promise's `undefined` result. An exception it throws
-/// rejects a promise the engine allocates for the reaction, which counts as an
+/// fulfillment reaction on a resolved promise. It is therefore called with one
+/// argument, that promise's `undefined` result. An exception it throws rejects
+/// a promise the engine allocates for the reaction, which counts as an
 /// unhandled rejection. Observing that requires the embedding to install a
 /// promise rejection tracker.
+///
+/// With [`crate::async_context::install_job_queue`]'s queue, the promise is a
+/// new one resolved after `job` is added, so that the reaction captures the
+/// current async context. The engine doesn't capture it for reactions to
+/// settled promises.
 pub fn queue_microtask(scope: &Scope<'_>, job: &crate::Function<'_>) -> Result<(), ExnThrown> {
+    if crate::async_context::is_installed(scope) {
+        let promise = crate::Promise::new_pending(scope)?;
+        promise.add_reactions(scope, Some(**job), None)?;
+        return promise.resolve(scope, scope.root_value(mozjs::jsval::UndefinedValue()));
+    }
     let resolved = crate::Promise::shared_resolved_undefined(scope)?;
     resolved.add_reactions(scope, Some(**job), None)
 }
 
-/// Drain the job queue, executing all pending microtasks.
+/// Drain the tick queue and the job queue, executing all pending callbacks and microtasks.
 ///
-/// This runs all queued promise reactions and other microtasks until the
-/// queue is empty. Jobs held by [`hold_jobs_queued_during`] are enqueued
-/// first, behind the jobs already queued, unless its closure is running.
-/// Jobs held while the queue drains are enqueued and run in the same call.
+/// The tick queue, if one is installed, runs first. Then all queued promise
+/// reactions and other microtasks run until the job queue is empty. Ticks
+/// queued by microtasks run after that, followed by the microtasks they
+/// queue, until both queues are empty.
+///
+/// Jobs held by [`hold_jobs_queued_during`] are enqueued behind the jobs
+/// already queued, unless its closure is running. Jobs held while the queue
+/// drains are enqueued and run in the same call.
 pub fn run_jobs(scope: &Scope<'_>) {
+    let ticks = TICK_QUEUE.with(Cell::get);
+    loop {
+        if let Some(ticks) = ticks {
+            (ticks.run)(scope);
+        }
+        run_microtasks(scope);
+        if crate::async_context::INTERRUPTED.get() || !has_pending_ticks(scope) {
+            return;
+        }
+    }
+}
+
+/// Run the job queue's microtasks and the held jobs until none are left, without running the tick
+/// queue.
+pub fn run_microtasks(scope: &Scope<'_>) {
     loop {
         let stuck = !enqueue_held_jobs(scope);
         unsafe { wrappers2::RunJobs(scope.cx_mut()) }
@@ -81,11 +138,13 @@ pub fn run_jobs(scope: &Scope<'_>) {
     }
 }
 
-/// Returns whether [`run_jobs`] would run anything: a promise reaction or
-/// other microtask is pending in the job queue, or a held job would be
-/// enqueued.
+/// Returns whether [`run_jobs`] would run anything: a tick is queued, a
+/// promise reaction or other microtask is pending in the job queue, or a held
+/// job would be enqueued.
 pub fn has_pending_jobs(scope: &Scope<'_>) -> bool {
-    has_held_jobs() || unsafe { wrappers2::HasJobsPending(scope.cx_mut()) }
+    has_pending_ticks(scope)
+        || has_held_jobs()
+        || unsafe { wrappers2::HasJobsPending(scope.cx_mut()) }
 }
 
 /// Whether [`enqueue_held_jobs`] would enqueue a job.
@@ -108,6 +167,7 @@ pub fn hold_jobs_queued_during<R>(scope: &Scope<'_>, f: impl FnOnce() -> R) -> R
     while unsafe { wrappers2::HasRegularMicroTasks(scope.cx()) } {
         // SAFETY: as above. The job is rooted below before anything can GC.
         let job = unsafe { wrappers2::DequeueNextRegularMicroTask(scope.cx()) };
+        crate::async_context::regular_microtasks_dequeued(1);
         // The internal job queue holds only job objects.
         debug_assert!(job.is_object(), "a regular microtask is an object");
         if !job.is_object() {
@@ -155,9 +215,10 @@ pub fn clear_held_jobs() {
 
 /// Stop draining the job queue.
 ///
-/// After calling this, [`run_jobs`] becomes a no-op until the queue is
-/// re-enabled.
+/// After calling this, [`run_jobs`] does nothing until
+/// [`crate::async_context::clear`] runs.
 pub fn stop_draining(scope: &Scope<'_>) {
+    crate::async_context::INTERRUPTED.set(true);
     unsafe { wrappers2::StopDrainingJobQueue(scope.cx()) }
 }
 
@@ -207,20 +268,24 @@ unsafe extern "C" fn track_rejection(
     UNHANDLED_REJECTIONS.with(|list| {
         let mut list = list.borrow_mut();
         match state {
-            PromiseRejectionHandlingState::Unhandled => list.push(RootedHeap::new(promise)),
-            PromiseRejectionHandlingState::Handled => list.retain(|tracked| *tracked != promise),
+            PromiseRejectionHandlingState::Unhandled => {
+                list.push((RootedHeap::new(promise), Snapshot::capture()))
+            }
+            PromiseRejectionHandlingState::Handled => {
+                list.retain(|(tracked, _)| *tracked != promise)
+            }
         }
     });
 }
 
 /// The promises that were rejected with no handler attached since the last call, and still have
-/// none, in rejection order.
-pub fn take_unhandled_rejections<'s>(scope: &'s Scope<'_>) -> Vec<crate::Promise<'s>> {
+/// none, in rejection order, each with the async context current when it was rejected.
+pub fn take_unhandled_rejections<'s>(scope: &'s Scope<'_>) -> Vec<(crate::Promise<'s>, Snapshot)> {
     let taken = UNHANDLED_REJECTIONS.with(|list| std::mem::take(&mut *list.borrow_mut()));
     taken
-        .iter()
-        .map(|tracked| tracked.get(scope))
-        .filter(|promise| promise.is_rejected() && !promise.is_handled())
+        .into_iter()
+        .map(|(tracked, context)| (tracked.get(scope), context))
+        .filter(|(promise, _)| promise.is_rejected() && !promise.is_handled())
         .collect()
 }
 

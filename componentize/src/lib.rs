@@ -41,7 +41,7 @@ pub(crate) const INIT_INTERFACE_PREFIX: &str = "starling:componentize/init";
 
 /// The name of the interface the runtime's `init` export implements, with the
 /// version of `starling/wit/init.wit` this componentizer calls, such as
-/// `starling:componentize/init@0.1.0`.
+/// `starling:componentize/init@0.2.0`.
 pub fn init_interface_name() -> String {
     let mut resolve = Resolve::default();
     let package = resolve
@@ -59,7 +59,7 @@ pub fn init_interface_name() -> String {
 }
 
 /// The version of the `init` interface `runtime` implements, as the name of its
-/// export, such as `starling:componentize/init@0.1.0`, or `None` for a runtime
+/// export, such as `starling:componentize/init@0.2.0`, or `None` for a runtime
 /// that exports none.
 pub fn runtime_init_interface(runtime: &Runtime) -> anyhow::Result<Option<String>> {
     Ok(builtin_export(runtime.module(), INIT_INTERFACE_PREFIX)?.map(|(_, name)| name))
@@ -617,7 +617,9 @@ pub async fn componentize(
         disabled,
         None,
         false,
+        false,
         add_to_linker,
+        false,
         None,
         true,
     )
@@ -649,6 +651,12 @@ pub struct Componentized {
 ///
 /// Without `debug`, [`finalize::WASIAPISet::Sockets`] is disabled, except for the
 /// `wasi:sockets` interfaces the world imports itself.
+///
+/// With `node_compat`, the runtime has Node.js compatibility enabled: the `node:`
+/// builtin modules, the Node globals and CommonJS modules.
+///
+/// With `allow_blocking_host_io`, synchronous host I/O, such as `fs.readFileSync`,
+/// may block while the component serves requests.
 #[expect(clippy::type_complexity)]
 pub async fn componentize_with_output(
     wit: Wit<'_, impl AsRef<Path>>,
@@ -661,7 +669,9 @@ pub async fn componentize_with_output(
     disabled: &[finalize::WASIAPISet],
     insecure_seed: Option<u128>,
     debug: bool,
+    node_compat: bool,
     add_to_linker: Option<&dyn Fn(&mut Linker<Ctx>) -> anyhow::Result<()>>,
+    allow_blocking_host_io: bool,
     init_location: Option<&str>,
     cache: bool,
 ) -> anyhow::Result<Componentized> {
@@ -913,6 +923,8 @@ pub async fn componentize_with_output(
                         raw_http_handler,
                         init_location.map(str::to_string),
                         debug,
+                        node_compat,
+                        allow_blocking_host_io,
                     )
                     .await
             })

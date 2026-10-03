@@ -120,6 +120,20 @@ pub fn error_from_exception<'a>(
     })
 }
 
+/// Whether the pending exception is a `SyntaxError` with an engine error report, such as a compile
+/// error. Leaves it pending.
+pub fn is_syntax_error_pending(scope: &Scope<'_>) -> bool {
+    let Some(error) = get_pending(scope) else {
+        return false;
+    };
+    let Some(object) = std::ptr::NonNull::new(error.to_object_or_null()) else {
+        return false;
+    };
+    let object = scope.root_object(object);
+    error_from_exception(scope, object)
+        .is_some_and(|report| report.exnType == mozjs::jsapi::JSExnType::JSEXN_SYNTAXERR as i16)
+}
+
 /// Report an uncatchable exception (e.g., OOM or stack overflow).
 pub fn report_uncatchable(scope: &Scope<'_>) {
     unsafe { wrappers2::ReportUncatchableException(scope.cx()) }

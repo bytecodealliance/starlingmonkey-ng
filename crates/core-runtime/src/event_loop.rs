@@ -59,6 +59,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use event_listener::{Event, EventListener};
+use js::async_context::Snapshot;
 use js::error::ExnThrown;
 use js::native::JSTracer;
 
@@ -122,6 +123,83 @@ js::instance_local! {
 /// which runs sync-lifted exports.
 pub fn blocking_allowed() -> bool {
     NO_LOOP_REASON.with(|cell| cell.borrow().is_none())
+}
+
+js::instance_local! {
+    /// Set once the runtime serves requests, which can run concurrently.
+    static SERVING_REQUESTS: Cell<bool> = const { Cell::new(false) };
+    /// Whether blocking on host I/O is allowed while serving requests, from
+    /// `--allow-blocking-host-io`.
+    static BLOCKING_HOST_IO_WHILE_SERVING: Cell<bool> = const { Cell::new(false) };
+    /// Set when the runtime runs its script as a command, where nothing serves requests.
+    static RUNNING_AS_COMMAND: Cell<bool> = const { Cell::new(false) };
+    /// Set when the runtime is a component without a `wasi:http/handler` export.
+    static WITHOUT_REQUEST_HANDLER: Cell<bool> = const { Cell::new(false) };
+    /// Whether `http.Server.listen()` in a script run as a command accepts connections itself,
+    /// from `--node-http-listen`.
+    static NODE_HTTP_LISTEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record whether `http.Server.listen()` in a script run as a command accepts connections itself.
+pub fn set_node_http_listen(enabled: bool) {
+    NODE_HTTP_LISTEN.with(|cell| cell.set(enabled));
+}
+
+/// Whether `http.Server.listen()` in a script run as a command accepts connections itself.
+pub fn node_http_listen() -> bool {
+    NODE_HTTP_LISTEN.with(Cell::get)
+}
+
+/// Record that the runtime runs its script as a command, so it serves no requests.
+pub fn set_running_as_command() {
+    RUNNING_AS_COMMAND.with(|cell| cell.set(true));
+}
+
+/// Whether the runtime runs its script as a command, so it serves no requests.
+pub fn running_as_command() -> bool {
+    RUNNING_AS_COMMAND.with(Cell::get)
+}
+
+/// Record that the runtime is a component without a `wasi:http/handler` export, so it serves no
+/// requests.
+pub fn set_without_request_handler() {
+    WITHOUT_REQUEST_HANDLER.with(|cell| cell.set(true));
+}
+
+/// Whether the runtime is a component without a `wasi:http/handler` export, so it serves no
+/// requests.
+pub fn without_request_handler() -> bool {
+    WITHOUT_REQUEST_HANDLER.with(Cell::get)
+}
+
+/// Record that the runtime serves requests from now on.
+pub fn set_serving_requests() {
+    SERVING_REQUESTS.with(|serving| serving.set(true));
+}
+
+/// Allow blocking on host I/O while serving requests, as `--allow-blocking-host-io` does.
+pub fn set_blocking_host_io_while_serving(allowed: bool) {
+    BLOCKING_HOST_IO_WHILE_SERVING.with(|cell| cell.set(allowed));
+}
+
+/// Why code running now must not block the current task on host I/O, such as a synchronous file
+/// read, or `None` if it may.
+///
+/// Blocking is refused inside synchronous exports, which must not block at all, and while the
+/// runtime serves requests, unless `--allow-blocking-host-io` allows it: a blocked task holds the
+/// component instance's lock, which stalls every other request the instance serves.
+pub fn blocking_host_io_refusal() -> Option<&'static str> {
+    if !blocking_allowed() {
+        return Some("inside a synchronous export, which must not block");
+    }
+    let serving = SERVING_REQUESTS.with(Cell::get);
+    if serving && !BLOCKING_HOST_IO_WHILE_SERVING.with(Cell::get) {
+        return Some(
+            "while serving requests, where it would stall every concurrent request \
+             (--allow-blocking-host-io allows it)",
+        );
+    }
+    None
 }
 
 js::instance_local! {
@@ -281,6 +359,11 @@ struct JsTimer {
     task: TaskId,
     /// Where the timer was created, kept for each re-queue of an interval.
     origin: Option<Rc<str>>,
+    /// Whether the timer keeps the loop alive. See [`EventLoop::set_js_timer_ref`].
+    keeps_alive: bool,
+    /// The async context current when the timer was created, kept for each re-queue of an
+    /// interval.
+    context: Snapshot,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +454,10 @@ struct TaskEntry {
     /// Where the task was queued, if origins were being recorded then. See
     /// [`js::stack::record_origins`].
     origin: Option<Rc<str>>,
+    /// Whether the task keeps the loop alive. Only unreferenced JS timers don't.
+    keeps_alive: bool,
+    /// The async context current when the task was queued, which is current while it runs.
+    context: Snapshot,
 }
 
 impl TaskEntry {
@@ -391,6 +478,8 @@ struct TaskQueue {
     ready: BTreeSet<(Option<Instant>, u64)>,
     /// The timers that are not ready yet, by deadline then id.
     timers: BTreeSet<(Instant, u64)>,
+    /// The number of entries that keep the loop alive.
+    keep_alive: usize,
 }
 
 impl TaskQueue {
@@ -400,17 +489,27 @@ impl TaskQueue {
         } else if let Some(deadline) = entry.deadline {
             self.timers.insert((deadline, entry.id.0));
         }
+        self.keep_alive += entry.keeps_alive as usize;
         self.entries.insert(entry.id, entry);
     }
 
     fn remove(&mut self, id: TaskId) -> Option<TaskEntry> {
         let entry = self.entries.remove(&id)?;
+        self.keep_alive -= entry.keeps_alive as usize;
         if entry.ready {
             self.ready.remove(&entry.ready_key());
         } else if let Some(deadline) = entry.deadline {
             self.timers.remove(&(deadline, id.0));
         }
         Some(entry)
+    }
+
+    /// Set whether the entry `id`, if it is queued, keeps the loop alive.
+    fn set_keeps_alive(&mut self, id: TaskId, keeps_alive: bool) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            self.keep_alive = self.keep_alive - entry.keeps_alive as usize + keeps_alive as usize;
+            entry.keeps_alive = keeps_alive;
+        }
     }
 
     /// Mark `id` ready. Returns whether a task not yet ready was found.
@@ -535,15 +634,16 @@ impl EventLoop {
     /// Returns the [`TaskId`] assigned to this task.
     pub fn queue(&self, task: Box<dyn Task>) -> TaskId {
         let id = self.next_task_id();
-        // Read before `tasks` is borrowed: recording the origin can GC, which traces the loop.
-        let origin = js::stack::current_origin();
         self.tasks.borrow_mut().insert(TaskEntry {
             id,
             task,
             ready: false,
             deadline: None,
-            origin,
+            origin: None,
+            keeps_alive: true,
+            context: Snapshot::capture(),
         });
+        self.record_origin(id);
         id
     }
 
@@ -553,17 +653,30 @@ impl EventLoop {
     /// external event (e.g. resolved promises, `queueMicrotask` work).
     pub fn queue_ready(&self, task: Box<dyn Task>) -> TaskId {
         let id = self.next_task_id();
-        // Read before `tasks` is borrowed: recording the origin can GC, which traces the loop.
-        let origin = js::stack::current_origin();
         self.tasks.borrow_mut().insert(TaskEntry {
             id,
             task,
             ready: true,
             deadline: None,
-            origin,
+            origin: None,
+            keeps_alive: true,
+            context: Snapshot::capture(),
         });
+        self.record_origin(id);
         self.notify.notify(1);
         id
+    }
+
+    /// Record the origin of the queued task `id`. Recording the origin can GC, which traces the
+    /// loop, so it happens once the task is in `tasks`, which traces the task's GC pointers, and
+    /// while `tasks` isn't borrowed.
+    fn record_origin(&self, id: TaskId) {
+        let Some(origin) = js::stack::current_origin() else {
+            return;
+        };
+        if let Some(entry) = self.tasks.borrow_mut().entries.get_mut(&id) {
+            entry.origin = Some(origin);
+        }
     }
 
     /// Queue a task with a timer deadline.
@@ -573,7 +686,8 @@ impl EventLoop {
     /// similar, use a deadline of `Instant::now()`.
     pub fn queue_timer(&self, task: Box<dyn Task>, deadline: Instant) -> TaskId {
         let id = self.next_task_id();
-        self.insert_timer(id, task, deadline, js::stack::current_origin());
+        self.insert_timer(id, task, deadline, None, true, Snapshot::capture());
+        self.record_origin(id);
         id
     }
 
@@ -585,6 +699,8 @@ impl EventLoop {
         task: Box<dyn Task>,
         deadline: Instant,
         origin: Option<Rc<str>>,
+        keeps_alive: bool,
+        context: Snapshot,
     ) {
         self.tasks.borrow_mut().insert(TaskEntry {
             id,
@@ -592,6 +708,8 @@ impl EventLoop {
             ready: false,
             deadline: Some(deadline),
             origin,
+            keeps_alive,
+            context,
         });
         self.notify.notify(1);
     }
@@ -612,13 +730,33 @@ impl EventLoop {
         deadline: Instant,
         make_task: impl FnOnce(u64) -> Box<dyn Task>,
     ) -> u64 {
-        let timer_id = self.allocate_js_timer_id(scope);
+        self.queue_js_timer_with_id(scope, None, deadline, make_task)
+    }
+
+    /// Queue a `setTimeout`/`setInterval` task under the JS timer id `id`, which must not belong
+    /// to a queued timer, or under a fresh id if `id` is `None`. Returns the id.
+    pub fn queue_js_timer_with_id(
+        &self,
+        scope: &Scope<'_>,
+        id: Option<u64>,
+        deadline: Instant,
+        make_task: impl FnOnce(u64) -> Box<dyn Task>,
+    ) -> u64 {
+        let timer_id = id.unwrap_or_else(|| self.allocate_js_timer_id(scope));
         let task = self.next_task_id();
         let origin = js::stack::current_origin();
-        self.insert_timer(task, make_task(timer_id), deadline, origin.clone());
-        self.js_timers
-            .borrow_mut()
-            .insert(timer_id, JsTimer { task, origin });
+        let context = Snapshot::capture();
+        let made = make_task(timer_id);
+        self.insert_timer(task, made, deadline, origin.clone(), true, context.clone());
+        self.js_timers.borrow_mut().insert(
+            timer_id,
+            JsTimer {
+                task,
+                origin,
+                keeps_alive: true,
+                context,
+            },
+        );
         timer_id
     }
 
@@ -634,11 +772,45 @@ impl EventLoop {
         task: Box<dyn Task>,
         deadline: Instant,
     ) {
-        let origin = match self.js_timers.borrow().get(&timer_id) {
-            Some(timer) if timer.task == id => timer.origin.clone(),
+        let (origin, keeps_alive, context) = match self.js_timers.borrow().get(&timer_id) {
+            Some(timer) if timer.task == id => (
+                timer.origin.clone(),
+                timer.keeps_alive,
+                timer.context.clone(),
+            ),
             _ => return,
         };
-        self.insert_timer(id, task, deadline, origin);
+        self.insert_timer(id, task, deadline, origin, keeps_alive, context);
+    }
+
+    /// Set whether the JS timer `timer_id` keeps the loop alive, which it does when created. An
+    /// unreferenced timer still runs while other work keeps the loop alive.
+    ///
+    /// Invalid IDs are ignored.
+    pub fn set_js_timer_ref(&self, timer_id: u64, referenced: bool) {
+        let mut timers = self.js_timers.borrow_mut();
+        let Some(timer) = timers.get_mut(&timer_id) else {
+            return;
+        };
+        timer.keeps_alive = referenced;
+        self.tasks
+            .borrow_mut()
+            .set_keeps_alive(timer.task, referenced);
+    }
+
+    /// Whether the JS timer `timer_id` is queued or running.
+    pub fn has_js_timer(&self, timer_id: u64) -> bool {
+        self.js_timers.borrow().contains_key(&timer_id)
+    }
+
+    /// The ids of the JS timers that are queued or running and keep the loop alive.
+    pub fn referenced_js_timers(&self) -> Vec<u64> {
+        self.js_timers
+            .borrow()
+            .iter()
+            .filter(|(_, timer)| timer.keeps_alive)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Cancel a JS timer by its `setTimeout`/`setInterval` id.
@@ -654,12 +826,19 @@ impl EventLoop {
         }
     }
 
-    /// Release a one-shot JS timer's id after it fired.
+    /// Release a one-shot JS timer's id after its task `task` fired. An id that was queued again
+    /// under another task while `task` ran stays.
     ///
     /// Mirrors HTML's "remove global's map of `setTimeout` and `setInterval`
     /// `IDs[id]`" task substep for non-repeating timers.
-    pub fn js_timer_fired(&self, timer_id: u64) {
-        self.js_timers.borrow_mut().remove(&timer_id);
+    pub fn js_timer_fired(&self, timer_id: u64, task: TaskId) {
+        let mut timers = self.js_timers.borrow_mut();
+        if timers
+            .get(&timer_id)
+            .is_some_and(|timer| timer.task == task)
+        {
+            timers.remove(&timer_id);
+        }
     }
 
     /// Allocate the next JS timer id: greater than zero and not currently in
@@ -718,9 +897,10 @@ impl EventLoop {
         Some(deadline.saturating_duration_since(Instant::now()))
     }
 
-    /// Returns `true` if there are any tasks (ready or not) in the queue.
+    /// Returns `true` if any task (ready or not) in the queue keeps the loop alive. Every task
+    /// does except unreferenced JS timers.
     pub fn has_pending(&self) -> bool {
-        !self.tasks.borrow().entries.is_empty()
+        self.tasks.borrow().keep_alive > 0
     }
 
     /// Returns `true` if at least one task is in the ready state.
@@ -831,7 +1011,11 @@ impl EventLoop {
     /// Tasks come first, in the order they were queued, then interest, then futures, then sends.
     pub fn pending_work(&self) -> Vec<PendingWork> {
         let tasks = self.tasks.borrow();
-        let mut entries: Vec<&TaskEntry> = tasks.entries.values().collect();
+        let mut entries: Vec<&TaskEntry> = tasks
+            .entries
+            .values()
+            .filter(|entry| entry.keeps_alive)
+            .collect();
         entries.sort_unstable_by_key(|entry| entry.id.0);
         let mut work: Vec<PendingWork> = entries
             .into_iter()
@@ -1219,11 +1403,25 @@ pub async unsafe fn run_until<S, F>(
 /// stack (see [`crate::diagnostics`]), and clears the pending state, allowing
 /// the event loop to continue. This is called by [`EventLoop::step`] when a
 /// task or microtask throws.
-fn handle_and_clear_exception(scope: &Scope<'_>) {
-    if js::exception::is_pending(scope) {
-        let captured = js::error::ExnThrown::capture(scope);
-        crate::diagnostics::report(&format!("Uncaught {}", captured.to_string().trim_end()));
+pub fn handle_and_clear_exception(scope: &Scope<'_>) {
+    if !js::exception::is_pending(scope) {
+        return;
     }
+    if crate::lifecycle::has_hooks() {
+        if let Some(error) = js::exception::take_pending(scope) {
+            let error = scope.root_value(error.get());
+            if crate::lifecycle::uncaught(scope, error, None) {
+                return;
+            }
+            js::exception::set_pending(
+                scope,
+                error,
+                js::native::ExceptionStackBehavior::DoNotCapture,
+            );
+        }
+    }
+    let captured = js::error::ExnThrown::capture(scope);
+    crate::diagnostics::report(&format!("Uncaught {}", captured.to_string().trim_end()));
 }
 
 impl EventLoop {
@@ -1268,9 +1466,13 @@ impl EventLoop {
             let Some(entry) = self.tasks.borrow_mut().remove(id) else {
                 continue;
             };
-            if entry.task.run(scope, id).is_err() {
+            let previous = entry.context.enter();
+            let result = entry.task.run(scope, id);
+            // An exception the task threw is handled with the task's async context current.
+            if result.is_err() {
                 handle_and_clear_exception(scope);
             }
+            previous.enter();
             ran_any = true;
 
             // After each task, drain microtasks — the task may have
@@ -1338,25 +1540,45 @@ impl Default for EventLoop {
 /// Any `FinalizationRegistry` cleanup a collection queued runs first, so a
 /// callback's own microtasks are drained in the same turn. A promise rejected
 /// with no handler attached by the end of the drain is reported by
-/// [`report_unhandled_rejections`].
+/// [`report_unhandled_rejections`], and the microtasks the `uncaught` lifecycle
+/// hook queued while handling it are drained as well. The messages
+/// [`crate::diagnostics::report_later`] queued are reported last.
 pub fn run_microtasks(scope: &Scope<'_>) {
     debug_assert!(
         !js::exception::is_pending(scope),
         "Cannot run microtasks with pending exception"
     );
     crate::finalization::run_pending(scope);
-    jobs::run_jobs(scope);
-    // Weak-ref set is cleared by run_jobs.
-    report_unhandled_rejections(scope);
+    loop {
+        jobs::run_jobs(scope);
+        // Weak-ref set is cleared by run_jobs.
+        if !report_unhandled_rejections(scope) || !jobs::has_pending_jobs(scope) {
+            break;
+        }
+    }
+    crate::diagnostics::report_queued();
 }
 
 /// Report each promise that was rejected with no handler attached, and still has none, with the
-/// rejection reason's message and stack (see [`crate::diagnostics`]).
-pub fn report_unhandled_rejections(scope: &Scope<'_>) {
-    for promise in jobs::take_unhandled_rejections(scope) {
+/// rejection reason's message and stack (see [`crate::diagnostics`]). The `uncaught` lifecycle
+/// hook runs with the async context that was current when the promise was rejected. Returns
+/// whether there was such a promise.
+pub fn report_unhandled_rejections(scope: &Scope<'_>) -> bool {
+    let rejections = jobs::take_unhandled_rejections(scope);
+    let reported = !rejections.is_empty();
+    for (promise, context) in rejections {
         let Some(reason) = promise.result(scope) else {
             continue;
         };
+        let promise_value = js::conversion::ToJSVal::to_jsval_throwing(&promise, scope);
+        if let Ok(promise_value) = promise_value {
+            let previous = context.enter();
+            let handled = crate::lifecycle::uncaught(scope, reason, Some(promise_value));
+            previous.enter();
+            if handled {
+                continue;
+            }
+        }
         js::exception::set_pending(scope, reason, js::native::ExceptionStackBehavior::Capture);
         let captured = js::error::ExnThrown::capture(scope);
         crate::diagnostics::report(&format!(
@@ -1364,4 +1586,5 @@ pub fn report_unhandled_rejections(scope: &Scope<'_>) {
             captured.to_string().trim_end()
         ));
     }
+    reported
 }

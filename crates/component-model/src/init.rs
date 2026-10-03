@@ -24,7 +24,6 @@ use js::error::ExnThrown;
 use js::gc::handle::Heap;
 use js::gc::scope::{RootScope, Scope};
 use js::heap::Trace;
-use js::module_raw::transform_str_to_source_text;
 use js::native::{JSTracer, RawJSContext};
 use js::Object;
 
@@ -195,18 +194,14 @@ fn evaluate_main_module(
     name: &str,
     path: Option<&str>,
 ) -> Result<ScriptEvaluation, String> {
-    let filename = std::ffi::CString::new(name)
-        .map_err(|_| format!("the main module's name `{name}` contains a NUL byte"))?;
-    let options = js::compile::options(scope, filename, 1);
-
-    let mut src = transform_str_to_source_text(source);
-    // SAFETY: `options` and `src` are valid for the duration of this call.
-    let module = unsafe { js::module::compile_module(scope, options.ptr, &mut src) }
-        .map_err(|_| capture_message(scope, "main module failed to compile"))?;
-    if let Some(path) = path {
-        core_runtime::module::register_entry_module(scope, module, std::path::Path::new(path))
-            .map_err(|_| capture_message(scope, "registering the main module failed"))?;
+    if name.contains('\0') {
+        return Err(format!(
+            "the main module's name `{name}` contains a NUL byte"
+        ));
     }
+    let (module, _) =
+        core_runtime::module::compile_entry(scope, source, name, path.map(std::path::Path::new))
+            .map_err(|_| capture_message(scope, "main module failed to compile"))?;
 
     js::module::load_requested_modules(scope, module)
         .map_err(|_| capture_message(scope, "main module failed to load"))?;

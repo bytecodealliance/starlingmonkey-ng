@@ -18,6 +18,7 @@ JS modules, and functions and properties on the global object.
 - [Extending with Custom Builtins](#extending-with-custom-builtins)
   - [`#[jsclass]` / `#[jsmethods]`](#jsclass--jsmethods)
   - [`#[jsmodule]`](#jsmodule)
+  - [`#[jsfunction_class]`](#jsfunction_class)
   - [`#[jsglobals]`](#jsglobals)
   - [`#[jsnamespace]` / `#[webidl_namespace]`](#jsnamespace--webidl_namespace)
   - [`#[webidl_interface]`](#webidl_interface)
@@ -254,6 +255,38 @@ Builtins are tested against the
 [Web Platform Tests](https://github.com/web-platform-tests/wpt) suite running
 on both native and `wasm32-wasip2` targets.
 
+### Node.js compatibility
+
+With `--node-compat` (or `starling-componentize --node-compat`), scripts can use
+Node.js builtin modules and CommonJS:
+
+```bash
+starlingmonkey --node-compat app.cjs
+```
+
+```js
+import path from "node:path";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { version } = require("./package.json");
+console.log(process.platform, path.join("a", "b"), version);
+```
+
+Every Node.js builtin module can be imported or `require`d. `assert`,
+`async_hooks`, `buffer`, `crypto`, `diagnostics_channel`, `dns`, `events`, `fs`,
+`http`, `https`, `module`, `net`, `os`, `path`, `process`, `punycode`,
+`querystring`, `readline`, `stream`, `string_decoder`, `test`, `timers`, `url`,
+`util` and `zlib` are implemented (`crypto` without keys or ciphers, `dns` with
+only `lookup`, `readline` in line mode, `test` without `run()`, snapshots or
+mock timers, `zlib` without brotli and zstd), as are
+`tty.isatty` and `tty.ReadStream`. Modules and exports that aren't
+implemented yet exist with Node's names and throw `ERR_METHOD_NOT_IMPLEMENTED`
+when used. The `process`, `global`, `Buffer`, `setImmediate` and
+`clearImmediate` globals are installed, packages resolve with the `node` export
+condition, and CommonJS modules can be required and imported.
+See [docs/node-compat.md](docs/node-compat.md) for the details and the
+differences from Node.js.
+
 ---
 
 ## CLI Reference
@@ -268,6 +301,9 @@ Options:
   -e, --eval <SCRIPT>                Evaluate inline script instead of a file
   -i, --initializer-script <PATH>    Run an init script (classic, synchronous) before the content script
       --legacy-script                Run as a classic script instead of an ES module
+      --node-compat                  Enable Node.js compatibility (node: modules, process, CommonJS)
+      --allow-node-runtime-flags     Accept Node.js runtime flags, such as --expose-gc, before the script path
+      --allow-blocking-host-io       Let synchronous APIs block on host I/O while serving requests
   -v, --verbose                      Enable verbose logging
   -d, --debug <TRANSPORT>            Debug over the Debug Adapter Protocol (`stdio`, `listen:[<addr>:]<port>[,wait]`, `connect:<host>:<port>[,timeout=<ms>]`)
       --async-stacks                 Show async parent frames in Error.stack (always on under a debugger)
@@ -566,7 +602,8 @@ mod math_utils {
 unsafe { math_utils::register(&scope); }
 ```
 
-Exported functions are renamed to camelCase; constants keep their declared name.
+Exported functions are renamed to camelCase, or to the name given with
+`#[js_name = "fileURLToPath"]`; constants keep their declared name.
 The import specifier is the `mod` name camelCased, so `mod math_utils` is
 imported as `"mathUtils"`:
 
@@ -575,6 +612,64 @@ import { PI, add, safeDivide } from "mathUtils";
 ```
 
 Override the import specifier: `#[jsmodule(name = "my-math")]`
+
+`pub use SomeClass;` exports a class's constructor, of a `#[jsclass]` or a
+`#[jsfunction_class]`, without installing it on the global object. A module can
+also have a `default` export:
+
+- `#[jsmodule(default_namespace)]`: an object holding every named export, the
+  shape of a Node.js builtin module's `module.exports`. `self_export = "name"`
+  adds a named export `name` holding that object.
+- `#[jsmodule(default = "Name")]`: the named export `Name`, with every named
+  export set as a property on it. `mirror = "a, b"` adds named exports holding
+  its properties `a` and `b`.
+
+### `#[jsfunction_class]`
+
+Define a Node.js builtin class: a constructor function whose prototype methods
+work on any object, the shape of Node.js classes that ES5-style code calls
+without `new` and subclasses with `util.inherits`. Instances keep their state in
+JS properties, and Rust state in a `#[jsclass]` object held in one of them:
+
+```rust
+#[jsfunction_class(name = "Counter")]
+pub mod counter {
+    // `new Counter()` and `Counter.call(obj)` both initialize `this`.
+    #[constructor]
+    pub fn init(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        this.set_property(scope, c"count", 0)
+    }
+
+    // A prototype method; `this` is the receiver.
+    pub fn increment(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        let count = this.get_property(scope, c"count")?.to_int32();
+        this.set_property(scope, c"count", count + 1)
+    }
+
+    #[static_method]
+    pub fn describe() -> String {
+        "a counter".into()
+    }
+}
+
+// The constructor in the current realm, created on first use:
+let ctor = counter::class_constructor(&scope)?;
+```
+
+A constructor without a `this` parameter is a factory: its return value is the
+result of both calling and constructing the class. `#[method(name = "...")]` and
+`#[static_method(name = "...")]` override a member's camelCased name.
+
+Methods and static methods are enumerable, as the members Node.js assigns to its
+function-style classes are. `#[jsfunction_class(class_syntax)]` makes them
+non-enumerable, for the classes Node.js defines with `class`.
+`#[jsfunction_class(self_construct)]` makes a call without `new` whose `this`
+isn't an instance return a new instance, as Node.js's
+`if (!(this instanceof C)) return new C(...)` does.
+
+`extends = "path::to::parent_module"` chains the constructor and prototype to
+another `#[jsfunction_class]`, and a `#[setup]` function receives the constructor
+and prototype once, to define further members.
 
 ### `#[jsglobals]`
 

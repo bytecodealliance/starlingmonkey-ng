@@ -2,7 +2,7 @@
 /// `init` under Wizer. Its version changes whenever the interface does, and the
 /// componentizer accepts a runtime whose version of it differs only in the
 /// patch number.
-package starling:componentize@0.1.0;
+package starling:componentize@0.2.0;
 
 interface init {
   /// `main` is the source of the application's main module, and `main-name` is
@@ -30,6 +30,12 @@ interface init {
   /// `debug` lets instances resumed from the snapshot start a debug session from
   /// the `STARLING_DEBUG` environment variable.
   ///
+  /// `node-compat` enables Node.js compatibility, as the CLI's `--node-compat`
+  /// does.
+  ///
+  /// `allow-blocking-host-io` lets synchronous host I/O block while the component
+  /// serves requests, as the CLI's `--allow-blocking-host-io` does.
+  ///
   /// `init` returns once the main module's top level, including a top-level
   /// `await`, has finished evaluating.
   init: async func(
@@ -40,6 +46,8 @@ interface init {
     raw-http-handler: option<string>,
     init-location: option<string>,
     debug: bool,
+    node-compat: bool,
+    allow-blocking-host-io: bool,
   ) -> result<bool, string>;
 }
 

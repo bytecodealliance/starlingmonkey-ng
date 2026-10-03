@@ -38,9 +38,10 @@ pub fn register_builtins() {
 }
 
 /// Apply CLI options that take effect before the runtime is initialized: the worker location URL
-/// from `--init-location`, and the WPT test globals from `--wpt-mode`. Shared between the native
-/// and wasm32 entry points, and between the CLI and HTTP ones — a WPT run under `--serve` needs
-/// the same globals a command-mode run does.
+/// from `--init-location`, the WPT test globals from `--wpt-mode`, and Node.js compatibility from
+/// `--node-compat`, with the Node.js runtime flags `--allow-node-runtime-flags` accepted. Shared
+/// between the native and wasm32 entry points, and between the CLI and HTTP ones: a WPT run under
+/// `--serve` needs the same globals a command-mode run does.
 pub fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), String> {
     if let Some(location) = config.init_location.as_deref() {
         let url = url::Url::parse(location)
@@ -49,6 +50,9 @@ pub fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), Strin
     }
     if config.wpt_mode {
         runtime::register_global_initializer(wpt_support::add_to_global);
+    }
+    if config.node_compat {
+        cpp_builtins::set_console_level_prefixes(false);
     }
     Ok(())
 }
@@ -74,8 +78,8 @@ fn canonicalize_script_path(config: &mut config::RuntimeConfig) {
 /// to [`core_runtime::run()`] with a tokio-based event loop driver otherwise.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run(mut config: config::RuntimeConfig) -> Result<(), String> {
-    apply_pre_init_config(&config)?;
     register_builtins();
+    apply_pre_init_config(&config)?;
     let debugging = config.debug.is_some();
     if debugging {
         canonicalize_script_path(&mut config);
@@ -86,7 +90,10 @@ pub fn run(mut config: config::RuntimeConfig) -> Result<(), String> {
     }
     let result = match config.serve {
         Some(port) => serve_native::serve(config, port),
-        None => core_runtime::run(config, drive_event_loop_native),
+        None => {
+            core_runtime::event_loop::set_running_as_command();
+            core_runtime::run(config, drive_event_loop_native)
+        }
     };
     if debugging {
         debugger::finish(&result);
@@ -103,8 +110,8 @@ pub fn run(mut config: config::RuntimeConfig) -> Result<(), String> {
 /// task via `wasip3::cli::command::export!`.
 #[cfg(target_arch = "wasm32")]
 pub async fn run(mut config: config::RuntimeConfig) -> Result<(), String> {
-    apply_pre_init_config(&config)?;
     register_builtins();
+    apply_pre_init_config(&config)?;
     let debugging = config.debug.is_some();
     if debugging {
         canonicalize_script_path(&mut config);
@@ -132,6 +139,7 @@ async fn run_wasm(config: config::RuntimeConfig) -> Result<(), String> {
         );
     }
 
+    core_runtime::event_loop::set_running_as_command();
     let Some((runtime, invocation, evaluation)) = core_runtime::setup(config)? else {
         return Ok(());
     };
@@ -173,6 +181,9 @@ async fn run_wasm(config: config::RuntimeConfig) -> Result<(), String> {
 
     let settled = evaluation.settled(&scope, "Script evaluation failed");
     drop(evaluation);
+    if settled.is_ok() {
+        core_runtime::event_loop::with_event_loop(el, |_| core_runtime::lifecycle::exit(&scope));
+    }
     drop(scope);
     settled
 }

@@ -78,6 +78,19 @@ impl<'s> Stack<'s, Array> {
         Ok(result)
     }
 
+    /// ECMAScript's `IsArray`, which `Array.isArray` applies: whether `obj` is an `Array` or a
+    /// `Proxy` whose target, through any number of proxies, is one. A revoked proxy throws a
+    /// `TypeError`.
+    pub fn is_array_or_array_proxy(
+        scope: &Scope<'_>,
+        obj: HandleObject,
+    ) -> Result<bool, ExnThrown> {
+        let mut result = false;
+        let ok = unsafe { wrappers2::IsArray(scope.cx_mut(), obj, &mut result) };
+        ExnThrown::check(ok)?;
+        Ok(result)
+    }
+
     /// Check whether a value is an `Array`.
     pub fn is_array_value(scope: &Scope<'_>, value: HandleValue) -> Result<bool, ExnThrown> {
         let mut result = false;
