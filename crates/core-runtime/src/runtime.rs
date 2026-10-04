@@ -273,6 +273,9 @@ pub struct Runtime {
     /// instances. The GC trace callback iterates this to trace all event
     /// loops across concurrent invocations.
     invocations: RefCell<InvocationRegistry>,
+    /// Whether globals define `SharedArrayBuffer` and `Atomics`, from
+    /// [`RuntimeConfig::shared_memory_enabled`].
+    shared_memory: bool,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -305,12 +308,15 @@ impl Runtime {
     pub fn init(config: &RuntimeConfig) -> Result<Rc<Self>, String> {
         crate::config::set_enforce_fetch_restrictions(config.enforce_fetch_restrictions());
         event_loop::set_blocking_host_io_while_serving(config.allow_blocking_host_io);
-        event_loop::set_node_http_listen(config.node_http_listen);
         // SAFETY: no parent runtime is given, which is the only condition.
         let mut mozjs_rt =
             unsafe { MozJSRuntime::create_with_internal_job_queues(engine_handle(), None) };
         js::gc::init(mozjs_rt.cx());
         js::context::set_async_stack_capture(mozjs_rt.cx(), !config.async_stacks);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(limit) = config.recursion_limit {
+            js::context::set_wasi_recursion_depth_limit(mozjs_rt.cx(), limit);
+        }
 
         let rt = Rc::new(Self {
             mozjs_rt: UnsafeCell::new(mozjs_rt),
@@ -318,6 +324,7 @@ impl Runtime {
             modules: module::ModuleState::default(),
             finalization: crate::finalization::FinalizationState::default(),
             invocations: RefCell::new(InvocationRegistry::new()),
+            shared_memory: config.shared_memory_enabled(),
         });
 
         // Set before anything can call back into us. Cleared by the `Drop` impl.
@@ -348,11 +355,15 @@ impl Runtime {
         crate::finalization::install(rt.mozjs_rt_mut().cx());
 
         rt.modules.node_compat.set(config.node_compat);
+        if rt.shared_memory {
+            js::context::set_futex_can_wait(rt.mozjs_rt_mut().cx());
+        }
         module::init_module_loader(&rt, config.base_path());
 
         // Create the default global and register builtins.
         drop(rt.new_global());
-        js::jobs::track_unhandled_rejections(&rt.default_global());
+        js::jobs::track_unhandled_rejections(&rt.default_global())
+            .map_err(|_| "Failed to set up promise rejection tracking".to_string())?;
         if config.pre_initialize {
             let scope = rt.default_global();
             // SAFETY: the context lives as long as `rt`, whose `Drop` stops the recording.
@@ -376,6 +387,10 @@ impl Runtime {
         // global via `set_global_private_and_proto`.
         let mut options = RealmOptions::default();
         js::class::install_global_private_trace(&mut options);
+        if self.shared_memory {
+            options.creationOptions_.sharedMemoryAndAtomics_ = true;
+            options.creationOptions_.defineSharedArrayBufferConstructor_ = true;
+        }
         let scope = RootScope::new_global(
             cx,
             &js::class::STARLING_GLOBAL_CLASS,

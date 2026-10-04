@@ -149,6 +149,38 @@ impl<'s> Str<'s> {
         Self::from_mozjs_rval(scope, new_js_string(scope, s))
     }
 
+    /// Create a new JS string from UTF-8 bytes, with each maximal invalid subsequence replaced by
+    /// U+FFFD. The replaced text is allocated fallibly, and a failed allocation reports out of
+    /// memory.
+    pub fn from_utf8_lossy(scope: &'s Scope<'_>, bytes: &[u8]) -> Result<Self, ExnThrown> {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return Self::from_str(scope, text);
+        }
+        const REPLACEMENT: &str = "\u{FFFD}";
+        let length = bytes.utf8_chunks().fold(0usize, |length, chunk| {
+            let replacement = if chunk.invalid().is_empty() {
+                0
+            } else {
+                REPLACEMENT.len()
+            };
+            length
+                .saturating_add(chunk.valid().len())
+                .saturating_add(replacement)
+        });
+        let mut text = String::new();
+        if text.try_reserve_exact(length).is_err() {
+            crate::exception::report_out_of_memory(scope);
+            return Err(ExnThrown);
+        }
+        for chunk in bytes.utf8_chunks() {
+            text.push_str(chunk.valid());
+            if !chunk.invalid().is_empty() {
+                text.push_str(REPLACEMENT);
+            }
+        }
+        Self::from_str(scope, &text)
+    }
+
     /// Create a new JS string from Latin-1 characters, one byte each.
     // TODO: explore whether we can use the non-copying `JS_NewStrin*` variants here and below.
     pub fn from_latin1(scope: &'s Scope<'_>, chars: &[u8]) -> Result<Self, ExnThrown> {
@@ -200,6 +232,38 @@ impl<'s> Str<'s> {
     pub fn to_utf8(&self, scope: &Scope<'_>) -> Result<String, ExnThrown> {
         let nn = NonNull::new(self.as_raw()).expect("a Str is never null");
         Ok(crate::conversion::jsstr_to_string(scope, nn))
+    }
+
+    /// The length of this string in UTF-8, with each lone surrogate counted as the three bytes of
+    /// U+FFFD.
+    pub fn utf8_length(&self, scope: &Scope<'_>) -> Result<usize, ExnThrown> {
+        // SAFETY: counting makes no call into SpiderMonkey.
+        unsafe {
+            self.with_chars(scope, |chars| match chars {
+                StrChars::Latin1(bytes) => {
+                    bytes.len() + bytes.iter().filter(|byte| **byte >= 0x80).count()
+                }
+                StrChars::TwoByte(units) => char::decode_utf16(units.iter().copied())
+                    .map(|c| c.map_or(3, char::len_utf8))
+                    .sum(),
+            })
+        }
+    }
+
+    /// Write this string as UTF-8 into `buffer`, with each lone surrogate as U+FFFD, up to the
+    /// last whole character that fits. Returns the number of bytes written.
+    pub fn write_utf8(&self, scope: &Scope<'_>, buffer: &mut [u8]) -> Result<usize, ExnThrown> {
+        // SAFETY: the conversion makes no call into SpiderMonkey.
+        unsafe {
+            self.with_chars(scope, |chars| match chars {
+                StrChars::Latin1(bytes) => {
+                    encoding_rs::mem::convert_latin1_to_utf8_partial(bytes, buffer).1
+                }
+                StrChars::TwoByte(units) => {
+                    encoding_rs::mem::convert_utf16_to_utf8_partial(units, buffer).1
+                }
+            })
+        }
     }
 
     /// Get a single character (code unit) at the given index.
@@ -343,6 +407,40 @@ impl<'s> Str<'s> {
                 ))))
             }
         }
+    }
+
+    /// This string's UTF-16 code units. Reports out of memory if the vector can't be allocated.
+    pub fn to_utf16_vec(&self, scope: &Scope<'_>) -> Result<Vec<u16>, ExnThrown> {
+        self.to_utf16_prefix(scope, self.len())
+    }
+
+    /// The first `count` UTF-16 code units of this string, or all of them if it is shorter.
+    /// Reports out of memory if the vector can't be allocated.
+    pub fn to_utf16_prefix(&self, scope: &Scope<'_>, count: usize) -> Result<Vec<u16>, ExnThrown> {
+        let mut units = Vec::new();
+        // SAFETY: the closure doesn't call into SpiderMonkey.
+        let copied = unsafe {
+            self.with_chars(scope, |chars| {
+                match chars {
+                    StrChars::Latin1(chars) => {
+                        let chars = &chars[..count.min(chars.len())];
+                        units.try_reserve_exact(chars.len()).ok()?;
+                        units.extend(chars.iter().map(|&c| u16::from(c)));
+                    }
+                    StrChars::TwoByte(chars) => {
+                        let chars = &chars[..count.min(chars.len())];
+                        units.try_reserve_exact(chars.len()).ok()?;
+                        units.extend_from_slice(chars);
+                    }
+                }
+                Some(())
+            })
+        }?;
+        if copied.is_none() {
+            crate::exception::report_out_of_memory(scope);
+            return Err(ExnThrown);
+        }
+        Ok(units)
     }
 
     /// Ensure this string has a linear (flat) representation.

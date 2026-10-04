@@ -318,7 +318,7 @@ fn find_provider<'s>(
             continue;
         };
         if container
-            .get_property(scope, &key)
+            .get_property_by_name(scope, &key)
             .map_err(read_failed)?
             .is_undefined()
         {
@@ -346,7 +346,7 @@ fn shape_container<'s>(
     shape: &Shape,
 ) -> Result<Option<Object<'s>>, ExnThrown> {
     let member = |object: &Object<'s>, name: &str| -> Result<Option<Object<'s>>, ExnThrown> {
-        let value = object.get_property(scope, &to_cstring(name))?;
+        let value = object.get_property_by_name(scope, &to_cstring(name))?;
         Ok(Object::from_value(scope, value).ok())
     };
     match shape {
@@ -661,7 +661,7 @@ fn lookup_class<'s>(
     ty: &str,
 ) -> Result<HandleValue<'s>, ExnThrown> {
     let key = to_cstring(&mangle_resource_name(ty));
-    let value = container.get_property(scope, &key)?;
+    let value = container.get_property_by_name(scope, &key)?;
     if value.is_undefined() {
         return Err(throw_type_error(
             scope,
@@ -690,7 +690,7 @@ fn lookup_member<'s>(
     mangled: &str,
 ) -> Result<HandleValue<'s>, ExnThrown> {
     let key = to_cstring(mangled);
-    let value = container.get_property(scope, &key)?;
+    let value = container.get_property_by_name(scope, &key)?;
     if value.is_undefined() {
         return Err(throw_type_error(scope, c"exported member is not defined"));
     }

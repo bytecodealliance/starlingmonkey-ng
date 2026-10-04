@@ -42,11 +42,63 @@ pub mod base64_globals {
     }
 }
 
+/// The realm object marker of the `atob` function [`add_to_global`] installs.
+struct AtobFunction;
+
+/// The realm object marker of the `btoa` function [`add_to_global`] installs.
+struct BtoaFunction;
+
+/// Install `atob` and `btoa` on `global`.
+pub fn add_to_global(scope: &js::gc::scope::Scope<'_>, global: js::Object<'_>) {
+    base64_globals::add_to_global(scope, global);
+    let installed = |name| {
+        let value = global
+            .get_property(scope, name)
+            .expect("failed to read an installed base64 global");
+        js::Object::from_value(scope, *value).expect("base64 globals are functions")
+    };
+    js::class::register_realm_object::<AtobFunction>(scope, installed(c"atob"));
+    js::class::register_realm_object::<BtoaFunction>(scope, installed(c"btoa"));
+}
+
+/// The `atob` function [`add_to_global`] installed on the current global, even if the global's
+/// `atob` property was reassigned since.
+pub fn atob_function<'s>(scope: &'s js::gc::scope::Scope<'_>) -> Option<js::Object<'s>> {
+    js::class::realm_object::<AtobFunction>(scope)
+}
+
+/// The `btoa` function [`add_to_global`] installed on the current global, even if the global's
+/// `btoa` property was reassigned since.
+pub fn btoa_function<'s>(scope: &'s js::gc::scope::Scope<'_>) -> Option<js::Object<'s>> {
+    js::class::realm_object::<BtoaFunction>(scope)
+}
+
 // ---------------------------------------------------------------------------
-// Base64 alphabet
+// Encoding
 // ---------------------------------------------------------------------------
 
-const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// `bytes` as base64: in the standard alphabet with `=` padding, or with `url`, in the URL-safe
+/// alphabet without padding.
+pub fn encode(bytes: &[u8], url: bool) -> String {
+    const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let alphabet = if url { URL } else { STANDARD };
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for index in 0..=chunk.len() {
+            out.push(alphabet[(n >> (18 - 6 * index)) as usize & 63] as char);
+        }
+        if !url {
+            for _ in chunk.len()..3 {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // btoa implementation
@@ -70,37 +122,7 @@ pub(crate) fn btoa(data: &str) -> Result<String, String> {
 
     // Collect the Latin-1 byte values.
     let bytes: Vec<u8> = data.chars().map(|ch| ch as u8).collect();
-    Ok(base64_encode(&bytes))
-}
-
-/// Standard base64 encoding with `=` padding.
-fn base64_encode(input: &[u8]) -> String {
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        output.push(BASE64_CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        output.push(BASE64_CHARS[((triple >> 12) & 0x3F) as usize] as char);
-
-        if chunk.len() > 1 {
-            output.push(BASE64_CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            output.push('=');
-        }
-
-        if chunk.len() > 2 {
-            output.push(BASE64_CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            output.push('=');
-        }
-    }
-
-    output
+    Ok(encode(&bytes, false))
 }
 
 // ---------------------------------------------------------------------------

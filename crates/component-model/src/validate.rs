@@ -701,7 +701,7 @@ fn define(
         return Ok(());
     };
     let item = scope.root_value(item);
-    copy.define_property(scope, value::to_cstring(name).as_c_str(), item, ENUMERATE)
+    copy.define_property_by_name(scope, value::to_cstring(name).as_c_str(), item, ENUMERATE)
         .map_err(|_| thrown(scope, path))
 }
 
@@ -814,7 +814,7 @@ fn property<'s>(
     name: &str,
     path: &str,
 ) -> Result<HandleValue<'s>, Mismatch> {
-    obj.get_property(scope, value::to_cstring(name).as_c_str())
+    obj.get_property_by_name(scope, value::to_cstring(name).as_c_str())
         .map_err(|_| thrown(scope, path))
 }
 

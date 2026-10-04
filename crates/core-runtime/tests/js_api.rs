@@ -819,3 +819,109 @@ fn strings_convert_to_utf8_from_either_representation() {
         assert_eq!(s.to_utf8(&scope).unwrap(), *expected, "{source}");
     }
 }
+
+/// Strings created from UTF-8 bytes with `from_utf8_lossy` hold valid text as is and one U+FFFD
+/// for each maximal invalid subsequence.
+#[test]
+fn strings_from_lossy_utf8_replace_each_invalid_subsequence() {
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+
+    let cases: [(&[u8], &str); 5] = [
+        (b"", ""),
+        ("héllo 🦀".as_bytes(), "héllo 🦀"),
+        (b"a\xffb", "a\u{FFFD}b"),
+        (b"\xf0\x9f\xa6", "\u{FFFD}"),
+        (b"\xe6\x97x\x80\x80", "\u{FFFD}x\u{FFFD}\u{FFFD}"),
+    ];
+    for (bytes, expected) in cases {
+        let s = js::string::Str::from_utf8_lossy(&scope, bytes).unwrap();
+        assert_eq!(s.to_utf8(&scope).unwrap(), expected, "{bytes:?}");
+    }
+}
+
+/// A class with one reserved slot and no hooks.
+static SLOTTED_CLASS: js::class_spec::JSClass = js::class_spec::JSClass {
+    name: c"Slotted".as_ptr(),
+    flags: (1 & js::class_spec::JSCLASS_RESERVED_SLOTS_MASK)
+        << js::class_spec::JSCLASS_RESERVED_SLOTS_SHIFT,
+    cOps: std::ptr::null(),
+    spec: std::ptr::null(),
+    ext: std::ptr::null(),
+    oOps: std::ptr::null(),
+};
+
+/// Objects created with room for their properties get them in one call, in order, as enumerable,
+/// writable and configurable data properties, without calling the prototype's setters and without
+/// changing the class's reserved slots. Plain objects with unique names get them the same way.
+#[test]
+fn objects_get_their_properties_in_one_call() {
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+
+    static SYMBOL: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"s");
+    let keys = [
+        js::class::get_or_init_property_id(&scope, c"a")
+            .unwrap()
+            .get(),
+        js::class::get_or_init_property_id(&scope, c"b")
+            .unwrap()
+            .get(),
+        SYMBOL.id(&scope).unwrap().get(),
+    ];
+    let check = |object: Object<'_>| {
+        let global = scope.global();
+        global.set_property(&scope, c"object", object).unwrap();
+        global
+            .set_property(&scope, c"symbol", SYMBOL.value(&scope).unwrap())
+            .unwrap();
+        let script = "Reflect.ownKeys(object).map((key) => { \
+                        const d = Object.getOwnPropertyDescriptor(object, key); \
+                        return [String(key), d.value, d.enumerable, d.writable, d.configurable]; \
+                      }).join(';') + '|' + (object[symbol] === 3)";
+        let value = js::compile::evaluate(&scope, script).unwrap();
+        assert_eq!(
+            String::from_jsval(&scope, value, ()).unwrap(),
+            "a,1,true,true,true;b,2,true,true,true;Symbol(s),3,true,true,true|true"
+        );
+    };
+
+    let proto =
+        js::compile::evaluate(&scope, "({ set a(v) { throw new Error('setter'); } })").unwrap();
+    let proto = Object::from_value(&scope, proto).unwrap();
+    for clasp in [Some(&SLOTTED_CLASS), None] {
+        let object =
+            Object::new_with_property_capacity(&scope, clasp, Some(proto), keys.len()).unwrap();
+        if clasp.is_some() {
+            // SAFETY: the object is rooted, and its class has one reserved slot.
+            unsafe { js::object::set_reserved_slot(object.handle().get(), 0, &value::from_i32(7)) };
+        }
+        // SAFETY: the object was just created with a class without hooks, and the keys are
+        // distinct, interned keys.
+        unsafe { object.add_new_data_properties(&scope, &keys, &[1, 2, 3]) }.unwrap();
+        assert!(
+            object
+                .get_prototype(&scope)
+                .unwrap()
+                .unwrap()
+                .handle()
+                .get()
+                == proto.handle().get()
+        );
+        check(object);
+        if clasp.is_some() {
+            // SAFETY: as above.
+            let slot = unsafe { js::object::get_reserved_slot(object.handle().get(), 0) };
+            assert_eq!(slot.to_int32(), 7);
+        }
+    }
+
+    let null_proto = Object::new_with_property_capacity(&scope, None, None, 0).unwrap();
+    assert!(null_proto.get_prototype(&scope).unwrap().is_none());
+
+    for _ in 0..2 {
+        // SAFETY: the keys are distinct, interned names and a cached symbol.
+        let object = unsafe { Object::new_plain_with_unique_names(&scope, &keys, &[1, 2, 3]) };
+        check(object.unwrap());
+    }
+}

@@ -38,7 +38,7 @@ impl WritableStreamDefaultWriter {
 
     /// <https://streams.spec.whatwg.org/#default-writer-closed>
     #[getter]
-    fn closed<'r>(&self, scope: &'r Scope<'_>) -> Promise<'r> {
+    pub fn closed<'r>(&self, scope: &'r Scope<'_>) -> Promise<'r> {
         // Step 1: Return `this`.`[[closedPromise]]`.
         self.data().closed_promise.get(scope)
     }
@@ -61,14 +61,14 @@ impl WritableStreamDefaultWriter {
 
     /// <https://streams.spec.whatwg.org/#default-writer-ready>
     #[getter]
-    fn ready<'r>(&self, scope: &'r Scope<'_>) -> Promise<'r> {
+    pub fn ready<'r>(&self, scope: &'r Scope<'_>) -> Promise<'r> {
         // Step 1: Return `this`.`[[readyPromise]]`.
         self.data().ready_promise.get(scope)
     }
 
     /// <https://streams.spec.whatwg.org/#default-writer-abort>
     #[method(length = 0)]
-    fn abort<'r>(
+    pub fn abort<'r>(
         &self,
         scope: &'r Scope<'_>,
         reason: HandleValue<'_>,
@@ -92,7 +92,7 @@ impl WritableStreamDefaultWriter {
 
     /// <https://streams.spec.whatwg.org/#default-writer-close>
     #[method]
-    fn close<'r>(&self, scope: &'r Scope<'_>) -> Result<Promise<'r>, ExnThrown> {
+    pub fn close<'r>(&self, scope: &'r Scope<'_>) -> Result<Promise<'r>, ExnThrown> {
         // Step 1: Let _stream_ be `this`.`[[stream]]`.
         // Step 2: If _stream_ is undefined, return `a promise rejected with` a ``TypeError``
         //         exception.
@@ -135,7 +135,7 @@ impl WritableStreamDefaultWriter {
 
     /// <https://streams.spec.whatwg.org/#default-writer-write>
     #[method]
-    fn write<'r>(
+    pub fn write<'r>(
         &self,
         scope: &'r Scope<'_>,
         chunk: Option<HandleValue<'_>>,

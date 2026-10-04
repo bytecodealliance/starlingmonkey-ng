@@ -174,6 +174,17 @@ impl EventTarget {
         let _ = algorithms::dispatch(scope, &event, self, script_stack_state);
     }
 
+    /// The callbacks of the listeners for `event_type`, including an event handler's, in the
+    /// order of the event listener list.
+    pub fn listeners_for<'r>(&self, scope: &'r Scope<'_>, event_type: &str) -> Vec<Object<'r>> {
+        self.data()
+            .event_listener_list
+            .iter()
+            .filter(|listener| listener.event_type == event_type)
+            .map(|listener| listener.callback.get(scope))
+            .collect()
+    }
+
     /// Whether any listener for `event_type` would be invoked by a dispatch.
     pub fn has_listener_for(&self, event_type: &str) -> bool {
         self.data()

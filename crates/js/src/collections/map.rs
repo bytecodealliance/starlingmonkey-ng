@@ -134,6 +134,21 @@ impl<'s> Stack<'s, Map> {
         ExnThrown::check(ok)
     }
 
+    /// The map's entries as `(key, value)` pairs, in insertion order. Runs no code the script
+    /// can change.
+    pub fn entries_vec<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+    ) -> Result<Vec<(HandleValue<'r>, HandleValue<'r>)>, ExnThrown> {
+        let values = super::collect_for_each(scope, self.handle(), wrappers2::MapForEach, 2)?;
+        Ok(values
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[key, value]| (*key, *value))
+            .collect())
+    }
+
     /// Check whether an object is a `Map`.
     pub fn is_map(scope: &Scope<'_>, obj: HandleObject) -> Result<bool, ExnThrown> {
         let mut result = false;

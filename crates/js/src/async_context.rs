@@ -44,6 +44,11 @@ crate::instance_local! {
 
     /// Set by [`crate::jobs::stop_draining`]. [`run_jobs`] does nothing while it is set.
     pub(crate) static INTERRUPTED: Cell<bool> = const { Cell::new(false) };
+
+    /// The context of the last job [`run_next_job`] ran with a context it captured, which the
+    /// next job that captured the same object reuses.
+    static LAST_JOB_CONTEXT: RefCell<Option<Rc<RootedHeap<crate::object::Object>>>> =
+        const { RefCell::new(None) };
 }
 
 /// A captured async context, or the absence of one.
@@ -76,6 +81,11 @@ impl Snapshot {
 /// The current async context, if one is set.
 pub fn current<'s>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
     Snapshot::capture().get(scope)
+}
+
+/// Whether an async context is current.
+pub fn has_current() -> bool {
+    CURRENT.with(|current| current.borrow().is_some())
 }
 
 /// Replace the engine's job queue with one that runs each promise job with the async context it
@@ -127,6 +137,7 @@ pub fn is_installed(scope: &Scope<'_>) -> bool {
 /// context is destroyed.
 pub fn clear() {
     CURRENT.with(|current| current.borrow_mut().take());
+    LAST_JOB_CONTEXT.with(|last| last.borrow_mut().take());
     TAGS.with(|tags| tags.borrow_mut().clear());
     INTERRUPTED.set(false);
 }
@@ -196,10 +207,15 @@ unsafe extern "C" fn get_host_defined_global(
     // SAFETY: the engine calls the hook with a valid context.
     let position = HEAD.get() + unsafe { jsapi::JS::GetRegularMicroTaskCount(cx) } as u64;
     let snapshot = Snapshot::capture();
+    // A job without a recorded context runs without one, so no context needs no record.
     TAGS.with(|tags| {
         let mut tags = tags.borrow_mut();
         match tags.back_mut() {
+            Some((tagged, _)) if *tagged == position && snapshot.0.is_none() => {
+                tags.pop_back();
+            }
             Some((tagged, current)) if *tagged == position => *current = snapshot,
+            _ if snapshot.0.is_none() => {}
             _ => tags.push_back((position, snapshot)),
         }
     });
@@ -247,6 +263,25 @@ unsafe extern "C" fn run_jobs(cx: *mut RawJSContext) {
         jsapi::JS::SetJobQueue(cx, queue);
     }
     TAGS.with(|tags| tags.borrow_mut().clear());
+}
+
+/// A snapshot of `captured`, the context a job captured. It shares the allocation of the last
+/// snapshot this returned if that holds the same object.
+fn job_context(scope: &Scope<'_>, captured: *mut JSObject) -> Snapshot {
+    LAST_JOB_CONTEXT.with(|last| {
+        let mut last = last.borrow_mut();
+        // SAFETY: the pointer is only compared.
+        if let Some(context) = last
+            .as_ref()
+            .filter(|context| unsafe { context.as_ptr() } == captured)
+        {
+            return Snapshot(Some(context.clone()));
+        }
+        // SAFETY: the engine stored a live object, which the caller roots.
+        let snapshot = Snapshot::of(unsafe { Object::from_raw(scope, captured) });
+        last.clone_from(&snapshot.0);
+        snapshot
+    })
 }
 
 /// Dequeue the next job and run it.
@@ -307,8 +342,7 @@ unsafe fn run_next_job(cx: *mut RawJSContext) {
     } else if captured == incumbent.get() {
         Snapshot::default()
     } else {
-        // SAFETY: the engine stored a live object, rooted in `data`.
-        Snapshot::of(unsafe { Object::from_raw(&scope, captured) })
+        job_context(&scope, captured)
     };
     let previous = snapshot.enter();
     // SAFETY: `job` is a rooted microtask, and its realm is entered.

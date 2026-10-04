@@ -88,7 +88,7 @@ impl WritableStreamDefaultController {
 
     /// <https://streams.spec.whatwg.org/#ws-default-controller-error>
     #[method]
-    fn error(&self, scope: &Scope<'_>, e: Option<HandleValue<'_>>) -> Result<(), ExnThrown> {
+    pub fn error(&self, scope: &Scope<'_>, e: Option<HandleValue<'_>>) -> Result<(), ExnThrown> {
         // Step 1: Let _state_ be `this`.`[[stream]]`.`[[state]]`.
         let stream: WritableStream<'_> = self.stream(scope);
         let state = stream.data().state;

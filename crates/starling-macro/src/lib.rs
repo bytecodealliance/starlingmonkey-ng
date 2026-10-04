@@ -25,8 +25,9 @@ struct AttrOpts {
     /// Optional name override for the JS class or method. By default, a
     /// camel-case version of the Rust struct or method name is used.
     name: Option<String>,
-    /// Optional length property for the class. Used by `#[method(length = N)]`
-    /// to set the `length` property on generated methods.
+    /// Optional length property for the class. Used by `#[method(length = N)]`,
+    /// `#[static_method(length = N)]` and `#[constructor(length = N)]` to set the
+    /// `length` property on generated methods and constructors.
     length: Option<usize>,
     /// Optional parent class for inheritance. `#[jsclass(extends = Parent)]`
     /// or `#[webidl_interface(extends = Parent)]` generates a JS class that
@@ -67,6 +68,16 @@ struct AttrOpts {
     /// `#[jsmodule(default = "...", mirror = "a, b")]` adds named exports `a` and `b`, initialized
     /// from the `default` export's properties of the same names.
     mirror: Option<String>,
+    /// Bare flag: `#[jsmodule(node_args)]` and `#[jsnamespace(node_args)]` make every argument of
+    /// the functions optional, as Node.js functions treat a missing argument as `undefined`.
+    /// Without it, a missing required argument throws a `TypeError`, as for WebIDL operations.
+    node_args: bool,
+    /// `#[jsclass(proto_parent = "path::to::fn_class")]` chains the class's prototype and
+    /// constructor to those of a `#[jsfunction_class]`, whose module path it names.
+    proto_parent: Option<syn::Path>,
+    /// `#[jsclass(invalid_this = "path::to::fn")]` makes a method or accessor called on a `this`
+    /// that isn't an instance throw by calling `fn(scope, class_name) -> ExnThrown`.
+    invalid_this: Option<syn::Path>,
 }
 
 impl Parse for AttrOpts {
@@ -96,6 +107,13 @@ impl Parse for AttrOpts {
                 }
                 continue;
             }
+            if key == "node_args" {
+                opts.node_args = true;
+                if !input.is_empty() {
+                    let _: Token![,] = input.parse()?;
+                }
+                continue;
+            }
             if input.parse::<Token![=]>().is_err() {
                 return Err(syn::Error::new(key.span(), "unknown option"));
             }
@@ -109,6 +127,8 @@ impl Parse for AttrOpts {
                 "default" => opts.default = Some(input.parse::<LitStr>()?.value()),
                 "self_export" => opts.self_export = Some(input.parse::<LitStr>()?.value()),
                 "mirror" => opts.mirror = Some(input.parse::<LitStr>()?.value()),
+                "proto_parent" => opts.proto_parent = Some(input.parse::<LitStr>()?.parse()?),
+                "invalid_this" => opts.invalid_this = Some(input.parse::<LitStr>()?.parse()?),
                 _ => return Err(syn::Error::new(key.span(), "unknown option")),
             }
             if !input.is_empty() {
@@ -127,11 +147,16 @@ impl Parse for AttrOpts {
                 "`default` and `default_namespace` are mutually exclusive",
             ));
         }
-        // Validate: js_proto and extends are mutually exclusive
-        if opts.js_proto.is_some() && opts.extends.is_some() {
+        // Validate: js_proto, extends and proto_parent are mutually exclusive
+        let parents = [
+            opts.js_proto.is_some(),
+            opts.extends.is_some(),
+            opts.proto_parent.is_some(),
+        ];
+        if parents.into_iter().filter(|set| *set).count() > 1 {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "`js_proto` and `extends` are mutually exclusive",
+                "`js_proto`, `extends` and `proto_parent` are mutually exclusive",
             ));
         }
         Ok(opts)
@@ -170,7 +195,7 @@ impl AttrOpts {
     /// the wrong shape. Listing the fields once here means a new option can't
     /// be quietly accepted by every attribute that forgot to name it.
     fn reject_all_but(&self, allowed: &[&str], span: impl quote::ToTokens) -> syn::Result<()> {
-        let set: [(bool, &str); 11] = [
+        let set: [(bool, &str); 13] = [
             (self.default.is_some(), "default"),
             (self.mirror.is_some(), "mirror"),
             (self.self_export.is_some(), "self_export"),
@@ -182,6 +207,8 @@ impl AttrOpts {
             (self.to_string_tag.is_some(), "to_string_tag"),
             (self.hidden, "hidden"),
             (self.unforgeable, "unforgeable"),
+            (self.node_args, "node_args"),
+            (self.proto_parent.is_some(), "proto_parent"),
         ];
         for (present, key) in set {
             if present && !allowed.contains(&key) {
@@ -367,6 +394,26 @@ fn process_class_def(attr: TokenStream, item: TokenStream, config: ClassConfig) 
                 }
             }
         }
+    } else if let Some(ref fn_class) = opts.proto_parent {
+        quote! {
+            const INHERITS_INTERFACE: bool = true;
+
+            // Returns a raw prototype pointer that the caller passes straight
+            // to SpiderMonkey. It is never held across an allocation.
+            #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+            fn parent_prototype(scope: &::js::gc::scope::Scope<'_>) -> *mut ::js::native::JSObject {
+                #fn_class::prototype_object(scope)
+                    .map(|proto| unsafe { proto.as_raw() })
+                    .unwrap_or(::std::ptr::null_mut())
+            }
+
+            fn ensure_parent_registered(
+                scope: &::js::gc::scope::Scope<'_>,
+                _global: ::js::Object<'_>,
+            ) {
+                #fn_class::register(scope).expect("registering a class succeeds outside of OOM");
+            }
+        }
     } else if let Some(ref proto_name) = opts.js_proto {
         // js_proto = "Error" → use the built-in JS prototype via JSProtoKey.
         let proto_key = format_ident!("JSProto_{}", proto_name);
@@ -521,10 +568,29 @@ fn process_class_def(attr: TokenStream, item: TokenStream, config: ClassConfig) 
 
     let cast_error_lit = cstr_literal(&format!("Value is not an instance of {}", struct_name));
     let not_type_error_lit = cstr_literal(&format!("'this' is not of type {}", js_name));
+    let no_new_error = if config.attribute == "jsclass" {
+        let message = cstr_literal(&format!(
+            "Class constructor {js_name} cannot be invoked without 'new'"
+        ));
+        quote! { const CALL_WITHOUT_NEW_ERROR: &'static ::core::ffi::CStr = #message; }
+    } else {
+        quote! {}
+    };
     let prototype_call_error_lit = cstr_literal(&format!(
         "\"{}\" getter/method called on prototype or uninitialized object",
         js_name
     ));
+    let throw_invalid_this = match &opts.invalid_this {
+        Some(path) => quote! {
+            fn throw_invalid_this(
+                scope: &::js::gc::scope::Scope<'_>,
+                _message: &'static ::core::ffi::CStr,
+            ) -> ::js::error::ExnThrown {
+                #path(scope, #js_name)
+            }
+        },
+        None => quote! {},
+    };
 
     let output = quote! {
         #[doc(hidden)]
@@ -581,6 +647,8 @@ fn process_class_def(attr: TokenStream, item: TokenStream, config: ClassConfig) 
             const NAME_CSTR: &'static ::core::ffi::CStr = #js_name_cstr_lit;
             const NOT_TYPE_ERROR: &'static ::core::ffi::CStr = #not_type_error_lit;
             const PROTOTYPE_CALL_ERROR: &'static ::core::ffi::CStr = #prototype_call_error_lit;
+            #no_new_error
+            #throw_invalid_this
 
             fn class() -> &'static ::js::class_spec::JSClass {
                 &#class_static
@@ -679,6 +747,14 @@ fn process_class_def(attr: TokenStream, item: TokenStream, config: ClassConfig) 
 
             fn js_handle(self) -> ::js::native::GCHandle<'s, *mut ::js::native::JSObject> {
                 self.0.handle()
+            }
+        }
+
+        impl<'s> ::js::class::InstanceState<'s> for #struct_name<'s> {
+            type Class = #inner_name;
+
+            fn of_instance(instance: ::js::Object<'s>) -> ::std::option::Option<Self> {
+                instance.cast::<#struct_name<'s>>().ok()
             }
         }
 
@@ -901,10 +977,12 @@ struct MethodInfo {
     params: Vec<(Ident, Type)>,
     /// Number of required arguments: the explicit `length = N` override when
     /// given, otherwise the count of non-`Option` (and non-`RestArgs`) params.
-    /// This is both the JS-visible `.length` and the threshold at and beyond
-    /// which `any`-typed (`HandleValue`/`Value`) params are extracted as
-    /// optional (missing → `undefined`) rather than throwing.
+    /// This is the JS-visible `.length`.
     nargs: u32,
+    /// The threshold at and beyond which `any`-typed (`HandleValue`/`Value`)
+    /// params are extracted as optional (missing → `undefined`) rather than
+    /// throwing: `nargs`, or 0 with `#[jsmethods(node_args)]`.
+    required: u32,
     /// How the return value should be handled
     return_style: ReturnStyle,
     /// Whether the method takes &self
@@ -934,7 +1012,9 @@ struct MethodInfo {
 ///
 /// To make a class constructible from JS, at most one function can be
 /// annotated with `#[constructor]`. Otherwise, attempting to instantiate the
-/// class will throw a `TypeError`.
+/// class will throw a `TypeError`. `#[constructor(length = N)]` sets the
+/// constructor's `length` and required argument count, as `length = N` does
+/// for `#[method]`.
 ///
 /// Independently of that, every constructor-shaped fn in the `impl` block is
 /// added to the stack newtype as a constructor, with the return type
@@ -991,8 +1071,12 @@ pub fn webidl_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
     process_methods(attr, item, ClassConfig::WEBIDL_INTERFACE)
 }
 
-fn process_methods(_attr: TokenStream, item: TokenStream, config: ClassConfig) -> TokenStream {
+fn process_methods(attr: TokenStream, item: TokenStream, config: ClassConfig) -> TokenStream {
+    let opts = parse_macro_input!(attr as AttrOpts);
     let mut input = parse_macro_input!(item as ItemImpl);
+    if let Err(e) = opts.reject_all_but(&["node_args"], &input.self_ty) {
+        return e.to_compile_error().into();
+    }
 
     let self_ty = &input.self_ty;
 
@@ -1097,6 +1181,12 @@ fn process_methods(_attr: TokenStream, item: TokenStream, config: ClassConfig) -
             // Check for our attributes
             fn_item.attrs.retain(|attr| {
                 if attr.path().is_ident("constructor") {
+                    match parse_marker_opts(attr, &["length"]) {
+                        Ok(opts) => custom_nargs = opts.length,
+                        Err(e) => {
+                            attr_error.get_or_insert(e);
+                        }
+                    }
                     kind = Some(MethodKind::Constructor);
                     assert_eq!(&fn_item.sig.ident, js_ctor_name.unwrap());
                     ctor_indices.push(methods.len());
@@ -1197,13 +1287,16 @@ fn process_methods(_attr: TokenStream, item: TokenStream, config: ClassConfig) -
                 );
             }
 
-            let info = parse_method_info(
+            let mut info = parse_method_info(
                 fn_item.clone(),
                 kind,
                 custom_rename,
                 custom_nargs,
                 &type_name,
             );
+            if opts.node_args {
+                info.required = 0;
+            }
 
             // Rewrite RestArgs<T> in the function signature to use the
             // fully-qualified type path so the impl block compiles.
@@ -1363,11 +1456,13 @@ fn process_methods(_attr: TokenStream, item: TokenStream, config: ClassConfig) -
             None => quote! { None },
         };
 
+        let flags = config.method_flags;
         builder_calls.push(quote! {
             .property(
                 #js_name_cstr_lit,
                 #getter,
                 #setter,
+                #flags,
             )
         });
     }
@@ -1545,8 +1640,13 @@ fn process_methods(_attr: TokenStream, item: TokenStream, config: ClassConfig) -
     let post_init_impl = if let Some(idx) = setup_ctor_info {
         let info = &methods[idx];
         let setup_fn_name = setup_fn_ident(&info.fn_item.sig.ident);
-        let arg_extractions =
-            gen_arg_extractions(&info.params, quote!(args), true, quote!(scope), info.nargs);
+        let arg_extractions = gen_arg_extractions(
+            &info.params,
+            quote!(args),
+            true,
+            quote!(scope),
+            info.required,
+        );
         let arg_names: Vec<_> = info.params.iter().map(|(name, _)| quote!(#name)).collect();
         let call = if info.has_cx {
             quote! { #type_name::#setup_fn_name(&__typed, scope, #(#arg_names),*) }
@@ -1579,16 +1679,19 @@ fn process_methods(_attr: TokenStream, item: TokenStream, config: ClassConfig) -
         /// If the class is marked as hidden `#[{jsclass,webidl_interface}(hidden)]`, the
         /// constructor isn't installed on the global object, so it is not visible to content.
         pub fn add_to_global<'scope>(scope: &'scope ::js::gc::scope::Scope<'_>, global: ::js::Object<'scope>) {
-            unsafe { ::js::class::register_class::<#inner_name>(scope, global); }
             if <#inner_name as ::js::class::ClassDef>::HIDDEN {
-                global.delete_property(scope, <#inner_name as ::js::class::ClassDef>::NAME_CSTR).expect("delete_property failed");
+                unsafe { ::js::class::register_hidden_class::<#inner_name>(scope); }
+            } else {
+                unsafe { ::js::class::register_class::<#inner_name>(scope, global); }
             }
         }
 
-        /// This class's constructor in the current realm. A class not registered in the realm
-        /// yet is registered without installing the constructor on the global object.
-        pub fn class_constructor<'scope>(scope: &'scope ::js::gc::scope::Scope<'scope>) -> ::js::Object<'scope> {
-            unsafe { ::js::class::class_constructor::<#inner_name>(scope) }
+        /// This class's constructor in the current realm, or a `TypeError` if the class isn't
+        /// registered in it.
+        pub fn class_constructor<'scope>(
+            scope: &'scope ::js::gc::scope::Scope<'_>,
+        ) -> ::std::result::Result<::js::Object<'scope>, ::js::error::ExnThrown> {
+            ::js::class::class_constructor::<#inner_name>(scope)
         }
     };
 
@@ -1881,6 +1984,7 @@ fn parse_method_info(
         fn_item,
         params,
         nargs: custom_nargs.unwrap_or(required_args) as u32,
+        required: custom_nargs.unwrap_or(required_args) as u32,
         return_style,
         has_self,
         has_mut_self,
@@ -2926,8 +3030,13 @@ fn gen_instance_factory(
 /// Generate the constructor body that extracts args and calls the Rust constructor fn.
 fn gen_constructor_body(info: &MethodInfo, type_name: &Ident) -> proc_macro2::TokenStream {
     let ctor_fn = &info.fn_item.sig.ident;
-    let arg_extractions =
-        gen_arg_extractions(&info.params, quote!(args), true, quote!(scope), info.nargs);
+    let arg_extractions = gen_arg_extractions(
+        &info.params,
+        quote!(args),
+        true,
+        quote!(scope),
+        info.required,
+    );
     let mut arg_names: Vec<_> = info.params.iter().map(|(name, _)| quote!(#name)).collect();
 
     let rest_setup = gen_rest_setup(
@@ -3287,7 +3396,7 @@ fn gen_method_native(
         &name_str,
         &info.return_style,
         &info.params,
-        info.nargs,
+        info.required,
         &call,
         &this_extraction,
         &this_in_closure,
@@ -3459,7 +3568,7 @@ fn gen_accessor_native(
             quote!(&__args),
             false,
             quote!(&scope),
-            info.nargs,
+            info.required,
         );
 
         let call_args: Vec<_> = info.params.iter().map(|(name, _)| quote!(#name)).collect();
@@ -4065,6 +4174,7 @@ fn parse_free_fn_export(fn_item: &syn::ItemFn) -> ModuleFnExport {
         is_raw,
         rest_arg_name,
         rest_inner_type,
+        length: None,
     }
 }
 
@@ -4080,6 +4190,41 @@ fn parse_const_export(const_item: &syn::ItemConst) -> ModuleConstExport {
         const_name: const_name.clone(),
         js_name,
         is_ref_type,
+    }
+}
+
+/// Remove a `#[js_length = N]` attribute from `fn_item`, and return the `.length` it gives, if it
+/// has one.
+fn take_js_length_attr(fn_item: &mut syn::ItemFn) -> syn::Result<Option<u32>> {
+    let mut length = None;
+    let mut error = None;
+    fn_item.attrs.retain(|attr| {
+        if !attr.path().is_ident("js_length") {
+            return true;
+        }
+        let parsed = match &attr.meta {
+            syn::Meta::NameValue(syn::MetaNameValue {
+                value:
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Int(lit),
+                        ..
+                    }),
+                ..
+            }) => lit.base10_parse::<u32>(),
+            other => Err(syn::Error::new_spanned(
+                other,
+                "expected `#[js_length = N]`",
+            )),
+        };
+        match parsed {
+            Ok(value) => length = Some(value),
+            Err(e) => error = Some(e),
+        }
+        false
+    });
+    match error {
+        Some(error) => Err(error),
+        None => Ok(length),
     }
 }
 
@@ -4176,11 +4321,13 @@ fn collect_mod_exports(
                 let mut fn_item = fn_item.clone();
                 let fn_name = fn_item.sig.ident.clone();
                 let js_name = take_js_name_attr(&mut fn_item)?;
+                let length = take_js_length_attr(&mut fn_item)?;
                 rewrite_rest_args_in_sig(&mut fn_item.sig, &fn_name)?;
                 let mut export = parse_free_fn_export(&fn_item);
                 if let Some(js_name) = js_name {
                     export.js_name = js_name;
                 }
+                export.length = length;
                 out.fns.push(export);
                 out.items.push(quote! { #fn_item });
             }
@@ -4248,7 +4395,8 @@ fn gen_free_fn_native(
 ///
 /// Public functions become callable JS exports renamed to camelCase while
 /// remaining callable from Rust under their original name. `#[js_name = "..."]`
-/// on a function sets its JS name instead.
+/// on a function sets its JS name instead. Their `.length` is the count of
+/// parameters that aren't `Option<T>`, or `N` with `#[js_length = N]`.
 /// Public `const` items become value exports without camelCasing:
 /// `PI` is exported as `PI`, not `pi`.
 ///
@@ -4270,7 +4418,7 @@ fn gen_free_fn_native(
 /// }
 ///
 /// // Register:
-/// unsafe { core_runtime::module::register_module::<my_math::js_module>(scope) };
+/// core_runtime::module::register_module::<my_math::js_module>(scope);
 ///
 /// // Call from Rust:
 /// assert_eq!(my_math::add(1.0, my_math::PI), 4.14159);
@@ -4292,6 +4440,7 @@ pub fn jsmodule(attr: TokenStream, item: TokenStream) -> TokenStream {
             "default_namespace",
             "self_export",
             "mirror",
+            "node_args",
         ],
         &input.ident,
     ) {
@@ -4322,20 +4471,20 @@ pub fn jsmodule(attr: TokenStream, item: TokenStream) -> TokenStream {
         let native_name = format_ident!("__native_module_{}", unraw(&exp.fn_name));
         let js_name = &exp.js_name;
         let nargs = required_arg_count(&exp.params);
+        let length = exp.length.unwrap_or(nargs);
 
         native_fns.push(gen_free_fn_native(
             exp,
             &native_name,
             &quote!(super::#mod_name),
-            // A Node.js function treats a missing argument as `undefined`.
-            0,
+            if opts.node_args { 0 } else { nargs },
         ));
 
         declaration_entries.push(quote! {
             ::core_runtime::module::ModuleExport::Function {
                 js_name: #js_name,
                 native: Some(#native_name),
-                nargs: #nargs,
+                nargs: #length,
             }
         });
     }
@@ -4447,7 +4596,7 @@ pub fn jsmodule(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Register this native module so it can be imported from JS.
             ///
             /// Equivalent to `register_module::<js_module>(scope)`.
-            pub unsafe fn register(
+            pub fn register(
                 scope: &::js::gc::scope::Scope<'_>,
             ) -> bool {
                 ::core_runtime::module::register_module::<js_module>(scope)
@@ -4469,6 +4618,9 @@ struct ModuleFnExport {
     /// function declared one.
     rest_arg_name: Option<Ident>,
     rest_inner_type: Option<Type>,
+    /// The JS-visible `.length` from `#[js_length = N]`, which replaces the count of required
+    /// arguments.
+    length: Option<u32>,
 }
 
 struct ModuleConstExport {
@@ -4492,6 +4644,11 @@ struct FunctionClassOpts {
     class_syntax: bool,
     /// Whether a call without `new` whose `this` isn't an instance returns a new instance.
     self_construct: bool,
+    /// The [`js::class::InstanceState`] of the class's instances.
+    state: Option<syn::Path>,
+    /// The function `fn(&Scope, &str) -> ExnThrown` that throws the error for a `this` without
+    /// state.
+    invalid_this: Option<syn::Path>,
 }
 
 impl Parse for FunctionClassOpts {
@@ -4514,11 +4671,25 @@ impl Parse for FunctionClassOpts {
             match key.to_string().as_str() {
                 "name" => opts.name = Some(input.parse::<LitStr>()?.value()),
                 "extends" => opts.extends = Some(input.parse::<LitStr>()?.parse()?),
+                "state" => opts.state = Some(input.parse::<LitStr>()?.parse()?),
+                "invalid_this" => opts.invalid_this = Some(input.parse::<LitStr>()?.parse()?),
                 _ => return Err(syn::Error::new(key.span(), "unknown option")),
             }
             if !input.is_empty() {
                 let _: Token![,] = input.parse()?;
             }
+        }
+        if opts.class_syntax && opts.self_construct {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`class_syntax` and `self_construct` are mutually exclusive",
+            ));
+        }
+        if opts.invalid_this.is_some() && opts.state.is_none() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`invalid_this` requires `state`",
+            ));
         }
         Ok(opts)
     }
@@ -4538,9 +4709,10 @@ enum FunctionClassMember {
 /// is a method, and `#[method(name = "...")]` names one.
 fn take_function_class_marker(
     fn_item: &mut syn::ItemFn,
-) -> syn::Result<(FunctionClassMember, Option<String>)> {
+) -> syn::Result<(FunctionClassMember, Option<String>, Option<usize>)> {
     let mut member = FunctionClassMember::Method;
     let mut name = None;
+    let mut length = None;
     let mut error = None;
     fn_item.attrs.retain(|attr| {
         let marker = if attr.path().is_ident("constructor") {
@@ -4555,15 +4727,18 @@ fn take_function_class_marker(
             return true;
         };
         member = marker;
-        match parse_marker_opts(attr, &["name"]) {
-            Ok(opts) => name = opts.name,
+        match parse_marker_opts(attr, &["name", "length"]) {
+            Ok(opts) => {
+                name = opts.name;
+                length = opts.length;
+            }
             Err(e) => error = Some(e),
         }
         false
     });
     match error {
         Some(error) => Err(error),
-        None => Ok((member, name)),
+        None => Ok((member, name, length)),
     }
 }
 
@@ -4571,9 +4746,29 @@ fn take_function_class_marker(
 /// work on any object, the shape of Node.js classes that ES5-style code calls without `new` and
 /// subclasses with `util.inherits`.
 ///
-/// Instances keep their state in JS properties rather than Rust data, so any object can be an
-/// instance: one created by `new`, one a subclass constructor passed to the constructor as
-/// `this`, or one the prototype's methods were copied onto.
+/// Any object can be an instance: one created by `new`, one a subclass constructor passed to the
+/// constructor as `this`, or one the prototype's methods were copied onto.
+///
+/// With the `state = "Type"` option, the instances hold Rust state of the
+/// [`js::class::InstanceState`] `Type`, usually a `#[jsclass(hidden)]` that the global registers:
+///
+/// - `new` and `super()` create instances of `Type::Class`, whose private data holds all of the
+///   instance's state. Their prototype is that of `new.target`.
+/// - A call without `new` whose `this` holds no state, as in `C.call(this)` from an ES5-style
+///   subclass constructor, creates a handle: an instance of `Type::Class` that `this` holds in a
+///   property under the private name symbol [`js::class::STATE_HANDLE_KEY`], which JavaScript
+///   can't read, list, copy or delete. It replaces a handle of another class. For a `Proxy`, its
+///   innermost target holds the handle, as [`js::class::set_state_handle`] defines it.
+/// - The state's data starts out as its default, which the `#[constructor]` function fills in.
+/// - The generated `try_state_of(scope, this) -> Result<Option<Type>, ExnThrown>` returns the
+///   state of `this` as [`js::class::find_instance_state`] finds it: the private data of `this`,
+///   of its handle, of a `Proxy`'s target, or of an object on its prototype chain, without running
+///   JavaScript. `state_of(scope, this)` throws
+///   for a `this` without state, with the `invalid_this = "path"` function if the class names one,
+///   and a `TypeError` otherwise.
+///
+/// A class that `extends` a class with state either has a `state` whose class extends the
+/// parent's, or creates its instances and handles as the parent does.
 ///
 /// - The `#[constructor]` function initializes `this`, its first parameter after an optional
 ///   `scope: &Scope`, and returns `Result<(), E>` with `E: ThrowException`. `new C(...)` calls it
@@ -4585,17 +4780,27 @@ fn take_function_class_marker(
 ///   receiver, which must be an object.
 /// - `#[static_method]` functions are methods of the constructor. `#[static_method(name = "...")]`
 ///   names one.
+/// - The constructor's and each method's `.length` is the count of its parameters that aren't
+///   `Option<T>`, or `N` with `length = N` in its `#[constructor]`, `#[method]` or
+///   `#[static_method]` attribute.
 /// - A `#[setup]` function `fn(scope, constructor: Object, prototype: Object) -> Result<(),
 ///   ExnThrown>` runs once after the constructor and prototype are created, for members the other
 ///   forms don't cover.
 ///
-/// The macro generates `pub fn class_constructor(scope) -> Result<Object, ExnThrown>`, which creates the
-/// constructor in the current realm on first use and returns the same one afterwards.
+/// The macro generates `pub fn register(scope) -> Result<Object, ExnThrown>`, which creates the
+/// constructor in the current realm unless it exists, and returns it. A global registers its
+/// classes when it is set up. The generated `pub fn class_constructor(scope)` returns the
+/// constructor, and throws a `TypeError` if the class isn't registered. It also generates
+/// `pub fn prototype_object(scope)`, `pub fn is_instance(scope, value)` and
+/// `pub fn new_instance(scope)`, which creates an instance as `new` does before the constructor
+/// initializes it. They use the prototype the constructor had when it was created. A `prototype`
+/// assigned to the constructor later is not used.
 /// `extends = "path::to::parent_module"` chains the constructor and prototype to those of another
 /// `#[jsfunction_class]`.
 ///
 /// Methods and static methods are enumerable, as properties assigned to a function and its
-/// prototype are. With the `class_syntax` option, they are non-enumerable, as a JS `class`'s are.
+/// prototype are. With the `class_syntax` option, they are non-enumerable, as a JS `class`'s are,
+/// and a call without `new` throws a `TypeError`.
 /// With the `self_construct` option, a call without `new` whose `this` isn't an instance of the
 /// class initializes and returns a new instance, as Node.js's
 /// `if (!(this instanceof C)) return new C(...)` does.
@@ -4628,6 +4833,7 @@ fn gen_function_class(
     let mod_name = &input.ident;
     let mod_vis = &input.vis;
     let self_construct = opts.self_construct;
+    let class_syntax = opts.class_syntax;
     let member_attrs = if opts.class_syntax {
         quote! { 0 }
     } else {
@@ -4636,6 +4842,11 @@ fn gen_function_class(
     let js_name = opts
         .name
         .unwrap_or_else(|| mod_name.to_string().to_upper_camel_case());
+    let no_new_message = cstr_literal(&format!(
+        "Class constructor {js_name} cannot be invoked without 'new'"
+    ));
+    let not_registered_message =
+        cstr_literal(&format!("{js_name} is not registered on this global"));
     let Some((_, items)) = &input.content else {
         return Err(syn::Error::new_spanned(
             &input,
@@ -4659,7 +4870,7 @@ fn gen_function_class(
             continue;
         }
         let mut fn_item = fn_item.clone();
-        let (member, js_name_override) = take_function_class_marker(&mut fn_item)?;
+        let (member, js_name_override, length_override) = take_function_class_marker(&mut fn_item)?;
         let fn_name = fn_item.sig.ident.clone();
         if member == FunctionClassMember::Setup {
             setup = Some(fn_name);
@@ -4695,7 +4906,8 @@ fn gen_function_class(
             call_args.push(quote!(#rest_name));
         }
         let call = quote! { super::#mod_name::#fn_name(#(#call_args),*) };
-        let nargs = required_arg_count(&export.params);
+        let nargs =
+            length_override.map_or_else(|| required_arg_count(&export.params), |n| n as u32);
         let native_name = format_ident!("__native_fnclass_{}", unraw(&fn_name));
 
         if member == FunctionClassMember::Constructor && !has_this {
@@ -4740,22 +4952,26 @@ fn gen_function_class(
                     let scope = unsafe { ::js::gc::scope::RootScope::from_current_realm(raw_cx) };
                     let __args = ::js::native::CallArgs::from_vp(vp, argc);
                     let mut __constructing = __args.is_constructing();
+                    if #class_syntax && !__constructing {
+                        ::js::error::throw_type_error(&scope, #no_new_message);
+                        return false;
+                    }
                     let this = if __constructing {
-                        match ::js::Object::new_plain_for_constructor(&scope, &__args) {
+                        match __new_for_constructor(&scope, &__args) {
                             Ok(__o) => __o,
                             Err(_) => return false,
                         }
-                    } else if #self_construct && !match __is_instance(&scope, scope.root_value(__args.thisv().get())) {
+                    } else if #self_construct && !match is_instance(&scope, scope.root_value(__args.thisv().get())) {
                         Ok(__instance) => __instance,
                         Err(_) => return false,
                     } {
                         __constructing = true;
-                        match __new_instance(&scope) {
+                        match new_instance(&scope) {
                             Ok(__o) => __o,
                             Err(_) => return false,
                         }
                     } else {
-                        match ::js::Object::from_value(&scope, __args.thisv().get()) {
+                        let __this = match ::js::Object::from_value(&scope, __args.thisv().get()) {
                             Ok(__o) => __o,
                             Err(_) => {
                                 ::js::error::throw_type_error(
@@ -4764,7 +4980,11 @@ fn gen_function_class(
                                 );
                                 return false;
                             }
+                        };
+                        if __ensure_state(&scope, __this).is_err() {
+                            return false;
                         }
+                        __this
                     };
                     #(#arg_extractions)*
                     #rest_setup
@@ -4839,7 +5059,7 @@ fn gen_function_class(
     let (parent_setup, proto_parent) = match &opts.extends {
         Some(parent) => (
             quote! {
-                let __parent = #parent::class_constructor(scope)?;
+                let __parent = #parent::register(scope)?;
                 let __parent_proto = ::js::Object::from_value(
                     scope,
                     __parent.get_property(scope, c"prototype")?,
@@ -4854,6 +5074,72 @@ fn gen_function_class(
         Some(setup) => quote! { super::#mod_name::#setup(scope, __ctor, __proto)?; },
         None => quote! {},
     };
+    let (new_for_constructor, new_with_proto, ensure_state) = match (&opts.state, &opts.extends) {
+        (Some(state), _) => (
+            quote! {
+                let __state = ::js::class::create_instance_for_constructor::<
+                    <#state<'s> as ::js::class::InstanceState<'s>>::Class,
+                >(scope, args, ::std::default::Default::default())?;
+                Ok(__state.as_object())
+            },
+            quote! {
+                let __state = ::js::class::create_instance_with_proto::<
+                    <#state<'s> as ::js::class::InstanceState<'s>>::Class,
+                >(scope, proto, ::std::default::Default::default())?;
+                Ok(__state.as_object())
+            },
+            quote! {
+                if ::js::class::find_instance_state::<#state<'_>>(scope, this, false)?.is_some() {
+                    return Ok(());
+                }
+                let __handle = ::js::class::create_instance_with::<
+                    <#state<'_> as ::js::class::InstanceState<'_>>::Class,
+                >(scope, |_| ::std::default::Default::default())?;
+                ::js::class::set_state_handle(scope, this, __handle.as_object())
+            },
+        ),
+        (None, Some(parent)) => (
+            quote! { #parent::__new_for_constructor(scope, args) },
+            quote! { #parent::__new_with_proto(scope, proto) },
+            quote! { #parent::__ensure_state(scope, this) },
+        ),
+        (None, None) => (
+            quote! { ::js::Object::new_plain_for_constructor(scope, args) },
+            quote! { ::js::Object::new_plain_with_proto(scope, proto.handle()) },
+            quote! { Ok(()) },
+        ),
+    };
+    let invalid_this = match &opts.invalid_this {
+        Some(path) => quote! { #path(scope, #js_name) },
+        None => {
+            let message = cstr_literal(&format!("Value of \"this\" must be of type {js_name}"));
+            quote! { ::js::error::throw_type_error(scope, #message) }
+        }
+    };
+    let state_items = match &opts.state {
+        Some(state) => quote! {
+            /// The Rust state of `this`, as `js::class::find_instance_state` finds it, including
+            /// through the prototype chain.
+            #[allow(dead_code)]
+            pub fn try_state_of<'s>(
+                scope: &'s ::js::gc::scope::Scope<'_>,
+                this: ::js::Object<'s>,
+            ) -> ::std::result::Result<::std::option::Option<#state<'s>>, ::js::error::ExnThrown> {
+                ::js::class::find_instance_state(scope, this, true)
+            }
+
+            /// The Rust state of `this`, as `try_state_of` finds it, or an exception for a `this`
+            /// without state.
+            #[allow(dead_code)]
+            pub fn state_of<'s>(
+                scope: &'s ::js::gc::scope::Scope<'_>,
+                this: ::js::Object<'s>,
+            ) -> ::std::result::Result<#state<'s>, ::js::error::ExnThrown> {
+                try_state_of(scope, this)?.ok_or_else(|| #invalid_this)
+            }
+        },
+        None => quote! {},
+    };
 
     Ok(quote! {
         #mod_vis mod #mod_name {
@@ -4865,19 +5151,67 @@ fn gen_function_class(
             #[doc(hidden)]
             pub struct __FunctionClassMarker;
 
+            /// Marker keying this class's prototype in the realm's class registry.
+            #[doc(hidden)]
+            pub struct __PrototypeMarker;
+
+            #state_items
+
+            /// A new instance for the constructor call `args`, whose prototype is `new.target`'s.
+            #[doc(hidden)]
+            pub fn __new_for_constructor<'s>(
+                scope: &'s ::js::gc::scope::Scope<'_>,
+                args: &::js::native::CallArgs,
+            ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
+                #new_for_constructor
+            }
+
+            /// A new instance whose prototype is `proto`.
+            #[doc(hidden)]
+            pub fn __new_with_proto<'s>(
+                scope: &'s ::js::gc::scope::Scope<'_>,
+                proto: ::js::Object<'s>,
+            ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
+                #new_with_proto
+            }
+
+            /// Give `this`, which the constructor initializes without having created it, a handle
+            /// that holds its state, unless it holds state already.
+            #[doc(hidden)]
+            #[allow(unused_variables)]
+            pub fn __ensure_state(
+                scope: &::js::gc::scope::Scope<'_>,
+                this: ::js::Object<'_>,
+            ) -> ::std::result::Result<(), ::js::error::ExnThrown> {
+                #ensure_state
+            }
+
+            /// The class's prototype in the current realm, or a `TypeError` if the class isn't
+            /// registered in it.
+            #[allow(dead_code)]
+            pub fn prototype_object<'s>(
+                scope: &'s ::js::gc::scope::Scope<'_>,
+            ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
+                ::js::class::realm_object::<__PrototypeMarker>(scope)
+                    .ok_or_else(|| __not_registered(scope))
+            }
+
+            /// Throw the `TypeError` for a class that isn't registered in the current realm.
+            #[cold]
+            fn __not_registered(scope: &::js::gc::scope::Scope<'_>) -> ::js::error::ExnThrown {
+                ::js::error::throw_type_error(scope, #not_registered_message)
+            }
+
             /// Whether `value` is an object whose prototype chain contains the class's prototype.
             #[allow(dead_code)]
-            fn __is_instance(
+            pub fn is_instance(
                 scope: &::js::gc::scope::Scope<'_>,
                 value: ::js::prelude::HandleValue<'_>,
             ) -> ::std::result::Result<bool, ::js::error::ExnThrown> {
                 let ::std::result::Result::Ok(__object) = ::js::Object::from_value(scope, *value) else {
                     return Ok(false);
                 };
-                let __prototype = class_constructor(scope)?.get_property(scope, c"prototype")?;
-                let ::std::result::Result::Ok(__prototype) = ::js::Object::from_value(scope, *__prototype) else {
-                    return Ok(false);
-                };
+                let __prototype = prototype_object(scope)?;
                 let mut __current = __object.get_prototype(scope)?;
                 while let ::std::option::Option::Some(__link) = __current {
                     if __link.as_raw() == __prototype.as_raw() {
@@ -4888,21 +5222,28 @@ fn gen_function_class(
                 Ok(false)
             }
 
-            /// A new object whose prototype is the class's prototype.
+            /// A new instance whose prototype is the class's prototype, as `new` creates it before
+            /// the constructor initializes it.
             #[allow(dead_code)]
-            fn __new_instance<'s>(
+            pub fn new_instance<'s>(
                 scope: &'s ::js::gc::scope::Scope<'_>,
             ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
-                let __prototype = class_constructor(scope)?.get_property(scope, c"prototype")?;
-                let __instance = ::js::Object::new_plain(scope)?;
-                if let ::std::result::Result::Ok(__prototype) = ::js::Object::from_value(scope, *__prototype) {
-                    __instance.set_prototype(scope, __prototype.handle())?;
-                }
-                Ok(__instance)
+                __new_with_proto(scope, prototype_object(scope)?)
             }
 
-            /// The class's constructor in the current realm, created on first use.
+            /// The class's constructor in the current realm, or a `TypeError` if the class isn't
+            /// registered in it.
             pub fn class_constructor<'s>(
+                scope: &'s ::js::gc::scope::Scope<'_>,
+            ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
+                ::js::class::realm_object::<__FunctionClassMarker>(scope)
+                    .ok_or_else(|| __not_registered(scope))
+            }
+
+            /// Create the class's constructor and prototype in the current realm, unless they
+            /// exist, and return the constructor. A global registers its classes when it is set
+            /// up.
+            pub fn register<'s>(
                 scope: &'s ::js::gc::scope::Scope<'_>,
             ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
                 if let Some(__ctor) = ::js::class::realm_object::<__FunctionClassMarker>(scope) {
@@ -4931,6 +5272,7 @@ fn gen_function_class(
                 __proto.define_property(scope, c"constructor", __ctor, 0)?;
                 #setup_call
                 ::js::class::register_realm_object::<__FunctionClassMarker>(scope, __ctor);
+                ::js::class::register_realm_object::<__PrototypeMarker>(scope, __proto);
                 Ok(__ctor)
             }
         }
@@ -5010,6 +5352,7 @@ pub fn jsglobals(attr: TokenStream, item: TokenStream) -> TokenStream {
         let native_name = format_ident!("__native_global_{}", unraw(&exp.fn_name));
         let js_name = &exp.js_name;
         let nargs = required_arg_count(&exp.params);
+        let length = exp.length.unwrap_or(nargs);
 
         native_fns.push(gen_free_fn_native(
             exp,
@@ -5026,7 +5369,7 @@ pub fn jsglobals(attr: TokenStream, item: TokenStream) -> TokenStream {
                 global.handle(),
                 #js_name_cstr_lit,
                 Some(#native_name),
-                #nargs,
+                #length,
                 ::js::class_spec::JSPROP_ENUMERATE as u32
             ).unwrap();
         });
@@ -5183,13 +5526,13 @@ fn process_namespace(opts: AttrOpts, input: syn::ItemMod, config: NamespaceConfi
     for exp in &fn_exports {
         let native_name = format_ident!("__native_ns_{}", unraw(&exp.fn_name));
         let nargs = required_arg_count(&exp.params);
+        let length = exp.length.unwrap_or(nargs);
 
         native_fns.push(gen_free_fn_native(
             exp,
             &native_name,
             &quote!(super::#mod_name),
-            // A Node.js function treats a missing argument as `undefined`.
-            0,
+            if opts.node_args { 0 } else { nargs },
         ));
 
         let js_name_cstr_lit = cstr_literal(&exp.js_name);
@@ -5200,7 +5543,7 @@ fn process_namespace(opts: AttrOpts, input: syn::ItemMod, config: NamespaceConfi
                 ns_handle,
                 #js_name_cstr_lit,
                 Some(#native_name),
-                #nargs,
+                #length,
                 ::js::class_spec::JSPROP_ENUMERATE as u32
             ).unwrap();
         });

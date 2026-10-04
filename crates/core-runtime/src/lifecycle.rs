@@ -19,10 +19,21 @@ pub struct Hooks {
     pub before_exit: fn(&Scope<'_>),
     /// Called once a run ends without an error. It may end the process itself.
     pub exit: fn(&Scope<'_>),
-    /// Called with an exception a task or microtask threw, or with the reason and promise of a
-    /// rejection nothing handled. Returns whether it handled the error, which is otherwise
-    /// reported. It may end the process itself.
-    pub uncaught: fn(&Scope<'_>, HandleValue<'_>, Option<HandleValue<'_>>) -> bool,
+    /// Called with an exception a task or microtask threw, or with the reason and the
+    /// [`Rejection`] of a promise rejected with no handler attached. Returns whether it handled the
+    /// error, which is otherwise reported. It may end the process itself.
+    pub uncaught: fn(&Scope<'_>, HandleValue<'_>, Option<Rejection<'_>>) -> bool,
+    /// Called with a promise that got a handler after the `uncaught` hook was called for its
+    /// rejection, and the promise's rejection ID.
+    pub rejection_handled: fn(&Scope<'_>, js::Promise<'_>, u64),
+}
+
+/// A promise rejected with no handler attached, which the `uncaught` hook is called for.
+#[derive(Clone, Copy)]
+pub struct Rejection<'a> {
+    pub promise: HandleValue<'a>,
+    /// The number of promises rejected with no handler attached up to and including this one.
+    pub id: u64,
 }
 
 js::instance_local! {
@@ -59,14 +70,21 @@ pub fn exit(scope: &Scope<'_>) {
     }
 }
 
-/// Call the `uncaught` hook with `error`, and the rejected `promise`. Returns whether it handled
-/// the error.
+/// Call the `uncaught` hook with `error`, and the `rejection` it is the reason of. Returns whether
+/// it handled the error.
 pub(crate) fn uncaught(
     scope: &Scope<'_>,
     error: HandleValue<'_>,
-    promise: Option<HandleValue<'_>>,
+    rejection: Option<Rejection<'_>>,
 ) -> bool {
     HOOKS
         .with(Cell::get)
-        .is_some_and(|hooks| (hooks.uncaught)(scope, error, promise))
+        .is_some_and(|hooks| (hooks.uncaught)(scope, error, rejection))
+}
+
+/// Call the `rejection_handled` hook with `promise` and its rejection `id`, if there is one.
+pub(crate) fn rejection_handled(scope: &Scope<'_>, promise: js::Promise<'_>, id: u64) {
+    if let Some(hooks) = HOOKS.with(Cell::get) {
+        (hooks.rejection_handled)(scope, promise, id);
+    }
 }

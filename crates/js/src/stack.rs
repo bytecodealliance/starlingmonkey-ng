@@ -136,6 +136,31 @@ pub fn capture_saved_frame<'s>(
     Ok(unsafe { crate::Object::from_raw(scope, frame.get()) })
 }
 
+/// The source URL of the innermost frame of the current JS stack, or `None` if no script is
+/// running.
+pub fn current_frame_source(scope: &Scope<'_>) -> Result<Option<String>, ExnThrown> {
+    let Some(frame) = capture_saved_frame(scope, 1)? else {
+        return Ok(None);
+    };
+    // SAFETY: the pointer is only used to root `source` in this frame.
+    let raw = unsafe { scope.cx_mut().raw_cx() };
+    mozjs::rooted!(in(raw) let mut source = std::ptr::null_mut::<mozjs::jsapi::JSString>());
+    // SAFETY: `frame` is a rooted `SavedFrame`, and `source` a rooted location.
+    unsafe {
+        get_saved_frame_source(
+            scope,
+            std::ptr::null_mut(),
+            frame.handle(),
+            source.handle_mut(),
+            mozjs::jsapi::SavedFrameSelfHosted::Exclude,
+        )
+    };
+    match std::ptr::NonNull::new(source.get()) {
+        Some(source) => Ok(Some(crate::conversion::jsstr_to_string(scope, source))),
+        None => Ok(None),
+    }
+}
+
 /// Build a string representation of a stack trace.
 ///
 /// `principals` controls security-filtered access — pass `std::ptr::null_mut()`

@@ -290,6 +290,7 @@ async fn deterministic_insecure_seed_is_returned() -> anyhow::Result<()> {
                 false,
                 None,
                 true,
+                &componentize::InitEnvironment::default(),
             )
             .await?;
             anyhow::Ok(Component::new(&ENGINE, &componentized.component)?)

@@ -187,7 +187,7 @@ impl ReadableByteStreamController {
 
     /// <https://streams.spec.whatwg.org/#rbs-controller-desired-size>
     #[getter]
-    fn desired_size(&self, scope: &Scope<'_>) -> Option<f64> {
+    pub fn desired_size(&self, scope: &Scope<'_>) -> Option<f64> {
         // Step 1: Return ! `ByteStreamControllerGetDesiredSize`(`this`).
         super::algorithms::readable_byte_stream_controller_get_desired_size(scope, self)
     }

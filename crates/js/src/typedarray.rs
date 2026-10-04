@@ -412,6 +412,24 @@ pub enum ViewKind {
 }
 
 impl ViewKind {
+    /// Whether this is an integer typed array kind: `Int8Array`, `Uint8Array`,
+    /// `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`,
+    /// `BigInt64Array` or `BigUint64Array`.
+    pub fn is_integer_array(self) -> bool {
+        matches!(
+            self,
+            ViewKind::Int8
+                | ViewKind::Uint8
+                | ViewKind::Uint8Clamped
+                | ViewKind::Int16
+                | ViewKind::Uint16
+                | ViewKind::Int32
+                | ViewKind::Uint32
+                | ViewKind::BigInt64
+                | ViewKind::BigUint64
+        )
+    }
+
     /// The name of the view kind's constructor, such as `Uint8Array`.
     pub fn name(self) -> &'static str {
         match self {
@@ -453,6 +471,14 @@ impl<'s> Stack<'s, ArrayBufferView> {
     /// `DataView`, otherwise return `None`.
     pub fn from_object(obj: Object<'s>) -> Option<Self> {
         obj.cast::<Self>().ok()
+    }
+
+    /// `value` as an `ArrayBufferView` handle if it is a typed array or `DataView`, otherwise
+    /// `None`.
+    pub fn from_value(scope: &'s Scope<'_>, value: HandleValue<'_>) -> Option<Self> {
+        Object::from_value(scope, value.get())
+            .ok()
+            .and_then(Self::from_object)
     }
 
     /// Get the byte length of this view.
@@ -620,6 +646,16 @@ pub fn copy_bytes_if_buffer_source(obj: Object<'_>) -> Option<Vec<u8>> {
     unsafe {
         if JS::IsArrayBufferObject(obj.as_raw()) {
             let (ptr, len) = array_buffer_length_and_data(obj.as_raw());
+            if ptr.is_null() || len == 0 {
+                return Some(Vec::new());
+            }
+            return Some(std::slice::from_raw_parts(ptr, len).to_vec());
+        }
+        if JS::IsSharedArrayBufferObject(obj.as_raw()) {
+            let mut len = 0;
+            let mut is_shared = false;
+            let mut ptr = std::ptr::null_mut();
+            JS::GetSharedArrayBufferLengthAndData(obj.as_raw(), &mut len, &mut is_shared, &mut ptr);
             if ptr.is_null() || len == 0 {
                 return Some(Vec::new());
             }
@@ -795,6 +831,13 @@ macro_rules! typed_array_marker {
             fn js_class() -> *const JSClass {
                 crate::class::proto_key_to_class(JSProtoKey::$proto)
             }
+
+            /// Views of fixed-length and of resizable buffers have different classes. Both are
+            /// instances.
+            unsafe fn is_instance(obj: *mut JSObject) -> bool {
+                // SAFETY: `obj` is a valid object pointer, per the trait's contract.
+                !unsafe { <$tag as TypedArrayElement>::unwrap_array(obj) }.is_null()
+            }
         }
 
         impl TypedArrayKind for $Marker {
@@ -863,7 +906,7 @@ typed_array_marker!(Float64Array, "Float64Array", JSProto_Float64Array, Float64)
 /// so the marker is written out against the JSAPI entry points directly.
 // TODO: add element tags to mozjs and remove the need for this.
 macro_rules! bigint_typed_array_marker {
-    ($Marker:ident, $name:literal, $proto:ident, $elem:ty, $new:ident, $data:ident) => {
+    ($Marker:ident, $name:literal, $proto:ident, $elem:ty, $new:ident, $data:ident, $unwrap:ident) => {
         #[doc = concat!("Marker type for JavaScript `", $name, "` objects.")]
         pub struct $Marker;
 
@@ -873,6 +916,13 @@ macro_rules! bigint_typed_array_marker {
 
             fn js_class() -> *const JSClass {
                 crate::class::proto_key_to_class(JSProtoKey::$proto)
+            }
+
+            /// Views of fixed-length and of resizable buffers have different classes. Both are
+            /// instances.
+            unsafe fn is_instance(obj: *mut JSObject) -> bool {
+                // SAFETY: `obj` is a valid object pointer, per the trait's contract.
+                !unsafe { mozjs::jsapi::js::$unwrap(obj) }.is_null()
             }
         }
 
@@ -935,7 +985,8 @@ bigint_typed_array_marker!(
     JSProto_BigInt64Array,
     i64,
     JS_NewBigInt64Array,
-    JS_GetBigInt64ArrayData
+    JS_GetBigInt64ArrayData,
+    UnwrapBigInt64Array
 );
 bigint_typed_array_marker!(
     BigUint64Array,
@@ -943,7 +994,8 @@ bigint_typed_array_marker!(
     JSProto_BigUint64Array,
     u64,
     JS_NewBigUint64Array,
-    JS_GetBigUint64ArrayData
+    JS_GetBigUint64ArrayData,
+    UnwrapBigUint64Array
 );
 
 // ---------------------------------------------------------------------------

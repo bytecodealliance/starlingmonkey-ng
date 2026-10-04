@@ -10,3 +10,9 @@ runner = 'wasmtime run --dir=.::/cwd --dir=. --dir=/tmp -Sinherit-env=y,inherit-
 # Keep in sync with the RUSTFLAGS override in scripts/build-dylib.sh.
 rustflags = ["-C", "target-feature=+simd128"]
 runner = 'wasmtime run --dir=.::/cwd --dir=. --dir=/tmp -Sinherit-env=y,inherit-network=y,http=y,tcp=y,udp=y -C native-unwind-info=n'
+
+[env]
+# The `[patch]` of the mozjs crates in `Cargo.toml` adds engine APIs that the published prebuilt
+# archives don't contain, so SpiderMonkey and its glue are built from source. Remove this with the
+# `[patch]` once archives with those APIs are published.
+MOZJS_FROM_SOURCE = "1"

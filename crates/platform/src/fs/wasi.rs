@@ -250,6 +250,34 @@ pub async fn read_dir(path: &str) -> io::Result<Vec<(String, FileKind)>> {
     Ok(listed)
 }
 
+/// Create the directory `path`. Its parent must exist.
+pub async fn create_dir(path: &str) -> io::Result<()> {
+    let (directory, relative) = resolve(path)?;
+    directory.create_directory_at(relative).await.map_err(error)
+}
+
+/// Remove the file or symlink `path`.
+pub async fn remove_file(path: &str) -> io::Result<()> {
+    let (directory, relative) = resolve(path)?;
+    directory.unlink_file_at(relative).await.map_err(error)
+}
+
+/// Remove the empty directory `path`.
+pub async fn remove_dir(path: &str) -> io::Result<()> {
+    let (directory, relative) = resolve(path)?;
+    directory.remove_directory_at(relative).await.map_err(error)
+}
+
+/// Rename the entry `from` to `to`, replacing an entry at `to` as `rename(2)` does.
+pub async fn rename(from: &str, to: &str) -> io::Result<()> {
+    let (from_directory, from_relative) = resolve(from)?;
+    let (to_directory, to_relative) = resolve(to)?;
+    from_directory
+        .rename_at(from_relative, &to_directory, to_relative)
+        .await
+        .map_err(error)
+}
+
 /// How to open a file, with the meaning of the `std::fs::OpenOptions` setting of each name.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenOptions {

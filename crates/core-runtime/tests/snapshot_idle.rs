@@ -84,6 +84,25 @@ fn pending_work_is_reported_with_its_origin() {
         assert!(el.ensure_idle_for_snapshot().is_ok());
     }
 
+    // An unreferenced timer is reported too.
+    {
+        let el = EventLoop::new();
+        eval_on(
+            &scope,
+            &el,
+            "unref.js",
+            "globalThis.unref = setTimeout(() => {}, 60000);",
+        );
+        let id = evaluate_with_filename(&scope, "globalThis.unref", "id.js", 1)
+            .unwrap()
+            .to_number() as u64;
+        el.set_js_timer_ref(id, false);
+        let message = el.ensure_idle_for_snapshot().unwrap_err();
+        assert!(message.contains("a pending `timeout` timer"), "{message}");
+        eval_on(&scope, &el, "clear.js", "clearTimeout(globalThis.unref);");
+        assert!(el.ensure_idle_for_snapshot().is_ok());
+    }
+
     // Interest acquired with no script running has no origin, and releasing it leaves the loop
     // idle.
     {

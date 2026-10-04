@@ -309,7 +309,7 @@ pub struct BuiltinModule {
     pub aliases: &'static [&'static str],
     /// Register the module in the module registry under `name`, which is passed in, the way
     /// [`register_module`] does. Returns `false`, with an exception pending, if that failed.
-    pub create: unsafe fn(&Scope<'_>, &'static str) -> bool,
+    pub create: fn(&Scope<'_>, &'static str) -> bool,
 }
 
 js::instance_local! {
@@ -361,7 +361,7 @@ fn builtin_module_object<'s>(
         return Ok(module);
     }
     // SAFETY: the module loader is initialized, since its load hook or `require` called this.
-    if !unsafe { (builtin.create)(scope, builtin.name) } {
+    if !(builtin.create)(scope, builtin.name) {
         return Err(ModuleLoadError::CompileThrew);
     }
     lookup().ok_or_else(|| {
@@ -444,13 +444,11 @@ fn commonjs_facade<'s>(
         let object =
             Object::from_value(scope, exports).map_err(|_| ModuleLoadError::CompileThrew)?;
         let value = object
-            .get_property(scope, &c_name)
+            .get_property_by_name(scope, &c_name)
             .map_err(|_| ModuleLoadError::CompileThrew)?;
         values.push((name.as_str(), value));
     }
-    // SAFETY: the module loader is initialized, since its load hook called this, and every value
-    // is rooted.
-    unsafe { register_synthetic_module(scope, cache_key, &values) }
+    register_synthetic_module(scope, cache_key, &values)
         .map_err(|_| ModuleLoadError::CompileThrew)?;
     let module = registry(|reg| {
         reg.borrow()
@@ -735,6 +733,17 @@ fn resolve_path_with(
 ) -> Result<(PathBuf, SourceFormat), String> {
     let base_dir = base_dir
         .ok_or_else(|| format!("Module '{}' not found (no base path configured)", specifier))?;
+    // `oxc_resolver` converts `file:` URLs to paths only when it isn't compiled for wasm32.
+    let file_path;
+    let target = if specifier.starts_with("file:") {
+        file_path = url::Url::parse(specifier)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or_else(|| format!("Cannot resolve module '{specifier}': invalid file URL"))?;
+        file_path.to_str().unwrap_or(specifier)
+    } else {
+        specifier
+    };
     with_state(|state| {
         let import = state.resolver.borrow();
         let require = state.require_resolver.borrow();
@@ -745,7 +754,7 @@ fn resolve_path_with(
                 .expect("resolver not initialized — call init_module_loader first"),
         };
         resolver
-            .resolve(&base_dir, specifier)
+            .resolve(&base_dir, target)
             .map(|res| {
                 let format = SourceFormat::from_resolution(res.module_type(), res.path());
                 (res.path().to_path_buf(), format)
@@ -1198,23 +1207,21 @@ pub(crate) fn clear_module_state(state: &ModuleState) {
 /// 4. Populates the module environment with native functions and values
 /// 5. Stores the module in the thread-local registry for the load hook
 ///
-/// # Safety
+/// # Panics
 ///
-/// - [`init_module_loader`] must have been called first.
-pub unsafe fn register_module<T: NativeModule>(scope: &Scope<'_>) -> bool {
-    // SAFETY: the caller upholds `register_module_with`'s requirements.
-    unsafe { register_module_with::<T>(scope, &[]) }
+/// Panics if no runtime is current.
+pub fn register_module<T: NativeModule>(scope: &Scope<'_>) -> bool {
+    register_module_with::<T>(scope, &[])
 }
 
 /// [`register_module`], with `extra` exports besides the module's declared ones: each
 /// `(name, value)` pair becomes a named export with that value, which is also a property of the
 /// module's `default` export, if it has one.
 ///
-/// # Safety
+/// # Panics
 ///
-/// - [`init_module_loader`] must have been called first.
-/// - `extra`'s value handles must be live and rooted for the duration of the call.
-pub unsafe fn register_module_with<T: NativeModule>(
+/// Panics if no runtime is current.
+pub fn register_module_with<T: NativeModule>(
     scope: &Scope<'_>,
     extra: &[(&str, HandleValue)],
 ) -> bool {
@@ -1305,7 +1312,7 @@ fn link_evaluate_and_populate<T: NativeModule>(
                 Ok(f) => f,
                 Err(_) => return false,
             };
-            if env.set_property(scope, &c_name, func).is_err() {
+            if env.set_property_by_name(scope, &c_name, func).is_err() {
                 return false;
             }
         }
@@ -1326,7 +1333,7 @@ fn link_evaluate_and_populate<T: NativeModule>(
         let Ok(c_name) = CString::new(*name) else {
             return false;
         };
-        if env.set_property(scope, &c_name, *value).is_err() {
+        if env.set_property_by_name(scope, &c_name, *value).is_err() {
             return false;
         }
         names.push(name);
@@ -1350,7 +1357,7 @@ fn set_default_export(
         DefaultExport::Namespace { .. } => Object::new_plain(scope)?,
         DefaultExport::Export { name, .. } => {
             let c_name = CString::new(name).map_err(|_| ExnThrown)?;
-            let value = env.get_property(scope, &c_name)?;
+            let value = env.get_property_by_name(scope, &c_name)?;
             Object::from_value(scope, value.get()).map_err(|_| {
                 js::error::TypeError(format!(
                     "the default export '{name}' of a native module must be an object"
@@ -1362,23 +1369,23 @@ fn set_default_export(
     let keep_existing = matches!(default_export, DefaultExport::Export { .. });
     for name in names {
         let c_name = CString::new(*name).map_err(|_| ExnThrown)?;
-        if keep_existing && target.has_own_property(scope, &c_name)? {
-            let value = target.get_property(scope, &c_name)?;
-            env.set_property(scope, &c_name, value)?;
+        if keep_existing && target.has_own_property_by_name(scope, &c_name)? {
+            let value = target.get_property_by_name(scope, &c_name)?;
+            env.set_property_by_name(scope, &c_name, value)?;
         } else {
-            let value = env.get_property(scope, &c_name)?;
-            target.set_property(scope, &c_name, value)?;
+            let value = env.get_property_by_name(scope, &c_name)?;
+            target.set_property_by_name(scope, &c_name, value)?;
         }
     }
     if let Some(name) = default_export.self_export() {
         let c_name = CString::new(name).map_err(|_| ExnThrown)?;
-        target.set_property(scope, &c_name, target)?;
-        env.set_property(scope, &c_name, target)?;
+        target.set_property_by_name(scope, &c_name, target)?;
+        env.set_property_by_name(scope, &c_name, target)?;
     }
     for name in mirrored {
         let c_name = CString::new(*name).map_err(|_| ExnThrown)?;
-        let value = target.get_property(scope, &c_name)?;
-        env.set_property(scope, &c_name, value)?;
+        let value = target.get_property_by_name(scope, &c_name)?;
+        env.set_property_by_name(scope, &c_name, value)?;
     }
     env.set_property(scope, c"__default", target)
 }
@@ -1427,12 +1434,10 @@ fn link_evaluate_and_get_env<'s>(scope: &'s Scope<'_>, module: Object<'_>) -> Op
 /// [`register_module`]: a later import then fails to resolve rather than finding
 /// a module whose value exports are undefined.
 ///
-/// # Safety
+/// # Panics
 ///
-/// - [`init_module_loader`] must have been called first.
-/// - `exports`' value handles must be live and rooted for the duration of the
-///   call.
-pub unsafe fn register_synthetic_module(
+/// Panics if no runtime is current.
+pub fn register_synthetic_module(
     scope: &Scope<'_>,
     name: &str,
     exports: &[(&str, HandleValue)],
@@ -1510,7 +1515,7 @@ fn link_evaluate_and_populate_values(
 
     for (index, (_, value)) in exports.iter().enumerate() {
         let binding = CString::new(format!("__e{index}")).map_err(|_| ExnThrown)?;
-        env.set_property(scope, &binding, *value)?;
+        env.set_property_by_name(scope, &binding, *value)?;
     }
     Ok(())
 }
@@ -1644,7 +1649,7 @@ pub unsafe fn set_module_export<'s, V: ToJSVal<'s> + ?Sized>(
 ) -> bool {
     let c_name = CString::new(name).unwrap();
     let env_obj = js::Object::from_handle(env).expect("module environment object is null");
-    env_obj.set_property(scope, &c_name, value).is_ok()
+    env_obj.set_property_by_name(scope, &c_name, value).is_ok()
 }
 
 #[cfg(test)]
@@ -1753,6 +1758,27 @@ mod tests {
             );
             assert!(result.is_ok(), "module evaluation failed");
             assert_eq!(read_global_f64(&scope, "globalThis._imported"), 99.0);
+        }
+    }
+
+    #[test]
+    fn resolve_file_url_import() {
+        let dir = test_tempdir();
+        let module_path = dir.path().join("helper.js");
+        std::fs::write(&module_path, "export const VALUE = 7;\n").unwrap();
+
+        let rt = test_runtime();
+        rt.reset_module_loader(dir.path().to_path_buf());
+        let scope = rt.default_global();
+        let url = file_url(module_path.to_str().unwrap());
+        unsafe {
+            let result = evaluate_module(
+                &scope,
+                &format!("import {{ VALUE }} from {url:?};\nglobalThis._imported = VALUE;"),
+                "entry.mjs",
+            );
+            assert!(result.is_ok(), "module evaluation failed");
+            assert_eq!(read_global_f64(&scope, "globalThis._imported"), 7.0);
         }
     }
 
@@ -2400,10 +2426,10 @@ mod tests {
         thread_local! {
             static CREATED: Cell<u32> = const { Cell::new(0) };
         }
-        unsafe fn create(scope: &Scope<'_>, name: &'static str) -> bool {
+        fn create(scope: &Scope<'_>, name: &'static str) -> bool {
             CREATED.with(|created| created.set(created.get() + 1));
             let value = scope.root_value(js::value::from_i32(7));
-            unsafe { register_synthetic_module(scope, name, &[("value", value)]) }.is_ok()
+            register_synthetic_module(scope, name, &[("value", value)]).is_ok()
         }
 
         let dir = test_tempdir();

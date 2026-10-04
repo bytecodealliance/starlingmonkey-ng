@@ -73,6 +73,11 @@ pub fn set_pending(
     ExnThrown
 }
 
+/// Throw `value` without capturing a new exception stack.
+pub fn throw_value(scope: &Scope<'_>, value: HandleValue) -> ExnThrown {
+    set_pending(scope, value, ExceptionStackBehavior::DoNotCapture)
+}
+
 /// Clear any pending exception on the context.
 pub fn clear(scope: &Scope<'_>) {
     unsafe { wrappers2::JS_ClearPendingException(scope.cx()) }
@@ -150,15 +155,13 @@ pub fn is_error_object(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
     if !value.is_object() {
         return false;
     }
-    let obj = scope.root_object(
-        std::ptr::NonNull::new(value.to_object()).expect("an object value is non-null"),
-    );
-    let mut class = mozjs::jsapi::ESClass::Other;
-    // SAFETY: `obj` is rooted on `scope`, and `GetBuiltinClass` only writes `class`.
-    let ok = unsafe { wrappers2::GetBuiltinClass(scope.cx_mut(), obj, &mut class) };
+    let obj = crate::Object::from_value(scope, value).expect("the value is an object");
     // A failed check counts as not an `Error` object, with its exception cleared.
-    if !ok {
-        clear(scope);
+    match obj.builtin_class(scope) {
+        Ok(class) => class == crate::object::ESClass::Error,
+        Err(ExnThrown) => {
+            clear(scope);
+            false
+        }
     }
-    ok && class == mozjs::jsapi::ESClass::Error
 }

@@ -663,9 +663,7 @@ unsafe fn synthesize_interface_module(
         .zip(values.iter().copied())
         .collect();
 
-    // SAFETY: the module loader is initialized by the caller's contract, and the
-    // export handles are rooted on `scope` for the duration of this call.
-    unsafe { core_runtime::module::register_synthetic_module(scope, module_name, &exports) }
+    core_runtime::module::register_synthetic_module(scope, module_name, &exports)
 }
 
 /// The frozen object a module exports for the enum or flags type `desc`: a
@@ -675,8 +673,8 @@ fn enum_object<'s>(scope: &'s Scope<'_>, desc: &EnumDesc) -> Result<Object<'s>, 
     const ENUMERATE: std::ffi::c_uint = js::class_spec::JSPROP_ENUMERATE as std::ffi::c_uint;
     let object = Object::new_plain(scope)?;
     for (name, value) in &desc.members {
-        object.define_property(scope, &to_cstring(name), *value, ENUMERATE)?;
-        object.define_property(
+        object.define_property_by_name(scope, &to_cstring(name), *value, ENUMERATE)?;
+        object.define_property_by_name(
             scope,
             &to_cstring(&value.to_string()),
             name.as_str(),
@@ -743,7 +741,7 @@ fn synthesize_resource_class<'s>(
         let c_method = to_cstring(method_name);
         let nargs = m.params.len().saturating_sub(1) as u32;
         let f = Function::new_callback(scope, &c_method, nargs, method_callback, m.index)?;
-        proto.set_property(scope, &c_method, f)?;
+        proto.set_property_by_name(scope, &c_method, f)?;
     }
 
     if let Some(dispose) = dispose {
@@ -761,7 +759,7 @@ fn synthesize_resource_class<'s>(
             import_callback,
             s.index,
         )?;
-        ctor_obj.set_property(scope, &c_static, f)?;
+        ctor_obj.set_property_by_name(scope, &c_static, f)?;
     }
 
     // `R.prototype === proto` and `proto.constructor === R`.

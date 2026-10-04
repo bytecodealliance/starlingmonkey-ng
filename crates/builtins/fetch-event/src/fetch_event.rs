@@ -15,7 +15,6 @@ use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::{HandleValue, OptionHeapExt};
 use js::{value, Function, Promise, PromiseOf};
-use std::cell::Cell;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use web_fetch::request::{Request, RequestImpl};
@@ -65,6 +64,9 @@ pub struct FetchEvent {
     wait_to_respond: bool,
     /// <https://w3c.github.io/ServiceWorker/#fetchevent-respond-with-error-flag>
     respond_with_error: bool,
+    /// The address of the client that sent the request, if the transport provides it.
+    #[no_trace]
+    client_address: Option<SocketAddr>,
     // Note: `preloadResponse`, `resultingClientId`, and `replacesClientId` omitted intentionally.
     // The first isn't supported anywhere, and all three don't really matter to our use cases.
 }
@@ -93,6 +95,7 @@ impl FetchEvent {
             respond_with_entered: false,
             wait_to_respond: false,
             respond_with_error: false,
+            client_address: None,
         })
     }
 
@@ -128,6 +131,7 @@ impl FetchEvent {
             respond_with_entered: false,
             wait_to_respond: false,
             respond_with_error: false,
+            client_address: None,
         }
         // The event is platform-created, so it is trusted; `respondWith` and
         // `waitUntil` refuse to run on an event that isn't.
@@ -162,25 +166,16 @@ impl FetchEvent {
     }
 
     /// [`FetchEvent::dispatch`], with the address of the client that sent the request, if the
-    /// transport reports it. [`current_client_address`] returns it while the event is dispatched.
+    /// transport provides it, which the event's [`client_address`](FetchEvent::client_address)
+    /// returns.
     pub fn dispatch_from(
         scope: &'s Scope,
         request: Request,
         script_stack_state: ScriptStackState,
         client_address: Option<SocketAddr>,
     ) -> Result<FetchEvent<'s>, ExnThrown> {
-        let previous = CLIENT_ADDRESS.replace(client_address);
-        let result = Self::dispatch_inner(scope, request, script_stack_state);
-        CLIENT_ADDRESS.set(previous);
-        result
-    }
-
-    fn dispatch_inner(
-        scope: &'s Scope,
-        request: Request,
-        script_stack_state: ScriptStackState,
-    ) -> Result<FetchEvent<'s>, ExnThrown> {
         let event = FetchEvent::create_for_request(scope, request)?;
+        event.data_mut().client_address = client_address;
         // Step 17.4.13: `Dispatch` _e_ at _activeWorker_’s `global object`.
         let target = scope
             .global()
@@ -469,6 +464,12 @@ impl<'s> FetchEvent<'s> {
         self.data().wait_to_respond
     }
 
+    /// The address of the client that sent the request, if the transport provides it. Native
+    /// serving provides it, and `wasi:http` doesn't.
+    pub fn client_address(&self) -> Option<SocketAddr> {
+        self.data().client_address
+    }
+
     /// Drop the event loop interest for the `respondWith` promise.
     ///
     /// The promise itself might still settle, and its reactions run, but the event loop won't
@@ -476,16 +477,4 @@ impl<'s> FetchEvent<'s> {
     pub fn abandon_respond(&self) {
         drop(self.data_mut().respond_interest.take());
     }
-}
-
-js::instance_local! {
-    /// The address of the client whose request's `fetch` event is being dispatched, if the
-    /// transport reports it.
-    static CLIENT_ADDRESS: Cell<Option<SocketAddr>> = const { Cell::new(None) };
-}
-
-/// The address of the client whose request's `fetch` event is being dispatched, if the transport
-/// reports it. Native serving reports it, and `wasi:http` doesn't.
-pub fn current_client_address() -> Option<SocketAddr> {
-    CLIENT_ADDRESS.get()
 }

@@ -306,10 +306,7 @@ fn main() {
     app_globals::add_to_global(&scope, global);
 
     // Register native module.
-    assert!(
-        unsafe { math::register(&scope) },
-        "Failed to register math module"
-    );
+    assert!(math::register(&scope), "Failed to register math module");
 
     // ====================================================================
     // Part A: Rust-side usage of every feature

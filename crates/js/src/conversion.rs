@@ -268,6 +268,27 @@ where
     }
 }
 
+/// A WebIDL `[Clamp]` integer.
+///
+/// Converting a value outside `T`'s range clamps it into the range, and `NaN` converts to 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Clamp<T>(pub T);
+
+impl<'s, 'v, T> FromJSVal<'s, 'v> for Clamp<T>
+where
+    T: FromJSVal<'s, 'v, Config = ConversionBehavior>,
+{
+    type Config = ();
+
+    fn from_jsval(
+        scope: &'s Scope<'s>,
+        val: HandleValue<'v>,
+        _: (),
+    ) -> Result<Self, ConversionError> {
+        T::from_jsval(scope, val, ConversionBehavior::Clamp).map(Clamp)
+    }
+}
+
 /// Try to cast the number to a smaller type, but
 /// if it doesn't fit, it will return an error.
 // https://searchfox.org/mozilla-esr128/rev/1aa97f9d67f7a7231e62af283eaa02a6b31380e1/dom/bindings/PrimitiveConversions.h#166
@@ -450,8 +471,15 @@ impl FromJSVal<'_, '_> for bool {
         val: HandleValue,
         _option: (),
     ) -> Result<bool, ConversionError> {
-        Ok(unsafe { ToBoolean(val) })
+        Ok(to_boolean(val))
     }
+}
+
+/// ECMAScript's `ToBoolean`: whether `value` is truthy.
+#[inline]
+pub fn to_boolean(value: HandleValue) -> bool {
+    // SAFETY: `value` is rooted. `ToBoolean` reads it and cannot GC.
+    unsafe { ToBoolean(value) }
 }
 
 // https://heycam.github.io/webidl/#es-byte

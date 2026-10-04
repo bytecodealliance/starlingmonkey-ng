@@ -106,6 +106,7 @@ async fn build(wit: &str, world: &str, name: &str, js: &str, debug: bool) -> Vec
         false,
         None,
         true,
+        &componentize::InitEnvironment::default(),
     )
     .await
     .unwrap_or_else(|e| panic!("componentizing the `{world}` world: {e:#}"))
@@ -639,6 +640,7 @@ async fn debug_with_the_runtime_dylib_is_refused() {
         false,
         None,
         true,
+        &componentize::InitEnvironment::default(),
     )
     .await
     .err()
@@ -673,6 +675,7 @@ async fn debug_with_sockets_disabled_is_refused() {
         false,
         None,
         true,
+        &componentize::InitEnvironment::default(),
     )
     .await
     .err()

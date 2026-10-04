@@ -1,0 +1,23 @@
+[package]
+name = "web-files"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+# No unit tests; skip building the (SpiderMonkey-sized) lib test harness binary.
+test = false
+
+[dependencies]
+bytes.workspace = true
+core-runtime.workspace = true
+js.workspace = true
+web-streams.workspace = true
+
+[dev-dependencies]
+libstarling.workspace = true
+
+[lints]
+workspace = true

@@ -407,6 +407,92 @@ pub trait HasParent: ClassDef {
 /// a parent class creates a direct derivation relationship.
 pub trait DerivedFrom<T: ClassDef>: ClassDef {}
 
+/// The Rust state of the instances of a `#[jsfunction_class(state = ...)]`.
+///
+/// `#[jsclass]` implements it for each class's stack newtype, whose instances hold the state as
+/// their private data. A state that the instances of several classes hold implements it by hand,
+/// such as an enum over those classes.
+pub trait InstanceState<'s>: Sized {
+    /// The class of the instances, and of the handles, that the constructor creates. Their data
+    /// starts out as its default.
+    #[must_root]
+    type Class: ClassDef + Default;
+
+    /// The state `instance` holds as its private data, if it holds this state.
+    fn of_instance(instance: Object<'s>) -> Option<Self>;
+}
+
+/// The key under which an object that a function-style class's constructor initialized without
+/// creating it, as in `Base.call(obj)`, holds a handle: an instance of the class's
+/// [`InstanceState::Class`] that holds the object's state. It is a private name symbol, so
+/// JavaScript can't read, list, copy or delete the property.
+pub static STATE_HANDLE_KEY: crate::symbol::CachedSymbol =
+    crate::symbol::CachedSymbol::private_name(c"kHandle");
+
+/// The state `S` of `this`, or `None` if it holds none. Runs no JavaScript.
+///
+/// The state is the private data of `this`, or else that of the handle `this` holds as an own
+/// data property under [`STATE_HANDLE_KEY`]. For a `Proxy`, the lookup continues with its target,
+/// and finds nothing for a revoked proxy. With `inherited`, an object that holds neither continues
+/// the lookup with its prototype, as a property lookup would.
+pub fn find_instance_state<'s, S: InstanceState<'s>>(
+    scope: &'s Scope<'_>,
+    this: crate::Object<'s>,
+    inherited: bool,
+) -> Result<Option<S>, ExnThrown> {
+    let key = STATE_HANDLE_KEY.id(scope)?;
+    let mut object = this;
+    loop {
+        if let Some(state) = S::of_instance(object) {
+            return Ok(Some(state));
+        }
+        if object.is_proxy() {
+            let Some(target) = object.proxy_target(scope) else {
+                return Ok(None);
+            };
+            object = target;
+            continue;
+        }
+        if let Some(own) = object.own_property_descriptor(scope, key)? {
+            let handle = own
+                .value
+                .and_then(|value| crate::Object::from_value(scope, value).ok());
+            return Ok(handle.and_then(S::of_instance));
+        }
+        if !inherited {
+            return Ok(None);
+        }
+        match object.get_prototype(scope)? {
+            Some(proto) => object = proto,
+            None => return Ok(None),
+        }
+    }
+}
+
+/// Give `this` the state of `handle` by defining the handle under [`STATE_HANDLE_KEY`], replacing
+/// a handle `this` holds. For a `Proxy`, the handle is defined on its innermost target, the object
+/// whose state [`find_instance_state`] finds for the proxy. Throws a `TypeError` for a revoked
+/// proxy. Runs no JavaScript.
+pub fn set_state_handle(
+    scope: &Scope<'_>,
+    this: crate::Object<'_>,
+    handle: crate::Object<'_>,
+) -> Result<(), ExnThrown> {
+    let key = STATE_HANDLE_KEY.id(scope)?;
+    let mut object = this;
+    while object.is_proxy() {
+        object = object.proxy_target(scope).ok_or_else(|| {
+            crate::error::throw_type_error(
+                scope,
+                c"Cannot perform 'defineProperty' on a proxy that has been revoked",
+            )
+        })?;
+    }
+    // No JavaScript can name the private key, so the property needs no attributes that protect
+    // it.
+    object.define_value_by_id(scope, key, handle, 0)
+}
+
 /// Trait implemented by all generated stack newtype wrappers (e.g. `Dog<'s>`).
 ///
 /// Enables type-checked [`cast`](StackType::cast) between stack newtypes
@@ -693,6 +779,27 @@ pub struct RefMut<'a, T: ?Sized> {
     flag: &'a Cell<BorrowFlag>,
 }
 
+impl<'a, T: ?Sized> RefMut<'a, T> {
+    /// Narrow a guard to part of what it borrows, as [`Ref::map`] does for shared borrows.
+    #[inline]
+    pub fn map<U: ?Sized>(
+        orig: Self,
+        project: impl FnOnce(&'a mut T) -> &'a mut U,
+    ) -> RefMut<'a, U> {
+        // The projection inherits the borrow rather than taking a second one, so the original
+        // guard must not run its `Drop` and release it.
+        let orig = std::mem::ManuallyDrop::new(orig);
+        // SAFETY: `orig` is never used or dropped again, so the `&'a mut T` it holds moves out
+        // of it exactly once.
+        let value = unsafe { std::ptr::read(&orig.value) };
+        RefMut {
+            value: project(value),
+            #[cfg(debug_assertions)]
+            flag: orig.flag,
+        }
+    }
+}
+
 impl<T: ?Sized> std::ops::Deref for RefMut<'_, T> {
     type Target = T;
     #[inline]
@@ -845,16 +952,24 @@ struct ClassRegistry {
     /// plumbing objects reused across calls (e.g. a resolved promise serving
     /// as a microtask trigger). Traced like prototypes.
     shared_objects: FxHashMap<usize, Box<MozHeap<*mut JSObject>>>,
+    /// Per-global shared objects keyed by an arbitrary `usize` and a name, for objects that a
+    /// family of names each has one of. Traced like prototypes.
+    named_shared_objects: FxHashMap<usize, FxHashMap<Box<str>, Box<MozHeap<*mut JSObject>>>>,
     /// Per-global monotonic `u64` counters keyed by an arbitrary `usize`. Used
     /// where a spec requires ids unique across a whole global rather than per
     /// call site — e.g. HTML's setTimeout/setInterval ids, which must not
     /// collide across the concurrent event loops that share one global. Plain
     /// integers, so no GC tracing.
     counters: FxHashMap<usize, u64>,
-    /// Per-global interned property names keyed by an arbitrary `usize` (by
-    /// convention the address of a `static` unique to the call site), so a hot
-    /// property name is interned once per global. Traced like prototypes.
-    property_atoms: FxHashMap<usize, Box<MozHeap<*mut crate::native::JSString>>>,
+    /// Per-global property keys keyed by the address of a `static` unique to each: interned
+    /// property names keyed by their `&'static CStr`, and symbols keyed by the
+    /// [`CachedSymbol`](crate::symbol::CachedSymbol) that describes each. Traced like prototypes.
+    property_ids: FxHashMap<usize, Box<MozHeap<mozjs::jsapi::jsid>>>,
+    /// Per-global keys of each [`PropertyTemplate`](crate::object::PropertyTemplate), keyed by the
+    /// template's address: the addresses of the cells in `property_ids` that hold them, in the
+    /// template's order. The cells are traced through `property_ids` and live as long as the
+    /// registry.
+    template_keys: FxHashMap<usize, Box<[*const mozjs::jsapi::jsid]>>,
     /// Type-erased GC glue for the global's private data,
     /// installed by [`set_global_private`].
     ///
@@ -874,8 +989,10 @@ impl ClassRegistry {
         Self {
             map: FxHashMap::default(),
             shared_objects: FxHashMap::default(),
+            named_shared_objects: FxHashMap::default(),
             counters: FxHashMap::default(),
-            property_atoms: FxHashMap::default(),
+            property_ids: FxHashMap::default(),
+            template_keys: FxHashMap::default(),
             global_private: None,
         }
     }
@@ -922,7 +1039,14 @@ impl ClassRegistry {
         for heap in self.shared_objects.values() {
             heap.trace(trc);
         }
-        for heap in self.property_atoms.values() {
+        for heap in self
+            .named_shared_objects
+            .values()
+            .flat_map(|names| names.values())
+        {
+            heap.trace(trc);
+        }
+        for heap in self.property_ids.values() {
             heap.trace(trc);
         }
     }
@@ -1425,6 +1549,17 @@ pub trait ClassDef: Sized + Trace + 'static {
     /// Generated by the proc macro as a compile-time C string literal.
     const PROTOTYPE_CALL_ERROR: &'static CStr;
 
+    /// The message of the `TypeError` a call of the constructor without `new` throws.
+    /// `#[jsclass]` overrides it with the message of a JS class constructor.
+    const CALL_WITHOUT_NEW_ERROR: &'static CStr = c"Constructor must be called with 'new'";
+
+    /// Throw the error for a method or accessor called on a `this` that isn't an initialized
+    /// instance, with `message` describing the problem. The default throws a `TypeError` with
+    /// `message`. `#[jsclass(invalid_this = "path")]` overrides it.
+    fn throw_invalid_this(scope: &Scope<'_>, message: &'static CStr) -> ExnThrown {
+        crate::error::throw_type_error(scope, message)
+    }
+
     /// Return the `JSClass` descriptor for this type.
     ///
     /// Each `ClassDef` type gets a unique `static JSClass` generated by the
@@ -1689,17 +1824,19 @@ impl<T: ClassDef> ClassBuilder<T> {
     /// `name` must be a null-terminated C string (use `c"name"`).
     /// `getter` is the getter callback (`JSNative` is `Option<fn>`: pass `None` for write-only).
     /// `setter` is the setter callback (`JSNative` is `Option<fn>`: pass `None` for read-only).
+    /// `flags` are the property attributes, such as `JSPROP_ENUMERATE`.
     pub fn property(
         mut self,
         name: &'static std::ffi::CStr,
         getter: JSNative,
         setter: JSNative,
+        flags: u16,
     ) -> Self {
         self.properties.push(JSPropertySpec {
             name: crate::class_spec::JSPropertySpec_Name {
                 string_: name.as_ptr(),
             },
-            attributes_: crate::class_spec::JSPROP_ENUMERATE,
+            attributes_: flags as u8,
             kind_: crate::class_spec::JSPropertySpec_Kind::NativeAccessor,
             u: crate::class_spec::JSPropertySpec_AccessorsOrValue {
                 accessors: crate::class_spec::JSPropertySpec_AccessorsOrValue_Accessors {
@@ -1806,38 +1943,40 @@ impl<'s> IntoConstructor<'s> for Result<Object<'s>, ExnThrown> {
     }
 }
 
-/// The constructor of class `T` in the current realm.
-///
-/// A class that isn't registered in the realm yet is registered, and its constructor is not
-/// installed on the global object. A class registered before keeps whatever global property it
+/// The constructor of class `T` in the current realm, or a `TypeError` if `T` isn't registered in
+/// it.
+pub fn class_constructor<'s, T: ClassDef>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+    let proto = registered_prototype::<T>(scope)?;
+    // SAFETY: `proto` is a registered class prototype, whose constructor `init_class` installed.
+    let ctor = unsafe { wrappers2::JS_GetConstructor(scope.cx_mut(), proto.handle()) };
+    // SAFETY: `ctor` is a live object, rooted here before anything can GC.
+    unsafe { Object::from_raw(scope, ctor) }.ok_or(ExnThrown)
+}
+
+/// Register class `T` on the current global without defining its constructor on the global
+/// object, and return its prototype. A class registered before keeps whatever global property it
 /// has.
 ///
 /// # Safety
 ///
 /// The same as for [`register_class`].
-pub unsafe fn class_constructor<'s, T: ClassDef>(scope: &'s Scope<'s>) -> Object<'s> {
-    let global = scope.global();
-    let registered = get_prototype::<T>(global).is_some();
+pub unsafe fn register_hidden_class<'s, T: ClassDef>(scope: &'s Scope<'s>) -> Object<'s> {
+    // An unregistered class's constructor is defined on a new object that nothing else
+    // references, so the global's properties stay as they are.
+    let target = Object::new_plain(scope).expect("creating an object succeeds outside of OOM");
     // SAFETY: the caller upholds `register_class`'s requirements.
-    let proto = unsafe { register_class::<T>(scope, global) };
-    if !registered {
-        global
-            .delete_property(scope, T::NAME_CSTR)
-            .expect("deleting a configurable global property succeeds");
-    }
-    // SAFETY: `proto` is a registered class prototype, whose constructor `init_class` installed.
-    let ctor = unsafe { wrappers2::JS_GetConstructor(scope.cx_mut(), proto.handle()) };
-    Object::from_raw(scope, ctor).expect("a registered class has a constructor")
+    unsafe { register_class::<T>(scope, target) }
 }
 
-/// Register a class on the global object, making it available as a constructor.
+/// Register a class on the current global, and define its constructor as a property of
+/// `global`, which is the global object unless [`register_hidden_class`] registers the class.
 ///
 /// This creates the class's JSClass, constructor, prototype, and methods,
 /// and stores the prototype for later use with [`create_instance`].
 ///
 /// # Safety
 ///
-/// - `global` must be a global object.
+/// - `global` must be the current global or an ordinary object.
 /// - Must be called within an appropriate realm/compartment.
 ///
 /// # Returns
@@ -1901,7 +2040,7 @@ pub unsafe fn register_class<'s, T: ClassDef>(
     )
     .expect("Constructor was just installed");
 
-    register_prototype::<T>(global, proto.handle().get());
+    register_prototype::<T>(scope.global(), proto.handle().get());
 
     // Define Symbol.toStringTag if the class specifies one.
     if !T::TO_STRING_TAG.is_empty() {
@@ -1962,7 +2101,7 @@ unsafe extern "C" fn generic_constructor<T: ClassDef>(
     let args = CallArgs::from_vp(vp, argc);
 
     if !args.is_constructing() {
-        crate::error::throw_type_error(&scope, c"Constructor must be called with 'new'");
+        crate::error::throw_type_error(&scope, T::CALL_WITHOUT_NEW_ERROR);
         return false;
     }
 
@@ -2249,7 +2388,7 @@ pub unsafe fn get_stack_arg<'s, T: StackType<'s>>(
 ///
 /// - `args` must be from a valid `JSNative` call.
 #[inline]
-unsafe fn resolve_webidl_this(
+unsafe fn resolve_webidl_this<T: ClassDef>(
     scope: &Scope<'_>,
     args: &CallArgs,
     target_tag: usize,
@@ -2264,10 +2403,7 @@ unsafe fn resolve_webidl_this(
             return Ok(global);
         }
     }
-    Err(crate::error::throw_type_error(
-        scope,
-        c"'this' is not an object",
-    ))
+    Err(T::throw_invalid_this(scope, c"'this' is not an object"))
 }
 
 /// Extract the `this` object's private data in a method callback.
@@ -2282,9 +2418,8 @@ pub unsafe fn get_this_data<'a, T: ClassDef>(
     scope: &'a Scope<'_>,
     args: &CallArgs,
 ) -> Result<Ref<'a, T>, ExnThrown> {
-    let obj = resolve_webidl_this(scope, args, class_tag::<T>())?;
-    unsafe { borrow::<T>(obj) }
-        .ok_or_else(|| crate::error::throw_type_error(scope, T::NOT_TYPE_ERROR))
+    let obj = resolve_webidl_this::<T>(scope, args, class_tag::<T>())?;
+    unsafe { borrow::<T>(obj) }.ok_or_else(|| T::throw_invalid_this(scope, T::NOT_TYPE_ERROR))
 }
 
 /// Extract the `this` object's private data mutably.
@@ -2298,9 +2433,8 @@ pub unsafe fn get_this_data_mut<'a, T: ClassDef>(
     scope: &'a Scope<'_>,
     args: &CallArgs,
 ) -> Result<RefMut<'a, T>, ExnThrown> {
-    let obj = resolve_webidl_this(scope, args, class_tag::<T>())?;
-    unsafe { borrow_mut::<T>(obj) }
-        .ok_or_else(|| crate::error::throw_type_error(scope, T::NOT_TYPE_ERROR))
+    let obj = resolve_webidl_this::<T>(scope, args, class_tag::<T>())?;
+    unsafe { borrow_mut::<T>(obj) }.ok_or_else(|| T::throw_invalid_this(scope, T::NOT_TYPE_ERROR))
 }
 
 /// Extract the `this` object as a rooted stack newtype in a method callback.
@@ -2321,11 +2455,11 @@ pub unsafe fn get_this<'s, T: StackType<'s>>(
 where
     T::Inner: ClassDef,
 {
-    let obj = resolve_webidl_this(scope, args, class_tag::<T::Inner>())?;
+    let obj = resolve_webidl_this::<T::Inner>(scope, args, class_tag::<T::Inner>())?;
     let concrete_tag = crate::object::get_object_class(obj) as usize;
     let target_tag = class_tag::<T::Inner>();
     if !is_derived_from_type(concrete_tag, target_tag) {
-        return Err(crate::error::throw_type_error(
+        return Err(T::Inner::throw_invalid_this(
             scope,
             T::Inner::NOT_TYPE_ERROR,
         ));
@@ -2334,7 +2468,7 @@ where
     // private data (set_private is only called during construction). Reject
     // it here so callers can use data()/data_mut(), which panic on missing private data.
     if get_private::<T::Inner>(obj).is_none() {
-        return Err(crate::error::throw_type_error(
+        return Err(T::Inner::throw_invalid_this(
             scope,
             T::Inner::PROTOTYPE_CALL_ERROR,
         ));
@@ -2604,6 +2738,39 @@ pub fn try_create_instance_with<'s, T: ClassDef>(
     Ok(T::Rooted::from(stack))
 }
 
+/// Create a JS object backed by `data` for the constructor call `args`. Its prototype is the
+/// `prototype` of `args`' `new.target`, as for an instance that the class's own constructor
+/// creates, so a constructor function that isn't `T`'s can create instances of `T` for the
+/// subclasses that extend it.
+pub fn create_instance_for_constructor<'s, T: ClassDef>(
+    scope: &'s Scope<'_>,
+    args: &CallArgs,
+    data: T,
+) -> Result<T::Rooted<'s>, ExnThrown> {
+    let obj = Object::new_for_constructor(scope, T::class(), args)?;
+    T::install_unforgeable(scope, obj)?;
+    // SAFETY: `obj` was just created with `T`'s class, which finalizes private data of type `T`.
+    unsafe { set_private(obj.as_raw(), data) };
+    // SAFETY: The handle points to a just-created object backed by `T`.
+    let stack = unsafe { Stack::<T>::from_handle_unchecked(obj.handle()) };
+    Ok(T::Rooted::from(stack))
+}
+
+/// Create a JS object backed by `data`, whose prototype is `proto`.
+pub fn create_instance_with_proto<'s, T: ClassDef>(
+    scope: &'s Scope<'_>,
+    proto: Object<'s>,
+    data: T,
+) -> Result<T::Rooted<'s>, ExnThrown> {
+    let obj = Object::new_with_proto(scope, T::class(), proto)?;
+    T::install_unforgeable(scope, obj)?;
+    // SAFETY: `obj` was just created with `T`'s class, which finalizes private data of type `T`.
+    unsafe { set_private(obj.as_raw(), data) };
+    // SAFETY: The handle points to a just-created object backed by `T`.
+    let stack = unsafe { Stack::<T>::from_handle_unchecked(obj.handle()) };
+    Ok(T::Rooted::from(stack))
+}
+
 // ---------------------------------------------------------------------------
 // Per-global shared objects and functions
 // ---------------------------------------------------------------------------
@@ -2639,6 +2806,56 @@ pub fn get_or_init_shared_object<'s>(
     Ok(obj)
 }
 
+/// The per-global shared object [`get_or_init_shared_object`] created for `key`, if it did.
+pub fn get_shared_object<'s>(scope: &'s Scope<'_>, key: usize) -> Option<Object<'s>> {
+    // SAFETY: the registry belongs to the current global, which is alive.
+    let cached = unsafe {
+        get_class_registry(scope.global().as_raw()).and_then(|r| r.get_shared_object(key))
+    }?;
+    // SAFETY: `cached` is a live object cached for this global and kept alive by the registry's
+    // tracer.
+    unsafe { Object::from_raw(scope, cached) }
+}
+
+/// Get a per-global shared object, keyed by `key` and `name`, creating it via `init` and caching
+/// it on first use. `key` is by convention the address of a `static` unique to the call site, and
+/// `name` distinguishes the objects of that call site, such as one prototype per error code.
+///
+/// The cached object is traced and finalized with the global, as with
+/// [`get_or_init_shared_object`], whose keys are separate from these.
+pub fn get_or_init_named_shared_object<'s>(
+    scope: &'s Scope<'_>,
+    key: usize,
+    name: &str,
+    init: impl FnOnce(&'s Scope<'_>) -> Result<Object<'s>, ExnThrown>,
+) -> Result<Object<'s>, ExnThrown> {
+    // Scope the registry borrow to the lookup so nothing under `init` can cause a second borrow.
+    let cached = unsafe {
+        get_class_registry(scope.global().as_raw()).and_then(|registry| {
+            let names = registry.named_shared_objects.get(&key)?;
+            names.get(name).map(|heap| heap.get())
+        })
+    };
+    if let Some(object) = cached {
+        // SAFETY: `object` is a live object cached for this global and kept alive by the
+        // registry's tracer.
+        if let Some(object) = unsafe { Object::from_raw(scope, object) } {
+            return Ok(object);
+        }
+    }
+    let object = init(scope)?;
+    // SAFETY: the registry belongs to the current global, which is alive.
+    let registry = unsafe { get_or_init_class_registry(scope.global().as_raw()) };
+    registry
+        .named_shared_objects
+        .entry(key)
+        .or_default()
+        .entry(name.into())
+        .or_insert_with(|| MozHeap::boxed(ptr::null_mut()))
+        .set(object.as_raw());
+    Ok(object)
+}
+
 /// Return, and create on the first call in a given global, an interned property key for `name`.
 ///
 /// `name` must not be an array index, whose property key is an integer rather than a string.
@@ -2646,28 +2863,105 @@ pub fn get_or_init_property_id<'s>(
     scope: &'s Scope<'_>,
     name: &'static CStr,
 ) -> Result<crate::native::HandleId<'s>, ExnThrown> {
-    let key = ptr::from_ref(name).addr();
+    get_or_init_cached_id(scope, ptr::from_ref(name).addr(), |scope| {
+        let text = name.to_str().expect("names are UTF-8");
+        let string = crate::string::Str::from_str(scope, text)?;
+        let id = crate::id::string_to_id(scope, string.handle())?;
+        assert!(id.is_string(), "property name `{text}` is an array index");
+        Ok(id)
+    })
+}
+
+/// Return, and create on the first call in a given global, the keys of `template`, as the addresses
+/// of the traced cells that [`get_or_init_property_id`] and
+/// [`CachedSymbol::id`](crate::symbol::CachedSymbol::id) store them in. The cells live as long as
+/// the global. The returned flag is whether the keys existed before the call.
+pub(crate) fn get_or_init_template_keys(
+    scope: &Scope<'_>,
+    template: &'static crate::object::PropertyTemplate,
+) -> Result<(*const [*const mozjs::jsapi::jsid], bool), ExnThrown> {
+    let key = ptr::from_ref(template).addr();
     // SAFETY: the registry belongs to the current global, which is alive.
-    let cached = unsafe {
-        get_class_registry(scope.global().as_raw())
-            .and_then(|r| r.property_atoms.get(&key).map(|h| h.get()))
-    };
-    let atom = match cached {
-        Some(atom) => atom,
-        None => {
-            let name =
-                crate::string::Str::from_str(scope, name.to_str().expect("names are UTF-8"))?;
-            let id = crate::id::string_to_id(scope, name.handle())?;
-            assert!(id.is_string(), "property name `{name:?}` is an array index");
-            // A string property key's bits are the interned string's address.
-            let atom = id.asBits_ as *mut crate::native::JSString;
-            // SAFETY: as above.
-            let registry = unsafe { get_or_init_class_registry(scope.global().as_raw()) };
-            registry.property_atoms.insert(key, MozHeap::boxed(atom));
-            atom
-        }
-    };
-    Ok(scope.root_id(mozjs_sys::jsid::StringId(atom)))
+    let cached = unsafe { get_class_registry(scope.global().as_raw()) }
+        .and_then(|registry| registry.template_keys.get(&key));
+    if let Some(keys) = cached {
+        return Ok((ptr::from_ref(&**keys), true));
+    }
+    let mut keys = Vec::with_capacity(template.keys().len());
+    for template_key in template.keys() {
+        let id = match *template_key {
+            crate::object::TemplateKey::Name(name) => get_or_init_property_id(scope, name)?,
+            crate::object::TemplateKey::Symbol(symbol) => symbol.id(scope)?,
+        };
+        keys.push(ptr::from_ref(&*id));
+    }
+    // SAFETY: as above.
+    let registry = unsafe { get_or_init_class_registry(scope.global().as_raw()) };
+    let keys = registry
+        .template_keys
+        .entry(key)
+        .or_insert(keys.into_boxed_slice());
+    Ok((ptr::from_ref(&**keys), false))
+}
+
+/// Return, and create with `init` on the first call in a given global, the symbol property key
+/// cached under `key`.
+pub(crate) fn get_or_init_symbol_id<'s>(
+    scope: &'s Scope<'_>,
+    key: usize,
+    init: impl FnOnce(&'s Scope<'_>) -> Result<mozjs::jsapi::jsid, ExnThrown>,
+) -> Result<crate::native::HandleId<'s>, ExnThrown> {
+    get_or_init_cached_id(scope, key, init)
+}
+
+/// Return, and create with `init` on the first call in a given global, the property key cached
+/// under `key`, the address of a `static` unique to it.
+#[crate::allow_unrooted]
+fn get_or_init_cached_id<'s>(
+    scope: &'s Scope<'_>,
+    key: usize,
+    init: impl FnOnce(&'s Scope<'_>) -> Result<mozjs::jsapi::jsid, ExnThrown>,
+) -> Result<crate::native::HandleId<'s>, ExnThrown> {
+    let global = scope.global().as_raw();
+    // SAFETY: the registry belongs to the current global, which is alive.
+    let cached = unsafe { get_class_registry(global).and_then(|r| r.property_ids.get(&key)) };
+    if let Some(heap) = cached {
+        // The registry's traced, boxed slot is a marked location of the key. The box lives as
+        // long as the global.
+        return Ok(unsafe {
+            crate::native::HandleId::from_marked_location(
+                heap.get_unsafe() as *const mozjs::jsapi::jsid
+            )
+        });
+    }
+    let id = init(scope)?;
+    // SAFETY: the registry belongs to the current global, which is alive.
+    let registry = unsafe { get_or_init_class_registry(scope.global().as_raw()) };
+    let slot = registry.property_ids.entry(key).or_insert_with(|| {
+        // The heap is boxed before `id` is stored, so the store's barrier runs at the heap's final
+        // address.
+        let heap = Box::new(MozHeap {
+            ptr: std::cell::UnsafeCell::new(mozjs::jsapi::jsid::default()),
+        });
+        heap.set(id);
+        heap
+    });
+    // SAFETY: as above.
+    Ok(unsafe {
+        crate::native::HandleId::from_marked_location(slot.get_unsafe() as *const mozjs::jsapi::jsid)
+    })
+}
+
+/// The string `name` as a value, interned once per global as [`get_or_init_property_id`] interns
+/// it.
+///
+/// `name` must not be an array index.
+pub fn get_or_init_atom<'s>(
+    scope: &'s Scope<'_>,
+    name: &'static CStr,
+) -> Result<crate::native::Handle<'s, crate::native::Value>, ExnThrown> {
+    let id = get_or_init_property_id(scope, name)?;
+    crate::id::id_to_value(scope, id.get())
 }
 
 /// Get a per-global shared function, keyed by `key` (typically the native
@@ -2989,7 +3283,7 @@ pub fn define_well_known_symbol_property<'s>(
 
 /// Adds an alias to the property given by `property` under the symbol `symbol` to the
 /// prototype of the builtin class `T`.
-pub fn add_symbol_alias<T: ClassDef>(scope: &Scope, property: &CStr, symbol: SymbolCode) {
+pub fn add_symbol_alias<T: ClassDef>(scope: &Scope, property: &'static CStr, symbol: SymbolCode) {
     let proto = get_prototype_object_for::<T>(scope).expect("prototype not found");
     let values = proto
         .get_property(scope, property)

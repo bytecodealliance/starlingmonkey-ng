@@ -6,7 +6,6 @@
 
 use core_runtime::{webidl_interface, webidl_methods};
 use js::gc::scope::Scope;
-use js::typedarray::ViewKind;
 use js::Object;
 
 use crate::dom_exception::DOMExceptionError;
@@ -30,19 +29,7 @@ impl Crypto {
         // Step 1: If array is not an Int8Array, Uint8Array, Uint8ClampedArray, Int16Array,
         // Uint16Array, Int32Array, Uint32Array, BigInt64Array, or BigUint64Array, then throw a
         // TypeMismatchError and terminate the algorithm.
-        let integer = matches!(
-            array.view_kind(),
-            ViewKind::Int8
-                | ViewKind::Uint8
-                | ViewKind::Uint8Clamped
-                | ViewKind::Int16
-                | ViewKind::Uint16
-                | ViewKind::Int32
-                | ViewKind::Uint32
-                | ViewKind::BigInt64
-                | ViewKind::BigUint64
-        );
-        if !integer {
+        if !array.view_kind().is_integer_array() {
             return Err(DOMExceptionError::new(
                 "TypeMismatchError",
                 "The array must be an integer typed array",
@@ -73,11 +60,21 @@ impl Crypto {
     }
 }
 
+/// The realm object marker of the `crypto` instance [`add_to_global`] installs.
+struct CryptoInstance;
+
+/// The `crypto` instance [`add_to_global`] installed on the current global, even if the global's
+/// `crypto` property was reassigned since.
+pub fn crypto_object<'s>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
+    js::class::realm_object::<CryptoInstance>(scope)
+}
+
 /// Register the `Crypto` class on `global` and install the `crypto` instance on it.
 pub fn add_to_global<'s>(scope: &'s Scope<'_>, global: Object<'s>) {
     Crypto::add_to_global(scope, global);
     let crypto = js::class::create_instance_with::<CryptoImpl>(scope, |_| CryptoImpl {})
         .expect("failed to allocate the crypto object");
+    js::class::register_realm_object::<CryptoInstance>(scope, *crypto);
     global
         .set_property(scope, c"crypto", crypto)
         .expect("failed to define globalThis.crypto");

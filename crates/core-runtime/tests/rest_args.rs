@@ -564,10 +564,7 @@ mod free_fn_tests {
             rest_globals::add_to_global(scope, global);
             rest_ns::add_to_global(scope, global);
             rest_webidl_ns::add_to_global(scope, global);
-            // SAFETY: called during global initialization, before any JS runs.
-            unsafe {
-                rest_module::register(scope);
-            }
+            rest_module::register(scope);
         });
     }
 

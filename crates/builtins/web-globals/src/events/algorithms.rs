@@ -96,7 +96,7 @@ fn options_dictionary<'s>(
 fn read_bool_option(
     scope: &Scope<'_>,
     dictionary: Option<&Object<'_>>,
-    name: &std::ffi::CStr,
+    name: &'static std::ffi::CStr,
 ) -> Result<bool, ExnThrown> {
     let Some(dictionary) = dictionary else {
         return Ok(false);

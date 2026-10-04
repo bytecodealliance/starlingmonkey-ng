@@ -5,10 +5,10 @@
 //! Tests are grouped in a single test function because `JSEngine` can
 //! only be initialized once per process, and must run with --test-threads=1.
 
-#[cfg(not(target_arch = "wasm32"))]
-use core_runtime::event_loop::run_to_completion;
 use core_runtime::event_loop::timer::install_timer_globals;
 use core_runtime::event_loop::{run_microtasks, with_event_loop, EventLoop, StepOutcome, Task};
+#[cfg(not(target_arch = "wasm32"))]
+use core_runtime::event_loop::{run_to_completion, run_until_empty};
 use core_runtime::runtime::Runtime;
 use js::gc::scope::Scope;
 use js::native::JSTracer;
@@ -379,6 +379,111 @@ fn test_event_loop() {
             "an unreferenced interval stopped running"
         );
         el.clear_js_timer(interval as u64);
+
+        // `run_until_empty` runs an unreferenced interval while nothing else is left, and returns
+        // once the interval cleared itself.
+        let interval = with_event_loop(&el, |_| {
+            eval(
+                "globalThis._emptyTicks = 0; \
+                 globalThis._emptyInterval = setInterval(function() { \
+                   if (++globalThis._emptyTicks === 3) clearInterval(globalThis._emptyInterval); \
+                 }, 1)",
+            )
+        })
+        .to_number();
+        el.set_js_timer_ref(interval as u64, false);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // SAFETY: as in `block_on_event_loop`.
+                let raw_cx = unsafe { scope.raw_cx_no_gc() };
+                unsafe { run_until_empty(raw_cx, &el, tokio::time::sleep).await }
+            });
+        assert_eq!(
+            eval("globalThis._emptyTicks").to_number(),
+            3.0,
+            "run_until_empty stopped running an unreferenced interval"
+        );
+        assert!(el.is_empty(), "run_until_empty returned with a task left");
+    }
+
+    // ---- Test 8d: another loop clears, references and restarts a loop's JS timers ----
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let owner = EventLoop::new();
+        let other = EventLoop::new();
+        let eval = |source: &str| {
+            js::compile::evaluate_with_filename(&scope, source, "<test-cross-loop>", 1).unwrap()
+        };
+        let start = |source: &str| with_event_loop(&owner, |_| eval(source)).to_number() as u64;
+
+        let interval = start("setInterval(function() {}, 100000)");
+        with_event_loop(&other, |_| eval(&format!("clearInterval({interval})")));
+        assert!(
+            owner.is_empty(),
+            "clearInterval from another loop left the interval queued"
+        );
+        assert!(!owner.has_js_timer(interval));
+
+        let timeout = start("setTimeout(function() {}, 100000)");
+        with_event_loop(&other, |el| el.set_js_timer_ref(timeout, false));
+        assert!(
+            !owner.is_alive(),
+            "unreferencing from another loop left the timer referenced"
+        );
+        with_event_loop(&other, |el| el.set_js_timer_ref(timeout, true));
+        assert!(
+            owner.is_alive(),
+            "referencing from another loop left the timer unreferenced"
+        );
+
+        assert!(with_event_loop(&other, |el| el.restart_js_timer(timeout, Duration::ZERO)));
+        assert!(
+            owner.time_to_next_timer().unwrap() < Duration::from_secs(1),
+            "restarting from another loop left the old deadline"
+        );
+        assert!(
+            other.is_empty(),
+            "restarting moved the timer to another loop"
+        );
+        with_event_loop(&other, |_| eval(&format!("clearTimeout({timeout})")));
+        assert!(owner.is_empty());
+
+        // The loop that holds a timer is woken when another loop clears it: `run_until_empty`
+        // returns rather than waiting for the cleared interval.
+        let interval = start("setInterval(function() {}, 100000)");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // SAFETY: as in `block_on_event_loop`.
+                let raw_cx = unsafe { scope.raw_cx_no_gc() };
+                let drive =
+                    async { unsafe { run_until_empty(raw_cx, &owner, tokio::time::sleep).await } };
+                let clear = async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    with_event_loop(&other, |_| eval(&format!("clearInterval({interval})")));
+                };
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    futures_lite::future::zip(drive, clear),
+                )
+                .await
+                .expect("the loop that held a cleared interval kept waiting for it");
+            });
+
+        // A timer whose loop ended is ignored.
+        let orphan = start("setTimeout(function() {}, 100000)");
+        drop(owner);
+        with_event_loop(&other, |el| {
+            el.clear_js_timer(orphan);
+            el.set_js_timer_ref(orphan, false);
+            assert!(!el.restart_js_timer(orphan, Duration::ZERO));
+        });
+        assert!(other.is_empty());
     }
 
     // ---- Test 8b: setTimeout forwards extra arguments to the callback ----

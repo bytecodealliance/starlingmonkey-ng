@@ -605,12 +605,13 @@ fn report_missing_fetch_listener(
 
 /// Keep driving the content script's own event loop, on a task of its own, for as long as it has
 /// work: an instance serves many requests, and the script expects a `setInterval` or promise
-/// chain its top level left behind to keep making progress between them.
+/// chain its top level left behind to keep making progress between them. Unreferenced timers
+/// count as work, as they do in a Node.js process whose server is listening.
 ///
 /// The task also keeps the loop from being dropped with async-promise futures still pending,
 /// which [`EventLoop::cancel_pending_futures`] documents as forbidden: it holds the invocation
-/// until [`run_to_completion`] reports the loop empty, which it only does once no future is left
-/// in flight. The task lives as long as the script requires, from one poll for a script that
+/// until [`run_until_empty`](core_runtime::event_loop::run_until_empty) reports the loop empty,
+/// which it only does once no future is left in flight. The task lives as long as the script requires, from one poll for a script that
 /// left nothing behind to the instance's lifetime for one whose `fetch` never responds.
 // TODO: Should reconsider this, it might make more sense to abort async work that's not added to waitUntil.
 fn keep_startup_loop_running(raw_cx: *mut js::native::RawJSContext, invocation: OwnedInvocation) {
@@ -619,7 +620,7 @@ fn keep_startup_loop_running(raw_cx: *mut js::native::RawJSContext, invocation: 
         // `raw_cx` outlives this task, since the runtime is held in a process-lifetime
         // thread-local.
         unsafe {
-            core_runtime::event_loop::run_to_completion(
+            core_runtime::event_loop::run_until_empty(
                 raw_cx,
                 invocation.state().event_loop(),
                 platform::clock::sleep,

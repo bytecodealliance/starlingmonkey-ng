@@ -14,7 +14,8 @@ use crate::builtins::JSType;
 use crate::gc::handle::Stack;
 use crate::gc::scope::Scope;
 use mozjs::gc::HandleValue;
-use mozjs::jsapi::{JSString, RegExpFlags};
+use mozjs::jsapi::JSString;
+pub use mozjs::jsapi::RegExpFlags;
 use mozjs::jsval::UndefinedValue;
 use mozjs::rust::wrappers2;
 use mozjs::rust::HandleObject;
@@ -139,6 +140,27 @@ impl<'s> Stack<'s, RegExp> {
         ExnThrown::check(ok)?;
         Ok(error.handle())
     }
+}
+
+/// The flags the flag characters of `flags` name, such as `gi` for global and case-insensitive
+/// matching. Other characters are ignored.
+pub fn flags_from_str(flags: &str) -> RegExpFlags {
+    use mozjs::jsapi::JS::*;
+    let flags = flags.chars().fold(RegExpFlag_NoFlags, |flags, flag| {
+        flags
+            | match flag {
+                'd' => RegExpFlag_HasIndices,
+                'g' => RegExpFlag_Global,
+                'i' => RegExpFlag_IgnoreCase,
+                'm' => RegExpFlag_Multiline,
+                's' => RegExpFlag_DotAll,
+                'u' => RegExpFlag_Unicode,
+                'v' => RegExpFlag_UnicodeSets,
+                'y' => RegExpFlag_Sticky,
+                _ => RegExpFlag_NoFlags,
+            }
+    });
+    RegExpFlags { flags_: flags }
 }
 
 crate::gc::handle::deref_to_object!(RegExp);

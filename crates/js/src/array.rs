@@ -64,6 +64,70 @@ impl<'s> Stack<'s, Array> {
         Ok(len)
     }
 
+    /// Append `value`, as `Array.prototype.push` does with one argument.
+    pub fn push<'v>(&self, scope: &'v Scope<'_>, value: impl ToJSVal<'v>) -> Result<(), ExnThrown> {
+        let length = self.length(scope)?;
+        self.set_element(scope, length, value)
+    }
+
+    /// Insert `value` at index 0 and move the other elements up by one, as
+    /// `Array.prototype.unshift` does with one argument.
+    pub fn unshift(&self, scope: &Scope<'_>, value: HandleValue<'_>) -> Result<(), ExnThrown> {
+        let length = self.length(scope)?;
+        for index in (0..length).rev() {
+            let element = self.get_element(scope, index)?;
+            self.set_element(scope, index + 1, element)?;
+        }
+        self.set_element(scope, 0, value)
+    }
+
+    /// Remove `count` elements from `start` on and move the elements after them down, as
+    /// `Array.prototype.splice(start, count)` does. A range past the end is clamped to it.
+    pub fn remove(&self, scope: &Scope<'_>, start: u32, count: u32) -> Result<(), ExnThrown> {
+        let length = self.length(scope)?;
+        let start = start.min(length);
+        let count = count.min(length - start);
+        if count == 0 {
+            return Ok(());
+        }
+        for index in start + count..length {
+            let element = self.get_element(scope, index)?;
+            self.set_element(scope, index - count, element)?;
+        }
+        self.set_length(scope, length - count)
+    }
+
+    /// The index of the first element that is strictly equal to `value`, as
+    /// `Array.prototype.indexOf` finds it.
+    pub fn index_of(
+        &self,
+        scope: &Scope<'_>,
+        value: HandleValue<'_>,
+    ) -> Result<Option<u32>, ExnThrown> {
+        for index in 0..self.length(scope)? {
+            let element = self.get_element(scope, index)?;
+            if crate::comparison::strictly_equal(scope, element, value)? {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The elements at the indices below `length`. Reports out of memory if the list can't be
+    /// allocated.
+    pub fn to_vec<'r>(&self, scope: &'r Scope<'_>) -> Result<Vec<HandleValue<'r>>, ExnThrown> {
+        let length = self.length(scope)?;
+        let mut elements = Vec::new();
+        if elements.try_reserve_exact(length as usize).is_err() {
+            crate::exception::report_out_of_memory(scope);
+            return Err(ExnThrown);
+        }
+        for index in 0..length {
+            elements.push(self.get_element(scope, index)?);
+        }
+        Ok(elements)
+    }
+
     /// Set the `length` of this array.
     pub fn set_length(&self, scope: &Scope<'_>, length: u32) -> Result<(), ExnThrown> {
         let ok = unsafe { wrappers2::SetArrayLength(scope.cx_mut(), self.handle(), length) };

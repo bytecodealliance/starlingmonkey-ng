@@ -18,6 +18,7 @@ js.workspace = true
 platform.workspace = true
 smallvec.workspace = true
 url.workspace = true
+web-files.workspace = true
 web-globals.workspace = true
 web-streams.workspace = true
 web-url.workspace = true

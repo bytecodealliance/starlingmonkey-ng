@@ -395,7 +395,7 @@ pub(crate) fn read_u32_field(
     obj: &Object<'_>,
     name: &std::ffi::CStr,
 ) -> Result<Option<u32>, ExnThrown> {
-    let v = obj.get_property(scope, name)?;
+    let v = obj.get_property_by_name(scope, name)?;
     // A `u32` past `i32::MAX` is stored as a double, so the field is read back
     // through the number path for the full `u32` range to round-trip.
     Ok(v.is_number().then(|| v.to_number() as u32))

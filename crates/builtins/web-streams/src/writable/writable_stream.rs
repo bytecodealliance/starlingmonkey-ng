@@ -142,7 +142,7 @@ pub enum WritableStreamState {
 impl WritableStream {
     /// <https://streams.spec.whatwg.org/#ws-constructor>
     #[constructor]
-    fn new(
+    pub fn new(
         &self,
         scope: &Scope<'_>,
         underlying_sink: Option<HandleValue<'_>>,
@@ -230,7 +230,7 @@ impl WritableStream {
 
     /// <https://streams.spec.whatwg.org/#writablestream-close>
     #[method]
-    fn close<'r>(&self, scope: &'r Scope<'_>) -> Result<Promise<'r>, ExnThrown> {
+    pub fn close<'r>(&self, scope: &'r Scope<'_>) -> Result<Promise<'r>, ExnThrown> {
         // Step 1: If ! `IsWritableStreamLocked`(`this`) is true, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if algorithms::is_writable_stream_locked(self) {
@@ -253,7 +253,7 @@ impl WritableStream {
 
     /// <https://streams.spec.whatwg.org/#ws-get-writer>
     #[method]
-    fn get_writer<'r>(
+    pub fn get_writer<'r>(
         &self,
         scope: &'r Scope<'_>,
     ) -> Result<WritableStreamDefaultWriter<'r>, ExnThrown> {

@@ -622,9 +622,21 @@ pub async fn componentize(
         false,
         None,
         true,
+        &InitEnvironment::default(),
     )
     .await
     .map(|componentized| componentized.component)
+}
+
+/// The environment variables and the read-write directories the application's top level gets
+/// while it initializes, in addition to the base directory, which is preopened read-only at `/`.
+/// The resumed instances get those of their host.
+#[derive(Clone, Debug, Default)]
+pub struct InitEnvironment {
+    /// The environment variables, as names and values.
+    pub env: Vec<(String, String)>,
+    /// The host directories to preopen read-write, and the guest paths to preopen them at.
+    pub dirs: Vec<(PathBuf, String)>,
 }
 
 /// What [`componentize_with_output`] produces.
@@ -657,6 +669,9 @@ pub struct Componentized {
 ///
 /// With `allow_blocking_host_io`, synchronous host I/O, such as `fs.readFileSync`,
 /// may block while the component serves requests.
+///
+/// `init` holds the environment variables and the read-write directories the
+/// application's top level gets while it initializes.
 #[expect(clippy::type_complexity)]
 pub async fn componentize_with_output(
     wit: Wit<'_, impl AsRef<Path>>,
@@ -674,6 +689,7 @@ pub async fn componentize_with_output(
     allow_blocking_host_io: bool,
     init_location: Option<&str>,
     cache: bool,
+    init: &InitEnvironment,
 ) -> anyhow::Result<Componentized> {
     if debug && matches!(runtime, Runtime::Dynamic(_)) {
         anyhow::bail!(
@@ -850,8 +866,15 @@ pub async fn componentize_with_output(
     };
     let mut wasi = WasiCtxBuilder::new();
     if let Some(dir) = js_base_directory {
-        // `init` only reads the application's dependency modules.
+        // `init` reads the application's dependency modules from the base directory.
         wasi.preopened_dir(dir, "/", FsPerms::ReadOnly)?;
+    }
+    for (host, guest) in &init.dirs {
+        wasi.preopened_dir(host, guest, FsPerms::ReadWrite)
+            .map_err(|error| anyhow::anyhow!("unable to preopen `{}`: {error}", host.display()))?;
+    }
+    for (name, value) in &init.env {
+        wasi.env(name, value);
     }
     let wasi = wasi
         .stdin(MemoryInputPipe::new(Bytes::new()))

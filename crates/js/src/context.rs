@@ -91,6 +91,91 @@ pub unsafe fn set_native_stack_quota(
     wrappers2::JS_SetNativeStackQuota(scope.cx(), system_code, trusted_script, untrusted_script)
 }
 
+/// Bytes of shadow stack that [`RecursionGuard::enter`] keeps free above SpiderMonkey's limit on
+/// wasm. SpiderMonkey's WASI limit is 1 KiB above the bottom of the stack, and the stack is the
+/// first 1 MiB of linear memory.
+#[cfg(target_family = "wasm")]
+const WASM_STACK_MARGIN: usize = 128 * 1024;
+
+/// One level of native recursion over a structure from content code, from
+/// [`enter`](Self::enter) until the guard is dropped. Native code that recurses over such a
+/// structure enters a level at each step and throws when it can't.
+#[must_use = "the guard counts a level of recursion until it is dropped"]
+pub struct RecursionGuard<'s> {
+    #[cfg(target_family = "wasm")]
+    rooting: NonNull<mozjs::jsapi::JS::RootingContext>,
+    _scope: std::marker::PhantomData<&'s ()>,
+}
+
+impl<'s> RecursionGuard<'s> {
+    /// Enter a level of recursion, or return `None` at the limit at which SpiderMonkey reports
+    /// "too much recursion" for JavaScript:
+    ///
+    /// - Natively, the limit is the native stack limit for untrusted script.
+    /// - On wasm, it is SpiderMonkey's recursion depth limit, which counts the levels of these
+    ///   guards together with the engine's own nested recursion checks, or the shadow stack
+    ///   position [`WASM_STACK_MARGIN`] above SpiderMonkey's stack limit, whichever comes first.
+    ///   [`set_wasi_recursion_depth_limit`] changes the depth limit.
+    ///
+    /// Guards are dropped in the reverse order of entering them.
+    #[inline]
+    pub fn enter(scope: &'s Scope<'_>) -> Option<Self> {
+        let marker = 0u8;
+        let sp = std::ptr::addr_of!(marker) as usize;
+        // SAFETY: reading the context pointer performs no GC.
+        let rooting = unsafe { scope.raw_cx_no_gc() } as *mut mozjs::jsapi::JS::RootingContext;
+        // SAFETY: a `JSContext` starts with its `JS::RootingContext` base, as in
+        // `JS::RootingContext::get`, and `nativeStackLimit` is only written by
+        // `JS_SetNativeStackQuota`.
+        let limit = unsafe {
+            (*rooting).nativeStackLimit
+                [mozjs::jsapi::JS::StackKind::StackForUntrustedScript as usize]
+        };
+        #[cfg(target_family = "wasm")]
+        let limit = limit + WASM_STACK_MARGIN;
+        // The stack grows downward on every target the runtime supports.
+        if sp <= limit {
+            return None;
+        }
+        #[cfg(target_family = "wasm")]
+        // SAFETY: as above. The engine reads and writes the depth only on this thread, in
+        // properly nested scopes, as the guard does.
+        unsafe {
+            if (*rooting).wasiRecursionDepth >= (*rooting).wasiRecursionDepthLimit {
+                return None;
+            }
+            (*rooting).wasiRecursionDepth += 1;
+        }
+        Some(RecursionGuard {
+            #[cfg(target_family = "wasm")]
+            // SAFETY: `raw_cx_no_gc` returns the live, non-null context.
+            rooting: unsafe { NonNull::new_unchecked(rooting) },
+            _scope: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for RecursionGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(target_family = "wasm")]
+        // SAFETY: the context outlives the scope the guard borrows, and `enter` incremented the
+        // depth.
+        unsafe {
+            (*self.rooting.as_ptr()).wasiRecursionDepth -= 1;
+        }
+    }
+}
+
+/// Set SpiderMonkey's recursion depth limit on wasm, the number of nested recursion checks at
+/// which JavaScript and [`RecursionGuard::enter`] report "too much recursion". The default is 350.
+/// A host that runs the runtime with a larger native stack can raise it.
+#[cfg(target_family = "wasm")]
+pub fn set_wasi_recursion_depth_limit(cx: &mut mozjs::context::JSContext, limit: u32) {
+    // SAFETY: `cx` is a live context, and the setter only writes one of its fields.
+    unsafe { wrappers2::SetWasiRecursionDepthLimit(cx, limit) }
+}
+
 /// Add an interrupt callback.
 ///
 /// The callback is invoked when the engine is interrupted (e.g., by
@@ -134,4 +219,10 @@ pub unsafe fn malloc(scope: &Scope<'_>, nbytes: usize) -> *mut std::os::raw::c_v
 /// `p` must have been allocated with [`malloc`] on the same context.
 pub unsafe fn free(scope: &Scope<'_>, p: *mut std::os::raw::c_void) {
     wrappers2::JS_free(scope.cx(), p)
+}
+
+/// Allow `Atomics.wait` to block on the thread of `cx`.
+pub fn set_futex_can_wait(cx: &mut mozjs::context::JSContext) {
+    // SAFETY: `cx` is a live context.
+    unsafe { mozjs::jsapi::JS_SetFutexCanWait(cx.raw_cx()) }
 }

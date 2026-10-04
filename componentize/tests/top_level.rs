@@ -17,7 +17,8 @@
 // the clock a resumed instance's exports read continues past the snapshot, that
 // a module importing the main module's file gets the main module, that what
 // the top level prints is returned with the component, and that the top level
-// reads the location it is given.
+// reads the location it is given, and the environment variables and read-write directories of
+// the init environment.
 
 mod shared;
 
@@ -295,6 +296,7 @@ async fn init_output_is_returned() -> anyhow::Result<()> {
         false,
         None,
         true,
+        &componentize::InitEnvironment::default(),
     )
     .await?;
     assert_eq!(
@@ -336,6 +338,7 @@ async fn top_level_reads_the_init_location() -> anyhow::Result<()> {
             false,
             init_location,
             true,
+            &componentize::InitEnvironment::default(),
         )
         .await?;
         let component = Component::new(&ENGINE, componentized.component)?;

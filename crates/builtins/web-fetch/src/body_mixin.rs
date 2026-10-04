@@ -70,7 +70,7 @@ impl BodyStorage {
 #[webidl_union]
 pub enum BodyInit<'a> {
     Stream(ReadableStream<'a>),
-    // Blob, // Not yet supported.
+    Blob(web_files::blob::Blob<'a>),
     ArrayBuffer(ArrayBuffer<'a>),
     ArrayBufferView(ArrayBufferView<'a>),
     // FormData, // Not yet supported.

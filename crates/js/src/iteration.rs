@@ -17,7 +17,7 @@
 //! value on the record and chaining the wrap continuation on the shared
 //! resolved trigger ([`Promise::shared_resolved_undefined`]).
 
-use crate::class::{get_or_init_shared_function, get_prototype_for};
+use crate::class::get_or_init_shared_function;
 use crate::conversion::{FromJSVal, ToJSVal};
 use crate::error::ExnThrown;
 use crate::function::{cast_payload, EmptyArgs};
@@ -120,15 +120,12 @@ impl AsyncIteratorRecord<'_> {
 
 /// `GetIterator(iterable, async)` with the `CreateAsyncFromSyncIterator`
 /// fallback: build an [`AsyncIteratorRecord`] for `iterable`, throwing a
-/// `TypeError` when it is not (async or sync) iterable. Registers the hidden
-/// record class on the scope's global on first use.
+/// `TypeError` when it is not (async or sync) iterable. The global must have
+/// registered the hidden record class with `AsyncIteratorRecord::add_to_global`.
 pub fn get_async_iterator<'s>(
     scope: &'s Scope<'_>,
     iterable: HandleValue<'_>,
 ) -> Result<AsyncIteratorRecord<'s>, ExnThrown> {
-    if get_prototype_for::<AsyncIteratorRecordImpl>(scope).is_none() {
-        AsyncIteratorRecord::add_to_global(scope, scope.global());
-    }
     AsyncIteratorRecord::new(scope, iterable)
 }
 
@@ -156,7 +153,7 @@ impl<'s> AsyncIteratorRecord<'s> {
         if return_method.is_null_or_undefined() {
             return Promise::new_resolved_with_value(scope, value::undefined());
         }
-        if !is_callable(scope, return_method) {
+        if !crate::function::is_callable(return_method) {
             crate::error::throw_type_error(scope, c"iterator return is not callable");
             return Promise::new_rejected_with_pending_error(scope);
         }
@@ -170,6 +167,36 @@ impl<'s> AsyncIteratorRecord<'s> {
             |scope| Function::new_callback(scope, c"", 1, return_result_check, ()),
         )?;
         return_promise.then(scope, Some(*cb), None)
+    }
+
+    /// The start of `AsyncIteratorClose(iteratorRecord, completion)` for a normal completion, as
+    /// a `for await` loop's `break` runs it: call the iterator's `return` method without
+    /// arguments. Returns `None` without a `return` method, and otherwise `PromiseResolve` of its
+    /// result, which the caller awaits and checks with [`iter_result_object`]. An exception the
+    /// lookup or the call throws is left pending as `Err`.
+    pub fn call_return<'r>(&self, scope: &'r Scope<'_>) -> Result<Option<Promise<'r>>, ExnThrown> {
+        let iterator = self.data().iterator.get(scope);
+        let method = ensure_is_method(scope, iterator.get_property(scope, c"return")?)?;
+        let Some(method) = method else {
+            return Ok(None);
+        };
+        let result = Function::call(scope, iterator, method, EmptyArgs)?;
+        Promise::call_original_resolve(scope, result).map(Some)
+    }
+
+    /// The start of `AsyncIteratorClose(iteratorRecord, completion)` for a throw completion, as
+    /// a `for await` loop that throws runs it: call the iterator's `return` method without
+    /// arguments, as [`call_return`](Self::call_return) does. An exception the lookup or the call
+    /// throws is cleared and gives `None`, as the throw completion supersedes it. The caller
+    /// awaits the promise and ignores how it settles.
+    pub fn close_after_throw<'r>(&self, scope: &'r Scope<'_>) -> Option<Promise<'r>> {
+        match self.call_return(scope) {
+            Ok(promise) => promise,
+            Err(ExnThrown) => {
+                crate::exception::clear(scope);
+                None
+            }
+        }
     }
 
     /// The `return`-method teardown path (the async analogue of
@@ -203,12 +230,6 @@ fn return_result_check(
     Ok(value::undefined())
 }
 
-/// Whether `v` is callable, without throwing — the `IsCallable` test for the
-/// `GetMethod`-style method lookups.
-fn is_callable(scope: &Scope<'_>, v: HandleValue<'_>) -> bool {
-    Object::from_value(scope, *v).is_ok_and(|o| o.is_callable())
-}
-
 /// `GetMethod`-style check: undefined/null yields `None`; a non-callable
 /// throws a `TypeError`; a callable is returned.
 pub(crate) fn ensure_is_method<'r>(
@@ -218,7 +239,7 @@ pub(crate) fn ensure_is_method<'r>(
     if v.is_null_or_undefined() {
         return Ok(None);
     }
-    if !is_callable(scope, v) {
+    if !crate::function::is_callable(v) {
         return Err(crate::error::throw_type_error(
             scope,
             c"iterator method is not callable",
@@ -335,7 +356,7 @@ fn afs_value_rejected(
     // Its outcome is discarded — when the incoming completion is a throw, the
     // original error wins, so a throwing or absent `return` cannot mask it.
     if let Ok(return_method) = sync_iter.get_property(scope, c"return") {
-        if is_callable(scope, return_method) {
+        if crate::function::is_callable(return_method) {
             let _ = Function::call(scope, sync_iter, return_method, EmptyArgs);
         }
     }
@@ -514,7 +535,9 @@ pub fn iter_result_object<'r>(
 /// `IteratorComplete(iterResult)`: `Get(iterResult, "done")`, coerced to a
 /// boolean.
 pub fn iter_result_done(scope: &Scope<'_>, result: &Object<'_>) -> Result<bool, ExnThrown> {
-    Ok(result.get_property(scope, c"done")?.get().to_boolean())
+    Ok(crate::conversion::to_boolean(
+        result.get_property(scope, c"done")?,
+    ))
 }
 
 /// `IteratorValue(iterResult)`: `Get(iterResult, "value")`.

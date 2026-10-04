@@ -111,6 +111,11 @@ impl<'s> Stack<'s, Set> {
         ExnThrown::check(ok)
     }
 
+    /// The set's values, in insertion order. Runs no code the script can change.
+    pub fn values_vec<'r>(&self, scope: &'r Scope<'_>) -> Result<Vec<HandleValue<'r>>, ExnThrown> {
+        super::collect_for_each(scope, self.handle(), wrappers2::SetForEach, 1)
+    }
+
     /// Check whether an object is a `Set`.
     pub fn is_set(scope: &Scope<'_>, obj: HandleObject) -> Result<bool, ExnThrown> {
         let mut result = false;

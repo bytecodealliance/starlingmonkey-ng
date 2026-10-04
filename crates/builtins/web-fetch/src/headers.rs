@@ -34,7 +34,7 @@ use crate::byte_string::ByteString;
 // This should ideally support returning `&'static str` references to the names.
 // If that's too much of a DoS vector, Cow might work instead, with the most common
 // names being interned.
-pub(crate) type HeaderList = Vec<(String, String)>;
+pub type HeaderList = Vec<(String, String)>;
 
 /// A `Headers` object's header list together with the result of `sort and combine` on it,
 /// computed on first use and dropped by every mutable access to the list.

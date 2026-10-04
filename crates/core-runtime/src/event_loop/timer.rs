@@ -287,11 +287,7 @@ fn rethrow(
     _args: js::function::CallbackArgs<'_>,
     payload: js::prelude::HandleValue,
 ) -> Result<js::native::Value, js::error::ExnThrown> {
-    Err(js::exception::set_pending(
-        scope,
-        payload,
-        js::native::ExceptionStackBehavior::DoNotCapture,
-    ))
+    Err(js::exception::throw_value(scope, payload))
 }
 
 /// The body of a microtask `queueMicrotask` queued, whose payload is its callback: invoke the
@@ -315,7 +311,7 @@ fn invoke_microtask(
 ///
 /// Returns the ID, or `None` if no event loop is active.
 pub fn start_timer(
-    scope: &Scope<'_>,
+    _scope: &Scope<'_>,
     callback: js::Callable<'_>,
     this: HandleValue<'_>,
     args: &[HandleValue<'_>],
@@ -331,7 +327,7 @@ pub fn start_timer(
     let this = RootedTraceableBox::new(Heap::from(this.get()));
     let deadline = Instant::now() + delay;
     with_active_event_loop(|el| {
-        el.queue_js_timer_with_id(scope, id, deadline, |timer_id| {
+        el.queue_js_timer_with_id(id, deadline, |timer_id| {
             Box::new(TimerTask {
                 handler: TimerHandler::Function {
                     callback: RootedTraceableBox::new(Heap::from(callback)),
@@ -388,7 +384,7 @@ fn timer_initialization_steps(
 
     // Queue on the current event loop.
     let timer_id = with_active_event_loop(|el| {
-        el.queue_js_timer(scope, deadline, |timer_id| match callable {
+        el.queue_js_timer(deadline, |timer_id| match callable {
             Some(callback) => Box::new(TimerTask::function(
                 callback,
                 extra_args,

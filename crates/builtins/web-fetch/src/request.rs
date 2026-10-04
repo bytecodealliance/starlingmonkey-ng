@@ -760,21 +760,21 @@ impl Request {
 
     /// <https://fetch.spec.whatwg.org/#dom-request-method>
     #[getter]
-    fn method(&self) -> Ref<'_, str> {
+    pub fn method(&self) -> Ref<'_, str> {
         // Step 1: Return `this`’s `request`’s `method`.
         Ref::map(self.data(), |data| data.request.method.as_str())
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-request-url>
     #[getter]
-    fn url(&self) -> Ref<'_, str> {
+    pub fn url(&self) -> Ref<'_, str> {
         // Step 1: Return `this`’s `request`’s `URL`, `serialized`.
         Ref::map(self.data(), |data| data.request.current_url().as_str())
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-request-headers>
     #[getter]
-    fn headers<'r>(&self, scope: &'r Scope<'_>) -> Headers<'r> {
+    pub fn headers<'r>(&self, scope: &'r Scope<'_>) -> Headers<'r> {
         // Step 1: Return `this`’s `headers`.
         self.data().headers.get(scope)
     }
@@ -1053,8 +1053,16 @@ impl Request<'_> {
     }
 
     /// The request's current URL.
-    pub(crate) fn current_url(&self) -> Url {
+    pub fn current_url(&self) -> Url {
         self.data().request.current_url().clone()
+    }
+
+    /// The body of an incoming request as the host delivers it, for a consumer that reads it
+    /// natively, while no `body` stream was created for it. Taking it marks the body disturbed.
+    pub fn take_incoming_body(&self) -> Option<platform::http::IncomingBody> {
+        let body = self.take_unread_host_body()?;
+        BodyMixin::set_source_disturbed(self);
+        Some(body)
     }
 
     /// The request's method (e.g. `"GET"`, `"HEAD"`).

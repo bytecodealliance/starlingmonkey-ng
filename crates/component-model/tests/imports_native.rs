@@ -446,7 +446,9 @@ fn call_named<'s>(
     name: &std::ffi::CStr,
     args: &[js::native::Handle<'s, js::native::Value>],
 ) -> js::native::Value {
-    let f = ns.get_property(scope, name).expect("export resolves");
+    let f = ns
+        .get_property_by_name(scope, name)
+        .expect("export resolves");
     match js::Function::call(scope, ns, f, args) {
         Ok(v) => v.get(),
         Err(_) => {

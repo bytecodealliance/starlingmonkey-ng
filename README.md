@@ -278,7 +278,7 @@ Every Node.js builtin module can be imported or `require`d. `assert`,
 `querystring`, `readline`, `stream`, `string_decoder`, `test`, `timers`, `url`,
 `util` and `zlib` are implemented (`crypto` without keys or ciphers, `dns` with
 only `lookup`, `readline` in line mode, `test` without `run()`, snapshots or
-mock timers, `zlib` without brotli and zstd), as are
+mock timers, `zlib` without the zip archive functions), as are
 `tty.isatty` and `tty.ReadStream`. Modules and exports that aren't
 implemented yet exist with Node's names and throw `ERR_METHOD_NOT_IMPLEMENTED`
 when used. The `process`, `global`, `Buffer`, `setImmediate` and
@@ -323,8 +323,15 @@ Options:
       --max-request-body-bytes <BYTES>   Cap a request body (default 512MiB)
       --max-body-drain-bytes <BYTES>   Spend at most this reading a body the handler ignored (default 256KiB)
       --max-connections <COUNT>      Serve at most this many connections at once (default 1024)
+      --recursion-limit <DEPTH>      Wasm only: the recursion depth at which a stack overflow is thrown (default 350)
   -h, --help                         Print help
 ```
+
+On wasm, the runtime can't check how much native stack is left, so a recursion depth bounds
+JavaScript and recursive builtins such as `util.inspect` instead. The default of 350 fits
+wasmtime's default `-W max-wasm-stack` of 512 KiB. A host that runs the runtime with a larger
+stack can raise the depth by up to 350 for each 512 KiB, for example
+`wasmtime run -W max-wasm-stack=2097152 starling.wasm --recursion-limit 1400`.
 
 The serve timeouts are unlimited by default, except under `--wpt-mode`, where the
 per-phase ones default to 120s. The per-phase timeouts each bound their own phase,
@@ -368,6 +375,9 @@ request whose evaluation fails is answered with a 500.
 
 StarlingMonkey provides proc macros for exposing Rust code to JavaScript. All
 builtins in the `web-globals` crate are implemented using these macros.
+
+[docs/builtin-development.md](docs/builtin-development.md) describes the practices builtins
+follow, and [docs/rooting.md](docs/rooting.md) describes GC rooting.
 
 ### `#[jsclass]` / `#[jsmethods]`
 
@@ -599,7 +609,7 @@ mod math_utils {
 }
 
 // Register before evaluating any JS that imports it:
-unsafe { math_utils::register(&scope); }
+math_utils::register(&scope);
 ```
 
 Exported functions are renamed to camelCase, or to the name given with
@@ -1060,6 +1070,14 @@ relative to the working directory. To link the dynamic library instead, pass
 `--init-location <url>` sets the URL `globalThis.location` reflects while the
 application's top level runs. Without it, reading `location` there throws a
 `TypeError`.
+
+While the top level runs, the base directory is preopened read-only at `/`, and
+the environment is empty. `--init-env NAME=VALUE` sets an environment variable
+then, and `--init-dir HOST::GUEST` preopens the host directory `HOST`
+read-write at `GUEST`. Both can be repeated. What the top level writes there
+stays in `HOST`, so a host that runs the component can mount those files at
+`GUEST` for the application to find them. The component's instances get their
+host's environment and preopens.
 
 What the application prints while it initializes is shown, unless `-q` is
 given. The compiled component is kept in wasmtime's compilation cache, which

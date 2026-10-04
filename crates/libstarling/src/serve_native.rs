@@ -21,7 +21,9 @@ use crate::serve_common::{
     RequestClock, ServeTimeouts, WireResponse,
 };
 use core_runtime::config::{RuntimeConfig, ServeLimits};
-use core_runtime::event_loop::{run_to_completion, run_until_evaluated, EventLoop};
+use core_runtime::event_loop::{
+    run_to_completion, run_until_empty, run_until_evaluated, EventLoop,
+};
 use core_runtime::invocation::{InvocationState, OwnedInvocation};
 use core_runtime::runtime::Runtime;
 use futures_channel::mpsc::UnboundedSender;
@@ -348,7 +350,7 @@ async fn run_server(
 }
 
 /// Keep the content script's own event loop running for as long as the server runs: the
-/// `setInterval`s it left behind, and whatever they start.
+/// `setInterval`s it left behind, including unreferenced ones, and whatever they start.
 ///
 /// Never returns while that loop still has work (with a repeating timer it never will), so this
 /// is raced against the accept loop rather than awaited.
@@ -358,7 +360,7 @@ async fn run_server(
 /// a non-zero delay, so the loop reports idle rather than finding ready work every step.
 async fn run_background_work(raw_cx: *mut js::native::RawJSContext, event_loop: &EventLoop) {
     // SAFETY: `raw_cx` is valid, with the serve loop's realm entered, for the server's life.
-    unsafe { run_to_completion(raw_cx, event_loop, tokio::time::sleep).await };
+    unsafe { run_until_empty(raw_cx, event_loop, tokio::time::sleep).await };
 }
 
 /// Poll `future` with the default global's realm entered. The realm is entered at the start of

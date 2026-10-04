@@ -179,7 +179,7 @@ pub mod native {
     pub use mozjs::jsapi::{
         BigInt, CallArgs, ColumnNumberOneOrigin, ExceptionStackBehavior, GCContext,
         HandleValueArray, JSFunction, JSNative, JSObject, JSRuntime, JSScript, JSString, JSTracer,
-        PropertyDescriptor, SymbolCode, Value, JSFUN_CONSTRUCTOR,
+        PropertyDescriptor, PropertyKey, SymbolCode, Value, JSFUN_CONSTRUCTOR,
     };
     pub use mozjs::rust::wrappers2::JS_GetRuntime;
     pub use mozjs::rust::{Handle, HandleId, HandleObject, MutableHandle, MutableHandleValue};
@@ -288,6 +288,9 @@ pub type Set<'s> = Stack<'s, collections::set::Set>;
 
 /// A scope-rooted handle to a JavaScript `WeakMap` object.
 pub type WeakMap<'s> = Stack<'s, collections::weak_map::WeakMap>;
+
+/// A scope-rooted handle to a JavaScript `WeakSet` object.
+pub type WeakSet<'s> = Stack<'s, collections::weak_set::WeakSet>;
 
 /// A scope-rooted handle to a JavaScript `Function` object.
 pub type Function<'s> = Stack<'s, function::Function>;

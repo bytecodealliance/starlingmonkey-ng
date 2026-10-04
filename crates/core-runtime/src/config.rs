@@ -20,6 +20,11 @@ pub struct RuntimeConfig {
     #[arg(default_value = "./index.js")]
     pub script_path: String,
 
+    /// The arguments after the script path, which the script receives in `process.argv` with
+    /// `--node-compat`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub script_args: Vec<String>,
+
     /// Evaluate inline script instead of a file.
     #[arg(short = 'e', long = "eval")]
     pub eval_script: Option<String>,
@@ -162,6 +167,18 @@ pub struct RuntimeConfig {
     #[arg(long = "end-to-end-timeout", value_name = "SECONDS")]
     pub end_to_end_timeout: Option<u64>,
 
+    /// The nesting depth of recursion at which JavaScript and recursive builtins, such as
+    /// `util.inspect`, throw a stack overflow error. wasm code can't check its native stack, so
+    /// this depth bounds recursion on wasm instead. The default is 350, for wasmtime's default
+    /// native stack of 512 KiB (`-W max-wasm-stack`). Keep the depth at most 350 for each 512 KiB
+    /// of native stack. A depth above that lets deep values exhaust the native stack, which traps
+    /// and ends the instance.
+    ///
+    /// Wasm only: natively, the thread's stack size bounds recursion.
+    #[cfg(target_arch = "wasm32")]
+    #[arg(long = "recursion-limit", value_name = "DEPTH")]
+    pub recursion_limit: Option<u32>,
+
     /// Limits applied for native builds. On Wasm, `wasi:http` enforces equivalents.
     #[cfg(not(target_arch = "wasm32"))]
     #[command(flatten)]
@@ -172,12 +189,23 @@ pub struct RuntimeConfig {
     /// taken (see [`EventLoop::ensure_idle_for_snapshot`](crate::event_loop::EventLoop::ensure_idle_for_snapshot)).
     #[arg(skip)]
     pub pre_initialize: bool,
+
+    /// Define `SharedArrayBuffer` and `Atomics` on every global, and let `Atomics.wait` block,
+    /// without cross-origin isolation. `--node-compat` implies it.
+    #[arg(skip)]
+    pub shared_memory: bool,
 }
 
 impl RuntimeConfig {
     /// Whether to use ES module mode (the default, unless --legacy-script).
     pub fn module_mode(&self) -> bool {
         !self.legacy_script
+    }
+
+    /// Whether shared memory is enabled: with [`shared_memory`](Self::shared_memory), and with
+    /// `--node-compat`.
+    pub fn shared_memory_enabled(&self) -> bool {
+        self.shared_memory || self.node_compat
     }
 
     /// The effective request-restrictions setting: an explicit
@@ -267,8 +295,16 @@ impl RuntimeConfig {
     /// errors.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self, clap::Error> {
         let (args, node_flags) = split_node_runtime_flags(args.into_iter().collect());
-        let mut config = Self::try_parse_from(args)?;
+        let matches = <Self as clap::CommandFactory>::command().try_get_matches_from(args)?;
+        let mut config = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
         config.node_runtime_flags = node_flags;
+        // With `-e`, every positional argument is a script argument.
+        if config.eval_script.is_some()
+            && matches.value_source("script_path") == Some(clap::parser::ValueSource::CommandLine)
+        {
+            let first = std::mem::replace(&mut config.script_path, "./index.js".into());
+            config.script_args.insert(0, first);
+        }
         Ok(config)
     }
 
@@ -1118,6 +1154,8 @@ mod tests {
         .unwrap();
         assert_eq!(config.eval_script.as_deref(), Some("1+1"));
         assert_eq!(config.node_runtime_flags, ["--pending-deprecation"]);
+        let config = RuntimeConfig::from_arg_string("--node-compat -e 1+1 a b").unwrap();
+        assert_eq!(config.script_args, ["a", "b"]);
     }
 
     #[test]
@@ -1127,11 +1165,12 @@ mod tests {
                 .unwrap();
         assert_eq!(config.script_path, "--x");
         assert!(config.node_runtime_flags.is_empty());
-        let error = RuntimeConfig::from_arg_string(
-            "--node-compat --allow-node-runtime-flags app.js --no-warnings",
+        let config = RuntimeConfig::from_arg_string(
+            "--node-compat --allow-node-runtime-flags app.js --no-warnings x",
         )
-        .unwrap_err();
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        .unwrap();
+        assert!(config.node_runtime_flags.is_empty());
+        assert_eq!(config.script_args, ["--no-warnings", "x"]);
     }
 
     #[test]

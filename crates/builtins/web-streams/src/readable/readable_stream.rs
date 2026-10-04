@@ -260,6 +260,28 @@ impl ReadableStream {
         Ok(stream)
     }
 
+    /// Create a readable byte stream that yields `bytes` as a single `Uint8Array` chunk and is
+    /// then closed, as [`ReadableStream::from_bytes`] does for a default stream. It can be read
+    /// with a BYOB reader.
+    pub fn from_bytes_with_byte_reading<'r>(
+        scope: &'r Scope<'_>,
+        bytes: &[u8],
+    ) -> Result<ReadableStream<'r>, ExnThrown> {
+        let none = AlgorithmArg::None;
+        let stream = algorithms::create_readable_byte_stream(scope, none, none, none)?;
+        let controller = stream
+            .byte_controller(scope)
+            .expect("stream has a byte controller");
+        if !bytes.is_empty() {
+            let chunk = Uint8Array::with_data(scope, bytes)?;
+            let chunk = scope.root_value(chunk.as_value());
+            let chunk = js::ArrayBufferView::from_jsval_throwing(scope, chunk, ())?;
+            algorithms::readable_byte_stream_controller_enqueue(scope, &controller, chunk)?;
+        }
+        algorithms::readable_byte_stream_controller_close(scope, &controller)?;
+        Ok(stream)
+    }
+
     /// Create a locked and disturbed `ReadableStream`.
     ///
     /// Useful to implement other builtins' behavior of internally consuming a stream
@@ -295,7 +317,7 @@ impl ReadableStream {
 
     /// <https://streams.spec.whatwg.org/#readablestream-cancel>
     #[method]
-    fn cancel<'r>(
+    pub fn cancel<'r>(
         &self,
         scope: &'r Scope<'_>,
         reason: Option<HandleValue<'r>>,

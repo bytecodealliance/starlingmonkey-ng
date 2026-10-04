@@ -70,7 +70,8 @@ pub(crate) fn extract_body<'r>(
     // (In the Step 10 `ReadableStream` arm below, after that arm's checks.)
     // Step 3: Otherwise, if _object_ is a `Blob` object, set _stream_ to the result of running
     //     _object_’s `get stream`.
-    // Not yet supported.
+    // Note: A blob's stream is materialized lazily from `source`, as for byte sequences (see
+    // Step 4).
     // Step 4: Otherwise, set _stream_ to a `new` `ReadableStream` object, and `set up` _stream_
     //     with byte reading support.
     // Note: For byte-sequence sources the stream is materialized lazily from `source` (see the
@@ -88,7 +89,7 @@ pub(crate) fn extract_body<'r>(
     let mut content_type: Option<Cow<'static, str>> = None;
 
     // Step 10: Switch on _object_:
-    // Note: Blob and FormData are not yet supported (the `Blob` and `FormData` arms of Step 10).
+    // Note: FormData is not yet supported (the `FormData` arm of Step 10).
     match object {
         // Step 10 `byte sequence`: Set _source_ to _object_.
         BodyInitOrBytes::Bytes(bytes) => {
@@ -100,6 +101,16 @@ pub(crate) fn extract_body<'r>(
         }
         BodyInitOrBytes::BodyInit(BodyInit::ArrayBufferView(view)) => {
             source = BodySource::Bytes(bytes::Bytes::from(view.copy_bytes()));
+        }
+        // Step 10 `Blob`: Set _source_ to _object_. Set _length_ to _object_’s `size`. If
+        //     _object_’s `type` attribute is not the empty byte sequence, set _type_ to its value.
+        // (The blob's bytes are the source. _length_ follows from them in Step 11.)
+        BodyInitOrBytes::BodyInit(BodyInit::Blob(blob)) => {
+            let data = blob.data();
+            source = BodySource::Bytes(data.bytes.clone());
+            if !data.r#type.is_empty() {
+                content_type = Some(Cow::Owned(data.r#type.clone()));
+            }
         }
         // Step 10 `URLSearchParams`: Set _source_ to the result of running the
         //     `application/x-www-form-urlencoded` serializer` with _object_’s `list`. Set _type_
@@ -1140,7 +1151,7 @@ pub(crate) type BodyWithType<'r> = (Body, Option<ReadableStream<'r>>, Option<Cow
 /// <https://fetch.spec.whatwg.org/#response-create>
 /// To create a Response object, given a response _response_, headers guard _guard_, and realm\
 /// _realm_, run these steps:
-pub(crate) fn create_a_response_object<'r>(
+pub fn create_a_response_object<'r>(
     scope: &'r Scope<'_>,
     record: ResponseRecord,
     header_list: HeaderList,

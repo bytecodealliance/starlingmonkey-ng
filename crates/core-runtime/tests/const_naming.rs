@@ -64,10 +64,7 @@ fn setup() {
         const_globals::add_to_global(scope, global);
         const_ns::add_to_global(scope, global);
         const_webidl_ns::add_to_global(scope, global);
-        // SAFETY: called during global initialization, before any JS runs.
-        unsafe {
-            const_module::register(scope);
-        }
+        const_module::register(scope);
     });
 }
 
@@ -200,11 +197,8 @@ mod multi_word_ns {
 fn setup_derived_names() {
     core_runtime::runtime::register_global_initializer(|scope, global| {
         multi_word_ns::add_to_global(scope, global);
-        // SAFETY: called during global initialization, before any JS runs.
-        unsafe {
-            multi_word_module::register(scope);
-            ignored_module_name::register(scope);
-        }
+        multi_word_module::register(scope);
+        ignored_module_name::register(scope);
     });
 }
 

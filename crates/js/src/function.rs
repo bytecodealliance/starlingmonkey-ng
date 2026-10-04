@@ -204,21 +204,26 @@ impl<'s> Stack<'s, Function> {
         Ok(rval.handle())
     }
 
-    /// Call a named method on an object.
+    /// Call a named method on an object. The method is looked up through the global's interned
+    /// key for `name` (see [`get_or_init_property_id`](crate::class::get_or_init_property_id)).
     pub fn call_by_name<'a>(
         scope: &'a Scope<'_>,
         obj: HandleObject,
-        name: &CStr,
+        name: &'static CStr,
         args: &[impl ToJSVal<'a>],
     ) -> Result<HandleValue<'a>, ExnThrown> {
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        let mut fval = scope.root_value_mut(UndefinedValue());
+        let ok = unsafe { wrappers2::JS_GetPropertyById(scope.cx_mut(), obj, id, fval.reborrow()) };
+        ExnThrown::check(ok)?;
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
         let mut rval = scope.root_value_mut(UndefinedValue());
         let ok = unsafe {
-            wrappers2::JS_CallFunctionName(
+            wrappers2::JS_CallFunctionValue(
                 scope.cx_mut(),
                 obj,
-                name.as_ptr(),
+                fval.handle(),
                 &args.handles(),
                 rval.reborrow(),
             )
@@ -559,6 +564,15 @@ impl<'a> CallbackArgs<'a> {
         }
     }
 
+    /// The `new.target` of a constructor call, or `undefined` for a plain call.
+    #[inline]
+    pub fn new_target(&self) -> Value {
+        match self.source {
+            ArgsSource::Call(args) if args.is_constructing() => args.new_target().get(),
+            _ => crate::value::undefined(),
+        }
+    }
+
     /// Whether this is a constructor call (`new`).
     #[inline]
     pub fn is_constructing(&self) -> bool {
@@ -567,6 +581,13 @@ impl<'a> CallbackArgs<'a> {
             ArgsSource::Values(_) => false,
         }
     }
+}
+
+/// Whether `value` is a callable object, as ECMAScript's `IsCallable` tests.
+#[inline]
+pub fn is_callable(value: HandleValue<'_>) -> bool {
+    // SAFETY: `value` is rooted, so an object it holds is live.
+    value.is_object() && unsafe { mozjs::jsapi::JS::IsCallable(value.to_object()) }
 }
 
 /// Type-erased callback stored in a helper function's reserved slot.
@@ -586,6 +607,17 @@ where
         .expect("callback payload is an object")
         .cast::<T>()
         .unwrap_or_else(|e| panic!("callback payload: {e}"))
+}
+
+/// The object a [`Callback`]'s `payload` is, for a callback created with a plain object as its
+/// payload.
+///
+/// # Panics
+///
+/// Panics if `payload` is not an object. The code that creates a callback also sets its
+/// payload, so a mismatch is a bug in that code.
+pub fn object_payload<'r>(scope: &'r Scope<'_>, payload: HandleValue<'_>) -> Object<'r> {
+    Object::from_value(scope, *payload).expect("callback payload is an object")
 }
 
 /// The extern "C" trampoline that bridges JSNative to the stored callback.

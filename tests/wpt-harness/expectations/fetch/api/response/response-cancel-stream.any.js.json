@@ -1,12 +1,12 @@
 {
   "Cancelling a starting blob Response stream": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "Cancelling a loading blob Response stream": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "Cancelling a closed blob Response stream": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "Cancelling a starting Response stream": {
     "status": "PASS"

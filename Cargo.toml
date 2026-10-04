@@ -21,6 +21,7 @@ resolver = "2"
 
 [workspace.dependencies]
 bitflags = "2"
+brotli = { version = "8", default-features = false, features = ["std"] }
 bytes = "1"
 clap = { version = "4.5.60", features = ["derive"] }
 crc32fast = "1.5"
@@ -53,6 +54,7 @@ oxc_resolver = "11"
 platform = { path = "crates/platform" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 ripemd = "0.2"
+ruzstd = "0.9"
 serve-test-support = { path = "crates/serve-test-support" }
 serde_json = "1.0.151"
 sha1 = "0.11"
@@ -70,6 +72,7 @@ wpt-support = { path = "crates/wpt-support" }
 # Builtins
 fetch-event = { path = "crates/builtins/fetch-event" }
 web-fetch = { path = "crates/builtins/web-fetch" }
+web-files = { path = "crates/builtins/web-files" }
 web-globals = { path = "crates/builtins/web-globals" }
 web-streams = { path = "crates/builtins/web-streams" }
 web-url = { path = "crates/builtins/web-url" }
@@ -79,6 +82,26 @@ cpp-builtins = { path = "crates/builtins/cpp-builtins" }
 # function. Replace the path with a git dependency on the pushed branch before merging.
 [patch.crates-io]
 wit-bindgen = { path = "../wit-bindgen-block-on/crates/guest-rust" }
+
+# The mozjs fork's `starling-glue` branch: private name symbols, objects created with their
+# properties' slot capacity, and a settable WASI recursion depth limit. The prebuilt engine
+# archives don't contain these yet, so `.cargo/config.toml` builds SpiderMonkey from source.
+# Replace the paths with the git dependency once the branch is merged and its archives are
+# published.
+[patch."https://github.com/tschneidereit/mozjs.git"]
+mozjs = { path = "../../mozjs/mozjs" }
+mozjs_sys = { path = "../../mozjs/mozjs-sys" }
+mozjs_collator_glue = { path = "../../mozjs/mozjs-extracted-crates/collator_glue" }
+mozjs_icu_collator = { path = "../../mozjs/mozjs-extracted-crates/icu_collator" }
+mozjs_icu_collections = { path = "../../mozjs/mozjs-extracted-crates/icu_collections" }
+mozjs_icu_normalizer = { path = "../../mozjs/mozjs-extracted-crates/icu_normalizer" }
+mozjs_icu_provider_glue = { path = "../../mozjs/mozjs-extracted-crates/icu_provider_glue" }
+mozjs_locale_glue = { path = "../../mozjs/mozjs-extracted-crates/locale_glue" }
+mozjs_normalizer_glue = { path = "../../mozjs/mozjs-extracted-crates/normalizer_glue" }
+mozjs_properties_glue = { path = "../../mozjs/mozjs-extracted-crates/properties_glue" }
+mozjs_unicode_bidi_ffi = { path = "../../mozjs/mozjs-extracted-crates/unicode_bidi_ffi" }
+mozjs_utf16_iter = { path = "../../mozjs/mozjs-extracted-crates/utf16_iter" }
+mozjs_utf8_iter = { path = "../../mozjs/mozjs-extracted-crates/utf8_iter" }
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,14 @@
+{
+  "Blob.stream() returns [NewObject]": {
+    "status": "PASS"
+  },
+  "Blob.text() returns [NewObject]": {
+    "status": "PASS"
+  },
+  "Blob.arrayBuffer() returns [NewObject]": {
+    "status": "PASS"
+  },
+  "Blob.bytes() returns [NewObject]": {
+    "status": "PASS"
+  }
+}

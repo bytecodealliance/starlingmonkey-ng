@@ -71,6 +71,7 @@ declare module 'starling:types/starling:cli/command' {
     readViaStream(offset: Filesize): [ReadableStream<Uint8Array>, Promise<void>];
     writeViaStream(data: ReadableStream<ArrayBufferView | ArrayBuffer> | AsyncIterable<ArrayBufferView | ArrayBuffer> | Iterable<ArrayBufferView | ArrayBuffer>, offset: Filesize): Promise<void>;
     appendViaStream(data: ReadableStream<ArrayBufferView | ArrayBuffer> | AsyncIterable<ArrayBufferView | ArrayBuffer> | Iterable<ArrayBufferView | ArrayBuffer>): Promise<void>;
+    syncData(): Promise<void>;
     getFlags(): Promise<DescriptorFlagsSet>;
     setSize(size: Filesize): Promise<void>;
     setTimes(dataAccessTimestamp: NewTimestamp, dataModificationTimestamp: NewTimestamp): Promise<void>;
@@ -346,6 +347,7 @@ declare module 'wasi:clocks/monotonic-clock@0.3.0' {
   import type * as $t from 'starling:types/starling:cli/command';
 
   export function now(): $t.Mark;
+  export function waitUntil(when: $t.Mark): Promise<void>;
   export function waitFor(howLong: $t.Duration): Promise<void>;
 
   export {

@@ -1306,6 +1306,35 @@ fn a_repeating_timer_keeps_running_between_requests() {
     handle.stop();
 }
 
+/// The number after `ticks=` in the response to a request for `path` on `port`.
+fn ticks_at(port: u16, path: &str) -> u32 {
+    request(port, "GET", path, "")
+        .strip_prefix("ticks=")
+        .and_then(|n| n.parse().ok())
+        .expect("a tick count")
+}
+
+/// A request handler that clears a `setInterval` the script's top level started stops it, although
+/// the interval runs on the script's event loop rather than the request's.
+#[test]
+fn a_request_clears_a_top_level_interval() {
+    let handler = r#"globalThis.ticks = 0;
+    const interval = setInterval(() => { globalThis.ticks += 1; }, 20);
+    addEventListener('fetch', (event) => {
+        if (event.request.url.endsWith('/clear')) clearInterval(interval);
+        event.respondWith(new Response('ticks=' + globalThis.ticks));
+    });"#;
+    let port = 18538;
+    let handle = start_serve(handler, port);
+
+    let cleared = ticks_at(port, "/clear");
+    std::thread::sleep(Duration::from_millis(300));
+    let later = ticks_at(port, "/");
+    assert_eq!(cleared, later, "the cleared interval kept firing");
+
+    handle.stop();
+}
+
 /// A zero-delay `setInterval` is always ready to run again, so driving the script's loop to
 /// completion would pin the thread and the server would never accept anything. It has to keep
 /// serving regardless.

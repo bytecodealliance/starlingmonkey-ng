@@ -33,7 +33,7 @@ pub fn add_to_global(scope: &js::prelude::Scope<'_>, global: js::Object<'_>) {
     events::add_to_global(scope, global);
     performance::add_to_global(scope, global);
     signals::add_to_global(scope, global);
-    base64::base64_globals::add_to_global(scope, global);
+    base64::add_to_global(scope, global);
     structured_clone::structured_clone_globals::add_to_global(scope, global);
     worker_location::add_to_global(scope, global);
     navigator::add_to_global(scope, global);

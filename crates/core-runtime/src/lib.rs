@@ -127,11 +127,7 @@ pub unsafe fn evaluate_content_script(
                 }) {
                     return Ok(ScriptEvaluation::new(None));
                 }
-                exception::set_pending(
-                    scope,
-                    error,
-                    js::native::ExceptionStackBehavior::DoNotCapture,
-                );
+                js::exception::throw_value(scope, error);
             }
             let exn = ExnThrown::capture(scope);
             return Err(format!("Script evaluation failed with error {exn}"));

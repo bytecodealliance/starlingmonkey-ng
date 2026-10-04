@@ -245,6 +245,40 @@ pub struct Componentize {
     /// component serves requests, as the runtime's `--allow-blocking-host-io` does.
     #[arg(long)]
     pub allow_blocking_host_io: bool,
+
+    /// Set the environment variable NAME to VALUE while the application's top
+    /// level runs. Repeatable. The component's instances get their host's
+    /// environment instead.
+    #[arg(long, value_name = "NAME=VALUE", value_parser = parse_env)]
+    pub init_env: Vec<(String, String)>,
+
+    /// Preopen the host directory HOST read-write at the guest path GUEST while
+    /// the application's top level runs. Repeatable. What the top level writes
+    /// there stays in HOST. The component's instances get their host's preopens
+    /// instead, so a host that runs the component preopens the same files at
+    /// GUEST for the application to find them.
+    #[arg(long, value_name = "HOST::GUEST", value_parser = parse_dir)]
+    pub init_dir: Vec<(PathBuf, String)>,
+}
+
+/// Parse `NAME=VALUE`.
+fn parse_env(arg: &str) -> Result<(String, String), String> {
+    match arg.split_once('=') {
+        Some((name, value)) if !name.is_empty() => Ok((name.to_string(), value.to_string())),
+        _ => Err(format!("`{arg}` is not of the form NAME=VALUE")),
+    }
+}
+
+/// Parse `HOST::GUEST`, where GUEST is an absolute path.
+fn parse_dir(arg: &str) -> Result<(PathBuf, String), String> {
+    match arg.split_once("::") {
+        Some((host, guest)) if !host.is_empty() && guest.starts_with('/') => {
+            Ok((PathBuf::from(host), guest.to_string()))
+        }
+        _ => Err(format!(
+            "`{arg}` is not of the form HOST::GUEST with an absolute GUEST path"
+        )),
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -580,6 +614,10 @@ fn componentize(
             componentize.allow_blocking_host_io,
             componentize.init_location.as_ref().map(url::Url::as_str),
             !componentize.no_cache,
+            &crate::InitEnvironment {
+                env: componentize.init_env.clone(),
+                dirs: componentize.init_dir.clone(),
+            },
         ))?;
 
     if !common.quiet {

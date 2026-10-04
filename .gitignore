@@ -8,3 +8,5 @@
 /crates/debugger/adapter/node_modules
 /deps/deno-bin
 /deps/bun-bin
+/tests/express-apps/*/node_modules
+/deps/spin-bin

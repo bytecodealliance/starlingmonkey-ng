@@ -26,6 +26,7 @@ platform.workspace = true
 fetch-event.workspace = true
 url.workspace = true
 web-fetch.workspace = true
+web-files.workspace = true
 web-globals.workspace = true
 wpt-support.workspace = true
 web-streams.workspace = true

@@ -55,7 +55,7 @@ pub mod timer;
 use platform::clock::Instant;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use event_listener::{Event, EventListener};
@@ -135,19 +135,6 @@ js::instance_local! {
     static RUNNING_AS_COMMAND: Cell<bool> = const { Cell::new(false) };
     /// Set when the runtime is a component without a `wasi:http/handler` export.
     static WITHOUT_REQUEST_HANDLER: Cell<bool> = const { Cell::new(false) };
-    /// Whether `http.Server.listen()` in a script run as a command accepts connections itself,
-    /// from `--node-http-listen`.
-    static NODE_HTTP_LISTEN: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Record whether `http.Server.listen()` in a script run as a command accepts connections itself.
-pub fn set_node_http_listen(enabled: bool) {
-    NODE_HTTP_LISTEN.with(|cell| cell.set(enabled));
-}
-
-/// Whether `http.Server.listen()` in a script run as a command accepts connections itself.
-pub fn node_http_listen() -> bool {
-    NODE_HTTP_LISTEN.with(Cell::get)
 }
 
 /// Record that the runtime runs its script as a command, so it serves no requests.
@@ -512,6 +499,18 @@ impl TaskQueue {
         }
     }
 
+    /// Make the queued timer task `id` due at `deadline` instead, and not ready. Returns whether
+    /// the task was queued.
+    fn reschedule(&mut self, id: TaskId, deadline: Instant) -> bool {
+        let Some(mut entry) = self.remove(id) else {
+            return false;
+        };
+        entry.ready = false;
+        entry.deadline = Some(deadline);
+        self.insert(entry);
+        true
+    }
+
     /// Mark `id` ready. Returns whether a task not yet ready was found.
     fn mark_ready(&mut self, id: TaskId) -> bool {
         let Some(entry) = self.entries.get_mut(&id) else {
@@ -546,11 +545,105 @@ impl TaskQueue {
 // EventLoop
 // ---------------------------------------------------------------------------
 
-/// Namespace token for the per-global setTimeout/setInterval id counter. Its
-/// address is a process-unique, stable `usize` key for
-/// [`js::class::next_global_counter`], mirroring how shared functions key on
-/// their native pointer.
-static TIMER_ID_COUNTER_KEY: u8 = 0;
+js::instance_local! {
+    /// The last JS timer id [`reserve_js_timer_id`] returned.
+    static LAST_JS_TIMER_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+js::instance_local! {
+    /// The state of the loop that holds each queued or running JS timer, by timer id.
+    static JS_TIMER_LOOPS: RefCell<HashMap<u64, Weak<LoopTasks>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// A JS timer id, greater than zero, that no earlier call or timer in this instance got, for a
+/// timer that [`timer::start_timer`] queues later under it. Ids are unique across globals and
+/// event loops, so that [`JS_TIMER_LOOPS`] finds the loop that holds a timer by its id alone.
+pub fn reserve_js_timer_id() -> u64 {
+    let id = LAST_JS_TIMER_ID.with(Cell::get) + 1;
+    assert!(
+        id < js::conversion::Number::MAX,
+        "JS timer ids wrapped around"
+    );
+    LAST_JS_TIMER_ID.with(|last| last.set(id));
+    id
+}
+
+/// The tasks and JS timers of an [`EventLoop`], shared with [`JS_TIMER_LOOPS`] so that a timer
+/// can be cleared, referenced, unreferenced and rescheduled while another loop is active.
+struct LoopTasks {
+    /// All live tasks.
+    tasks: RefCell<TaskQueue>,
+    /// HTML's "map of setTimeout and setInterval IDs": the timer ids
+    /// JS sees, mapped to the internal task they control.
+    js_timers: RefCell<HashMap<u64, JsTimer>>,
+    /// The owning loop's driver notification.
+    notify: Rc<Event>,
+}
+
+impl LoopTasks {
+    /// Cancel the JS timer `timer_id`. Returns whether this loop holds it.
+    fn clear_js_timer(self: &Rc<Self>, timer_id: u64) -> bool {
+        let removed = self.js_timers.borrow_mut().remove(&timer_id);
+        let Some(timer) = removed else {
+            return false;
+        };
+        self.unregister_js_timer(timer_id);
+        // If the task is still queued, remove it. If it is currently
+        // running (an interval clearing itself from its own callback),
+        // the now-missing map entry suppresses the re-queue instead.
+        self.tasks.borrow_mut().remove(timer.task);
+        true
+    }
+
+    /// Set whether the JS timer `timer_id` keeps the loop alive. Returns whether this loop holds
+    /// it.
+    fn set_js_timer_ref(&self, timer_id: u64, referenced: bool) -> bool {
+        let mut timers = self.js_timers.borrow_mut();
+        let Some(timer) = timers.get_mut(&timer_id) else {
+            return false;
+        };
+        timer.keeps_alive = referenced;
+        self.tasks
+            .borrow_mut()
+            .set_keeps_alive(timer.task, referenced);
+        true
+    }
+
+    /// Make the queued JS timer `timer_id` due at `deadline` instead. Returns whether this loop
+    /// holds it queued.
+    fn reschedule_js_timer(&self, timer_id: u64, deadline: Instant) -> bool {
+        let Some(task) = self
+            .js_timers
+            .borrow()
+            .get(&timer_id)
+            .map(|timer| timer.task)
+        else {
+            return false;
+        };
+        self.tasks.borrow_mut().reschedule(task, deadline)
+    }
+
+    /// Record in [`JS_TIMER_LOOPS`] that this loop holds the JS timer `timer_id`.
+    fn register_js_timer(self: &Rc<Self>, timer_id: u64) {
+        JS_TIMER_LOOPS.with(|loops| {
+            loops.borrow_mut().insert(timer_id, Rc::downgrade(self));
+        });
+    }
+
+    /// Remove the [`JS_TIMER_LOOPS`] entry of the JS timer `timer_id` if it is this loop's.
+    fn unregister_js_timer(self: &Rc<Self>, timer_id: u64) {
+        JS_TIMER_LOOPS.with(|loops| {
+            let mut loops = loops.borrow_mut();
+            if loops
+                .get(&timer_id)
+                .is_some_and(|owner| std::ptr::eq(owner.as_ptr(), Rc::as_ptr(self)))
+            {
+                loops.remove(&timer_id);
+            }
+        });
+    }
+}
 
 /// The event loop task registry.
 ///
@@ -574,11 +667,8 @@ pub struct EventLoop {
     loop_id: u64,
     /// Monotonically increasing counter for generating unique [`TaskId`]s.
     next_id: Cell<u64>,
-    /// All live tasks.
-    tasks: RefCell<TaskQueue>,
-    /// HTML's per-loop "map of setTimeout and setInterval IDs": the timer ids
-    /// JS sees, mapped to the internal task they control.
-    js_timers: RefCell<HashMap<u64, JsTimer>>,
+    /// All live tasks and JS timers.
+    shared: Rc<LoopTasks>,
     /// Scratch buffer for [`step`](Self::step)'s per-batch dispatch list,
     /// reused across steps so the hot path stays allocation-free.
     batch_buf: RefCell<Vec<TaskId>>,
@@ -616,8 +706,11 @@ impl EventLoop {
         Self {
             loop_id: NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             next_id: Cell::new(0),
-            tasks: RefCell::new(TaskQueue::default()),
-            js_timers: RefCell::new(HashMap::new()),
+            shared: Rc::new(LoopTasks {
+                tasks: RefCell::new(TaskQueue::default()),
+                js_timers: RefCell::new(HashMap::new()),
+                notify: Rc::clone(&notify),
+            }),
             batch_buf: RefCell::new(Vec::new()),
             stop_requested: Cell::new(false),
             interest: InterestTracker::new(Rc::clone(&notify)),
@@ -634,7 +727,7 @@ impl EventLoop {
     /// Returns the [`TaskId`] assigned to this task.
     pub fn queue(&self, task: Box<dyn Task>) -> TaskId {
         let id = self.next_task_id();
-        self.tasks.borrow_mut().insert(TaskEntry {
+        self.shared.tasks.borrow_mut().insert(TaskEntry {
             id,
             task,
             ready: false,
@@ -653,7 +746,7 @@ impl EventLoop {
     /// external event (e.g. resolved promises, `queueMicrotask` work).
     pub fn queue_ready(&self, task: Box<dyn Task>) -> TaskId {
         let id = self.next_task_id();
-        self.tasks.borrow_mut().insert(TaskEntry {
+        self.shared.tasks.borrow_mut().insert(TaskEntry {
             id,
             task,
             ready: true,
@@ -674,7 +767,7 @@ impl EventLoop {
         let Some(origin) = js::stack::current_origin() else {
             return;
         };
-        if let Some(entry) = self.tasks.borrow_mut().entries.get_mut(&id) {
+        if let Some(entry) = self.shared.tasks.borrow_mut().entries.get_mut(&id) {
             entry.origin = Some(origin);
         }
     }
@@ -702,7 +795,7 @@ impl EventLoop {
         keeps_alive: bool,
         context: Snapshot,
     ) {
-        self.tasks.borrow_mut().insert(TaskEntry {
+        self.shared.tasks.borrow_mut().insert(TaskEntry {
             id,
             task,
             ready: false,
@@ -720,35 +813,33 @@ impl EventLoop {
     /// in the queue (already run, or currently being executed by the driver)
     /// is left alone.
     pub fn cancel_if_queued(&self, id: TaskId) -> bool {
-        self.tasks.borrow_mut().remove(id).is_some()
+        self.shared.tasks.borrow_mut().remove(id).is_some()
     }
 
     /// Queue a `setTimeout`/`setInterval` task under a fresh JS timer id.
     pub fn queue_js_timer(
         &self,
-        scope: &Scope<'_>,
         deadline: Instant,
         make_task: impl FnOnce(u64) -> Box<dyn Task>,
     ) -> u64 {
-        self.queue_js_timer_with_id(scope, None, deadline, make_task)
+        self.queue_js_timer_with_id(None, deadline, make_task)
     }
 
     /// Queue a `setTimeout`/`setInterval` task under the JS timer id `id`, which must not belong
     /// to a queued timer, or under a fresh id if `id` is `None`. Returns the id.
     pub fn queue_js_timer_with_id(
         &self,
-        scope: &Scope<'_>,
         id: Option<u64>,
         deadline: Instant,
         make_task: impl FnOnce(u64) -> Box<dyn Task>,
     ) -> u64 {
-        let timer_id = id.unwrap_or_else(|| self.allocate_js_timer_id(scope));
+        let timer_id = id.unwrap_or_else(reserve_js_timer_id);
         let task = self.next_task_id();
         let origin = js::stack::current_origin();
         let context = Snapshot::capture();
         let made = make_task(timer_id);
         self.insert_timer(task, made, deadline, origin.clone(), true, context.clone());
-        self.js_timers.borrow_mut().insert(
+        self.shared.js_timers.borrow_mut().insert(
             timer_id,
             JsTimer {
                 task,
@@ -757,6 +848,7 @@ impl EventLoop {
                 context,
             },
         );
+        self.shared.register_js_timer(timer_id);
         timer_id
     }
 
@@ -772,7 +864,7 @@ impl EventLoop {
         task: Box<dyn Task>,
         deadline: Instant,
     ) {
-        let (origin, keeps_alive, context) = match self.js_timers.borrow().get(&timer_id) {
+        let (origin, keeps_alive, context) = match self.shared.js_timers.borrow().get(&timer_id) {
             Some(timer) if timer.task == id => (
                 timer.origin.clone(),
                 timer.keeps_alive,
@@ -783,29 +875,53 @@ impl EventLoop {
         self.insert_timer(id, task, deadline, origin, keeps_alive, context);
     }
 
-    /// Set whether the JS timer `timer_id` keeps the loop alive, which it does when created. An
-    /// unreferenced timer still runs while other work keeps the loop alive.
+    /// Run `op` on the tasks of the loop that holds the JS timer `timer_id`, and return its
+    /// result: this loop's if it holds the timer, and otherwise those of the live loop
+    /// [`JS_TIMER_LOOPS`] maps it to, whose driver is woken afterwards. Returns `false` if no live
+    /// loop holds the timer.
+    fn with_js_timer_loop(&self, timer_id: u64, op: impl FnOnce(&Rc<LoopTasks>) -> bool) -> bool {
+        if self.shared.js_timers.borrow().contains_key(&timer_id) {
+            return op(&self.shared);
+        }
+        let owner =
+            JS_TIMER_LOOPS.with(|loops| loops.borrow().get(&timer_id).and_then(Weak::upgrade));
+        let Some(owner) = owner else {
+            return false;
+        };
+        let done = op(&owner);
+        owner.notify.notify(1);
+        done
+    }
+
+    /// Set whether the JS timer `timer_id` keeps the event loop that holds it alive, which it does
+    /// when created. An unreferenced timer still runs while other work keeps the loop alive.
     ///
     /// Invalid IDs are ignored.
     pub fn set_js_timer_ref(&self, timer_id: u64, referenced: bool) {
-        let mut timers = self.js_timers.borrow_mut();
-        let Some(timer) = timers.get_mut(&timer_id) else {
-            return;
-        };
-        timer.keeps_alive = referenced;
-        self.tasks
-            .borrow_mut()
-            .set_keeps_alive(timer.task, referenced);
+        self.with_js_timer_loop(timer_id, |tasks| {
+            tasks.set_js_timer_ref(timer_id, referenced)
+        });
+    }
+
+    /// Make the queued JS timer `timer_id` due `delay` from now instead, on the event loop that
+    /// holds it. Returns `false`, and changes nothing, if no loop holds the timer queued, which
+    /// includes a timer whose callback is running.
+    pub fn restart_js_timer(&self, timer_id: u64, delay: Duration) -> bool {
+        let deadline = Instant::now() + delay;
+        self.with_js_timer_loop(timer_id, |tasks| {
+            tasks.reschedule_js_timer(timer_id, deadline)
+        })
     }
 
     /// Whether the JS timer `timer_id` is queued or running.
     pub fn has_js_timer(&self, timer_id: u64) -> bool {
-        self.js_timers.borrow().contains_key(&timer_id)
+        self.shared.js_timers.borrow().contains_key(&timer_id)
     }
 
     /// The ids of the JS timers that are queued or running and keep the loop alive.
     pub fn referenced_js_timers(&self) -> Vec<u64> {
-        self.js_timers
+        self.shared
+            .js_timers
             .borrow()
             .iter()
             .filter(|(_, timer)| timer.keeps_alive)
@@ -813,17 +929,11 @@ impl EventLoop {
             .collect()
     }
 
-    /// Cancel a JS timer by its `setTimeout`/`setInterval` id.
+    /// Cancel a JS timer by its `setTimeout`/`setInterval` id, on the event loop that holds it.
     ///
     /// Invalid IDs are silently ignored per spec.
     pub fn clear_js_timer(&self, timer_id: u64) {
-        let removed = self.js_timers.borrow_mut().remove(&timer_id);
-        if let Some(timer) = removed {
-            // If the task is still queued, remove it. If it is currently
-            // running (an interval clearing itself from its own callback),
-            // the now-missing map entry suppresses the re-queue instead.
-            self.cancel_if_queued(timer.task);
-        }
+        self.with_js_timer_loop(timer_id, |tasks| tasks.clear_js_timer(timer_id));
     }
 
     /// Release a one-shot JS timer's id after its task `task` fired. An id that was queued again
@@ -832,25 +942,14 @@ impl EventLoop {
     /// Mirrors HTML's "remove global's map of `setTimeout` and `setInterval`
     /// `IDs[id]`" task substep for non-repeating timers.
     pub fn js_timer_fired(&self, timer_id: u64, task: TaskId) {
-        let mut timers = self.js_timers.borrow_mut();
+        let mut timers = self.shared.js_timers.borrow_mut();
         if timers
             .get(&timer_id)
             .is_some_and(|timer| timer.task == task)
         {
             timers.remove(&timer_id);
-        }
-    }
-
-    /// Allocate the next JS timer id: greater than zero and not currently in
-    /// this loop's timer map.
-    fn allocate_js_timer_id(&self, scope: &Scope<'_>) -> u64 {
-        let key = &TIMER_ID_COUNTER_KEY as *const u8 as usize;
-        let js_timers = self.js_timers.borrow();
-        loop {
-            let id = js::class::next_global_counter(scope, key);
-            if id != 0 && !js_timers.contains_key(&id) {
-                return id;
-            }
+            drop(timers);
+            self.shared.unregister_js_timer(timer_id);
         }
     }
 
@@ -859,7 +958,7 @@ impl EventLoop {
     /// Has no effect if the task ID is not found (the task may have
     /// already been cancelled or run).
     pub fn signal_ready(&self, id: TaskId) {
-        if self.tasks.borrow_mut().mark_ready(id) {
+        if self.shared.tasks.borrow_mut().mark_ready(id) {
             self.notify.notify(1);
         }
     }
@@ -871,7 +970,7 @@ impl EventLoop {
     /// "Next" follows [`step`](Self::step)'s dispatch order: ready non-timer
     /// tasks in allocation order, then expired timers by deadline.
     pub fn pop_ready(&self) -> Option<(TaskId, Box<dyn Task>)> {
-        let mut tasks = self.tasks.borrow_mut();
+        let mut tasks = self.shared.tasks.borrow_mut();
         let &(_, id) = tasks.ready.first()?;
         let entry = tasks.remove(TaskId(id)).expect("ready tasks are live");
         Some((entry.id, entry.task))
@@ -883,7 +982,7 @@ impl EventLoop {
     /// Returns the number of timers that became ready.
     // TODO: consider merging with `time_to_next_timer` and returning the tasks directly.
     pub fn advance_timers(&self) -> usize {
-        self.tasks.borrow_mut().expire_timers(Instant::now())
+        self.shared.tasks.borrow_mut().expire_timers(Instant::now())
     }
 
     /// Returns the duration until the next timer fires, or `None` if
@@ -893,29 +992,29 @@ impl EventLoop {
     /// is already expired and [`advance_timers`](Self::advance_timers)
     /// should be called.
     pub fn time_to_next_timer(&self) -> Option<Duration> {
-        let &(deadline, _) = self.tasks.borrow().timers.first()?;
+        let &(deadline, _) = self.shared.tasks.borrow().timers.first()?;
         Some(deadline.saturating_duration_since(Instant::now()))
     }
 
     /// Returns `true` if any task (ready or not) in the queue keeps the loop alive. Every task
     /// does except unreferenced JS timers.
     pub fn has_pending(&self) -> bool {
-        self.tasks.borrow().keep_alive > 0
+        self.shared.tasks.borrow().keep_alive > 0
     }
 
     /// Returns `true` if at least one task is in the ready state.
     pub fn has_ready(&self) -> bool {
-        !self.tasks.borrow().ready.is_empty()
+        !self.shared.tasks.borrow().ready.is_empty()
     }
 
     /// Returns the number of tasks currently queued (ready or not).
     pub fn len(&self) -> usize {
-        self.tasks.borrow().entries.len()
+        self.shared.tasks.borrow().entries.len()
     }
 
     /// Returns `true` if the event loop has no tasks.
     pub fn is_empty(&self) -> bool {
-        self.tasks.borrow().entries.is_empty()
+        self.shared.tasks.borrow().entries.is_empty()
     }
 
     // -----------------------------------------------------------------------
@@ -1004,17 +1103,18 @@ impl EventLoop {
         Err(message)
     }
 
-    /// Everything that keeps this loop alive: its tasks, its external interest, the async-promise
-    /// futures it owns, and its pending sends. Each entry's origin is set if origins were being
-    /// recorded when the work was created (see [`js::stack::record_origins`]).
+    /// Everything that keeps this loop alive, and its unreferenced timers: its tasks, its external
+    /// interest, the async-promise futures it owns, and its pending sends. Each entry's origin is
+    /// set if origins were being recorded when the work was created (see
+    /// [`js::stack::record_origins`]).
     ///
     /// Tasks come first, in the order they were queued, then interest, then futures, then sends.
     pub fn pending_work(&self) -> Vec<PendingWork> {
-        let tasks = self.tasks.borrow();
+        let tasks = self.shared.tasks.borrow();
         let mut entries: Vec<&TaskEntry> = tasks
             .entries
             .values()
-            .filter(|entry| entry.keeps_alive)
+            .filter(|entry| entry.keeps_alive || entry.deadline.is_some())
             .collect();
         entries.sort_unstable_by_key(|entry| entry.id.0);
         let mut work: Vec<PendingWork> = entries
@@ -1109,6 +1209,25 @@ pub async unsafe fn run_to_completion<S, F>(
     F: std::future::Future<Output = ()>,
 {
     unsafe { run_until(raw_cx, event_loop, sleep, |_| false).await }
+}
+
+/// Run the event loop as [`run_to_completion`] does, except that unreferenced JS timers count as
+/// work: the loop keeps running while it holds only those, and returns once it holds no task, no
+/// interest and no futures in flight.
+///
+/// # Safety
+///
+/// `raw_cx` must be a valid JSContext pointer that remains valid for the
+/// lifetime of this future (i.e. the `Runtime` must not be dropped).
+pub async unsafe fn run_until_empty<S, F>(
+    raw_cx: *mut js::native::RawJSContext,
+    event_loop: &EventLoop,
+    sleep: S,
+) where
+    S: Fn(Duration) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    unsafe { drive(raw_cx, event_loop, sleep, |_| false, true).await }
 }
 
 /// The prefix [`trace_idle`] writes before its tag.
@@ -1256,6 +1375,25 @@ pub async unsafe fn run_until<S, F>(
     S: Fn(Duration) -> F,
     F: std::future::Future<Output = ()>,
 {
+    unsafe { drive(raw_cx, event_loop, sleep, should_stop, false).await }
+}
+
+/// [`run_until`], which with `keep_unreferenced` also keeps running while the loop holds only
+/// unreferenced JS timers.
+///
+/// # Safety
+///
+/// As for [`run_until`].
+async unsafe fn drive<S, F>(
+    raw_cx: *mut js::native::RawJSContext,
+    event_loop: &EventLoop,
+    sleep: S,
+    should_stop: impl Fn(&Scope<'_>) -> bool,
+    keep_unreferenced: bool,
+) where
+    S: Fn(Duration) -> F,
+    F: std::future::Future<Output = ()>,
+{
     // Completions that arrived as a suspension began, settled once it ends.
     let mut held: Vec<js::promise::CompletedFuture> = Vec::new();
     loop {
@@ -1299,8 +1437,14 @@ pub async unsafe fn run_until<S, F>(
         let owner = event_loop.loop_id;
         let have_futures = js::promise::has_pending_futures(owner);
 
+        // With `keep_unreferenced`, a loop that is `Done` but not empty holds only unreferenced
+        // timers, and the await arm below waits for the next one.
         match outcome {
-            StepOutcome::Done if !have_futures => return,
+            StepOutcome::Done
+                if !have_futures && !(keep_unreferenced && !event_loop.is_empty()) =>
+            {
+                return
+            }
             StepOutcome::Progressed => {
                 // A perpetually-ready task chain — a self-rescheduling timer
                 // whose handler outlasts the 4ms nested-timer clamp — never
@@ -1413,11 +1557,7 @@ pub fn handle_and_clear_exception(scope: &Scope<'_>) {
             if crate::lifecycle::uncaught(scope, error, None) {
                 return;
             }
-            js::exception::set_pending(
-                scope,
-                error,
-                js::native::ExceptionStackBehavior::DoNotCapture,
-            );
+            js::exception::throw_value(scope, error);
         }
     }
     let captured = js::error::ExnThrown::capture(scope);
@@ -1456,14 +1596,21 @@ impl EventLoop {
         // ties broken the same way, which is the order of the ready set. The batch buffer is
         // reused to keep the path allocation-free.
         let mut batch = self.batch_buf.take();
-        batch.extend(self.tasks.borrow().ready.iter().map(|&(_, id)| TaskId(id)));
+        batch.extend(
+            self.shared
+                .tasks
+                .borrow()
+                .ready
+                .iter()
+                .map(|&(_, id)| TaskId(id)),
+        );
         let mut ran_any = false;
         for &id in &batch {
             // Take the task out before running it, ending the borrow: the
             // task's JS can re-enter this loop (setTimeout, clearTimeout)
             // through `with_active_event_loop`. Re-locate by id — an earlier
             // task in the batch may have cancelled this one.
-            let Some(entry) = self.tasks.borrow_mut().remove(id) else {
+            let Some(entry) = self.shared.tasks.borrow_mut().remove(id) else {
                 continue;
             };
             let previous = entry.context.enter();
@@ -1508,7 +1655,7 @@ impl EventLoop {
     /// allocation points, and no `tasks` borrow is held across a call into JS, so the borrow here
     /// cannot conflict.
     pub unsafe fn trace(&self, trc: *mut JSTracer) {
-        for entry in self.tasks.borrow().entries.values() {
+        for entry in self.shared.tasks.borrow().entries.values() {
             entry.task.trace(trc);
         }
     }
@@ -1527,6 +1674,15 @@ impl Default for EventLoop {
     }
 }
 
+impl Drop for EventLoop {
+    fn drop(&mut self) {
+        let ids: Vec<u64> = self.shared.js_timers.borrow().keys().copied().collect();
+        for id in ids {
+            self.shared.unregister_js_timer(id);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1540,8 +1696,8 @@ impl Default for EventLoop {
 /// Any `FinalizationRegistry` cleanup a collection queued runs first, so a
 /// callback's own microtasks are drained in the same turn. A promise rejected
 /// with no handler attached by the end of the drain is reported by
-/// [`report_unhandled_rejections`], and the microtasks the `uncaught` lifecycle
-/// hook queued while handling it are drained as well. The messages
+/// [`report_unhandled_rejections`], and the microtasks the lifecycle hooks
+/// queued while it ran are drained as well. The messages
 /// [`crate::diagnostics::report_later`] queued are reported last.
 pub fn run_microtasks(scope: &Scope<'_>) {
     debug_assert!(
@@ -1559,21 +1715,33 @@ pub fn run_microtasks(scope: &Scope<'_>) {
     crate::diagnostics::report_queued();
 }
 
-/// Report each promise that was rejected with no handler attached, and still has none, with the
-/// rejection reason's message and stack (see [`crate::diagnostics`]). The `uncaught` lifecycle
-/// hook runs with the async context that was current when the promise was rejected. Returns
-/// whether there was such a promise.
+/// Call the `rejection_handled` lifecycle hook for each promise that got a handler after this
+/// reported its rejection. Then report each promise that was rejected with no handler attached,
+/// and still has none, to the `uncaught` lifecycle hook, and with the rejection reason's message
+/// and stack (see [`crate::diagnostics`]) if the hook doesn't handle it. The `uncaught` hook runs
+/// with the async context that was current when the promise was rejected. Returns whether there
+/// was such a promise of either kind.
 pub fn report_unhandled_rejections(scope: &Scope<'_>) -> bool {
+    let handled = jobs::take_handled_rejections(scope);
+    let mut reported = !handled.is_empty();
+    for (promise, id) in handled {
+        crate::lifecycle::rejection_handled(scope, promise, id);
+    }
     let rejections = jobs::take_unhandled_rejections(scope);
-    let reported = !rejections.is_empty();
-    for (promise, context) in rejections {
+    reported |= !rejections.is_empty();
+    for rejection in rejections {
+        let promise = rejection.promise;
         let Some(reason) = promise.result(scope) else {
             continue;
         };
         let promise_value = js::conversion::ToJSVal::to_jsval_throwing(&promise, scope);
         if let Ok(promise_value) = promise_value {
-            let previous = context.enter();
-            let handled = crate::lifecycle::uncaught(scope, reason, Some(promise_value));
+            let previous = rejection.context.enter();
+            let hooked = crate::lifecycle::Rejection {
+                promise: promise_value,
+                id: rejection.id,
+            };
+            let handled = crate::lifecycle::uncaught(scope, reason, Some(hooked));
             previous.enter();
             if handled {
                 continue;

@@ -25,9 +25,8 @@ use std::ptr;
 use crate::exception::is_pending;
 use crate::gc::scope::Scope;
 use crate::Object;
-use mozjs::jsapi::{
-    JSErrorFormatString, JSExnType, JSString, JS_ReportErrorNumberUTF8, StackFormat,
-};
+pub use mozjs::jsapi::JSExnType;
+use mozjs::jsapi::{JSErrorFormatString, JSString, JS_ReportErrorNumberUTF8, StackFormat};
 use mozjs::rooted;
 use mozjs::rust::wrappers2;
 #[cfg(debug_assertions)]
@@ -517,6 +516,85 @@ pub fn throw_error(scope: &Scope<'_>, msg: &str) -> ExnThrown {
 }
 
 // ---------------------------------------------------------------------------
+// new_error
+// ---------------------------------------------------------------------------
+
+/// The most frames an error's stack keeps, as SpiderMonkey's `MAX_REPORTED_STACK_DEPTH`.
+const MAX_STACK_FRAMES: u32 = 128;
+
+/// A new error object of type `kind`, such as `JSEXN_TYPEERR` for a `TypeError`, with `message`
+/// and the current stack, as the type's constructor creates it, without throwing it. Its
+/// `fileName`, `lineNumber` and `columnNumber` are those of the innermost frame of the stack, and
+/// empty and 0 if no script is running.
+pub fn new_error<'s>(
+    scope: &'s Scope<'_>,
+    kind: JSExnType,
+    message: &str,
+) -> Result<mozjs::gc::HandleValue<'s>, ExnThrown> {
+    let message = crate::string::Str::from_str(scope, message)?;
+    let stack = crate::stack::capture_saved_frame(scope, MAX_STACK_FRAMES)?;
+    let raw = unsafe { scope.raw_cx_no_gc() };
+    rooted!(in(raw) let mut file = crate::string::Str::empty(scope).as_raw());
+    let mut line = 0;
+    let mut column = 0;
+    let stack_handle = match stack {
+        Some(frame) => {
+            let self_hosted = mozjs::jsapi::SavedFrameSelfHosted::Exclude;
+            // SAFETY: `frame` is a rooted `SavedFrame`, and the out-parameters are rooted locations.
+            unsafe {
+                crate::stack::get_saved_frame_source(
+                    scope,
+                    ptr::null_mut(),
+                    frame.handle(),
+                    file.handle_mut(),
+                    self_hosted,
+                );
+                crate::stack::get_saved_frame_line(
+                    scope,
+                    ptr::null_mut(),
+                    frame.handle(),
+                    &mut line,
+                    self_hosted,
+                );
+                let mut one_origin = mozjs::jsapi::JS::TaggedColumnNumberOneOrigin { value_: 0 };
+                wrappers2::GetSavedFrameColumn(
+                    scope.cx_mut(),
+                    ptr::null_mut(),
+                    frame.handle(),
+                    &mut one_origin,
+                    self_hosted,
+                );
+                column = one_origin.value_;
+            }
+            frame.handle()
+        }
+        None => mozjs::rust::HandleObject::null(),
+    };
+    let mut error = scope.root_value_mut(mozjs::jsval::UndefinedValue());
+    // SAFETY: every handle is rooted, and the report is null.
+    let ok = unsafe {
+        wrappers2::CreateError(
+            scope.cx_mut(),
+            kind,
+            stack_handle,
+            file.handle(),
+            line,
+            column,
+            ptr::null_mut(),
+            message.handle(),
+            mozjs::rust::HandleValue::undefined(),
+            error.reborrow(),
+        )
+    };
+    ExnThrown::check(ok)?;
+    let error = error.handle();
+    // `CreateError` always gives the error a `cause`, which an error created without one lacks.
+    let object = Object::from_value(scope, error).map_err(|e| e.throw(scope))?;
+    object.delete_property(scope, c"cause")?;
+    Ok(error)
+}
+
+// ---------------------------------------------------------------------------
 // capture_stack_from_error
 // ---------------------------------------------------------------------------
 
@@ -531,9 +609,7 @@ pub fn throw_error(scope: &Scope<'_>, msg: &str) -> ExnThrown {
 /// Leaves the slot empty if no script is running, or if the capture fails. A failed capture's
 /// exception is cleared.
 pub fn capture_stack_from_error(scope: &Scope<'_>, obj: &Object<'_>) {
-    // SpiderMonkey's `Error` keeps at most this many frames (`MAX_REPORTED_STACK_DEPTH`).
-    const MAX_FRAMES: u32 = 128;
-    match crate::stack::capture_saved_frame(scope, MAX_FRAMES) {
+    match crate::stack::capture_saved_frame(scope, MAX_STACK_FRAMES) {
         Ok(Some(frame)) => {
             // SAFETY: `obj` is an instance of an error-data class, which has the slot.
             unsafe {
