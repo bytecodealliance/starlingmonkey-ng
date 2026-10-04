@@ -390,6 +390,59 @@ async fn top_level_reads_the_init_location() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The top level reads the init environment's variables and writes to its read-write
+/// directories, and what it wrote stays in the host directory.
+#[tokio::test]
+async fn top_level_gets_the_init_environment() -> anyhow::Result<()> {
+    const MAIN: &str = "\
+        import { writeFileSync, readFileSync } from 'node:fs';\n\
+        writeFileSync(`${process.env.DATA_DIR}/written.txt`, process.env.GREETING);\n\
+        const read = readFileSync(`${process.env.DATA_DIR}/written.txt`, 'utf8');\n\
+        export const greeting = () => read;";
+    let runtime = shared::runtime().expect("reading the runtime build");
+    let host = std::env::temp_dir().join(format!("starling-init-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&host)?;
+    let init = componentize::InitEnvironment {
+        env: vec![
+            ("DATA_DIR".into(), "/data".into()),
+            ("GREETING".into(), "hello from init".into()),
+        ],
+        dirs: vec![(host.clone(), "/data".into())],
+    };
+    let componentized = componentize::componentize_with_output(
+        componentize::Wit::<PathBuf>::String(include_str!("fixtures/top_level.wit")),
+        Some("top-level"),
+        &[],
+        false,
+        MAIN,
+        Some(base_directory()),
+        &runtime,
+        &[],
+        None,
+        false,
+        true,
+        None,
+        false,
+        None,
+        true,
+        &init,
+    )
+    .await;
+    let written = std::fs::read_to_string(host.join("written.txt"));
+    std::fs::remove_dir_all(&host)?;
+    let component = Component::new(&ENGINE, componentized?.component)?;
+    assert_eq!(written?, "hello from init");
+    let mut linker = Linker::new(&ENGINE);
+    componentize::add_wasi(&mut linker)?;
+    componentize::trap_unsatisfied_imports(&ENGINE, &component, &mut linker, &[])?;
+    let mut store = shared::store(&ENGINE);
+    let instance = TopLevelPre::new(linker.instantiate_pre(&component)?)?
+        .instantiate_async(&mut store)
+        .await?;
+    assert_eq!(instance.call_greeting(&mut store).await?, "hello from init");
+    Ok(())
+}
+
 /// With `node_compat`, the top level can use the `node:` builtin modules, the `process` global
 /// and `require`, and what it computes is in the snapshot. Without it, `node:` modules don't
 /// resolve.

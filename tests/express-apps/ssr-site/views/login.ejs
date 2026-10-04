@@ -1,0 +1,10 @@
+<%- include('layout-top', { title: 'Log in' }) %>
+  <form method="post" action="<%= base %>/login">
+    <input type="hidden" name="_csrf" value="<%= csrf %>">
+    <label>Name <input name="name"></label>
+    <label>Password <input type="password" name="password"></label>
+    <label><input type="checkbox" name="remember" value="1"> Remember me</label>
+    <button>Log in</button>
+  </form>
+</body>
+</html>

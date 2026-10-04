@@ -3,42 +3,69 @@
 //
 // Writes a Markdown summary of Node.js test-suite results: overall counts per target, counts and
 // the largest blockers per area, the blockers by failure signature with example tests, the skip
-// reasons, and the tests that pass natively but not on wasm.
+// reasons, the tests that pass natively but not on wasm, and the tests that other runtimes pass
+// and the native target fails.
 //
 // Usage:
-//   node tests/node-harness/report.mjs --native=FILE [--wasm=FILE] [--out=FILE]
+//   node tests/node-harness/report.mjs --native=FILE [--wasm=FILE] [--compare=NAME=FILE...]
+//                                      [--out=FILE]
 //
-// The input files are what `run-node-tests.mjs --json=FILE` writes. Without --out, the report goes
+// The input files are what `run-node-tests.mjs --json=FILE` writes. Each `--compare` names
+// another runtime's run, such as `--compare=Deno=deno.json`. Without --out, the report goes
 // to standard output.
 
 import { readFileSync, writeFileSync } from "node:fs";
 
-/** The area of each test, by the start of its file name, longest prefix first. */
+/**
+ * The area of each test, by the start of its file name after `test-`. The first matching entry
+ * wins. Tests that match no entry count as `other`.
+ */
 const AREAS = [
-  ["test-async-local-storage-", "async_hooks"],
-  ["test-diagnostics-channel-", "diagnostics_channel"],
-  ["test-event-emitter-", "events"],
-  ["test-string-decoder", "string_decoder"],
-  ["test-dns-lookup", "dns"],
-  ["test-querystring", "querystring"],
-  ["test-punycode", "punycode"],
-  ["test-readline-", "readline"],
-  ["test-stream2-", "stream"],
-  ["test-stream3-", "stream"],
-  ["test-stream-", "stream"],
-  ["test-process-", "process"],
-  ["test-events-", "events"],
-  ["test-assert", "assert"],
-  ["test-buffer-", "buffer"],
-  ["test-timers", "timers"],
-  ["test-http-", "http"],
-  ["test-path-", "path"],
-  ["test-util-", "util"],
-  ["test-zlib-", "zlib"],
-  ["test-url-", "url"],
-  ["test-net-", "net"],
-  ["test-fs-", "fs"],
-  ["test-os", "os"],
+  [/^(async-hooks|async-wrap|async-local-storage|asyncresource|als-)/, "async_hooks"],
+  [/^(socketaddress|blocklist|tcp-)/, "net"],
+  [/^diagnostics?-channel/, "diagnostics_channel"],
+  [/^(event-emitter|events-|eventemitter)/, "events"],
+  [/^(eventtarget|nodeeventtarget|abortcontroller|abortsignal|aborted|abort-controller|event-target)/, "events"],
+  [/^string-decoder/, "string_decoder"],
+  [/^(stream|readable|duplex|stream2|stream3)-/, "stream"],
+  [/^(webstream|webstreams|streams|whatwg-readablebytestream|whatwg-webstreams)/, "webstreams"],
+  [/^(whatwg-url|url|fileurltopathbuffer|urlpattern)/, "url"],
+  [/^(whatwg-encoding|whatwg-events|whatwg|domexception|btoa|blob|file\.|structuredClone|messag|broadcastchannel|eventsource|websocket|webstorage|navigator|fetch|global|web-|webapi|mime|compression)/, "web APIs"],
+  [/^(process|next-tick|tick|beforeexit|uncaught|unhandled|exception|cwd|env|kill|setproctitle|signal|sigint|exit|memory-usage)/, "process"],
+  [/^(timers|microtask|queue-microtask|promise)/, "timers and promises"],
+  [/^(module|require|esm|preload|package|vfs|directory-import)/, "module"],
+  [/^(stdin|stdout|stdio|tty|ttywrap|pipe)/, "tty and stdio"],
+  [/^(http-|outgoing|listen)/, "http"],
+  [/^(http2|h2)/, "http2"],
+  [/^https/, "https"],
+  [/^(tls|crypto|webcrypto|x509|dsa|openssl)/, "crypto and tls"],
+  [/^(child-process|spawn)/, "child_process"],
+  [/^worker/, "worker_threads"],
+  [/^cluster/, "cluster"],
+  [/^(performance|perf-|performanceobserver)/, "perf_hooks"],
+  [/^(error|errors|err-|throw|stack|source-map|warn)/, "errors"],
+  [/^(fs|file-|filehandle|fastutf8stream)/, "fs"],
+  [/^(buffer|stringbytes|utf8)/, "buffer"],
+  [/^(util|inspect)/, "util"],
+  [/^assert/, "assert"],
+  [/^console/, "console"],
+  [/^dgram/, "dgram"],
+  [/^dns/, "dns"],
+  [/^domain/, "domain"],
+  [/^net-/, "net"],
+  [/^os/, "os"],
+  [/^path/, "path"],
+  [/^permission/, "permission"],
+  [/^punycode/, "punycode"],
+  [/^querystring/, "querystring"],
+  [/^readline/, "readline"],
+  [/^repl/, "repl"],
+  [/^(runner|mock)/, "test"],
+  [/^sqlite/, "sqlite"],
+  [/^(v8|gc|finalization|weakref|hash-seed)/, "v8"],
+  [/^vm/, "vm"],
+  [/^zlib/, "zlib"],
+  [/^(icu|intl|tz|datetime|unicode)/, "intl"],
 ];
 
 /**
@@ -47,9 +74,9 @@ const AREAS = [
  */
 const KNOWN_BLOCKERS = [
   {
-    title: "HTTP servers in scripts run as commands",
-    match: (entry) => entry.signature === "http-command-mode",
-    text: "Node's HTTP tests start a server and request it from the same script. `listen()` serves requests only in serve mode (`--serve`) and in `wasi:http` components, where requests arrive through the host, so in a command it emits `ERR_SERVE_MODE_REQUIRED`. A real listener in command mode is the largest remaining lever.",
+    title: "The HTTP client",
+    match: (entry) => entry.area === "http" && entry.status === "FAIL",
+    text: "Tests run with `--node-http-listen`, so their servers accept connections, and most remaining HTTP failures are on the client side. The client is built on reqwest, which adds `accept: */*`, lowercases header names, normalizes paths, strips hop-by-hop headers and reports the standard reason phrase. 1xx responses, `Agent` socket pools and `req.socket` are not exposed.",
   },
   {
     title: "Child processes, workers, cluster and the inspector",
@@ -57,9 +84,9 @@ const KNOWN_BLOCKERS = [
     text: "WASI has no processes or threads, so these tests are skipped without running.",
   },
   {
-    title: "Runtime flags and Node.js internals",
-    match: (entry) => /runtime flags|Node\.js internals/.test(entry.reason ?? ""),
-    text: "Tests that need V8 or Node flags, or `require('internal/...')`, are skipped without running.",
+    title: "Unsupported runtime flags",
+    match: (entry) => /unsupported runtime flag/.test(entry.reason ?? ""),
+    text: "Tests that need a runtime flag the runtime rejects, such as `--allow-natives-syntax` or the permission model's flags, are skipped without running. The runtime gets the other flags with `--allow-node-runtime-flags`.",
   },
   {
     title: "Unimplemented APIs",
@@ -79,12 +106,16 @@ const KNOWN_BLOCKERS = [
 ];
 
 function parseArgs(argv) {
-  const config = { native: null, wasm: null, out: null };
+  const config = { native: null, wasm: null, out: null, compare: [] };
   for (const arg of argv) {
     const [name, value] = arg.split(/=(.*)/s);
     if (name === "--native") config.native = value;
     else if (name === "--wasm") config.wasm = value;
     else if (name === "--out") config.out = value;
+    else if (name === "--compare") {
+      const [runtime, file] = value.split(/=(.*)/s);
+      config.compare.push({ name: runtime, results: JSON.parse(readFileSync(file, "utf8")) });
+    }
     else {
       console.error(`Unknown argument ${arg}`);
       process.exit(2);
@@ -98,7 +129,8 @@ function parseArgs(argv) {
 }
 
 function areaOf(file) {
-  return AREAS.find(([prefix]) => file.startsWith(prefix))?.[1] ?? "other";
+  const name = file.replace(/^test-/, "");
+  return AREAS.find(([pattern]) => pattern.test(name))?.[1] ?? "other";
 }
 
 /** What a failure signature means. */
@@ -106,7 +138,7 @@ function describe(signature) {
   const [kind, detail] = signature.split(/:(.*)/s);
   switch (kind) {
     case "http-command-mode":
-      return "`http.Server.listen()` in a script run as a command. The tests request their own server, which needs a real listener in command mode; only serve mode and `wasi:http` components serve requests.";
+      return "`http.Server.listen()` in a script run as a command without `--node-http-listen`.";
     case "unimplemented":
       return `\`${detail}\` is not implemented.`;
     case "timeout":
@@ -135,7 +167,7 @@ function tally(entries) {
       signatures.get(entry.signature).push(file);
     }
   }
-  const sorted = [...signatures].sort(([a, x], [b, y]) => y.length - x.length || a.localeCompare(b));
+  const sorted = [...signatures].sort(([a, x], [b, y]) => y.length - x.length || a.localeCompare(b, 'en'));
   return { counts, signatures: sorted };
 }
 
@@ -165,9 +197,10 @@ function main() {
   lines.push("# Node.js test-suite results", "");
   lines.push(
     "Results of running Node.js v24.21.0's own tests from `test/parallel` against `--node-compat`, " +
-      "with `tests/node-harness/run-node-tests.mjs`. `tests/node-harness/tests.txt` selects the tests " +
-      "of the implemented modules. A test passes if it exits with status 0. Tests that need runtime " +
-      "flags, child processes, workers, `cluster`, the inspector or Node.js internals are skipped " +
+      "with `tests/node-harness/run-node-tests.mjs`. `tests/node-harness/tests.txt` selects every test " +
+      "except those of Node's build tooling, V8's heap and trace tooling, the inspector and QUIC. " +
+      "A test passes if it exits with status 0. Tests that need runtime " +
+      "flags the runtime rejects, child processes, workers, `cluster` or the inspector are skipped " +
       "without running, and tests that call `common.skip()` count as skipped.",
     "",
     `Generated by \`tests/node-harness/report.mjs\` from runs on ${native.date.slice(0, 10)}.`,
@@ -177,6 +210,7 @@ function main() {
   lines.push("## Summary", "");
   const summaryRows = [["native", nativeTally.counts]];
   if (wasm) summaryRows.push(["wasm", tally(Object.entries(wasm.tests)).counts]);
+  for (const other of config.compare) summaryRows.push([other.name, tally(Object.entries(other.results.tests)).counts]);
   lines.push(
     table(
       ["Target", "Passed", "Failed", "Skipped", "Total", "Pass rate of run tests"],
@@ -202,7 +236,7 @@ function main() {
     table(
       ["Blocker", "Failing", "Skipped", "What it is"],
       KNOWN_BLOCKERS.map((blocker) => {
-        const hits = nativeEntries.filter(([, entry]) => blocker.match(entry));
+        const hits = nativeEntries.filter(([file, entry]) => blocker.match({ ...entry, area: areaOf(file) }));
         const failing = hits.filter(([, entry]) => entry.status === "FAIL").length;
         const skipped = hits.filter(([, entry]) => entry.status === "SKIP").length;
         return [blocker.title, failing, skipped, blocker.text];
@@ -219,7 +253,7 @@ function main() {
     areas.get(area).push(entry);
   }
   const areaRows = [...areas]
-    .sort(([a], [b]) => a.localeCompare(b))
+    .sort(([a], [b]) => a.localeCompare(b, 'en'))
     .map(([area, entries]) => {
       const { counts, signatures } = tally(entries);
       const blockers = signatures
@@ -254,7 +288,7 @@ function main() {
   lines.push(
     table(
       ["Reason", "Tests"],
-      [...reasons].sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).map(([reason, count]) => [reason, count]),
+      [...reasons].sort(([a, x], [b, y]) => y - x || a.localeCompare(b, 'en')).map(([reason, count]) => [reason, count]),
     ),
     "",
   );
@@ -277,6 +311,44 @@ function main() {
       ),
       "",
     );
+  }
+
+  if (config.compare.length > 0) {
+    const names = config.compare.map((other) => other.name);
+    lines.push(`## Passing in ${names.join(" or ")}`, "");
+    lines.push(
+      `The tests that fail natively and pass in ${names.join(" or ")}, by area. ` +
+        `These runtimes run the tests without their runtime flags. Each test lists the runtimes that pass it.`,
+      "",
+    );
+    const passingElsewhere = new Map();
+    for (const [file, entry] of nativeEntries) {
+      if (entry.status !== "FAIL") continue;
+      const passing = config.compare.filter((other) => other.results.tests[file]?.status === "PASS");
+      if (passing.length === 0) continue;
+      const area = areaOf(file);
+      if (!passingElsewhere.has(area)) passingElsewhere.set(area, []);
+      passingElsewhere.get(area).push([file, entry, passing.map((other) => other.name)]);
+    }
+    const sortedAreas = [...passingElsewhere].sort(([a, x], [b, y]) => y.length - x.length || a.localeCompare(b, 'en'));
+    lines.push(
+      table(
+        ["Area", ...names.map((name) => `Passing in ${name}`), "Passing in any"],
+        sortedAreas.map(([area, tests]) => [
+          `\`${area}\``,
+          ...names.map((name) => tests.filter(([, , passing]) => passing.includes(name)).length),
+          tests.length,
+        ]),
+      ),
+      "",
+    );
+    for (const [area, tests] of sortedAreas) {
+      lines.push(`### \`${area}\``, "");
+      for (const [file, entry, passing] of tests) {
+        lines.push(`- \`${file}\` (${passing.join(", ")}): ${entry.signature}`);
+      }
+      lines.push("");
+    }
   }
 
   const markdown = lines.join("\n");

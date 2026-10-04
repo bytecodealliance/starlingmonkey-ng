@@ -203,3 +203,33 @@ for (const fn of ["join", "resolve", "normalize", "isAbsolute", "relative", "dir
 const error = throws(() => path.basename(null), "ERR_INVALID_ARG_TYPE");
 eq(error instanceof TypeError, true, "ERR_INVALID_ARG_TYPE is a TypeError");
 eq(error.message, 'The "path" argument must be of type string. Received null', "error message");
+
+// Globs, matched as minimatch matches them.
+const nocase = process.platform === "darwin" || process.platform === "win32";
+for (const [file, pattern, expected] of [
+  ["foo/bar/baz", "foo/[bcr]ar/baz", true],
+  ["foo/bar/baz", "foo/[!bcr]ar/baz", false],
+  ["foo/bar/baz", "foo/*/!bar/*/baz", false],
+  ["foo/bar/baz", "foo/**", true],
+  ["foo/bar/baz", "*", false],
+  ["a/b/c.js", "**/*.js", true],
+  ["a/.b/c.js", "**/*.js", false],
+  ["a/b/c.js", "a/{b,x}/*.{js,ts}", true],
+  ["a/./b", "a/b", true],
+  ["a/x/../b", "a/b", true],
+  ["file3", "file{1..3}", true],
+  ["a.JS", "*.js", nocase],
+  ["A/b", "a/b", false],
+  ["ab", "+(a|b)", true],
+  ["x", "!(a|b)", true],
+  ["a", "!(a|b)", false],
+  [".hidden", "*", false],
+  [".hidden", ".*", true],
+  ["a1", "a[[:digit:]]", true],
+  ["", "", true],
+  ["a", "", false],
+]) {
+  eq(path.matchesGlob(file, pattern), expected, `matchesGlob(${file}, ${pattern})`);
+}
+throws(() => path.matchesGlob(1, "a"), "ERR_INVALID_ARG_TYPE", "matchesGlob validates the path");
+throws(() => path.matchesGlob("a"), "ERR_INVALID_ARG_TYPE", "matchesGlob validates the pattern");

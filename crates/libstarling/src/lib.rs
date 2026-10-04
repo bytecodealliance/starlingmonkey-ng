@@ -56,6 +56,7 @@ pub fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), Strin
         runtime::register_global_initializer(wpt_support::add_to_global);
     }
     if config.node_compat {
+        node_builtins::runtime_flags::set(&config.node_runtime_flags, config.node_http_listen)?;
         node_builtins::register();
         cpp_builtins::set_console_level_prefixes(false);
         web_globals::messaging::set_node_ports(true);

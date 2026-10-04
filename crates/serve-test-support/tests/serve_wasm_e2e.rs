@@ -3090,3 +3090,45 @@ fn node_fs_reads_files_while_serving() {
         "{refused}"
     );
 }
+
+/// With `--node-compat`, the callback and promise forms of `mkdir`, `rename`, `unlink` and `rmdir`
+/// change directories while the component serves requests.
+#[test]
+fn node_fs_changes_directories_while_serving() {
+    let handler = r#"import fs from 'node:fs';
+    import fsp from 'node:fs/promises';
+    import http from 'node:http';
+    http.createServer(async (req, res) => {
+        try {
+            if (req.url === '/change') {
+                const first = await fsp.mkdir('made/a/b', { recursive: true });
+                const again = await fsp.mkdir('made/a/b', { recursive: true });
+                await fsp.writeFile('made/a/b/file.txt', 'x');
+                await fsp.rename('made/a/b/file.txt', 'made/moved.txt');
+                await new Promise((resolve, reject) =>
+                    fs.unlink('made/moved.txt', (error) => (error ? reject(error) : resolve())));
+                await fsp.rmdir('made/a/b');
+                await fsp.mkdir('made/c');
+                const missing = await fsp.unlink('made/none.txt').catch((error) => error.code);
+                const exists = await fsp.mkdir('made/c').catch((error) => error.code);
+                const listed = (await fsp.readdir('made')).sort().join(',');
+                res.end([first, again, listed, missing, exists].join(' '));
+            } else {
+                res.end('ready');
+            }
+        } catch (error) {
+            res.end(`error ${error.code}: ${error.message}`);
+        }
+    }).listen(8080);"#;
+    let Some(server) = Serve::new(18483)
+        .flags(["--node-compat"])
+        .module("handler.mjs", handler)
+        .start()
+    else {
+        return;
+    };
+    assert_eq!(
+        server.request("GET", "/change", ""),
+        "made  a,c ENOENT EEXIST"
+    );
+}

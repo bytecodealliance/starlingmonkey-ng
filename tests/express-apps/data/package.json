@@ -1,0 +1,1 @@
+{"name":"express-app-data","private":true,"version":"1.0.0","dependencies":{"dotenv":"18.0.5","express":"5.2.1","http-proxy":"1.18.1","http-proxy-middleware":"4.2.0","lowdb":"7.0.1","pino":"10.4.0","winston":"3.19.0"}}

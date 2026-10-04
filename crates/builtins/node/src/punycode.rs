@@ -445,7 +445,22 @@ fn ucs2_encode(
     Ok(js::JSString::from_utf16(scope, &units)?.as_value())
 }
 
-/// Register `node:punycode` with `ucs2`.
+/// Emit DEP0040 for loading the module. Without `--pending-deprecation`, a load from a module in
+/// `node_modules` emits nothing.
+fn warn_deprecated(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    if !crate::runtime_flags::get().pending_deprecation
+        && crate::process::called_from_node_modules(scope)?
+    {
+        return Ok(());
+    }
+    crate::process::deprecation_warning(
+        scope,
+        "The `punycode` module is deprecated. Please use a userland alternative instead.",
+        "DEP0040",
+    )
+}
+
+/// Register `node:punycode` with `ucs2`, and emit DEP0040.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let ucs2 = || -> Result<HandleValue<'_>, ExnThrown> {
         let ucs2 = Object::new_plain(scope)?;
@@ -458,5 +473,8 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let Ok(ucs2) = ucs2() else {
         return false;
     };
+    if warn_deprecated(scope).is_err() {
+        return false;
+    }
     crate::stub::register_implemented_with::<module::js_module>(scope, name, &[("ucs2", ucs2)])
 }

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{title}}</title>
+  <link rel="stylesheet" href="/css/portal.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="/">StarlingMonkey Express apps</a>
+    <nav>
+      <a href="/feedback">Feedback</a>
+      <a href="/api/apps">JSON catalog</a>
+    </nav>
+  </header>
+  {{#each flash}}
+  <p class="flash flash-{{type}}">{{message}}</p>
+  {{/each}}
+  <main>
+{{{body}}}
+  </main>
+  <footer>
+    {{> recent}}
+    <p>Visits this session: {{visits}}</p>
+  </footer>
+</body>
+</html>

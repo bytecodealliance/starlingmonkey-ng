@@ -1049,17 +1049,29 @@ pub mod module {
         Ok(js::Array::with_contents(scope, &sites)?)
     }
 
-    /// <https://nodejs.org/api/util.html#utildeprecatefn-msg-code-options>
+    /// <https://nodejs.org/api/util.html#utildeprecatefn-msg-code-options>: the wrapper has `fn`'s
+    /// `length`, `fn` as its prototype, and `fn.prototype`, if it has one, as its `prototype`.
+    /// With the option `modifyPrototype: false`, it has none of these, and its `prototype` is an
+    /// object of its own.
     pub fn deprecate<'s>(
         scope: &'s Scope<'_>,
         function: HandleValue<'_>,
         message: Option<HandleValue<'_>>,
         code: Option<HandleValue<'_>>,
+        options: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
         let function = validate_function(scope, function, "fn")?;
         if let Some(code) = code.filter(|code| !code.is_undefined()) {
             validate_string(scope, code, "code")?;
         }
+        let modify_prototype =
+            match options.and_then(|options| Object::from_value(scope, options).ok()) {
+                Some(options) => {
+                    let value = options.get_property(scope, c"modifyPrototype")?;
+                    value.is_undefined() || bool::from_jsval(scope, value, ()).unwrap_or(false)
+                }
+                None => true,
+            };
         let state = js::Array::with_contents(
             scope,
             &[
@@ -1071,6 +1083,12 @@ pub mod module {
         )?;
         let wrapper =
             Function::new_constructor_callback(scope, c"deprecated", 0, deprecated, *state)?;
+        if !modify_prototype {
+            let prototype = Object::new_plain(scope)?;
+            prototype.define_property(scope, c"constructor", *wrapper, 0)?;
+            wrapper.set_property(scope, c"prototype", prototype)?;
+            return Ok(*wrapper);
+        }
         wrapper.set_prototype(scope, function.handle())?;
         let prototype = function.get_property(scope, c"prototype")?;
         if bool::from_jsval(scope, prototype, ()).unwrap_or(false) {
@@ -1247,6 +1265,14 @@ pub mod module {
             Ok(object) => js::Array::is_array(scope, object.handle()),
             Err(_) => Ok(false),
         }
+    }
+
+    /// <https://nodejs.org/api/util.html#utilparseargsconfig>
+    pub fn parse_args<'s>(
+        scope: &'s Scope<'_>,
+        config: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        crate::parse_args::parse_args(scope, config)
     }
 
     /// `util._extend(target, source)`: copy `source`'s own enumerable properties onto `target`.

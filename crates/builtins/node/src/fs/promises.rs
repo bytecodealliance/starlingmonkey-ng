@@ -296,6 +296,9 @@ pub(super) fn promises_object<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s
                 } else if name == "cp" {
                     Function::new_callback(scope, c"cp", 3, super::cp::cp_promise, ())?
                         .to_jsval_throwing(scope)?
+                } else if name == "watch" {
+                    Function::new_callback(scope, c"watch", 1, super::watch::promises_watch, ())?
+                        .to_jsval_throwing(scope)?
                 } else if name == "constants" {
                     super::constants(scope)?
                 } else if let Some(index) = ops::OPS

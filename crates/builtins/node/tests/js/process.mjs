@@ -56,3 +56,4 @@ eq(process.env.STARLING_NUMBER, undefined, "env properties can be deleted");
 eq(process.getBuiltinModule("node:path"), (await import("node:path")).default, "getBuiltinModule");
 eq(process.getBuiltinModule("not-a-builtin"), undefined, "getBuiltinModule of a non-builtin");
 eq(typeof process.dlopen, "function", "unimplemented members are stubs");
+eq(process.domain, null, "domain is null without an active domain");

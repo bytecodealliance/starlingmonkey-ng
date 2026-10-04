@@ -19,20 +19,25 @@ pub mod events;
 mod events_async;
 mod exports_table;
 pub mod fs;
+mod glob;
 pub mod http;
 mod inspect;
 mod internal_modules;
+mod internals;
 pub mod net;
 pub mod os;
+mod parse_args;
 pub mod path;
 pub mod process;
 pub mod punycode;
 pub mod querystring;
 pub mod readline;
+pub mod runtime_flags;
 mod stack_trace;
 pub mod stream;
 pub mod string_decoder;
 mod stub;
+pub mod test_runner;
 pub mod timers;
 pub mod tty;
 pub mod url;
@@ -78,6 +83,7 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
         "node:tty" => stub::register_implemented::<tty::module::js_module>(scope, name),
         "node:readline" => readline::register_module(scope, name),
         "node:readline/promises" => readline::register_promises(scope, name),
+        "node:test" => test_runner::register_module(scope, name),
         "node:timers" => timers::register_module(scope, name),
         "node:timers/promises" => timers::register_promises(scope, name),
         "node:url" => url::register_module(scope, name),
@@ -97,12 +103,14 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
         "node:process" => process::register_module(scope, name),
         "node:zlib" => zlib::register_module(scope, name),
         name if internal_modules::is_implemented(name) => internal_modules::register(scope, name),
+        name if name.starts_with("node:internal/") => internals::register(scope, name),
         _ => stub::register_stub(scope, name),
     }
 }
 
 /// Install the Node.js globals on `global`: `process`, `Buffer`, `global`, `setImmediate` and
-/// `clearImmediate`, and the `setTimeout` and `setInterval` that return `Timeout` objects.
+/// `clearImmediate`, the `setTimeout` and `setInterval` that return `Timeout` objects, and `gc`
+/// with `--expose-gc`.
 pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
     let install = || -> Result<(), ExnThrown> {
         register_classes(scope, global)?;
@@ -112,10 +120,18 @@ pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
         stack_trace::install(scope)?;
         console::install(scope, global)?;
         let buffer = buffer::buffer::class_constructor(scope)?;
+        buffer::define_species(scope, buffer)?;
         global.define_property(scope, c"Buffer", buffer, 0)?;
+        if runtime_flags::get().expose_gc {
+            let gc = js::Function::new_callback(scope, c"gc", 0, collect_garbage, ())?;
+            global.define_property(scope, c"gc", *gc, 0)?;
+        }
         global.set_property(scope, c"global", global)
     };
-    install().expect("installing the Node.js globals can only fail due to OOM");
+    if install().is_err() {
+        js::exception::report_and_clear(scope, "installing the Node.js globals");
+        panic!("installing the Node.js globals can only fail due to OOM");
+    }
 }
 
 /// Register the classes of the Node.js modules on `global`, without defining their constructors
@@ -123,35 +139,66 @@ pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
 fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
     events::event_emitter::register(scope)?;
     stream::register_classes(scope)?;
-    fs::register_classes(scope, global)?;
-    http::register_classes(scope, global)?;
-    net::register_classes(scope, global)?;
-    crypto::register_classes(scope, global)?;
-    zlib::register_classes(scope, global)?;
     assert::assertion_error::register(scope)?;
     assert::call_tracker::register(scope)?;
     async_hooks::async_local_storage::register(scope)?;
     async_hooks::async_resource::register(scope)?;
     buffer::buffer::register(scope)?;
     commonjs::module_class::register(scope)?;
+    crypto::KeyObjectHandle::add_to_global(scope, global);
+    crypto::NativeHash::add_to_global(scope, global);
+    crypto::NativeHmac::add_to_global(scope, global);
+    crypto::hash_class::register(scope)?;
+    crypto::hmac_class::register(scope)?;
+    crypto::key_object_class::register(scope)?;
+    crypto::secret_key_object_class::register(scope)?;
     diagnostics_channel::channel::register(scope)?;
     diagnostics_channel::tracing_channel::register(scope)?;
     errors::abort_error_class::register(scope)?;
+    fs::register_classes(scope, global)?;
+    http::register_classes(scope, global)?;
+    net::register_classes(scope, global)?;
     readline::interface_class::register(scope)?;
     readline::promises_interface_class::register(scope)?;
     stack_trace::CallSite::add_to_global(scope, global);
     string_decoder::NativeDecoder::add_to_global(scope, global);
     string_decoder::string_decoder_class::register(scope)?;
+    test_runner::register_classes(scope)?;
     timers::timeout::register(scope)?;
     timers::immediate::register(scope)?;
     tty::StdinHandle::add_to_global(scope, global);
     tty::read_stream_class::register(scope)?;
     url::url_class::register(scope)?;
-    Ok(())
+    zlib::ZlibHandle::add_to_global(scope, global);
+    zlib::register_classes(scope)
+}
+
+/// `gc(options)`, which `--expose-gc` installs: run a full garbage collection. Returns a promise
+/// resolved after it if `options.execution` is `'async'`, and `undefined` otherwise. The other
+/// options are ignored.
+fn collect_garbage(
+    scope: &Scope<'_>,
+    args: js::function::CallbackArgs<'_>,
+    _: HandleValue,
+) -> Result<js::native::Value, ExnThrown> {
+    js::gc::gc(scope, js::gc::GCReason::API);
+    let options = args.get(0);
+    if let Ok(options) = js::Object::from_value(scope, options) {
+        let execution = options.get_property(scope, c"execution")?;
+        if execution.is_string()
+            && js::JSString::from_value(scope, execution)?.to_utf8(scope)? == "async"
+        {
+            let promise = js::Promise::new_resolved_with_value(scope, HandleValue::undefined())?;
+            return js::conversion::ToJSVal::to_jsval_raw_throwing(&promise, scope);
+        }
+    }
+    Ok(js::value::undefined())
 }
 
 /// Register every `node:` builtin module and the Node.js globals, so they exist in every runtime
-/// created after this call.
+/// created after this call. The modules that only exist with a runtime flag are registered if
+/// [`runtime_flags::set`] enabled them: the `internal/` modules with `--expose-internals`, and
+/// `stream/iter` and `zlib/iter` with `--experimental-stream-iter`.
 pub fn register() {
     core_runtime::runtime::register_global_initializer(add_to_global);
     core_runtime::runtime::register_resume_fixup(process::on_resume);
@@ -173,6 +220,21 @@ pub fn register() {
             aliases: extra.unwrap_or(aliases),
             create: create_module,
         });
+    }
+    let flags = runtime_flags::get();
+    for &(name, aliases, _, _) in exports_table::FLAGGED_EXPORTS {
+        let enabled = if name.starts_with("node:internal/") {
+            flags.expose_internals
+        } else {
+            flags.experimental_stream_iter
+        };
+        if enabled {
+            register_builtin_module(BuiltinModule {
+                name,
+                aliases,
+                create: create_module,
+            });
+        }
     }
 }
 

@@ -63,9 +63,11 @@ fn encoding_name(encoding: Encoding) -> &'static str {
 
 /// The bytes of a `write` or `end` argument that is a `Buffer`, a typed array or a `DataView`.
 fn chunk_bytes(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<Vec<u8>, Thrown> {
-    let view = Object::from_value(scope, *value)
+    Object::from_value(scope, *value)
         .ok()
         .and_then(ArrayBufferView::from_object)
+        .map(|view| view.copy_bytes(scope))
+        .transpose()?
         .ok_or_else(|| {
             NodeError::invalid_arg_type(
                 scope,
@@ -73,8 +75,8 @@ fn chunk_bytes(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<Vec<u8>, Thr
                 "an instance of Buffer, TypedArray, or DataView",
                 value,
             )
-        })?;
-    Ok(view.copy_bytes(scope)?)
+            .into()
+        })
 }
 
 /// A decoder's state, which a `StringDecoder` holds in its `_starlingNativeDecoder` property.

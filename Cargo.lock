@@ -1966,6 +1966,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 name = "node-builtins"
 version = "0.3.0"
 dependencies = [
+ "brotli",
  "core-runtime",
  "crc32fast",
  "digest",
@@ -1973,6 +1974,7 @@ dependencies = [
  "flate2",
  "futures-channel",
  "futures-lite",
+ "httparse",
  "idna",
  "js",
  "libstarling",
@@ -1980,11 +1982,13 @@ dependencies = [
  "memchr",
  "platform",
  "ripemd",
+ "ruzstd",
  "sha1",
  "sha2",
  "sha3",
  "url",
  "web-fetch",
+ "web-streams",
 ]
 
 [[package]]

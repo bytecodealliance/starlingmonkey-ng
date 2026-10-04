@@ -99,6 +99,38 @@ pub fn emit_warning(scope: &Scope<'_>, message: &str, kind: &str) -> Result<(), 
     Ok(())
 }
 
+/// Emit the deprecation warning `code` with `message` through `process.emitWarning`.
+pub(crate) fn deprecation_warning(
+    scope: &Scope<'_>,
+    message: &str,
+    code: &str,
+) -> Result<(), ExnThrown> {
+    let process = scope.global().get_property(scope, c"process")?;
+    let Ok(process) = Object::from_value(scope, process) else {
+        return Ok(());
+    };
+    let emit = process.get_property(scope, c"emitWarning")?;
+    if Object::from_value(scope, emit).is_ok_and(|emit| emit.is_callable()) {
+        Function::call(scope, process, emit, &[message, "DeprecationWarning", code])?;
+    }
+    Ok(())
+}
+
+/// Whether the innermost frame of the JS stack is in a `node_modules` directory.
+pub(crate) fn called_from_node_modules(scope: &Scope<'_>) -> Result<bool, ExnThrown> {
+    let error_class = scope.global().get_property(scope, c"Error")?;
+    let Ok(error_class) = Object::from_value(scope, error_class) else {
+        return Ok(false);
+    };
+    let error = Function::construct(scope, error_class, js::function::EmptyArgs)?;
+    let stack =
+        String::from_jsval(scope, error.get_property(scope, c"stack")?, ()).unwrap_or_default();
+    Ok(stack
+        .lines()
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.contains("/node_modules/")))
+}
+
 /// The global's `process` object.
 fn global_process<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
     let process = scope.global().get_property(scope, c"process")?;
@@ -269,6 +301,10 @@ fn rejection_handled(_scope: &Scope<'_>, _promise: js::Promise<'_>, _id: u64) {}
 /// throws, print its exception and exit with code 7. If nothing listens and the runtime runs a script as a
 /// command, emit `exit` with code 1, print the error and exit, as Node.js does. In other runs,
 /// return `false`, and the runtime reports the error.
+///
+/// With `--abort-on-uncaught-exception` and no capture callback, an exception aborts the process
+/// after its message and stack frames are printed, without emitting `uncaughtException`, and a
+/// rejection nothing handles aborts it after it is printed.
 fn uncaught(
     scope: &Scope<'_>,
     error: HandleValue<'_>,
@@ -278,6 +314,11 @@ fn uncaught(
     let Ok(process) = global_process(scope) else {
         return false;
     };
+    let abort = crate::runtime_flags::get().abort_on_uncaught_exception
+        && capture_callback(scope).is_none();
+    if abort && promise.is_none() {
+        abort_uncaught(scope, error);
+    }
     let threw = match promise {
         Some(promise) if has_listeners(scope, process, "unhandledRejection").unwrap_or(false) => {
             Some(emit(
@@ -331,9 +372,37 @@ fn uncaught(
             })();
             js::exception::clear(scope);
             eprintln!("{text}");
+            if abort {
+                platform::process::abort();
+            }
             flush_and_exit(exit_code_if_set(scope, process).unwrap_or(1))
         }
     }
+}
+
+/// Print uncaught exception `error` as Node.js does under `--abort-on-uncaught-exception`, as
+/// `Uncaught` followed by the error's string and the frames of its stack, and abort the process.
+fn abort_uncaught(scope: &Scope<'_>, error: HandleValue<'_>) -> ! {
+    let text = js::JSString::from_value(scope, error)
+        .and_then(|text| text.to_utf8(scope))
+        .unwrap_or_else(|_| crate::errors::describe_value(scope, error));
+    let stack = Object::from_value(scope, error)
+        .ok()
+        .and_then(|error| error.get_property(scope, c"stack").ok())
+        .and_then(|stack| String::from_jsval(scope, stack, ()).ok())
+        .unwrap_or_default();
+    js::exception::clear(scope);
+    // A SpiderMonkey frame is `name@location`, which Node.js prints as `name (location)`.
+    let frames: Vec<String> = stack
+        .lines()
+        .filter_map(|line| line.rsplit_once('@'))
+        .map(|(name, location)| match name {
+            "" => location.to_string(),
+            name => format!("{name} ({location})"),
+        })
+        .collect();
+    eprintln!("Uncaught {text}\n\nFROM\n{}", frames.join("\n"));
+    platform::process::abort()
 }
 
 /// The exit code `value` specifies: an integer, or `process.exitCode` if it is `undefined`.
@@ -367,13 +436,25 @@ js::instance_local! {
 }
 
 /// The tick `process.emitWarning` queues, with the warning as its argument: print the warning to
-/// stderr as Node.js's default `warning` listener does, then emit `warning` on `process`.
+/// stderr as Node.js's default `warning` listener does, unless `--no-warnings` was given, then
+/// emit `warning` on `process`.
 fn emit_warning_now(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let warning = args.get(0);
+    if crate::runtime_flags::get().warnings {
+        print_warning(scope, warning)?;
+    }
+    let process = global_process(scope)?;
+    let event = scope.root_value(js::JSString::from_str(scope, "warning")?.as_value());
+    Function::call_by_name(scope, process.handle(), c"emit", &[event, warning])?;
+    Ok(js::value::undefined())
+}
+
+/// Print `warning` to stderr as Node.js's default `warning` listener does.
+fn print_warning(scope: &Scope<'_>, warning: HandleValue<'_>) -> Result<(), ExnThrown> {
     let object = Object::from_value(scope, warning).map_err(|e| e.throw(scope))?;
     let code = object.get_property(scope, c"code")?;
     let code = if truthy(scope, code) {
@@ -384,8 +465,16 @@ fn emit_warning_now(
     } else {
         String::new()
     };
-    let text =
-        Function::call_by_name(scope, object.handle(), c"toString", js::function::EmptyArgs)?;
+    // A warning whose `toString` isn't a function is converted by `Error.prototype.toString`.
+    let mut to_string = object.get_property(scope, c"toString")?;
+    if !Object::from_value(scope, to_string).is_ok_and(|function| function.is_callable()) {
+        let error = scope.global().get_property(scope, c"Error")?;
+        let error = Object::from_value(scope, error).map_err(|e| e.throw(scope))?;
+        let prototype = error.get_property(scope, c"prototype")?;
+        let prototype = Object::from_value(scope, prototype).map_err(|e| e.throw(scope))?;
+        to_string = prototype.get_property(scope, c"toString")?;
+    }
+    let text = Function::call(scope, warning, to_string, js::function::EmptyArgs)?;
     let text = js::JSString::from_value(scope, text)?.to_utf8(scope)?;
     let detail = object.get_property(scope, c"detail")?;
     let detail = if detail.is_string() {
@@ -420,9 +509,7 @@ fn emit_warning_now(
         format!("\n(Use `{argv0} {flag} ...` to show where the warning was created)")
     };
     eprintln!("(node:{}) {code}{text}{detail}{hint}", pid());
-    let event = scope.root_value(js::JSString::from_str(scope, "warning")?.as_value());
-    Function::call_by_name(scope, process.handle(), c"emit", &[event, warning])?;
-    Ok(js::value::undefined())
+    Ok(())
 }
 
 /// The key of the global's state object for `process.exitCode` and the uncaught exception
@@ -499,12 +586,16 @@ pub mod functions {
         super::cwd()
     }
 
-    /// <https://nodejs.org/api/process.html#processgetactiveresourcesinfo>: `Timeout` for each
-    /// referenced `setTimeout` and `setInterval` timer, and `Immediate` for each referenced
-    /// `setImmediate`. Other resources aren't listed.
+    /// <https://nodejs.org/api/process.html#processgetactiveresourcesinfo>: `FSEventWrap` for each
+    /// referenced `fs.watch` or `fsPromises.watch` watcher, `StatWatcher` for each referenced
+    /// `fs.watchFile` watcher, `Timeout` for each referenced `setTimeout` and `setInterval` timer,
+    /// and `Immediate` for each referenced `setImmediate`. Other resources aren't listed.
     pub fn get_active_resources_info<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+        let (fs_events, stat_watchers) = crate::fs::active_watchers();
         let (timeouts, immediates) = crate::timers::active_timers();
-        let names: Vec<&str> = std::iter::repeat_n("Timeout", timeouts)
+        let names: Vec<&str> = std::iter::repeat_n("FSEventWrap", fs_events)
+            .chain(std::iter::repeat_n("StatWatcher", stat_watchers))
+            .chain(std::iter::repeat_n("Timeout", timeouts))
             .chain(std::iter::repeat_n("Immediate", immediates))
             .collect();
         Ok(*js::Array::with_contents(scope, &names)?)
@@ -691,9 +782,12 @@ pub mod functions {
                 return Err(Thrown::Pending);
             }
         }
-        let emit = Function::new_callback(scope, c"", 1, emit_warning_now, ())?;
-        let emit = (*emit).to_jsval_throwing(scope)?;
-        Ok(js::jobs::queue_tick(scope, emit, &[warning])?)
+        Ok(js::jobs::queue_native_tick(
+            scope,
+            emit_warning_now,
+            (),
+            &[warning],
+        )?)
     }
 
     /// <https://nodejs.org/api/process.html#processumaskmask>: always the default `0o022`.
@@ -769,6 +863,12 @@ pub mod functions {
             Some(namespace) => Ok(namespace.get_property(scope, c"default")?),
             None => Ok(scope.root_value(js::value::undefined())),
         }
+    }
+
+    /// `process.binding(name)`, Node.js's deprecated access to its internal bindings: the binding
+    /// objects of `internal/test/binding`'s `internalBinding`, for the names Node.js allows.
+    pub fn binding<'s>(scope: &'s Scope<'_>, name: String) -> Result<Object<'s>, Thrown> {
+        crate::internals::process_binding(scope, &name)
     }
 
     /// <https://nodejs.org/api/process.html#processkillpid-signal>: there are no other processes
@@ -874,10 +974,16 @@ fn host_view<'s>(scope: &'s Scope<'_>, index: usize) -> Result<Object<'s>, ExnTh
     })
 }
 
+js::instance_local! {
+    /// Set once DEP0104 was emitted.
+    static ENV_VALUE_WARNED: Cell<bool> = const { Cell::new(false) };
+}
+
 /// A trap of a [`HostView`] proxy, whose payload is `[state, trap]`: fill the target if this is
 /// the proxy's first use since the last resume, then call the `Reflect` function named by the
 /// trap's index in [`HOST_VIEW_TRAPS`] with the trap's arguments, after converting the value to a
-/// string if the view coerces it.
+/// string if the view coerces it. With `--pending-deprecation`, setting a value that isn't a
+/// string, number or boolean emits DEP0104 once per instance.
 fn host_view_trap(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -900,6 +1006,19 @@ fn host_view_trap(
         (0..args.len()).map(|index| args.get(index)).collect();
     let name = HOST_VIEW_TRAPS[trap];
     if view.coerce && name == c"set" && call_args.len() > 2 {
+        let value = call_args[2];
+        if !(value.is_string() || value.is_number() || value.is_boolean())
+            && crate::runtime_flags::get().pending_deprecation
+            && !ENV_VALUE_WARNED.replace(true)
+        {
+            deprecation_warning(
+                scope,
+                "Assigning any value other than a string, number, or boolean to a process.env \
+                 property is deprecated. Please make sure to convert the value to a string before \
+                 setting process.env with it.",
+                "DEP0104",
+            )?;
+        }
         let value = js::JSString::from_value(scope, call_args[2])?;
         call_args[2] = value.to_jsval_throwing(scope)?;
         call_args.truncate(3);
@@ -1088,7 +1207,7 @@ fn stream_write(
         .ok()
         .and_then(js::ArrayBufferView::from_object)
     {
-        view.copy_bytes(scope)?
+        view.with_bytes(<[u8]>::to_vec)
     } else {
         return Err(NodeError::invalid_arg_type(
             scope,
@@ -1164,10 +1283,26 @@ pub fn install(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     process.set_property(scope, c"arch", arch())?;
     process.set_property(scope, c"pid", pid())?;
     process.set_property(scope, c"ppid", 0)?;
-    process.set_property(scope, c"title", "starlingmonkey")?;
+    let flags = crate::runtime_flags::get();
+    let title = flags.title.as_deref().unwrap_or("starlingmonkey");
+    process.set_property(scope, c"title", title)?;
     process.set_property(scope, c"argv0", "starlingmonkey")?;
-    let exec_argv = js::Array::with_contents(scope, &[] as &[Value])?;
+    let exec_argv = flags
+        .exec_argv
+        .iter()
+        .map(|flag| flag.as_str().to_jsval_throwing(scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    let exec_argv = js::Array::with_contents(scope, &exec_argv)?;
     process.set_property(scope, c"execArgv", exec_argv)?;
+    if !flags.warnings {
+        process.set_property(scope, c"noProcessWarnings", true)?;
+    }
+    if flags.no_deprecation {
+        process.set_property(scope, c"noDeprecation", true)?;
+    }
+    if flags.throw_deprecation {
+        process.set_property(scope, c"throwDeprecation", true)?;
+    }
     let getter = Function::new_callback(scope, c"exitCode", 0, get_exit_code, ())?;
     let setter = Function::new_callback(scope, c"exitCode", 1, set_exit_code_property, ())?;
     process.define_accessor(

@@ -1,10 +1,11 @@
-// `node:net` sockets and servers on the loopback interface, and `node:dns` lookups that need no
-// name server.
+// `node:net` sockets and servers on the loopback interface, socket addresses and block lists, and
+// `node:dns` lookups that need no name server.
 
 import net, { Server, Socket } from "node:net";
 import dns from "node:dns";
 import dnsPromises from "node:dns/promises";
 import { Duplex } from "node:stream";
+import { inspect } from "node:util";
 import { eq, deepEq, throws } from "./harness.mjs";
 
 const once = (emitter, event) => new Promise((resolve) => emitter.once(event, (...args) => resolve(args)));
@@ -144,4 +145,67 @@ throws(() => server.listen(0), "ERR_SERVER_ALREADY_LISTEN", "listening twice");
   eq(dnsPromises.getDefaultResultOrder(), "ipv4first", "setDefaultResultOrder");
   dns.setDefaultResultOrder("verbatim");
   throws(() => dns.setDefaultResultOrder("bogus"), "ERR_INVALID_ARG_VALUE", "result orders");
+}
+
+// Socket addresses and block lists.
+{
+  const { BlockList, SocketAddress } = net;
+  deepEq(new SocketAddress().toJSON(), { address: "127.0.0.1", port: 0, family: "ipv4", flowlabel: 0 }, "SocketAddress defaults");
+  const mapped = new SocketAddress({ address: "0::ffff:102:304", family: "IPv6", port: "80", flowlabel: 5 });
+  deepEq([mapped.address, mapped.port, mapped.family, mapped.flowlabel], ["::ffff:1.2.3.4", 80, "ipv6", 5], "IPv6 addresses");
+  deepEq(["::0.0.0.1", "1::1.2.3.4", "::1.2.3.4", "1:2:3:4:5:6:7::", "fe80::1%eth0"].map((address) => new SocketAddress({ address, family: "ipv6" }).address),
+    ["::1", "1::102:304", "::1.2.3.4", "1:2:3:4:5:6:7:0", "fe80::1"], "IPv6 formatting");
+  throws(() => new SocketAddress({ address: "01.2.3.4" }), "ERR_INVALID_ADDRESS", "IPv4 parsing");
+  throws(() => new SocketAddress({ family: "IPV4" }), "ERR_INVALID_ADDRESS", "the default address follows the family as given");
+  throws(() => new SocketAddress({ family: "foo" }), "ERR_INVALID_ARG_VALUE", "families");
+  throws(() => new SocketAddress([]), "ERR_INVALID_ARG_TYPE", "options");
+  throws(() => new SocketAddress({ port: -1 }), "ERR_SOCKET_BAD_PORT", "SocketAddress ports");
+  throws(() => new SocketAddress({ flowlabel: -1 }), "ERR_OUT_OF_RANGE", "flow labels");
+  let called;
+  try { SocketAddress(); } catch (error) { called = error.message; }
+  eq(called, "Class constructor SocketAddress cannot be invoked without 'new'", "class constructors need new");
+  const parsed = [["1.2.3.4", "1.2.3.4", 0], ["192.168.257:1", "192.168.1.1", 1], ["0xffffffff", "255.255.255.255", 0], ["[1::8]:123", "1::8", 123], ["1.2.3.4:80", "1.2.3.4", 0]];
+  for (const [input, address, port] of parsed) deepEq([SocketAddress.parse(input)?.address, SocketAddress.parse(input)?.port], [address, port], `parse(${input})`);
+  deepEq(["not an ip", "abc.123", "259.1.1.1", "12:12:12"].map((input) => SocketAddress.parse(input)), [undefined, undefined, undefined, undefined], "parse failures");
+  eq(SocketAddress.isSocketAddress(mapped) && !SocketAddress.isSocketAddress({}), true, "isSocketAddress");
+
+  const list = new BlockList();
+  list.addAddress("1.1.1.1");
+  list.addAddress("::ffff:1.1.1.2", "ipv6");
+  list.addRange("10.0.0.1", "10.0.0.10");
+  list.addSubnet("8592:757c:efae:4e45::", 64, "IpV6");
+  list.addCIDR("192.168.0.0/16");
+  deepEq(list.rules, ["Address: IPv4 1.1.1.1", "Address: IPv6 ::ffff:1.1.1.2", "Subnet: IPv4 192.168.0.0/16", "Subnet: IPv6 8592:757c:efae:4e45::/64", "Range: IPv4 10.0.0.1-10.0.0.10"], "rules");
+  eq(list.size, 5, "size");
+  deepEq([list.check("1.1.1.1"), list.check("::ffff:1.1.1.1", "IPV6"), list.check("1.1.1.2"), list.check("::ffff:10.0.0.5", "ipv6"), list.check("8592:757c:efae:4e45::f", "ipv6"), list.check("192.168.3.4"), list.check("1.1.1.1", "ipv6"), list.check("not an ip")],
+    [true, true, true, true, true, true, false, false], "check");
+  throws(() => list.addRange("1.1.1.2", "1.1.1.1"), "ERR_INVALID_ARG_VALUE", "ranges are ordered");
+  throws(() => list.addSubnet("1.1.1.1", 33), "ERR_OUT_OF_RANGE", "prefix lengths");
+  throws(() => list.addCIDR("10.0.0.0/08"), "ERR_INVALID_ARG_VALUE", "CIDR prefixes");
+  throws(() => list.addCIDRs(["10.0.0.0/8", "bad"]), "ERR_INVALID_ARG_VALUE", "addCIDRs validates first");
+  eq(list.size, 5, "a failed addCIDRs adds nothing");
+  const copy = new BlockList();
+  copy.fromJSON(JSON.stringify(list));
+  // As in Node.js, `fromJSON` reads `::ffff:1.1.1.2` as `::ffff:1`, and adds the subnets in the
+  // order given, so they are listed in reverse.
+  deepEq(copy.rules, ["Address: IPv4 1.1.1.1", "Address: IPv6 ::255.255.0.1", "Subnet: IPv6 8592:757c:efae:4e45::/64", "Subnet: IPv4 192.168.0.0/16", "Range: IPv4 10.0.0.1-10.0.0.10"], "toJSON and fromJSON");
+  list.removeCIDR("192.168.0.0/16");
+  list.removeAddress("1.1.1.2");
+  eq(list.check("::ffff:1.1.1.2", "ipv6") || list.check("192.168.3.4"), false, "removing rules");
+  eq(inspect(new BlockList(), { depth: -1 }), "[BlockList]", "inspect at a negative depth");
+  eq(Object.isFrozen(BlockList.PRIVATE_RANGES) && BlockList.isBlockList(list), true, "PRIVATE_RANGES and isBlockList");
+
+  // A socket's block list refuses addresses, and a server's closes connections.
+  const blocked = new BlockList();
+  blocked.addAddress("127.0.0.1");
+  const guarded = net.createServer({ blockList: blocked });
+  guarded.on("connection", () => { throw new Error("a blocked peer connected"); });
+  await new Promise((resolve) => guarded.listen(0, "127.0.0.1", resolve));
+  const client = net.connect(guarded.address().port, "127.0.0.1");
+  await within(once(client, "close"), "a blocked peer's connection closing");
+  const refused = net.connect({ port: guarded.address().port, host: "127.0.0.1", blockList: blocked });
+  const [error] = await once(refused, "error");
+  deepEq([error.code, error.message], ["ERR_IP_BLOCKED", "IP(127.0.0.1) is blocked by net.BlockList"], "blocked connects");
+  throws(() => net.createServer({ blockList: {} }), "ERR_INVALID_ARG_TYPE", "blockList options");
+  await within(new Promise((resolve) => guarded.close(resolve)), "closing the guarded server");
 }

@@ -281,9 +281,14 @@ fn run_immediate(
 
 /// The numbers of referenced `Timeout`s and `Immediate`s whose timers are queued or running, for
 /// `process.getActiveResourcesInfo`. An `Immediate` stops counting when its callback starts.
+/// Watchers' poll timers don't count.
 pub(crate) fn active_timers() -> (usize, usize) {
     let (referenced, live) = core_runtime::event_loop::with_active_event_loop(|event_loop| {
-        let referenced: BTreeSet<u64> = event_loop.referenced_js_timers().into_iter().collect();
+        let referenced: BTreeSet<u64> = event_loop
+            .referenced_js_timers()
+            .into_iter()
+            .filter(|id| !crate::fs::is_poll_timer(*id))
+            .collect();
         let live = |ids: &BTreeSet<u64>| -> BTreeSet<u64> {
             ids.iter()
                 .copied()

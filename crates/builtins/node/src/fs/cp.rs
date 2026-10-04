@@ -788,6 +788,7 @@ fn step(scope: &Scope<'_>, context: Object<'_>, decision: Option<bool>) -> Resul
         .take()
         .expect("one step runs at a time");
     let context_root = RootedHeap::<js::object::Object>::new(context);
+    let interest = super::hold_event_loop();
     let future = async move {
         let (walker, result) = platform::fs::offload(move || {
             let mut walker = walker;
@@ -796,6 +797,7 @@ fn step(scope: &Scope<'_>, context: Object<'_>, decision: Option<bool>) -> Resul
         })
         .await;
         PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
+            drop(interest);
             copy_walk(scope, context_root.get(scope))?.data_mut().walker = Some(walker);
             match result {
                 Ok(Next::Done) => Ok(HandleValue::undefined()),

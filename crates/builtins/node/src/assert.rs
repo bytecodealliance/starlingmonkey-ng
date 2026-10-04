@@ -137,14 +137,30 @@ fn readable_operator(operator: &str) -> Option<&'static str> {
 /// A line of a diff: an inserted line of `actual`, a deleted line of `expected`, or a line both
 /// share.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DiffOp {
+pub(crate) enum DiffOp {
     Delete,
     Nop,
     Insert,
 }
 
+impl DiffOp {
+    /// The number Node.js's `myersDiff` represents the operation with: `-1` for `Delete`, `0` for
+    /// `Nop` and `1` for `Insert`.
+    pub(crate) fn sign(self) -> i32 {
+        match self {
+            DiffOp::Delete => -1,
+            DiffOp::Nop => 0,
+            DiffOp::Insert => 1,
+        }
+    }
+}
+
 /// Node.js's `myersDiff` of the lines `actual` and `expected`, in reverse order.
-fn myers_diff(actual: &[String], expected: &[String], comma: bool) -> Vec<(DiffOp, String)> {
+pub(crate) fn myers_diff(
+    actual: &[String],
+    expected: &[String],
+    comma: bool,
+) -> Vec<(DiffOp, String)> {
     let equal =
         |a: &str, b: &str| a == b || (comma && (format!("{a},") == b || a == format!("{b},")));
     let max = actual.len() + expected.len();

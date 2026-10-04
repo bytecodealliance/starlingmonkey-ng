@@ -604,12 +604,11 @@ fn index_of(
         }
     };
     let (offset, end) = (integer(offset), integer(end));
-    let search = |needle: &Needle| {
-        view.with_bytes(|haystack| search_haystack(haystack, needle, offset, end, forward))
-    };
     if value.is_number() {
         let needle = Needle::Byte(to_uint8(value.to_number()));
-        return Ok(search(&needle));
+        return Ok(
+            view.with_bytes(|haystack| search_haystack(haystack, &needle, offset, end, forward))
+        );
     }
     let encoding_value = encoding.filter(|encoding| !encoding.is_undefined());
     let found = match encoding_value {
@@ -646,7 +645,7 @@ fn index_of(
         )
         .into());
     };
-    Ok(search(&needle))
+    Ok(view.with_bytes(|haystack| search_haystack(haystack, &needle, offset, end, forward)))
 }
 
 // ============================================================================
@@ -879,9 +878,8 @@ fn read_number(
             offset
         };
         let offset = number_offset(scope, offset, width, view.byte_length())?;
-        let mut copy = [0; 8];
-        view.with_bytes(|bytes| copy[..width].copy_from_slice(&bytes[offset..offset + width]));
-        let bytes = &copy[..width];
+        let bytes = view.with_bytes(|bytes| bytes[offset..offset + width].to_vec());
+        let bytes = bytes.as_slice();
         let endian = method.format.endian();
         Ok(match method.format {
             NumberFormat::U8
@@ -1068,9 +1066,7 @@ fn write_number(
         if offset + width > view.byte_length() {
             return Err(out_of_bounds(None));
         }
-        view.with_bytes_mut(|target| {
-            target[offset..offset + width].copy_from_slice(&bytes);
-        });
+        view.with_bytes_mut(|target| target[offset..offset + width].copy_from_slice(&bytes));
         Ok(js::value::from_f64((offset + width) as f64))
     };
     run().map_err(|error| error.throw(scope))
@@ -1121,7 +1117,13 @@ fn from_array_buffer<'s>(
         js::error::throw_range_error(scope, c"Start offset is outside the bounds of the buffer");
         return Err(Thrown::Pending);
     }
-    let length = length.unwrap_or(byte_length - offset);
+    let Some(length) = length else {
+        // Without a length, a view of a resizable buffer follows the buffer's length, as in Node.js.
+        let array = js::Uint8Array::with_buffer_to_end(scope, buffer, offset as usize)?;
+        let array: Object<'s> = *array.as_array_buffer_view();
+        array.set_prototype(scope, buffer_prototype(scope)?.handle())?;
+        return Ok(array);
+    };
     Ok(buffer_view(
         scope,
         buffer,
@@ -1518,6 +1520,103 @@ impl FillPlan {
     }
 }
 
+/// `Buffer(value, encodingOrOffset, length)` without the deprecation warning: `Buffer.alloc(value)`
+/// for a number, and `Buffer.from` otherwise.
+fn construct<'s>(
+    scope: &'s Scope<'_>,
+    value: HandleValue<'_>,
+    encoding_or_offset: Option<HandleValue<'_>>,
+    length: Option<HandleValue<'_>>,
+) -> Result<Object<'s>, Thrown> {
+    if value.is_number() {
+        if encoding_or_offset.is_some_and(|encoding| encoding.is_string()) {
+            return Err(
+                NodeError::invalid_arg_type(scope, "string", "of type string", value).into(),
+            );
+        }
+        let size = size_arg(scope, value)?;
+        return Ok(new_buffer(scope, &vec![0; size])?);
+    }
+    buffer_from(scope, value, encoding_or_offset, length)
+}
+
+js::instance_local! {
+    /// Set once DEP0005 was emitted.
+    static CONSTRUCTOR_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Emit DEP0005 for a call of the `Buffer` constructor, once per instance. Without
+/// `--pending-deprecation`, a call from a module in `node_modules` emits nothing.
+fn warn_buffer_constructor(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    if CONSTRUCTOR_WARNED.get()
+        || (!crate::runtime_flags::get().pending_deprecation
+            && crate::process::called_from_node_modules(scope)?)
+    {
+        return Ok(());
+    }
+    CONSTRUCTOR_WARNED.set(true);
+    crate::process::deprecation_warning(
+        scope,
+        "Buffer() is deprecated due to security and usability issues. Please use the \
+         Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.",
+        "DEP0005",
+    )
+}
+
+/// The constructor `Buffer[Symbol.species]` returns, which `Uint8Array` methods such as `map` and
+/// `filter` create their results with: the `Buffer` constructor without the deprecation warning.
+fn species_constructor(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let optional = |index| (args.len() > index).then(|| args.get(index));
+    let buffer =
+        construct(scope, args.get(0), optional(1), optional(2)).map_err(|e| e.throw(scope))?;
+    buffer.to_jsval_raw_throwing(scope)
+}
+
+/// The getter of `Buffer[Symbol.species]`: the constructor in the payload.
+fn get_species(
+    _scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    Ok(payload.get())
+}
+
+/// Define `Buffer[Symbol.species]` on `ctor`, the `Buffer` constructor: a getter of a constructor
+/// named `FastBuffer`, as in Node.js, that shares `Buffer.prototype`.
+pub(crate) fn define_species(scope: &Scope<'_>, ctor: Object<'_>) -> Result<(), ExnThrown> {
+    let species =
+        Function::new_constructor_callback(scope, c"FastBuffer", 3, species_constructor, ())?;
+    species.define_property(
+        scope,
+        c"prototype",
+        ctor.get_property(scope, c"prototype")?,
+        0,
+    )?;
+    let getter = Function::new_callback(scope, c"get [Symbol.species]", 0, get_species, *species)?;
+    let descriptor = Object::new_plain(scope)?;
+    descriptor.set_property(scope, c"get", *getter)?;
+    descriptor.set_property(scope, c"configurable", true)?;
+    let key = js::symbol::get_well_known(scope, js::native::SymbolCode::species);
+    let key = scope.root_value(js::value::from_symbol(key));
+    let object = scope.global().get_property(scope, c"Object")?;
+    let object = Object::from_value(scope, object).map_err(|e| e.throw(scope))?;
+    Function::call_by_name(
+        scope,
+        object.handle(),
+        c"defineProperty",
+        &[
+            ctor.to_jsval_throwing(scope)?,
+            key,
+            descriptor.to_jsval_throwing(scope)?,
+        ],
+    )?;
+    Ok(())
+}
+
 #[core_runtime::jsfunction_class(name = "Buffer")]
 pub mod buffer {
     use super::*;
@@ -1531,16 +1630,8 @@ pub mod buffer {
         encoding_or_offset: Option<HandleValue<'_>>,
         length: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
-        if value.is_number() {
-            if encoding_or_offset.is_some_and(|encoding| encoding.is_string()) {
-                return Err(
-                    NodeError::invalid_arg_type(scope, "string", "of type string", value).into(),
-                );
-            }
-            let size = size_arg(scope, value)?;
-            return Ok(new_buffer(scope, &vec![0; size])?);
-        }
-        buffer_from(scope, value, encoding_or_offset, length)
+        warn_buffer_constructor(scope)?;
+        construct(scope, value, encoding_or_offset, length)
     }
 
     /// <https://nodejs.org/api/buffer.html#static-method-bufferfromarray>
@@ -1691,7 +1782,7 @@ pub mod buffer {
         for index in 0..count {
             let item = array.get_element(scope, index)?;
             let view = uint8_array_arg(scope, item, &format!("list[{index}]"))?;
-            bytes.extend_from_slice(&view.copy_bytes(scope)?);
+            view.with_bytes(|view| bytes.extend_from_slice(view));
         }
         if let Some(total) = total {
             bytes.resize(total, 0);
@@ -2119,7 +2210,7 @@ pub mod buffer {
             (target_start as usize, source_start as usize, count as usize);
         target.with_bytes_mut(|target| {
             target[target_start..target_start + count]
-                .copy_from_slice(&source[source_start..source_start + count]);
+                .copy_from_slice(&source[source_start..source_start + count])
         });
         Ok(count as f64)
     }
@@ -2510,14 +2601,17 @@ pub mod module {
     }
 }
 
-/// Register `node:buffer`, whose `atob`, `btoa` and `constants` are the global's `atob` and
-/// `btoa` and an object with `MAX_LENGTH` and `MAX_STRING_LENGTH`.
+/// Register `node:buffer`, whose `Blob`, `File`, `atob`, `btoa` and `constants` are the global's
+/// `Blob`, `File`, `atob` and `btoa` and an object with `MAX_LENGTH` and `MAX_STRING_LENGTH`.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let overrides = || -> Result<Vec<(&'static str, HandleValue<'_>)>, ExnThrown> {
         let constants = Object::new_plain(scope)?;
         constants.set_property(scope, c"MAX_LENGTH", MAX_LENGTH)?;
         constants.set_property(scope, c"MAX_STRING_LENGTH", MAX_STRING_LENGTH)?;
         Ok(vec![
+            ("Blob", scope.global().get_property(scope, c"Blob")?),
+            ("File", scope.global().get_property(scope, c"File")?),
+            ("SlowBuffer", slow_buffer_function(scope)?),
             ("atob", scope.global().get_property(scope, c"atob")?),
             ("btoa", scope.global().get_property(scope, c"btoa")?),
             ("constants", constants.to_jsval_throwing(scope)?),
@@ -2530,6 +2624,41 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         return false;
     }
     define_inspect_max_bytes(scope, name).is_ok()
+}
+
+/// The body of `buffer.SlowBuffer(size)`: a new zero-filled `Buffer` of `size` bytes.
+fn slow_buffer(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let size = if !args.is_empty() {
+        args.get(0)
+    } else {
+        HandleValue::undefined()
+    };
+    let size = size_arg(scope, size).map_err(|error| error.throw(scope))?;
+    new_buffer(scope, &vec![0; size])?.to_jsval_raw_throwing(scope)
+}
+
+/// `buffer.SlowBuffer`: [`slow_buffer`] deprecated with DEP0030, as `util.deprecate` wraps it.
+fn slow_buffer_function<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+    let function = Function::new_constructor_callback(scope, c"SlowBuffer", 1, slow_buffer, ())?;
+    let util = crate::internal_modules::module_default(scope, "node:util")?;
+    let wrapper = Function::call_by_name(
+        scope,
+        util.handle(),
+        c"deprecate",
+        &[
+            function.to_jsval_throwing(scope)?,
+            crate::stream::string(
+                scope,
+                "SlowBuffer() is deprecated. Please use Buffer.allocUnsafeSlow()",
+            )?,
+            crate::stream::string(scope, "DEP0030")?,
+        ],
+    )?;
+    Ok(scope.root_value(wrapper.get()))
 }
 
 js::instance_local! {

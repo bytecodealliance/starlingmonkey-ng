@@ -109,10 +109,17 @@ pub(crate) fn chunk_length(scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<
     if chunk.is_string() {
         return Ok(js::JSString::from_value(scope, chunk)?.len() as f64);
     }
-    match as_object(scope, chunk) {
-        Some(object) => object.num(scope, c"length"),
-        None => Ok(0.0),
+    let Some(object) = as_object(scope, chunk) else {
+        return Ok(0.0);
+    };
+    // A typed array's `length` is its element count, which is read directly unless the object has
+    // an own `length` property shadowing the prototype's getter.
+    if let Some(view) = js::ArrayBufferView::from_object(object) {
+        if view.view_kind().is_typed_array() && !object.has_own_property(scope, c"length")? {
+            return Ok(view.array_length() as f64);
+        }
     }
+    object.num(scope, c"length")
 }
 
 /// The length `chunk` adds to the buffered length of a stream in `object_mode` or not.
@@ -2076,6 +2083,47 @@ pub(crate) fn wrap<'s>(
     Ok(readable)
 }
 
+/// The `destroy` option of a `Readable.wrap` stream, whose captures are `[src]`: destroy `src`
+/// with the error, and call the callback with it.
+fn wrap_destroy(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let src = Captures::of(scope, payload)?.get(0)?;
+    destroy::destroyer(scope, src, args.get(0))?;
+    call(scope, HandleValue::undefined(), args.get(1), &[args.get(0)])?;
+    Ok(js::value::undefined())
+}
+
+/// The static `Readable.wrap(src, options)`.
+fn wrap_static<'s>(
+    scope: &'s Scope<'_>,
+    src: HandleValue<'_>,
+    options: Option<HandleValue<'_>>,
+) -> Result<Object<'s>, ExnThrown> {
+    let src_object = Object::from_value_coerce(scope, src)?;
+    let mut object_mode = src_object.val(scope, c"readableObjectMode")?;
+    if object_mode.is_null() || object_mode.is_undefined() {
+        object_mode = src_object.val(scope, c"objectMode")?;
+    }
+    if object_mode.is_null() || object_mode.is_undefined() {
+        object_mode = scope.root_value(js::value::from_bool(true));
+    }
+    let merged = Object::new_plain(scope)?;
+    merged.set_property(scope, c"objectMode", object_mode)?;
+    if let Some(options) = options.and_then(|options| as_object(scope, options)) {
+        merged.assign(scope, options)?;
+    }
+    merged.set_property(
+        scope,
+        c"destroy",
+        closure(scope, 2, wrap_destroy, &[src.get()])?,
+    )?;
+    let readable = Function::construct(scope, readable::class_constructor(scope)?, &[merged])?;
+    wrap(scope, readable, src)
+}
+
 #[core_runtime::jsfunction_class(
     name = "Readable",
     extends = "super::super::legacy::stream",
@@ -2299,6 +2347,38 @@ pub mod readable {
         super::super::from::from(scope, iterable, options)
     }
 
+    /// <https://nodejs.org/api/stream.html#streamreadablefromwebreadablestream-options>
+    #[static_method]
+    pub fn from_web<'s>(
+        scope: &'s Scope<'_>,
+        readable_stream: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        super::super::adapters::readable_from_web(scope, readable_stream, options)
+    }
+
+    /// <https://nodejs.org/api/stream.html#streamreadabletowebstreamreadable-options>
+    #[static_method]
+    pub fn to_web<'s>(
+        scope: &'s Scope<'_>,
+        stream_readable: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        super::super::adapters::readable_to_web(scope, stream_readable, options)
+    }
+
+    /// Node's static `Readable.wrap(src, options)`: a `Readable` with `options` that wraps the
+    /// old-style stream `src`, and destroys it when destroyed. Its `objectMode` defaults to
+    /// `src.readableObjectMode`, then `src.objectMode`, then `true`.
+    #[static_method(name = "wrap")]
+    pub fn wrap_stream<'s>(
+        scope: &'s Scope<'_>,
+        src: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        super::wrap_static(scope, src, options)
+    }
+
     /// Define the accessors, `Symbol.asyncIterator`, the rejection handler, and `ReadableState`.
     #[setup]
     pub fn setup(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
@@ -2387,7 +2467,7 @@ fn on_constructed(
 pub(crate) fn accessor(
     scope: &Scope<'_>,
     proto: Object<'_>,
-    name: &'static CStr,
+    name: &CStr,
     getter: Callback,
     setter: Option<Callback>,
 ) -> Result<(), ExnThrown> {
@@ -2398,7 +2478,7 @@ pub(crate) fn accessor(
     };
     let get = shared(getter, 0)?;
     let set = setter.map(|setter| shared(setter, 1)).transpose()?;
-    proto.define_accessor(scope, name, Some(*get), set.map(|set| *set), 0)
+    proto.define_accessor_by_name(scope, name, Some(*get), set.map(|set| *set), 0)
 }
 
 /// `this._readableState`, for the accessors.
@@ -2738,6 +2818,7 @@ fn setup_readable(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Res
     let capture = crate::symbol(scope, "nodejs.rejection", true)?;
     define_symbol_method(scope, proto, capture, c"", capture_rejection)?;
     define_async_dispose(scope, proto, false)?;
+    super::operators::define_operators(scope, proto)?;
     ctor.set_property(
         scope,
         c"ReadableState",

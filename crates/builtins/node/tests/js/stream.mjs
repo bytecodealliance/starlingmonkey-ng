@@ -508,3 +508,156 @@ eq({} instanceof Writable, false, "plain objects aren't Writables");
   }
   eq(returned.message.endsWith("but got type number (5)."), true, "the invalid return value is described");
 }
+
+// Web stream adapters, from test-stream-readable-to-web*.js, test-whatwg-webstreams-adapters-*.js.
+{
+  const text = (chunks) => chunks.map((chunk) => Buffer.from(chunk).toString()).join("");
+  const readAll = async (readableStream) => {
+    const chunks = [];
+    for await (const chunk of readableStream) chunks.push(chunk);
+    return chunks;
+  };
+
+  const web = Readable.toWeb(Readable.from(["ab", "cd"], { objectMode: false }));
+  eq(web instanceof ReadableStream, true, "Readable.toWeb returns a ReadableStream");
+  const chunks = await readAll(web);
+  eq(chunks[0] instanceof Uint8Array && !Buffer.isBuffer(chunks[0]), true, "Buffers are copied to Uint8Arrays");
+  eq(text(chunks), "abcd", "Readable.toWeb reads the stream");
+  deepEq(await readAll(Readable.toWeb(Readable.from([1, { a: 2 }]))), [1, { a: 2 }], "object mode chunks pass as is");
+  throws(() => Readable.toWeb({}), "ERR_INVALID_ARG_TYPE", "toWeb needs a Readable");
+  throws(() => Readable.toWeb(new Readable(), { type: "nope" }), "ERR_INVALID_ARG_VALUE", "toWeb validates type");
+
+  const failing = new Readable({ read() { this.destroy(new Error("bad")); } });
+  const rejected = await readAll(Readable.toWeb(failing)).catch((error) => error);
+  eq(rejected.message, "bad", "a stream error errors the ReadableStream");
+  const closed = new Readable({ read() {} });
+  const pending = Readable.toWeb(closed).getReader().read();
+  closed.destroy();
+  const aborted = await pending.catch((error) => error);
+  eq(aborted.name, "AbortError", "a premature close errors the ReadableStream with an AbortError");
+  eq(aborted.cause.code, "ERR_STREAM_PREMATURE_CLOSE", "the AbortError's cause is the premature close");
+
+  const bytes = Readable.toWeb(Readable.from([Buffer.from("xyz")], { objectMode: false }), { type: "bytes" });
+  const reader = bytes.getReader({ mode: "byob" });
+  const first = await reader.read(new Uint8Array(2));
+  eq(Buffer.from(first.value).toString(), "xy", "a byte stream fills BYOB reads");
+
+  const source = new ReadableStream({ start(c) { c.enqueue("a"); c.enqueue("b"); c.close(); } });
+  const readable = Readable.fromWeb(source, { objectMode: true });
+  deepEq(await collect(readable), ["a", "b"], "Readable.fromWeb reads the ReadableStream");
+  eq(source.locked, true, "fromWeb locks the ReadableStream");
+  throws(() => Readable.fromWeb({}), "ERR_INVALID_ARG_TYPE", "fromWeb needs a ReadableStream");
+  throws(() => Readable.fromWeb(new ReadableStream(), { encoding: "nope" }), "ERR_INVALID_ARG_VALUE", "fromWeb validates encoding");
+  throws(() => Readable.fromWeb(new ReadableStream(), { objectMode: 1 }), "ERR_INVALID_ARG_TYPE", "fromWeb validates objectMode");
+  const erroring = Readable.fromWeb(new ReadableStream({ pull(c) { c.error(new Error("boom")); } }));
+  eq((await collect(erroring).catch((error) => error)).message, "boom", "a ReadableStream error destroys the Readable");
+  const canceled = [];
+  const cancelable = Readable.fromWeb(new ReadableStream({ cancel(reason) { canceled.push(reason.message); } }));
+  cancelable.on("error", () => {});
+  cancelable.destroy(new Error("stop"));
+  await tick();
+  deepEq(canceled, ["stop"], "destroying the Readable cancels the ReadableStream");
+
+  const written = [];
+  const target = new Writable({ highWaterMark: 2, write(chunk, encoding, callback) { written.push(chunk.toString()); setTimeout(callback, 1); } });
+  const writer = Writable.toWeb(target).getWriter();
+  await writer.write(new Uint8Array([65, 66]));
+  await writer.write("cd");
+  await writer.write(new Uint8Array([69]).buffer);
+  await writer.close();
+  deepEq(written, ["AB", "cd", "E"], "Writable.toWeb writes, with ArrayBuffers as Uint8Arrays");
+  eq(target.writableFinished, true, "closing the WritableStream ends the Writable");
+  const ended = new Writable({ write(c, e, cb) { cb(); } });
+  ended.end();
+  const closedWriter = Writable.toWeb(ended).getWriter();
+  eq(await closedWriter.closed, undefined, "an ended Writable gives a closed WritableStream");
+  throws(() => Writable.toWeb({}), "ERR_INVALID_ARG_TYPE", "toWeb needs a Writable");
+
+  const sink = [];
+  const writable = Writable.fromWeb(new WritableStream({ write(chunk) { sink.push(typeof chunk === "string" ? chunk : text([chunk])); } }), { decodeStrings: false });
+  writable.write("x");
+  writable.end(Buffer.from("y"));
+  await new Promise((resolve) => writable.on("finish", resolve));
+  deepEq(sink, ["x", "y"], "Writable.fromWeb writes to the WritableStream");
+  throws(() => Writable.fromWeb({}), "ERR_INVALID_ARG_TYPE", "fromWeb needs a WritableStream");
+  throws(() => Writable.fromWeb(new WritableStream(), { decodeStrings: 0 }), "ERR_INVALID_ARG_TYPE", "fromWeb validates decodeStrings");
+
+  const pair = Duplex.toWeb(new PassThrough());
+  deepEq(Object.keys(pair), ["writable", "readable"], "Duplex.toWeb returns writable and readable");
+  const pairWriter = pair.writable.getWriter();
+  pairWriter.write(new TextEncoder().encode("hello"));
+  pairWriter.close();
+  eq(text(await readAll(pair.readable)), "hello", "Duplex.toWeb's sides are connected through the Duplex");
+  const destroyedDuplex = new PassThrough();
+  destroyedDuplex.destroy();
+  deepEq(Object.keys(Duplex.toWeb(destroyedDuplex)), ["readable", "writable"], "a destroyed Duplex gives closed sides");
+  throws(() => Duplex.toWeb(new Readable()), "ERR_INVALID_ARG_TYPE", "Duplex.toWeb needs a Duplex");
+
+  const upper = new TransformStream({ transform(chunk, controller) { controller.enqueue(chunk.toUpperCase()); } });
+  const duplex = Duplex.fromWeb(upper, { objectMode: true });
+  duplex.end("abc");
+  deepEq(await collect(duplex), ["ABC"], "Duplex.fromWeb writes to the pair's writable and reads its readable");
+  throws(() => Duplex.fromWeb({ readable: new ReadableStream() }), "ERR_INVALID_ARG_TYPE", "fromWeb needs a writable");
+}
+
+// The static Readable.wrap.
+{
+  const old = new EventEmitter();
+  const wrapped = Readable.wrap(old);
+  eq(wrapped.readableObjectMode, true, "objectMode defaults to true");
+  setImmediate(() => {
+    old.emit("data", "q");
+    old.emit("end");
+  });
+  deepEq(await collect(wrapped), ["q"], "Readable.wrap reads the old-style stream");
+  const destroyed = [];
+  const source = new EventEmitter();
+  source.readableObjectMode = false;
+  source.destroy = (error) => destroyed.push(error.message);
+  const bytes = Readable.wrap(source, { highWaterMark: 4 });
+  eq(bytes.readableObjectMode, false, "objectMode comes from src.readableObjectMode");
+  eq(bytes.readableHighWaterMark, 4, "the options apply");
+  bytes.on("error", () => {});
+  bytes.destroy(new Error("gone"));
+  deepEq(destroyed, ["gone"], "destroying the Readable destroys the wrapped stream");
+}
+
+// The iterator helpers, from test-stream-map.js, test-stream-filter.js, test-stream-reduce.js and
+// the other operator tests.
+{
+  const from = (values) => Readable.from(values);
+  const descriptor = Object.getOwnPropertyDescriptor(Readable.prototype, "map");
+  eq(descriptor.enumerable, false, "the operators are not enumerable");
+  eq(Readable.prototype.reduce.length, 3, "the operators have Node's lengths");
+  eq(Readable.prototype.flatMap.name, "flatMap", "the operators have Node's names");
+  deepEq(await from([1, 2, 3]).map((x) => x * 2).toArray(), [2, 4, 6], "map");
+  deepEq(await from([1, 2, 3]).map(async (x) => x + 1, { concurrency: 2 }).toArray(), [2, 3, 4], "map keeps the order with concurrency");
+  eq(from([1]).map((x) => x) instanceof Readable, true, "map returns a Readable");
+  deepEq(await from([1, 2, 3, 4]).filter(async (x) => x % 2 === 0).toArray(), [2, 4], "filter");
+  deepEq(await from([1, 2]).flatMap((x) => [x, x]).toArray(), [1, 1, 2, 2], "flatMap with arrays");
+  deepEq(await from([1, 2]).flatMap((x) => Readable.from([x * 10])).toArray(), [10, 20], "flatMap with streams");
+  deepEq(await from([1, 2, 3]).drop(1).take(1).toArray(), [2], "drop and take");
+  deepEq(await from([1, 2, 3]).take(1.5).toArray(), [1, 2], "take counts down by one without truncating");
+  eq(await from([1, 2, 3]).reduce((a, b) => a + b), 6, "reduce without an initial value");
+  eq(await from([]).reduce((a, b) => a + b, 7), 7, "reduce of an empty stream returns the initial value");
+  eq((await from([]).reduce((a, b) => a + b).catch((error) => error)).code, "ERR_MISSING_ARGS", "reduce needs a value");
+  eq(await from([1, 2, 3]).some((x) => x > 2), true, "some");
+  eq(await from([1, 2, 3]).every((x) => x > 2), false, "every");
+  eq(await from([1, 2, 3]).find(async (x) => x > 1), 2, "find");
+  const seen = [];
+  eq(await from([1, 2]).forEach((x) => { seen.push(x); }), undefined, "forEach fulfills with undefined");
+  deepEq(seen, [1, 2], "forEach calls fn for each value");
+  const infinite = Readable.from((function* () { let i = 0; while (true) yield i++; })());
+  deepEq(await infinite.take(3).toArray(), [0, 1, 2], "take stops an infinite stream");
+  eq(infinite.destroyed, true, "take destroys its source once done");
+  const failure = await from([1, 2]).map((x) => { throw new Error(`no ${x}`); }).toArray().catch((error) => error);
+  eq(failure.message, "no 1", "an exception of fn errors the stream");
+  const signal = AbortSignal.abort();
+  eq((await from([1]).toArray({ signal }).catch((error) => error)).name, "AbortError", "toArray takes a signal");
+  throws(() => from([1]).map(1), "ERR_INVALID_ARG_TYPE", "map validates fn");
+  throws(() => from([1]).map((x) => x, { concurrency: 0 }), "ERR_OUT_OF_RANGE", "map validates concurrency");
+  throws(() => from([1]).drop(-1), "ERR_OUT_OF_RANGE", "drop validates the number");
+  eq((await from([1]).forEach(1).catch((error) => error)).code, "ERR_INVALID_ARG_TYPE", "forEach rejects an invalid fn");
+  const error = throws(() => from([1]).take(1, 1), "ERR_INVALID_ARG_TYPE", "take validates options");
+  eq(String(error).startsWith("TypeError [ERR_INVALID_ARG_TYPE]: "), true, "Node.js errors' toString has the code");
+}

@@ -261,6 +261,9 @@ const buffer = {
         () => `return require("node:buffer").transcode(${bufferExpr(g)}, ${g.lit(g.pick(["utf8", "latin1", "ucs2", "ascii"]))}, ${g.lit(g.pick(["utf8", "latin1", "ucs2", "ascii"]))});`,
         () => `const { isUtf8, isAscii } = require("node:buffer");\nconst b = ${g.lit(g.bytes())};\nreturn [isUtf8(b), isAscii(b)];`,
         () => `return [...${bufferExpr(g)}.entries()];`,
+        () => `return [Buffer[Symbol.species].name, Buffer[Symbol.species].prototype === Buffer.prototype, ${bufferExpr(g)}.map((x) => x + 1), ${bufferExpr(g)}.filter((x) => x % 2) instanceof Buffer];`,
+        () => `const { SlowBuffer } = require("node:buffer");\ntry { return [SlowBuffer(${g.pick(["0", "3", "\"x\"", "undefined"])}), new SlowBuffer(2).length, SlowBuffer.name, SlowBuffer.length]; } catch (e) { return [e.name, e.code, e.message]; }`,
+        () => `const ab = new ArrayBuffer(4, { maxByteLength: 8 });\nconst b = Buffer.from(ab, ${g.range(0, 4)}${g.chance(0.3) ? `, ${g.range(0, 2)}` : ""});\nab.resize(${g.range(0, 8)});\nreturn [b.length, b.byteOffset];`,
       ])(),
   },
 };
@@ -302,9 +305,32 @@ function pathSegment(g) {
   return g.pick(["", ".", "..", "a", "b.c", "/", "//", ".d", "e.", "f.g.h", "a/b", "../x", "./y", "/z/", "~", "a\\b", "C:"]);
 }
 
+function globPath(g) {
+  const segments = g.many(g.range(0, 4), () =>
+    g.pick(["a", "b", "ab", "A", "a.js", "B.JS", ".a", "..", ".", "", "x y", "é", "1", "abc", "a]b", "{a}", "(a)", "!a", "a\\b", "aa", "ba"]),
+  );
+  return (g.chance(0.2) ? "/" : "") + segments.join(g.chance(0.1) ? "//" : "/");
+}
+
+function globPattern(g) {
+  const atom = () =>
+    g.pick([
+      "a", "b", "A", "*", "*", "?", ".", "..", "[ab]", "[!a]", "[^b]", "[a-b]", "[z-a]", "[]", "[]]", "[a", "{a,b}", "{,a}",
+      "{a}", "{1..3}", "{a..c}", "@(a|b)", "!(a)", "+(a|b)", "*(a)", "?(a)", "!(a|)", "!(*.js)", "@(a|!(b))", ".js", ".JS",
+      "[[:alpha:]]", "[[:digit:]]", "[[:upper:]]", "\\", "#", "!", "é", " ",
+    ]);
+  const segment = () => (g.chance(0.15) ? "**" : g.many(g.range(1, 3), atom).join(""));
+  return (g.chance(0.15) ? "/" : "") + g.many(g.range(1, 3), segment).join("/");
+}
+
 const path = {
   name: "path",
   variants: {
+    matchesGlob: (g) => {
+      const paths = g.many(g.range(1, 6), () => globPath(g));
+      const module = `require("node:path")${g.chance(0.5) ? ".posix" : ""}`;
+      return `return ${g.lit(paths)}.map((p) => ${module}.matchesGlob(p, ${g.lit(globPattern(g))}));`;
+    },
     posix: (g) => {
       const segments = g.many(g.range(0, 4), () => pathSegment(g));
       const call = g.pick([
@@ -323,7 +349,7 @@ const path = {
       return `return require("node:path").posix.${call};`;
     },
     invalid: (g) =>
-      `return require("node:path").${g.pick(["join", "resolve", "basename", "extname", "dirname", "normalize"])}(${g.lit(g.pick([null, 1, {}, undefined]))});`,
+      `return require("node:path").${g.pick(["join", "resolve", "basename", "extname", "dirname", "normalize", "matchesGlob"])}(${g.lit(g.pick([null, 1, {}, undefined]))});`,
     win32: (g) => {
       const segments = g.many(g.range(1, 3), () => g.pick(["C:\\", "a", "..", "\\\\server\\share", "b.c", "C:", "\\x", "/y"]));
       return `return require("node:path").win32.${g.pick(["join", "normalize", "basename", "dirname", "isAbsolute"])}(${args(g, ...segments)});`;
@@ -392,6 +418,40 @@ const crypto = {
       ])(),
     "timing-safe-equal": (g) =>
       `return require("node:crypto").timingSafeEqual(${g.lit(g.bytes(3))}, ${g.lit(g.bytes(3))});`,
+    kdf: (g) => {
+      const password = g.pick([() => g.string(6), () => g.bytes(5), () => g.pick([1, null, undefined])])();
+      const salt = g.pick([() => g.string(4), () => g.bytes(4), () => g.pick([1, {}])])();
+      return g.pick([
+        () => {
+          const iterations = g.pick([1, 2, 3, 0, -1, 1.5, "1"]);
+          const keylen = g.pick([0, 1, 20, 33, 64, -1, 2.5]);
+          return `return require("node:crypto").pbkdf2Sync(${args(g, password, salt, iterations, keylen, g.pick(HASHES))}).toString("hex");`;
+        },
+        () => {
+          const keylen = g.pick([0, 1, 16, 33, -1]);
+          const options = g.pick([
+            undefined, null, 1, { N: 16 }, { N: 3 }, { N: 1 }, { N: 0, r: 0, p: 0 }, { cost: 16, blockSize: 1 },
+            { N: 16, cost: 16 }, { r: 2, p: 2, N: 32 }, { maxmem: 1 }, { N: 2 ** 20 }, { N: -1 }, { parallelization: "2" },
+          ]);
+          return `return require("node:crypto").scryptSync(${args(g, password, salt, keylen, options)}).toString("hex");`;
+        },
+        () => {
+          const info = g.pick([() => g.string(4), () => g.bytes(1025), () => 1])();
+          const length = g.pick([0, 1, 16, 255 * 20, 255 * 32 + 1, -1, 1.5]);
+          return `return Buffer.from(require("node:crypto").hkdfSync(${args(g, g.pick(HASHES), password, salt, info, length)})).toString("hex");`;
+        },
+      ])();
+    },
+    "secret-key": (g) => {
+      const key = g.pick([() => g.string(6), () => g.bytes(5), () => g.pick([1, null, ""])])();
+      const encoding = g.pick([undefined, "hex", "base64", "latin1", "bogus"]);
+      return g.pick([
+        () => `const k = require("node:crypto").createSecretKey(${args(g, key, encoding)});\nreturn [k.type, k.symmetricKeySize, k.export().toString("hex"), k.export(${args(g, g.pick([undefined, { format: "jwk" }, { format: "buffer" }, { format: "pem" }, 1]))})];`,
+        () => `const c = require("node:crypto");\nconst k = c.createSecretKey(${g.lit(g.bytes(4))});\nreturn k.equals(${g.pick([() => `c.createSecretKey(${g.lit(g.bytes(4))})`, () => "k", () => g.lit(g.string(4))])()});`,
+        () => `const c = require("node:crypto");\nconst k = c.createSecretKey(${g.lit(g.bytes(8))});\nreturn c.createHmac(${g.lit(g.pick(HASHES))}, k).update(${g.lit(g.string())}).digest("hex") === c.createHmac(${g.lit(g.pick(HASHES))}, k.export()).update("x").digest("hex");`,
+        () => `return require("node:crypto").createHmac("sha256", ${g.lit(g.string(6))}, ${g.lit(g.pick([undefined, { encoding: "hex" }, { encoding: "base64" }, { encoding: 1 }, null]))}).update("x").digest("hex");`,
+      ])();
+    },
     random: (g) =>
       g.pick([
         () => `return require("node:crypto").randomBytes(${g.lit(g.size())}).length;`,
@@ -610,6 +670,59 @@ const stream = {
         () => `const { Readable } = require("node:stream");\nconst r = new Readable({ read() { this.push(${g.lit(g.string(3) || "c")}); this.push(null); } });\nr.pause();\nr.on("data", (c) => __log("data", c));\nawait new Promise((resolve) => setImmediate(resolve));\n__log("flowing", r.readableFlowing);\nr.resume();\nreturn await __settle(new Promise((resolve) => r.on("end", () => resolve("ended"))));`,
         () => `const { Writable } = require("node:stream");\nconst w = new Writable({ writev(chunks, callback) { __log("writev", chunks.map((c) => c.chunk)); callback(); } });\nw.cork();\nw.write("a");\nw.write("b");\nprocess.nextTick(() => w.uncork());\nw.end("c");\nreturn await __settle(new Promise((resolve) => w.on("finish", () => resolve("finished"))));`,
       ])(),
+    web: (g) => {
+      const chunks = g.many(g.range(0, 4), () => g.string(4) || "w");
+      const objectMode = g.chance(0.4);
+      const bytes = `(chunk) => (typeof chunk === "string" ? chunk : Array.from(chunk))`;
+      return g.pick([
+        () => `const { Readable } = require("node:stream");\nconst web = Readable.toWeb(Readable.from(${g.lit(chunks)}, { objectMode: ${objectMode} })${g.chance(0.3) ? `, { strategy: new CountQueuingStrategy({ highWaterMark: ${g.range(0, 3)} }) }` : ""});\nconst out = [];\nfor await (const chunk of web) out.push((${bytes})(chunk));\nreturn out;`,
+        () => `const { Readable } = require("node:stream");\nconst r = new Readable({ read() { ${g.pick(["this.destroy(new Error(\"r\"));", "this.push(\"a\"); this.push(null);", "this.destroy();"])} } });\nconst reader = Readable.toWeb(r).getReader();\nconst results = [];\nfor (let i = 0; i < 3; i++) results.push(await reader.read().then((result) => [result.done, result.value && Array.from(result.value)], (error) => [error.name, error.code, error.cause?.code]));\nreturn results;`,
+        () => `const { Readable } = require("node:stream");\nconst source = new ReadableStream({ start(c) { for (const chunk of ${g.lit(chunks)}) c.enqueue(${objectMode ? "chunk" : "new TextEncoder().encode(chunk)"}); ${g.pick(["c.close();", "c.error(new Error(\"web\"));"])} } });\nconst r = Readable.fromWeb(source, { objectMode: ${objectMode}${g.chance(0.3) ? ", encoding: \"utf8\"" : ""} });\n${logStream("r")}\nconst out = [];\nr.on("data", (chunk) => out.push(typeof chunk === "string" ? chunk : Array.from(chunk)));\nreturn await __settle(new Promise((resolve) => r.on("close", () => resolve(out))));`,
+        () => `const { Writable } = require("node:stream");\nconst w = new Writable({ objectMode: ${objectMode}, highWaterMark: ${g.pick([1, 2, 16])}, write(chunk, encoding, callback) { __log("write", typeof chunk === "string" ? chunk : Array.from(chunk)); ${g.pick(["callback();", "setImmediate(callback);", "callback(new Error(\"w\"));"])} } });\nconst writer = Writable.toWeb(w).getWriter();\nfor (const chunk of ${g.lit(chunks)}) await writer.write(${objectMode ? "chunk" : "new TextEncoder().encode(chunk)"}).catch((error) => __log("write rejected", error.message));\nreturn await writer.close().then(() => ["closed", w.writableFinished], (error) => ["close rejected", error.name]);`,
+        () => `const { Writable } = require("node:stream");\nconst sink = new WritableStream({ write(chunk) { __log("sink", typeof chunk === "string" ? chunk : Array.from(chunk)); ${g.chance(0.2) ? "throw new Error(\"sink\");" : ""} } });\nconst w = Writable.fromWeb(sink, { objectMode: ${objectMode}, decodeStrings: ${g.chance(0.5)} });\n${logStream("w")}\nfor (const chunk of ${g.lit(chunks)}) w.write(chunk);\nw.end();\nreturn await __settle(new Promise((resolve) => w.on("close", () => resolve([w.writableFinished, w.destroyed]))));`,
+        () => `const { Duplex, PassThrough } = require("node:stream");\nconst { readable, writable } = Duplex.toWeb(new PassThrough(${objectMode ? "{ objectMode: true }" : ""}));\nconst writer = writable.getWriter();\nfor (const chunk of ${g.lit(chunks)}) writer.write(${objectMode ? "chunk" : "new TextEncoder().encode(chunk)"});\nwriter.close();\nconst out = [];\nfor await (const chunk of readable) out.push((${bytes})(chunk));\nreturn out;`,
+        () => `const { Duplex } = require("node:stream");\nconst d = Duplex.fromWeb(new TransformStream({ transform(chunk, controller) { controller.enqueue(chunk.toUpperCase()); } }), { objectMode: true });\nfor (const chunk of ${g.lit(chunks)}) d.write(chunk);\nd.end();\nconst out = [];\nfor await (const chunk of d) out.push(chunk);\nreturn out;`,
+        () => `const { Readable } = require("node:stream");\nconst { EventEmitter } = require("node:events");\nconst old = new EventEmitter();\n${g.chance(0.5) ? "old.readableObjectMode = false;" : ""}\nconst r = Readable.wrap(old${g.chance(0.4) ? ", { highWaterMark: 2 }" : ""});\n__log("mode", r.readableObjectMode, r.readableHighWaterMark);\nsetImmediate(() => { for (const chunk of ${g.lit(chunks)}) old.emit("data", chunk); old.emit(${g.lit(g.pick(["end", "end", "close"]))}); });\nconst out = [];\nr.on("data", (chunk) => out.push(String(chunk)));\nreturn await __settle(new Promise((resolve) => r.on("close", () => resolve(out))));`,
+        () => `const { Readable, Writable, Duplex } = require("node:stream");\nconst calls = [() => Readable.toWeb(${g.pick(["{}", "null", "new Readable()"])}${g.chance(0.5) ? `, ${g.pick(["{ type: \"bytes\" }", "{ type: \"x\" }", "1"])}` : ""}), () => Readable.fromWeb(${g.pick(["{}", "new ReadableStream()"])}, ${g.pick(["undefined", "{ objectMode: 1 }", "{ encoding: \"x\" }", "null"])}), () => Writable.fromWeb(${g.pick(["{}", "new WritableStream()"])}, ${g.pick(["undefined", "{ decodeStrings: 1 }", "{ objectMode: \"x\" }"])}), () => Writable.toWeb(${g.pick(["{}", "1", "new Writable()"])}), () => Duplex.fromWeb(${g.pick(["{}", "1", "{ readable: new ReadableStream(), writable: new WritableStream() }"])}), () => Duplex.toWeb(${g.pick(["new Readable()", "{}", "new Duplex()"])})];\nreturn calls.map((call) => { try { const result = call(); return [typeof result, result?.constructor?.name]; } catch (error) { return [error.name, error.code]; } });`,
+      ])();
+    },
+    operators: (g) => {
+      const values = g.many(g.range(0, 6), () => g.range(0, 9));
+      const fn = (kind) => {
+        const sync = g.chance(0.5) ? "" : "async ";
+        return {
+          map: `${sync}(x) => x * ${g.range(1, 3)} + ${g.range(0, 2)}`,
+          filter: `${sync}(x) => x % ${g.range(2, 3)} === 0`,
+          flatMap: g.pick([`${sync}(x) => [x, x]`, `(x) => Readable.from([x, -x])`, `${sync}(x) => []`]),
+          reduce: `${sync}(a, x) => a + x`,
+          predicate: `${sync}(x) => x > ${g.range(0, 9)}`,
+        }[kind];
+      };
+      const options = () => (g.chance(0.3) ? `, { concurrency: ${g.range(1, 3)}${g.chance(0.5) ? `, highWaterMark: ${g.range(0, 2)}` : ""} }` : "");
+      let chain = `Readable.from(${g.lit(values)})`;
+      for (let index = g.range(0, 3); index > 0; index--) {
+        chain += g.pick([
+          () => `.map(${fn("map")}${options()})`,
+          () => `.filter(${fn("filter")}${options()})`,
+          () => `.flatMap(${fn("flatMap")})`,
+          () => `.drop(${g.pick([0, 1, 2, "1.5", "\"2\"", "NaN"])})`,
+          () => `.take(${g.pick([0, 1, 2, "1.5", "Infinity"])})`,
+        ])();
+      }
+      const end = g.pick([
+        () => `.toArray()`,
+        () => `.reduce(${fn("reduce")}${g.chance(0.6) ? ", 0" : ""})`,
+        () => `.some(${fn("predicate")})`,
+        () => `.every(${fn("predicate")})`,
+        () => `.find(${fn("predicate")})`,
+        () => `.forEach((x) => { __log("each", x); })`,
+      ])();
+      return g.pick([
+        () => `const { Readable } = require("node:stream");\nreturn await ${chain}${end};`,
+        () => `const { Readable } = require("node:stream");\nconst out = [];\nfor await (const x of ${chain}) out.push(x);\nreturn out;`,
+        () => `const { Readable } = require("node:stream");\nconst calls = [() => Readable.from([1]).map(${g.pick(["1", "null", "(x) => x"])}, ${g.pick(["1", "{ concurrency: 0 }", "{ concurrency: \"x\" }", "{ highWaterMark: -1 }", "{ signal: true }", "{}"])}), () => Readable.from([1]).drop(${g.pick(["-1", "-Infinity", "\"a\"", "1"])}), () => Readable.from([1]).take(1, ${g.pick(["1", "{ signal: 1 }", "undefined"])})];\nconst sync = calls.map((call) => { try { return typeof call(); } catch (error) { return [error.name, error.code, String(error).split(":")[0]]; } });\nconst rejected = await Promise.all([Readable.from([]).reduce(${g.pick(["1", "(a, b) => a + b"])}), Readable.from([1]).forEach(${g.pick(["1", "() => {}"])}), Readable.from([1]).toArray(${g.pick(["1", "{ signal: AbortSignal.abort() }", "undefined"])})].map((promise) => promise.then((value) => ["ok", value], (error) => [error.name, error.code])));\nreturn [sync, rejected];`,
+      ])();
+    },
   },
 };
 
@@ -704,6 +817,28 @@ function cpStep(g) {
   ])();
 }
 
+/**
+ * The source of an operation that watches `target` with `options` after `setup`, repeats `action`
+ * every 50 ms until a `change` event names `name`, and returns whether its type is `rename` or
+ * `change`, and its filename. Repeating the action keeps the result independent of how long the
+ * host takes to start watching, which macOS's FSEvents does after `fs.watch` returns.
+ */
+function watchUntil(setup, target, options, action, name) {
+  return [
+    `const fs = require("node:fs");`,
+    `const dir = __dir();`,
+    ...setup,
+    `await new Promise((resolve) => setTimeout(resolve, 120));`,
+    `const watcher = fs.watch(${target}, ${options});`,
+    `const event = __settle(new Promise((resolve) => watcher.on("change", (type, filename) => { if (String(filename) === ${JSON.stringify(name)}) resolve([type === "rename" || type === "change", String(filename)]); })), 3000);`,
+    `const timer = setInterval(() => ${action}, 50);`,
+    `const result = await event;`,
+    `clearInterval(timer);`,
+    `watcher.close();`,
+    `return result;`,
+  ].join("\n");
+}
+
 const fsGenerator = {
   name: "fs",
   variants: {
@@ -739,6 +874,93 @@ const fsGenerator = {
         ...g.many(g.range(1, 4), () => cpStep(g)),
         `return tree();`,
       ].join("\n"),
+
+    watchFile: (g) => {
+      const exists = g.chance(0.5);
+      const action = exists
+        ? g.pick([`fs.writeFileSync(file, "changed!")`, `fs.unlinkSync(file)`, `fs.truncateSync(file, 0)`])
+        : `fs.writeFileSync(file, ${g.lit(g.pick(["", "abc", "héllo"]))})`;
+      return [
+        `const fs = require("node:fs");`,
+        `const file = __dir() + "/watched";`,
+        ...(exists ? [`fs.writeFileSync(file, ${g.lit(g.pick(["x", "hello"]))});`] : []),
+        `const events = [];`,
+        `const shape = (s) => [s.size, s.isFile(), s.mtimeMs === 0, s.ino === 0, s.nlink];`,
+        `const done = new Promise((resolve) => {`,
+        `  fs.watchFile(file, { interval: ${g.pick([1, 5, 20])} }, (curr, prev) => {`,
+        `    events.push([shape(curr), shape(prev)]);`,
+        `    if (events.length === ${exists ? 1 : 2}) resolve();`,
+        exists ? "" : `    else ${action};`,
+        `  });`,
+        `});`,
+        exists ? `await new Promise((resolve) => setTimeout(resolve, 50));
+${action};` : "",
+        `const settled = await __settle(done, 3000);`,
+        `await new Promise((resolve) => setTimeout(resolve, 60));`,
+        `const watcher = fs.watchFile(file, () => {});`,
+        `const stops = [];`,
+        `watcher.on("stop", () => stops.push("stop"));`,
+        `fs.unwatchFile(file${g.chance(0.5) ? "" : ", () => {}"});`,
+        `const before = stops.length;`,
+        `fs.unwatchFile(file);`,
+        `await new Promise((resolve) => setImmediate(resolve));`,
+        `return [settled, events, before, stops];`,
+      ].join("\n");
+    },
+    watch: (g) =>
+      g.pick([
+        () =>
+          watchUntil(
+            [`fs.mkdirSync(dir + "/w");`],
+            `dir + "/w"`,
+            g.lit(g.pick([{}, { recursive: true }, { encoding: "buffer" }, { ignore: "*.log" }])),
+            `fs.writeFileSync(dir + "/w/f", String(Date.now()))`,
+            "f",
+          ),
+        () =>
+          watchUntil(
+            [`fs.mkdirSync(dir + "/w/d", { recursive: true });`],
+            `dir + "/w"`,
+            "{ recursive: true }",
+            `fs.writeFileSync(dir + "/w/d/f", String(Date.now()))`,
+            "d/f",
+          ),
+        () => watchUntil([`fs.writeFileSync(dir + "/f", "x");`], `dir + "/f"`, "{}", `fs.appendFileSync(dir + "/f", "more")`, "f"),
+        () => [
+          `const fs = require("node:fs");`,
+          `const watcher = fs.watch(__dir()${g.chance(0.5) ? ", { persistent: false }" : ""});`,
+          `const events = [];`,
+          `watcher.on("close", () => events.push("close"));`,
+          `events.push(watcher.ref() === watcher, watcher.unref() === watcher);`,
+          `watcher.close();`,
+          `events.push("closed", watcher._handle);`,
+          `watcher.close();`,
+          `await new Promise((resolve) => setImmediate(resolve));`,
+          `return events;`,
+        ].join("\n"),
+        () => {
+          const options = g.pick([
+            1, "bogus", { encoding: "bogus" }, { ignore: "" }, { ignore: [1] }, { ignore: [/x/, "*.js", ""] }, { signal: 1 },
+            { recursive: "1" }, { persistent: 1 }, { throwIfNoEntry: false }, { maxQueue: "x" }, { overflow: "x" },
+          ]);
+          const target = g.pick(["__dir()", "__dir() + \"/missing\"", "1", "null", "new URL(\"file:///nonexistent-dir\")"]);
+          return g.pick([
+            `const w = require("node:fs").watch(${target}, ${g.lit(options)});\nconst handle = typeof w._handle;\nw.close();\nreturn handle;`,
+            `const it = require("node:fs").promises.watch(${target}, ${g.lit(options)});\nconst first = await Promise.race([it.next().then(() => "no error", (error) => error), new Promise((resolve) => setTimeout(resolve, 300, "no error"))]);\nawait it.return();\nreturn first;`,
+            `const w = require("node:fs").watchFile(${target}, ${g.lit(options)}, () => {});\nrequire("node:fs").unwatchFile(${target});\nreturn typeof w._handle;`,
+          ]);
+        },
+        () => [
+          `const fs = require("node:fs");`,
+          `const dir = __dir();`,
+          `const ac = new AbortController();`,
+          `const iterator = fs.promises.watch(dir, { signal: ac.signal });`,
+          `const first = iterator.next();`,
+          `${g.chance(0.5) ? "ac.abort();" : `ac.abort(new Error("why"));`}`,
+          `const settled = await __settle(first.then((value) => ["value", value], (error) => ["error", error.name, error.code, error.cause?.name, error.cause?.message === "why"]), 1000);`,
+          `return [settled, await iterator.next()];`,
+        ].join("\n"),
+      ])(),
     sequence: (g) =>
       [
         `const fs = require("node:fs");`,
@@ -758,14 +980,18 @@ const COMPRESSORS = [
   ["gzipSync", "gunzipSync", "gzip", "gunzip", "createGzip", "createGunzip"],
   ["deflateRawSync", "inflateRawSync", "deflateRaw", "inflateRaw", "createDeflateRaw", "createInflateRaw"],
   ["brotliCompressSync", "brotliDecompressSync", "brotliCompress", "brotliDecompress", "createBrotliCompress", "createBrotliDecompress"],
+  ["zstdCompressSync", "zstdDecompressSync", "zstdCompress", "zstdDecompress", "createZstdCompress", "createZstdDecompress"],
 ];
 
 function zlibData(g) {
   return g.pick([() => g.bytes(40), () => Buffer.from(g.string(10).repeat(g.range(1, 20))), () => Buffer.alloc(0), () => Buffer.alloc(g.range(1, 3000), g.int(256))])();
 }
 
-function zlibOptions(g, brotli, valid = true) {
-  if (brotli) {
+function zlibOptions(g, index, valid = true) {
+  if (index === 4) {
+    return g.pick([undefined, { params: { [zlibHost.constants.ZSTD_c_compressionLevel]: g.range(1, 19) } }, { chunkSize: 64 }, ...(valid ? [] : [{ params: { 999: 1 } }, { params: { 99: 1 } }, { flush: 3 }])]);
+  }
+  if (index === 3) {
     return g.pick([undefined, { params: { [zlibHost.constants.BROTLI_PARAM_QUALITY]: g.range(0, 11) } }, { chunkSize: 64 }, ...(valid ? [] : [{ params: { 999: 1 } }, { chunkSize: 1 }])]);
   }
   return g.pick([
@@ -785,7 +1011,7 @@ const zlib = {
       const index = g.int(COMPRESSORS.length);
       const [compress] = COMPRESSORS[index];
       const data = zlibData(g);
-      let compressed = zlibHost[compress](data, zlibOptions(g, index === 3));
+      let compressed = zlibHost[compress](data, zlibOptions(g, index));
       const mutation = g.pick(["none", "none", "truncate", "flip", "append", "other"]);
       if (mutation === "truncate") compressed = compressed.subarray(0, g.int(compressed.length));
       if (mutation === "flip" && compressed.length > 0) {
@@ -795,13 +1021,13 @@ const zlib = {
       if (mutation === "append") compressed = Buffer.concat([compressed, g.bytes(4)]);
       const decompress = mutation === "other" ? g.pick([...COMPRESSORS.map((c) => c[1]), "unzipSync"]) : g.chance(0.2) && index < 2 ? "unzipSync" : COMPRESSORS[index][1];
       const options = g.pick([undefined, undefined, { finishFlush: zlibHost.constants.Z_SYNC_FLUSH }, { maxOutputLength: g.range(1, 100) }, { chunkSize: 64 }]);
-      return `return require("node:zlib").${decompress}(${args(g, compressed, decompress.startsWith("brotli") && options?.finishFlush ? undefined : options)});`;
+      return `return require("node:zlib").${decompress}(${args(g, compressed, /^(brotli|zstd)/.test(decompress) && options?.finishFlush ? undefined : options)});`;
     },
     roundtrip: (g) => {
       const index = g.int(COMPRESSORS.length);
       const [compress, decompress] = COMPRESSORS[index];
       const data = zlibData(g);
-      const options = zlibOptions(g, index === 3, g.chance(0.7));
+      const options = zlibOptions(g, index, g.chance(0.7));
       return `const zlib = require("node:zlib");\nconst data = ${g.lit(data)};\nconst out = zlib.${decompress}(zlib.${compress}(data, ${g.lit(options)}), ${g.lit(options)});\nreturn [out.equals(data), out.length];`;
     },
     async: (g) => {
@@ -816,7 +1042,7 @@ const zlib = {
       const chunks = g.many(g.range(0, 4), () => g.chance(0.5) ? g.bytes(20) : Buffer.from(g.string(6)));
       return [
         `const zlib = require("node:zlib");`,
-        `const c = zlib.${create}(${g.lit(zlibOptions(g, index === 3))});`,
+        `const c = zlib.${create}(${g.lit(zlibOptions(g, index))});`,
         `const d = zlib.${createInverse}();`,
         `const out = [];`,
         `d.on("data", (chunk) => out.push(chunk));`,
@@ -931,7 +1157,28 @@ const util = {
         () => `return require("node:util").styleText(${g.lit(g.pick(["red", ["bold", "underline"], "notAStyle", "italic"]))}, "text", { validateStream: false });`,
         () => `const util = require("node:util");\nreturn util.inspect({ [util.inspect.custom](depth, options) { return ${g.pick(["\"custom\"", "{ replaced: depth }", "options.stylize(\"s\", \"string\")", "this"])}; } });`,
         () => `return require("node:util").isArray(${valueExpr(g)});`,
+        () => `const util = require("node:util");\nfunction F(a, b) {}\nF.prototype.m = 1;\nconst d = util.deprecate(F, "msg", "DEP_X"${g.pick(["", ", {}", ", { modifyPrototype: false }", ", { modifyPrototype: true }"])});\nreturn [d.prototype === F.prototype, Object.getPrototypeOf(d) === F, d.prototype.m, d.length];`,
       ])(),
+    "parse-args": (g) => {
+      const argv = Array.from({ length: g.range(0, 5) }, () =>
+        g.pick(["-f", "-v", "-fv", "-ofile", "-o", "--flag", "--out", "--out=x", "--no-flag", "--no-color", "--", "-", "pos", "--unknown", "-x", "--out=-y", "-vo"]),
+      );
+      const options = g.pick([
+        "{ flag: { type: \"boolean\", short: \"f\" }, out: { type: \"string\", short: \"o\" }, v: { type: \"boolean\", multiple: true } }",
+        "{ out: { type: \"string\", multiple: true, default: [\"d\"] }, flag: { type: \"boolean\", default: false } }",
+        "{ color: { type: \"boolean\" }, flag: { type: \"boolean\" } }",
+        "{}",
+      ]);
+      const extra = g.pick(["", ", strict: false", ", allowPositionals: true", ", allowNegative: true", ", tokens: true", ", strict: false, allowNegative: true, tokens: true"]);
+      return `const { values, positionals, tokens } = require("node:util").parseArgs({ args: ${JSON.stringify(argv)}, options: ${options}${extra} });\nreturn { values: { ...values }, positionals, tokens };`;
+    },
+    console: (g) => {
+      const calls = Array.from({ length: g.range(1, 4) }, () =>
+        g.pick(["c.log(\"a %s\", 1, { b: [2] })", "c.error(\"e\")", "c.warn(new Error(\"w\").message)", "c.info(1, 2)", "c.dir({ d: { e: 1 } }, { depth: 0 })", "c.assert(false, \"x %d\", 3)", "c.debug()"]),
+      );
+      const ctor = g.pick(["new Console(out, err)", "new Console({ stdout: out, stderr: err })", "new Console(out)", "Console(out)", "new Console({})"]);
+      return `const { Console } = require("node:console");\nconst { Writable } = require("node:stream");\nconst chunks = [];\nconst out = new Writable({ write(chunk, encoding, cb) { chunks.push(["out", String(chunk)]); cb(); } });\nconst err = new Writable({ write(chunk, encoding, cb) { chunks.push(["err", String(chunk)]); cb(); } });\nconst c = ${ctor};\n${calls.join(";\n")};\nreturn chunks;`;
+    },
   },
 };
 
@@ -1123,6 +1370,182 @@ const os = {
   },
 };
 
+/** An IPv4 address string, drawn so that addresses repeat and overlap, or an invalid one. */
+function ipv4Address(g) {
+  return g.pick([
+    () => [g.pick([1, 10, 127, 192, 0, 255]), g.pick([0, 1, 168, 255]), g.int(3), g.int(12)].join("."),
+    () => [g.pick([1, 10, 127, 192, 0, 255]), g.pick([0, 1, 168, 255]), g.int(3), g.int(12)].join("."),
+    () => g.many(4, () => g.int(256)).join("."),
+    () => g.pick(["01.2.3.4", "256.1.1.1", "1.2.3", "1.2.3.4.", " 1.2.3.4", "1.2.3.4\u0000x", "", "1.2.3.04", "0.0.0.0", "255.255.255.255", "abc", "::1"]),
+  ])();
+}
+
+/** An IPv6 address string, including IPv4-mapped and IPv4-compatible ones, or an invalid one. */
+function ipv6Address(g) {
+  const group = () => g.pick(["0", "1", "ffff", "a", "fe80", "2001", "db8", "FFFF", g.int(65536).toString(16)]);
+  return g.pick([
+    () => `::ffff:${ipv4Address(g)}`,
+    () => `::ffff:${ipv4Address(g)}`,
+    () => `::${ipv4Address(g)}`,
+    () => `::${g.chance(0.5) ? "" : group()}`,
+    () => g.many(8, () => (g.chance(0.4) ? "0" : group())).join(":"),
+    () => `${group()}::${group()}`,
+    () => `2001:db8::${g.int(20).toString(16)}`,
+    () => `::ffff:${group()}:${group()}`,
+    () => `fe80::${group()}${g.chance(0.2) ? "%eth0" : ""}`,
+    () => g.pick([":::", "12345::", "1:2:3:4:5:6:7:8:9", "1::2::3", "::1.2.3", "fe80::1%", "::ffff:1.2.3.4.5", "1:2:3:4:5:6:1.2.3.4", "1:2:3:4:5:6:7::", "::2:3:4:5:6:7:8", "1.2.3.4", g.string(6)]),
+  ])();
+}
+
+/** An address string and the family argument to pass with it, which is sometimes wrong. */
+function netAddress(g) {
+  const ipv6 = g.chance(0.5);
+  const address = ipv6 ? ipv6Address(g) : ipv4Address(g);
+  const family = g.pick([
+    () => (ipv6 ? "ipv6" : g.pick([undefined, "ipv4"])),
+    () => (ipv6 ? "ipv6" : g.pick([undefined, "ipv4"])),
+    () => (ipv6 ? g.pick(["IPv6", "IPV6"]) : "IPv4"),
+    () => g.pick(["ipv4", "ipv6", "foo", "", 4, null]),
+  ])();
+  return [address, family];
+}
+
+/** The source of a `SocketAddress` construction, with options that are usually valid. */
+function socketAddressSource(g, valid = true) {
+  const [address, family] = netAddress(g);
+  const options = {};
+  if (g.chance(0.9)) options.address = valid && g.chance(0.8) ? (family === "ipv6" ? ipv6Address(g) : ipv4Address(g)) : address;
+  if (g.chance(0.8)) options.family = valid ? g.pick(["ipv4", "ipv6", "IPv6", "IPV4", undefined]) : family;
+  if (g.chance(0.3)) options.port = g.pick([0, 80, 65535, "443", "0x50", ...(valid ? [] : [-1, 65536, 1.5, "", true, null])]);
+  if (g.chance(0.2)) options.flowlabel = g.pick([0, 1, 0xfffff, ...(valid ? [] : [-1, 1.5, "1", null])]);
+  return g.chance(0.05) && !valid ? g.pick(["null", "[]", "1", "\"x\""]) : g.lit(options);
+}
+
+/** A prefix length argument, usually in range for one family or the other. */
+function netPrefix(g) {
+  return g.pick([0, 1, 7, 8, 12, 16, 24, 31, 32, 48, 64, 96, 100, 104, 120, 127, 128, () => g.pick([33, 129, -1, -0, 1.5, "8", NaN, undefined])]);
+}
+
+/** A CIDR string, usually valid. */
+function cidrString(g) {
+  const prefix = g.pick(["8", "16", "24", "32", "0", "64", "96", "120", "128", "08", "-1", "", "abc", "1e1", "+8", " 8", "33", "129"]);
+  const address = g.chance(0.5) ? ipv4Address(g) : ipv6Address(g);
+  return g.pick([`${address}/${prefix}`, `${address}/${prefix}`, address, `${address}/${prefix}/8`]);
+}
+
+/** The source of one random operation on the `BlockList` `bl`. */
+function blockListOp(g) {
+  const fam = (family) => (family === undefined ? "" : `, ${g.lit(family)}`);
+  const [address, family] = netAddress(g);
+  const objectOf = () => `new SocketAddress(${socketAddressSource(g)})`;
+  const value = () => (g.chance(0.2) ? objectOf() : g.lit(address));
+  switch (g.int(13)) {
+    case 0:
+    case 1:
+      return `bl.addAddress(${value()}${fam(family)})`;
+    case 2: {
+      const [end] = netAddress(g);
+      return `bl.addRange(${value()}, ${g.chance(0.2) ? objectOf() : g.lit(end)}${fam(family)})`;
+    }
+    case 3:
+    case 4:
+      return `bl.addSubnet(${value()}, ${g.lit(netPrefix(g))}${fam(family)})`;
+    case 5:
+      return `bl.addCIDR(${g.lit(cidrString(g))})`;
+    case 6:
+      return `bl.addCIDRs(${g.lit(g.many(g.range(0, 3), () => cidrString(g)))})`;
+    case 7:
+      return `bl.addAddresses([${g.many(g.range(0, 3), () => (g.chance(0.2) ? objectOf() : g.lit(netAddress(g)[0]))).join(", ")}]${fam(family)})`;
+    case 8:
+      return `bl.removeAddress(${value()}${fam(family)})`;
+    case 9: {
+      const [end] = netAddress(g);
+      return `bl.removeRange(${value()}, ${g.lit(end)}${fam(family)})`;
+    }
+    case 10:
+      return `bl.removeSubnet(${value()}, ${g.lit(netPrefix(g))}${fam(family)})`;
+    case 11:
+      return `bl.removeCIDR(${g.lit(cidrString(g))})`;
+    default:
+      return g.pick(["bl.clear()", `bl.addAddress(${g.pick(["1", "null", "{}"])})`, `bl.check(${g.pick(["1", "null"])})`, `bl.addSubnet("1.1.1.1", ${g.pick(["\"8\"", "null"])})`]);
+  }
+}
+
+/** Source that sorts `bl.rules` so the address rules, which Node.js lists in hash order, compare. */
+const SORTED_RULES = `const sortedRules = (rules) => [...rules.filter((r) => r.startsWith("Address")).sort(), ...rules.filter((r) => !r.startsWith("Address"))];`;
+
+/** Source that runs `f` and records its error's name, code and message, or `null`, in `errors`. */
+const RECORD = `const errors = [];\nconst record = (f) => { try { f(); errors.push(null); } catch (e) { errors.push([e.name, e.code, e.name === "SyntaxError" ? "" : e.message]); } };`;
+
+const netGenerator = {
+  name: "net",
+  variants: {
+    blockList: (g) => {
+      const ops = g.many(g.range(1, 8), () => blockListOp(g));
+      const checks = g.many(g.range(1, 8), () => {
+        const [address, family] = netAddress(g);
+        return g.chance(0.15) ? `new SocketAddress(${socketAddressSource(g)})` : `${g.lit(address)}${family === undefined ? "" : `, ${g.lit(family)}`}`;
+      });
+      return [
+        `const { BlockList, SocketAddress } = require("node:net");`,
+        SORTED_RULES,
+        RECORD,
+        `const bl = new BlockList();`,
+        ...ops.map((op) => `record(() => ${op});`),
+        `const checks = [];`,
+        ...checks.map((check) => `try { checks.push(bl.check(${check})); } catch (e) { checks.push(e.code); }`),
+        `return { rules: sortedRules(bl.rules), size: bl.size, json: sortedRules(bl.toJSON()), checks, errors };`,
+      ].join("\n");
+    },
+    normalizeArgs: (g) => {
+      const callArgs = g.pick(["", "{ port: 1 }", "80, \"host\"", "80, 1", "\"/pipe\"", "\"81\"", "() => {}", "{}, () => {}", "null"]);
+      return `const a = require("node:net")._normalizeArgs([${callArgs}]);\nreturn [a[0], typeof a[1], a.length];`;
+    },
+    socketAddress: (g) => {
+      const source = socketAddressSource(g, g.chance(0.6));
+      return [
+        `const { SocketAddress } = require("node:net");`,
+        `const sa = new SocketAddress(${source});`,
+        `return [sa.toJSON(), require("node:util").inspect(sa), JSON.stringify(sa), SocketAddress.isSocketAddress(sa), sa instanceof SocketAddress];`,
+      ].join("\n");
+    },
+    parse: (g) => {
+      const input = g.pick([
+        () => `${ipv4Address(g)}:${g.pick([0, 1, 80, 443, 65535, 65536, ""])}`,
+        () => `[${ipv6Address(g)}]:${g.pick([0, 1, 80, 8080, 65535])}`,
+        () => `[${ipv6Address(g)}]`,
+        () => g.pick(["1.2.3.4", "256", "0xffffffff", "0x.0x.0", "192.168.257:1", "999999999:12", "[1:0::]", "not an ip", "abc.123", "259.1.1.1", "12:12:12", "example.com", "user@1.2.3.4/x", "", "[fe80::1%25lo0]:1", "1.2.3.4:80"]),
+        () => g.string(10),
+      ])();
+      const value = g.chance(0.05) ? g.pick(["1", "null", "undefined"]) : g.lit(input);
+      return `const sa = require("node:net").SocketAddress.parse(${value});\nreturn sa === undefined ? sa : sa.toJSON();`;
+    },
+    fromJSON: (g) => {
+      const rule = () =>
+        g.pick([
+          () => `Address: IPv4 ${ipv4Address(g)}`,
+          () => `Address: IPv6 ${ipv6Address(g)}`,
+          () => `Subnet: IPv4 ${ipv4Address(g)}/${g.int(40)}`,
+          () => `Subnet: IPv6 ${ipv6Address(g)}/${g.int(140)}`,
+          () => `Range: IPv4 ${ipv4Address(g)}-${ipv4Address(g)}`,
+          () => `Range: IPv6 ${ipv6Address(g)}-${ipv6Address(g)}`,
+          () => `${g.pick(["subnet: ipv6 ::/0 IPv6", "x Address: IPv4 1.2.3.4567", "Range: IPv4 1.1.1.1-2.2.2.2 IPv6", "Address: IPv6 ::ffff:1.2.3.4", "Subnet: IPv4 1234.1.1.1/8", "Address: IPv4 ", "IPv4 IPv6", g.string(8)])}`,
+        ])();
+      const data = g.many(g.range(0, 5), rule);
+      const arg = g.pick([() => g.lit(data), () => g.lit(JSON.stringify(data)), () => g.pick(["1", "null", "\"x\"", "\"123\"", "[1]", "\"{}\""])])();
+      return [`const { BlockList } = require("node:net");`, SORTED_RULES, RECORD, `const bl = new BlockList();`, `record(() => bl.fromJSON(${arg}));`, `return [sortedRules(bl.rules), errors];`].join("\n");
+    },
+    misc: (g) =>
+      g.pick([
+        () => `const { BlockList } = require("node:net");\nconst bl = new BlockList();\n${g.many(g.range(0, 3), () => blockListOp(g)).map((op) => `try { ${op}; } catch {}`).join("\n")}\nreturn require("node:util").inspect(bl, ${g.lit({ depth: g.pick([-1, 0, 1, null, undefined]) })}).replace(/'Address: [^']*'/g, "'Address'");`,
+        () => `const { BlockList } = require("node:net");\nreturn [BlockList.PRIVATE_RANGES, Object.isFrozen(BlockList.PRIVATE_RANGES), BlockList.isBlockList(new BlockList()), BlockList.isBlockList(${g.pick(["{}", "null", "undefined", "1", "new (require(\"node:net\").SocketAddress)()"])})];`,
+        () => `const { BlockList, SocketAddress } = require("node:net");\nreturn [BlockList, SocketAddress, BlockList.prototype.addAddress, BlockList.prototype.addRange, BlockList.prototype.check, BlockList.prototype.fromJSON, SocketAddress.parse, SocketAddress.isSocketAddress].map((f) => [f.name, f.length]);`,
+        () => `const { ${g.pick(["BlockList", "SocketAddress"])}: C } = require("node:net");\ntry { C(); return "called"; } catch (e) { return [e.name, e.message]; }`,
+        () => `const { BlockList } = require("node:net");\nconst bl = new BlockList();\nbl.addCIDRs(BlockList.PRIVATE_RANGES);\nreturn [${g.many(4, () => g.lit(netAddress(g)[0])).join(", ")}].map((a) => [bl.check(a), bl.check(a, "ipv6")]);`,
+      ])(),
+  },
+};
+
 const processGenerator = {
   name: "process",
   variants: {
@@ -1135,6 +1558,7 @@ const processGenerator = {
         () => `const before = process.exitCode;\ntry { process.exitCode = ${g.pick(["1", "\"2\"", "1.5", "\"x\"", "null", "undefined"])}; return process.exitCode; } finally { process.exitCode = before; }`,
         () => `return [process.platform === require("node:os").platform(), typeof process.pid, process.argv.length >= 2, typeof process.execPath, process.release.name];`,
         () => `return Object.keys(process.memoryUsage()).sort();`,
+        () => `const { EventEmitter } = require("node:events");\nconst e = new EventEmitter();\ne.setMaxListeners(${g.range(0, 2)});\nconst type = ${g.pick(["\"x\"", "Symbol(\"s\")", "null"])};\nconst seen = new Promise((resolve) => process.on("warning", function listener(w) { if (w.name !== "MaxListenersExceededWarning") return; process.off("warning", listener); resolve([w.type === type, w.count, w.emitter === e, w.message]); }));\nfor (let i = 0; i < 3; i++) e.on(type, () => {});\nreturn await __settle(seen);`,
         () => {
           const timeouts = g.range(0, 3);
           const immediates = g.range(0, 3);
@@ -1161,7 +1585,7 @@ const processGenerator = {
 const SHAPE_MODULES = [
   "assert", "async_hooks", "buffer", "constants", "crypto", "diagnostics_channel", "dns", "events", "fs", "http", "module",
   "net", "os", "path", "punycode", "querystring", "readline", "stream", "string_decoder", "timers", "tty", "url", "util",
-  "zlib",
+  "zlib", "node:test",
 ];
 const hostRequire = createRequire(import.meta.url);
 
@@ -1262,9 +1686,274 @@ const stackTrace = {
   },
 };
 
+/** A summary of the recorded calls of the mock `name`, without their `stack`. */
+function mockCalls(name) {
+  return `${name}.mock.calls.map((c) => [c.arguments, c.result, c.error, c.this === undefined ? "undefined" : typeof c.this, typeof c.target])`;
+}
+
+/**
+ * `node:test`'s mocks, with the module's `mock` tracker: `mock.fn()` and `mock.method()` called in
+ * sequences of calls and changes to their implementations, compared by the calls they record and
+ * the values the calls return, and the errors invalid arguments throw.
+ */
+const testRunner = {
+  name: "test_runner",
+  variants: {
+    fn: (g) => {
+      const impls = ["(a, b) => a + b", "function () { return this === undefined ? \"no this\" : typeof this; }", "() => { throw new TypeError(\"impl\"); }", "(...a) => a.length", "function F(x) { this.x = x; }"];
+      const original = g.chance(0.2) ? "" : g.pick(impls);
+      const implementation = original && g.chance(0.4) ? `, ${g.pick(impls)}` : "";
+      const times = g.chance(0.3) ? `${original ? "" : "undefined, "}${implementation ? "" : original ? "undefined, " : ""}{ times: ${g.pick([1, 2, 3, "Infinity"])} }` : "";
+      const optionsArgs = times ? `${original}${implementation}${original ? ", " : ""}${times}`.replace(/^undefined, undefined, /, "") : `${original}${implementation}`;
+      const lines = [`const { mock } = require("node:test");`, `const f = mock.fn(${optionsArgs});`];
+      for (let index = g.range(2, 8); index > 0; index--) {
+        lines.push(
+          g.pick([
+            () => step("call", `f(${g.many(g.range(0, 3), () => g.lit(g.pick([1, 2, "x", null]))).join(", ")})`),
+            () => step("call-this", `f.call(${g.pick(["{}", "null", "1"])}, 1)`),
+            () => step("new", `typeof new f(1)`),
+            () => step("once", `f.mock.mockImplementationOnce(${g.pick(impls)}${g.chance(0.3) ? `, ${g.pick([0, 1, 2, 5])}` : ""})`),
+            () => step("impl", `f.mock.mockImplementation(${g.pick(impls)})`),
+            () => step("count", `f.mock.callCount()`),
+            () => step("reset", `f.mock.resetCalls()`),
+            () => step("restore", `f.mock.restore()`),
+          ])(),
+        );
+      }
+      lines.push(`const calls = ${mockCalls("f")};`, `mock.reset();`, `return [f.mock.callCount(), calls, typeof f, f.length];`);
+      return lines.join("\n");
+    },
+    method: (g) => {
+      const accessor = g.pick(["method", "method", "getter", "setter"]);
+      const onPrototype = g.chance(0.4);
+      const body = `{ value: 2, m(x) { return x * this.value; }, get p() { return "real"; }, set p(v) { this.value = v; } }`;
+      const lines = [
+        `const { mock } = require("node:test");`,
+        onPrototype ? `const proto = ${body};\nconst o = Object.create(proto);` : `const o = ${body};`,
+      ];
+      const name = accessor === "method" ? "m" : "p";
+      const impl = g.pick(["", accessor === "setter" ? ", function (v) { this.value = v * 10; }" : accessor === "getter" ? ", () => \"mocked\"" : ", (x) => -x"]);
+      const options = g.chance(0.4) ? `${impl ? "" : ", undefined"}, { times: ${g.pick([1, 2])} }` : "";
+      const call = accessor === "method" ? `mock.method(o, "m"${impl}${options})` : `mock.${accessor}(o, "p"${impl}${options})`;
+      lines.push(`const spy = ${call.replace(", undefined, {", ", {")};`);
+      for (let index = g.range(1, 5); index > 0; index--) {
+        lines.push(
+          g.pick([
+            () => step("use", accessor === "method" ? `o.m(${g.pick([1, 3])})` : accessor === "getter" ? "o.p" : `(o.p = ${g.pick([1, 4])}, o.value)`),
+            () => step("own", `Object.prototype.hasOwnProperty.call(o, ${g.lit(name)})`),
+            () => step("restore", `spy.mock.restore()`),
+            () => step("restore-all", `mock.restoreAll()`),
+            () => step("count", `spy.mock.callCount()`),
+          ])(),
+        );
+      }
+      lines.push(`const calls = ${mockCalls("spy")};`, `mock.reset();`, `return [calls, typeof Object.getOwnPropertyDescriptor(o, ${g.lit(name)})?.${accessor === "method" ? "value" : "get"}];`);
+      return lines.join("\n");
+    },
+    errors: (g) =>
+      g.pick([
+        () => `return require("node:test").mock.fn(${g.pick(["1", "null", "\"f\"", "() => {}, 1", "() => {}, () => {}, 1"])});`,
+        () => `return require("node:test").mock.fn(() => {}, { times: ${g.pick(["0", "-1", "1.5", "\"2\"", "NaN"])} });`,
+        () => `return require("node:test").mock.method({ m() {} }, ${g.pick(["1", "null", "\"missing\"", "\"m\", 1", "\"m\", () => {}, 1"])});`,
+        () => `return require("node:test").mock.method(${g.pick(["1", "null", "\"s\""])}, "m");`,
+        () => `return require("node:test").mock.method({ m() {}, get g() { return 1; } }, ${g.pick(["\"m\", { getter: true }", "\"g\"", "\"m\", { getter: true, setter: true }", "\"m\", { getter: 1 }"])});`,
+        () => `return require("node:test").mock.${g.pick(["getter", "setter"])}({ get g() { return 1; }, set g(v) {} }, "g", ${g.pick(["{ getter: false }", "{ setter: false }", "1"])});`,
+        () => `const f = require("node:test").mock.fn();\nf();\nreturn f.mock.mockImplementationOnce(() => 1, ${g.pick(["0", "-1", "1.5", "\"1\"", "1"])});`,
+        () => `const f = require("node:test").mock.fn();\nreturn f.mock.mockImplementation(${g.pick(["1", "null", "undefined"])});`,
+      ])(),
+  },
+};
+
+// Header names and values for requests and responses: mixed case, duplicates once lowercased, the
+// names Node.js keeps one value of, joins with `; ` or collects in an array, and invalid ones.
+const HTTP_NAMES = [
+  "X-Test", "x-test", "X-TEST", "X-Dup", "x-dup", "Set-Cookie", "set-cookie", "Cookie", "cookie", "Content-Type",
+  "content-type", "Age", "age", "Authorization", "Accept-Language", "X-Empty", "Via", "ETag", "Location",
+];
+const HTTP_VALUES = ["a", "b", "1", "", " padded ", "x=1; Path=/", "a, b", "é", "text/plain", "5", "0", "日本", "\u0001"];
+// The values a client sends the same way: Node.js encodes the request head as UTF-8 when it sends
+// it with a string body, and the runtime's HTTP client as Latin-1.
+const ASCII_VALUES = HTTP_VALUES.filter((value) => /^[\x20-\x7e]*$/.test(value));
+const HTTP_STATUSES = [200, 200, 201, 202, 204, 206, 301, 302, 304, 400, 404, 418, 500, 503, 599, 600, 99, 1000, 200.5, "201"];
+const HTTP_MESSAGES = ["OK", "Custom", "", "Bad\nMessage", "Ünïcode"];
+
+/** A header value for `setHeader`: a string, a number, or an array of strings. */
+function httpValue(g) {
+  return g.pick([
+    () => g.pick(HTTP_VALUES),
+    () => g.pick(HTTP_VALUES),
+    () => g.int(100),
+    () => g.many(g.range(1, 3), () => g.pick(HTTP_VALUES)),
+  ])();
+}
+
+/** A body chunk expression for `write` or `end`, mostly valid, with an encoding if `encoded`. */
+function httpChunk(g, encoded) {
+  return g.pick([
+    () => g.lit(g.pick(["hello", "", "a".repeat(20), "héllo", "😀", "chunk\r\n"])),
+    () => g.lit(g.bytes(12)),
+    () => (encoded ? `${g.lit(g.pick(["68656c6c6f", "aGVsbG8=", "é"]))}, ${g.lit(g.pick(["hex", "base64", "latin1"]))}` : g.lit("hello")),
+    () => g.pick(["1", "null", "{}"]),
+  ])();
+}
+
+/**
+ * The source of a response program for `res`: header and status changes, `writeHead`, writes and
+ * `end`, each recorded by `rec` with the error it throws. A response the program leaves unended is
+ * ended with a valid status, so every exchange completes. String chunks have encodings if
+ * `encoded`.
+ */
+function httpResponseProgram(g, encoded) {
+  const steps = g.many(g.range(0, 4), () =>
+    g.pick([
+      () => `res.setHeader(${g.lit(g.pick(HTTP_NAMES))}, ${g.lit(httpValue(g))})`,
+      () => `res.appendHeader(${g.lit(g.pick(HTTP_NAMES))}, ${g.lit(httpValue(g))})`,
+      () => `res.removeHeader(${g.lit(g.pick([...HTTP_NAMES, "Content-Length", "Transfer-Encoding", "Connection", "Date"]))})`,
+      () => `res.setHeader(${g.lit(g.pick(["Connection", "connection"]))}, ${g.lit(g.pick(["close", "keep-alive", "upgrade"]))})`,
+      () => `res.statusCode = ${g.lit(g.pick(HTTP_STATUSES))}`,
+      () => `res.statusMessage = ${g.lit(g.pick(HTTP_MESSAGES))}`,
+      () => `res.sendDate = ${g.pick(["false", "true"])}`,
+    ])(),
+  );
+  if (g.chance(0.5)) {
+    const headers = g.pick([
+      () => undefined,
+      () => Object.fromEntries(g.many(g.range(1, 3), () => [g.pick(HTTP_NAMES), httpValue(g)])),
+      () => g.many(g.range(1, 3), () => [g.pick(HTTP_NAMES), g.pick(HTTP_VALUES)]).flat(),
+      () => g.many(g.range(1, 3), () => [g.pick(HTTP_NAMES), g.pick(HTTP_VALUES)]),
+    ])();
+    const message = g.chance(0.3) ? `, ${g.lit(g.pick(HTTP_MESSAGES))}` : "";
+    const rest = headers === undefined ? "" : `, ${g.lit(headers)}`;
+    steps.push(`res.writeHead(${g.lit(g.pick(HTTP_STATUSES))}${message}${rest})`);
+  }
+  if (g.chance(0.15)) steps.push("res.flushHeaders()");
+  for (let index = g.range(0, 3); index > 0; index--) steps.push(`res.write(${httpChunk(g, encoded)})`);
+  if (g.chance(0.2)) steps.push(`res.addTrailers(${g.lit({ [g.pick(["X-Trailer", "x-t"])]: g.pick(HTTP_VALUES) })})`);
+  steps.push(g.chance(0.6) ? `res.end(${httpChunk(g, encoded)})` : "res.end()");
+  return [
+    ...steps.map((step) => `rec(() => ${step});`),
+    `if (!res.writableEnded) { res.statusCode = 200; res.statusMessage = undefined; rec(() => res.end()); }`,
+    `if (!res.writableEnded) res.destroy();`,
+    `log.push(["response", res.headersSent, res.statusCode, String(res._header).replace(/Date: [^\\r]*\\r\\n/, "Date: -\\r\\n")]);`,
+  ].join("\n");
+}
+
+/** The source that creates `server`, whose handler records each request in `log` and runs `program`. */
+function httpServerSource(program, rawHeaders) {
+  return [
+    `const http = require("node:http");`,
+    `const log = [];`,
+    `const rec = (f) => { try { f(); } catch (e) { log.push(["throws", e.name, e.code]); } };`,
+    `const server = http.createServer((req, res) => {`,
+    `  const chunks = [];`,
+    `  req.on("data", (chunk) => chunks.push(chunk));`,
+    `  req.on("end", () => {`,
+    `    log.push(["request", req.method, req.url, req.httpVersion, ${rawHeaders ? "req.rawHeaders, req.headers" : "names.map((name) => req.headers[name.toLowerCase()])"}, Buffer.concat(chunks).toString("latin1"), req.complete, req.trailers]);`,
+    program.replace(/^/gm, "    "),
+    `  });`,
+    `});`,
+    `await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));`,
+    `const port = server.address().port;`,
+  ].join("\n");
+}
+
+/** A raw HTTP/1.x request, the last of an exchange if `last`. */
+function rawRequest(g, last) {
+  const method = g.pick(["GET", "GET", "POST", "PUT", "HEAD", "DELETE", "OPTIONS", "PATCH", "FOO", "get"]);
+  const path = g.pick(["/", "/a?b=1", "/%20x", "*", "http://example.com/x", "/a b"]);
+  const version = g.pick(["HTTP/1.1", "HTTP/1.1", "HTTP/1.1", "HTTP/1.0", "HTTP/2.0"]);
+  const lines = [`${method} ${path} ${version}`];
+  if (g.chance(0.9)) lines.push(`${g.pick(["Host", "host", "HOST"])}: localhost`);
+  for (let index = g.range(0, 3); index > 0; index--) lines.push(`${g.pick(HTTP_NAMES)}: ${g.pick(HTTP_VALUES.slice(0, 11))}`);
+  if (g.chance(0.1)) lines.push("Expect: 100-continue");
+  if (g.chance(0.05)) lines.push(g.pick(["Bad Header: x", "X-Bad: a\rb", ": empty", "X-Ctl: \u0007"]));
+  const body = g.chance(0.4) ? g.pick(["hello", "", "a=1&b=2", "é"]) : null;
+  let encoded = "";
+  if (body !== null) {
+    if (g.chance(0.5)) {
+      lines.push(`Content-Length: ${g.chance(0.9) ? Buffer.byteLength(body) : g.pick(["abc", "-1", "1, 2"])}`);
+      encoded = body;
+    } else {
+      lines.push(`Transfer-Encoding: ${g.pick(["chunked", "chunked", "gzip, chunked", "chunked, gzip"])}`);
+      const bytes = Buffer.from(body);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const size = Math.min(bytes.length - offset, g.range(1, 4));
+        encoded += `${size.toString(16)}${g.chance(0.2) ? ";ext=1" : ""}\r\n${bytes.subarray(offset, offset + size).toString("latin1")}\r\n`;
+        offset += size;
+      }
+      encoded += `0\r\n${g.chance(0.3) ? "X-Trailer: t\r\n" : ""}\r\n`;
+    }
+  }
+  if (last && version !== "HTTP/1.0") lines.push(g.pick(["Connection: close", "connection: Close"]));
+  if (!last && version === "HTTP/1.0") lines.push("Connection: keep-alive");
+  return `${lines.join("\r\n")}\r\n\r\n${encoded}`;
+}
+
+const httpGenerator = {
+  name: "http",
+  variants: {
+    // A request from `http.request` and the response the client receives. The client's
+    // `statusMessage` is left out, since the runtime's HTTP client reports the standard reason
+    // phrase, and so are the request headers the op didn't set, which the clients choose.
+    request: (g) => {
+      const method = g.pick(["GET", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]);
+      const headers = Object.fromEntries(
+        g.many(g.range(0, 3), () => [g.pick(HTTP_NAMES.filter((name) => !/cookie|authorization/i.test(name))), g.chance(0.2) ? [g.pick(ASCII_VALUES), g.pick(ASCII_VALUES)] : g.pick(ASCII_VALUES)]),
+      );
+      const path = g.pick(["/", "/path?x=1&y=2", "/%7Euser", "/?q=%20", "/a;b"]);
+      const body = ["POST", "PUT", "PATCH"].includes(method) ? g.pick([[], ["hello"], ["a", "b", "c"], ["é"]]) : [];
+      return [
+        `const names = ${g.lit(Object.keys(headers))};`,
+        httpServerSource(httpResponseProgram(g, false), false),
+        `const response = await new Promise((resolve) => {`,
+        `  const req = http.request({ host: "127.0.0.1", port, method: ${g.lit(method)}, path: ${g.lit(path)}, headers: ${g.lit(headers)} }, (res) => {`,
+        `    const chunks = [];`,
+        `    res.on("data", (chunk) => chunks.push(chunk));`,
+        `    res.on("end", () => resolve([res.statusCode, Object.entries(res.headers).filter(([name]) => name !== "date").sort(), Buffer.concat(chunks).toString("latin1")]));`,
+        `    res.on("error", (e) => resolve(["response error", e.code]));`,
+        `  });`,
+        `  req.on("error", (e) => resolve(["request error", e.code]));`,
+        ...body.slice(0, -1).map((chunk) => `  req.write(${g.lit(chunk)});`),
+        `  req.end(${body.length ? g.lit(body[body.length - 1]) : ""});`,
+        `});`,
+        `server.closeAllConnections();`,
+        `server.close();`,
+        `for (const [label, ...values] of log) __log(label, ...values);`,
+        `__log("client", ...response);`,
+      ].join("\n");
+    },
+    // Raw requests over a `net` socket, and the bytes the server sends back until it closes the
+    // connection, with the `Date` header's value masked.
+    raw: (g) => {
+      const count = g.chance(0.25) ? 2 : 1;
+      const requests = Array.from({ length: count }, (_, index) => rawRequest(g, index === count - 1));
+      const clientError = g.chance(0.5);
+      return [
+        httpServerSource(httpResponseProgram(g, true), true),
+        clientError
+          ? `server.on("clientError", (e, socket) => { log.push(["clientError", e.code, e.bytesParsed], ["clientError socket", socket.writable]); socket.end("HTTP/1.1 400 Custom\\r\\n\\r\\n"); });`
+          : ``,
+        `const net = require("node:net");`,
+        `const bytes = await new Promise((resolve) => {`,
+        `  const socket = net.connect(port, "127.0.0.1", () => socket.write(${g.lit(requests.join(""))}));`,
+        `  const chunks = [];`,
+        `  const timer = setTimeout(() => { chunks.push(Buffer.from("(open)")); socket.destroy(); }, 1000);`,
+        `  socket.on("data", (chunk) => chunks.push(chunk));`,
+        `  socket.on("error", () => {});`,
+        `  socket.on("close", () => { clearTimeout(timer); resolve(Buffer.concat(chunks).toString("latin1").replace(/Date: [^\\r]*\\r\\n/g, "Date: -\\r\\n")); });`,
+        `});`,
+        `server.close();`,
+        `for (const [label, ...values] of log) __log(label, ...values);`,
+        `__log("bytes", bytes);`,
+      ].join("\n");
+    },
+  },
+};
+
 export const GENERATORS = [
   buffer, stringDecoder, path, querystring, crypto, events, stream, fsGenerator, zlib, util, assert, url, timers, punycode, os,
-  processGenerator, shape, stackTrace,
+  processGenerator, shape, stackTrace, testRunner, netGenerator, httpGenerator,
 ];
 
 /** An operation drawn from a random variant of `generator` with `g`. */

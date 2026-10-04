@@ -75,7 +75,10 @@ pub(crate) fn is_implemented(name: &str) -> bool {
 }
 
 /// The `default` export of builtin module `name`.
-fn module_default<'s>(scope: &'s Scope<'_>, name: &str) -> Result<Object<'s>, ExnThrown> {
+pub(crate) fn module_default<'s>(
+    scope: &'s Scope<'_>,
+    name: &str,
+) -> Result<Object<'s>, ExnThrown> {
     let namespace = core_runtime::module::builtin_namespace(scope, name)?.ok_or_else(|| {
         js::error::TypeError(format!("{name} is not a builtin module")).throw(scope)
     })?;

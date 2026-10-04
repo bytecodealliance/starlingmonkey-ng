@@ -386,7 +386,7 @@ fn take_all<'s>(
     name: &'static std::ffi::CStr,
 ) -> Result<Vec<HandleValue<'s>>, ExnThrown> {
     let values = elements(scope, state.get_property(scope, name)?)?;
-    state.set_property(
+    state.set_property_by_name(
         scope,
         name,
         *js::Array::with_contents(scope, &[] as &[Value])?,

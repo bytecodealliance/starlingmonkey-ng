@@ -1,6 +1,6 @@
 // `node:buffer` and the `Buffer` global.
 
-import { Buffer as BufferExport, constants, kMaxLength, isUtf8, isAscii, atob } from "node:buffer";
+import { Blob as BlobExport, Buffer as BufferExport, File as FileExport, constants, kMaxLength, isUtf8, isAscii, atob } from "node:buffer";
 import bufferModule from "buffer";
 import { deepEq, eq, throws } from "./harness.mjs";
 
@@ -122,3 +122,24 @@ eq(Object.keys(Buffer.prototype).includes("readUInt8"), true, "prototype methods
 eq(Object.keys(Buffer.prototype).includes("constructor"), false, "constructor isn't");
 deepEq([...Buffer.of(1, 2, 257)], [1, 2, 1], "Buffer.of");
 eq(Buffer.from("ab").inspect(), "<Buffer 61 62>", "inspect");
+
+// `Blob` and `File` are the globals, which Koa checks response bodies against.
+eq(BlobExport, globalThis.Blob, "Blob is the global's");
+eq(FileExport, globalThis.File, "File is the global's");
+{
+  const blob = new Blob(["ab", Buffer.from("cd"), new Blob(["e"])], { type: "Text/Plain" });
+  eq(blob.size, 5, "Blob size");
+  eq(blob.type, "text/plain", "Blob type");
+  eq(await blob.text(), "abcde", "Blob text");
+  eq(await blob.slice(1, -1).text(), "bcd", "Blob slice");
+  eq(Buffer.from(await blob.arrayBuffer()).toString(), "abcde", "Blob arrayBuffer");
+  const chunks = [];
+  for await (const chunk of blob.stream()) chunks.push(Buffer.from(chunk));
+  eq(Buffer.concat(chunks).toString(), "abcde", "Blob stream");
+  const file = new File([blob], "name.txt", { lastModified: 42 });
+  eq(file instanceof Blob, true, "File extends Blob");
+  eq(`${file.name} ${file.size} ${file.lastModified}`, "name.txt 5 42", "File attributes");
+  const response = new Response(blob);
+  eq(response.headers.get("content-type"), "text/plain", "a Blob body's content type");
+  eq(await response.text(), "abcde", "a Blob body");
+}

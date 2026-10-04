@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 //
 // Runs Node.js's own tests from test/parallel against StarlingMonkey's `--node-compat` mode, and
-// compares the results with tests/node-harness/expectations.json.
+// compares the results with tests/node-harness/expectations.json. Tests run with
+// `--node-http-listen`, so their HTTP servers accept connections.
 //
 // The tests come from a sparse clone of Node.js at the tag scripts/clone-node-tests.sh pins. Each
 // test runs as its own process with Node's unmodified test/common, and passes if it exits with
@@ -13,10 +14,12 @@
 //
 // Options:
 //   --node-root=PATH        The Node.js clone (default: deps/node)
-//   --target=native|wasm    Execution target (default: native)
-//   --runtime=PATH          The starlingmonkey binary, or starling.wasm for --target=wasm
-//                           (default: target/debug/starlingmonkey, or
-//                           target/wasm32-wasip3/release/starling.wasm for --target=wasm)
+//   --target=TARGET         Execution target: native, wasm, or deno or bun for comparison runs
+//                           (default: native)
+//   --runtime=PATH          The starlingmonkey binary, starling.wasm for --target=wasm, or the
+//                           deno or bun binary (default: target/debug/starlingmonkey,
+//                           target/wasm32-wasip3/release/starling.wasm, deps/deno-bin/deno or
+//                           deps/bun-bin/bun)
 //   --timeout=MS            Per-test timeout (default: 30000)
 //   -j N                    Tests run at once (default: the number of CPUs)
 //   --update-expectations   Record the current results as the expectations
@@ -24,14 +27,21 @@
 //                           excerpt to FILE, for tests/node-harness/report.mjs
 //   -v                      Print the output of failing tests
 //
-// tests.txt lists the tests to run, as file name globs. Tests whose source shows that they need
-// something the runtime can't provide are skipped without running, with the reason recorded:
-// runtime flags (`// Flags:`), child processes, workers, `cluster`, `inspector` or Node.js
-// internals.
+// tests.txt lists the tests to run, as file name globs, and the tests to leave out, as globs with a
+// leading `!`. Tests whose source shows that they need something the runtime can't provide are
+// skipped without running, with the reason recorded: runtime flags the runtime rejects, child
+// processes, workers, `cluster` or `inspector`. The runtime gets the other flags of a test's
+// `// Flags:` line with `--allow-node-runtime-flags`.
 //
-// expectations.json maps each test to `{ "status": "PASS" | "FAIL" | "SKIP" }`, with
-// `wasm_status` where the wasm target's result differs. The run exits with status 1 if a test
-// expected to pass fails or skips, and with status 2 if no test was selected.
+// `--target=deno` and `--target=bun` run the tests under Deno or Bun, as
+// scripts/fetch-other-runtimes.sh downloads them, without the tests' runtime flags. These runs are
+// not compared with expectations.json and can't update it. Their `--json` output gives
+// tests/node-harness/report.mjs the tests those runtimes pass.
+//
+// expectations.json maps each test to `{ "status": "PASS" | "FAIL" | "SKIP" | "FLAKY" }`, with
+// `wasm_status` where the wasm target's result differs. `FLAKY` marks a test whose result varies
+// between runs: its result is neither compared nor recorded. The run exits with status 1 if a
+// test expected to pass fails or skips, and with status 2 if no test was selected.
 
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -49,14 +59,63 @@ const TEMP_ROOT = "/tmp";
 
 /** The reasons to skip a test without running it, by a pattern its source matches. */
 const SKIP_PATTERNS = [
-  [/^\/\/ Flags:/m, "needs runtime flags"],
   [/require\(['"](node:)?child_process['"]\)/, "spawns child processes"],
   [/require\(['"](node:)?cluster['"]\)/, "uses cluster"],
   [/new Worker\(|require\(['"](node:)?worker_threads['"]\)/, "uses worker threads"],
   [/require\(['"](node:)?inspector(\/promises)?['"]\)/, "uses the inspector"],
-  [/require\(['"]internal\//, "uses Node.js internals"],
   [/common\.spawnPromisified|common\.childShouldThrowAndAbort|spawnSyncAndExit/, "spawns child processes"],
 ];
+
+/**
+ * The Node.js runtime flags the runtime rejects, by name with dashes. A test whose `// Flags:`
+ * line has one is skipped. The runtime gets the other flags with `--allow-node-runtime-flags`.
+ * `REJECTED` in `crates/builtins/node/src/runtime_flags.rs` lists the same flags.
+ */
+const UNSUPPORTED_FLAGS = [
+  "allow-natives-syntax",
+  "expose-externalize-string",
+  "permission",
+  "allow-fs-read",
+  "allow-fs-write",
+  "allow-child-process",
+  "allow-worker",
+  "allow-addons",
+  "allow-wasi",
+];
+
+/** The flags of the `// Flags:` line in `source`, as test/common reads them. */
+function testFlags(source) {
+  const match = /\/\/ Flags:\s+(--.*)$/m.exec(source);
+  return match ? match[1].split(/\s+/).filter(Boolean) : [];
+}
+
+/** The name of runtime flag `flag`, without leading dashes or a value, and with dashes. */
+function flagName(flag) {
+  return flag.replace(/^-+/, "").split("=")[0].replaceAll("_", "-");
+}
+
+/** The runtime arguments that pass the `// Flags:` of `file` to the runtime. */
+function flagArgs(config, file) {
+  const flags = testFlags(readFileSync(path.join(config.nodeRoot, "test/parallel", file), "utf8"));
+  return flags.length > 0 ? ["--allow-node-runtime-flags", ...flags] : [];
+}
+
+/** The comparison targets: each runtime's default binary and its arguments before the test. */
+const OTHER_RUNTIMES = {
+  deno: {
+    runtime: "deps/deno-bin/deno",
+    args: [
+      "run",
+      "-A",
+      "--quiet",
+      "--unstable-detect-cjs",
+      "--unstable-bare-node-builtins",
+      "--unstable-node-globals",
+      "--unstable-unsafe-proto",
+    ],
+  },
+  bun: { runtime: "deps/bun-bin/bun", args: [] },
+};
 
 function parseArgs(argv) {
   const config = {
@@ -89,8 +148,13 @@ function parseArgs(argv) {
   }
   config.runtime ??= path.join(
     REPO_ROOT,
-    config.target === "wasm" ? "target/wasm32-wasip3/release/starling.wasm" : "target/debug/starlingmonkey",
+    OTHER_RUNTIMES[config.target]?.runtime ??
+      (config.target === "wasm" ? "target/wasm32-wasip3/release/starling.wasm" : "target/debug/starlingmonkey"),
   );
+  if (config.update && OTHER_RUNTIMES[config.target]) {
+    console.error(`--update-expectations can't be used with --target=${config.target}`);
+    process.exit(2);
+  }
   return config;
 }
 
@@ -99,15 +163,22 @@ function globToRegExp(glob) {
   return new RegExp(`^${glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
 }
 
-/** The tests tests.txt selects that match one of `patterns`, or all of them without patterns. */
+/**
+ * The tests tests.txt selects that match one of `patterns`, or all of them without patterns. A
+ * test is selected if it matches a glob line and no `!` glob line.
+ */
 function selectTests(config) {
-  const globs = readFileSync(TESTS_FILE, "utf8")
+  const lines = readFileSync(TESTS_FILE, "utf8")
     .split("\n")
     .map((line) => line.replace(/#.*/, "").trim())
-    .filter(Boolean)
-    .map(globToRegExp);
+    .filter(Boolean);
+  const included = lines.filter((line) => !line.startsWith("!")).map(globToRegExp);
+  const excluded = lines.filter((line) => line.startsWith("!")).map((line) => globToRegExp(line.slice(1)));
   const files = readdirSync(path.join(config.nodeRoot, "test/parallel")).filter(
-    (file) => /\.(js|mjs|cjs)$/.test(file) && globs.some((glob) => glob.test(file)),
+    (file) =>
+      /\.(js|mjs|cjs)$/.test(file) &&
+      included.some((glob) => glob.test(file)) &&
+      !excluded.some((glob) => glob.test(file)),
   );
   return files
     .filter((file) => config.patterns.length === 0 || config.patterns.some((pattern) => file.includes(pattern)))
@@ -117,6 +188,8 @@ function selectTests(config) {
 /** The reason to skip `file` without running it, or `null`. */
 function skipReason(config, file) {
   const source = readFileSync(path.join(config.nodeRoot, "test/parallel", file), "utf8");
+  const unsupported = testFlags(source).find((flag) => UNSUPPORTED_FLAGS.includes(flagName(flag)));
+  if (unsupported) return `needs the unsupported runtime flag ${unsupported}`;
   for (const [pattern, reason] of SKIP_PATTERNS) {
     if (pattern.test(source)) return reason;
   }
@@ -126,8 +199,16 @@ function skipReason(config, file) {
 /** The command and arguments that run `file` on the configured target, with `env`. */
 function command(config, file, env) {
   const testPath = path.join(config.nodeRoot, "test/parallel", file);
+  const other = OTHER_RUNTIMES[config.target];
+  if (other) {
+    return { command: config.runtime, args: [...other.args, testPath], env: { ...process.env, ...env } };
+  }
   if (config.target !== "wasm") {
-    return { command: config.runtime, args: ["--node-compat", testPath], env: { ...process.env, ...env } };
+    return {
+      command: config.runtime,
+      args: ["--node-compat", "--node-http-listen", ...flagArgs(config, file), testPath],
+      env: { ...process.env, ...env },
+    };
   }
   // wasmtime maps the repository to the guest's root and the temporary directory to itself, so
   // guest paths are the repository-relative ones.
@@ -143,6 +224,8 @@ function command(config, file, env) {
       ...Object.entries(env).map(([name, value]) => `--env=${name}=${value}`),
       config.runtime,
       "--node-compat",
+      "--node-http-listen",
+      ...flagArgs(config, file),
       guest(testPath),
     ],
     env: process.env,
@@ -217,7 +300,8 @@ async function main() {
     process.exit(2);
   }
   if (config.target === "wasm") execFileSync("wasmtime", ["--version"]);
-  const expectations = existsSync(EXPECTATIONS_FILE) ? JSON.parse(readFileSync(EXPECTATIONS_FILE, "utf8")) : {};
+  const compared = !OTHER_RUNTIMES[config.target];
+  const expectations = compared && existsSync(EXPECTATIONS_FILE) ? JSON.parse(readFileSync(EXPECTATIONS_FILE, "utf8")) : {};
   const tests = selectTests(config);
   const results = new Map();
   const queue = [...tests];
@@ -231,8 +315,14 @@ async function main() {
       results.set(file, result);
       const expected = expectedStatus(config, expectations, file);
       const marker =
-        expected === undefined ? "?" : expected === result.status ? " " : result.status === "PASS" ? "+" : "-";
-      if (marker !== " " || config.verbose) {
+        expected === undefined
+          ? "?"
+          : expected === result.status || expected === "FLAKY"
+            ? " "
+            : result.status === "PASS"
+              ? "+"
+              : "-";
+      if ((compared && marker !== " ") || config.verbose) {
         console.log(`${marker} ${result.status.padEnd(4)} ${file}${result.reason ? ` (${result.reason})` : ""}`);
       }
       if (config.verbose && result.status === "FAIL") {
@@ -254,6 +344,7 @@ async function main() {
     const { status } = results.get(file);
     counts[status]++;
     const expected = expectedStatus(config, expectations, file);
+    if (expected === "FLAKY") continue;
     if (expected === undefined) unexpected.push(`${file} (${status}, no expectation)`);
     else if (expected === "PASS" && status !== "PASS") regressions.push(`${file} (${status})`);
     else if (expected !== "PASS" && status === "PASS") improvements.push(file);
@@ -261,6 +352,7 @@ async function main() {
 
   if (config.update) {
     for (const file of tests) {
+      if (expectedStatus(config, expectations, file) === "FLAKY") continue;
       const { status, reason } = results.get(file);
       const entry = { ...(expectations[file] ?? {}) };
       if (config.target === "wasm") {
@@ -307,7 +399,7 @@ async function main() {
     `\n${counts.PASS} passed, ${counts.FAIL} failed, ${counts.SKIP} skipped of ${tests.length} tests ` +
       `(${config.target}, ${seconds}s): ${improvements.length} newly passing, ${regressions.length} regressed`,
   );
-  if (unexpected.length > 0 && !config.update) {
+  if (compared && unexpected.length > 0 && !config.update) {
     console.log(`Without expectations:\n${unexpected.map((file) => `  ${file}`).join("\n")}`);
   }
   if (regressions.length > 0) {

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title><%= title %> | Notes</title>
+  <link rel="stylesheet" href="<%= base %>/static/css/site.css">
+</head>
+<body>
+  <nav>
+    <a href="<%= base %>/">Home</a>
+    <% if (user) { %>
+      Signed in as <strong><%= user.name %></strong>
+      <form method="post" action="<%= base %>/logout"><button>Log out</button></form>
+    <% } else { %>
+      <a href="<%= base %>/login">Log in</a>
+    <% } %>
+  </nav>
+  <% for (const f of flash) { %>
+    <p class="flash <%= f.type %>"><%= f.message %></p>
+  <% } %>

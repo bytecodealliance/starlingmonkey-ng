@@ -69,9 +69,8 @@ fn on_line(scope: &Scope<'_>, interface: Object<'_>, line: &str) -> Result<(), E
     Ok(())
 }
 
-/// Add `text` to the line being read, and handle each line it completes, including the lines after
-/// one that closes the interface, as in Node.js. A `\r` that ends one piece of text and a `\n` that
-/// starts the next end a single line.
+/// Add `text` to the line being read, and handle each line it completes. A `\r` that ends one
+/// piece of text and a `\n` that starts the next end a single line.
 fn feed(scope: &Scope<'_>, interface: Object<'_>, text: &str) -> Result<(), ExnThrown> {
     let mut buffer =
         String::from_jsval(scope, interface.val(scope, c"line")?, ()).unwrap_or_default();
@@ -98,6 +97,9 @@ fn feed(scope: &Scope<'_>, interface: Object<'_>, text: &str) -> Result<(), ExnT
     interface.set_property(scope, c"line", rest)?;
     for line in lines {
         on_line(scope, interface, line)?;
+        if interface.flag(scope, c"closed")? {
+            return Ok(());
+        }
     }
     Ok(())
 }

@@ -14,6 +14,7 @@ use js::prelude::HandleValue;
 use js::Object;
 
 use crate::errors::{validate_object, validate_string, Thrown};
+use crate::glob::{platform_nocase, Glob, GlobOptions};
 
 /// Normalize `path`, resolving `.` and `..` segments. `..` segments above the start are kept if
 /// `allow_above_root`, and dropped otherwise.
@@ -476,6 +477,23 @@ pub mod path {
             Some(dir) if Some(&dir) == root.as_ref() => format!("{dir}{base}"),
             Some(dir) => format!("{dir}/{base}"),
         })
+    }
+
+    /// <https://nodejs.org/api/path.html#pathmatchesglobpath-pattern>: whether `path` matches the
+    /// glob `pattern`. Segments with magic match case-insensitively on macOS and Windows.
+    pub fn matches_glob(
+        scope: &Scope<'_>,
+        path: HandleValue<'_>,
+        pattern: HandleValue<'_>,
+    ) -> Result<bool, Thrown> {
+        let path = validate_string(scope, path, "path")?;
+        let pattern = validate_string(scope, pattern, "pattern")?;
+        let options = GlobOptions {
+            nocase: platform_nocase(),
+            nocase_magic_only: true,
+            match_base: false,
+        };
+        Ok(Glob::new(scope, &pattern, options)?.matches(scope, &path)?)
     }
 
     /// <https://nodejs.org/api/path.html#pathparsepath>

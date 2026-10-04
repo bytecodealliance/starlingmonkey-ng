@@ -372,6 +372,28 @@ pub(crate) fn eos<'s>(
     options: Option<HandleValue<'_>>,
     callback: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, Thrown> {
+    eos_impl(scope, stream, options, callback, false)
+}
+
+/// [`eos`] with Node's `kEosNodeSynchronousCallback` option: a result known when it is called
+/// is passed to the callback, with `this` the stream, before it returns instead of in a tick.
+pub(crate) fn eos_synchronous<'s>(
+    scope: &'s Scope<'_>,
+    stream: HandleValue<'_>,
+    options: Option<HandleValue<'_>>,
+    callback: HandleValue<'_>,
+) -> Result<HandleValue<'s>, Thrown> {
+    eos_impl(scope, stream, options, callback, true)
+}
+
+/// The body of [`eos`] and [`eos_synchronous`].
+fn eos_impl<'s>(
+    scope: &'s Scope<'_>,
+    stream: HandleValue<'_>,
+    options: Option<HandleValue<'_>>,
+    callback: HandleValue<'_>,
+    synchronous: bool,
+) -> Result<HandleValue<'s>, Thrown> {
     use captures::*;
     let options = match options.filter(|options| !options.is_null() && !options.is_undefined()) {
         Some(options) => Some(validate_object(scope, options, "options")?),
@@ -487,9 +509,14 @@ pub(crate) fn eos<'s>(
         Some(context) => context.to_jsval_throwing(scope)?,
         None => HandleValue::undefined(),
     };
+    let cleanup = closure(scope, 0, cleanup, &[state_value.get()])?;
+    if let Some(error) = immediate.filter(|_| synchronous) {
+        state.set(CALLBACK, callback)?;
+        complete_with(scope, &state, error)?;
+        return Ok(cleanup.to_jsval_throwing(scope)?);
+    }
     let callback = closure(scope, 0, bound_callback, &[callback.get(), context.get()])?;
     state.set(CALLBACK, callback)?;
-    let cleanup = closure(scope, 0, cleanup, &[state_value.get()])?;
     if let Some(error) = immediate {
         next_tick(
             scope,

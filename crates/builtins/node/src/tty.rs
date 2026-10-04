@@ -387,7 +387,8 @@ pub mod module {
     pub use super::read_stream_class as ReadStream;
 
     /// <https://nodejs.org/api/tty.html#ttyisattyfd>: whether `fd` is a standard stream connected
-    /// to a terminal. Other file descriptors are never terminals.
+    /// to a terminal. Other file descriptors are never terminals, and values that aren't numbers
+    /// are `false` without being converted.
     pub fn isatty(fd: Option<js::prelude::HandleValue<'_>>) -> bool {
         fd.filter(|fd| fd.is_number())
             .is_some_and(|fd| super::is_terminal(fd.to_number()))

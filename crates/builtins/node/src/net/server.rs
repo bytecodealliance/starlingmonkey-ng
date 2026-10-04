@@ -99,9 +99,37 @@ fn drop_connection(
     Ok(())
 }
 
+/// Whether the `check` method of the `blockList` of `server` returns a truthy value for the peer
+/// address of `socket`.
+fn blocked(scope: &Scope<'_>, server: Object<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
+    let Some(block_list) = server.obj(scope, c"blockList")? else {
+        return Ok(false);
+    };
+    let address = socket.val(scope, c"remoteAddress")?;
+    let text = match address.is_string() {
+        true => String::from_jsval_throwing(scope, address, ())?,
+        false => return Ok(false),
+    };
+    let family = if super::is_ipv4(&text) {
+        "ipv4"
+    } else if super::is_ipv6(&text) {
+        "ipv6"
+    } else {
+        return Ok(false);
+    };
+    let blocked = call_method(
+        scope,
+        block_list,
+        c"check",
+        &[address, string(scope, family)?],
+    )?;
+    Ok(truthy(scope, blocked))
+}
+
 /// The fulfillment reaction of an accept, whose captures are `[server]`: emit `connection` with
 /// the connected socket, or `drop` once `maxConnections` connections are open, and accept the
-/// next connection. A cancelled accept is fulfilled with `undefined`.
+/// next connection. A connection whose peer `blockList` blocks is closed without an event. A
+/// cancelled accept is fulfilled with `undefined`.
 fn on_accept(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -115,6 +143,10 @@ fn on_accept(
     let max = server.val(scope, c"maxConnections")?;
     if max.is_number() && connections >= max.to_number() {
         drop_connection(scope, server, socket)?;
+        return accept(scope, server);
+    }
+    if blocked(scope, server, socket)? {
+        release(scope, socket)?;
         return accept(scope, server);
     }
     if server.flag(scope, c"pauseOnConnect")? {
@@ -332,7 +364,8 @@ pub mod server_class {
 
     /// <https://nodejs.org/api/net.html#class-netserver>: a server whose `connection` events go
     /// to `listener`. Of the options, `allowHalfOpen` and `pauseOnConnect` apply to the accepted
-    /// sockets, and `noDelay` and `keepAlive` have no effect.
+    /// sockets, `blockList` closes connections from the peers it blocks, and `noDelay` and
+    /// `keepAlive` have no effect.
     #[constructor]
     pub fn init(
         scope: &Scope<'_>,
@@ -383,6 +416,17 @@ pub mod server_class {
                 None => false,
             };
             this.set_property(scope, name, value)?;
+        }
+        if let Some(options) = options {
+            let block_list = options.val(scope, c"blockList")?;
+            if truthy(scope, block_list) {
+                super::super::blocklist::validate_block_list(
+                    scope,
+                    block_list,
+                    "options.blockList",
+                )?;
+                this.set_property(scope, c"blockList", block_list)?;
+            }
         }
         Ok(())
     }

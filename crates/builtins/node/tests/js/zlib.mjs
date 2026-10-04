@@ -27,6 +27,8 @@ const fixtures = {
   deflate: "eJzLSM3JyVfIQCLL84tyUgBofQjF",
   gzip: "H4sIAAAAAAAAE8tIzcnJV8hAIsvzi3JSACbmWoEXAAAA",
   raw: "y0jNyclXyEAiy/OLclIA",
+  brotli: "GxYA+I2Ubt5EVYaWbCBvNUg8dUAJiSM=",
+  zstd: "KLUv/SAXjQAAWGhlbGxvIHdvcmxkAQDhShE=",
 };
 const fixture = (name) => Buffer.from(fixtures[name], "base64");
 
@@ -65,6 +67,52 @@ eq(failure(() => inflateRawSync(Buffer.from([0xff, 0xff]))), "Error Z_DATA_ERROR
 eq(failure(() => gunzipSync(Buffer.concat([gzipSync("ab"), Buffer.from("junk")]))), "Error Z_DATA_ERROR -3 incorrect header check", "non-zero bytes after a member start another");
 throws(() => deflateSync(5), "ERR_INVALID_ARG_TYPE", "input type");
 throws(() => deflate("x"), "ERR_INVALID_ARG_TYPE", "callback functions need a callback");
+
+// Brotli and zstd.
+eq(zlib.brotliDecompressSync(fixture("brotli")).toString(), text, "decompress Node's Brotli output");
+eq(zlib.zstdDecompressSync(fixture("zstd")).toString(), text, "decompress Node's zstd output");
+eq(zlib.brotliDecompressSync(zlib.brotliCompressSync(large)).equals(large), true, "Brotli round trip");
+eq(zlib.zstdDecompressSync(zlib.zstdCompressSync(large)).equals(large), true, "zstd round trip");
+const quality = (q) => zlib.brotliCompressSync(large, { params: { [constants.BROTLI_PARAM_QUALITY]: q } }).length;
+eq(quality(9) < quality(0), true, "BROTLI_PARAM_QUALITY selects the quality");
+eq(zlib.zstdCompressSync("").subarray(0, 4).toString("hex"), "28b52ffd", "an empty input is one zstd frame");
+eq(zlib.zstdDecompressSync(Buffer.concat([fixture("zstd"), fixture("zstd")])).toString(), text, "zstd decompresses the first frame");
+eq(zlib.brotliDecompressSync(Buffer.concat([fixture("brotli"), Buffer.from("xx")])).toString(), text, "bytes after a Brotli stream are ignored");
+eq(failure(() => zlib.brotliDecompressSync(Buffer.from("garbage data here"))).startsWith("Error ERR__ERROR_FORMAT_"), true, "Brotli errors");
+eq(failure(() => zlib.zstdDecompressSync(Buffer.from("garbage data here"))), "Error ZSTD_error_prefix_unknown 10 Unknown frame descriptor", "zstd errors");
+eq(failure(() => zlib.brotliDecompressSync(fixture("brotli").subarray(0, 10))), "Error Z_BUF_ERROR -5 unexpected end of file", "truncated Brotli input");
+eq(failure(() => zlib.zstdDecompressSync(fixture("zstd").subarray(0, 10))), "Error Z_BUF_ERROR -5 unexpected end of file", "truncated zstd input");
+throws(() => zlib.createBrotliCompress({ params: { 99: 1 } }), "ERR_BROTLI_INVALID_PARAM", "Brotli parameter keys");
+throws(() => zlib.createBrotliCompress({ params: { 1: "x" } }), "ERR_INVALID_ARG_TYPE", "Brotli parameter values");
+throws(() => zlib.createZstdCompress({ params: { 999: 1 } }), "ERR_ZSTD_INVALID_PARAM", "zstd parameter keys");
+throws(() => zlib.createZstdCompress({ params: { 99: 1 } }), "ERR_ZLIB_INITIALIZATION_FAILED", "unknown zstd parameters");
+throws(() => zlib.createBrotliCompress({ flush: 4 }), "ERR_OUT_OF_RANGE", "Brotli flush range");
+{
+  const [error, result] = await new Promise((resolve) => zlib.brotliCompress(text, (...args) => resolve(args)));
+  eq(error, null, "brotliCompress succeeds");
+  eq(zlib.brotliDecompressSync(result).toString(), text, "brotliCompress output");
+  const brotli = zlib.createBrotliCompress();
+  eq(brotli instanceof zlib.BrotliCompress && brotli instanceof Transform, true, "Brotli streams are Transforms");
+  const parts = [];
+  brotli.on("data", (chunk) => parts.push(chunk));
+  brotli.write("part one ");
+  await new Promise((resolve) => brotli.flush(resolve));
+  const flushed = zlib.brotliDecompressSync(Buffer.concat(parts), { finishFlush: constants.BROTLI_OPERATION_FLUSH });
+  eq(flushed.toString(), "part one ", "a Brotli flush makes the input so far decompressible");
+  brotli.end("part two");
+  await new Promise((resolve) => brotli.on("end", resolve));
+  eq(zlib.brotliDecompressSync(Buffer.concat(parts)).toString(), "part one part two", "Brotli stream output");
+  const piped = zlib.createZstdCompress();
+  const back = zlib.createZstdDecompress();
+  const backChunks = [];
+  back.on("data", (chunk) => backChunks.push(chunk));
+  const done = new Promise((resolve) => back.on("end", resolve));
+  piped.pipe(back);
+  piped.write("zstd ");
+  piped.end("stream");
+  await done;
+  eq(Buffer.concat(backChunks).toString(), "zstd stream", "zstd streams");
+}
 
 eq(crc32("hello"), 907060870, "crc32");
 eq(crc32("world", crc32("hello ")), crc32("hello world"), "crc32 continues from a value");

@@ -15,6 +15,7 @@ use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{validate_string, ErrorKind, NodeError, Thrown};
+use crate::process::{called_from_node_modules, deprecation_warning};
 
 /// The protocols whose URLs always have `//` before the host.
 const SLASHED_PROTOCOLS: &[&str] = &[
@@ -904,34 +905,6 @@ impl LegacyUrl {
             self.host = host;
         }
     }
-}
-
-/// Emit the deprecation warning `code` with `message` through `process.emitWarning`.
-fn deprecation_warning(scope: &Scope<'_>, message: &str, code: &str) -> Result<(), ExnThrown> {
-    let process = scope.global().get_property(scope, c"process")?;
-    let Ok(process) = Object::from_value(scope, process) else {
-        return Ok(());
-    };
-    let emit = process.get_property(scope, c"emitWarning")?;
-    if Object::from_value(scope, emit).is_ok_and(|emit| emit.is_callable()) {
-        Function::call(scope, process, emit, &[message, "DeprecationWarning", code])?;
-    }
-    Ok(())
-}
-
-/// Whether the innermost frame of the JS stack is in a `node_modules` directory.
-fn called_from_node_modules(scope: &Scope<'_>) -> Result<bool, Thrown> {
-    let error_class = scope.global().get_property(scope, c"Error")?;
-    let Ok(error_class) = Object::from_value(scope, error_class) else {
-        return Ok(false);
-    };
-    let error = Function::construct(scope, error_class, js::function::EmptyArgs)?;
-    let stack =
-        String::from_jsval(scope, error.get_property(scope, c"stack")?, ()).unwrap_or_default();
-    Ok(stack
-        .lines()
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| line.contains("/node_modules/")))
 }
 
 /// `Url.prototype.parse` of `input`. DEP0170 is emitted once per instance for an invalid port.

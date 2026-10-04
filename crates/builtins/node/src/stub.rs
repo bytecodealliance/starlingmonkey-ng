@@ -15,6 +15,7 @@ use js::prelude::HandleValue;
 use js::Object;
 
 use crate::errors::NodeError;
+use crate::stream::Props;
 
 /// The kind of value a builtin module exports under a name, as `exports_table` records it.
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +32,11 @@ pub(crate) enum ExportKind {
     Bool(bool),
     /// `undefined`.
     Undefined,
+    /// `null`.
+    Null,
+    /// A symbol with this description. The stub is a new symbol. Only the modules that exist with
+    /// a runtime flag record symbols as such.
+    Symbol(&'static str),
     /// Any other object. The stub is an empty object.
     Object,
 }
@@ -41,27 +47,61 @@ pub(crate) type ModuleExports = &'static [(&'static str, ExportKind)];
 /// A builtin module's name, the other specifiers that import it, and its exports.
 pub(crate) type BuiltinEntry = (&'static str, &'static [&'static str], ModuleExports);
 
-/// The exports of builtin module `name`, or `None` for a name that isn't one.
+/// A builtin module that only exists with a runtime flag: its name, the other specifiers that
+/// import it, the kind of its value, and its exports.
+pub(crate) type FlaggedEntry = (
+    &'static str,
+    &'static [&'static str],
+    ExportKind,
+    ModuleExports,
+);
+
+/// The exports of builtin module `name`, including the modules that only exist with a runtime
+/// flag, or `None` for a name that isn't one.
 pub(crate) fn exports_of(name: &str) -> Option<ModuleExports> {
-    crate::exports_table::BUILTIN_EXPORTS
+    let builtin = crate::exports_table::BUILTIN_EXPORTS
         .binary_search_by(|(module, _, _)| (*module).cmp(name))
         .ok()
-        .map(|index| crate::exports_table::BUILTIN_EXPORTS[index].2)
+        .map(|index| crate::exports_table::BUILTIN_EXPORTS[index].2);
+    builtin.or_else(|| flagged_entry(name).map(|entry| entry.3))
+}
+
+/// The entry of `name` among the builtin modules that only exist with a runtime flag.
+pub(crate) fn flagged_entry(name: &str) -> Option<&'static FlaggedEntry> {
+    crate::exports_table::FLAGGED_EXPORTS
+        .binary_search_by(|(module, _, _, _)| (*module).cmp(name))
+        .ok()
+        .map(|index| &crate::exports_table::FLAGGED_EXPORTS[index])
 }
 
 /// Register the stub of builtin module `name` under that name: its named exports, and a
-/// `default` export holding them all.
+/// `default` export holding them all. An export takes the value of the global of the same name
+/// where one is defined, such as `stream/web`'s classes and `perf_hooks.performance`. `console`'s
+/// exports are the global `console`'s properties, and its default export is `console` itself.
 pub(crate) fn register_stub(scope: &Scope<'_>, name: &'static str) -> bool {
     create_stub(scope, name).is_ok()
 }
 
 fn create_stub(scope: &Scope<'_>, name: &'static str) -> Result<(), ExnThrown> {
     let exports = exports_of(name).unwrap_or_default();
-    let namespace = Object::new_plain(scope)?;
+    let global = scope.global();
+    let console = match name {
+        "node:console" => global.obj(scope, c"console")?,
+        _ => None,
+    };
+    let namespace = console.map_or_else(|| Object::new_plain(scope), Ok)?;
     let mut values = Vec::with_capacity(exports.len() + 1);
     for &(export, kind) in exports {
-        let value = stub_value(scope, name, export, kind)?;
         let c_export = CString::new(export).map_err(|_| ExnThrown)?;
+        let existing = match console {
+            Some(console) => console.get_property_by_name(scope, &c_export)?,
+            None => global.get_property_by_name(scope, &c_export)?,
+        };
+        let value = if existing.is_undefined() {
+            stub_value(scope, name, export, kind)?
+        } else {
+            existing
+        };
         namespace.set_property_by_name(scope, &c_export, value)?;
         values.push((export, value));
     }
@@ -110,6 +150,8 @@ pub(crate) fn stub_value<'s>(
         ExportKind::Num(number) => scope.root_value(js::value::from_f64(number)),
         ExportKind::Bool(boolean) => scope.root_value(js::value::from_bool(boolean)),
         ExportKind::Undefined => scope.root_value(js::value::undefined()),
+        ExportKind::Null => scope.root_value(js::value::null()),
+        ExportKind::Symbol(description) => crate::symbol(scope, description, false)?,
         ExportKind::Object => Object::new_plain(scope)?.to_jsval_throwing(scope)?,
     })
 }

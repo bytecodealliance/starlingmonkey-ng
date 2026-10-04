@@ -8,12 +8,14 @@
 //! code that inspects them reads the same values. `process.nextTick` work runs in the tick queue of
 //! `process.nextTick`.
 
+mod adapters;
 mod destroy;
 mod duplex;
 mod duplex_pair;
 mod eos;
 mod from;
 mod legacy;
+mod operators;
 mod pipeline;
 mod readable;
 mod state;
@@ -25,8 +27,9 @@ pub(crate) use eos::eos as end_of_stream;
 pub(crate) use legacy::stream as stream_class;
 pub(crate) use readable::readable as readable_class;
 pub(crate) use util::{
-    as_object, call_method, closure, error_value, has_method, is_function, next_tick_call, string,
-    take_exception, truthy, Captures, Props,
+    as_object, call, call_method, closure, emit, error_value, has_method, is_function, is_str,
+    listen, listener_count, next_tick, next_tick_call, rust_string, same, string, take_exception,
+    this_object, truthy, Captures, Props,
 };
 pub(crate) use writable::writable as writable_class;
 
@@ -38,20 +41,7 @@ use js::native::Value;
 use js::prelude::HandleValue;
 
 use crate::errors::{validate_abort_signal, NodeError, Thrown};
-use util::{is_node_stream, listen};
-
-/// Register the stream classes.
-pub(crate) fn register_classes(scope: &Scope<'_>) -> Result<(), ExnThrown> {
-    legacy::stream::register(scope)?;
-    readable::readable_state::register(scope)?;
-    readable::readable::register(scope)?;
-    writable::writable_state::register(scope)?;
-    writable::writable::register(scope)?;
-    duplex::duplex::register(scope)?;
-    duplex::transform::register(scope)?;
-    duplex::pass_through::register(scope)?;
-    Ok(())
-}
+use util::is_node_stream;
 
 /// The abort listener of [`add_abort_signal`], whose captures are `[stream, signal]`: destroy the
 /// stream with an `AbortError`.
@@ -347,4 +337,17 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         name,
         &[("promises", promises)],
     )
+}
+
+/// Register the classes of `node:stream`.
+pub(crate) fn register_classes(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    legacy::stream::register(scope)?;
+    readable::readable_state::register(scope)?;
+    readable::readable::register(scope)?;
+    writable::writable_state::register(scope)?;
+    writable::writable::register(scope)?;
+    duplex::duplex::register(scope)?;
+    duplex::transform::register(scope)?;
+    duplex::pass_through::register(scope)?;
+    Ok(())
 }

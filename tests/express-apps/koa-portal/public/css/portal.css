@@ -1,0 +1,118 @@
+:root {
+  --fg: #1d2330;
+  --bg: #fbfaf7;
+  --accent: #b2452c;
+  --muted: #687083;
+  --card: #ffffff;
+  --border: #e3e0d8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8e6e1;
+    --bg: #15171c;
+    --accent: #f08a6c;
+    --muted: #9aa1b2;
+    --card: #1e2128;
+    --border: #2e323b;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font: 16px/1.5 system-ui, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+header,
+main,
+footer {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid var(--border);
+}
+
+header nav a {
+  margin-left: 1rem;
+}
+
+a {
+  color: var(--accent);
+}
+
+.brand {
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.app {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+}
+
+.app h2 small,
+.stack,
+code {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.links {
+  padding-left: 1.25rem;
+}
+
+form.example fieldset,
+.feedback form {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 0.5rem 0;
+}
+
+label {
+  display: inline-block;
+  margin: 0.25rem 0.75rem 0.25rem 0;
+}
+
+.flash {
+  max-width: 58rem;
+  margin: 1rem auto;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+}
+
+.flash-info {
+  background: #e3f1e5;
+  color: #1f5130;
+}
+
+.flash-error {
+  background: #f8e1dc;
+  color: #7a2716;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+td,
+th {
+  border-bottom: 1px solid var(--border);
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+}

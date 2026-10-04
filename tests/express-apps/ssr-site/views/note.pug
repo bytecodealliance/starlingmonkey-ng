@@ -1,0 +1,20 @@
+extends base.pug
+
+block content
+  article.note(data-id=note.id)
+    h1= note.title
+    if note.tags && note.tags.length
+      ul.tags
+        each tag, i in note.tags
+          li(class=i === 0 ? 'first' : undefined)= tag
+    p!= note.body.replace(/\n/g, '<br>')
+    p.meta Created by #{note.author} &mdash; #{note.body.length} characters
+  - var related = notes.filter(function (n) { return n.id !== note.id }).slice(0, 2)
+  case related.length
+    when 0
+      p No related notes.
+    default
+      ul
+        each r in related
+          li: a(href=base + '/notes/' + r.id)= r.title
+  include footer.pug

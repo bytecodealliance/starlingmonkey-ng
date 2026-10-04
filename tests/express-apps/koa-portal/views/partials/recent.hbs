@@ -1,0 +1,5 @@
+{{#if recent.length}}
+<p>Recently viewed:
+  {{#each recent}}<a href="/apps/{{this}}">{{this}}</a>{{#unless @last}}, {{/unless}}{{/each}}
+</p>
+{{/if}}

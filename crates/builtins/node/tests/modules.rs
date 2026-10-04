@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{run_js, run_js_after};
+use common::{run_js, run_js_after, run_js_with_flags};
 
 #[test]
 fn assert() {
@@ -115,6 +115,11 @@ fn stubs() {
 }
 
 #[test]
+fn test_runner() {
+    run_js("test_runner.mjs");
+}
+
+#[test]
 fn timers() {
     run_js("timers.mjs");
 }
@@ -147,6 +152,10 @@ fn http() {
     );
 }
 
+#[test]
+fn http_listen() {
+    run_js_with_flags("http_listen.mjs", &["--node-http-listen"]);
+}
 /// Serve HTTP/1.1 on a local port for the rest of the process, and return the port. Each request
 /// gets its own connection, which the response closes:
 ///

@@ -1,0 +1,22 @@
+<ul class="links">
+  {{#each links}}
+  <li><a href="{{appUrl ../name path}}">{{label}}</a> <code>{{path}}</code></li>
+  {{/each}}
+</ul>
+{{#each forms}}
+<form class="example" method="{{method}}" action="{{appUrl ../name action}}"{{#if enctype}} enctype="{{enctype}}"{{/if}}>
+  <fieldset>
+    <legend>{{label}} <code>{{upper method}} {{action}}</code></legend>
+    {{#each fields}}
+    <label>{{label}}
+      {{#if (eq type "file")}}
+      <input type="file" name="{{name}}">
+      {{else}}
+      <input type="{{#if type}}{{type}}{{else}}text{{/if}}" name="{{name}}" value="{{value}}">
+      {{/if}}
+    </label>
+    {{/each}}
+    <button type="submit">Send</button>
+  </fieldset>
+</form>
+{{/each}}

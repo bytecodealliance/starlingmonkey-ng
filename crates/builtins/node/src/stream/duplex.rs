@@ -44,6 +44,26 @@ pub mod duplex {
         Err(NodeError::not_implemented("Duplex.from()"))
     }
 
+    /// <https://nodejs.org/api/stream.html#streamduplexfromwebpair-options>
+    #[static_method]
+    pub fn from_web<'s>(
+        scope: &'s Scope<'_>,
+        pair: Option<HandleValue<'_>>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        super::super::adapters::duplex_from_web(scope, pair, options)
+    }
+
+    /// <https://nodejs.org/api/stream.html#streamduplextowebstreamduplex-options>
+    #[static_method]
+    pub fn to_web<'s>(
+        scope: &'s Scope<'_>,
+        duplex: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        super::super::adapters::duplex_to_web(scope, duplex, options)
+    }
+
     /// Copy the methods and accessors of `Writable.prototype` that `Duplex.prototype` doesn't
     /// have, and define `destroyed` over both sides.
     #[setup]

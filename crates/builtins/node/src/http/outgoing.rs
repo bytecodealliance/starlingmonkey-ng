@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! `OutgoingMessage` and its subclass `ServerResponse`, which responds to a served request with a
-//! web `Response`.
+//! web `Response`, or writes HTTP/1.1 to a socket (see [`super::wire`]).
 //!
 //! Headers are kept in a null-prototype object under `_starlingHeaders`, mapping each lowercase
 //! name to the pair of the name as set and the value. `write` and `end` pass their bytes to the
-//! subclass's `_starlingSend(chunk, last)`.
+//! subclass's `_starlingSend(chunk, last)`, except for a response that writes to a socket.
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
@@ -31,7 +31,7 @@ pub(super) const HOST_HEADERS: [&str; 4] = [
 ];
 
 /// The number of bytes a response body stream queues before `write` returns `false`.
-const HIGH_WATER_MARK: f64 = 16384.0;
+pub(super) const HIGH_WATER_MARK: f64 = 16384.0;
 
 /// A new object without a prototype.
 pub(super) fn null_object<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
@@ -74,7 +74,7 @@ pub(super) fn object_keys<'s>(
 }
 
 /// The header store of `message`, if a header was ever set.
-fn existing_store<'s>(
+pub(super) fn existing_store<'s>(
     scope: &'s Scope<'_>,
     message: Object<'_>,
 ) -> Result<Option<Object<'s>>, ExnThrown> {
@@ -116,15 +116,8 @@ pub(super) fn header_pairs(
     scope: &Scope<'_>,
     message: Object<'_>,
 ) -> Result<Vec<(String, String)>, ExnThrown> {
-    let Some(store) = existing_store(scope, message)? else {
-        return Ok(Vec::new());
-    };
     let mut pairs = Vec::new();
-    for key in store.own_keys(scope)? {
-        let entry = Object::from_value(scope, crate::http::get_by_key(scope, store, key)?)
-            .map_err(|e| e.throw(scope))?;
-        let name = String::from_jsval(scope, entry.get_element(scope, 0)?, ()).unwrap_or_default();
-        let value = entry.get_element(scope, 1)?;
+    for (name, value) in header_entries(scope, message)? {
         let values = match as_array(scope, value)? {
             Some(array) => elements(scope, array)?,
             None => vec![value],
@@ -134,6 +127,83 @@ pub(super) fn header_pairs(
         }
     }
     Ok(pairs)
+}
+
+/// The headers of `message` as (name, value) pairs, where a value can be an array: the headers set
+/// in the order they were set, then the headers `writeHead` was given without any header set
+/// before.
+pub(super) fn header_entries<'s>(
+    scope: &'s Scope<'_>,
+    message: Object<'_>,
+) -> Result<Vec<(String, HandleValue<'s>)>, ExnThrown> {
+    let mut entries = Vec::new();
+    if let Some(store) = existing_store(scope, message)? {
+        for key in store.own_keys(scope)? {
+            let entry = Object::from_value(scope, crate::http::get_by_key(scope, store, key)?)
+                .map_err(|e| e.throw(scope))?;
+            let name =
+                String::from_jsval(scope, entry.get_element(scope, 0)?, ()).unwrap_or_default();
+            entries.push((name, entry.get_element(scope, 1)?));
+        }
+    }
+    if let Some(head) = message.obj(scope, c"_starlingHeadHeaders")? {
+        for entry in elements(scope, head)? {
+            let entry = Object::from_value(scope, *entry).map_err(|e| e.throw(scope))?;
+            let name =
+                String::from_jsval(scope, entry.get_element(scope, 0)?, ()).unwrap_or_default();
+            entries.push((name, entry.get_element(scope, 1)?));
+        }
+    }
+    Ok(entries)
+}
+
+/// The headers `headers` that `writeHead` was given without any header set before, as an array of
+/// `[name, value]` pairs, after checking each name and value as `setHeader` does: from an object,
+/// a flat array of names and values, or an array of pairs.
+fn head_headers<'s>(scope: &'s Scope<'_>, headers: HandleValue<'_>) -> Result<Object<'s>, Thrown> {
+    let mut pairs = Vec::new();
+    if let Some(array) = as_array(scope, headers)? {
+        let items = elements(scope, array)?;
+        match items.first() {
+            Some(first) if as_array(scope, *first)?.is_some() => {
+                for item in &items {
+                    let pair = Object::from_value(scope, **item)
+                        .map_err(|e| Thrown::from(e.throw(scope)))?;
+                    pairs.push((pair.get_element(scope, 0)?, pair.get_element(scope, 1)?));
+                }
+            }
+            _ => {
+                if items.len() % 2 != 0 {
+                    return Err(NodeError::invalid_arg_value(
+                        scope,
+                        "headers",
+                        headers,
+                        "is invalid",
+                    )
+                    .into());
+                }
+                pairs.extend(items.chunks(2).map(|pair| (pair[0], pair[1])));
+            }
+        }
+    } else if let Ok(object) = Object::from_value(scope, *headers) {
+        for key in object_keys(scope, object)? {
+            pairs.push((key, crate::http::get_by_key(scope, object, key)?));
+        }
+    }
+    let mut entries = Vec::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        let text = validate_name(scope, name)?;
+        validate_value(scope, &text, value)?;
+        let entry = js::Array::with_contents(
+            scope,
+            &[
+                js::JSString::from_str(scope, &text)?.to_jsval_throwing(scope)?,
+                value,
+            ],
+        )?;
+        entries.push((*entry).to_jsval_throwing(scope)?);
+    }
+    Ok(*js::Array::with_contents(scope, &entries)?)
 }
 
 /// `ERR_HTTP_HEADERS_SENT` for `action`, such as "set".
@@ -147,7 +217,7 @@ fn headers_sent(action: &str) -> NodeError {
 
 /// The bytes of the chunk `chunk`, a string in `encoding` or a `Buffer` or `Uint8Array`, or
 /// `ERR_UNKNOWN_ENCODING` for an encoding name Node.js doesn't know.
-fn chunk_bytes(
+pub(super) fn chunk_bytes(
     scope: &Scope<'_>,
     chunk: HandleValue<'_>,
     encoding: Option<HandleValue<'_>>,
@@ -172,9 +242,11 @@ fn chunk_bytes(
             encoding,
         )?);
     }
-    let view = Object::from_value(scope, *chunk)
+    Object::from_value(scope, *chunk)
         .ok()
         .and_then(js::ArrayBufferView::from_object)
+        .map(|view| view.copy_bytes(scope))
+        .transpose()?
         .ok_or_else(|| {
             NodeError::invalid_arg_type(
                 scope,
@@ -182,8 +254,8 @@ fn chunk_bytes(
                 "of type string or an instance of Buffer or Uint8Array",
                 chunk,
             )
-        })?;
-    Ok(view.copy_bytes(scope)?)
+            .into()
+        })
 }
 
 /// Pass `bytes` to `message`'s `_starlingSend`, as the last chunk if `last`, and return its
@@ -282,8 +354,20 @@ fn finish(
     Ok(js::value::undefined())
 }
 
+/// The tick callback whose payload is a message: mark it destroyed and emit `close` on it, unless
+/// it already emitted `close`.
+pub(super) fn emit_close_job(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let message = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
+    emit_close(scope, message)?;
+    Ok(js::value::undefined())
+}
+
 /// Mark `message` destroyed and emit `close` on it, unless it already emitted `close`.
-fn emit_close(scope: &Scope<'_>, message: Object<'_>) -> Result<(), ExnThrown> {
+pub(super) fn emit_close(scope: &Scope<'_>, message: Object<'_>) -> Result<(), ExnThrown> {
     if message.flag(scope, c"_closed")? {
         return Ok(());
     }
@@ -293,10 +377,19 @@ fn emit_close(scope: &Scope<'_>, message: Object<'_>) -> Result<(), ExnThrown> {
     Ok(())
 }
 
-/// Remove the header `name`, a validated string, from `message`.
+/// Remove the header `name`, a validated string, from `message`. Removing `Connection`,
+/// `Content-Length` or `Transfer-Encoding` keeps the header block from adding it, and removing
+/// `Date` clears `sendDate`.
 fn remove_named(scope: &Scope<'_>, message: Object<'_>, name: &str) -> Result<(), Thrown> {
     if message.flag(scope, c"_headerSent")? {
         return Err(headers_sent("remove").into());
+    }
+    match name.to_lowercase().as_str() {
+        "connection" => message.set_property(scope, c"_removedConnection", true)?,
+        "content-length" => message.set_property(scope, c"_removedContLen", true)?,
+        "transfer-encoding" => message.set_property(scope, c"_removedTE", true)?,
+        "date" => message.set_property(scope, c"sendDate", false)?,
+        _ => {}
     }
     if let Some(store) = existing_store(scope, message)? {
         store.delete_property_by_id(scope, key(scope, name)?)?;
@@ -382,11 +475,34 @@ pub mod outgoing_message_class {
             (c"sendDate", false),
             (c"destroyed", false),
             (c"writable", true),
+            (c"_last", false),
+            (c"chunkedEncoding", false),
+            (c"shouldKeepAlive", true),
+            (c"maxRequestsOnConnectionReached", false),
+            (c"_defaultKeepAlive", true),
+            (c"useChunkedEncodingByDefault", true),
+            (c"_removedConnection", false),
+            (c"_removedContLen", false),
+            (c"_removedTE", false),
+            (c"strictContentLength", false),
+            (c"_hasBody", true),
+            (c"_closed", false),
         ] {
             this.set_property(scope, name, value)?;
         }
+        this.set_property(scope, c"outputData", *js::Array::new(scope, 0)?)?;
+        this.set_property(scope, c"outputSize", 0)?;
+        this.set_property(scope, c"_contentLength", js::value::null())?;
+        this.set_property(scope, c"_trailer", "")?;
+        this.set_property(scope, c"_header", js::value::null())?;
+        this.set_property(scope, c"_keepAliveTimeout", 0)?;
         this.set_property(scope, c"socket", js::value::null())?;
         this.set_property(scope, c"connection", js::value::null())?;
+        this.define_property(scope, c"_starlingErrored", js::value::null(), 0)?;
+        this.define_property(scope, c"_starlingCorked", 0, 0)?;
+        this.define_property(scope, c"_starlingHeaderPending", false, 0)?;
+        this.define_property(scope, c"_starlingBytesWritten", 0, 0)?;
+        this.define_property(scope, c"_starlingWire", true, 0)?;
         Ok(())
     }
 
@@ -587,6 +703,9 @@ pub mod outgoing_message_class {
 
     /// <https://nodejs.org/api/http.html#outgoingmessageflushheaders>
     pub fn flush_headers(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        if super::super::wire::is_wire(scope, this)? {
+            return super::super::wire::flush_headers(scope, this);
+        }
         implicit_header(scope, this)?;
         this.set_property(scope, c"_headerSent", true)?;
         send(scope, this, &[], false)?;
@@ -594,8 +713,8 @@ pub mod outgoing_message_class {
     }
 
     /// <https://nodejs.org/api/http.html#outgoingmessagewritechunk-encoding-callback>: `false`
-    /// once the body stream of a served response queues more than 16 KiB, and `drain` follows
-    /// once it has room again.
+    /// once the body stream of a served response queues more than 16 KiB, or the socket of a
+    /// response that writes to one does, and `drain` follows once it has room again.
     pub fn write<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -603,10 +722,18 @@ pub mod outgoing_message_class {
         encoding: Option<HandleValue<'_>>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<HandleValue<'s>, Thrown> {
-        let callback = match encoding {
-            Some(encoding) if is_function(scope, encoding) => Some(encoding),
-            _ => callback,
+        let (encoding, callback) = match encoding {
+            Some(encoding) if is_function(scope, encoding) => (None, Some(encoding)),
+            _ => (encoding, callback),
         };
+        if super::super::wire::is_wire(scope, this)? {
+            let callback = callback.filter(|callback| is_function(scope, *callback));
+            let room = super::super::wire::write(scope, this, chunk, encoding, callback, false)?;
+            if !room {
+                this.set_property(scope, c"writableNeedDrain", true)?;
+            }
+            return Ok(scope.root_value(js::value::from_bool(room)));
+        }
         if this.flag(scope, c"finished")? {
             write_after_end(scope, this, callback)?;
             return Ok(scope.root_value(js::value::from_bool(false)));
@@ -638,6 +765,11 @@ pub mod outgoing_message_class {
         };
         let callback = callback.filter(|callback| is_function(scope, *callback));
         let chunk = chunk.filter(|chunk| truthy(scope, *chunk));
+        if super::super::wire::is_wire(scope, this)? {
+            super::super::wire::end(scope, this, chunk, encoding, callback)?;
+            this.set_property(scope, c"_headerSent", true)?;
+            return Ok(this);
+        }
         if this.flag(scope, c"finished")? {
             if chunk.is_some() {
                 write_after_end(scope, this, callback)?;
@@ -667,9 +799,93 @@ pub mod outgoing_message_class {
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/http.html#outgoingmessagesettimeoutmsecs-callback>: has no effect.
-    pub fn set_timeout<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+    /// <https://nodejs.org/api/http.html#outgoingmessagesettimeoutmsecs-callback>: sets the
+    /// timeout of the socket, once a response that writes to a socket has one. `callback`
+    /// becomes a `timeout` listener. The timeout has no effect for a served request's response.
+    pub fn set_timeout<'s>(
+        scope: &Scope<'_>,
+        this: Object<'s>,
+        msecs: Option<HandleValue<'_>>,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        let msecs = msecs.unwrap_or_else(|| scope.root_value(js::value::undefined()));
+        if let Some(callback) = callback.filter(|callback| is_function(scope, *callback)) {
+            call_method(scope, this, c"on", &[string(scope, "timeout")?, callback])?;
+        }
+        match this.obj(scope, c"socket")? {
+            Some(socket) if crate::stream::has_method(scope, socket, c"setTimeout")? => {
+                call_method(scope, socket, c"setTimeout", &[msecs])?;
+            }
+            Some(_) => {}
+            None if super::super::wire::is_wire(scope, this)? => {
+                let set = closure(scope, 1, set_socket_timeout, &[msecs.get()])?;
+                call_method(
+                    scope,
+                    this,
+                    c"once",
+                    &[string(scope, "socket")?, set.to_jsval_throwing(scope)?],
+                )?;
+            }
+            None => {}
+        }
         Ok(this)
+    }
+
+    /// <https://nodejs.org/api/http.html#outgoingmessageaddtrailersheaders>: the trailers a
+    /// chunked message sends after its last chunk, from an object or an array of pairs. An
+    /// array value is a line per element.
+    pub fn add_trailers(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        headers: HandleValue<'_>,
+    ) -> Result<(), Thrown> {
+        let mut trailer = String::new();
+        let headers = Object::from_value_coerce(scope, headers)?;
+        let pairs = if js::Array::is_array(scope, headers.handle())? {
+            let mut pairs = Vec::new();
+            for item in elements(scope, headers)? {
+                let pair =
+                    Object::from_value(scope, *item).map_err(|e| Thrown::from(e.throw(scope)))?;
+                pairs.push((pair.get_element(scope, 0)?, pair.get_element(scope, 1)?));
+            }
+            pairs
+        } else {
+            let mut pairs = Vec::new();
+            for key in object_keys(scope, headers)? {
+                pairs.push((key, crate::http::get_by_key(scope, headers, key)?));
+            }
+            pairs
+        };
+        for (field, value) in pairs {
+            super::super::module::validate_header_name(scope, field, Some("Trailer name".into()))?;
+            let field = String::from_jsval(scope, field, ())?;
+            let values = match as_array(scope, value)? {
+                Some(array) => {
+                    let items = elements(scope, array)?;
+                    if items.len() > 1 {
+                        items
+                    } else {
+                        let joined = call_method(scope, array, c"join", &[string(scope, "; ")?])?;
+                        vec![joined]
+                    }
+                }
+                None => vec![value],
+            };
+            for value in values {
+                let value = String::from_jsval(scope, value, ())?;
+                if has_invalid_header_char(&value) {
+                    return Err(NodeError::new(
+                        ErrorKind::TypeError,
+                        "ERR_INVALID_CHAR",
+                        format!("Invalid character in trailer content [\"{field}\"]"),
+                    )
+                    .into());
+                }
+                trailer.push_str(&format!("{field}: {value}\r\n"));
+            }
+        }
+        this.set_property(scope, c"_trailer", trailer.as_str())?;
+        Ok(())
     }
 
     /// <https://nodejs.org/api/http.html#outgoingmessagedestroyerror>
@@ -682,38 +898,120 @@ pub mod outgoing_message_class {
             return Ok(this);
         }
         this.set_property(scope, c"destroyed", true)?;
-        call_method(
-            scope,
-            this,
-            c"_starlingDestroy",
-            &[error.unwrap_or_else(|| scope.root_value(js::value::undefined()))],
-        )?;
+        let error = error.unwrap_or_else(|| scope.root_value(js::value::undefined()));
+        this.set_property(scope, c"_starlingErrored", error)?;
+        call_method(scope, this, c"_starlingDestroy", &[error])?;
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/http.html#outgoingmessagecork>: has no effect, since the body
-    /// is not sent before `end` or the first `write`.
-    pub fn cork() -> Result<(), ExnThrown> {
+    /// <https://nodejs.org/api/http.html#outgoingmessagecork>: count the call in
+    /// `writableCorked`, and cork the socket, if the message has one.
+    pub fn cork(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        let corked = this.num(scope, c"_starlingCorked")?;
+        this.set_property(scope, c"_starlingCorked", corked + 1.0)?;
+        if let Some(socket) = this.obj(scope, c"socket")? {
+            if crate::stream::has_method(scope, socket, c"cork")? {
+                call_method(scope, socket, c"cork", &[])?;
+            }
+        }
         Ok(())
     }
 
-    /// <https://nodejs.org/api/http.html#outgoingmessageuncork>: has no effect.
-    pub fn uncork() -> Result<(), ExnThrown> {
+    /// <https://nodejs.org/api/http.html#outgoingmessageuncork>: undo a `cork` call, and uncork
+    /// the socket, if the message has one.
+    pub fn uncork(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        let corked = this.num(scope, c"_starlingCorked")?;
+        this.set_property(scope, c"_starlingCorked", corked - 1.0)?;
+        if let Some(socket) = this.obj(scope, c"socket")? {
+            if crate::stream::has_method(scope, socket, c"uncork")? {
+                call_method(scope, socket, c"uncork", &[])?;
+            }
+        }
         Ok(())
     }
 
-    /// The subclass's part of `destroy`, called with its error. This one has no effect.
+    /// Store the header block before the first write, which a subclass implements. This one
+    /// throws `ERR_METHOD_NOT_IMPLEMENTED`, as Node.js's does.
+    #[method(name = "_implicitHeader")]
+    pub fn implicit_header_impl() -> Result<(), NodeError> {
+        Err(NodeError::not_implemented("_implicitHeader()"))
+    }
+
+    /// The subclass's part of `destroy`, called with its error. This one emits `close` in the
+    /// tick queue, unless it was emitted.
     #[method(name = "_starlingDestroy")]
-    pub fn destroy_impl() -> Result<(), ExnThrown> {
-        Ok(())
+    pub fn destroy_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        let job = Function::new_callback(scope, c"", 0, emit_close_job, this)?;
+        js::jobs::queue_tick(scope, job.to_jsval_throwing(scope)?, &[])
     }
 
-    /// Define `headersSent`.
+    /// Define `headersSent`, `closed`, `errored`, `writableLength`, `writableHighWaterMark`,
+    /// `writableCorked` and `writableObjectMode`.
     #[setup]
     pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
         let getter = Function::new_callback(scope, c"headersSent", 0, headers_sent_getter, ())?;
-        proto.define_accessor(scope, c"headersSent", Some(*getter), None, 0)
+        proto.define_accessor(scope, c"headersSent", Some(*getter), None, 0)?;
+        for (index, name) in OUTGOING_GETTERS.iter().enumerate() {
+            let getter = Function::new_callback(scope, name, 0, outgoing_getter, index as f64)?;
+            proto.define_accessor(scope, name, Some(*getter), None, 0)?;
+        }
+        Ok(())
     }
+}
+
+/// The names of the getters [`outgoing_getter`] implements, in the order of their payloads.
+const OUTGOING_GETTERS: [&std::ffi::CStr; 6] = [
+    c"closed",
+    c"errored",
+    c"writableLength",
+    c"writableHighWaterMark",
+    c"writableCorked",
+    c"writableObjectMode",
+];
+
+/// The getter of the `OutgoingMessage` property whose index in [`OUTGOING_GETTERS`] is the
+/// payload: whether the message emitted `close`, the error it was destroyed with, the bytes it
+/// and its socket haven't written, the high water mark of its socket or 16 KiB without one, the
+/// number of `cork` calls not undone, and `false`.
+fn outgoing_getter(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
+    let socket = this.obj(scope, c"socket")?;
+    Ok(match payload.to_number() as usize {
+        0 => js::value::from_bool(this.flag(scope, c"_closed")?),
+        1 => this.val(scope, c"_starlingErrored")?.get(),
+        2 => {
+            let socket = match socket {
+                Some(socket) => socket.num(scope, c"writableLength")?,
+                None => 0.0,
+            };
+            js::value::from_f64(this.num(scope, c"outputSize")? + socket)
+        }
+        3 => match socket {
+            Some(socket) if socket.val(scope, c"writableHighWaterMark")?.is_number() => {
+                js::value::from_f64(socket.num(scope, c"writableHighWaterMark")?)
+            }
+            _ => js::value::from_f64(HIGH_WATER_MARK),
+        },
+        4 => js::value::from_f64(this.num(scope, c"_starlingCorked")?),
+        _ => js::value::from_bool(false),
+    })
+}
+
+/// The `socket` listener of `setTimeout`, whose captures are `[msecs]`: set the timeout of the
+/// socket.
+fn set_socket_timeout(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let msecs = Captures::of(scope, payload)?.get(0)?;
+    let socket = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
+    call_method(scope, socket, c"setTimeout", &[msecs])?;
+    Ok(js::value::undefined())
 }
 
 /// The getter of `headersSent`.
@@ -832,6 +1130,64 @@ fn on_body_aborted(
     Ok(js::value::undefined())
 }
 
+/// The interest a served response with a streamed body holds in its request's event loop.
+#[core_runtime::jsclass(hidden)]
+pub struct BodyInterest {
+    /// The interest, or `None` once it was released.
+    #[no_trace]
+    handle: Option<core_runtime::event_loop::InterestHandle>,
+}
+
+#[core_runtime::jsmethods]
+impl BodyInterest {
+    #[constructor]
+    fn new() -> Result<Self, NodeError> {
+        Err(NodeError::new(
+            ErrorKind::TypeError,
+            "ERR_ILLEGAL_CONSTRUCTOR",
+            "Illegal constructor",
+        ))
+    }
+}
+
+/// Keep the current event loop running until the promise `closed` settles. A served response's
+/// body writer closes when the response ends, and errors when it is destroyed or the client
+/// disconnects. Until then, another request's handler can write to the body.
+fn hold_event_loop(scope: &Scope<'_>, closed: Object<'_>) -> Result<(), ExnThrown> {
+    let Some(handle) =
+        core_runtime::event_loop::with_active_event_loop(|el| el.acquire_interest_handle())
+    else {
+        return Ok(());
+    };
+    let interest =
+        js::class::create_instance_with::<BodyInterestImpl>(scope, |_| BodyInterestImpl {
+            handle: Some(handle),
+        })?;
+    let release = closure(
+        scope,
+        1,
+        release_interest,
+        &[interest.to_jsval_raw_throwing(scope)?],
+    )?;
+    let release = release.to_jsval_throwing(scope)?;
+    call_method(scope, closed, c"then", &[release, release])?;
+    Ok(())
+}
+
+/// The reaction to a body writer's `closed`, whose captures are `[interest]`: release the
+/// interest.
+fn release_interest(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let interest = Captures::of(scope, payload)?.obj(0)?;
+    if let Ok(interest) = interest.cast::<BodyInterest>() {
+        interest.data_mut().handle.take();
+    }
+    Ok(js::value::undefined())
+}
+
 /// Whether the response `response` has no body: a `HEAD` request's, or one with status 1xx, 204
 /// or 304.
 fn without_body(scope: &Scope<'_>, response: Object<'_>) -> Result<bool, ExnThrown> {
@@ -862,6 +1218,8 @@ fn take_respond<'s>(
 }
 
 /// The web `Response` for `response`, with its status and headers and with `body` as its body.
+/// The headers the host owns are left out, except `Content-Length`, which frames the response
+/// unless the response has no body.
 fn web_response<'s>(
     scope: &'s Scope<'_>,
     response: Object<'_>,
@@ -879,7 +1237,8 @@ fn web_response<'s>(
     }
     let mut headers = Vec::new();
     for (name, value) in header_pairs(scope, response)? {
-        if HOST_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+        let lower = name.to_ascii_lowercase();
+        if HOST_HEADERS.contains(&lower.as_str()) && lower != "content-length" {
             continue;
         }
         let pair = js::Array::with_contents(
@@ -935,7 +1294,11 @@ fn respond(
 pub mod server_response_class {
     use super::*;
 
-    /// <https://nodejs.org/api/http.html#class-httpserverresponse>: the response to `req`.
+    /// <https://nodejs.org/api/http.html#class-httpserverresponse>: the response to `req`. It
+    /// writes HTTP/1.1 to the socket `assignSocket` gives it, unless it responds to a served
+    /// request. The response to a `HEAD` request has no body, and the response to an HTTP/1.0
+    /// request closes the connection and uses chunked encoding only if the request's `TE` header
+    /// names it.
     #[constructor]
     pub fn init(
         scope: &Scope<'_>,
@@ -946,15 +1309,119 @@ pub mod server_response_class {
         this.set_property(scope, c"statusCode", 200)?;
         this.set_property(scope, c"statusMessage", js::value::undefined())?;
         this.set_property(scope, c"sendDate", true)?;
+        this.set_property(scope, c"_sent100", false)?;
+        this.set_property(scope, c"_expect_continue", false)?;
+        this.define_property(scope, c"_starlingWire", true, 0)?;
         if let Some(req) = req {
             this.set_property(scope, c"req", req)?;
             if let Ok(req) = Object::from_value(scope, *req) {
-                let socket = req.val(scope, c"socket")?;
-                this.set_property(scope, c"socket", socket)?;
-                this.set_property(scope, c"connection", socket)?;
+                let method = req.val(scope, c"method")?;
+                if crate::stream::is_str(scope, method, c"HEAD")? {
+                    this.set_property(scope, c"_hasBody", false)?;
+                }
+                let major = req.val(scope, c"httpVersionMajor")?;
+                let minor = req.val(scope, c"httpVersionMinor")?;
+                if (major.is_number() && major.to_number() < 1.0)
+                    || (minor.is_number() && minor.to_number() < 1.0)
+                {
+                    let te = match req.obj(scope, c"headers")? {
+                        Some(headers) => headers.val(scope, c"te")?,
+                        None => scope.root_value(js::value::undefined()),
+                    };
+                    let te = String::from_jsval(scope, te, ()).unwrap_or_default();
+                    let chunked = super::super::wire::has_word(&te, "chunked");
+                    this.set_property(scope, c"useChunkedEncodingByDefault", chunked)?;
+                    this.set_property(scope, c"shouldKeepAlive", false)?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Make `socket` the socket the response writes to, emit `socket`, and write what the response
+    /// queued. Throws `ERR_HTTP_SOCKET_ASSIGNED` if the socket has a response.
+    pub fn assign_socket(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        socket: HandleValue<'_>,
+    ) -> Result<(), Thrown> {
+        let socket =
+            Object::from_value(scope, *socket).map_err(|e| Thrown::from(e.throw(scope)))?;
+        if truthy(scope, socket.val(scope, c"_httpMessage")?) {
+            return Err(NodeError::new(
+                ErrorKind::Error,
+                "ERR_HTTP_SOCKET_ASSIGNED",
+                "ServerResponse has an already assigned socket",
+            )
+            .into());
+        }
+        socket.set_property(scope, c"_httpMessage", this)?;
+        let on_close = super::super::connection::response_close_listener(scope)?;
+        call_method(
+            scope,
+            socket,
+            c"on",
+            &[string(scope, "close")?, on_close.to_jsval_throwing(scope)?],
+        )?;
+        this.set_property(scope, c"socket", socket)?;
+        this.set_property(scope, c"connection", socket)?;
+        call_method(
+            scope,
+            this,
+            c"emit",
+            &[string(scope, "socket")?, socket.to_jsval_throwing(scope)?],
+        )?;
+        super::super::wire::flush(scope, this)?;
+        Ok(())
+    }
+
+    /// Stop writing to `socket`.
+    pub fn detach_socket(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        socket: HandleValue<'_>,
+    ) -> Result<(), ExnThrown> {
+        if let Ok(socket) = Object::from_value(scope, *socket) {
+            let on_close = super::super::connection::response_close_listener(scope)?;
+            call_method(
+                scope,
+                socket,
+                c"removeListener",
+                &[string(scope, "close")?, on_close.to_jsval_throwing(scope)?],
+            )?;
+            socket.set_property(scope, c"_httpMessage", js::value::null())?;
+        }
+        this.set_property(scope, c"socket", js::value::null())?;
+        this.set_property(scope, c"connection", js::value::null())?;
+        Ok(())
+    }
+
+    /// Write what the response queued to its socket, as Node.js's `_flush` does.
+    #[method(name = "_flush")]
+    pub fn flush_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        super::super::wire::flush(scope, this)
+    }
+
+    /// Emit `prefinish`, as Node.js's `_finish` does once all data was handed to the socket.
+    #[method(name = "_finish")]
+    pub fn finish_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        call_method(scope, this, c"emit", &[string(scope, "prefinish")?])?;
+        Ok(())
+    }
+
+    /// Write an informational response with `statusCode` and `headers` before the response. It
+    /// has no effect for a served request's response.
+    pub fn write_information(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        status: HandleValue<'_>,
+        headers: Option<HandleValue<'_>>,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        if !super::super::wire::is_wire(scope, this)? {
+            return Ok(());
+        }
+        super::super::wire::write_information(scope, this, status, headers, callback)
     }
 
     /// <https://nodejs.org/api/http.html#responsewriteheadstatuscode-statusmessage-headers>:
@@ -971,13 +1438,12 @@ pub mod server_response_class {
         }
         let code = super::super::to_int32(f64::from_jsval(scope, status, ())?);
         if !(100..=999).contains(&code) {
+            let options = crate::inspect::InspectOptions::current(scope)?;
+            let shown = crate::inspect::format(scope, &[string(scope, "%s")?, status], &options)?;
             return Err(NodeError::new(
                 ErrorKind::RangeError,
                 "ERR_HTTP_INVALID_STATUS_CODE",
-                format!(
-                    "Invalid status code: {}",
-                    String::from_jsval(scope, status, ())?
-                ),
+                format!("Invalid status code: {shown}"),
             )
             .into());
         }
@@ -997,7 +1463,9 @@ pub mod server_response_class {
             }
         };
         this.set_property(scope, c"statusCode", code)?;
-        if let Some(headers) = headers {
+        // Headers given with headers set before are set too. Without, they are only sent.
+        let progressive = super::existing_store(scope, this)?.is_some();
+        if let Some(headers) = headers.filter(|_| progressive) {
             super::apply_headers(scope, this, headers)?;
         }
         let status_message = this.val(scope, c"statusMessage")?;
@@ -1008,6 +1476,27 @@ pub mod server_response_class {
                 "Invalid character in statusMessage",
             )
             .into());
+        }
+        let wire = super::super::wire::is_wire(scope, this)?;
+        if wire {
+            if code == 204 || code == 304 || (100..=199).contains(&code) {
+                this.set_property(scope, c"_hasBody", false)?;
+            }
+            if this.flag(scope, c"_expect_continue")? && !this.flag(scope, c"_sent100")? {
+                this.set_property(scope, c"shouldKeepAlive", false)?;
+            }
+        }
+        if let Some(headers) = headers.filter(|headers| !progressive && truthy(scope, *headers)) {
+            let entries = super::head_headers(scope, headers)?;
+            this.define_property(scope, c"_starlingHeadHeaders", entries, 0)?;
+        }
+        if wire {
+            let status_message = String::from_jsval(scope, status_message, ())?;
+            let line = super::super::wire::status_line(code, &status_message);
+            if let Err(thrown) = super::super::wire::store_header(scope, this, &line) {
+                this.delete_property(scope, c"_starlingHeadHeaders")?;
+                return Err(thrown);
+            }
         }
         this.set_property(scope, c"_headerSent", true)?;
         Ok(this)
@@ -1033,28 +1522,81 @@ pub mod server_response_class {
         )
     }
 
-    /// <https://nodejs.org/api/http.html#responsewritecontinue>: has no effect, since the host
-    /// sends informational responses.
-    pub fn write_continue() -> Result<(), ExnThrown> {
+    /// <https://nodejs.org/api/http.html#responsewritecontinue>: write a `100 Continue` response.
+    /// It has no effect for a served request's response, since the host sends informational
+    /// responses.
+    pub fn write_continue(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        if !super::super::wire::is_wire(scope, this)? {
+            return Ok(());
+        }
+        let status = scope.root_value(js::value::from_f64(100.0));
+        super::super::wire::write_information(scope, this, status, None, callback)?;
+        this.set_property(scope, c"_sent100", true)?;
         Ok(())
     }
 
-    /// <https://nodejs.org/api/http.html#responsewriteprocessing>: has no effect.
-    pub fn write_processing() -> Result<(), ExnThrown> {
-        Ok(())
+    /// <https://nodejs.org/api/http.html#responsewriteprocessing>: write a `102 Processing`
+    /// response. It has no effect for a served request's response.
+    pub fn write_processing(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        if !super::super::wire::is_wire(scope, this)? {
+            return Ok(());
+        }
+        let status = scope.root_value(js::value::from_f64(102.0));
+        super::super::wire::write_information(scope, this, status, None, callback)
     }
 
-    /// <https://nodejs.org/api/http.html#responsewriteearlyhintshints-callback>: has no effect
-    /// besides calling `callback`.
+    /// <https://nodejs.org/api/http.html#responsewriteearlyhintshints-callback>: write a `103
+    /// Early Hints` response with the `Link` header of `hints.link` and the other hints as
+    /// headers. Nothing is written without links. For a served request's response, it has no
+    /// effect besides calling `callback`.
     pub fn write_early_hints(
         scope: &Scope<'_>,
-        _hints: HandleValue<'_>,
+        this: Object<'_>,
+        hints: HandleValue<'_>,
         callback: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        if let Some(callback) = callback {
-            next_tick_call(scope, callback, &[])?;
+    ) -> Result<(), Thrown> {
+        if !super::super::wire::is_wire(scope, this)? {
+            if let Some(callback) = callback {
+                next_tick_call(scope, callback, &[])?;
+            }
+            return Ok(());
         }
-        Ok(())
+        let hints = crate::errors::validate_plain_object(scope, hints, "hints", false)?;
+        let link = hints.val(scope, c"link")?;
+        if link.is_null() || link.is_undefined() {
+            return Ok(());
+        }
+        let link = super::super::wire::link_header_value(scope, link)?;
+        if link.is_empty() {
+            return Ok(());
+        }
+        if has_invalid_header_char(&link) {
+            return Err(NodeError::new(
+                ErrorKind::TypeError,
+                "ERR_INVALID_CHAR",
+                "Invalid character in header content [\"Link\"]",
+            )
+            .into());
+        }
+        let headers = null_object(scope)?;
+        headers.set_property(scope, c"Link", link.as_str())?;
+        for key in object_keys(scope, hints)? {
+            if !crate::stream::is_str(scope, key, c"link")? {
+                let value = crate::http::get_by_key(scope, hints, key)?;
+                crate::http::set_by_key(scope, headers, key, value)?;
+            }
+        }
+        let status = scope.root_value(js::value::from_f64(103.0));
+        let headers = headers.to_jsval_throwing(scope)?;
+        super::super::wire::write_information(scope, this, status, Some(headers), callback)
     }
 
     /// Respond to the request: with the whole body if `last` and nothing was sent before, and
@@ -1135,6 +1677,7 @@ pub mod server_response_class {
             c"then",
             &[undefined, aborted.to_jsval_throwing(scope)?],
         )?;
+        super::hold_event_loop(scope, closed)?;
         respond(scope, this, transform.val(scope, c"readable")?)?;
         if empty {
             return Ok(true);
@@ -1142,13 +1685,24 @@ pub mod server_response_class {
         super::write_body(scope, this, writer, chunk)
     }
 
-    /// Error the response body if it is a stream, or reject the response, and emit `close`.
+    /// Error the response body if it is a stream, or reject the response, and emit `close`. A
+    /// response that writes to a socket destroys the socket with `error`, or emits `close` in the
+    /// tick queue without one.
     #[method(name = "_starlingDestroy")]
     pub fn destroy_impl(
         scope: &Scope<'_>,
         this: Object<'_>,
         error: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
+        if super::super::wire::is_wire(scope, this)? {
+            if let Some(socket) = this.obj(scope, c"socket")? {
+                call_method(scope, socket, c"destroy", &[error])?;
+            } else {
+                let job = Function::new_callback(scope, c"", 0, emit_close_job, this)?;
+                js::jobs::queue_tick(scope, job.to_jsval_throwing(scope)?, &[])?;
+            }
+            return Ok(());
+        }
         if let Some(writer) = this.obj(scope, c"_starlingWriter")? {
             writer_call(scope, writer, c"abort", &[error])?;
         } else if let Some(promise) = super::take_respond(scope, this)? {

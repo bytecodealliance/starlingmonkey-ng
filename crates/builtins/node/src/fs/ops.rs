@@ -988,7 +988,47 @@ fn make_directories(
     }
 }
 
-fn mkdir(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prepared, Thrown> {
+/// [`make_directories`] over `platform::fs::wasi`, which creates directories without modes.
+#[cfg(target_arch = "wasm32")]
+fn make_directories_wasi(
+    path: String,
+    outermost: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), UvError>>>> {
+    Box::pin(async move {
+        let fail = |error| UvError::new(error, "mkdir").path(&path);
+        match platform::fs::wasi::create_dir(&path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == IoErrorKind::AlreadyExists => {
+                match platform::fs::wasi::stat(&path, true).await {
+                    Ok(stat) if stat.kind == FileKind::Directory => Ok(()),
+                    Ok(_) if outermost => Err(fail(error)),
+                    Err(error) if outermost => Err(fail(error)),
+                    _ => Err(UvError::code("ENOTDIR", "mkdir").path(&path)),
+                }
+            }
+            Err(error) if error.kind() == IoErrorKind::NotFound => {
+                match std::path::Path::new(&path)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    Some(parent) => {
+                        let parent = parent.to_string_lossy().into_owned();
+                        make_directories_wasi(parent, false).await?;
+                    }
+                    None => return Err(fail(error)),
+                }
+                platform::fs::wasi::create_dir(&path).await.map_err(fail)
+            }
+            Err(error) => Err(fail(error)),
+        }
+    })
+}
+
+fn mkdir(
+    scope: &Scope<'_>,
+    args: &[HandleValue<'_>],
+    variant: Variant,
+) -> Result<Prepared, Thrown> {
     let path = path_arg(scope, arg(args, 0), "path")?;
     let options = opt(args, 1);
     let (recursive, mode) = match options {
@@ -1000,6 +1040,34 @@ fn mkdir(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prep
             mode_arg(scope, option(scope, options, c"mode")?, Some(0o777))?,
         ),
     };
+    on_wasi!(variant, {
+        let path = path.clone();
+        Prepared::future(Some(Encoding::Utf8), async move {
+            if !recursive {
+                platform::fs::wasi::create_dir(&path)
+                    .await
+                    .map_err(|error| UvError::new(error, "mkdir").path(&path))?;
+                return Ok(Output::Unit);
+            }
+            // The first directory created is the outermost ancestor that doesn't exist yet.
+            let mut first = None;
+            let mut candidate = Some(std::path::Path::new(&path));
+            while let Some(directory) =
+                candidate.filter(|directory| !directory.as_os_str().is_empty())
+            {
+                let name = directory.to_string_lossy();
+                match platform::fs::wasi::stat(&name, true).await {
+                    Err(error) if error.kind() == IoErrorKind::NotFound => {
+                        first = Some(name.into_owned())
+                    }
+                    _ => break,
+                }
+                candidate = directory.parent();
+            }
+            make_directories_wasi(path.clone(), true).await?;
+            Ok(Output::MaybeText(first))
+        })
+    });
     Ok(Prepared::new(Some(Encoding::Utf8), move || {
         let fail = |error| UvError::new(error, "mkdir").path(&path);
         let mut builder = std::fs::DirBuilder::new();
@@ -1187,7 +1255,7 @@ fn read(scope: &Scope<'_>, args: &[HandleValue<'_>], variant: Variant) -> Result
             let end = (offset + bytes.len()).min(view.byte_length());
             if offset < end {
                 view.with_bytes_mut(|target| {
-                    target[offset..end].copy_from_slice(&bytes[..end - offset]);
+                    target[offset..end].copy_from_slice(&bytes[..end - offset])
                 });
             }
         }
@@ -1246,10 +1314,9 @@ fn write(
         return Ok(write_bytes(variant, handle, bytes, position, finish));
     }
     let (buffer, offset, length, position) = buffer_args(scope, args, 1, false)?;
-    let bytes = match js::ArrayBufferView::from_object(buffer) {
-        Some(view) => view.with_bytes(|bytes| bytes[offset..offset + length].to_vec()),
-        None => Vec::new(),
-    };
+    let bytes = js::ArrayBufferView::from_object(buffer)
+        .map(|view| view.with_bytes(|bytes| bytes[offset..offset + length].to_vec()))
+        .unwrap_or_default();
     let buffer = RootedHeap::<js::object::Object>::new(buffer);
     let finish: Finish = Box::new(move |scope, output, variant| {
         let Output::Count(count) = output else {
@@ -1520,9 +1587,22 @@ fn realpath(
     }))
 }
 
-fn rename(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prepared, Thrown> {
+fn rename(
+    scope: &Scope<'_>,
+    args: &[HandleValue<'_>],
+    variant: Variant,
+) -> Result<Prepared, Thrown> {
     let old = path_arg(scope, arg(args, 0), "oldPath")?;
     let new = path_arg(scope, arg(args, 1), "newPath")?;
+    on_wasi!(variant, {
+        let (old, new) = (old.clone(), new.clone());
+        Prepared::future(None, async move {
+            platform::fs::wasi::rename(&old, &new)
+                .await
+                .map_err(|error| UvError::new(error, "rename").path(&old).dest(&new))?;
+            Ok(Output::Unit)
+        })
+    });
     Ok(Prepared::new(None, move || {
         std::fs::rename(&old, &new)
             .map_err(|error| UvError::new(error, "rename").path(&old).dest(&new))?;
@@ -1569,9 +1649,22 @@ fn rm(scope: &Scope<'_>, args: &[HandleValue<'_>], variant: Variant) -> Result<P
     }))
 }
 
-fn rmdir(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prepared, Thrown> {
+fn rmdir(
+    scope: &Scope<'_>,
+    args: &[HandleValue<'_>],
+    variant: Variant,
+) -> Result<Prepared, Thrown> {
     let path = path_arg(scope, arg(args, 0), "path")?;
     let recursive = flag_option(scope, opt(args, 1), c"recursive")?;
+    on_wasi!(variant, !recursive, {
+        let path = path.clone();
+        Prepared::future(None, async move {
+            platform::fs::wasi::remove_dir(&path)
+                .await
+                .map_err(|error| UvError::new(error, "rmdir").path(&path))?;
+            Ok(Output::Unit)
+        })
+    });
     Ok(Prepared::new(None, move || {
         let result = if recursive {
             std::fs::remove_dir_all(&path)
@@ -1583,8 +1676,21 @@ fn rmdir(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prep
     }))
 }
 
-fn unlink(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prepared, Thrown> {
+fn unlink(
+    scope: &Scope<'_>,
+    args: &[HandleValue<'_>],
+    variant: Variant,
+) -> Result<Prepared, Thrown> {
     let path = path_arg(scope, arg(args, 0), "path")?;
+    on_wasi!(variant, {
+        let path = path.clone();
+        Prepared::future(None, async move {
+            platform::fs::wasi::remove_file(&path)
+                .await
+                .map_err(|error| UvError::new(error, "unlink").path(&path))?;
+            Ok(Output::Unit)
+        })
+    });
     Ok(Prepared::new(None, move || {
         std::fs::remove_file(&path).map_err(|error| UvError::new(error, "unlink").path(&path))?;
         Ok(Output::Unit)

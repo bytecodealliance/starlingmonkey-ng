@@ -1151,6 +1151,25 @@ pub mod writable {
         )
     }
 
+    /// <https://nodejs.org/api/stream.html#streamwritablefromwebwritablestream-options>
+    #[static_method]
+    pub fn from_web<'s>(
+        scope: &'s Scope<'_>,
+        writable_stream: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        super::super::adapters::writable_from_web(scope, writable_stream, options)
+    }
+
+    /// <https://nodejs.org/api/stream.html#streamwritabletowebstreamwritable>
+    #[static_method]
+    pub fn to_web<'s>(
+        scope: &'s Scope<'_>,
+        stream_writable: HandleValue<'_>,
+    ) -> Result<Object<'s>, Thrown> {
+        super::super::adapters::writable_to_web(scope, stream_writable)
+    }
+
     /// Define the accessors, `_writev`, `Symbol.hasInstance`, the rejection handler, and
     /// `WritableState`.
     #[setup]

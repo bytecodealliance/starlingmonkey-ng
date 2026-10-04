@@ -1,27 +1,34 @@
-# The Node.js tests run-node-tests.mjs runs, as globs over test/parallel. Each covers a module
-# --node-compat implements. The crypto tests are left out: test/common's `hasCrypto` requires
-# `process.versions.openssl`, so they all skip.
-test-assert*
-test-async-local-storage-*
-test-buffer-*
-test-diagnostics-channel-*
-test-dns-lookup*
-test-event-emitter-*
-test-events-*
-test-fs-*
-test-http-*
-test-net-*
-test-os*
-test-path-*
-test-process-*
-test-punycode*
-test-querystring*
-test-readline-*
-test-stream-*
-test-stream2-*
-test-stream3-*
-test-string-decoder*
-test-timers*
-test-url-*
-test-util-*
-test-zlib-*
+# The Node.js tests run-node-tests.mjs runs: every test in test/parallel, except those that a `!`
+# glob leaves out. A selected test that needs something the runtime can't provide is skipped
+# with the reason (see SKIP_PATTERNS in run-node-tests.mjs), as are tests that call
+# `common.skip()`, such as the crypto, TLS and HTTPS tests, which need `process.versions.openssl`.
+test-*
+
+# Tests of Node's own build and tooling rather than of its runtime APIs: startup snapshots,
+# single executable applications, the compile cache, code coverage, the bootstrap module list,
+# its lint rules, the npm and corepack integrations, and its test and benchmark tooling.
+!test-snapshot-*
+!test-sea-*
+!test-compile-cache-*
+!test-coverage*
+!test-bootstrap-modules*
+!test-eslint-*
+!test-npm-*
+!test-corepack*
+!test-testpy*
+!test-benchmark-*
+!test-strace*
+
+# V8's heap snapshots and C++ heap, V8's trace events, and the V8 inspector protocol and the
+# debugger built on it.
+!test-heapdump*
+!test-heapsnapshot*
+!test-heap-*
+!test-cppheap*
+!test-trace-*
+!test-tracing-*
+!test-inspector*
+!test-debugger-*
+
+# QUIC, which is experimental and bound to Node's ngtcp2 and OpenSSL build.
+!test-quic-*

@@ -1,0 +1,1 @@
+{"name":"koa-portal","private":true,"version":"1.0.0","type":"module","dependencies":{"@koa/cors":"5.0.0","@koa/etag":"5.0.2","@koa/router":"15.7.0","handlebars":"4.7.9","koa":"3.2.1","koa-body":"8.0.1","koa-compress":"5.2.2","koa-conditional-get":"3.0.0","koa-session":"7.0.2","koa-static":"5.0.0"}}

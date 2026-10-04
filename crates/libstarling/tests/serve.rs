@@ -4041,3 +4041,133 @@ fn node_http_servers_respond_to_served_requests() {
     handle.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// With `--node-compat`, a `ServerResponse` whose body another request's handler writes and ends,
+/// as server-sent events fed by an `EventEmitter` are, is sent whole, and the `Content-Length` a
+/// handler sets frames its streamed body and a `HEAD` response.
+#[test]
+fn node_http_responses_stay_open_for_other_requests() {
+    let dir = std::env::temp_dir().join(format!("starling-serve-node-sse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("server.cjs"),
+        r#"const http = require('http');
+        const { EventEmitter } = require('events');
+        const bus = new EventEmitter();
+        http.createServer((req, res) => {
+            if (req.url === '/events') {
+                res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+                res.write('data: open\n\n');
+                bus.once('event', (text) => res.end(`data: ${text}\n\n`));
+            } else if (req.url === '/emit') {
+                res.end(String(bus.emit('event', 'from another request')));
+            } else {
+                res.setHeader('Content-Length', '5');
+                res.write('he');
+                setTimeout(() => res.end('llo'), 5);
+            }
+        }).listen(0);
+        "#,
+    )
+    .unwrap();
+    let port = 18483;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            script_path: dir.join("server.cjs").to_string_lossy().into_owned(),
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    let mut events = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    events
+        .write_all(b"GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut opened = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !String::from_utf8_lossy(&opened).contains("data: open") {
+        let n = events.read(&mut buf).unwrap();
+        assert!(n > 0, "{}", String::from_utf8_lossy(&opened));
+        opened.extend_from_slice(&buf[..n]);
+    }
+    // The events request's handler has no work queued until this request emits the event.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(request(port, "GET", "/emit", ""), "true");
+    let rest = read_until_eof(&mut events, PATIENCE).expect("the events response ends");
+    let response = String::from_utf8_lossy(&opened).into_owned() + &String::from_utf8_lossy(&rest);
+    let body = &response[response.find("\r\n\r\n").unwrap() + 4..];
+    assert_eq!(
+        dechunk(body),
+        "data: open\n\ndata: from another request\n\n",
+        "{response}"
+    );
+
+    let sized = raw_request(
+        port,
+        b"GET /sized HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        sized.to_ascii_lowercase().contains("content-length: 5"),
+        "{sized}"
+    );
+    assert!(sized.ends_with("\r\n\r\nhello"), "{sized}");
+    let head = raw_request(
+        port,
+        b"HEAD /sized HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("content-length: 5"),
+        "{head}"
+    );
+
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--node-compat`, a pending `node:fs` operation keeps its request's event loop running, so a
+/// `WriteStream` that requests write to after their responses keeps writing every chunk.
+#[test]
+fn node_fs_operations_outlive_the_response() {
+    let dir = std::env::temp_dir().join(format!("starling-serve-node-fs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("server.cjs"),
+        r#"const http = require('http');
+        const fs = require('fs');
+        const path = require('path');
+        const file = path.join(__dirname, 'log.txt');
+        fs.writeFileSync(file, '');
+        const log = fs.createWriteStream(file, { flags: 'a' });
+        http.createServer(async (req, res) => {
+            if (req.url === '/read') {
+                res.end(await fs.promises.readFile(file, 'utf8'));
+                return;
+            }
+            log.write(`${req.url} 1\n`);
+            log.write(`${req.url} 2\n`);
+            res.end('ok');
+        }).listen(0);
+        "#,
+    )
+    .unwrap();
+    let port = 18484;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            script_path: dir.join("server.cjs").to_string_lossy().into_owned(),
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    assert_eq!(request(port, "GET", "/a", ""), "ok");
+    assert_eq!(request(port, "GET", "/b", ""), "ok");
+    let expected = "/a 1\n/a 2\n/b 1\n/b 2\n";
+    assert_eq!(eventually(port, "/read", |log| log == expected), expected);
+
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

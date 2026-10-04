@@ -13,6 +13,7 @@ use platform::fs::{FileKind, Stat};
 
 use super::{text_value, Entry};
 use crate::buffer::Encoding;
+use crate::errors::Thrown;
 
 /// The numeric fields of `Stats`, in the order of the `Stats` constructor's parameters.
 const FIELDS: [&std::ffi::CStr; 14] = [
@@ -267,6 +268,27 @@ pub mod dirent_class {
     pub fn is_socket(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
         is_kind(scope, this, FileKind::Socket)
     }
+}
+
+/// A new `Dirent` named `name` in the directory `parent`, of the type `kind`, a `UV_DIRENT_*`
+/// constant. With `UV_DIRENT_UNKNOWN`, the type is that of the file `path`, as `lstat` reports it.
+pub(crate) fn new_dirent<'s>(
+    scope: &'s Scope<'_>,
+    name: HandleValue<'s>,
+    parent: HandleValue<'s>,
+    kind: f64,
+    path: &str,
+) -> Result<HandleValue<'s>, Thrown> {
+    let kind = if kind == f64::from(dirent_type(FileKind::Unknown)) {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| super::UvError::new(error, "lstat").path(path).throw(scope))?;
+        f64::from(dirent_type(FileKind::of(metadata.file_type())))
+    } else {
+        kind
+    };
+    let class = dirent_class::class_constructor(scope)?;
+    let kind = scope.root_value(js::value::from_f64(kind));
+    Ok(Function::construct(scope, class, &[name, kind, parent])?.to_jsval_throwing(scope)?)
 }
 
 /// A new `Dirent` for `entry`, with the name in `encoding`.

@@ -1,0 +1,31 @@
+<%- include('layout-top', { title: 'Home' }) %>
+  <h1>Notes (<%= notes.length %>)</h1>
+  <% if (notes.length === 0) { %>
+    <p>No notes yet.</p>
+  <% } else { %>
+    <table>
+      <tr><th>#</th><th>Title</th><th>Body</th><th></th></tr>
+      <% notes.forEach(function (note, i) { %>
+        <tr>
+          <td><%= i + 1 %></td>
+          <td><a href="<%= base %>/notes/<%= note.id %>"><%= note.title %></a></td>
+          <td><%- formatBody(note.body) %></td>
+          <td>
+            <form method="post" action="<%= base %>/notes/<%= note.id %>?_method=DELETE"><button>Delete</button></form>
+          </td>
+        </tr>
+      <% }) %>
+    </table>
+  <% } %>
+  <% if (user) { %>
+    <form method="post" action="<%= base %>/notes">
+      <input name="title" value="<%= draft.title || '' %>">
+      <textarea name="body"><%= draft.body || '' %></textarea>
+      <input type="hidden" name="tags[]" value="a">
+      <input type="hidden" name="tags[]" value="b">
+      <button>Add</button>
+    </form>
+  <% } %>
+  <footer>Visits this session: <%= visits %>. Theme: <%= theme %>.</footer>
+</body>
+</html>

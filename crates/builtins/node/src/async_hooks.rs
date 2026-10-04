@@ -25,7 +25,7 @@ use js::{Function, Object};
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
 
 /// The `Map` the current async context is, if there is one.
-fn current_frame<'s>(scope: &'s Scope<'_>) -> Option<js::Map<'s>> {
+pub(crate) fn current_frame<'s>(scope: &'s Scope<'_>) -> Option<js::Map<'s>> {
     js::async_context::current(scope).and_then(|context| context.cast::<js::Map>().ok())
 }
 
@@ -45,7 +45,7 @@ fn copy_entry(
 
 /// A copy of the current async context's frame in which `storage` maps to `store`, or doesn't
 /// appear if `store` is `None`.
-fn derived_frame<'s>(
+pub(crate) fn derived_frame<'s>(
     scope: &'s Scope<'_>,
     storage: Object<'_>,
     store: Option<HandleValue<'_>>,
@@ -68,7 +68,7 @@ fn derived_frame<'s>(
 
 /// Call `callback` with `this` and `args` while `context` is current, then restore the context
 /// that was current before, whether or not `callback` throws.
-fn call_in(
+pub(crate) fn call_in(
     scope: &Scope<'_>,
     context: Snapshot,
     callback: HandleValue<'_>,

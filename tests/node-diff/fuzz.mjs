@@ -4,16 +4,18 @@
 // Differential fuzzing of StarlingMonkey's `--node-compat` mode, with Node.js as the oracle.
 //
 // Each program is a sequence of operations drawn from the generators in generators.mjs, after
-// prelude.js. The driver runs a program twice under Node.js and once under StarlingMonkey, and
-// compares the traces operation by operation. Operations whose two Node.js traces differ are
-// nondeterministic and are not compared. Each difference is rerun as a program of its one
-// operation: if that program still differs, it becomes the difference's reproduction, and
-// otherwise the difference is reported as an interaction with the program it came from.
+// prelude.js. The driver runs a program twice under Node.js and once under StarlingMonkey (with
+// `--node-http-listen`, so HTTP servers accept connections), and compares the traces operation by
+// operation. Operations whose two Node.js traces differ are nondeterministic and are not compared.
+// Each difference is rerun as a program of its one operation: if that program still differs, it
+// becomes the difference's reproduction, and otherwise the difference is reported as an
+// interaction with the program it came from.
 //
 // Differences are grouped by signature: generator, variant, the kind of difference, and the
 // error code involved. known-diffs.json lists the signatures that are accepted, with a reason
-// each. A listed key ending in `*` accepts every signature that starts with the rest. The run exits with status 1 if it finds a signature outside that list that reproduces as
-// a program of its one operation.
+// each. A listed key ending in `*` accepts every signature that starts with the rest. The run
+// exits with status 1 if it finds a signature outside that list that reproduces as a program of
+// its one operation.
 //
 // Usage:
 //   node tests/node-diff/fuzz.mjs [options]
@@ -209,7 +211,7 @@ function parseTrace(stdout) {
 }
 
 const nodeRun = (config, file, workDir) => run(config, config.node, ["--no-warnings"], file, workDir);
-const starlingRun = (config, file, workDir) => run(config, config.runtime, ["--node-compat"], file, workDir);
+const starlingRun = (config, file, workDir) => run(config, config.runtime, ["--node-compat", "--node-http-listen"], file, workDir);
 
 /** Runs `ops` in a program in `workDir`, and resolves with the differences found. */
 async function compareProgram(config, ops, workDir) {

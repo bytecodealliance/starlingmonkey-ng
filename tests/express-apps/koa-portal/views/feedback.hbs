@@ -1,0 +1,13 @@
+<h1>{{title}}</h1>
+{{#if empty}}
+<p>No feedback yet. <a href="/#feedback">Be the first.</a></p>
+{{else}}
+<table>
+  <thead><tr><th>#</th><th>Name</th><th>App</th><th>Rating</th><th>Message</th></tr></thead>
+  <tbody>
+    {{#each feedback}}
+    <tr><td>{{id}}</td><td>{{name}}</td><td><a href="/apps/{{app}}">{{app}}</a></td><td>{{rating}}</td><td>{{message}}</td></tr>
+    {{/each}}
+  </tbody>
+</table>
+{{/if}}

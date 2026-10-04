@@ -1,0 +1,28 @@
+<h1>{{title}}</h1>
+<p>Each app below runs on StarlingMonkey's Node.js compatibility mode. The links and forms send
+requests to the app's own routes.</p>
+
+{{#each apps}}
+<section class="app" id="{{name}}">
+  <h2><a href="{{appUrl name home}}">{{title}}</a> <small>{{stack}}</small></h2>
+  <p>{{summary}}</p>
+  {{> examples}}
+  <p><a href="/apps/{{name}}">More about {{title}}</a></p>
+</section>
+{{/each}}
+
+<section class="feedback">
+  <h2>Leave feedback</h2>
+  <p>{{feedbackCount}} notes so far.</p>
+  <form method="POST" action="/feedback">
+    <label>Name <input type="text" name="name"></label>
+    <label>App
+      <select name="app">
+        {{#each apps}}<option value="{{name}}">{{title}}</option>{{/each}}
+      </select>
+    </label>
+    <label>Rating <input type="number" name="rating" min="1" max="5" value="5"></label>
+    <label>Message <textarea name="message"></textarea></label>
+    <button type="submit">Send</button>
+  </form>
+</section>

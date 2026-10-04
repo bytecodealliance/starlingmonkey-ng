@@ -129,13 +129,27 @@ eq(http.STATUS_CODES[418], "I'm a Teapot", "STATUS_CODES");
 
   const response = new ServerResponse({ method: "GET" });
   eq(response.writeHead(201, "Made", { "X-A": "1" }), response, "writeHead returns the response");
-  deepEq([response.statusCode, response.statusMessage, response.getHeader("x-a"), response.headersSent], [201, "Made", "1", true], "writeHead");
+  deepEq([response.statusCode, response.statusMessage, response.getHeader("x-a"), response.headersSent], [201, "Made", undefined, true], "writeHead sends the headers it is given without setting them");
   throws(() => response.removeHeader("x-a"), "ERR_HTTP_HEADERS_SENT", "removeHeader after writeHead");
   throws(() => new ServerResponse().setHeader("bad name", "x"), "ERR_INVALID_HTTP_TOKEN", "header names");
   const finished = new Promise((resolve) => response.on("finish", resolve));
-  response.end("ignored");
+  response.end("body");
+  eq(response.writableFinished, false, "a response without a socket queues its bytes");
+  const written = [];
+  const socket = new Writable({
+    write(chunk, encoding, callback) {
+      written.push(Buffer.from(chunk, encoding));
+      callback();
+    },
+  });
+  response.assignSocket(socket);
   await finished;
-  eq(response.writableFinished, true, "finish");
+  eq(response.writableFinished, true, "finish once the socket wrote the response");
+  eq(
+    Buffer.concat(written).toString("latin1").replace(/Date: [^\r]*\r\n/, "Date: -\r\n"),
+    "HTTP/1.1 201 Made\r\nX-A: 1\r\nDate: -\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n",
+    "the response on the wire",
+  );
   const lateErrors = [];
   response.on("error", (error) => lateErrors.push(error.code));
   response.write("more", (error) => lateErrors.push(error.code));

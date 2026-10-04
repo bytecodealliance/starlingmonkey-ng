@@ -349,16 +349,17 @@ pub fn add_listener<'s>(
     Ok(emitter)
 }
 
-/// Print the `MaxListenersExceededWarning` for `count` listeners of `name`, through
-/// `process.emitWarning` if `process` exists, and to stderr otherwise.
+/// Print the `MaxListenersExceededWarning` for `count` listeners of the event `event`, through
+/// `process.emitWarning` if `process` exists, and to stderr otherwise. The warning is an `Error`
+/// with the `emitter`, the event as `type`, and the `count`.
 fn warn_max_listeners(
     scope: &Scope<'_>,
     emitter: Object<'_>,
-    name: HandleValue<'_>,
+    event: HandleValue<'_>,
     count: u32,
     limit: f64,
 ) -> Result<(), ExnThrown> {
-    let name = string_of(scope, name)?;
+    let name = string_of(scope, event)?;
     let constructor = emitter.get_property(scope, c"constructor")?;
     let class = match Object::from_value(scope, constructor) {
         Ok(constructor) => {
@@ -371,7 +372,25 @@ fn warn_max_listeners(
         "Possible EventEmitter memory leak detected. {count} {name} listeners added to [{class}]. \
          MaxListeners is {limit}. Use emitter.setMaxListeners() to increase limit"
     );
-    crate::process::emit_warning(scope, &message, "MaxListenersExceededWarning")
+    let process = scope.global().get_property(scope, c"process")?;
+    let Ok(process) = Object::from_value(scope, process) else {
+        return crate::process::emit_warning(scope, &message, "MaxListenersExceededWarning");
+    };
+    let error_class = scope.global().get_property(scope, c"Error")?;
+    let error_class = Object::from_value(scope, error_class).map_err(|e| e.throw(scope))?;
+    let message = js::JSString::from_str(scope, &message)?.to_jsval_throwing(scope)?;
+    let warning = Function::construct(scope, error_class, &[message])?;
+    warning.set_property(scope, c"name", "MaxListenersExceededWarning")?;
+    warning.set_property(scope, c"emitter", emitter)?;
+    warning.set_property(scope, c"type", event)?;
+    warning.set_property(scope, c"count", count)?;
+    Function::call_by_name(
+        scope,
+        process.handle(),
+        c"emitWarning",
+        &[warning.to_jsval_throwing(scope)?],
+    )?;
+    Ok(())
 }
 
 /// `String(value)`, which gives a symbol's description where `ToString` throws.

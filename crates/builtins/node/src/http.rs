@@ -2,13 +2,18 @@
 
 //! `node:http` and `node:https`. See <https://nodejs.org/api/http.html>.
 //!
-//! Servers serve the runtime's incoming requests (see [`server`]), and clients send requests
-//! through `platform::http` (see [`client`]), which handles connections and TLS.
+//! Servers serve the runtime's incoming requests, or HTTP/1.1 connections they accept themselves
+//! (see [`server`]), and clients send requests through `platform::http` (see [`client`]), which
+//! handles connections and TLS.
 
 mod client;
+mod connection;
+mod host_socket;
 mod incoming;
 mod outgoing;
+mod parser;
 mod server;
+mod wire;
 
 use js::conversion::ToJSVal;
 use js::error::ExnThrown;
@@ -19,20 +24,6 @@ use js::{Function, Object};
 use crate::stream::{call_method, Props};
 
 use crate::errors::{ErrorKind, NodeError, Thrown};
-
-/// Register the classes of `node:http` on `global`.
-pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
-    client::SendCancel::add_to_global(scope, global);
-    incoming::ResponseBody::add_to_global(scope, global);
-    outgoing::outgoing_message_class::register(scope)?;
-    outgoing::server_response_class::register(scope)?;
-    incoming::incoming_message_class::register(scope)?;
-    client::client_request_class::register(scope)?;
-    client::agent_class::register(scope)?;
-    client::https_agent_class::register(scope)?;
-    server::server_class::register(scope)?;
-    Ok(())
-}
 
 /// The methods Node's HTTP parser supports, in order.
 const METHODS: [&str; 35] = [
@@ -457,4 +448,21 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         return false;
     };
     crate::stub::register_implemented_with::<module::js_module>(scope, name, &tables)
+}
+
+/// Register the classes of `node:http` on `global`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
+    client::SendCancel::add_to_global(scope, global);
+    client::client_request_class::register(scope)?;
+    client::agent_class::register(scope)?;
+    client::https_agent_class::register(scope)?;
+    connection::ParserHandle::add_to_global(scope, global);
+    host_socket::host_socket_class::register(scope)?;
+    incoming::ResponseBody::add_to_global(scope, global);
+    incoming::incoming_message_class::register(scope)?;
+    outgoing::BodyInterest::add_to_global(scope, global);
+    outgoing::outgoing_message_class::register(scope)?;
+    outgoing::server_response_class::register(scope)?;
+    server::server_class::register(scope)?;
+    Ok(())
 }

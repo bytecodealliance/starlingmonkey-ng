@@ -838,9 +838,14 @@ fn is_zero_width(code: u32) -> bool {
 }
 
 /// The columns `text` takes on a terminal, without its escape sequences.
-fn string_width(text: &str) -> usize {
-    crate::util::strip_vt_control_characters(text)
-        .chars()
+pub(crate) fn string_width(text: &str) -> usize {
+    columns(&crate::util::strip_vt_control_characters(text))
+}
+
+/// The columns `text` takes on a terminal, counting the characters of escape sequences as any
+/// other characters.
+pub(crate) fn columns(text: &str) -> usize {
+    text.chars()
         .map(|c| {
             let code = c as u32;
             if is_full_width(code) {
@@ -1149,10 +1154,10 @@ impl<'s> Inspector<'s> {
         scope: &Scope<'_>,
         object: Object<'_>,
     ) -> Result<String, ExnThrown> {
-        let bytes = view_of(object)
-            .map(|view| view.copy_bytes(scope))
-            .transpose()?
-            .unwrap_or_default();
+        let bytes = match view_of(object) {
+            Some(view) => view.copy_bytes(scope)?,
+            None => Vec::new(),
+        };
         let max = crate::buffer::inspect_max_bytes() as usize;
         let mut text: Vec<String> = bytes.iter().take(max).map(|b| format!("{b:02x}")).collect();
         let mut text = std::mem::take(&mut text).join(" ");

@@ -19,6 +19,7 @@ mod cp;
 mod ops;
 mod promises;
 mod streams;
+mod watch;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -39,18 +40,9 @@ use crate::buffer::{decode_bytes, encode_string, new_buffer, Encoding};
 use crate::errors::{validate_function, validate_integer, ErrorKind, NodeError, Thrown};
 use crate::stream::{closure, Captures};
 
+pub(crate) use classes::new_dirent;
 pub(crate) use promises::register_promises;
-
-/// Register the classes of `node:fs` on `global`.
-pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
-    cp::CopyWalk::add_to_global(scope, global);
-    classes::stats_class::register(scope)?;
-    classes::dirent_class::register(scope)?;
-    promises::file_handle_class::register(scope)?;
-    streams::read_stream_class::register(scope)?;
-    streams::write_stream_class::register(scope)?;
-    Ok(())
-}
+pub(crate) use watch::{active_watchers, is_poll_timer};
 
 /// How an operation reports its result: returned from a synchronous function, passed to a
 /// callback, or fulfilling a promise.
@@ -426,7 +418,7 @@ pub(crate) fn path_arg(
     } else {
         let object = Object::from_value(scope, *value).map_err(|_| invalid())?;
         if let Some(view) = js::ArrayBufferView::from_object(object) {
-            String::from_utf8_lossy(&view.copy_bytes(scope)?).into_owned()
+            view.with_bytes(|bytes| String::from_utf8_lossy(bytes).into_owned())
         } else if crate::url::is_url(scope, value)? {
             let href = object.get_property(scope, c"href")?;
             let href = js::JSString::from_value(scope, href)?.to_utf8(scope)?;
@@ -720,9 +712,11 @@ pub(crate) fn data_arg(
         let string = js::JSString::from_value(scope, value)?;
         return Ok(encode_string(scope, string, encoding)?);
     }
-    let view = Object::from_value(scope, *value)
+    Object::from_value(scope, *value)
         .ok()
         .and_then(js::ArrayBufferView::from_object)
+        .map(|view| view.copy_bytes(scope))
+        .transpose()?
         .ok_or_else(|| {
             NodeError::invalid_arg_type(
                 scope,
@@ -730,8 +724,8 @@ pub(crate) fn data_arg(
                 "of type string or an instance of Buffer, TypedArray, or DataView",
                 value,
             )
-        })?;
-    Ok(view.copy_bytes(scope)?)
+            .into()
+        })
 }
 
 // ============================================================================
@@ -960,9 +954,18 @@ pub(crate) fn run_sync<'s>(
         .unwrap_or(HandleValue::undefined()))
 }
 
+/// An interest in the current event loop, which keeps it running until the handle is dropped, or
+/// `None` without an event loop.
+pub(crate) fn hold_event_loop() -> Option<core_runtime::event_loop::InterestHandle> {
+    core_runtime::event_loop::with_active_event_loop(|event_loop| {
+        event_loop.acquire_interest_handle()
+    })
+}
+
 /// Start `prepared` and return a promise for its result. The promise is fulfilled with the
 /// array of the values for [`Variant::Callback`], and with the first value otherwise. On WASI,
-/// blocking work throws where blocking host I/O isn't allowed.
+/// blocking work throws where blocking host I/O isn't allowed. Until the promise settles,
+/// the operation keeps the current event loop running, as a pending libuv request does in Node.js.
 pub(crate) fn run_async<'s>(
     scope: &'s Scope<'_>,
     function: &str,
@@ -970,8 +973,10 @@ pub(crate) fn run_async<'s>(
     variant: Variant,
 ) -> Result<js::Promise<'s>, Thrown> {
     let Prepared { work, finish } = prepared;
+    let interest = hold_event_loop();
     let settle = move |result: Result<Output, UvError>| {
         PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
+            drop(interest);
             let output = result.map_err(|error| error.throw(scope))?;
             let values = finish(scope, output, variant).map_err(|thrown| thrown.throw(scope))?;
             if variant == Variant::Callback {
@@ -1251,6 +1256,35 @@ pub mod module {
         Function::construct(scope, class, &[path, options])
     }
 
+    /// <https://nodejs.org/api/fs.html#fswatchfilename-options-listener>
+    pub fn watch<'s>(
+        scope: &'s Scope<'_>,
+        filename: HandleValue<'_>,
+        options: HandleValue<'_>,
+        listener: HandleValue<'_>,
+    ) -> Result<Object<'s>, Thrown> {
+        super::watch::watch(scope, filename, options, listener)
+    }
+
+    /// <https://nodejs.org/api/fs.html#fswatchfilefilename-options-listener>
+    pub fn watch_file<'s>(
+        scope: &'s Scope<'_>,
+        filename: HandleValue<'_>,
+        options: HandleValue<'_>,
+        listener: HandleValue<'_>,
+    ) -> Result<Object<'s>, Thrown> {
+        super::watch::watch_file(scope, filename, options, listener)
+    }
+
+    /// <https://nodejs.org/api/fs.html#fsunwatchfilefilename-listener>
+    pub fn unwatch_file(
+        scope: &Scope<'_>,
+        filename: HandleValue<'_>,
+        listener: HandleValue<'_>,
+    ) -> Result<(), Thrown> {
+        super::watch::unwatch_file(scope, filename, listener)
+    }
+
     /// <https://nodejs.org/api/fs.html#fscreatewritestreampath-options>
     pub fn create_write_stream<'s>(
         scope: &'s Scope<'_>,
@@ -1303,4 +1337,19 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         return false;
     };
     crate::stub::register_implemented_with::<module::js_module>(scope, name, &exports)
+}
+
+/// Register the classes of `node:fs` on `global`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
+    classes::stats_class::register(scope)?;
+    classes::dirent_class::register(scope)?;
+    cp::CopyWalk::add_to_global(scope, global);
+    promises::file_handle_class::register(scope)?;
+    streams::read_stream_class::register(scope)?;
+    streams::write_stream_class::register(scope)?;
+    watch::FSEvent::add_to_global(scope, global);
+    watch::fs_watcher_class::register(scope)?;
+    watch::recursive_watcher_class::register(scope)?;
+    watch::stat_watcher_class::register(scope)?;
+    Ok(())
 }

@@ -9,9 +9,10 @@ specification for the implementation in `crates/builtins/node` and the module-sy
 
 Node compatibility is opt-in:
 
-- The CLI takes `--node-compat`.
+- The CLI takes `--node-compat`. With `--allow-node-runtime-flags` as well, it also takes Node.js
+  runtime flags, such as `--expose-gc` (see [Runtime flags](#runtime-flags)).
 - `starling-componentize` takes `--node-compat`, which it passes to the runtime's `init` export
-  (`starling:componentize/init@0.2.0`).
+  (`starling:componentize/init@0.2.0`). Components don't take Node.js runtime flags.
 
 Without the flag the runtime is web-only: no Node globals, no `node:` modules, no CommonJS, and
 module resolution uses the web condition set (see [Module resolution](#module-resolution)).
@@ -28,6 +29,126 @@ With the flag:
 - `console.log`, `info`, `debug`, `warn`, `error` and `trace` format their arguments with
   `util.format`, `console.dir` uses `util.inspect` with its options, and `warn` and `error` print
   to stderr without the runtime's `Warn: ` and `Error: ` prefixes, as Node prints them.
+
+The CLI also takes `--node-http-listen`, which makes `http.Server.listen()` in a script run as a
+command accept HTTP/1.1 connections itself, through `net.Server` (see
+[`node:http`](#nodehttp-and-nodehttps)). Without it, `listen()` emits `ERR_SERVE_MODE_REQUIRED`
+there. It has no effect with `--serve` or in a component.
+
+## Runtime flags
+
+`--allow-node-runtime-flags`, which requires `--node-compat`, makes the CLI accept Node.js runtime
+flags before the script path:
+
+```sh
+starlingmonkey --node-compat --allow-node-runtime-flags --expose-internals --no-warnings test.js
+```
+
+Every argument before the script path that starts with `-` and isn't an option of the runtime is
+a Node.js flag. The runtime's options keep their meaning where Node.js has an option of the same
+name, such as `-e` and `-v`. A flag is written as `--name` or `--name=value`. A value in the next
+argument isn't supported, since that argument is taken for the script path. Dashes and underscores
+in a name are interchangeable, as in Node.js. The flags are `process.execArgv`, as given.
+
+A flag takes effect, is accepted without effect, or is rejected. A rejected or unknown flag ends
+the process with status 1 and an error naming it, before the script runs. Without
+`--allow-node-runtime-flags`, every Node.js flag is an unknown option of the runtime.
+
+These flags take effect:
+
+- `--expose-internals`: `require` and `import` resolve Node.js's internal modules (see
+  [Internal modules](#internal-modules)).
+- `--expose-gc`: a global `gc(options)` runs a full garbage collection. With
+  `options.execution` `'async'` it returns a promise resolved after the collection. `options.type`
+  is ignored.
+- `--no-warnings` and `--warnings`: with `--no-warnings`, process warnings aren't printed, and
+  are still emitted as `warning` events. `process.noProcessWarnings` is then `true`.
+- `--pending-deprecation`: the pending deprecations emit their warnings. `Buffer()` (DEP0005) and
+  loading `punycode` (DEP0040) warn when called from a module in `node_modules` as well, assigning
+  a value other than a string, number or boolean to a `process.env` property warns (DEP0104), and
+  so does `process.binding()` (DEP0111).
+- `--no-deprecation`, `--deprecation` and `--throw-deprecation`: the initial
+  `process.noDeprecation` and `process.throwDeprecation`.
+- `--abort-on-uncaught-exception`: an uncaught exception, unless
+  `process.setUncaughtExceptionCaptureCallback` set a callback, prints `Uncaught` with the error
+  and its stack frames, as Node.js does, and aborts the process with `SIGABRT` natively and traps
+  on wasm, without emitting `uncaughtException`. A rejection nothing handles is printed as without
+  the flag, and then aborts the process.
+- `--title=title`: the initial `process.title`.
+- `--network-family-autoselection`, `--no-network-family-autoselection` and
+  `--network-family-autoselection-attempt-timeout=ms`: the initial
+  `net.getDefaultAutoSelectFamily()` and `net.getDefaultAutoSelectFamilyAttemptTimeout()`.
+  Connecting tries the addresses a host resolves to in turn either way.
+- `--experimental-stream-iter`: `stream/iter` and `zlib/iter` can be imported. Their exports are
+  stubs.
+
+These flags are accepted without effect:
+
+- `--zero-fill-buffers`: every new `Buffer` is zero-filled, including those of `allocUnsafe`.
+- `--insecure-http-parser`: the HTTP parser has no lenient mode, so it stays strict.
+- `--max-old-space-size`, `--max-semi-space-size` and `--no-concurrent-array-buffer-sweeping`:
+  V8 heap settings.
+- `--experimental-vm-modules`: `node:vm` is a stub.
+
+These flags are rejected:
+
+- `--allow-natives-syntax`: V8's `%` intrinsics have no SpiderMonkey equivalent.
+- `--expose-externalize-string`: V8's external strings have no SpiderMonkey equivalent.
+- `--permission`, `--allow-fs-read`, `--allow-fs-write`, `--allow-child-process`,
+  `--allow-worker`, `--allow-addons` and `--allow-wasi`: the permission model isn't implemented,
+  and a script given them would otherwise run without the restrictions they ask for.
+
+### Internal modules
+
+With `--expose-internals`, the internal modules Node.js's tests load can be `require`d and
+imported, with and without the `node:` prefix: `internal/assert/myers_diff`,
+`internal/async_context_frame`, `internal/async_hooks`, `internal/blocklist`, `internal/buffer`,
+`internal/errors`, `internal/event_target`, `internal/fs/glob`, `internal/fs/promises`,
+`internal/fs/recursive_watch`, `internal/fs/utils`, `internal/fs/watchers`, `internal/http`,
+`internal/js_stream_socket`, `internal/linkedlist`, `internal/net`, `internal/options`,
+`internal/readline/utils`, `internal/socketaddress`, `internal/streams/add-abort-signal`,
+`internal/streams/end-of-stream`, `internal/streams/state`, `internal/test/binding`,
+`internal/timers`, `internal/url`, `internal/util` and `internal/util/inspect`. Unlike Node.js,
+`module.builtinModules` doesn't list them. Each has Node.js's export names. The exports below are
+implemented, and the others are stubs, as in a stub module, with a new symbol for each symbol
+export. Loading `internal/test/binding` emits Node.js's warning about it.
+
+- `internal/assert/myers_diff`: `myersDiff`.
+- `internal/blocklist` and `internal/socketaddress`: `BlockList` and `SocketAddress`, which are
+  `node:net`'s.
+- `internal/buffer`: `FastBuffer`, which is `Buffer[Symbol.species]`.
+- `internal/event_target`: `Event`, `EventTarget` and `CustomEvent`, which are the globals.
+- `internal/fs/utils`: `Dirent`, `Stats`, `getDirent`, `getDirents`, `stringToFlags`,
+  `validateOffsetLengthRead` and `validateOffsetLengthWrite`.
+- `internal/linkedlist`: `append`, `init`, `isEmpty`, `peek` and `remove`.
+- `internal/net`: `isIP`, `isIPv4`, `isIPv6`, and `normalizedArgsSymbol`, which marks the arrays
+  `net._normalizeArgs` returns.
+- `internal/options`: `getOptionValue`, for the options the flags above set and
+  `--max-http-header-size`. Other options are `undefined`.
+- `internal/readline/utils`: `CSI`.
+- `internal/streams/add-abort-signal`: `addAbortSignal` and `addAbortSignalNoValidate`.
+- `internal/streams/end-of-stream`: `eos` and `finished`, which are `stream.finished`.
+- `internal/streams/state`: `getDefaultHighWaterMark` and `setDefaultHighWaterMark`.
+- `internal/timers`: `setUnrefTimeout`.
+- `internal/url`: `isURL`, and `node:url`'s `URL`, `URLSearchParams`, `domainToASCII`,
+  `domainToUnicode`, `fileURLToPath`, `pathToFileURL` and `urlToHttpOptions`.
+- `internal/util`: `deprecate`, `emitExperimentalWarning`, `pendingDeprecate`, `promisify` and
+  `sleep`.
+- `internal/util/inspect`: `format`, `formatWithOptions`, `getStringWidth`, `inspect`,
+  `inspectDefaultOptions` and `stripVTControlCharacters`.
+
+`internal/test/binding`'s `internalBinding(name)` returns an object for each of Node.js's binding
+names, and throws an `Error` with the code `ERR_INVALID_MODULE` for other names. The objects hold
+these members, and nothing else:
+
+- `buffer`: `fill`.
+- `constants`: `fs` and `os`, which are `fs.constants` and `os.constants`.
+- `timers`: `getLibuvNow`, which is `process.uptime()` in milliseconds, as an integer.
+- `uv`: a `UV_` constant for each libuv error code, and `errname`.
+
+The runtime's modules don't use the binding objects, so replacing a member of one changes no
+module's behavior. `process.binding(name)` returns the same objects for the names Node.js allows it, and throws an
+`Error` otherwise.
 
 ## Implementation rules
 
@@ -154,7 +275,11 @@ synchronous component exports, which must not block at all, they always throw.
 `core_runtime::event_loop::blocking_host_io_refusal` implements the policy. On wasm, the callback
 and promise forms of most `node:fs` operations suspend instead of blocking, so they work while
 serving (see [`node:fs`](#nodefs-and-nodefspromises)). The others block and follow the same
-policy.
+policy. So do the file watchers: `fs.watch`, `fsPromises.watch` and `fs.watchFile` read the
+filesystem synchronously on the JS thread when they start and at every poll. Starting one throws
+`ERR_BLOCKING_NOT_ALLOWED` where blocking isn't allowed, and a watcher started earlier skips its
+polls there, so it reports nothing while the runtime serves requests unless
+`--allow-blocking-host-io` is given.
 
 ## Runtime constants
 
@@ -170,15 +295,26 @@ policy.
 ### `node:path`
 
 The POSIX implementation, which `path.posix` and `node:path/posix` also are. `path.win32` is not
-implemented. `path.matchesGlob` is a stub.
+implemented.
+
+`path.matchesGlob` matches as the minimatch that Node.js bundles, with the options Node passes:
+brace expansion including sequences, `*`, `**`, `?`, character classes with ranges, negation and
+POSIX classes, and extglobs. Backslashes are path separators, a leading `!` and `#` are literal,
+and `.` segments and `<segment>/..` are collapsed in both the pattern and the path. Segments with
+magic match case-insensitively where `process.platform` is `darwin` or `win32`, which is natively
+on macOS and Windows, and never on wasm. Segment patterns compile to minimatch's regular
+expressions, which run on the JS engine's `RegExp`. Matching follows minimatch's POSIX rules on
+every platform, without its Windows drive and UNC handling.
 
 ### `node:crypto`
 
-Hashes, HMACs and random values are implemented: `createHash`, `createHmac`, `hash`, `getHashes`,
-`randomBytes`, `randomFill`, `randomFillSync`, `randomInt`, `randomUUID`, `getRandomValues` and
-`timingSafeEqual`. `webcrypto` is the global `crypto`, and `subtle` is its `subtle` if it has one.
-The rest of the module is stubs, including the key derivation functions `pbkdf2`, `scrypt` and
-`hkdf`.
+Hashes, HMACs, secret keys, key derivation and random values are implemented: `createHash`,
+`createHmac`, `hash`, `getHashes`, `KeyObject`, `createSecretKey`, `pbkdf2`, `pbkdf2Sync`,
+`scrypt`, `scryptSync`, `hkdf`, `hkdfSync`, `randomBytes`, `randomFill`, `randomFillSync`,
+`randomInt`, `randomUUID`, `getRandomValues` and `timingSafeEqual`. `pseudoRandomBytes`, `prng`
+and `rng` are non-enumerable aliases of `randomBytes`, as in Node. `webcrypto` is the global
+`crypto`, and `subtle` is its `subtle` if it has one. The rest of the module is stubs, including
+asymmetric keys, signatures and ciphers.
 
 - The digests are MD5, RIPEMD-160, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224,
   SHA-512/256 and SHA3-224, SHA3-256, SHA3-384 and SHA3-512, under their names with or without an
@@ -186,6 +322,16 @@ The rest of the module is stubs, including the key derivation functions `pbkdf2`
 - `Hash` and `Hmac` are the classes `createHash` and `createHmac` instantiate. Their objects
   have `update`, `digest` and, for `Hash`, `copy`, but aren't streams.
   `digest` returns a `Buffer` for an encoding it doesn't know, as Node does.
+- `createHmac` takes a secret `KeyObject` as its key, and decodes a string key in
+  `options.encoding`.
+- `KeyObject`s are secret keys, which `createSecretKey` creates. They have `type`,
+  `symmetricKeySize`, `equals` and `export`, which returns a `Buffer` or a JSON Web Key.
+  `KeyObject.from` and `toCryptoKey` are missing, and `createPublicKey` and `createPrivateKey` are
+  stubs.
+- `pbkdf2`, `scrypt` and `hkdf` validate their arguments and options as Node does, and derive the
+  keys of RFC 8018, RFC 7914 and RFC 5869 with the supported digests. scrypt's parameters are
+  checked as OpenSSL checks them, including `maxmem`. The keys are derived on the JS thread,
+  including in the callback forms, which call back in a later turn of the event loop.
 - Random bytes come from the operating system natively, and from `wasi:random/random` on wasm.
 - The callbacks of `randomBytes` and `randomFill` run in a later turn of the event loop, and
   `randomInt`'s in a tick.
@@ -212,7 +358,8 @@ implemented, as are `once` and `on`, for emitters and `EventTarget`s, except tha
 `lowWaterMark` options call the emitter's `pause` and `resume` if it has them.
 `addAbortListener` and `EventEmitterAsyncResource` are stubs.
 
-- Exceeding the listener limit emits a `MaxListenersExceededWarning`.
+- Exceeding the listener limit emits a `MaxListenersExceededWarning`, whose `emitter`, `type` and
+  `count` are the emitter, the event and the number of listeners.
 - With the `captureRejections` option, a promise a listener returns that rejects emits `error`
   in a later tick, or calls the emitter's `Symbol.for('nodejs.rejection')` method if it has one.
   The static `EventEmitter.captureRejections` is a constant `false`.
@@ -252,6 +399,9 @@ exports.
   timer and `Immediate` for each referenced `setImmediate` whose callback hasn't started. Sockets,
   servers and pending fs requests aren't listed.
 - `cwd()` and `chdir()` use the process's working directory, which WASI emulates in the guest.
+- `execArgv` is the Node.js runtime flags (see [Runtime flags](#runtime-flags)), and `title` is
+  `starlingmonkey` unless `--title` sets it. `binding(name)` returns the binding objects of
+  [Internal modules](#internal-modules).
 - `pid` is 1 on wasm. `memoryUsage()` and `cpuUsage()` report 0. `umask()` is `0o022`, and
   `getuid()`, `geteuid()`, `getgid()` and `getegid()` are 0. `kill()` throws
   `ERR_METHOD_NOT_IMPLEMENTED`.
@@ -267,8 +417,8 @@ stubs.
 The legacy internal modules `_stream_duplex`, `_stream_passthrough`, `_stream_readable`,
 `_stream_transform` and `_stream_writable` are the `stream` classes. `_http_agent`,
 `_http_client`, `_http_common`, `_http_incoming`, `_http_outgoing` and `_http_server` hold the
-`http` classes and helpers Node.js exports from them. Their other exports, and the other internal
-modules, are stubs.
+`http` classes and helpers Node.js exports from them. Their other exports are stubs. The
+`internal/` modules exist with `--expose-internals` (see [Internal modules](#internal-modules)).
 
 ### `node:async_hooks`
 
@@ -295,7 +445,10 @@ emitted.
 `Buffer` is installed on every global. A `Buffer` is a `Uint8Array` whose prototype is
 `Buffer.prototype`, which inherits from `Uint8Array.prototype`, and `Buffer`'s methods accept plain
 `Uint8Array`s as `this`. `Buffer(...)` and `new Buffer(...)` behave as `Buffer.from` and
-`Buffer.alloc`. The encodings are `utf8`, `utf16le`, `latin1`, `ascii`, `base64`, `base64url`
+`Buffer.alloc`, and emit DEP0005 once, unless called from a module in `node_modules`.
+`Buffer[Symbol.species]` is a constructor that creates `Buffer`s without the warning, which the
+`Uint8Array` methods such as `map` use. A `Buffer` of a resizable `ArrayBuffer` created without a
+length follows the buffer's length. The encodings are `utf8`, `utf16le`, `latin1`, `ascii`, `base64`, `base64url`
 and `hex`, with Node's aliases. Decoding is lenient as in Node: base64 skips characters outside
 both alphabets and stops at `=`, hex stops at the first pair that isn't hex, and both read only
 the low byte of each UTF-16 code unit.
@@ -312,56 +465,131 @@ the low byte of each UTF-16 code unit.
   as in Node.js, and has no effect.
 
 `atob` and `btoa` are the globals. `isUtf8`, `isAscii`, `transcode`, `constants`, `kMaxLength`,
-`kStringMaxLength` and `INSPECT_MAX_BYTES` are implemented. `transcode` converts between UTF-8,
-UTF-16LE, Latin-1 and ASCII as Node.js's ICU-based implementation does. `Blob`, `File` and
-`resolveObjectURL` are stubs.
+`kStringMaxLength`, `INSPECT_MAX_BYTES` and `SlowBuffer`, which emits DEP0030, are implemented. `transcode` converts between UTF-8,
+UTF-16LE, Latin-1 and ASCII as Node.js's ICU-based implementation does. `Blob` and `File` are
+the globals, which implement the File API's `Blob` and `File` without `textStream()`, with and
+without `--node-compat`. `resolveObjectURL` is a stub.
 
 ### `node:http` and `node:https`
 
-Servers serve the runtime's incoming requests, and clients send requests through the runtime's
-HTTP client, which also serves `fetch`. `Server`, `createServer`, `IncomingMessage`,
-`OutgoingMessage`, `ServerResponse`, `ClientRequest`, `request`, `get`, `Agent`, `globalAgent`,
-`METHODS`, `STATUS_CODES`, `validateHeaderName` and `validateHeaderValue` are implemented. The
-rest of the modules are stubs.
+Servers serve the runtime's incoming requests, or accept HTTP/1.1 connections themselves, and
+clients send requests through the runtime's HTTP client, which also serves `fetch`. `Server`,
+`createServer`, `IncomingMessage`, `OutgoingMessage`, `ServerResponse`, `ClientRequest`,
+`request`, `get`, `Agent`, `globalAgent`, `METHODS`, `STATUS_CODES`, `validateHeaderName` and
+`validateHeaderValue` are implemented. The rest of the modules are stubs.
 
-- `listen()` adds a `fetch` event listener: with `--serve` natively, and in a `wasi:http`
-  component. A request goes to the listening server whose port is the request URL's, or else to
-  the first server that listened. When the CLI runs a script as a command, nothing serves
-  requests, and `listen()` emits an `ERR_SERVE_MODE_REQUIRED` error. In a component without a
-  `wasi:http/handler` export, `listen()` throws that error, which fails the build when the top
-  level listens. A server that listens while the component is built emits `listening` then.
+- `Server` extends `net.Server`. Its options are validated and stored as Node.js stores them.
+- `listen()` depends on how the runtime runs:
+  - When the CLI runs a script as a command with `--node-http-listen`, `listen()` is
+    `net.Server`'s, and the server handles the connections it accepts, as described below.
+  - Otherwise, `listen()` adds a `fetch` event listener: with `--serve` natively, and in a
+    `wasi:http` component. A request goes to the listening server whose port is the request URL's,
+    or else to the first server that listened. When the CLI runs a script as a command without
+    `--node-http-listen`, nothing serves requests, and `listen()` emits an
+    `ERR_SERVE_MODE_REQUIRED` error. In a component without a `wasi:http/handler` export,
+    `listen()` throws that error, which fails the build when the top level listens. A server that
+    listens while the component is built emits `listening` then.
+- `https.createServer` ignores the TLS options, and its servers don't accept TLS connections
+  themselves, since the host terminates TLS.
+- `setHeaders` sets the headers of a `Headers` or `Map`, and `writeHeader` is `writeHead`. The first
+  `write` or `end` calls `writeHead` through the response, so a patched `writeHead` sees implicit
+  headers too. As in Node.js, the headers `writeHead` is given are sent without being set, so
+  `getHeader` doesn't return them, unless a header was set before.
+- A `ServerResponse` that doesn't respond to a served request writes HTTP/1.1 to the socket it is
+  assigned with `assignSocket`, and queues what it writes in `outputData` until then, as in
+  Node.js.
+
+A server that accepts connections itself handles each connection's requests as Node.js does:
+
+- Request heads are parsed with `httparse` and checked as `llhttp` checks them in its strict mode:
+  methods of `METHODS`, URLs of visible ASCII characters, HTTP/0.9, 1.0, 1.1 and 2.0, header
+  names of token characters, header values without control characters other than a tab, CRLF
+  line ends, and at most `maxHeadersCount` (by default 1000) header lines in at most
+  `maxHeaderSize` (by default 16 KiB) bytes. Bodies are framed by `Content-Length` or chunked
+  transfer coding, with trailers. A parse error has `llhttp`'s `code`, `reason` and the position it
+  reports as `bytesParsed`, and `rawPacket`. It is emitted as `clientError`, and without
+  listeners the server responds with a 400, 408, 413 or 431 and destroys the socket. Data after a
+  request that closes the connection is an `HPE_CLOSED_CONNECTION` error.
+- `rawHeaders` keep the names as received, and `headers` join duplicates as Node.js does
+  (`joinDuplicateHeaders` included). `headersDistinct`, `trailersDistinct` and `trailers` are
+  set.
+- Connections are kept alive and requests can be pipelined: responses are written in the order of
+  their requests. `requireHostHeader`, `maxRequestsPerSocket` (with `dropRequest`),
+  `Expect: 100-continue` (with `checkContinue`), other expectations (with `checkExpectation`),
+  and `upgrade` and `connect` with the socket and the bytes after the head (with
+  `shouldUpgradeCallback`) behave as in Node.js. The socket's `setEncoding` throws
+  `ERR_HTTP_SOCKET_ENCODING`.
+- `headersTimeout` and `requestTimeout` are checked every `connectionsCheckingInterval`
+  milliseconds, and a request that exceeds them gets a 408. Between requests, a connection times
+  out after `keepAliveTimeout` plus `keepAliveTimeoutBuffer` milliseconds. `timeout` and
+  `setTimeout` apply to the connections accepted later.
+- Responses have Node.js's wire format: the headers set, then `Date` unless `sendDate` is false,
+  `Connection` and `Keep-Alive`, and `Content-Length` when `end` is given the whole body before
+  the head was stored, or chunked transfer coding otherwise. Responses to `HEAD` requests and
+  responses with status 1xx, 204 or 304 have no body. `writeContinue`, `writeProcessing`,
+  `writeEarlyHints` and `writeInformation` write informational responses, and `addTrailers` adds
+  trailers to a chunked response. The head is encoded as Node.js encodes it, as UTF-8 when it is
+  sent with a string body chunk in UTF-8 and as Latin-1 otherwise. `cork` and `uncork` cork the
+  socket, and `writableLength`, `writableHighWaterMark`, `writableCorked`, `closed` and `errored`
+  are Node.js's.
+- `close()` destroys the connections without a request in progress, as Node.js does. A connection
+  whose response finishes after `close()` is destroyed if it is still without a request 500
+  milliseconds later, where Node.js waits for the client or `keepAliveTimeout`.
+  `closeAllConnections` and `closeIdleConnections` destroy the connections.
+- After it passes a request body chunk or trailers to the request, the server runs the tick queue,
+  as Node.js does for a TCP socket. The microtasks don't run then, so their effects can come
+  after events Node.js emits after them, such as a `clientError` for a later pipelined request.
+
+For served requests:
+
 - A served request with an `Upgrade` header, or a `CONNECT` request, gets a 501 response when the
   server has `upgrade` or `connect` listeners, since served requests have no socket to give them.
   Without such listeners it is a `request` event.
-- `https.createServer` ignores the TLS options, since the host terminates TLS.
 - The `rawHeaders` of served requests and of client responses have the lowercase names the host
   reports, and `httpVersion` is `1.1`. A served request's `url` is the path and query of the URL
   the host parsed, not the raw request target. Its `socket` has the client's `remoteAddress`,
   `remotePort` and `remoteFamily` natively, and no remote address on wasm, since `wasi:http`
-  doesn't report it. A
+  doesn't report it. The socket is an `EventEmitter` whose `setTimeout`, `setNoDelay`,
+  `setKeepAlive`, `ref`, `unref` and `address` have no effect on the connection, and whose
+  `destroy` and `end` only mark it destroyed and emit `close`. A
   `wasi:http` host passes the host as the request's authority, which becomes its `host` header.
   `writeContinue`, `writeProcessing` and `writeEarlyHints` have no effect.
-- `setHeaders` sets the headers of a `Headers` or `Map`, and `writeHeader` is `writeHead`. The first
-  `write` or `end` calls `writeHead` through the response, so a patched `writeHead` sees implicit
-  headers too.
-- The host frames responses and requests, so `Connection`, `Keep-Alive`, `Transfer-Encoding` and
-  `Content-Length` headers set on them are left out. On wasm, so are the request headers the host
-  refuses. A response's `write` returns `false` once 16 KiB are buffered, and the response emits
-  `drain` once they're sent. A response's status must be from 200 to 599, since the host's
-  responses can't have other statuses.
+- The host frames responses and requests, so `Connection`, `Keep-Alive` and `Transfer-Encoding`
+  headers set on them are left out, and so are `Content-Length` headers set on requests. A
+  response's `Content-Length` frames its body, and is the length of the body of a response to a
+  `HEAD` request. Without one, a response whose body isn't written whole by `end` is chunked. On
+  wasm, the request headers the host refuses are left out too. A response's `write` returns
+  `false` once 16 KiB are buffered, and the response emits `drain` once they're sent. A
+  response's status must be from 200 to 599, since the host's responses can't have other
+  statuses.
+- A response whose body is being written keeps its request's event loop running until it ends,
+  is destroyed, or the client disconnects, so another request's handler can write to it and end
+  it, as for server-sent events. Other work a handler leaves running when its response is sent,
+  such as timers and client requests, is abandoned, except for pending `node:fs` operations (see
+  [`node:fs`](#nodefs-and-nodefspromises)).
 - When a client disconnects, the response doesn't emit `close`.
+
+For clients:
+
 - A client request is sent once `end()` is called, with everything written as its body. Agents
   hold their options and have no effect on connections, which the host manages. The TLS options,
-  `createConnection` and the `socket` event aren't supported, and `signal` is. `setTimeout` emits
-  `timeout` when no response arrives in time. Transport errors have `code` `ECONNREFUSED`,
-  `ECONNRESET`, `ENOTFOUND` or `ETIMEDOUT` where the host's message names the cause.
+  `createConnection` and upgrades aren't supported, and `signal` is. `setTimeout` emits `timeout`
+  when no response arrives in time. Transport errors have `code` `ECONNREFUSED`, `ECONNRESET`,
+  `ENOTFOUND` or `ETIMEDOUT` where the host's message names the cause.
+- A client request emits `socket` in the tick queue after it is created, unless it was destroyed
+  by then, and `socket` and `connection` are the socket from then on, as is its response's
+  `socket`. The socket is the one of served requests (see above), with `pending` and `connecting`
+  `false`, the host as its `remoteAddress` if the host is an IP address, and `encrypted` set for
+  `https:`. Its `destroy` destroys the request. A `keepAlive` agent takes the socket back when the
+  response ends, and gives it to its next request to the same host and port, whose `reusedSocket`
+  is then `true`.
 
 ### `node:net` and `node:dns`
 
 TCP sockets and servers, over tokio natively and `wasi:sockets` on wasm: `Socket`, `Stream`,
-`Server`, `connect`, `createConnection`, `createServer`, `isIP`, `isIPv4` and `isIPv6`, and
-`dns.lookup`, `dns.promises.lookup` and `node:dns/promises`' `lookup`. The rest of the modules,
-including the DNS queries other than `lookup`, are stubs.
+`Server`, `connect`, `createConnection`, `createServer`, `BlockList`, `SocketAddress`, `isIP`,
+`isIPv4`, `isIPv6` and `_normalizeArgs`, and `dns.lookup`, `dns.promises.lookup` and `node:dns/promises`' `lookup`.
+The rest of the modules, including the DNS queries other than `lookup`, are stubs.
 
 - IPC paths are not supported. A server listens on every IPv4 address unless given an address or
   `localhost`, and its `address()` reports that address.
@@ -370,6 +598,20 @@ including the DNS queries other than `lookup`, are stubs.
   `localAddress` and `localPort`, so it emits no `lookup` event. Servers support `allowHalfOpen`,
   `pauseOnConnect` and `maxConnections`. `setTimeout` emits `timeout` once the socket was idle for
   the given time.
+- Natively, a write sends what the connection takes at once before returning, and waits for the
+  rest. On wasm, every write waits. `bytesWritten` counts the bytes handed to the connection and
+  the bytes the socket buffers, as in Node.js, and `destroySoon` ends the socket and destroys it
+  once it finished writing.
+- A socket's `blockList` option makes `connect` skip the addresses the list blocks, and fail with
+  `ERR_IP_BLOCKED` if it blocks the last address tried. A server's `blockList` closes connections
+  from the peers it blocks without emitting an event. `http.request` ignores `createConnection`,
+  so a block list passed through it has no effect.
+- `BlockList` and `SocketAddress` parse, format and match addresses as Node.js does, with these
+  differences: `rules` lists address rules in the order they were first added, where Node.js lists
+  them in hash table order. An IPv6 zone ID is accepted and ignored, so addresses that differ
+  only in their zone are equal. A flow label above 0xFFFFF for IPv6, or above 2\*\*31 - 1 for
+  IPv4, throws `ERR_OUT_OF_RANGE`, where Node.js aborts. Neither class can be sent with
+  `postMessage`.
 - Errors have Node's message, `errno`, `code` and `syscall`, plus `address` and `port` for
   `connect` and `listen`, and `hostname` for lookups.
 - On wasm, `localhost` resolves to `127.0.0.1` and `::1` without asking the host, since
@@ -434,9 +676,19 @@ The implementation follows Node.js v24's `lib/internal/streams` function by func
 - In a `pipeline`, a function stage's result stays an iterable unless a Node stream consumes it.
   Web streams aren't accepted in a `pipeline`, and `finished` doesn't accept them.
 - `duplexPair` returns two `Duplex` streams, each reading what the other writes.
-- `compose` and `Duplex.from` are stubs. The web stream conversions (`fromWeb`,
-  `toWeb`), the static `Readable.wrap` and the experimental `Readable` iterator helpers, such as
-  `map`, `filter` and `toArray`, don't exist. `node:stream/consumers` is a stub.
+- `Readable.toWeb`, `Readable.fromWeb`, `Writable.toWeb`, `Writable.fromWeb`, `Duplex.toWeb` and
+  `Duplex.fromWeb` follow Node's `lib/internal/webstreams/adapters.js`, with the runtime's
+  `ReadableStream` and `WritableStream`. `Duplex.toWeb` doesn't take the internal options Node's
+  `CompressionStream` and `DecompressionStream` pass to it.
+- The static `Readable.wrap(src, options)` wraps an old-style stream in a `Readable` that destroys
+  `src` when destroyed.
+- The experimental iterator helpers `map`, `filter`, `flatMap`, `drop`, `take`, `every`,
+  `forEach`, `reduce`, `toArray`, `some` and `find` follow Node's
+  `lib/internal/streams/operators.js`, including `concurrency`, `highWaterMark` and `signal`.
+  Their async generators are objects whose `next`, `return` and `throw` run promise reactions,
+  so a result can settle after a different number of microtasks than in Node.
+- `compose` and `Duplex.from` are stubs, and `Readable.prototype.compose` doesn't exist.
+  `node:stream/consumers` is a stub.
 
 ### `node:string_decoder`
 
@@ -448,7 +700,8 @@ can be called on any object, as constructors that inherit from it do.
 
 ### `node:punycode`
 
-Punycode.js 2.1.0's API: `encode`, `decode`, `toASCII`, `toUnicode` and `ucs2`. `toASCII` and
+Punycode.js 2.1.0's API: `encode`, `decode`, `toASCII`, `toUnicode` and `ucs2`. Loading the module
+emits DEP0040, unless it is loaded from a module in `node_modules`. `toASCII` and
 `toUnicode` convert each label without case mapping or normalization, as Punycode.js does.
 
 ### `node:querystring`
@@ -477,7 +730,8 @@ arguments.
 
 `isDeepStrictEqual`, `inherits`, `promisify` (with `promisify.custom`), `callbackify`,
 `deprecate`, `debuglog`, `debug`, `getCallSites`, `stripVTControlCharacters`, `styleText`,
-`toUSVString`, `getSystemErrorName`, `isArray` and `_extend` are implemented. `styleText` styles
+`toUSVString`, `getSystemErrorName`, `isArray` and `_extend` are implemented, and `deprecate`
+takes the `modifyPrototype` option. `styleText` styles
 its text whatever the output stream. `types` is `node:util/types`, and `TextEncoder` and
 `TextDecoder` are the globals. The rest is stubs.
 
@@ -492,6 +746,30 @@ and Node's generated message, including its diff. Deep equality follows Node's
 `lib/internal/util/comparisons.js`. The deprecated `CallTracker` follows Node's
 `lib/internal/assert/calltracker.js`, and emits DEP0173 when the first one is created.
 `partialDeepStrictEqual` and the `Assert` class are stubs.
+
+### `node:test`
+
+`test`, which is also `it` and the module's `default` export, `suite`, which is also `describe`,
+their `skip`, `todo`, `only` and `expectFailure` variants, the hooks `before`, `after`,
+`beforeEach` and `afterEach`, `getTestContext`, `mock` and `assert.register` are implemented.
+`run` and `snapshot` are stubs, and so are `t.waitFor`, `t.log` and `mock.timers`. Module mocks
+and `t.assert.snapshot` are missing.
+
+- Tests run one at a time, in the order they start, whatever their `concurrency` option.
+  Top-level tests start in a later job than the one that registered them, once the functions of
+  the suites registered by then have finished. A test or suite registered while the function of
+  another one or of its hook runs, including after an `await` in it, becomes its subtest.
+- A test fails if its function throws or rejects, passes an error to its callback, runs out of
+  time, misses its plan, or has a failed subtest. An uncaught exception or unhandled rejection in
+  a running test's async context fails the test. A test waits for its subtests until none of
+  them is pending for the first time, and subtests it started after that are cancelled if they
+  haven't finished when it does.
+- `only` leaves out the other tests, as Node.js does for a file it runs without `--test`.
+- The `signal` option and `t.plan`'s `wait` option are ignored.
+- The results are written with `process.stdout.write`, in the format of Node's `spec` reporter
+  without colors. The list of failed tests doesn't show their locations. The summary is written
+  when `process` emits `beforeExit`, and sets `process.exitCode` to 1 if a test failed. Tests that
+  haven't finished by then are cancelled, where Node.js keeps waiting for them.
 
 ### `node:timers`, `node:timers/promises` and the timer globals
 
@@ -517,18 +795,24 @@ The synchronous, callback and promise forms of `access`, `appendFile`, `chmod`, 
 `copyFile`, `cp`, `exists`, `fchmod`, `fchown`, `fdatasync`, `fstat`, `fsync`, `ftruncate`, `futimes`,
 `link`, `lstat`, `mkdir`, `mkdtemp`, `open`, `read`, `readFile`, `readdir`, `readlink`,
 `realpath`, `rename`, `rm`, `rmdir`, `stat`, `symlink`, `truncate`, `unlink`, `utimes`, `write`
-and `writeFile` are implemented, as are `createReadStream`, `createWriteStream`, `Stats`,
-`Dirent`, `constants`, and `node:fs/promises` with `FileHandle`. `fs.promises` holds the same
-functions as `node:fs/promises`. The rest of the modules are stubs.
+and `writeFile` are implemented, as are `createReadStream`, `createWriteStream`, `watch`,
+`watchFile`, `unwatchFile`, `Stats`, `Dirent`, `constants`, and `node:fs/promises` with
+`FileHandle` and `watch`. `fs.promises` holds the same functions as `node:fs/promises`. The rest
+of the modules are stubs.
 
+- A pending callback or promise form keeps the event loop it started in running until it settles,
+  as a pending libuv request does in Node. So the operations a served request starts, such as the
+  writes of a `WriteStream` that outlives the request, complete after its response is sent,
+  within the serve layer's `waitUntil` time limit.
 - Natively, the callback and promise forms run on four worker threads. Where
   [blocking isn't allowed](#synchronous-host-io), the synchronous forms throw
   `ERR_BLOCKING_NOT_ALLOWED`.
 - On wasm, the callback and promise forms of `access`, `appendFile`, `close`, `exists`,
-  `fdatasync`, `fstat`, `fsync`, `ftruncate`, `futimes`, `lstat`, `open`, `read`, `readFile`,
-  `readdir`, `stat`, `truncate`, `utimes`, `write` and `writeFile` use `wasi:filesystem`'s
-  asynchronous API and never block, so these operations, `createReadStream`, `createWriteStream`
-  and the matching `FileHandle` methods work while the runtime serves requests. Their paths
+  `fdatasync`, `fstat`, `fsync`, `ftruncate`, `futimes`, `lstat`, `mkdir`, `open`, `read`,
+  `readFile`, `readdir`, `rename`, `rmdir` without `recursive`, `stat`, `truncate`, `unlink`,
+  `utimes`, `write` and `writeFile` use `wasi:filesystem`'s asynchronous API and never block, so
+  these operations, `createReadStream`, `createWriteStream` and the matching `FileHandle` methods
+  work while the runtime serves requests. Their paths
   resolve the way wasi-libc resolves the synchronous forms' paths: a relative path is made
   absolute against the working directory, the preopened directory whose name is the longest
   prefix of whole path components wins, and a preopen named `.` contains every path. Their errors
@@ -556,13 +840,41 @@ functions as `node:fs/promises`. The rest of the modules are stubs.
   `0o755` for directories and `0o777` for symlinks. `chown` does nothing, and `access` doesn't
   check permissions.
 - The `bigint` and `signal` options are ignored, and so are the file streams' `fs` and `flush`
-  options.
+  options. `fs.watch` and `fsPromises.watch` do take `signal`.
+- There is no file watching API on WASI, so the watchers poll with JS timers. `unref()` and
+  `persistent: false` unreference a watcher's timer, so that it doesn't keep the event loop
+  running, and `ref()` references it again. `fs.watch` and `fsPromises.watch` take a snapshot of
+  the watched file or directory every 100 ms: the metadata of every entry, and with `recursive`
+  of every entry below it, without following symlinks. A new, removed or
+  replaced entry is a `rename`, and a file whose size, mode or times changed is a `change`.
+  Directories whose entries changed aren't reported themselves. Filenames are relative to the
+  watched directory, and changes of the watched path itself are named after its basename. A file
+  created and removed between two polls is invisible to the snapshots, so when the watched
+  directory's modification time changed without an entry appearing, disappearing or being
+  replaced, the change is a `rename` with a `null` filename, as Node documents filenames may be.
+  Changes from one poll are reported in path order. A watched file or directory that disappears
+  is a `rename`, and the watcher keeps polling, so it reports another `rename` if the path
+  reappears. A file replaced by another file is told apart from a changed one by its inode
+  number, so on wasm and Windows, which report none, it is a `change`.
+- `fs.watch` creates the watcher Node creates on the platform `process.platform` names. With
+  `recursive` on Linux and on wasm, that is the watcher of Node's `internal/fs/recursive_watch`:
+  its options are validated as Node validates them, `close()` emits `close` at once, `ref()` and
+  `unref()` do nothing, it is an async iterable, the watched path's own removal is named `''`, and
+  every change has a filename. Otherwise it is Node's `FSWatcher`, which emits `close` in the tick
+  queue. `ignore` filters the reported changes by filename with minimatch's `matchBase` (see
+  [`node:path`](#nodepath)), a `RegExp` or a function. The Linux recursive watcher also drops the
+  changes below an ignored directory. `FSWatcher` and `StatWatcher` aren't exported, as in Node.
+- `fs.watchFile` stats the file every `interval` milliseconds as libuv's `uv_fs_poll` does: the
+  first stat runs right after the call, a failing stat reports zeroed `Stats` as the current ones
+  once per error, and the previous `Stats` are those of the last successful stat.
+  `process.getActiveResourcesInfo()` lists referenced `fs.watch` watchers as `FSEventWrap` and
+  `watchFile` watchers as `StatWatcher`.
 
 ### `node:zlib`
 
-The deflate, zlib and gzip formats are implemented: the synchronous functions, such as
-`gzipSync`, the callback functions, such as `gzip`, the stream classes and their `create`
-functions, `crc32`, `constants` and `codes`. Brotli, zstd and the zip archive functions are stubs.
+The deflate, zlib, gzip, Brotli and zstd formats are implemented: the synchronous functions, such
+as `gzipSync`, the callback functions, such as `gzip`, the stream classes and their `create`
+functions, `crc32`, `constants` and `codes`. The zip archive functions are stubs.
 
 - The callback functions compress or decompress synchronously, and call back in a tick.
 - Errors have zlib's message, `code` and `errno`, such as `Z_DATA_ERROR` and -3.
@@ -574,6 +886,21 @@ functions, `crc32`, `constants` and `codes`. Brotli, zstd and the zip archive fu
   first input produces no output.
 - `params` ignores the strategy, and leaves the level unchanged when the stream has already
   compressed input and the new level uses a different zlib strategy function.
+- Brotli's `params` are validated as Node validates them. `BROTLI_PARAM_MODE`,
+  `BROTLI_PARAM_QUALITY`, `BROTLI_PARAM_LGWIN`, `BROTLI_PARAM_LGBLOCK`,
+  `BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING`, `BROTLI_PARAM_SIZE_HINT` and
+  `BROTLI_PARAM_LARGE_WINDOW` are used, and the others have no effect. A flush of a Brotli stream
+  is `BROTLI_OPERATION_FLUSH`, and `flush()` defaults to it.
+- zstd's `params` are validated as Node validates them, and have no effect: the compressors
+  compress at one level, close to zstd's level 1. `pledgedSrcSize` and `dictionary` are ignored.
+  A zstd compressor writes one frame when its input ends, and a zstd decompressor decompresses the
+  first frame of its input when the input ends, so flushes don't produce output.
+- Corrupt Brotli and zstd input can fail with another error than in Node.js, and some corrupt
+  zstd input decompresses without an error.
+- The Brotli and zstd stream classes extend the zlib stream classes' base class, where Node.js
+  gives them their own.
+- Destroying a stream frees its codec and sets `_handle` to `null`, as in Node.js. `reset()` of a
+  destroyed stream throws `ERR_INVALID_THIS`, where Node.js throws an `AssertionError`.
 
 ## Testing
 
@@ -584,20 +911,27 @@ Three kinds of tests check the implementation.
   in `scripts/test-runtime.sh`.
 - `tests/node-harness/run-node-tests.mjs` runs Node.js's own tests from `test/parallel`, at the
   tag `scripts/clone-node-tests.sh` pins, with Node's unmodified `test/common`. Each test runs as a
-  process of its own and passes if it exits with status 0. `tests.txt` selects the tests by file
-  name, and tests whose source needs runtime flags, child processes, workers or Node.js internals
-  are skipped without running. `expectations.json` records each test's status, natively and, where
-  it differs, on wasm. The run fails if a test expected to pass fails or skips.
-  `--update-expectations` records the current results.
+  process of its own, with `--node-http-listen`, and passes if it exits with status 0.
+  `tests.txt` selects the tests by file name: every test except those of Node's build tooling,
+  V8's heap and trace tooling, the inspector and QUIC. The runtime gets the flags of a test's
+  `// Flags:` line with `--allow-node-runtime-flags`. Tests whose flags the runtime rejects, and
+  tests whose source needs child processes, workers, `cluster` or `inspector`, are skipped without
+  running. `expectations.json` records each test's status, natively and, where it differs, on
+  wasm. The run fails if a test expected to pass fails or skips. `--update-expectations` records
+  the current results. `--target=deno` and `--target=bun` run the tests under Deno and Bun, as
+  `scripts/fetch-other-runtimes.sh` downloads them, and `report.mjs --compare` lists the tests they
+  pass and the runtime fails.
 - `tests/node-diff/fuzz.mjs` compares the runtime with Node.js on generated programs. The
   generators in `generators.mjs` draw operations on the implemented modules, such as `Buffer`
   conversions with edge-case arguments, `StringDecoder` chunk sequences, event orders of streams
-  and emitters, and file system sequences. Each program runs twice under Node.js, to drop
-  operations whose result varies, and once under the runtime. The fuzzer reruns each difference as
-  a program of its one operation, groups the differences by signature, and writes a report and
-  reproductions to `target/node-diff`. Calls to unimplemented functions share one signature per
-  function. `known-diffs.json` lists the accepted signatures. The oracle is the Node.js release
-  `scripts/fetch-node-oracle.sh` downloads, the same version as the Node.js tests.
+  and emitters, file system sequences, and HTTP exchanges between a listening server and
+  `http.request` or raw requests over a `net` socket. Each program runs twice under Node.js, to
+  drop operations whose result varies, and once under the runtime, with `--node-http-listen`. The
+  fuzzer reruns each difference as a program of its one operation, groups the differences by
+  signature, and writes a report and reproductions to `target/node-diff`. Calls to unimplemented
+  functions share one signature per function. `known-diffs.json` lists the accepted signatures.
+  The oracle is the Node.js release `scripts/fetch-node-oracle.sh` downloads, the same version as
+  the Node.js tests.
 
 ```sh
 ./scripts/clone-node-tests.sh

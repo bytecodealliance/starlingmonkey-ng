@@ -188,6 +188,10 @@ fn on_response(
         return Ok(js::value::undefined());
     }
     request.set_property(scope, c"res", response)?;
+    if let Some(socket) = request.obj(scope, c"socket")? {
+        response.set_property(scope, c"socket", socket)?;
+        response.set_property(scope, c"client", socket)?;
+    }
     response.set_property(scope, c"req", request)?;
     let emit_close = closure(
         scope,
@@ -214,13 +218,15 @@ fn on_response(
     Ok(js::value::undefined())
 }
 
-/// The `end` listener of a response, whose captures are `[request]`: emit `close` on the request.
+/// The `end` listener of a response, whose captures are `[request]`: return the request's socket
+/// to its agent, and emit `close` on the request.
 fn emit_request_close(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let request = Captures::of(scope, payload)?.obj(0)?;
+    release_socket(scope, request)?;
     emit_later(scope, request, &[string(scope, "close")?])?;
     Ok(js::value::undefined())
 }
@@ -411,6 +417,120 @@ fn start(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrown> {
     react(scope, request, promise)
 }
 
+/// The free sockets of `agent` for connections named `name`, an array the agent keeps under the
+/// connection's name.
+fn free_sockets<'s>(
+    scope: &'s Scope<'_>,
+    agent: Object<'_>,
+    name: &str,
+) -> Result<Object<'s>, ExnThrown> {
+    let pool = match agent.obj(scope, c"_starlingFreeSockets")? {
+        Some(pool) => pool,
+        None => {
+            let pool = super::outgoing::null_object(scope)?;
+            agent.define_property(scope, c"_starlingFreeSockets", pool, 0)?;
+            pool
+        }
+    };
+    let key = string(scope, name)?;
+    let sockets = crate::http::get_by_key(scope, pool, key)?;
+    if let Ok(sockets) = Object::from_value(scope, *sockets) {
+        return Ok(sockets);
+    }
+    let sockets = *js::Array::new(scope, 0)?;
+    crate::http::set_by_key(scope, pool, key, sockets.to_jsval_throwing(scope)?)?;
+    Ok(sockets)
+}
+
+/// Assign `request` a socket for a connection to `host` and `port` in the tick queue, as Node.js's
+/// agent does once it has one: `socket` and `connection` become the socket, and `socket` is
+/// emitted. A request destroyed before then gets no socket. A `keepAlive` agent reuses a socket
+/// a response of the same host and port returned to it, and sets `reusedSocket`. The socket's
+/// remote address is `host` if it is an IP address.
+fn assign_socket_later(
+    scope: &Scope<'_>,
+    request: Object<'_>,
+    agent: Option<Object<'_>>,
+    host: &str,
+    port: f64,
+    encrypted: bool,
+) -> Result<(), ExnThrown> {
+    let name = format!("{host}:{port}:");
+    request.define_property(scope, c"_starlingSocketName", name.as_str(), 0)?;
+    let mut reused = None;
+    if let Some(agent) = agent.filter(|agent| agent.flag(scope, c"keepAlive").unwrap_or(false)) {
+        let free = free_sockets(scope, agent, &name)?;
+        let socket = call_method(scope, free, c"pop", &[])?;
+        if let Ok(socket) = Object::from_value(scope, *socket) {
+            socket.define_property(scope, c"_starlingOwner", request, 0)?;
+            request.set_property(scope, c"reusedSocket", true)?;
+            reused = Some(socket);
+        }
+    }
+    let socket = match reused {
+        Some(socket) => socket,
+        None => {
+            let remote = host.parse::<std::net::IpAddr>().ok().map(|ip| {
+                let family = if ip.is_ipv4() { "IPv4" } else { "IPv6" };
+                (ip.to_string(), port as u16, family)
+            });
+            let connection = super::host_socket::HostConnection {
+                remote,
+                local_port: None,
+                encrypted,
+                owner: Some(request),
+            };
+            super::host_socket::new_host_socket(scope, connection)?
+        }
+    };
+    crate::stream::next_tick(
+        scope,
+        assign_socket,
+        &[
+            request.to_jsval_raw_throwing(scope)?,
+            socket.to_jsval_raw_throwing(scope)?,
+        ],
+    )
+}
+
+/// The tick of [`assign_socket_later`], whose captures are `[request, socket]`.
+fn assign_socket(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let captures = Captures::of(scope, payload)?;
+    let request = captures.obj(0)?;
+    if request.flag(scope, c"destroyed")? {
+        return Ok(js::value::undefined());
+    }
+    let socket = captures.obj(1)?;
+    request.set_property(scope, c"socket", socket)?;
+    request.set_property(scope, c"connection", socket)?;
+    let socket = socket.to_jsval_throwing(scope)?;
+    call_method(scope, request, c"emit", &[string(scope, "socket")?, socket])?;
+    Ok(js::value::undefined())
+}
+
+/// Return the socket of `request` to its agent's free sockets, if the agent is a `keepAlive` one
+/// and the socket isn't destroyed.
+fn release_socket(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrown> {
+    let Some(agent) = request.obj(scope, c"agent")? else {
+        return Ok(());
+    };
+    let Some(socket) = request.obj(scope, c"socket")? else {
+        return Ok(());
+    };
+    if !agent.flag(scope, c"keepAlive")? || socket.flag(scope, c"destroyed")? {
+        return Ok(());
+    }
+    let name = String::from_jsval_throwing(scope, request.val(scope, c"_starlingSocketName")?, ())?;
+    socket.define_property(scope, c"_starlingOwner", js::value::undefined(), 0)?;
+    let free = free_sockets(scope, agent, &name)?;
+    call_method(scope, free, c"push", &[socket.to_jsval_throwing(scope)?])?;
+    Ok(())
+}
+
 /// Add the headers `headers` gives to `request`: from an object, a flat array of names and
 /// values, or an array of `[name, value]` pairs.
 fn add_headers(scope: &Scope<'_>, request: Object<'_>, headers: Object<'_>) -> Result<(), Thrown> {
@@ -480,6 +600,7 @@ pub mod client_request_class {
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
         super::outgoing_message_class::init(scope, this)?;
+        this.set_property(scope, c"_starlingWire", false)?;
         let merged = Object::new_plain(scope)?;
         let assign = scope.global().obj(scope, c"Object")?.ok_or(ExnThrown)?;
         let (options, callback) = match options {
@@ -639,6 +760,13 @@ pub mod client_request_class {
         if truthy(scope, signal) {
             crate::stream::add_abort_signal(scope, signal, this.to_jsval_throwing(scope)?)?;
         }
+        super::assign_socket_later(scope, this, agent, &host, port, protocol == "https:")?;
+        Ok(())
+    }
+
+    /// Has no effect, since the runtime's HTTP client writes the request head.
+    #[method(name = "_implicitHeader")]
+    pub fn implicit_header_impl() -> Result<(), ExnThrown> {
         Ok(())
     }
 

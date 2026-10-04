@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! `node:zlib`'s deflate and gzip formats, and `crc32`. See <https://nodejs.org/api/zlib.html>.
+//! `node:zlib`'s deflate, gzip, Brotli and zstd formats, and `crc32`. See
+//! <https://nodejs.org/api/zlib.html>.
 //!
 //! The streams, the callback functions and the synchronous functions share one codec over the
-//! `flate2` crate's zlib engine. The callback functions compress or decompress synchronously and
-//! call back in a microtask. Brotli, zstd and the zip archive functions are stubs.
+//! `flate2` crate's zlib engine, the `brotli` crate and the `ruzstd` crate. The callback functions
+//! compress or decompress synchronously and call back in a microtask. The zip archive functions are
+//! stubs.
 //!
 //! `params` leaves the level unchanged when the engine has already compressed input and the new
 //! level uses a different zlib strategy function, because `flate2` changes the level without an
 //! output buffer.
+//!
+//! `ruzstd` compresses at one level, which is close to zstd's level 1, so the zstd compression
+//! level has no effect. The zstd compressors and decompressors produce their output once their
+//! input ends, so flushes have no effect on them.
 
+use brotli::enc::encode::{
+    BrotliEncoderOperation, BrotliEncoderParameter, BrotliEncoderStateStruct,
+};
+use brotli::enc::StandardAlloc;
+use brotli::{BrotliDecompressStream, BrotliResult, BrotliState};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
@@ -18,6 +29,8 @@ use js::gc::scope::Scope;
 use js::native::{HandleId, Value};
 use js::prelude::HandleValue;
 use js::Object;
+use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 
 use crate::buffer::{encode_string, new_buffer, Encoding, MAX_LENGTH};
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
@@ -200,6 +213,57 @@ const CONSTANTS: [(&str, f64); 170] = [
     ("ZSTD_error_noForwardProgress_inputEmpty", 82.0),
 ];
 
+/// Node.js's code names of the Brotli decoder's errors: `ERR_` and the name of the constant without
+/// `BROTLI_DECODER`, by error code.
+const BROTLI_ERROR_CODES: [(i32, &str); 25] = [
+    (-1, "ERR__ERROR_FORMAT_EXUBERANT_NIBBLE"),
+    (-2, "ERR__ERROR_FORMAT_RESERVED"),
+    (-3, "ERR__ERROR_FORMAT_EXUBERANT_META_NIBBLE"),
+    (-4, "ERR__ERROR_FORMAT_SIMPLE_HUFFMAN_ALPHABET"),
+    (-5, "ERR__ERROR_FORMAT_SIMPLE_HUFFMAN_SAME"),
+    (-6, "ERR__ERROR_FORMAT_CL_SPACE"),
+    (-7, "ERR__ERROR_FORMAT_HUFFMAN_SPACE"),
+    (-8, "ERR__ERROR_FORMAT_CONTEXT_MAP_REPEAT"),
+    (-9, "ERR__ERROR_FORMAT_BLOCK_LENGTH_1"),
+    (-10, "ERR__ERROR_FORMAT_BLOCK_LENGTH_2"),
+    (-11, "ERR__ERROR_FORMAT_TRANSFORM"),
+    (-12, "ERR__ERROR_FORMAT_DICTIONARY"),
+    (-13, "ERR__ERROR_FORMAT_WINDOW_BITS"),
+    (-14, "ERR__ERROR_FORMAT_PADDING_1"),
+    (-15, "ERR__ERROR_FORMAT_PADDING_2"),
+    (-16, "ERR__ERROR_FORMAT_DISTANCE"),
+    (-19, "ERR__ERROR_DICTIONARY_NOT_SET"),
+    (-20, "ERR__ERROR_INVALID_ARGUMENTS"),
+    (-21, "ERR__ERROR_ALLOC_CONTEXT_MODES"),
+    (-22, "ERR__ERROR_ALLOC_TREE_GROUPS"),
+    (-25, "ERR__ERROR_ALLOC_CONTEXT_MAP"),
+    (-26, "ERR__ERROR_ALLOC_RING_BUFFER_1"),
+    (-27, "ERR__ERROR_ALLOC_RING_BUFFER_2"),
+    (-30, "ERR__ERROR_ALLOC_BLOCK_TYPE_TREES"),
+    (-31, "ERR__ERROR_UNREACHABLE"),
+];
+
+/// zstd's errors for input that doesn't start with a frame, for corrupt frames, for frame headers
+/// with the reserved bit set and for frames whose checksum doesn't match their content: the
+/// message, the code name and its number.
+const ZSTD_PREFIX_UNKNOWN: (&str, &str, i32) =
+    ("Unknown frame descriptor", "ZSTD_error_prefix_unknown", 10);
+const ZSTD_CORRUPTION_DETECTED: (&str, &str, i32) = (
+    "Data corruption detected",
+    "ZSTD_error_corruption_detected",
+    20,
+);
+const ZSTD_FRAME_PARAMETER_UNSUPPORTED: (&str, &str, i32) = (
+    "Unsupported frame parameter",
+    "ZSTD_error_frameParameter_unsupported",
+    14,
+);
+const ZSTD_CHECKSUM_WRONG: (&str, &str, i32) = (
+    "Restored data doesn't match checksum",
+    "ZSTD_error_checksum_wrong",
+    22,
+);
+
 /// The zlib return codes, by name.
 const CODES: [(&str, i32); 9] = [
     ("Z_OK", 0),
@@ -212,6 +276,14 @@ const CODES: [(&str, i32); 9] = [
     ("Z_BUF_ERROR", -5),
     ("Z_VERSION_ERROR", -6),
 ];
+
+/// Whether `code` names `Z_NEED_DICT` or a negative constant of [`CONSTANTS`], the zlib and Brotli
+/// failures.
+pub(crate) fn is_failure_code(code: &str) -> bool {
+    CONSTANTS
+        .iter()
+        .any(|&(name, value)| name == code && (value < 0.0 || name == "Z_NEED_DICT"))
+}
 
 /// The size of the output buffer each step of the engine fills.
 const CHUNK: usize = 16 * 1024;
@@ -227,6 +299,77 @@ enum Format {
     DeflateRaw,
     InflateRaw,
     Unzip,
+    BrotliCompress,
+    BrotliDecompress,
+    ZstdCompress,
+    ZstdDecompress,
+}
+
+/// The formats that share flush constants and options.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Zlib,
+    Brotli,
+    Zstd,
+}
+
+impl Format {
+    fn family(self) -> Family {
+        match self {
+            Format::BrotliCompress | Format::BrotliDecompress => Family::Brotli,
+            Format::ZstdCompress | Format::ZstdDecompress => Family::Zstd,
+            _ => Family::Zlib,
+        }
+    }
+
+    fn decompresses(self) -> bool {
+        matches!(
+            self,
+            Format::Inflate
+                | Format::Gunzip
+                | Format::InflateRaw
+                | Format::Unzip
+                | Format::BrotliDecompress
+                | Format::ZstdDecompress
+        )
+    }
+}
+
+impl Family {
+    /// The flush constants Node.js's `flush`, `finishFlush` and `flush()` take: the lowest, the
+    /// highest, the default flush, the default finishing flush, and the flush `flush()` defaults to.
+    fn flush_constants(self) -> (f64, f64, f64, f64, f64) {
+        match self {
+            // `Z_NO_FLUSH` to `Z_BLOCK`, `Z_FINISH` and `Z_FULL_FLUSH`.
+            Family::Zlib => (0.0, 5.0, 0.0, 4.0, 3.0),
+            // `BROTLI_OPERATION_PROCESS` to `BROTLI_OPERATION_EMIT_METADATA`,
+            // `BROTLI_OPERATION_FINISH` and `BROTLI_OPERATION_FLUSH`.
+            Family::Brotli => (0.0, 3.0, 0.0, 2.0, 1.0),
+            // `ZSTD_e_continue` to `ZSTD_e_end`, `ZSTD_e_end` and `ZSTD_e_flush`.
+            Family::Zstd => (0.0, 2.0, 0.0, 2.0, 1.0),
+        }
+    }
+
+    /// The flush for the flush constant `kind` of this family. For zlib, `Z_NO_FLUSH` is `None`,
+    /// `Z_PARTIAL_FLUSH`, `Z_SYNC_FLUSH` and `Z_BLOCK` are `Sync`, and the others are `Full`. For
+    /// Brotli and zstd, 0 is `None`, and the others are `Sync`.
+    fn flush(self, kind: f64) -> Flush {
+        match (self, kind as i32) {
+            (_, 0) => Flush::None,
+            (Family::Zlib, 1 | 2 | 5) => Flush::Sync,
+            (Family::Zlib, _) => Flush::Full,
+            _ => Flush::Sync,
+        }
+    }
+
+    /// The flush that ends a conversion whose `finishFlush` is `kind`.
+    fn finish_flush(self, kind: f64) -> Flush {
+        if kind == self.flush_constants().3 {
+            Flush::Finish
+        } else {
+            self.flush(kind)
+        }
+    }
 }
 
 /// How much of the compressed data a call to [`Codec::process`] produces.
@@ -240,18 +383,6 @@ enum Flush {
     Full,
     /// Everything, ending the compressed stream.
     Finish,
-}
-
-impl Flush {
-    /// The flush for the zlib flush constant `kind`: `Z_NO_FLUSH` is `None`, `Z_PARTIAL_FLUSH`,
-    /// `Z_SYNC_FLUSH` and `Z_BLOCK` are `Sync`, and the others are `Full`.
-    fn from_kind(kind: f64) -> Self {
-        match kind as i32 {
-            0 => Flush::None,
-            1 | 2 | 5 => Flush::Sync,
-            _ => Flush::Full,
-        }
-    }
 }
 
 /// A zlib error: the message, the code name, such as `Z_DATA_ERROR`, and its number, or
@@ -285,6 +416,55 @@ impl ZlibError {
             code: "ERR_BUFFER_TOO_LARGE",
             errno: None,
         }
+    }
+
+    /// The error of a Brotli decoder that failed with the error code `code`.
+    fn brotli(code: i32) -> Self {
+        let name = BROTLI_ERROR_CODES
+            .iter()
+            .find(|&&(value, _)| value == code)
+            .map_or("ERR__ERROR_UNREACHABLE", |&(_, name)| name);
+        ZlibError {
+            message: "Decompression failed".into(),
+            code: name,
+            errno: Some(code),
+        }
+    }
+
+    /// The zstd error `code`: its message, code name and number.
+    fn zstd_code((message, code, errno): (&str, &'static str, i32)) -> Self {
+        ZlibError {
+            message: message.into(),
+            code,
+            errno: Some(errno),
+        }
+    }
+
+    /// The error of a zstd decoder that failed with `error`.
+    fn zstd(error: &FrameDecoderError) -> Self {
+        let truncated =
+            std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |error| {
+                error.source()
+            })
+            .any(|error| {
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
+            });
+        if truncated {
+            return ZlibError::unexpected_end();
+        }
+        ZlibError::zstd_code(match error {
+            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_)) => {
+                ZSTD_PREFIX_UNKNOWN
+            }
+            FrameDecoderError::WindowSizeTooBig { .. } => (
+                "Frame requires too much memory for decoding",
+                "ZSTD_error_frameParameter_windowTooLarge",
+                16,
+            ),
+            _ => ZSTD_CORRUPTION_DETECTED,
+        })
     }
 
     /// The error as a JS `Error` with `code` and `errno`.
@@ -321,10 +501,52 @@ fn compression(level: i32) -> Compression {
     }
 }
 
-/// The zlib engine of a [`Codec`].
+/// The options a [`Codec`] is created with.
+#[derive(Clone)]
+struct Params {
+    /// The zlib compression level, -1 for the default.
+    level: i32,
+    /// The Brotli parameters, as `BROTLI_PARAM_*` keys and their values.
+    brotli: Vec<(u32, u32)>,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            level: -1,
+            brotli: Vec::new(),
+        }
+    }
+}
+
+/// The Brotli encoder parameter with the `BROTLI_PARAM_*` value `key`. `BROTLI_PARAM_NPOSTFIX` and
+/// `BROTLI_PARAM_NDIRECT` have none, so they have no effect.
+fn brotli_parameter(key: u32) -> Option<BrotliEncoderParameter> {
+    Some(match key {
+        0 => BrotliEncoderParameter::BROTLI_PARAM_MODE,
+        1 => BrotliEncoderParameter::BROTLI_PARAM_QUALITY,
+        2 => BrotliEncoderParameter::BROTLI_PARAM_LGWIN,
+        3 => BrotliEncoderParameter::BROTLI_PARAM_LGBLOCK,
+        4 => BrotliEncoderParameter::BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING,
+        5 => BrotliEncoderParameter::BROTLI_PARAM_SIZE_HINT,
+        6 => BrotliEncoderParameter::BROTLI_PARAM_LARGE_WINDOW,
+        _ => return None,
+    })
+}
+
+/// The Brotli decoder's state.
+type BrotliDecoder = BrotliState<StandardAlloc, StandardAlloc, StandardAlloc>;
+
+/// The engine of a [`Codec`].
 enum Engine {
     Compress(Compress),
     Decompress(Decompress),
+    BrotliCompress(Box<BrotliEncoderStateStruct<StandardAlloc>>),
+    BrotliDecompress(Box<BrotliDecoder>),
+    /// The zstd input, which is compressed as one frame once it ends.
+    ZstdCompress(Vec<u8>),
+    /// The zstd input, which is decompressed once it ends.
+    ZstdDecompress(Vec<u8>),
 }
 
 /// A compressor or decompressor that takes its input in pieces.
@@ -333,7 +555,7 @@ pub(crate) struct Codec {
     format: Format,
     /// The format the codec was created for, which `reset` restores.
     created: Format,
-    level: i32,
+    params: Params,
     /// The engine, or `None` for `Unzip` until two bytes have arrived.
     engine: Option<Engine>,
     /// The input `Unzip` buffers until two bytes have arrived.
@@ -344,12 +566,13 @@ pub(crate) struct Codec {
 
 impl Default for Codec {
     fn default() -> Self {
-        Codec::new(Format::Deflate, -1)
+        Codec::new(Format::Deflate, &Params::default())
     }
 }
 
 impl Codec {
-    fn new(format: Format, level: i32) -> Self {
+    fn new(format: Format, params: &Params) -> Self {
+        let level = params.level;
         let compress = |engine| Some(Engine::Compress(engine));
         let decompress = |engine| Some(Engine::Decompress(engine));
         let engine = match format {
@@ -366,12 +589,40 @@ impl Codec {
             Format::Gunzip => decompress(Decompress::new_gzip(15)),
             Format::InflateRaw => decompress(Decompress::new_with_window_bits(false, 15)),
             Format::Unzip => None,
+            Format::BrotliCompress => {
+                let mut state = BrotliEncoderStateStruct::new(StandardAlloc::default());
+                for &(key, value) in &params.brotli {
+                    if let Some(parameter) = brotli_parameter(key) {
+                        state.set_parameter(parameter, value);
+                    }
+                }
+                Some(Engine::BrotliCompress(Box::new(state)))
+            }
+            Format::BrotliDecompress => Some(Engine::BrotliDecompress(Box::new(BrotliState::new(
+                StandardAlloc::default(),
+                StandardAlloc::default(),
+                StandardAlloc::default(),
+            )))),
+            Format::ZstdCompress => Some(Engine::ZstdCompress(Vec::new())),
+            Format::ZstdDecompress => Some(Engine::ZstdDecompress(Vec::new())),
         };
         Codec {
             format,
             created: format,
-            level,
+            params: params.clone(),
             engine,
+            held: Vec::new(),
+            ended: false,
+        }
+    }
+
+    /// A codec without an engine, which holds no compression state.
+    fn closed(format: Format, params: Params) -> Self {
+        Codec {
+            format,
+            created: format,
+            params,
+            engine: None,
             held: Vec::new(),
             ended: false,
         }
@@ -396,7 +647,7 @@ impl Codec {
             };
             *self = Codec {
                 created: self.created,
-                ..Codec::new(format, self.level)
+                ..Codec::new(format, &self.params)
             };
             input = &held;
         }
@@ -430,9 +681,35 @@ impl Codec {
                 }
             }
             Some(Engine::Decompress(_)) => self.decompress(input, &mut output)?,
+            Some(Engine::BrotliCompress(state)) => {
+                brotli_compress(state, input, flush, &mut output)?
+            }
+            Some(Engine::BrotliDecompress(state)) => {
+                if !self.ended {
+                    self.ended = brotli_decompress(state, input, &mut output)?;
+                }
+            }
+            Some(Engine::ZstdCompress(held)) => {
+                held.extend_from_slice(input);
+                if finish {
+                    output = ruzstd::encoding::compress_to_vec(
+                        held.as_slice(),
+                        ruzstd::encoding::CompressionLevel::Fastest,
+                    );
+                    held.clear();
+                }
+            }
+            Some(Engine::ZstdDecompress(held)) => {
+                held.extend_from_slice(input);
+                if finish {
+                    zstd_decompress(held, &mut output)?;
+                    held.clear();
+                    self.ended = true;
+                }
+            }
             None => unreachable!("the engine was created above"),
         }
-        if finish && !self.ended && !matches!(self.engine, Some(Engine::Compress(_))) {
+        if finish && !self.ended && self.format.decompresses() {
             return Err(ZlibError::unexpected_end());
         }
         Ok(output)
@@ -452,7 +729,7 @@ impl Codec {
                 }
                 *self = Codec {
                     created: self.created,
-                    ..Codec::new(Format::Gunzip, self.level)
+                    ..Codec::new(Format::Gunzip, &self.params)
                 };
             }
             let Some(Engine::Decompress(engine)) = self.engine.as_mut() else {
@@ -475,6 +752,152 @@ impl Codec {
         }
         Ok(())
     }
+}
+
+/// Compress `input` with the Brotli encoder `state` into `output`, with the operation `flush`
+/// selects: `BROTLI_OPERATION_PROCESS` for `Flush::None`, `BROTLI_OPERATION_FINISH` for
+/// `Flush::Finish`, and `BROTLI_OPERATION_FLUSH` otherwise.
+fn brotli_compress(
+    state: &mut BrotliEncoderStateStruct<StandardAlloc>,
+    mut input: &[u8],
+    flush: Flush,
+    output: &mut Vec<u8>,
+) -> Result<(), ZlibError> {
+    let operation = match flush {
+        Flush::None if input.is_empty() => return Ok(()),
+        Flush::None => BrotliEncoderOperation::BROTLI_OPERATION_PROCESS,
+        Flush::Sync | Flush::Full => BrotliEncoderOperation::BROTLI_OPERATION_FLUSH,
+        Flush::Finish => BrotliEncoderOperation::BROTLI_OPERATION_FINISH,
+    };
+    let finish = flush == Flush::Finish;
+    let mut buffer = vec![0; CHUNK];
+    loop {
+        let mut available_in = input.len();
+        let mut input_offset = 0;
+        let mut available_out = buffer.len();
+        let mut output_offset = 0;
+        let compressed = state.compress_stream(
+            operation,
+            &mut available_in,
+            input,
+            &mut input_offset,
+            &mut available_out,
+            &mut buffer,
+            &mut output_offset,
+            &mut None,
+            &mut |_, _, _, _| (),
+        );
+        output.extend_from_slice(&buffer[..output_offset]);
+        input = &input[input_offset..];
+        if !compressed {
+            return Err(ZlibError::data(Some("Compression failed")));
+        }
+        let done = if finish {
+            state.is_finished()
+        } else {
+            input.is_empty() && !state.has_more_output()
+        };
+        if done {
+            return Ok(());
+        }
+    }
+}
+
+/// Decompress `input` with the Brotli decoder `state` into `output`. Returns whether the
+/// compressed stream ended. Bytes after its end are ignored.
+fn brotli_decompress(
+    state: &mut BrotliDecoder,
+    mut input: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<bool, ZlibError> {
+    let mut buffer = vec![0; CHUNK];
+    loop {
+        let mut available_in = input.len();
+        let mut input_offset = 0;
+        let mut available_out = buffer.len();
+        let mut output_offset = 0;
+        let mut total_out = 0;
+        let result = BrotliDecompressStream(
+            &mut available_in,
+            &mut input_offset,
+            input,
+            &mut available_out,
+            &mut output_offset,
+            &mut buffer,
+            &mut total_out,
+            state,
+        );
+        output.extend_from_slice(&buffer[..output_offset]);
+        input = &input[input_offset..];
+        match result {
+            BrotliResult::ResultSuccess => return Ok(true),
+            BrotliResult::NeedsMoreInput => return Ok(false),
+            BrotliResult::NeedsMoreOutput => {}
+            BrotliResult::ResultFailure => {
+                return Err(ZlibError::brotli(state.error_code as i32));
+            }
+        }
+    }
+}
+
+/// Decompress the first zstd frame in `input` into `output`, as Node.js does. Skippable frames
+/// before it are skipped, and the bytes after it are ignored.
+fn zstd_decompress(mut input: &[u8], output: &mut Vec<u8>) -> Result<(), ZlibError> {
+    let mut decoder = FrameDecoder::new();
+    let mut declares_size;
+    loop {
+        if input.is_empty() {
+            return Err(ZlibError::unexpected_end());
+        }
+        // A frame starts with the magic number 0xFD2FB528, and a skippable frame with one from
+        // 0x184D2A50 to 0x184D2A5F, both little-endian.
+        let head = &input[..input.len().min(4)];
+        let frame = head == &[0x28, 0xb5, 0x2f, 0xfd][..head.len()];
+        let skippable = head[0] & 0xf0 == 0x50 && head[1..] == [0x2a, 0x4d, 0x18][..head.len() - 1];
+        if !frame && !skippable {
+            return Err(ZlibError::zstd_code(ZSTD_PREFIX_UNKNOWN));
+        }
+        // The frame header descriptor's `Frame_Content_Size_flag` and `Single_Segment_flag`
+        // tell whether the header holds the size of the frame's content.
+        let descriptor = input.get(4).copied().unwrap_or(0);
+        declares_size = frame && (descriptor >> 6 != 0 || descriptor & 0x20 != 0);
+        // Its reserved bit must be 0.
+        if frame && descriptor & 0x08 != 0 {
+            return Err(ZlibError::zstd_code(ZSTD_FRAME_PARAMETER_UNSUPPORTED));
+        }
+        match decoder.init(&mut input) {
+            Ok(()) => break,
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                length,
+                ..
+            })) => {
+                input = input
+                    .get(length as usize..)
+                    .ok_or_else(ZlibError::unexpected_end)?;
+            }
+            Err(error) => return Err(ZlibError::zstd(&error)),
+        }
+    }
+    decoder
+        .decode_blocks(&mut input, BlockDecodingStrategy::All)
+        .map_err(|error| ZlibError::zstd(&error))?;
+    if !decoder.is_finished() {
+        return Err(ZlibError::unexpected_end());
+    }
+    let content = decoder.collect().unwrap_or_default();
+    if declares_size && content.len() as u64 != decoder.content_size() {
+        return Err(ZlibError::zstd_code(ZSTD_CORRUPTION_DETECTED));
+    }
+    if let (Some(expected), Some(actual)) = (
+        decoder.get_checksum_from_data(),
+        decoder.get_calculated_checksum(),
+    ) {
+        if expected != actual {
+            return Err(ZlibError::zstd_code(ZSTD_CHECKSUM_WRONG));
+        }
+    }
+    output.extend(content);
+    Ok(())
 }
 
 /// The bytes of `data`: a string as UTF-8, or the bytes of a `Buffer`, `TypedArray`, `DataView`
@@ -528,26 +951,80 @@ fn range_or_default(
 
 /// The options of a zlib stream or conversion that the codec uses.
 struct ZlibOptions {
-    /// The compression level, -1 for the default.
-    level: i32,
+    params: Params,
     /// The largest output a synchronous conversion produces.
     max_output_length: f64,
-    /// The zlib flush constant a conversion ends with, `Z_FINISH` by default.
+    /// The flush constant a conversion ends with, `Z_FINISH`, `BROTLI_OPERATION_FINISH` or
+    /// `ZSTD_e_end` by default.
     finish_flush: f64,
 }
 
-/// The options of `format` in `options`, validated as Node.js's `Zlib` and `ZlibBase`
-/// constructors validate them: `windowBits`, `level`, `memLevel`, `strategy`, `dictionary`,
-/// `chunkSize`, `flush`, `finishFlush` and `maxOutputLength`.
+/// The `ZSTD_c_*` parameters.
+const ZSTD_COMPRESS_PARAMS: [u32; 19] = [
+    100, 101, 102, 103, 104, 105, 106, 107, 160, 161, 162, 163, 164, 200, 201, 202, 400, 401, 402,
+];
+
+/// The keys and values of `options.params`, validated as Node.js's `Brotli` and `Zstd`
+/// constructors validate them: a key must be a number from 0 to `max_key`, which is
+/// `invalid_code`, an error with the message `invalid_message` after the key, otherwise, and a
+/// value must be a number or a boolean.
+fn codec_params(
+    scope: &Scope<'_>,
+    options: Object<'_>,
+    max_key: f64,
+    invalid_code: &'static str,
+    invalid_message: &str,
+) -> Result<Vec<(u32, u32)>, Thrown> {
+    let params = options.get_property(scope, c"params")?;
+    let Some(params) = Some(params)
+        .filter(|params| bool::from_jsval(scope, *params, ()).unwrap_or(false))
+        .and_then(|params| Object::from_value(scope, *params).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    for key in params.own_enumerable_keys(scope)? {
+        let name = String::from_jsval(scope, key, ())?;
+        let number = if name.trim().is_empty() {
+            0.0
+        } else {
+            name.trim().parse::<f64>().unwrap_or(f64::NAN)
+        };
+        if number.is_nan() || !(0.0..=max_key).contains(&number) || number.fract() != 0.0 {
+            let message = format!("{name} {invalid_message}");
+            return Err(NodeError::new(ErrorKind::RangeError, invalid_code, message).into());
+        }
+        let id = scope.root_id(js::id::value_to_id(scope, key)?);
+        let value = params.get_property_by_id(scope, id)?;
+        let value = if value.is_boolean() {
+            u32::from(value.to_boolean())
+        } else if value.is_number() {
+            value.to_number() as u32
+        } else {
+            let name = "options.params[key]";
+            return Err(NodeError::invalid_arg_type(scope, name, "of type number", value).into());
+        };
+        result.push((number as u32, value));
+    }
+    Ok(result)
+}
+
+/// The options of `format` in `options`, validated as Node.js's `Zlib`, `Brotli`, `Zstd` and
+/// `ZlibBase` constructors validate them: `windowBits`, `level`, `memLevel`, `strategy` and
+/// `dictionary` for zlib, `params` for Brotli and zstd, and `chunkSize`, `flush`, `finishFlush`
+/// and `maxOutputLength`. The `dictionary` of Brotli and zstd and zstd's `pledgedSrcSize` are
+/// ignored.
 fn zlib_options(
     scope: &Scope<'_>,
     options: Option<HandleValue<'_>>,
     format: Format,
 ) -> Result<ZlibOptions, Thrown> {
+    let family = format.family();
+    let (min_flush, max_flush, default_flush, default_finish, _) = family.flush_constants();
     let mut result = ZlibOptions {
-        level: -1,
+        params: Params::default(),
         max_output_length: MAX_LENGTH,
-        finish_flush: 4.0,
+        finish_flush: default_finish,
     };
     let Some(options) = options
         .filter(|options| bool::from_jsval(scope, *options, ()).unwrap_or(false))
@@ -555,28 +1032,39 @@ fn zlib_options(
     else {
         return Ok(result);
     };
-    let window_bits = options.get_property(scope, c"windowBits")?;
-    let decompressing = matches!(format, Format::Inflate | Format::Gunzip | Format::Unzip);
-    let unset = window_bits.is_null_or_undefined()
-        || (window_bits.is_number() && window_bits.to_number() == 0.0);
-    if !(unset && decompressing) {
-        let min = if format == Format::Gzip { 9.0 } else { 8.0 };
-        range_or_default(scope, window_bits, "options.windowBits", min, 15.0, 15.0)?;
-    }
-    let level = options.get_property(scope, c"level")?;
-    result.level = range_or_default(scope, level, "options.level", -1.0, 9.0, -1.0)? as i32;
-    let mem_level = options.get_property(scope, c"memLevel")?;
-    range_or_default(scope, mem_level, "options.memLevel", 1.0, 9.0, 8.0)?;
-    let strategy = options.get_property(scope, c"strategy")?;
-    range_or_default(scope, strategy, "options.strategy", 0.0, 4.0, 0.0)?;
-    let dictionary = options.get_property(scope, c"dictionary")?;
-    let is_buffer_source =
-        Object::from_value(scope, dictionary).is_ok_and(js::typedarray::is_buffer_source);
-    if !dictionary.is_undefined() && !is_buffer_source {
-        let expected = "an instance of Buffer, TypedArray, DataView, or ArrayBuffer";
-        return Err(
-            NodeError::invalid_arg_type(scope, "options.dictionary", expected, dictionary).into(),
-        );
+    match family {
+        Family::Zlib => result.params.level = zlib_format_options(scope, options, format)?,
+        Family::Brotli => {
+            let message = "is not a valid Brotli parameter";
+            result.params.brotli =
+                codec_params(scope, options, 8.0, "ERR_BROTLI_INVALID_PARAM", message)?;
+        }
+        Family::Zstd => {
+            let compress = format == Format::ZstdCompress;
+            let max_key = if compress { 402.0 } else { 100.0 };
+            let message = "is not a valid zstd parameter";
+            let params = codec_params(scope, options, max_key, "ERR_ZSTD_INVALID_PARAM", message)?;
+            let known = |key: u32| {
+                if compress {
+                    ZSTD_COMPRESS_PARAMS.contains(&key)
+                } else {
+                    key == 100
+                }
+            };
+            // `ZSTD_c_windowLog` and `ZSTD_d_windowLogMax` take 0 for the default, or 10 to 31.
+            let valid_window = |key: u32, value: u32| {
+                key != if compress { 101 } else { 100 } || value == 0 || (10..=31).contains(&value)
+            };
+            if params
+                .iter()
+                .any(|&(key, value)| !known(key) || !valid_window(key, value))
+            {
+                let code = "ERR_ZLIB_INITIALIZATION_FAILED";
+                return Err(
+                    NodeError::new(ErrorKind::Error, code, "Setting parameter failed").into(),
+                );
+            }
+        }
     }
     let chunk_size = options.get_property(scope, c"chunkSize")?;
     let chunk_size = range_or_default(
@@ -593,10 +1081,23 @@ fn zlib_options(
         );
     }
     let flush = options.get_property(scope, c"flush")?;
-    range_or_default(scope, flush, "options.flush", 0.0, 5.0, 0.0)?;
+    range_or_default(
+        scope,
+        flush,
+        "options.flush",
+        min_flush,
+        max_flush,
+        default_flush,
+    )?;
     let finish_flush = options.get_property(scope, c"finishFlush")?;
-    result.finish_flush =
-        range_or_default(scope, finish_flush, "options.finishFlush", 0.0, 5.0, 4.0)?;
+    result.finish_flush = range_or_default(
+        scope,
+        finish_flush,
+        "options.finishFlush",
+        min_flush,
+        max_flush,
+        default_finish,
+    )?;
     let max = options.get_property(scope, c"maxOutputLength")?;
     result.max_output_length = range_or_default(
         scope,
@@ -609,6 +1110,40 @@ fn zlib_options(
     Ok(result)
 }
 
+/// The zlib options of `format` in `options`, validated as Node.js's `Zlib` constructor
+/// validates them: `windowBits`, `level`, `memLevel`, `strategy` and `dictionary`. Returns the
+/// level.
+fn zlib_format_options(
+    scope: &Scope<'_>,
+    options: Object<'_>,
+    format: Format,
+) -> Result<i32, Thrown> {
+    let window_bits = options.get_property(scope, c"windowBits")?;
+    let decompressing = matches!(format, Format::Inflate | Format::Gunzip | Format::Unzip);
+    let unset = window_bits.is_null_or_undefined()
+        || (window_bits.is_number() && window_bits.to_number() == 0.0);
+    if !(unset && decompressing) {
+        let min = if format == Format::Gzip { 9.0 } else { 8.0 };
+        range_or_default(scope, window_bits, "options.windowBits", min, 15.0, 15.0)?;
+    }
+    let level = options.get_property(scope, c"level")?;
+    let level = range_or_default(scope, level, "options.level", -1.0, 9.0, -1.0)? as i32;
+    let mem_level = options.get_property(scope, c"memLevel")?;
+    range_or_default(scope, mem_level, "options.memLevel", 1.0, 9.0, 8.0)?;
+    let strategy = options.get_property(scope, c"strategy")?;
+    range_or_default(scope, strategy, "options.strategy", 0.0, 4.0, 0.0)?;
+    let dictionary = options.get_property(scope, c"dictionary")?;
+    let is_buffer_source =
+        Object::from_value(scope, dictionary).is_ok_and(js::typedarray::is_buffer_source);
+    if !dictionary.is_undefined() && !is_buffer_source {
+        let expected = "an instance of Buffer, TypedArray, DataView, or ArrayBuffer";
+        return Err(
+            NodeError::invalid_arg_type(scope, "options.dictionary", expected, dictionary).into(),
+        );
+    }
+    Ok(level)
+}
+
 /// Compress or decompress all of `data` in `format`.
 fn convert<'s>(
     scope: &'s Scope<'_>,
@@ -618,12 +1153,8 @@ fn convert<'s>(
 ) -> Result<Result<Object<'s>, ZlibError>, Thrown> {
     let options = zlib_options(scope, options, format)?;
     let bytes = input_bytes(scope, data)?;
-    let mut codec = Codec::new(format, options.level);
-    let flush = if options.finish_flush == 4.0 {
-        Flush::Finish
-    } else {
-        Flush::from_kind(options.finish_flush)
-    };
+    let mut codec = Codec::new(format, &options.params);
+    let flush = format.family().finish_flush(options.finish_flush);
     Ok(match codec.process(&bytes, flush) {
         Ok(output) if output.len() as f64 > options.max_output_length => {
             let message = format!(
@@ -753,17 +1284,22 @@ fn flush_flag<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
     Ok(scope.root_id(js::id::value_to_id(scope, symbol)?))
 }
 
-/// The flush the chunk `chunk` requests: the flush of its flush flag, or `Flush::None`.
-fn chunk_flush(scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<Flush, ExnThrown> {
+/// The flush the chunk `chunk` written to `stream` requests: the flush of its flush flag, or
+/// `Flush::None`.
+fn chunk_flush(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    chunk: HandleValue<'_>,
+) -> Result<Flush, Thrown> {
     let Ok(chunk) = Object::from_value(scope, *chunk) else {
         return Ok(Flush::None);
     };
     let kind = chunk.get_property_by_id(scope, flush_flag(scope)?)?;
-    Ok(if kind.is_number() {
-        Flush::from_kind(kind.to_number())
-    } else {
-        Flush::None
-    })
+    if !kind.is_number() {
+        return Ok(Flush::None);
+    }
+    let family = handle_of(scope, stream)?.data().codec.format.family();
+    Ok(family.flush(kind.to_number()))
 }
 
 /// Flush `stream` with the zlib flush constant `kind` after the chunks written before, and then
@@ -805,7 +1341,7 @@ fn apply_params(
         _ => true,
     };
     if changed {
-        state.codec.level = level;
+        state.codec.params.level = level;
     }
     drop(state);
     let callback = captures.get(2)?;
@@ -828,7 +1364,7 @@ fn init_stream(
     format: Format,
 ) -> Result<(), Thrown> {
     crate::stream::init_transform(scope, stream, options)?;
-    let codec = Codec::new(format, zlib_options(scope, options, format)?.level);
+    let codec = Codec::new(format, &zlib_options(scope, options, format)?.params);
     let handle =
         js::class::create_instance_with::<ZlibHandleImpl>(scope, |_| ZlibHandleImpl { codec })?;
     stream.set_property(scope, c"_handle", handle.to_jsval_throwing(scope)?)?;
@@ -858,12 +1394,13 @@ pub mod zlib_class {
         _encoding: HandleValue<'_>,
         callback: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        let result = chunk_flush(scope, chunk)
-            .map_err(Thrown::from)
-            .and_then(|flush| {
-                let bytes = input_bytes(scope, chunk)?;
-                write_to(scope, this, &bytes, flush)
-            });
+        if this.val(scope, c"_handle")?.is_null() {
+            return next_tick_call(scope, callback, &[]);
+        }
+        let result = chunk_flush(scope, this, chunk).and_then(|flush| {
+            let bytes = input_bytes(scope, chunk)?;
+            write_to(scope, this, &bytes, flush)
+        });
         complete(scope, callback, result)
     }
 
@@ -873,27 +1410,58 @@ pub mod zlib_class {
         this: Object<'_>,
         callback: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
+        if this.val(scope, c"_handle")?.is_null() {
+            return next_tick_call(scope, callback, &[]);
+        }
         let result = write_to(scope, this, &[], Flush::Finish);
         complete(scope, callback, result)
     }
 
+    /// Node's `_destroy`: free the codec, set `_handle` to `null`, and call `callback` with
+    /// `error`.
+    #[method(name = "_destroy")]
+    pub fn destroy_impl(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        error: HandleValue<'_>,
+        callback: HandleValue<'_>,
+    ) -> Result<(), ExnThrown> {
+        if let Some(handle) = this.obj(scope, c"_handle")? {
+            if let Ok(handle) = handle.cast::<ZlibHandle>() {
+                let mut state = handle.data_mut();
+                let params = state.codec.params.clone();
+                state.codec = Codec::closed(state.codec.created, params);
+            }
+        }
+        this.set_property(scope, c"_handle", js::value::null())?;
+        js::Function::call(scope, js::value::undefined(), callback, &[error])?;
+        Ok(())
+    }
+
     /// <https://nodejs.org/api/zlib.html#zlibflushkind-callback>: `kind` defaults to
-    /// `Z_FULL_FLUSH`.
+    /// `Z_FULL_FLUSH`, or `BROTLI_OPERATION_FLUSH` or `ZSTD_e_flush`.
     pub fn flush(
         scope: &Scope<'_>,
         this: Object<'_>,
         kind: Option<HandleValue<'_>>,
         callback: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
+    ) -> Result<(), Thrown> {
         let (kind, callback) = match kind {
             Some(kind) if is_function(scope, kind) => (None, Some(kind)),
             _ => (kind, callback),
         };
+        // A destroyed stream has no handle, and fails the write below.
+        let family = if this.val(scope, c"_handle")?.is_null() {
+            Family::Zlib
+        } else {
+            handle_of(scope, this)?.data().codec.format.family()
+        };
+        let full_flush = family.flush_constants().4;
         let kind = kind
             .filter(|kind| kind.is_number())
-            .map_or(3.0, |kind| kind.to_number());
+            .map_or(full_flush, |kind| kind.to_number());
         let callback = callback.unwrap_or_else(|| scope.root_value(js::value::undefined()));
-        flush_stream(scope, this, kind, callback)
+        Ok(flush_stream(scope, this, kind, callback)?)
     }
 
     /// <https://nodejs.org/api/zlib.html#zlibparamslevel-strategy-callback>: set the level of a
@@ -918,15 +1486,17 @@ pub mod zlib_class {
         flush_stream(scope, this, 2.0, done.to_jsval_throwing(scope)?)
     }
 
-    /// <https://nodejs.org/api/zlib.html#zlibclosecallback>
+    /// <https://nodejs.org/api/zlib.html#zlibclosecallback>: `callback` is called once the
+    /// stream finished, closed or failed, as `stream.finished` calls it.
     pub fn close(
         scope: &Scope<'_>,
         this: Object<'_>,
         callback: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        if let Some(callback) = callback.filter(|callback| !callback.is_undefined()) {
-            let close = string(scope, "close")?;
-            call_method(scope, this, c"once", &[close, callback])?;
+    ) -> Result<(), Thrown> {
+        if let Some(callback) = callback.filter(|callback| crate::stream::truthy(scope, *callback))
+        {
+            let stream = this.to_jsval_throwing(scope)?;
+            crate::stream::end_of_stream(scope, stream, None, callback)?;
         }
         call_method(scope, this, c"destroy", &[])?;
         Ok(())
@@ -936,7 +1506,8 @@ pub mod zlib_class {
     pub fn reset(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
         let handle = handle_of(scope, this)?;
         let mut state = handle.data_mut();
-        state.codec = Codec::new(state.codec.created, state.codec.level);
+        let params = state.codec.params.clone();
+        state.codec = Codec::new(state.codec.created, &params);
         Ok(())
     }
 }
@@ -967,20 +1538,14 @@ zlib_stream_class!(gunzip_class, "Gunzip", Gunzip);
 zlib_stream_class!(deflate_raw_class, "DeflateRaw", DeflateRaw);
 zlib_stream_class!(inflate_raw_class, "InflateRaw", InflateRaw);
 zlib_stream_class!(unzip_class, "Unzip", Unzip);
-
-/// Register the classes of `node:zlib` on `global`.
-pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
-    ZlibHandle::add_to_global(scope, global);
-    zlib_class::register(scope)?;
-    deflate_class::register(scope)?;
-    inflate_class::register(scope)?;
-    gzip_class::register(scope)?;
-    gunzip_class::register(scope)?;
-    deflate_raw_class::register(scope)?;
-    inflate_raw_class::register(scope)?;
-    unzip_class::register(scope)?;
-    Ok(())
-}
+zlib_stream_class!(brotli_compress_class, "BrotliCompress", BrotliCompress);
+zlib_stream_class!(
+    brotli_decompress_class,
+    "BrotliDecompress",
+    BrotliDecompress
+);
+zlib_stream_class!(zstd_compress_class, "ZstdCompress", ZstdCompress);
+zlib_stream_class!(zstd_decompress_class, "ZstdDecompress", ZstdDecompress);
 
 /// A new instance of the class `class`, constructed with `options`.
 fn create<'s>(
@@ -996,6 +1561,8 @@ fn create<'s>(
 pub mod module {
     use super::*;
 
+    pub use super::brotli_compress_class as BrotliCompress;
+    pub use super::brotli_decompress_class as BrotliDecompress;
     pub use super::deflate_class as Deflate;
     pub use super::deflate_raw_class as DeflateRaw;
     pub use super::gunzip_class as Gunzip;
@@ -1003,6 +1570,8 @@ pub mod module {
     pub use super::inflate_class as Inflate;
     pub use super::inflate_raw_class as InflateRaw;
     pub use super::unzip_class as Unzip;
+    pub use super::zstd_compress_class as ZstdCompress;
+    pub use super::zstd_decompress_class as ZstdDecompress;
 
     pub fn deflate_sync<'s>(
         scope: &'s Scope<'_>,
@@ -1060,6 +1629,38 @@ pub mod module {
         convert_sync(scope, Format::Unzip, buffer, options)
     }
 
+    pub fn brotli_compress_sync<'s>(
+        scope: &'s Scope<'_>,
+        buffer: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        convert_sync(scope, Format::BrotliCompress, buffer, options)
+    }
+
+    pub fn brotli_decompress_sync<'s>(
+        scope: &'s Scope<'_>,
+        buffer: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        convert_sync(scope, Format::BrotliDecompress, buffer, options)
+    }
+
+    pub fn zstd_compress_sync<'s>(
+        scope: &'s Scope<'_>,
+        buffer: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        convert_sync(scope, Format::ZstdCompress, buffer, options)
+    }
+
+    pub fn zstd_decompress_sync<'s>(
+        scope: &'s Scope<'_>,
+        buffer: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        convert_sync(scope, Format::ZstdDecompress, buffer, options)
+    }
+
     pub fn deflate(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1114,6 +1715,38 @@ pub mod module {
         rest: RestArgs<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
         convert_async(scope, Format::Unzip, buffer, &rest)
+    }
+
+    pub fn brotli_compress(
+        scope: &Scope<'_>,
+        buffer: HandleValue<'_>,
+        rest: RestArgs<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        convert_async(scope, Format::BrotliCompress, buffer, &rest)
+    }
+
+    pub fn brotli_decompress(
+        scope: &Scope<'_>,
+        buffer: HandleValue<'_>,
+        rest: RestArgs<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        convert_async(scope, Format::BrotliDecompress, buffer, &rest)
+    }
+
+    pub fn zstd_compress(
+        scope: &Scope<'_>,
+        buffer: HandleValue<'_>,
+        rest: RestArgs<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        convert_async(scope, Format::ZstdCompress, buffer, &rest)
+    }
+
+    pub fn zstd_decompress(
+        scope: &Scope<'_>,
+        buffer: HandleValue<'_>,
+        rest: RestArgs<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        convert_async(scope, Format::ZstdDecompress, buffer, &rest)
     }
 
     pub fn create_deflate<'s>(
@@ -1189,6 +1822,50 @@ pub mod module {
         )
     }
 
+    pub fn create_brotli_compress<'s>(
+        scope: &'s Scope<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        create(
+            scope,
+            super::brotli_compress_class::class_constructor(scope)?,
+            options,
+        )
+    }
+
+    pub fn create_brotli_decompress<'s>(
+        scope: &'s Scope<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        create(
+            scope,
+            super::brotli_decompress_class::class_constructor(scope)?,
+            options,
+        )
+    }
+
+    pub fn create_zstd_compress<'s>(
+        scope: &'s Scope<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        create(
+            scope,
+            super::zstd_compress_class::class_constructor(scope)?,
+            options,
+        )
+    }
+
+    pub fn create_zstd_decompress<'s>(
+        scope: &'s Scope<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        create(
+            scope,
+            super::zstd_decompress_class::class_constructor(scope)?,
+            options,
+        )
+    }
+
     /// <https://nodejs.org/api/zlib.html#zlibcrc32data-value>
     pub fn crc32(
         scope: &Scope<'_>,
@@ -1235,4 +1912,21 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         name,
         &[("constants", constants), ("codes", codes)],
     )
+}
+
+/// Register the stream classes of `node:zlib`.
+pub(crate) fn register_classes(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    zlib_class::register(scope)?;
+    deflate_class::register(scope)?;
+    inflate_class::register(scope)?;
+    gzip_class::register(scope)?;
+    gunzip_class::register(scope)?;
+    deflate_raw_class::register(scope)?;
+    inflate_raw_class::register(scope)?;
+    unzip_class::register(scope)?;
+    brotli_compress_class::register(scope)?;
+    brotli_decompress_class::register(scope)?;
+    zstd_compress_class::register(scope)?;
+    zstd_decompress_class::register(scope)?;
+    Ok(())
 }

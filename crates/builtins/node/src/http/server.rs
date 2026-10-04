@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! `http.Server`, which serves the runtime's incoming requests.
+//! `http.Server`, a `net.Server` that serves the runtime's incoming requests, or HTTP/1.1
+//! connections it accepts itself.
 //!
-//! `listen()` adds a `fetch` event listener, and records the server with its port. Each `fetch`
-//! event goes to the listening server whose port is the request URL's, or else to the server that
-//! listened first, as a `request` event with an `IncomingMessage` for the web `Request` and a
-//! `ServerResponse` whose web `Response` is the event's response. When the runtime runs a script as
-//! a command, nothing serves requests, so `listen()` emits an `ERR_SERVE_MODE_REQUIRED` error. In a
-//! component without a `wasi:http/handler` export, `listen()` throws that error.
+//! When the runtime runs a script as a command with `--node-http-listen`, `listen()` listens
+//! through `net.Server`, and the server's `connection` listener handles the HTTP/1.1 requests of
+//! each connection (see [`super::connection`]).
+//!
+//! Otherwise `listen()` adds a `fetch` event listener, and records the server with its port. Each
+//! `fetch` event goes to the listening server whose port is the request URL's, or else to the
+//! server that listened first, as a `request` event with an `IncomingMessage` for the web
+//! `Request` and a `ServerResponse` whose web `Response` is the event's response. When the
+//! runtime runs a script as a command without `--node-http-listen`, nothing serves requests, so
+//! `listen()` emits an `ERR_SERVE_MODE_REQUIRED` error. In a component without a
+//! `wasi:http/handler` export, `listen()` throws that error.
 
-use fetch_event::fetch_event::FetchEvent;
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
@@ -20,11 +25,17 @@ use js::{Function, Object};
 
 use super::incoming::{incoming_message_class, set_headers};
 use super::outgoing::server_response_class;
-use crate::errors::{ErrorKind, NodeError, Thrown};
+use crate::errors::{validate_integer, validate_plain_object, ErrorKind, NodeError, Thrown};
 use crate::stream::{call_method, is_function, next_tick_call, string, Props};
 
 /// The key of the shared array of listening servers.
 static SERVERS_KEY: u8 = 0;
+
+/// Whether `listen()` accepts connections through `net.Server`: when the runtime runs a script as
+/// a command with `--node-http-listen`.
+pub(super) fn listens_itself() -> bool {
+    core_runtime::event_loop::running_as_command() && crate::runtime_flags::get().http_listen
+}
 
 /// The listening servers of the current global, in the order they started listening.
 fn servers<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
@@ -60,37 +71,30 @@ fn server_for<'s>(
     Ok(first)
 }
 
-/// The socket a served request reports: an `EventEmitter` with the request's local port, whether
-/// it was encrypted, and the address, port and family of the client's address `client`. `client`
-/// is `None` where the transport doesn't report it, as with `wasi:http`.
+/// The socket a served request reports, with the request's local port, whether it was encrypted,
+/// and the client's address, port and family where the transport reports them, which `wasi:http`
+/// doesn't.
 fn socket<'s>(
     scope: &'s Scope<'_>,
+    event: Object<'_>,
     port: Option<u16>,
     encrypted: bool,
-    client: Option<std::net::SocketAddr>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let class = crate::events::emitter_constructor(scope)?;
-    let socket = Function::construct(scope, class, js::function::EmptyArgs)?;
-    match client {
-        Some(client) => {
-            socket.set_property(scope, c"remoteAddress", client.ip().to_string().as_str())?;
-            socket.set_property(scope, c"remotePort", f64::from(client.port()))?;
-            let family = if client.is_ipv4() { "IPv4" } else { "IPv6" };
-            socket.set_property(scope, c"remoteFamily", family)?;
-        }
-        None => socket.set_property(scope, c"remoteAddress", js::value::undefined())?,
-    }
-    socket.set_property(
-        scope,
-        c"localPort",
-        port.map_or(js::value::undefined(), |port| {
-            js::value::from_f64(f64::from(port))
-        }),
-    )?;
-    socket.set_property(scope, c"encrypted", encrypted)?;
-    socket.set_property(scope, c"writable", true)?;
-    socket.set_property(scope, c"readable", true)?;
-    socket.to_jsval_throwing(scope)
+    let client_address = event
+        .cast::<fetch_event::fetch_event::FetchEvent>()
+        .ok()
+        .and_then(|event| event.client_address());
+    let remote = client_address.map(|client| {
+        let family = if client.is_ipv4() { "IPv4" } else { "IPv6" };
+        (client.ip().to_string(), client.port(), family)
+    });
+    let connection = super::host_socket::HostConnection {
+        remote,
+        local_port: port,
+        encrypted,
+        owner: None,
+    };
+    super::host_socket::new_host_socket(scope, connection)?.to_jsval_throwing(scope)
 }
 
 /// The authority of `url`: its host, followed by its port if it has one.
@@ -169,14 +173,10 @@ fn on_fetch(
     }
 
     let encrypted = url.as_ref().is_some_and(|url| url.scheme() == "https");
-    let client = event
-        .cast::<FetchEvent>()
-        .ok()
-        .and_then(|event| event.client_address());
     let req = Function::construct(
         scope,
         incoming_message_class::class_constructor(scope)?,
-        &[socket(scope, port, encrypted, client)?],
+        &[socket(scope, event, port, encrypted)?],
     )?;
     req.set_property(scope, c"method", request.val(scope, c"method")?)?;
     let path = url.as_ref().map_or_else(
@@ -213,6 +213,10 @@ fn on_fetch(
         server_response_class::class_constructor(scope)?,
         &[req_value],
     )?;
+    res.set_property(scope, c"_starlingWire", false)?;
+    let req_socket = req.val(scope, c"socket")?;
+    res.set_property(scope, c"socket", req_socket)?;
+    res.set_property(scope, c"connection", req_socket)?;
     let promise = js::Promise::new_pending(scope)?;
     res.define_property(scope, c"_starlingRespond", *promise, 0)?;
     call_method(
@@ -262,46 +266,278 @@ pub(super) fn emit_later(
     next_tick_call(scope, bound, args)
 }
 
+/// Call the `net.Server` method `name` on `server` with `args`.
+fn call_net<'s>(
+    scope: &'s Scope<'_>,
+    server: Object<'_>,
+    name: &'static std::ffi::CStr,
+    args: &[HandleValue<'_>],
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let class = crate::net::server::server_class::class_constructor(scope)?;
+    let proto = class.obj(scope, c"prototype")?.ok_or(ExnThrown)?;
+    let method = proto.val(scope, name)?;
+    crate::stream::call(scope, server.to_jsval_throwing(scope)?, method, args)
+}
+
+/// `validateBoolean(value, name)`.
+fn validate_boolean(scope: &Scope<'_>, value: HandleValue<'_>, name: &str) -> Result<(), Thrown> {
+    if !value.is_boolean() {
+        return Err(NodeError::invalid_arg_type(scope, name, "of type boolean", value).into());
+    }
+    Ok(())
+}
+
+/// `Number.MAX_SAFE_INTEGER`.
+const MAX_SAFE_INTEGER: f64 = 9007199254740991.0;
+
+/// The integer option `name` of `options`, at least 0, or `default` if it is `undefined`.
+fn integer_option(
+    scope: &Scope<'_>,
+    options: Option<Object<'_>>,
+    name: &'static std::ffi::CStr,
+    default: f64,
+) -> Result<f64, Thrown> {
+    let value = option(scope, options, name)?;
+    if value.is_undefined() {
+        return Ok(default);
+    }
+    let label = name.to_str().unwrap_or_default();
+    validate_integer(scope, value, label, 0.0, MAX_SAFE_INTEGER)
+}
+
+/// The option `name` of `options`, or `undefined` without options.
+fn option<'s>(
+    scope: &'s Scope<'_>,
+    options: Option<Object<'_>>,
+    name: &'static std::ffi::CStr,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    match options {
+        Some(options) => options.val(scope, name),
+        None => Ok(scope.root_value(js::value::undefined())),
+    }
+}
+
+/// Validate the HTTP options `options` and store them on `server`, as Node.js's
+/// `storeHTTPOptions` does.
+fn store_options(
+    scope: &Scope<'_>,
+    server: Object<'_>,
+    options: Option<Object<'_>>,
+) -> Result<(), Thrown> {
+    for (name, hidden) in [
+        (c"IncomingMessage", c"_starlingIncomingMessage"),
+        (c"ServerResponse", c"_starlingServerResponse"),
+    ] {
+        let class = option(scope, options, name)?;
+        if crate::stream::truthy(scope, class) {
+            server.define_property(scope, hidden, class, 0)?;
+        }
+    }
+    let max_header_size = option(scope, options, c"maxHeaderSize")?;
+    if !max_header_size.is_undefined() {
+        validate_integer(
+            scope,
+            max_header_size,
+            "maxHeaderSize",
+            0.0,
+            MAX_SAFE_INTEGER,
+        )?;
+    }
+    server.set_property(scope, c"maxHeaderSize", max_header_size)?;
+    let optimize = option(scope, options, c"optimizeEmptyRequests")?;
+    if !optimize.is_undefined() {
+        validate_boolean(scope, optimize, "options.optimizeEmptyRequests")?;
+    }
+    let insecure = option(scope, options, c"insecureHTTPParser")?;
+    if !insecure.is_undefined() {
+        validate_boolean(scope, insecure, "options.insecureHTTPParser")?;
+    }
+    server.set_property(scope, c"insecureHTTPParser", insecure)?;
+    let validation = option(scope, options, c"httpValidation")?;
+    if !validation.is_undefined() {
+        let text = crate::stream::rust_string(scope, validation);
+        if !matches!(text.as_deref(), Some("strict" | "relaxed" | "insecure")) {
+            return Err(NodeError::invalid_arg_value(
+                scope,
+                "options.httpValidation",
+                validation,
+                "must be one of: 'strict', 'relaxed', 'insecure'",
+            )
+            .into());
+        }
+        if !insecure.is_undefined() {
+            return Err(NodeError::invalid_arg_value(
+                scope,
+                "options.httpValidation",
+                validation,
+                "cannot be used together with options.insecureHTTPParser",
+            )
+            .into());
+        }
+    }
+    server.set_property(scope, c"httpValidation", validation)?;
+    let request_timeout = integer_option(scope, options, c"requestTimeout", 300_000.0)?;
+    server.set_property(scope, c"requestTimeout", request_timeout)?;
+    let given_headers_timeout = option(scope, options, c"headersTimeout")?;
+    let headers_timeout = integer_option(
+        scope,
+        options,
+        c"headersTimeout",
+        request_timeout.min(60_000.0),
+    )?;
+    server.set_property(scope, c"headersTimeout", headers_timeout)?;
+    if request_timeout > 0.0 && headers_timeout > 0.0 && headers_timeout > request_timeout {
+        let received = if given_headers_timeout.is_number() {
+            crate::errors::out_of_range_received(given_headers_timeout.to_number())
+        } else {
+            crate::errors::describe_value(scope, given_headers_timeout)
+        };
+        return Err(
+            NodeError::out_of_range("headersTimeout", "<= requestTimeout", &received).into(),
+        );
+    }
+    for (name, default) in [
+        (c"keepAliveTimeout", 5_000.0),
+        (c"keepAliveTimeoutBuffer", 1_000.0),
+        (c"connectionsCheckingInterval", 30_000.0),
+    ] {
+        let value = integer_option(scope, options, name, default)?;
+        server.set_property(scope, name, value)?;
+    }
+    for (name, label, default) in [
+        (
+            c"requireHostHeader",
+            "options.requireHostHeader",
+            Some(true),
+        ),
+        (
+            c"joinDuplicateHeaders",
+            "options.joinDuplicateHeaders",
+            None,
+        ),
+        (
+            c"rejectNonStandardBodyWrites",
+            "options.rejectNonStandardBodyWrites",
+            Some(false),
+        ),
+    ] {
+        let value = option(scope, options, name)?;
+        if !value.is_undefined() {
+            validate_boolean(scope, value, label)?;
+            server.set_property(scope, name, value)?;
+        } else {
+            match default {
+                Some(default) => server.set_property(scope, name, default)?,
+                None => server.set_property(scope, name, js::value::undefined())?,
+            }
+        }
+    }
+    let callback = option(scope, options, c"shouldUpgradeCallback")?;
+    if !callback.is_undefined() {
+        crate::errors::validate_function(scope, callback, "options.shouldUpgradeCallback")?;
+        server.set_property(scope, c"shouldUpgradeCallback", callback)?;
+    } else {
+        let default = shared_function(scope, super::connection::default_should_upgrade, 1)?;
+        server.set_property(scope, c"shouldUpgradeCallback", default)?;
+    }
+    Ok(())
+}
+
+/// The shared function of the current global for `body`.
+fn shared_function<'s>(
+    scope: &'s Scope<'_>,
+    body: js::function::Callback,
+    nargs: u32,
+) -> Result<Object<'s>, ExnThrown> {
+    let function =
+        js::class::get_or_init_shared_function(scope, body as *const () as usize, |scope| {
+            Function::new_callback(scope, c"", nargs, body, ())
+        })?;
+    Ok(*function)
+}
+
 #[core_runtime::jsfunction_class(
     name = "Server",
-    extends = "crate::events::event_emitter",
+    extends = "crate::net::server::server_class",
     self_construct
 )]
 pub mod server_class {
     use super::*;
 
     /// <https://nodejs.org/api/http.html#class-httpserver>: a server whose `request` events go to
-    /// `listener`. The options are ignored.
+    /// `listener`. The options are validated and stored as Node.js stores them. Of them,
+    /// `IncomingMessage`, `ServerResponse`, `maxHeaderSize`, `requestTimeout`, `headersTimeout`,
+    /// `keepAliveTimeout`, `keepAliveTimeoutBuffer`, `connectionsCheckingInterval`,
+    /// `requireHostHeader`, `joinDuplicateHeaders`, `rejectNonStandardBodyWrites` and
+    /// `shouldUpgradeCallback` apply to the connections a server accepts itself, and the others
+    /// have no effect.
     #[constructor]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
         options: Option<HandleValue<'_>>,
         listener: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        crate::events::event_emitter::init(scope, this, None)
-            .map_err(|thrown| thrown.throw(scope))?;
-        let listener = match options {
-            Some(options) if is_function(scope, options) => Some(options),
-            _ => listener,
+    ) -> Result<(), Thrown> {
+        let (options, listener) = match options {
+            Some(options) if is_function(scope, options) => (None, Some(options)),
+            Some(options) if options.is_null() || options.is_undefined() => (None, listener),
+            Some(options) => (
+                Some(validate_plain_object(scope, options, "options", false)?),
+                listener,
+            ),
+            None => (None, listener),
         };
+        store_options(scope, this, options)?;
+        let net_options = Object::new_plain(scope)?;
+        net_options.set_property(scope, c"allowHalfOpen", true)?;
+        let no_delay = option(scope, options, c"noDelay")?;
+        if no_delay.is_null() || no_delay.is_undefined() {
+            net_options.set_property(scope, c"noDelay", true)?;
+        } else {
+            net_options.set_property(scope, c"noDelay", no_delay)?;
+        }
+        for name in [c"keepAlive", c"keepAliveInitialDelay", c"highWaterMark"] {
+            net_options.set_property(scope, name, option(scope, options, name)?)?;
+        }
+        crate::net::server::server_class::init(
+            scope,
+            this,
+            Some(net_options.to_jsval_throwing(scope)?),
+            None,
+        )?;
         if let Some(listener) = listener.filter(|listener| is_function(scope, *listener)) {
             call_method(scope, this, c"on", &[string(scope, "request")?, listener])?;
         }
-        this.set_property(scope, c"listening", false)?;
-        for (name, value) in [
-            (c"timeout", 0.0),
-            (c"keepAliveTimeout", 5000.0),
-            (c"headersTimeout", 60000.0),
-            (c"requestTimeout", 300000.0),
-            (c"maxHeadersCount", f64::NAN),
-        ] {
-            this.set_property(scope, name, value)?;
-        }
+        this.set_property(scope, c"httpAllowHalfOpen", false)?;
+        let on_connection = shared_function(scope, super::super::connection::on_connection, 1)?;
+        call_method(
+            scope,
+            this,
+            c"on",
+            &[
+                string(scope, "connection")?,
+                on_connection.to_jsval_throwing(scope)?,
+            ],
+        )?;
+        let on_listening = shared_function(scope, super::super::connection::on_listening, 0)?;
+        call_method(
+            scope,
+            this,
+            c"on",
+            &[
+                string(scope, "listening")?,
+                on_listening.to_jsval_throwing(scope)?,
+            ],
+        )?;
+        this.set_property(scope, c"timeout", 0)?;
+        this.set_property(scope, c"maxHeadersCount", js::value::null())?;
+        this.set_property(scope, c"maxRequestsPerSocket", 0)?;
         Ok(())
     }
 
     /// <https://nodejs.org/api/net.html#serverlisten>: serve requests to `port`, or to any port.
+    /// When the runtime runs a script as a command with `--node-http-listen`, this is
+    /// `net.Server`'s `listen`.
     pub fn listen<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
@@ -309,6 +545,11 @@ pub mod server_class {
     ) -> Result<Object<'s>, Thrown> {
         let args: Vec<HandleValue<'_>> =
             args.iter().map(|arg| scope.root_value(arg.get())).collect();
+        if super::listens_itself() {
+            this.set_property(scope, c"_starlingClosing", false)?;
+            call_net(scope, this, c"listen", &args)?;
+            return Ok(this);
+        }
         let (port, _, callback) = crate::net::listen_args(scope, &args)?;
         if core_runtime::event_loop::without_request_handler() {
             return Err(NodeError::new(
@@ -324,7 +565,7 @@ pub mod server_class {
                 NodeError::new(
                     ErrorKind::Error,
                     "ERR_SERVE_MODE_REQUIRED",
-                    "Serving HTTP requests needs serve mode: run the script with --serve <port>, or serve the component with a wasi:http host",
+                    "Serving HTTP requests needs serve mode: run the script with --serve <port>, or serve the component with a wasi:http host, or pass --node-http-listen",
                 ),
             )?;
             emit_later(scope, this, &[string(scope, "error")?, error])?;
@@ -366,12 +607,22 @@ pub mod server_class {
 
     /// <https://nodejs.org/api/net.html#serverclosecallback>: stop serving requests, and emit
     /// `close`. `callback` is called on `close`, with `ERR_SERVER_NOT_RUNNING` if the server was
-    /// not listening.
+    /// not listening. A server that accepts connections itself destroys its idle connections,
+    /// closes the others once their response is finished, and emits `close` once they are
+    /// closed.
     pub fn close<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, ExnThrown> {
+        if super::listens_itself() {
+            super::super::connection::close_connections(scope, this, true)?;
+            super::super::connection::stop_checking(scope, this)?;
+            this.set_property(scope, c"_starlingClosing", true)?;
+            let callback = callback.unwrap_or_else(|| scope.root_value(js::value::undefined()));
+            call_net(scope, this, c"close", &[callback])?;
+            return Ok(this);
+        }
         let servers = servers(scope)?;
         let index = call_method(
             scope,
@@ -396,12 +647,16 @@ pub mod server_class {
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/net.html#serveraddress>: the port `listen` was given, on every
-    /// address, or `null` before `listen`.
+    /// <https://nodejs.org/api/net.html#serveraddress>: the address `net.Server` listens on, or,
+    /// when serving the runtime's requests, the port `listen` was given, on every address. `null`
+    /// before `listen`.
     pub fn address<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
     ) -> Result<HandleValue<'s>, ExnThrown> {
+        if super::listens_itself() {
+            return call_net(scope, this, c"address", &[]);
+        }
         if !this.flag(scope, c"listening")? {
             return Ok(scope.root_value(js::value::null()));
         }
@@ -412,29 +667,32 @@ pub mod server_class {
         address.to_jsval_throwing(scope)
     }
 
-    /// <https://nodejs.org/api/http.html#serversettimeoutmsecs-callback>: has no effect.
-    pub fn set_timeout<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+    /// <https://nodejs.org/api/http.html#serversettimeoutmsecs-callback>: the idle timeout of
+    /// the connections the server accepts from now on. `callback` becomes a `timeout` listener.
+    pub fn set_timeout<'s>(
+        scope: &Scope<'_>,
+        this: Object<'s>,
+        msecs: Option<HandleValue<'_>>,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        let msecs = msecs.unwrap_or_else(|| scope.root_value(js::value::undefined()));
+        this.set_property(scope, c"timeout", msecs)?;
+        if let Some(callback) = callback.filter(|callback| crate::stream::truthy(scope, *callback))
+        {
+            call_method(scope, this, c"on", &[string(scope, "timeout")?, callback])?;
+        }
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/http.html#servercloseallconnections>: has no effect.
-    pub fn close_all_connections() -> Result<(), ExnThrown> {
-        Ok(())
+    /// <https://nodejs.org/api/http.html#servercloseallconnections>: destroy the connections
+    /// the server accepted itself.
+    pub fn close_all_connections(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        super::super::connection::close_connections(scope, this, false)
     }
 
-    /// <https://nodejs.org/api/http.html#servercloseidleconnections>: has no effect.
-    pub fn close_idle_connections() -> Result<(), ExnThrown> {
-        Ok(())
-    }
-
-    /// <https://nodejs.org/api/net.html#serverref>: has no effect.
-    #[method(name = "ref")]
-    pub fn ref_impl<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
-        Ok(this)
-    }
-
-    /// <https://nodejs.org/api/net.html#serverunref>: has no effect.
-    pub fn unref<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
-        Ok(this)
+    /// <https://nodejs.org/api/http.html#servercloseidleconnections>: destroy the connections
+    /// the server accepted itself that are between requests and have no response in progress.
+    pub fn close_idle_connections(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        super::super::connection::close_connections(scope, this, true)
     }
 }

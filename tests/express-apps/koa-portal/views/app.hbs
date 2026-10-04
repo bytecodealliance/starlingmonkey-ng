@@ -1,0 +1,9 @@
+<p><a href="{{home}}">All apps</a></p>
+<h1>{{entry.title}}</h1>
+<p class="stack">{{entry.stack}}</p>
+<p>{{entry.summary}}</p>
+{{#with entry}}
+<p>Open the app at <a href="{{appUrl name home}}">{{appUrl name home}}</a>.</p>
+<h2>Examples</h2>
+{{> examples}}
+{{/with}}

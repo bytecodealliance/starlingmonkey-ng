@@ -315,6 +315,82 @@ try {
   appended.end("!");
   await new Promise((resolve) => appended.on("finish", resolve));
   eq(readFileSync(`${dir}/stream.txt`, "utf8"), "hello streams!", "WriteStream flags");
+
+  // Watching, which polls.
+  const nextChange = (watcher) => new Promise((resolve) => watcher.once("change", (...args) => resolve(args)));
+  const watched = `${dir}/watched`;
+  mkdirSync(watched);
+  const watcher = fs.watch(watched);
+  eq(process.getActiveResourcesInfo().includes("FSEventWrap"), true, "watchers are active resources");
+  let change = nextChange(watcher);
+  writeFileSync(`${watched}/new.txt`, "x");
+  deepEq(await change, ["rename", "new.txt"], "a new file is a rename");
+  change = nextChange(watcher);
+  writeFileSync(`${watched}/new.txt`, "xy");
+  deepEq(await change, ["change", "new.txt"], "a modified file is a change");
+  change = nextChange(watcher);
+  writeFileSync(`${watched}/brief.txt`, "");
+  fs.unlinkSync(`${watched}/brief.txt`);
+  deepEq(await change, ["rename", null], "a file created and removed between polls has no filename");
+  change = nextChange(watcher);
+  fs.unlinkSync(`${watched}/new.txt`);
+  deepEq(await change, ["rename", "new.txt"], "a removed file is a rename");
+  const closed = new Promise((resolve) => watcher.on("close", resolve));
+  watcher.close();
+  watcher.close();
+  await closed;
+  eq(watcher._handle, null, "close drops the handle");
+
+  const fileWatcher = fs.watch(`${dir}/stream.txt`, { encoding: "buffer" });
+  change = nextChange(fileWatcher);
+  fs.appendFileSync(`${dir}/stream.txt`, "?");
+  const [fileEvent, fileName] = await change;
+  deepEq([fileEvent, Buffer.isBuffer(fileName), String(fileName)], ["change", true, "stream.txt"], "watching a file, with Buffer filenames");
+  fileWatcher.close();
+
+  const tree = fs.watch(watched, { recursive: true, ignore: ["*.log", /skip/] });
+  const treeEvents = [];
+  tree.on("change", (...args) => treeEvents.push(args));
+  mkdirSync(`${watched}/sub`);
+  writeFileSync(`${watched}/sub/inner.txt`, "");
+  writeFileSync(`${watched}/sub/noise.log`, "");
+  writeFileSync(`${watched}/skip.txt`, "");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  tree.close();
+  const sep = process.platform === "win32" ? "\\" : "/";
+  deepEq(treeEvents, [["rename", "sub"], ["rename", `sub${sep}inner.txt`]], "recursive watching with ignore patterns");
+  throws(() => fs.watch(watched, { ignore: "" }), "ERR_INVALID_ARG_VALUE", "empty ignore patterns");
+  throws(() => fs.watch(`${dir}/missing`), "ENOENT", "watching a missing file");
+  eq(fs.watch(`${dir}/missing`, { throwIfNoEntry: false })._handle !== null, true, "throwIfNoEntry");
+
+  const ac = new AbortController();
+  const iterator = fsp.watch(watched, { signal: ac.signal });
+  const first = iterator.next();
+  writeFileSync(`${watched}/iterated.txt`, "");
+  deepEq((await first).value, { eventType: "rename", filename: "iterated.txt" }, "fsPromises.watch yields changes");
+  ac.abort();
+  eq((await iterator.next().catch((error) => error)).name, "AbortError", "aborting ends fsPromises.watch");
+  deepEq(await iterator.next(), { value: undefined, done: true }, "an ended iterator is done");
+  eq((await fsp.watch(watched, { maxQueue: "x" }).next().catch((error) => error)).code, "ERR_INVALID_ARG_TYPE", "fsPromises.watch validates on next()");
+
+  const polled = `${dir}/polled.txt`;
+  const statChanges = [];
+  const statChanged = new Promise((resolve) =>
+    fs.watchFile(polled, { interval: 10 }, (current, previous) => {
+      statChanges.push([current.size, previous.size, current.mtimeMs === 0]);
+      if (statChanges.length === 2) resolve();
+      else writeFileSync(polled, "abc");
+    }),
+  );
+  await statChanged;
+  deepEq(statChanges, [[0, 0, true], [3, 0, false]], "watchFile reports zeroed stats for a missing file, then its creation");
+  const stopped = fs.watchFile(polled, () => {});
+  let stopEvents = 0;
+  stopped.on("stop", () => stopEvents++);
+  fs.unwatchFile(polled);
+  eq(stopEvents, 0, "stop is emitted later");
+  await new Promise((resolve) => setImmediate(resolve));
+  eq(stopEvents, 1, "unwatchFile stops the watcher");
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }

@@ -19,6 +19,7 @@ use js::promise::{PromiseFuture, PromiseOutcome};
 use js::{Function, Object};
 use platform::net::{Connection, ConnectionReader, ConnectionWriter, NetError};
 
+use super::blocklist::Rules;
 use crate::buffer::{encode_string, new_buffer, Encoding};
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
 use crate::stream::{call_method, closure, is_function, string, truthy, Captures, Props};
@@ -193,16 +194,25 @@ fn touch(scope: &Scope<'_>, socket: Object<'_>) -> Result<(), ExnThrown> {
     Ok(())
 }
 
+/// The reason a connect failed.
+enum ConnectFailure {
+    /// A network error, and the address it occurred for, if any.
+    Net(NetError, Option<SocketAddr>),
+    /// The socket's `BlockList` blocks the address.
+    Blocked(IpAddr),
+}
+
 /// The body of the connect: resolve `host`, and connect to its first address of the address
-/// family `family` (4, 6, or 0 for both) that accepts.
+/// family `family` (4, 6, or 0 for both) that `rules` doesn't block and that accepts.
 async fn connect_to(
     host: String,
     port: u16,
     family: u8,
-) -> Result<Connection, (NetError, Option<SocketAddr>)> {
+    rules: Option<Rules>,
+) -> Result<Connection, ConnectFailure> {
     let addrs = platform::net::resolve(&host)
         .await
-        .map_err(|error| (error, None))?;
+        .map_err(|error| ConnectFailure::Net(error, None))?;
     let mut last = None;
     let wanted = |addr: &IpAddr| match family {
         4 => addr.is_ipv4(),
@@ -210,13 +220,17 @@ async fn connect_to(
         _ => true,
     };
     for addr in addrs.into_iter().filter(wanted) {
+        if rules.as_ref().is_some_and(|rules| rules.blocks(addr)) {
+            last = Some(ConnectFailure::Blocked(addr));
+            continue;
+        }
         let addr = SocketAddr::new(addr, port);
         match platform::net::connect_stream(addr, None).await {
             Ok(connection) => return Ok(connection),
-            Err(error) => last = Some((error, Some(addr))),
+            Err(error) => last = Some(ConnectFailure::Net(error, Some(addr))),
         }
     }
-    Err(last.unwrap_or((NetError::NoAddress(host), None)))
+    Err(last.unwrap_or(ConnectFailure::Net(NetError::NoAddress(host), None)))
 }
 
 /// Start the first read of `socket` unless it is paused, so `end` is emitted even without a
@@ -264,13 +278,15 @@ fn on_error(
     Ok(js::value::undefined())
 }
 
-/// Connect `socket` to `port` on `host`, keeping only addresses of the address family `family`.
+/// Connect `socket` to `port` on `host`, keeping only addresses of the address family `family`
+/// that `rules` doesn't block.
 fn connect(
     scope: &Scope<'_>,
     socket: Object<'_>,
     host: String,
     port: u16,
     family: u8,
+    rules: Option<Rules>,
 ) -> Result<(), ExnThrown> {
     socket.set_property(scope, c"connecting", true)?;
     let (sender, cancelled) = futures_channel::oneshot::channel();
@@ -286,7 +302,7 @@ fn connect(
     )?;
     let target = RootedHeap::<js::object::Object>::new(socket);
     let future = async move {
-        let connect = async { Some(connect_to(host.clone(), port, family).await) };
+        let connect = async { Some(connect_to(host.clone(), port, family, rules).await) };
         let cancel = async {
             let _ = cancelled.await;
             None
@@ -306,7 +322,13 @@ fn connect(
                     attach(scope, socket, connection)?;
                     Ok(scope.root_value(js::value::undefined()))
                 }
-                Err((error, Some(addr))) => {
+                Err(ConnectFailure::Blocked(ip)) => Err(NodeError::new(
+                    ErrorKind::Error,
+                    "ERR_IP_BLOCKED",
+                    format!("IP({ip}) is blocked by net.BlockList"),
+                )
+                .throw(scope)),
+                Err(ConnectFailure::Net(error, Some(addr))) => {
                     let address = js::JSString::from_str(scope, &addr.ip().to_string())?
                         .to_jsval_throwing(scope)?;
                     let port = scope.root_value(js::value::from_f64(f64::from(addr.port())));
@@ -318,7 +340,7 @@ fn connect(
                         &[(c"address", address), (c"port", port)],
                     ))
                 }
-                Err((error, None)) => {
+                Err(ConnectFailure::Net(error, None)) => {
                     let hostname =
                         js::JSString::from_str(scope, &host)?.to_jsval_throwing(scope)?;
                     Err(throw_net_error(
@@ -425,8 +447,8 @@ fn start_read(scope: &Scope<'_>, socket: Object<'_>) -> Result<(), ExnThrown> {
     Ok(())
 }
 
-/// The fulfillment reaction of a write, whose captures are `[socket, callback, length]`: count
-/// the bytes written and call the callback. A cancelled write is fulfilled with `undefined`.
+/// The fulfillment reaction of a write, whose captures are `[socket, callback]`: restart the idle
+/// timer and call the callback. A cancelled write is fulfilled with `undefined`.
 fn on_written(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -437,12 +459,6 @@ fn on_written(
     }
     let captures = Captures::of(scope, payload)?;
     let socket = captures.obj(0)?;
-    let written = socket.num(scope, c"bytesWritten")?;
-    socket.set_property(
-        scope,
-        c"bytesWritten",
-        written + captures.get(2)?.to_number(),
-    )?;
     touch(scope, socket)?;
     Function::call(
         scope,
@@ -501,7 +517,8 @@ fn socket_closed(scope: &Scope<'_>, callback: HandleValue<'_>) -> Result<(), Exn
 }
 
 /// Write `bytes` to `socket`'s connection, or shut its sending side down for `None`, and call
-/// `callback` once done.
+/// `callback` once done. The bytes the connection takes without waiting are written at once, and
+/// `callback` is called before this returns if that is all of them.
 fn write_or_shutdown(
     scope: &Scope<'_>,
     socket: Object<'_>,
@@ -510,6 +527,26 @@ fn write_or_shutdown(
 ) -> Result<(), ExnThrown> {
     let Some(handle) = handle_of(scope, socket)? else {
         return socket_closed(scope, callback);
+    };
+    let bytes = match bytes {
+        Some(bytes) if !bytes.is_empty() => {
+            let unwritten = match handle.data_mut().writer.as_mut() {
+                Some(writer) => writer.try_write(bytes),
+                None => bytes,
+            };
+            if unwritten.is_empty() {
+                touch(scope, socket)?;
+                Function::call(
+                    scope,
+                    js::value::undefined(),
+                    callback,
+                    js::function::EmptyArgs,
+                )?;
+                return Ok(());
+            }
+            Some(unwritten)
+        }
+        bytes => bytes,
     };
     let (sender, cancelled) = futures_channel::oneshot::channel();
     let Some(mut writer) = ({
@@ -522,7 +559,6 @@ fn write_or_shutdown(
     }) else {
         return socket_closed(scope, callback);
     };
-    let length = bytes.as_ref().map_or(0, Vec::len);
     let shutdown = bytes.is_none();
     let target = RootedHeap::<js::object::Object>::new(*handle);
     let future = async move {
@@ -575,11 +611,7 @@ fn write_or_shutdown(
             scope,
             1,
             on_written,
-            &[
-                socket.to_jsval_raw_throwing(scope)?,
-                callback.get(),
-                js::value::from_f64(length as f64),
-            ],
+            &[socket.to_jsval_raw_throwing(scope)?, callback.get()],
         )?
     };
     let failed = closure(
@@ -616,6 +648,45 @@ fn retry_after_connect(
     };
     write_or_shutdown(scope, socket, bytes, captures.get(2)?)?;
     Ok(js::value::undefined())
+}
+
+/// The bytes of the written chunk `chunk`: a `Buffer`, or a string in `encoding`.
+fn chunk_bytes(
+    scope: &Scope<'_>,
+    chunk: HandleValue<'_>,
+    encoding: HandleValue<'_>,
+) -> Result<Vec<u8>, ExnThrown> {
+    Ok(if chunk.is_string() {
+        let encoding = String::from_jsval(scope, encoding, ())
+            .ok()
+            .and_then(|name| Encoding::parse(&name))
+            .unwrap_or_default();
+        encode_string(scope, js::JSString::from_value(scope, chunk)?, encoding)?
+    } else {
+        Object::from_value(scope, *chunk)
+            .ok()
+            .and_then(js::ArrayBufferView::from_object)
+            .map(|view| view.copy_bytes(scope))
+            .transpose()?
+            .unwrap_or_default()
+    })
+}
+
+/// Write `bytes` to `socket`, once it is connected, and call `callback` once done.
+fn write_bytes(
+    scope: &Scope<'_>,
+    socket: Object<'_>,
+    bytes: Vec<u8>,
+    callback: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let dispatched = socket.num(scope, c"_starlingBytesDispatched")? + bytes.len() as f64;
+    socket.set_property(scope, c"_starlingBytesDispatched", dispatched)?;
+    if socket.flag(scope, c"connecting")? {
+        let buffer = new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?;
+        when_connected(scope, socket, buffer, callback)?;
+        return Ok(());
+    }
+    write_or_shutdown(scope, socket, Some(bytes), callback)
 }
 
 /// Run the write of `chunk`, a `Buffer`, or the shutdown for `null`, once `socket` is connected.
@@ -775,6 +846,33 @@ fn address_getter(
     }
 }
 
+/// The getter of `bytesWritten`: the bytes handed to the connection, or waiting for it to connect,
+/// and the bytes the stream buffers, as Node.js counts them.
+fn bytes_written(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let socket = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
+    let mut bytes = socket.num(scope, c"_starlingBytesDispatched")?;
+    if let Some(buffered) = socket.obj(scope, c"writableBuffer")? {
+        let length = buffered
+            .cast::<js::Array>()
+            .map_err(|_| js::error::TypeError("unexpected object".into()).throw(scope))?
+            .length(scope)?;
+        for index in 0..length {
+            let Ok(entry) = Object::from_value(scope, buffered.get_element(scope, index)?) else {
+                continue;
+            };
+            let chunk = entry.val(scope, c"chunk")?;
+            let encoding = entry.val(scope, c"encoding")?;
+            bytes += crate::buffer::buffer::byte_length(scope, chunk, Some(encoding))
+                .map_err(|thrown| thrown.throw(scope))?;
+        }
+    }
+    Ok(js::value::from_f64(bytes))
+}
+
 /// The getter of `pending`: whether the socket is not connected yet.
 fn pending_getter(
     scope: &Scope<'_>,
@@ -872,8 +970,8 @@ pub mod socket_class {
     use super::*;
 
     /// <https://nodejs.org/api/net.html#new-netsocketoptions>: the stream options `options`
-    /// apply, and `signal` destroys the socket when aborted. `fd` and `handle` are not
-    /// supported.
+    /// apply, `signal` destroys the socket when aborted, and `connect` skips the addresses that
+    /// `blockList` blocks. `fd` and `handle` are not supported.
     #[constructor]
     pub fn init(
         scope: &Scope<'_>,
@@ -899,24 +997,41 @@ pub mod socket_class {
         for (name, value) in [(c"connecting", false), (c"_starlingReadPending", false)] {
             this.set_property(scope, name, value)?;
         }
-        for name in [c"bytesRead", c"bytesWritten", c"timeout"] {
+        this.define_property(scope, c"_starlingBytesDispatched", 0, 0)?;
+        for name in [c"bytesRead", c"timeout"] {
             this.set_property(scope, name, 0)?;
         }
         let signal = base.val(scope, c"signal")?;
         if truthy(scope, signal) {
             crate::stream::add_abort_signal(scope, signal, this.to_jsval_throwing(scope)?)?;
         }
+        let block_list = base.val(scope, c"blockList")?;
+        if truthy(scope, block_list) {
+            super::super::blocklist::validate_block_list(scope, block_list, "options.blockList")?;
+            this.set_property(scope, c"blockList", block_list)?;
+        }
         Ok(())
     }
 
     /// <https://nodejs.org/api/net.html#socketconnect>: connect to `port` on `host`, which
-    /// defaults to `localhost`, from `(port[, host][, listener])` or `(options[, listener])`.
+    /// defaults to `localhost`, from `(port[, host][, listener])`, `(options[, listener])`, or an
+    /// array of `[options, listener]` that `net._normalizeArgs` returned.
     /// The option `family` keeps only addresses of that family. IPC paths are not supported.
     pub fn connect<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
         args: RestArgs<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
+        if let Some((options, listener)) = match args.first() {
+            Some(first) => super::super::normalized_args(scope, *first)?,
+            None => None,
+        } {
+            return connect(
+                scope,
+                this,
+                js::class::RestArgs::new(vec![options, listener]),
+            );
+        }
         let first = args.first().copied();
         let options = match first {
             Some(first) if first.is_object() && !is_function(scope, first) => {
@@ -955,7 +1070,8 @@ pub mod socket_class {
             return Err(NodeError::not_implemented("connect() to an IPC path").into());
         }
         let (port, host, family) = super::connect_target(scope, options)?;
-        super::connect(scope, this, host, port, family)?;
+        let rules = crate::net::blocklist::rules_of(scope, this.val(scope, c"blockList")?)?;
+        super::connect(scope, this, host, port, family, rules)?;
         Ok(this)
     }
 
@@ -976,26 +1092,32 @@ pub mod socket_class {
         encoding: HandleValue<'_>,
         callback: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        let bytes = if chunk.is_string() {
-            let encoding = String::from_jsval(scope, encoding, ())
-                .ok()
-                .and_then(|name| Encoding::parse(&name))
-                .unwrap_or_default();
-            encode_string(scope, js::JSString::from_value(scope, chunk)?, encoding)?
-        } else {
-            Object::from_value(scope, *chunk)
-                .ok()
-                .and_then(js::ArrayBufferView::from_object)
-                .map(|view| view.copy_bytes(scope))
-                .transpose()?
-                .unwrap_or_default()
-        };
-        if this.flag(scope, c"connecting")? {
-            let buffer = new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?;
-            super::when_connected(scope, this, buffer, callback)?;
-            return Ok(());
+        let bytes = super::chunk_bytes(scope, chunk, encoding)?;
+        super::write_bytes(scope, this, bytes, callback)
+    }
+
+    /// Write the buffered writes `chunks`, an array of `{ chunk, encoding }` entries, together.
+    #[method(name = "_writev")]
+    pub fn writev_impl(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        chunks: HandleValue<'_>,
+        callback: HandleValue<'_>,
+    ) -> Result<(), ExnThrown> {
+        let mut bytes = Vec::new();
+        if let Ok(chunks) = Object::from_value(scope, *chunks) {
+            let length = chunks.num(scope, c"length")? as u32;
+            for index in 0..length {
+                let entry = chunks.get_element(scope, index)?;
+                let Some(entry) = crate::stream::as_object(scope, entry) else {
+                    continue;
+                };
+                let chunk = entry.val(scope, c"chunk")?;
+                let encoding = entry.val(scope, c"encoding")?;
+                bytes.extend(super::chunk_bytes(scope, chunk, encoding)?);
+            }
         }
-        super::write_or_shutdown(scope, this, Some(bytes), callback)
+        super::write_bytes(scope, this, bytes, callback)
     }
 
     #[method(name = "_final")]
@@ -1151,6 +1273,21 @@ pub mod socket_class {
         Ok(this)
     }
 
+    /// Destroy the socket once it wrote what it buffers, ending it first, as Node.js's
+    /// `destroySoon` does.
+    pub fn destroy_soon(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        if this.flag(scope, c"writable")? {
+            call_method(scope, this, c"end", &[])?;
+        }
+        if this.flag(scope, c"writableFinished")? {
+            call_method(scope, this, c"destroy", &[])?;
+        } else {
+            let destroy = this.val(scope, c"destroy")?;
+            call_method(scope, this, c"once", &[string(scope, "finish")?, destroy])?;
+        }
+        Ok(())
+    }
+
     /// <https://nodejs.org/api/net.html#socketresetanddestroy>
     pub fn reset_and_destroy<'s>(
         scope: &Scope<'_>,
@@ -1160,11 +1297,13 @@ pub mod socket_class {
         Ok(this)
     }
 
-    /// Define `readyState`, `pending`, and the address getters.
+    /// Define `readyState`, `pending`, `bytesWritten`, and the address getters.
     #[setup]
     pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
         let getter = Function::new_callback(scope, c"readyState", 0, super::ready_state, ())?;
         proto.define_accessor(scope, c"readyState", Some(*getter), None, 0)?;
+        let getter = Function::new_callback(scope, c"bytesWritten", 0, super::bytes_written, ())?;
+        proto.define_accessor(scope, c"bytesWritten", Some(*getter), None, 0)?;
         let getter = Function::new_callback(scope, c"pending", 0, super::pending_getter, ())?;
         proto.define_accessor(scope, c"pending", Some(*getter), None, 0)?;
         for (index, (name, _, _)) in super::ADDRESS_GETTERS.iter().enumerate() {
