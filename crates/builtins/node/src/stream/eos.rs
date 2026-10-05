@@ -2,70 +2,143 @@
 
 //! `finished`: Node's `lib/internal/streams/end-of-stream.js`.
 
+use std::ffi::CStr;
+
 use js::async_context::Snapshot;
 use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
-use js::function::{Callback, CallbackArgs};
+use js::function::{cast_payload, Callback, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use super::util::{
-    as_object, call, closure, error_value, is_closed, is_function, is_node_stream, is_readable,
-    is_readable_finished, is_readable_node_stream, is_writable, is_writable_finished,
-    is_writable_node_stream, listen, next_tick, required_obj, side_errored, states, string, truthy,
-    type_error, will_emit_close, Captures, Props,
+    is_closed, is_node_stream, is_readable, is_readable_finished, is_readable_node_stream,
+    is_writable, is_writable_finished, is_writable_node_stream, side_errored, sides,
+    will_emit_close, Field,
 };
 use crate::errors::{
-    validate_abort_signal, validate_function, validate_object, ErrorKind, NodeError, Thrown,
+    validate_abort_signal, validate_function, validate_plain_object, ErrorKind, NodeError, Thrown,
 };
+use crate::events::listen;
 
-/// The captures of `finished`'s listeners: `[stream, callback, readable, writable,
-/// willEmitClose, readableFinished, writableFinished, called, listeners, signal, abortListener]`,
-/// where `callback` runs in the async context of the `finished()` call, `called` is set once the
-/// callback ran or the cleanup made it a no-op, and `listeners` is the array of `[emitter, event,
-/// listener]` to remove in cleanup.
-mod captures {
-    pub(super) const STREAM: u32 = 0;
-    pub(super) const CALLBACK: u32 = 1;
-    pub(super) const READABLE: u32 = 2;
-    pub(super) const WRITABLE: u32 = 3;
-    pub(super) const WILL_EMIT_CLOSE: u32 = 4;
-    pub(super) const READABLE_FINISHED: u32 = 5;
-    pub(super) const WRITABLE_FINISHED: u32 = 6;
-    pub(super) const CALLED: u32 = 7;
-    pub(super) const LISTENERS: u32 = 8;
-    pub(super) const SIGNAL: u32 = 9;
-    pub(super) const ABORT_LISTENER: u32 = 10;
-    pub(super) const COUNT: usize = 11;
+/// The options of [`eos_native`]: Node's `eos` options, and its internal
+/// `kEosNodeSynchronousCallback`.
+pub(crate) struct EosOptions<'a> {
+    /// Whether to wait for the readable side, or `None` to wait for it if the stream is readable.
+    pub(crate) readable: Option<bool>,
+    /// Whether to wait for the writable side, or `None` to wait for it if the stream is writable.
+    pub(crate) writable: Option<bool>,
+    /// Whether an `error` event finishes the stream.
+    pub(crate) error: bool,
+    pub(crate) signal: Option<Object<'a>>,
+    /// Whether a result known when `eos` is called is passed to the callback before it returns,
+    /// instead of in a tick.
+    pub(crate) synchronous: bool,
 }
 
-/// The state array of a listener whose captures are `[state]`.
-fn state_of<'s>(scope: &'s Scope<'_>, payload: HandleValue<'_>) -> Result<Captures<'s>, ExnThrown> {
-    Captures::of(scope, Captures::of(scope, payload)?.get(0)?)
+impl Default for EosOptions<'_> {
+    fn default() -> Self {
+        EosOptions {
+            readable: None,
+            writable: None,
+            error: true,
+            signal: None,
+            synchronous: false,
+        }
+    }
 }
 
-/// Call the callback once with `args`, with `this` the stream, and detach the abort listener.
+/// The callback of [`eos_native`]: a JS function, which runs with the stream as `this` in the
+/// async context of the `eos` call, or a native callback with its payload.
+#[derive(Clone, Copy)]
+pub(crate) enum EosCallback<'a> {
+    Js(HandleValue<'a>),
+    Native(Callback, HandleValue<'a>),
+}
+
+/// A listener `eos` added, which its cleanup removes.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+struct EosListener {
+    emitter: Heap<js::object::Object>,
+    #[no_trace]
+    event: &'static CStr,
+    listener: Heap<js::object::Object>,
+}
+
+/// The state of an `eos` call.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct EosState {
+    stream: Heap<js::object::Object>,
+    /// The JS callback, or the payload of `native`.
+    callback: Heap<Value>,
+    #[no_trace]
+    native: Option<Callback>,
+    /// The async context of the `eos` call, in which a JS callback runs.
+    #[no_trace]
+    context: Snapshot,
+    #[no_trace]
+    readable: bool,
+    #[no_trace]
+    writable: bool,
+    #[no_trace]
+    will_emit_close: bool,
+    #[no_trace]
+    readable_finished: bool,
+    #[no_trace]
+    writable_finished: bool,
+    /// Set once the callback ran, or the cleanup made it a no-op.
+    #[no_trace]
+    called: bool,
+    listeners: Vec<EosListener>,
+    signal: Option<Heap<js::object::Object>>,
+    abort_listener: Option<Heap<js::object::Object>>,
+}
+
+#[core_runtime::jsmethods]
+impl EosState {}
+
+/// Call the callback once with `error`, with `this` the stream, and detach the abort listener.
 fn complete(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
-    args: &[HandleValue<'_>],
+    state: EosState<'_>,
+    error: Option<HandleValue<'_>>,
 ) -> Result<(), ExnThrown> {
-    use captures::*;
-    if state.flag(CALLED)? {
+    if state.data().called {
         return Ok(());
     }
-    state.set(CALLED, true)?;
-    if let (Some(signal), Some(listener)) = (
-        as_object(scope, state.get(SIGNAL)?),
-        as_object(scope, state.get(ABORT_LISTENER)?),
-    ) {
-        listen(scope, signal, c"removeEventListener", "abort", listener)?;
+    state.data_mut().called = true;
+    let (signal, abort_listener) = {
+        let data = state.data();
+        (data.signal.get(scope), data.abort_listener.get(scope))
+    };
+    if let (Some(signal), Some(listener)) = (signal, abort_listener) {
+        listen(scope, signal, c"removeEventListener", c"abort", listener)?;
     }
-    let callback = state.get(CALLBACK)?;
-    let stream = state.get(STREAM)?;
-    call(scope, stream, callback, args)?;
+    let (stream, callback, native, context) = {
+        let data = state.data();
+        (
+            data.stream.get(scope),
+            data.callback.get(scope),
+            data.native,
+            data.context.clone(),
+        )
+    };
+    let args: Vec<HandleValue<'_>> = error.into_iter().collect();
+    match native {
+        Some(native) => {
+            native(scope, CallbackArgs::from_values(&args), callback)?;
+        }
+        None => {
+            let previous = context.enter();
+            let result = Function::call(scope, stream, callback, &args);
+            previous.enter();
+            result?;
+        }
+    }
     Ok(())
 }
 
@@ -83,21 +156,23 @@ fn onfinish(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use captures::*;
-    let state = state_of(scope, payload)?;
-    state.set(WRITABLE_FINISHED, true)?;
-    let stream = state.obj(STREAM)?;
-    if truthy(scope, stream.get_property(scope, c"destroyed")?) {
-        state.set(WILL_EMIT_CLOSE, false)?;
+    let state = cast_payload::<EosState>(scope, payload);
+    state.data_mut().writable_finished = true;
+    let stream = state.data().stream.get(scope);
+    if js::conversion::to_boolean(stream.get_property(scope, c"destroyed")?) {
+        state.data_mut().will_emit_close = false;
     }
-    let readable = state.flag(READABLE)?;
-    if state.flag(WILL_EMIT_CLOSE)?
-        && (!truthy(scope, stream.get_property(scope, c"readable")?) || readable)
+    let (readable, will_emit_close, readable_finished) = {
+        let data = state.data();
+        (data.readable, data.will_emit_close, data.readable_finished)
+    };
+    if will_emit_close
+        && (!js::conversion::to_boolean(stream.get_property(scope, c"readable")?) || readable)
     {
         return Ok(js::value::undefined());
     }
-    if !readable || state.flag(READABLE_FINISHED)? {
-        complete(scope, &state, &[])?;
+    if !readable || readable_finished {
+        complete(scope, state, None)?;
     }
     Ok(js::value::undefined())
 }
@@ -107,21 +182,23 @@ fn onend(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use captures::*;
-    let state = state_of(scope, payload)?;
-    state.set(READABLE_FINISHED, true)?;
-    let stream = state.obj(STREAM)?;
-    if truthy(scope, stream.get_property(scope, c"destroyed")?) {
-        state.set(WILL_EMIT_CLOSE, false)?;
+    let state = cast_payload::<EosState>(scope, payload);
+    state.data_mut().readable_finished = true;
+    let stream = state.data().stream.get(scope);
+    if js::conversion::to_boolean(stream.get_property(scope, c"destroyed")?) {
+        state.data_mut().will_emit_close = false;
     }
-    let writable = state.flag(WRITABLE)?;
-    if state.flag(WILL_EMIT_CLOSE)?
-        && (!truthy(scope, stream.get_property(scope, c"writable")?) || writable)
+    let (writable, will_emit_close, writable_finished) = {
+        let data = state.data();
+        (data.writable, data.will_emit_close, data.writable_finished)
+    };
+    if will_emit_close
+        && (!js::conversion::to_boolean(stream.get_property(scope, c"writable")?) || writable)
     {
         return Ok(js::value::undefined());
     }
-    if !writable || state.flag(WRITABLE_FINISHED)? {
-        complete(scope, &state, &[])?;
+    if !writable || writable_finished {
+        complete(scope, state, None)?;
     }
     Ok(js::value::undefined())
 }
@@ -131,13 +208,11 @@ fn onlegacyfinish(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    if !truthy(
-        scope,
-        state
-            .obj(captures::STREAM)?
-            .get_property(scope, c"writable")?,
-    ) {
+    let stream = cast_payload::<EosState>(scope, payload)
+        .data()
+        .stream
+        .get(scope);
+    if !js::conversion::to_boolean(stream.get_property(scope, c"writable")?) {
         return onfinish(scope, args, payload);
     }
     Ok(js::value::undefined())
@@ -148,19 +223,25 @@ fn onerror(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    complete(scope, &state_of(scope, payload)?, &[args.get(0)])?;
+    complete(
+        scope,
+        cast_payload::<EosState>(scope, payload),
+        Some(args.get(0)),
+    )?;
     Ok(js::value::undefined())
 }
 
-/// The error either side of `stream` failed with, if any.
-fn errored<'s>(
+/// Node's `getEosErrored`: the error of either side, unless it is a boolean.
+fn eos_errored<'s>(
     scope: &'s Scope<'_>,
-    stream: Object<'_>,
+    stream: Object<'s>,
 ) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-    if let Some(error) = side_errored(scope, stream, c"writableErrored", c"_writableState")? {
-        return Ok(Some(error));
-    }
-    side_errored(scope, stream, c"readableErrored", c"_readableState")
+    let sides = sides(scope, stream)?;
+    let errored = match side_errored(scope, stream, c"writableErrored", sides.writable)? {
+        Some(error) => Some(error),
+        None => side_errored(scope, stream, c"readableErrored", sides.readable)?,
+    };
+    Ok(errored.filter(|error| !error.is_boolean() && js::conversion::to_boolean(*error)))
 }
 
 /// Node's `getEosOnCloseError`: the error `finished` reports once the stream closed. That is
@@ -168,48 +249,36 @@ fn errored<'s>(
 /// finish, or `None`.
 fn close_error<'s>(
     scope: &'s Scope<'_>,
-    state: &Captures<'_>,
+    state: EosState<'_>,
 ) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-    use captures::*;
-    let stream = state.obj(STREAM)?;
+    let stream = state.data().stream.get(scope);
     if let Some(error) = eos_errored(scope, stream)? {
         return Ok(Some(error));
     }
+    let (readable, readable_finished, writable, writable_finished) = {
+        let data = state.data();
+        (
+            data.readable,
+            data.readable_finished,
+            data.writable,
+            data.writable_finished,
+        )
+    };
     let stream_value = stream.to_jsval_throwing(scope)?;
-    if state.flag(READABLE)?
-        && !state.flag(READABLE_FINISHED)?
+    if readable
+        && !readable_finished
         && is_readable_node_stream(scope, stream_value, true)?
         && is_readable_finished(scope, stream_value, false)? != Some(true)
     {
-        return Ok(Some(error_value(scope, premature_close())?));
+        return Ok(Some(premature_close().to_value(scope)?));
     }
-    if state.flag(WRITABLE)?
-        && !state.flag(WRITABLE_FINISHED)?
+    if writable
+        && !writable_finished
         && is_writable_finished(scope, stream_value, false)? != Some(true)
     {
-        return Ok(Some(error_value(scope, premature_close())?));
+        return Ok(Some(premature_close().to_value(scope)?));
     }
     Ok(None)
-}
-
-/// Node's `getEosErrored`: the error of either side, unless it is a boolean.
-fn eos_errored<'s>(
-    scope: &'s Scope<'_>,
-    stream: Object<'_>,
-) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-    Ok(errored(scope, stream)?.filter(|error| !error.is_boolean() && truthy(scope, *error)))
-}
-
-/// Call the callback with `error`, or with no arguments for `None`.
-fn complete_with(
-    scope: &Scope<'_>,
-    state: &Captures<'_>,
-    error: Option<HandleValue<'_>>,
-) -> Result<(), ExnThrown> {
-    match error {
-        Some(error) => complete(scope, state, &[error]),
-        None => complete(scope, state, &[]),
-    }
 }
 
 fn onclose(
@@ -217,99 +286,87 @@ fn onclose(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let error = close_error(scope, &state)?;
-    complete_with(scope, &state, error)?;
+    let state = cast_payload::<EosState>(scope, payload);
+    let error = close_error(scope, state)?;
+    complete(scope, state, error)?;
     Ok(js::value::undefined())
 }
 
-/// The listener for `request` of an HTTP request, whose captures are `[state]`: listen for
-/// `finish` on `stream.req`.
+/// The listener for `request` of an HTTP request: listen for `finish` on `stream.req`.
 fn onrequest(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let request = required_obj(scope, state.obj(captures::STREAM)?, c"req")?;
-    add_listener(scope, &state, request, "finish", onfinish)?;
+    let state = cast_payload::<EosState>(scope, payload);
+    let stream = state.data().stream.get(scope);
+    let request = stream.get_property(scope, c"req")?;
+    let request = Object::from_value(scope, request)
+        .map_err(|_| js::error::TypeError("req is not an object".into()).throw(scope))?;
+    let finish = listener_function(scope, state, onfinish)?;
+    add_listener(scope, state, request, c"finish", finish)?;
     Ok(js::value::undefined())
 }
 
-/// The tick that reports the result `eos` computed when it was called, whose captures are
-/// `[state, hasError, error]`.
+/// The tick that reports the result `eos` computed when it was called, whose payload is the
+/// [`EosState`] and whose argument, if any, is the error.
 fn report_immediate(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
+    args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let state = Captures::of(scope, captures.get(0)?)?;
-    let error = if captures.flag(1)? {
-        Some(captures.get(2)?)
-    } else {
-        None
-    };
-    complete_with(scope, &state, error)?;
+    let error = (!args.is_empty()).then(|| args.get(0));
+    complete(scope, cast_payload::<EosState>(scope, payload), error)?;
     Ok(js::value::undefined())
 }
 
-/// The abort listener, whose captures are `[state]`: remove the listeners and call the callback
-/// with an `AbortError`, unless it ran or the cleanup ran.
+/// The abort listener: remove the listeners and call the callback with an `AbortError`, unless
+/// it ran or the cleanup ran.
 fn onabort(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    if state.flag(captures::CALLED)? {
+    let state = cast_payload::<EosState>(scope, payload);
+    if state.data().called {
         return Ok(js::value::undefined());
     }
-    let signal = state.obj(captures::SIGNAL)?;
-    let reason = signal.get_property(scope, c"reason")?;
-    let error = crate::errors::abort_error(scope, Some(reason))?;
-    cleanup_state(scope, &state)?;
-    state.set(captures::CALLED, false)?;
-    complete(scope, &state, &[error])?;
+    let signal = state.data().signal.get(scope);
+    let reason = match signal {
+        Some(signal) => Some(signal.get_property(scope, c"reason")?),
+        None => None,
+    };
+    let error = crate::errors::abort_error(scope, reason)?;
+    cleanup(scope, state)?;
+    state.data_mut().called = false;
+    complete(scope, state, Some(error))?;
     Ok(js::value::undefined())
 }
 
-/// Add `body`, with captures `[state]`, as the listener for `event` on `emitter`, and record it
-/// for the cleanup.
-fn add_listener(
-    scope: &Scope<'_>,
-    state: &Captures<'_>,
-    emitter: Object<'_>,
-    event: &str,
+/// A listener function running `body` for `state`.
+fn listener_function<'s>(
+    scope: &'s Scope<'_>,
+    state: EosState<'s>,
     body: Callback,
-) -> Result<(), ExnThrown> {
-    let listener = closure(scope, 1, body, &[state.array_value()?])?;
-    record_listener(scope, state, emitter, event, listener)
+) -> Result<Object<'s>, ExnThrown> {
+    Ok(*Function::new_callback(scope, c"", 1, body, state)?)
 }
 
 /// Add `listener` for `event` on `emitter`, and record it for the cleanup.
-fn record_listener(
+fn add_listener(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
+    state: EosState<'_>,
     emitter: Object<'_>,
-    event: &str,
+    event: &'static CStr,
     listener: Object<'_>,
 ) -> Result<(), ExnThrown> {
     listen(scope, emitter, c"on", event, listener)?;
-    let event = string(scope, event)?;
-    let entry = js::Array::with_contents(
-        scope,
-        &[
-            emitter.to_jsval_raw_throwing(scope)?,
-            event.get(),
-            listener.to_jsval_raw_throwing(scope)?,
-        ],
-    )?;
-    super::readable::array_push(
-        scope,
-        state.obj(captures::LISTENERS)?,
-        (*entry).to_jsval_throwing(scope)?,
-    )
+    state.data_mut().listeners.push(EosListener {
+        emitter: Heap::from(emitter),
+        event,
+        listener: Heap::from(listener),
+    });
+    Ok(())
 }
 
 fn nop(
@@ -320,89 +377,231 @@ fn nop(
     Ok(js::value::undefined())
 }
 
-/// Remove `finished`'s listeners, and make the callback a no-op.
-fn cleanup_state(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    state.set(captures::CALLED, true)?;
-    let listeners = state.obj(captures::LISTENERS)?;
-    for index in 0..listeners.num(scope, c"length")? as u32 {
-        let entry = Captures::of(scope, listeners.get_element(scope, index)?)?;
-        let emitter = entry.obj(0)?;
-        let event = entry.get(1)?;
-        let listener = entry.get(2)?;
-        super::util::call_method(scope, emitter, c"removeListener", &[event, listener])?;
+/// `eos`'s cleanup: remove its listeners, and make the callback a no-op.
+pub(crate) fn cleanup(scope: &Scope<'_>, state: EosState<'_>) -> Result<(), ExnThrown> {
+    state.data_mut().called = true;
+    let listeners: Vec<(Object<'_>, &'static CStr, Object<'_>)> = state
+        .data()
+        .listeners
+        .iter()
+        .map(|entry| {
+            (
+                entry.emitter.get(scope),
+                entry.event,
+                entry.listener.get(scope),
+            )
+        })
+        .collect();
+    for (emitter, event, listener) in listeners {
+        listen(scope, emitter, c"removeListener", event, listener)?;
     }
     Ok(())
 }
 
-/// The cleanup function `finished` returns, whose captures are `[state]`.
-fn cleanup(
+/// The cleanup function `finished` returns, whose payload is the [`EosState`].
+fn cleanup_callback(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    cleanup_state(scope, &state_of(scope, payload)?)?;
+    cleanup(scope, cast_payload::<EosState>(scope, payload))?;
     Ok(js::value::undefined())
 }
 
-/// Run the captured callback with the async context of the `finished()` call, whose captures are
-/// `[callback, context]`.
-fn bound_callback(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let callback = captures.get(0)?;
-    let context = Snapshot::of(as_object(scope, captures.get(1)?));
-    let previous = context.enter();
-    let call_args: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
-    let this = scope.root_value(args.this());
-    let result = Function::call(scope, this, callback, &call_args);
-    previous.enter();
-    result.map(|value| value.get())
+/// Node's `eos` for a stream `is_node_stream` accepts: call `callback` once `stream` finished,
+/// closed or failed. Returns the state, which [`cleanup`] takes. If the stream already finished,
+/// closed or failed, or the signal already aborted, the callback runs in a tick, or before this
+/// returns with `options.synchronous`, and no listeners are added, except a no-op `error`
+/// listener unless `options.error` is `false`.
+pub(crate) fn eos_native<'s>(
+    scope: &'s Scope<'_>,
+    stream: Object<'_>,
+    options: EosOptions<'_>,
+    callback: EosCallback<'_>,
+) -> Result<EosState<'s>, Thrown> {
+    let stream_value = stream.to_jsval_throwing(scope)?;
+    let readable = match options.readable {
+        Some(readable) => readable,
+        None => is_readable_node_stream(scope, stream_value, false)?,
+    };
+    let writable = match options.writable {
+        Some(writable) => writable,
+        None => is_writable_node_stream(scope, stream_value)?,
+    };
+    let will_emit_close = will_emit_close(scope, stream)?
+        && is_readable_node_stream(scope, stream_value, false)? == readable
+        && is_writable_node_stream(scope, stream_value)? == writable;
+    let writable_finished = is_writable_finished(scope, stream_value, false)? == Some(true);
+    let readable_finished = is_readable_finished(scope, stream_value, false)? == Some(true);
+    let (callback, native) = match callback {
+        EosCallback::Js(callback) => (callback, None),
+        EosCallback::Native(native, payload) => (payload, Some(native)),
+    };
+    let state = js::class::create_instance_with::<EosStateImpl>(scope, |_| EosStateImpl {
+        stream: Heap::from(stream),
+        callback: Heap::from(callback.get()),
+        native,
+        context: Snapshot::capture(),
+        readable,
+        writable,
+        will_emit_close,
+        readable_finished,
+        writable_finished,
+        called: false,
+        listeners: Vec::new(),
+        signal: None,
+        abort_listener: None,
+    })?;
+
+    let sides = sides(scope, stream)?;
+    let error_emitted = |side: Option<super::util::Side<'_>>| -> Result<bool, ExnThrown> {
+        match side {
+            Some(side) => side.error_emitted(scope),
+            None => Ok(false),
+        }
+    };
+    let pending_writes = match sides.writable {
+        Some(w) => {
+            let pending = w.get(scope, Field::Pendingcb)?;
+            !(pending.is_undefined() || (pending.is_number() && pending.to_number() == 0.0))
+        }
+        None => false,
+    };
+    // `Some(None)` is a result without an error.
+    let mut immediate: Option<Option<HandleValue<'_>>> = None;
+    if is_closed(scope, stream)? == Some(true) {
+        immediate = Some(close_error(scope, state)?);
+    } else if error_emitted(sides.writable)? || error_emitted(sides.readable)? {
+        if !will_emit_close {
+            immediate = Some(eos_errored(scope, stream)?);
+        }
+    } else if (!readable
+        && (!will_emit_close || is_readable(scope, stream_value)? == Some(true))
+        && (writable_finished || is_writable(scope, stream_value)? == Some(false))
+        && !pending_writes)
+        || (!writable
+            && (!will_emit_close || is_writable(scope, stream_value)? == Some(true))
+            && (readable_finished || is_readable(scope, stream_value)? == Some(false)))
+        || (sides.readable.is_some()
+            && js::conversion::to_boolean(stream.get_property(scope, c"req")?)
+            && js::conversion::to_boolean(stream.get_property(scope, c"aborted")?))
+    {
+        immediate = Some(eos_errored(scope, stream)?);
+    }
+    if immediate.is_some() {
+        if options.error {
+            let nop = js::class::get_or_init_shared_function(
+                scope,
+                nop as *const () as usize,
+                |scope| Function::new_callback(scope, c"nop", 0, nop, ()),
+            )?;
+            add_listener(scope, state, stream, c"error", *nop)?;
+        }
+    } else if let Some(signal) = options.signal {
+        if js::conversion::to_boolean(signal.get_property(scope, c"aborted")?) {
+            let reason = signal.get_property(scope, c"reason")?;
+            immediate = Some(Some(crate::errors::abort_error(scope, Some(reason))?));
+        }
+    }
+
+    if let Some(error) = immediate {
+        if options.synchronous {
+            complete(scope, state, error)?;
+        } else {
+            let args: Vec<HandleValue<'_>> = error.into_iter().collect();
+            js::jobs::queue_native_tick(scope, report_immediate, state, &args)?;
+        }
+        return Ok(state);
+    }
+
+    let onfinish_fn = listener_function(scope, state, onfinish)?;
+    let onclose_fn = listener_function(scope, state, onclose)?;
+    if super::destroy::is_request(scope, stream)? {
+        add_listener(scope, state, stream, c"complete", onfinish_fn)?;
+        if !will_emit_close {
+            add_listener(scope, state, stream, c"abort", onclose_fn)?;
+        }
+        let request = stream.get_property(scope, c"req")?;
+        if js::conversion::to_boolean(request) {
+            let request = Object::from_value(scope, request)
+                .map_err(|_| js::error::TypeError("req is not an object".into()).throw(scope))?;
+            add_listener(scope, state, request, c"finish", onfinish_fn)?;
+        } else {
+            let onrequest_fn = listener_function(scope, state, onrequest)?;
+            add_listener(scope, state, stream, c"request", onrequest_fn)?;
+        }
+    } else if writable && sides.writable.is_none() {
+        let legacy = listener_function(scope, state, onlegacyfinish)?;
+        add_listener(scope, state, stream, c"end", legacy)?;
+        add_listener(scope, state, stream, c"close", legacy)?;
+    }
+    if !will_emit_close && stream.get_property(scope, c"aborted")?.is_boolean() {
+        add_listener(scope, state, stream, c"aborted", onclose_fn)?;
+    }
+    let onend_fn = listener_function(scope, state, onend)?;
+    add_listener(scope, state, stream, c"end", onend_fn)?;
+    add_listener(scope, state, stream, c"finish", onfinish_fn)?;
+    if options.error {
+        let onerror_fn = listener_function(scope, state, onerror)?;
+        add_listener(scope, state, stream, c"error", onerror_fn)?;
+    }
+    add_listener(scope, state, stream, c"close", onclose_fn)?;
+
+    if let Some(signal) = options.signal {
+        let listener = listener_function(scope, state, onabort)?;
+        {
+            let mut data = state.data_mut();
+            data.signal = Some(Heap::from(signal));
+            data.abort_listener = Some(Heap::from(listener));
+        }
+        listen(scope, signal, c"addEventListener", c"abort", listener)?;
+    }
+    Ok(state)
 }
 
-/// Node's `eos`: call `callback` once `stream` finished, closed or failed. Returns the cleanup
-/// function. If the stream already finished, closed or failed, or `options.signal` already
-/// aborted, the callback runs in a tick and no listeners are added, except a no-op `error`
-/// listener unless `options.error` is `false`.
+/// The cleanup function `eos` returns for `state`.
+pub(crate) fn cleanup_function<'s>(
+    scope: &'s Scope<'_>,
+    state: EosState<'s>,
+) -> Result<Object<'s>, ExnThrown> {
+    Ok(*Function::new_callback(
+        scope,
+        c"cleanup",
+        0,
+        cleanup_callback,
+        state,
+    )?)
+}
+
+/// Node's `eos`, `stream.finished(stream, options, callback)` with `options` given: returns the
+/// cleanup function.
 pub(crate) fn eos<'s>(
     scope: &'s Scope<'_>,
     stream: HandleValue<'_>,
     options: Option<HandleValue<'_>>,
     callback: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, Thrown> {
-    eos_impl(scope, stream, options, callback, false)
+    let state = eos_checked(scope, stream, options, EosCallback::Js(callback))?;
+    Ok(cleanup_function(scope, state)?.to_jsval_throwing(scope)?)
 }
 
-/// [`eos`] with Node's `kEosNodeSynchronousCallback` option: a result known when it is called
-/// is passed to the callback, with `this` the stream, before it returns instead of in a tick.
-pub(crate) fn eos_synchronous<'s>(
+/// [`eos_native`] for JS arguments, which it validates as Node's `eos` does.
+fn eos_checked<'s>(
     scope: &'s Scope<'_>,
     stream: HandleValue<'_>,
     options: Option<HandleValue<'_>>,
-    callback: HandleValue<'_>,
-) -> Result<HandleValue<'s>, Thrown> {
-    eos_impl(scope, stream, options, callback, true)
-}
-
-/// The body of [`eos`] and [`eos_synchronous`].
-fn eos_impl<'s>(
-    scope: &'s Scope<'_>,
-    stream: HandleValue<'_>,
-    options: Option<HandleValue<'_>>,
-    callback: HandleValue<'_>,
-    synchronous: bool,
-) -> Result<HandleValue<'s>, Thrown> {
-    use captures::*;
-    let options = match options.filter(|options| !options.is_null() && !options.is_undefined()) {
-        Some(options) => Some(validate_object(scope, options, "options")?),
+    callback: EosCallback<'_>,
+) -> Result<EosState<'s>, Thrown> {
+    let options = match options.filter(|options| !options.is_null_or_undefined()) {
+        Some(options) => Some(validate_plain_object(scope, options, "options", false)?),
         None => None,
     };
-    validate_function(scope, callback, "callback")?;
-    let option = |name: &'static std::ffi::CStr| -> Result<HandleValue<'_>, ExnThrown> {
+    if let EosCallback::Js(callback) = callback {
+        validate_function(scope, callback, "callback")?;
+    }
+    let option = |name: &'static CStr| -> Result<HandleValue<'_>, ExnThrown> {
         match options {
-            Some(options) => options.val(scope, name),
+            Some(options) => options.get_property(scope, name),
             None => Ok(HandleValue::undefined()),
         }
     };
@@ -417,179 +616,51 @@ fn eos_impl<'s>(
         )
         .into());
     }
-    let stream_object = as_object(scope, stream).expect("streams are objects");
-    let readable_option = option(c"readable")?;
-    let readable = if readable_option.is_null() || readable_option.is_undefined() {
-        is_readable_node_stream(scope, stream, false)?
-    } else {
-        truthy(scope, readable_option)
+    let stream = Object::from_value(scope, stream).expect("streams are objects");
+    let side_option = |name: &'static CStr| -> Result<Option<bool>, ExnThrown> {
+        let value = option(name)?;
+        Ok((!value.is_null_or_undefined()).then(|| js::conversion::to_boolean(value)))
     };
-    let writable_option = option(c"writable")?;
-    let writable = if writable_option.is_null() || writable_option.is_undefined() {
-        is_writable_node_stream(scope, stream)?
-    } else {
-        truthy(scope, writable_option)
+    let readable = side_option(c"readable")?;
+    let writable = side_option(c"writable")?;
+    let error = option(c"error")?;
+    let options = EosOptions {
+        readable,
+        writable,
+        error: !(error.is_boolean() && !error.to_boolean()),
+        signal: Object::from_value(scope, signal).ok(),
+        synchronous: false,
     };
-    let will_emit_close = will_emit_close(scope, stream_object)?
-        && is_readable_node_stream(scope, stream, false)? == readable
-        && is_writable_node_stream(scope, stream)? == writable;
-    let writable_finished = is_writable_finished(scope, stream, false)? == Some(true);
-    let readable_finished = is_readable_finished(scope, stream, false)? == Some(true);
-    let (r_state, w_state) = states(scope, stream_object)?;
-
-    let state_array = js::Array::with_contents(scope, &[js::value::undefined(); COUNT])?;
-    let state_value = scope.root_value((*state_array).to_jsval_raw_throwing(scope)?);
-    let state = Captures::of(scope, (*state_array).to_jsval_throwing(scope)?)?;
-    state.set(STREAM, stream)?;
-    state.set(READABLE, readable)?;
-    state.set(WRITABLE, writable)?;
-    state.set(WILL_EMIT_CLOSE, will_emit_close)?;
-    state.set(READABLE_FINISHED, readable_finished)?;
-    state.set(WRITABLE_FINISHED, writable_finished)?;
-    state.set(CALLED, false)?;
-    state.set(
-        LISTENERS,
-        *js::Array::with_contents(scope, &[] as &[Value])?,
-    )?;
-
-    let error_emitted = |side: Option<Object<'_>>| -> Result<bool, ExnThrown> {
-        Ok(match side {
-            Some(side) => side.flag(scope, c"errorEmitted")?,
-            None => false,
-        })
-    };
-    let pending_writes = match w_state {
-        Some(w) => {
-            let pending = w.get_property(scope, c"pendingcb")?;
-            !(pending.is_undefined() || (pending.is_number() && pending.to_number() == 0.0))
-        }
-        None => false,
-    };
-    // `Some(None)` is a result without an error.
-    let mut immediate: Option<Option<HandleValue<'_>>> = None;
-    if is_closed(scope, stream_object)? == Some(true) {
-        immediate = Some(close_error(scope, &state)?);
-    } else if error_emitted(w_state)? || error_emitted(r_state)? {
-        if !will_emit_close {
-            immediate = Some(eos_errored(scope, stream_object)?);
-        }
-    } else if (!readable
-        && (!will_emit_close || is_readable(scope, stream)? == Some(true))
-        && (writable_finished || is_writable(scope, stream)? == Some(false))
-        && !pending_writes)
-        || (!writable
-            && (!will_emit_close || is_writable(scope, stream)? == Some(true))
-            && (readable_finished || is_readable(scope, stream)? == Some(false)))
-        || (r_state.is_some()
-            && truthy(scope, stream_object.get_property(scope, c"req")?)
-            && truthy(scope, stream_object.get_property(scope, c"aborted")?))
-    {
-        immediate = Some(eos_errored(scope, stream_object)?);
-    }
-    let error_option = option(c"error")?;
-    let listen_errors = !(error_option.is_boolean() && !error_option.to_boolean());
-    let signal_object = as_object(scope, signal);
-    if immediate.is_some() {
-        if listen_errors {
-            let nop = js::class::get_or_init_shared_function(
-                scope,
-                nop as *const () as usize,
-                |scope| Function::new_callback(scope, c"nop", 0, nop, ()),
-            )?;
-            record_listener(scope, &state, stream_object, "error", *nop)?;
-        }
-    } else if let Some(signal) = signal_object {
-        if truthy(scope, signal.get_property(scope, c"aborted")?) {
-            let reason = signal.get_property(scope, c"reason")?;
-            immediate = Some(Some(crate::errors::abort_error(scope, Some(reason))?));
-        }
-    }
-
-    let context = match js::async_context::current(scope) {
-        Some(context) => context.to_jsval_throwing(scope)?,
-        None => HandleValue::undefined(),
-    };
-    let cleanup = closure(scope, 0, cleanup, &[state_value.get()])?;
-    if let Some(error) = immediate.filter(|_| synchronous) {
-        state.set(CALLBACK, callback)?;
-        complete_with(scope, &state, error)?;
-        return Ok(cleanup.to_jsval_throwing(scope)?);
-    }
-    let callback = closure(scope, 0, bound_callback, &[callback.get(), context.get()])?;
-    state.set(CALLBACK, callback)?;
-    if let Some(error) = immediate {
-        next_tick(
-            scope,
-            report_immediate,
-            &[
-                state_value.get(),
-                js::value::from_bool(error.is_some()),
-                error.map_or(js::value::undefined(), |error| error.get()),
-            ],
-        )?;
-        return Ok(cleanup.to_jsval_throwing(scope)?);
-    }
-
-    if is_request(scope, stream_object)? {
-        add_listener(scope, &state, stream_object, "complete", onfinish)?;
-        if !will_emit_close {
-            add_listener(scope, &state, stream_object, "abort", onclose)?;
-        }
-        if truthy(scope, stream_object.get_property(scope, c"req")?) {
-            let request = required_obj(scope, stream_object, c"req")?;
-            add_listener(scope, &state, request, "finish", onfinish)?;
-        } else {
-            add_listener(scope, &state, stream_object, "request", onrequest)?;
-        }
-    } else if writable && w_state.is_none() {
-        add_listener(scope, &state, stream_object, "end", onlegacyfinish)?;
-        add_listener(scope, &state, stream_object, "close", onlegacyfinish)?;
-    }
-    if !will_emit_close && stream_object.get_property(scope, c"aborted")?.is_boolean() {
-        add_listener(scope, &state, stream_object, "aborted", onclose)?;
-    }
-    add_listener(scope, &state, stream_object, "end", onend)?;
-    add_listener(scope, &state, stream_object, "finish", onfinish)?;
-    if listen_errors {
-        add_listener(scope, &state, stream_object, "error", onerror)?;
-    }
-    add_listener(scope, &state, stream_object, "close", onclose)?;
-
-    if let Some(signal_object) = signal_object {
-        state.set(SIGNAL, signal_object)?;
-        let listener = closure(scope, 0, onabort, &[state_value.get()])?;
-        state.set(ABORT_LISTENER, listener)?;
-        listen(scope, signal_object, c"addEventListener", "abort", listener)?;
-    }
-    Ok(cleanup.to_jsval_throwing(scope)?)
+    eos_native(scope, stream, options, callback)
 }
 
-/// Node's `isRequest`: whether `stream` has a truthy `setHeader` and an `abort` method.
-fn is_request(scope: &Scope<'_>, stream: Object<'_>) -> Result<bool, ExnThrown> {
-    Ok(truthy(scope, stream.get_property(scope, c"setHeader")?)
-        && is_function(scope, stream.get_property(scope, c"abort")?))
+/// The state of the promise `stream/promises`' `finished` returns: the promise, and the `eos`
+/// state to clean up once it settles if `cleanup` was requested.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct FinishedState {
+    promise: Heap<js::promise::Promise>,
+    cleanup: Option<Heap<EosStateImpl>>,
 }
 
-/// The callback of the promise `finished` returns, whose captures are `[promise, cleanup flag,
-/// cleanup function]`.
+#[core_runtime::jsmethods]
+impl FinishedState {}
+
+/// The `eos` callback of `stream/promises`' `finished`, whose payload is a [`FinishedState`].
 fn settle(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let promise = captures
-        .obj(0)?
-        .cast::<js::Promise>()
-        .map_err(|_| type_error(scope, "not a promise"))?;
-    if captures.flag(1)? {
-        let cleanup = captures.get(2)?;
-        if is_function(scope, cleanup) {
-            call(scope, HandleValue::undefined(), cleanup, &[])?;
-        }
+    let state = cast_payload::<FinishedState>(scope, payload);
+    let (promise, eos_state) = {
+        let data = state.data();
+        (data.promise.get(scope), data.cleanup.get(scope))
+    };
+    if let Some(eos_state) = eos_state {
+        cleanup(scope, eos_state)?;
     }
     let error = args.get(0);
-    if truthy(scope, error) {
+    if !args.is_empty() && js::conversion::to_boolean(error) {
         promise.reject(scope, error)?;
     } else {
         promise.resolve(scope, HandleValue::undefined())?;
@@ -603,11 +674,11 @@ pub(crate) fn finished_promise<'s>(
     stream: HandleValue<'_>,
     options: Option<HandleValue<'_>>,
 ) -> Result<js::Promise<'s>, ExnThrown> {
-    let cleanup_option = match options.and_then(|options| as_object(scope, options)) {
-        Some(options) => options.val(scope, c"cleanup")?,
+    let cleanup_option = match options.and_then(|options| Object::from_value(scope, options).ok()) {
+        Some(options) => options.get_property(scope, c"cleanup")?,
         None => HandleValue::undefined(),
     };
-    if truthy(scope, cleanup_option) && !cleanup_option.is_boolean() {
+    if js::conversion::to_boolean(cleanup_option) && !cleanup_option.is_boolean() {
         return Err(NodeError::invalid_arg_type(
             scope,
             "cleanup",
@@ -616,25 +687,21 @@ pub(crate) fn finished_promise<'s>(
         )
         .throw(scope));
     }
-    let auto_cleanup = truthy(scope, cleanup_option);
+    let auto_cleanup = js::conversion::to_boolean(cleanup_option);
     let promise = js::Promise::new_pending(scope)?;
+    let state =
+        js::class::create_instance_with::<FinishedStateImpl>(scope, |_| FinishedStateImpl {
+            promise: Heap::from(promise),
+            cleanup: None,
+        })?;
     let options = options.filter(|options| !options.is_null());
-    let state = js::Array::with_contents(
-        scope,
-        &[
-            promise.to_jsval_raw_throwing(scope)?,
-            js::value::from_bool(auto_cleanup),
-            js::value::undefined(),
-        ],
-    )?;
-    let callback = Function::new_callback(scope, c"", 1, settle, *state)?;
-    match eos(
-        scope,
-        stream,
-        options,
-        (*callback).to_jsval_throwing(scope)?,
-    ) {
-        Ok(cleanup) => state.set_element(scope, 2, cleanup)?,
+    let payload = state.to_jsval_throwing(scope)?;
+    match eos_checked(scope, stream, options, EosCallback::Native(settle, payload)) {
+        Ok(eos_state) => {
+            if auto_cleanup {
+                state.data_mut().cleanup = Some(Heap::from(eos_state));
+            }
+        }
         Err(error) => {
             error.throw(scope);
             promise.reject_with_pending(scope)?;

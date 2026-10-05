@@ -29,6 +29,7 @@ use std::sync::Arc;
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
+use js::gc::handle::RootedHeap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
@@ -37,8 +38,7 @@ use js::{Function, Object};
 use platform::fs::{FileKind, FsError, Stat};
 
 use crate::buffer::{decode_bytes, encode_string, new_buffer, Encoding};
-use crate::errors::{validate_function, validate_integer, ErrorKind, NodeError, Thrown};
-use crate::stream::{closure, Captures};
+use crate::errors::{validate_function, validate_integer, NodeError, Thrown};
 
 pub(crate) use classes::new_dirent;
 pub(crate) use promises::register_promises;
@@ -66,6 +66,18 @@ pub(crate) struct UvError {
     /// Whether the error is reported as Node's C++ `ErrnoException`: with a positive `errno`, and
     /// the message `CODE, strerror 'path'`, which omits the system call.
     errno_exception: bool,
+    /// The details of a network error, which has the message `syscall CODE` followed by its
+    /// `suffix`.
+    net: Option<Box<NetDetail>>,
+}
+
+/// The message suffix and the extra properties of a network error.
+#[derive(Default)]
+pub(crate) struct NetDetail {
+    suffix: String,
+    address: Option<String>,
+    port: Option<u16>,
+    hostname: Option<String>,
 }
 
 impl UvError {
@@ -78,7 +90,56 @@ impl UvError {
             rm_directory: false,
             positive_errno: false,
             errno_exception: false,
+            net: None,
         }
+    }
+
+    /// The network error `error` of `syscall`, with the message `syscall CODE`. `ENOTFOUND` and
+    /// `EAI_AGAIN` have libuv's `getaddrinfo` error numbers.
+    pub(crate) fn net(error: &platform::net::NetError, syscall: &'static str) -> Self {
+        let code = error.code();
+        let error = match code {
+            "ENOTFOUND" => FsError {
+                code,
+                errno: -3008,
+                description: "unknown node or service",
+            },
+            "EAI_AGAIN" => FsError {
+                code,
+                errno: -3001,
+                description: "temporary failure",
+            },
+            code => FsError::from_code(code),
+        };
+        UvError {
+            net: Some(Box::default()),
+            ..Self::new(error, syscall)
+        }
+    }
+
+    /// The network error with `suffix` after the code in its message.
+    pub(crate) fn suffix(mut self, suffix: String) -> Self {
+        if let Some(net) = &mut self.net {
+            net.suffix = suffix;
+        }
+        self
+    }
+
+    /// The network error with the `address` and `port` properties of `addr`.
+    pub(crate) fn addr(mut self, addr: std::net::SocketAddr) -> Self {
+        if let Some(net) = &mut self.net {
+            net.address = Some(addr.ip().to_string());
+            net.port = Some(addr.port());
+        }
+        self
+    }
+
+    /// The network error with the `hostname` property `hostname`.
+    pub(crate) fn hostname(mut self, hostname: &str) -> Self {
+        if let Some(net) = &mut self.net {
+            net.hostname = Some(hostname.into());
+        }
+        self
     }
 
     /// The error with a positive `errno`.
@@ -117,43 +178,43 @@ impl UvError {
 
     /// The error as a JS `Error`, such as `ENOENT: no such file or directory, open 'a'`, with
     /// `errno`, `code`, `syscall` and, where known, `path` and `dest`.
-    fn into_value<'s>(self, scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+    pub(crate) fn into_value<'s>(self, scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+        if let Some(net) = &self.net {
+            let message = format!("{} {}{}", self.syscall, self.error.code, net.suffix);
+            let error = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &message)?;
+            let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
+            object.set_property(scope, c"errno", self.error.errno)?;
+            object.set_property(scope, c"code", self.error.code)?;
+            object.set_property(scope, c"syscall", self.syscall)?;
+            if let Some(hostname) = &net.hostname {
+                object.set_property(scope, c"hostname", hostname.as_str())?;
+            }
+            if let Some(address) = &net.address {
+                object.set_property(scope, c"address", address.as_str())?;
+            }
+            if let Some(port) = net.port {
+                object.set_property(scope, c"port", f64::from(port))?;
+            }
+            return Ok(error);
+        }
         if self.rm_directory {
             let path = self.path.unwrap_or_default();
-            let error = crate::stream::error_value(
-                scope,
-                NodeError::new(
-                    ErrorKind::Error,
-                    "ERR_FS_EISDIR",
-                    format!("Path is a directory: rm returned EISDIR (is a directory) {path}"),
-                ),
-            )?;
-            let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
-            object.define_property(scope, c"name", "SystemError", 0)?;
-            let to_string =
-                Function::new_callback(scope, c"toString", 0, system_error_to_string, ())?;
-            object.define_property(scope, c"toString", to_string, 0)?;
-            let info = Object::new_plain(scope)?;
-            info.set_property(scope, c"code", "EISDIR")?;
-            info.set_property(scope, c"message", "is a directory")?;
-            info.set_property(scope, c"path", path.as_str())?;
-            info.set_property(scope, c"syscall", "rm")?;
-            info.set_property(scope, c"errno", -self.error.errno)?;
-            object.set_property(scope, c"info", info)?;
-            object.set_property(scope, c"errno", -self.error.errno)?;
-            object.set_property(scope, c"syscall", "rm")?;
-            object.set_property(scope, c"path", path.as_str())?;
-            return Ok(error);
+            let message =
+                format!("Path is a directory: rm returned EISDIR (is a directory) {path}");
+            return crate::errors::system_error(scope, "ERR_FS_EISDIR", message, |info| {
+                info.set_property(scope, c"code", "EISDIR")?;
+                info.set_property(scope, c"message", "is a directory")?;
+                info.set_property(scope, c"path", path.as_str())?;
+                info.set_property(scope, c"syscall", "rm")?;
+                info.set_property(scope, c"errno", -self.error.errno)
+            });
         }
         if self.errno_exception {
             let mut message = format!("{}, {}", self.error.code, strerror(-self.error.errno));
             if let Some(path) = &self.path {
                 message.push_str(&format!(" '{path}'"));
             }
-            let message =
-                std::ffi::CString::new(message.replace('\0', "\\0")).expect("NULs were replaced");
-            js::error::throw_plain_error(scope, &message);
-            let error = crate::stream::take_exception(scope);
+            let error = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &message)?;
             let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
             object.set_property(scope, c"errno", -self.error.errno)?;
             object.set_property(scope, c"code", self.error.code)?;
@@ -173,10 +234,7 @@ impl UvError {
         if let Some(dest) = &self.dest {
             message.push_str(&format!(" -> '{dest}'"));
         }
-        let message =
-            std::ffi::CString::new(message.replace('\0', "\\0")).expect("NULs were replaced");
-        js::error::throw_plain_error(scope, &message);
-        let error = crate::stream::take_exception(scope);
+        let error = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &message)?;
         let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
         let errno = match self.positive_errno {
             true => -self.error.errno,
@@ -202,26 +260,6 @@ fn strerror(errno: i32) -> String {
         Some(end) => text[..end].to_string(),
         None => text,
     }
-}
-
-/// The `toString` of a `SystemError`: `${name} [${code}]: ${message}`.
-pub(super) fn system_error_to_string(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let this =
-        Object::from_value(scope, scope.root_value(args.this())).map_err(|e| e.throw(scope))?;
-    let part = |name| -> Result<String, ExnThrown> {
-        js::JSString::from_value(scope, this.get_property(scope, name)?)?.to_utf8(scope)
-    };
-    let text = format!(
-        "{} [{}]: {}",
-        part(c"name")?,
-        part(c"code")?,
-        part(c"message")?
-    );
-    js::JSString::from_str(scope, &text)?.to_jsval_raw_throwing(scope)
 }
 
 impl ThrowException for UvError {
@@ -418,7 +456,7 @@ pub(crate) fn path_arg(
     } else {
         let object = Object::from_value(scope, *value).map_err(|_| invalid())?;
         if let Some(view) = js::ArrayBufferView::from_object(object) {
-            view.with_bytes(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            String::from_utf8_lossy(&view.copy_bytes(scope)?).into_owned()
         } else if crate::url::is_url(scope, value)? {
             let href = object.get_property(scope, c"href")?;
             let href = js::JSString::from_value(scope, href)?.to_utf8(scope)?;
@@ -488,7 +526,7 @@ pub(crate) fn flag_option(
     options: Option<HandleValue<'_>>,
     name: &'static std::ffi::CStr,
 ) -> Result<bool, ExnThrown> {
-    Ok(option(scope, options, name)?.is_some_and(|value| crate::stream::truthy(scope, value)))
+    Ok(option(scope, options, name)?.is_some_and(|value| js::conversion::to_boolean(value)))
 }
 
 /// The encoding of `options`, which is the encoding's name or an object with an `encoding`
@@ -712,11 +750,9 @@ pub(crate) fn data_arg(
         let string = js::JSString::from_value(scope, value)?;
         return Ok(encode_string(scope, string, encoding)?);
     }
-    Object::from_value(scope, *value)
+    let view = Object::from_value(scope, *value)
         .ok()
         .and_then(js::ArrayBufferView::from_object)
-        .map(|view| view.copy_bytes(scope))
-        .transpose()?
         .ok_or_else(|| {
             NodeError::invalid_arg_type(
                 scope,
@@ -724,8 +760,8 @@ pub(crate) fn data_arg(
                 "of type string or an instance of Buffer, TypedArray, or DataView",
                 value,
             )
-            .into()
-        })
+        })?;
+    Ok(view.copy_bytes(scope)?)
 }
 
 // ============================================================================
@@ -773,6 +809,42 @@ pub(crate) fn remove_file(fd: i32) -> Result<(), UvError> {
         .ok_or_else(|| UvError::code("EBADF", "close"))
 }
 
+/// Remove `fd` from the table if it still refers to `file`, for a `FileHandle` finalized while
+/// open. Does nothing while the table is in use or once the thread has destroyed it.
+pub(crate) fn remove_file_of(fd: i32, file: &WeakHandle) {
+    let _ = FILES.try_with(|files| {
+        let Ok(mut files) = files.try_borrow_mut() else {
+            return;
+        };
+        if files.get(&fd).is_some_and(|handle| file.refers_to(handle)) {
+            files.remove(&fd);
+        }
+    });
+}
+
+/// A reference to the file of a [`Handle`] that doesn't keep the file open.
+pub(crate) enum WeakHandle {
+    File(std::sync::Weak<File>),
+    #[cfg(target_arch = "wasm32")]
+    Wasi(std::sync::Weak<platform::fs::wasi::File>),
+}
+
+impl WeakHandle {
+    /// Whether `handle` is the file this refers to.
+    fn refers_to(&self, handle: &Handle) -> bool {
+        match (self, handle) {
+            (WeakHandle::File(weak), Handle::File(file)) => {
+                std::ptr::eq(weak.as_ptr(), Arc::as_ptr(file))
+            }
+            #[cfg(target_arch = "wasm32")]
+            (WeakHandle::Wasi(weak), Handle::Wasi(file)) => {
+                std::ptr::eq(weak.as_ptr(), Arc::as_ptr(file))
+            }
+            _ => false,
+        }
+    }
+}
+
 /// The file a file descriptor refers to.
 #[derive(Clone)]
 pub(crate) enum Handle {
@@ -795,6 +867,16 @@ impl Handle {
             _ => FILES
                 .with(|files| files.borrow().get(&fd).cloned())
                 .ok_or_else(|| UvError::code("EBADF", syscall)),
+        }
+    }
+
+    /// A [`WeakHandle`] of the file, or `None` for the standard streams.
+    pub(crate) fn downgrade(&self) -> Option<WeakHandle> {
+        match self {
+            Handle::File(file) => Some(WeakHandle::File(Arc::downgrade(file))),
+            #[cfg(target_arch = "wasm32")]
+            Handle::Wasi(file) => Some(WeakHandle::Wasi(Arc::downgrade(file))),
+            _ => None,
         }
     }
 
@@ -923,13 +1005,8 @@ impl Handle {
 
 /// `ERR_BLOCKING_NOT_ALLOWED` naming `function` where blocking host I/O isn't allowed.
 pub(super) fn refuse_blocking(function: &str) -> Result<(), Thrown> {
-    match core_runtime::event_loop::blocking_host_io_refusal() {
-        Some(reason) => Err(NodeError::new(
-            ErrorKind::Error,
-            "ERR_BLOCKING_NOT_ALLOWED",
-            format!("fs.{function} would block {reason}"),
-        )
-        .into()),
+    match crate::errors::blocking_not_allowed(&format!("fs.{function}")) {
+        Some(error) => Err(error.into()),
         None => Ok(()),
     }
 }
@@ -962,30 +1039,37 @@ pub(crate) fn hold_event_loop() -> Option<core_runtime::event_loop::InterestHand
     })
 }
 
-/// Start `prepared` and return a promise for its result. The promise is fulfilled with the
-/// array of the values for [`Variant::Callback`], and with the first value otherwise. On WASI,
-/// blocking work throws where blocking host I/O isn't allowed. Until the promise settles,
-/// the operation keeps the current event loop running, as a pending libuv request does in Node.js.
-pub(crate) fn run_async<'s>(
+/// The conversion of an operation's values, or of the exception its failure left pending, to the
+/// value its promise settles with.
+type Deliver = Box<
+    dyn for<'r> FnOnce(
+        &'r Scope<'_>,
+        Result<Vec<HandleValue<'r>>, ExnThrown>,
+    ) -> Result<HandleValue<'r>, ExnThrown>,
+>;
+
+/// Start `prepared` as `function`, and return a promise that settles with what `deliver` makes
+/// of the operation's values once it finished. Blocking work throws where blocking host I/O
+/// isn't allowed. Until the promise settles, the operation keeps the current event loop
+/// running, as a pending libuv request does in Node.js.
+fn start<'s>(
     scope: &'s Scope<'_>,
     function: &str,
     prepared: Prepared,
     variant: Variant,
+    deliver: Deliver,
 ) -> Result<js::Promise<'s>, Thrown> {
     let Prepared { work, finish } = prepared;
     let interest = hold_event_loop();
     let settle = move |result: Result<Output, UvError>| {
         PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
             drop(interest);
-            let output = result.map_err(|error| error.throw(scope))?;
-            let values = finish(scope, output, variant).map_err(|thrown| thrown.throw(scope))?;
-            if variant == Variant::Callback {
-                return js::Array::with_contents(scope, &values)?.to_jsval_throwing(scope);
-            }
-            Ok(values
-                .into_iter()
-                .next()
-                .unwrap_or(HandleValue::undefined()))
+            let values = result
+                .map_err(|error| error.throw(scope))
+                .and_then(|output| {
+                    finish(scope, output, variant).map_err(|thrown| thrown.throw(scope))
+                });
+            deliver(scope, values)
         }))
     };
     match work {
@@ -1007,53 +1091,24 @@ pub(crate) fn run_async<'s>(
     }
 }
 
-/// The fulfillment reaction of a callback function's promise, whose captures are
-/// `[callback, with_error]`: call the callback with `null` (unless `with_error` is false) and
-/// the values in the array the promise was fulfilled with.
-pub(super) fn call_back_with_values(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let values = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
-    let length = values.get_property(scope, c"length")?.to_number() as u32;
-    let mut call_args = Vec::new();
-    if captures.flag(1)? {
-        call_args.push(HandleValue::null());
-    }
-    for index in 0..length {
-        call_args.push(values.get_element(scope, index)?);
-    }
-    call_reporting(scope, captures.get(0)?, &call_args)
+/// Start `prepared` as `function`, and return a promise for its first value.
+pub(crate) fn run_async<'s>(
+    scope: &'s Scope<'_>,
+    function: &str,
+    prepared: Prepared,
+    variant: Variant,
+) -> Result<js::Promise<'s>, Thrown> {
+    let deliver: Deliver = Box::new(|_scope, values| {
+        Ok(values?
+            .into_iter()
+            .next()
+            .unwrap_or(HandleValue::undefined()))
+    });
+    start(scope, function, prepared, variant, deliver)
 }
 
-/// The rejection reaction of a callback function's promise, whose captures are `[callback]`:
-/// call the callback with the error.
-pub(super) fn call_back_with_error(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    call_reporting(scope, captures.get(0)?, &[args.get(0)])
-}
-
-/// Call `callback` with `args`, and report an exception it throws as uncaught.
-fn call_reporting(
-    scope: &Scope<'_>,
-    callback: HandleValue<'_>,
-    args: &[HandleValue<'_>],
-) -> Result<Value, ExnThrown> {
-    if Function::call(scope, js::value::undefined(), callback, args).is_err() {
-        let error = crate::stream::take_exception(scope);
-        core_runtime::event_loop::timer::rethrow_in_microtask(scope, error)?;
-    }
-    Ok(js::value::undefined())
-}
-
-/// Start `prepared`, and call `callback` with its error or with `null` and its values. Without
-/// `with_error`, `callback` receives only the values.
+/// Start `prepared` as `function`, and once it finished, call `callback` with its error or with
+/// `null` and its values. Without `with_error`, `callback` receives only the values.
 pub(crate) fn run_callback(
     scope: &Scope<'_>,
     function: &str,
@@ -1061,16 +1116,36 @@ pub(crate) fn run_callback(
     callback: HandleValue<'_>,
     with_error: bool,
 ) -> Result<(), Thrown> {
-    let promise = run_async(scope, function, prepared, Variant::Callback)?;
-    let on_values = closure(
-        scope,
-        1,
-        call_back_with_values,
-        &[callback.get(), js::value::from_bool(with_error)],
-    )?;
-    let on_error = closure(scope, 1, call_back_with_error, &[callback.get()])?;
-    promise.then(scope, Some(on_values), Some(on_error))?;
+    let callback = RootedHeap::new(Object::from_value(scope, *callback)?);
+    let deliver: Deliver = Box::new(move |scope, values| {
+        let callback = callback.get(scope);
+        let args = match values {
+            Ok(values) if with_error => {
+                std::iter::once(HandleValue::null()).chain(values).collect()
+            }
+            Ok(values) => values,
+            Err(ExnThrown) => vec![js::exception::take_pending_or_undefined(scope)],
+        };
+        crate::support::call_reporting(scope, callback, &args)?;
+        Ok(HandleValue::undefined())
+    });
+    start(scope, function, prepared, Variant::Callback, deliver)?;
     Ok(())
+}
+
+/// The body of `fs.exists[util.promisify.custom](path)`, whose payload is unused: a promise that
+/// resolves with whether `path` exists. An invalid `path` resolves it with `false`.
+fn exists_promise(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let prepared =
+        (ops::OPS[ops::index_of("exists")].parse)(scope, &[args.get(0)], Variant::Promise)
+            .map_err(|thrown| thrown.throw(scope))?;
+    run_async(scope, "exists", prepared, Variant::Promise)
+        .map_err(|thrown| thrown.throw(scope))?
+        .to_jsval_raw_throwing(scope)
 }
 
 /// The body of every function [`ops::OPS`] defines, whose payload is the index of the operation
@@ -1128,11 +1203,10 @@ fn op_function<'s>(
         Variant::Promise => 2,
     };
     let name = std::ffi::CString::new(name).expect("names have no NULs");
-    let nargs = op.nargs + u32::from(variant == Variant::Callback);
     let function = Function::new_callback(
         scope,
         &name,
-        nargs,
+        op.lengths[variant_index],
         call_op,
         js::value::from_f64((index * 3 + variant_index) as f64),
     )?;
@@ -1244,6 +1318,7 @@ pub mod module {
     pub use super::streams::write_stream_class as WriteStream;
 
     /// <https://nodejs.org/api/fs.html#fscreatereadstreampath-options>
+    #[function(length = 2)]
     pub fn create_read_stream<'s>(
         scope: &'s Scope<'_>,
         path: HandleValue<'_>,
@@ -1286,6 +1361,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/fs.html#fscreatewritestreampath-options>
+    #[function(length = 2)]
     pub fn create_write_stream<'s>(
         scope: &'s Scope<'_>,
         path: HandleValue<'_>,
@@ -1314,11 +1390,27 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
                 ));
             }
         }
-        // `realpath.native` and `realpathSync.native` are the functions themselves.
+        // `realpath.native` and `realpathSync.native` are the functions themselves. `read` and
+        // `write` have Node's `customPromisifyArgs`, and `exists` has Node's `promisify.custom`.
         for (name, function) in &exports {
-            if matches!(*name, "realpath" | "realpathSync") {
-                let function = Object::from_value(scope, **function).map_err(|e| e.throw(scope))?;
-                function.set_property(scope, c"native", function)?;
+            let function = Object::from_value(scope, **function).map_err(|e| e.throw(scope))?;
+            match *name {
+                "realpath" | "realpathSync" => function.set_property(scope, c"native", function)?,
+                "read" => {
+                    crate::util::define_promisify_args(scope, function, &["bytesRead", "buffer"])?
+                }
+                "write" => crate::util::define_promisify_args(
+                    scope,
+                    function,
+                    &["bytesWritten", "buffer"],
+                )?,
+                "exists" => {
+                    let custom = Function::new_callback(scope, c"exists", 1, exists_promise, ())?;
+                    let id = crate::util::PROMISIFY_CUSTOM.id(scope)?;
+                    let attrs = js::class_spec::JSPROP_READONLY | js::class_spec::JSPROP_PERMANENT;
+                    function.define_value_by_id(scope, id, custom, attrs as u32)?;
+                }
+                _ => {}
             }
         }
         let cp = Function::new_callback(scope, c"cp", 4, cp::cp_callback, ())?;
@@ -1339,17 +1431,25 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     crate::stub::register_implemented_with::<module::js_module>(scope, name, &exports)
 }
 
-/// Register the classes of `node:fs` on `global`.
+/// Register the internal classes of `node:fs` on `global`.
 pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
+    cp::CopyWalk::add_to_global(scope, global);
+    streams::CloseRequest::add_to_global(scope, global);
+    streams::FileStreamState::add_to_global(scope, global);
+    streams::StreamRequest::add_to_global(scope, global);
+    watch::AbortListener::add_to_global(scope, global);
+    watch::FSEvent::add_to_global(scope, global);
+    watch::WatchIterator::add_to_global(scope, global);
+    watch::RecursiveNext::add_to_global(scope, global);
+    watch::StatChange::add_to_global(scope, global);
+    watch::WatcherState::add_to_global(scope, global);
     classes::stats_class::register(scope)?;
     classes::dirent_class::register(scope)?;
-    cp::CopyWalk::add_to_global(scope, global);
-    promises::file_handle_class::register(scope)?;
+    promises::register_classes(scope, global)?;
     streams::read_stream_class::register(scope)?;
     streams::write_stream_class::register(scope)?;
-    watch::FSEvent::add_to_global(scope, global);
     watch::fs_watcher_class::register(scope)?;
-    watch::recursive_watcher_class::register(scope)?;
+    watch::register_recursive_watcher(scope, global)?;
     watch::stat_watcher_class::register(scope)?;
     Ok(())
 }

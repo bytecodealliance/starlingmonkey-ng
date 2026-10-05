@@ -64,6 +64,12 @@ componentize() {
     local name="$1" app="$2" entry="$3"
     shift 3
     echo "Componentizing $name..."
+    # WASI doesn't follow a symbolic link out of a preopened directory, so a linked
+    # `node_modules` is preopened at its guest path.
+    local modules="$APPS/$app/node_modules"
+    if [[ -L "$modules" ]]; then
+        set -- "$@" --init-dir "$(cd "$modules" && pwd -P)::/node_modules"
+    fi
     "$COMPONENTIZE" componentize --serve --node-compat --init-env NODE_ENV=production "$@" \
         -p "$APPS/$app" -o "$OUT/$name.wasm" "$APPS/$app/$entry"
 }

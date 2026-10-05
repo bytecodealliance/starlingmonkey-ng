@@ -2,26 +2,25 @@
 
 //! `net.BlockList` and `net.SocketAddress`.
 //!
-//! A `SocketAddress` keeps its address in a `SocketAddressHandle` and a `BlockList` its rules in a
-//! `BlockListHandle`, each under the symbol `Symbol(kHandle)`. Addresses parse and format as
-//! libuv's `uv_ip4_addr`, `uv_ip6_addr` and `uv_inet_ntop` do, and the rules match as Node.js's
-//! `SocketAddressBlockList` matches them. An IPv6 zone ID is accepted and ignored.
+//! A `SocketAddress` keeps its address and a `BlockList` its rules as their private data.
+//! Addresses parse and format as libuv's `uv_ip4_addr`, `uv_ip6_addr` and `uv_inet_ntop` do, and
+//! the rules match as Node.js's `SocketAddressBlockList` matches them. An IPv6 zone ID is accepted
+//! and ignored.
 
 use std::cmp::Ordering;
-use std::ffi::CStr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
 use js::gc::scope::Scope;
-use js::native::{CallArgs, HandleId, Value};
+use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{validate_integer, validate_plain_object, validate_string, ErrorKind};
 use crate::errors::{NodeError, Thrown};
-use crate::stream::{call_method, string, Props};
+use crate::support::array_elements;
 
 /// An address as Node.js's `SocketAddress` holds it. Two addresses are equal if their IPs, ports
 /// and flow labels are.
@@ -279,115 +278,36 @@ impl Rules {
     }
 }
 
-/// The address of a `SocketAddress`.
-#[core_runtime::jsclass(hidden)]
-pub struct SocketAddressHandle {
-    #[no_trace]
-    address: SockAddr,
-}
-
-#[core_runtime::jsmethods]
-impl SocketAddressHandle {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(illegal_constructor())
-    }
-}
-
-/// The rules of a `BlockList`.
-#[core_runtime::jsclass(hidden)]
-pub struct BlockListHandle {
-    #[no_trace]
-    rules: Rules,
-}
-
-#[core_runtime::jsmethods]
-impl BlockListHandle {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(illegal_constructor())
-    }
-}
-
-/// The error constructing a handle directly throws.
-fn illegal_constructor() -> NodeError {
-    NodeError::new(
-        ErrorKind::TypeError,
-        "ERR_ILLEGAL_CONSTRUCTOR",
-        "Illegal constructor",
-    )
-}
-
-/// The object a construction of the class `class` initializes, whose prototype is that of
-/// `new.target`, or a `TypeError` if `args` isn't a construction.
-fn instance<'s>(scope: &'s Scope<'_>, args: &CallArgs, class: &str) -> Result<Object<'s>, Thrown> {
-    if !args.is_constructing() {
-        return Err(type_error(
-            scope,
-            &format!("Class constructor {class} cannot be invoked without 'new'"),
-        ));
-    }
-    Ok(Object::new_plain_for_constructor(scope, args, 0)?)
-}
-
-/// Throw a `TypeError` with `message` and without a `code`.
-fn type_error(scope: &Scope<'_>, message: &str) -> Thrown {
-    js::error::TypeError(message.into()).throw(scope);
-    Thrown::Pending
-}
-
-/// The key of the shared object that holds the symbol [`handle_key`] returns.
-static HANDLE_KEY: u8 = 0;
-
-/// The symbol `Symbol(kHandle)`, under which instances keep their handles.
-fn handle_key<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
-    let key = &HANDLE_KEY as *const u8 as usize;
-    let holder = js::class::get_or_init_shared_object(scope, key, |scope| {
-        let holder = Object::new_plain(scope)?;
-        holder.set_property(scope, c"symbol", crate::symbol(scope, "kHandle", false)?)?;
-        Ok(holder)
-    })?;
-    let symbol = holder.get_property(scope, c"symbol")?;
-    Ok(scope.root_id(js::id::value_to_id(scope, symbol)?))
-}
-
-/// Set `object[kHandle]` to `handle`.
-fn set_handle(
-    scope: &Scope<'_>,
-    object: Object<'_>,
-    handle: HandleValue<'_>,
-) -> Result<(), ExnThrown> {
-    object.set_property_by_id(scope, handle_key(scope)?, handle)
-}
-
-/// `value[kHandle]`, if `value` is an object and that is a handle of class `T`.
-fn handle_of<'s, T: js::builtins::CastTarget<'s>>(
+/// `value` as a `SocketAddress`, if it is one.
+fn as_socket_address<'s>(
     scope: &'s Scope<'_>,
     value: HandleValue<'_>,
-) -> Result<Option<T::Output>, ExnThrown> {
-    let Ok(object) = Object::from_value(scope, *value) else {
-        return Ok(None);
-    };
-    let handle = object.get_property_by_id(scope, handle_key(scope)?)?;
-    Ok(Object::from_value(scope, *handle)
+) -> Option<SocketAddress<'s>> {
+    Object::from_value(scope, *value)
         .ok()
-        .and_then(|handle| handle.cast::<T>().ok()))
+        .and_then(|object| object.cast::<SocketAddress>().ok())
 }
 
 /// The address of `value`, if it is a `SocketAddress`.
-fn socket_address_of(
-    scope: &Scope<'_>,
-    value: HandleValue<'_>,
-) -> Result<Option<SockAddr>, ExnThrown> {
-    Ok(handle_of::<SocketAddressHandle>(scope, value)?.map(|handle| handle.data().address))
+fn socket_address_of(scope: &Scope<'_>, value: HandleValue<'_>) -> Option<SockAddr> {
+    as_socket_address(scope, value).map(|address| address.data().address)
+}
+
+/// `value` as a `BlockList`, if it is one.
+fn as_block_list<'s>(scope: &'s Scope<'_>, value: HandleValue<'_>) -> Option<BlockList<'s>> {
+    Object::from_value(scope, *value)
+        .ok()
+        .and_then(|object| object.cast::<BlockList>().ok())
 }
 
 /// The rules of `value`, if it is a `BlockList`.
-pub(crate) fn rules_of(
-    scope: &Scope<'_>,
-    value: HandleValue<'_>,
-) -> Result<Option<Rules>, ExnThrown> {
-    Ok(handle_of::<BlockListHandle>(scope, value)?.map(|handle| handle.data().rules.clone()))
+pub(crate) fn rules_of(scope: &Scope<'_>, value: HandleValue<'_>) -> Option<Rules> {
+    as_block_list(scope, value).map(|list| list.data().rules.clone())
+}
+
+/// Whether `value` is a `BlockList` that blocks `ip`.
+pub(crate) fn blocks(scope: &Scope<'_>, value: HandleValue<'_>, ip: IpAddr) -> bool {
+    as_block_list(scope, value).is_some_and(|list| list.data().rules.blocks(ip))
 }
 
 /// `ERR_INVALID_ARG_TYPE` naming `name` unless `value` is a `BlockList`, as `net.Socket` and
@@ -397,23 +317,18 @@ pub(crate) fn validate_block_list(
     value: HandleValue<'_>,
     name: &str,
 ) -> Result<(), Thrown> {
-    if handle_of::<BlockListHandle>(scope, value)?.is_none() {
+    if as_block_list(scope, value).is_none() {
         return Err(NodeError::invalid_arg_type(scope, name, "net.BlockList", value).into());
     }
     Ok(())
 }
 
-/// The `BlockList` handle of `this`, or a `TypeError` if it isn't a `BlockList`.
-fn block_list<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<BlockListHandle<'s>, Thrown> {
-    let this = this.to_jsval_throwing(scope)?;
-    handle_of::<BlockListHandle>(scope, this)?
-        .ok_or_else(|| type_error(scope, "The receiver is not a BlockList"))
-}
-
 /// The address of the `SocketAddress` `this`, or a `TypeError` if it isn't a `SocketAddress`.
 fn this_address(scope: &Scope<'_>, this: HandleValue<'_>) -> Result<SockAddr, Thrown> {
-    socket_address_of(scope, this)?
-        .ok_or_else(|| type_error(scope, "The receiver is not a SocketAddress"))
+    socket_address_of(scope, this).ok_or_else(|| {
+        js::error::TypeError("The receiver is not a SocketAddress".into()).throw(scope);
+        Thrown::Pending
+    })
 }
 
 /// Whether `family`, the `family` option of a `SocketAddress`, lowercased with its `toLowerCase`
@@ -423,7 +338,7 @@ fn family_of(scope: &Scope<'_>, family: HandleValue<'_>) -> Result<Option<bool>,
         Some(String::from_jsval_throwing(scope, family, ())?)
     } else if let Ok(object) = Object::from_value(scope, *family) {
         let method = object.get_property(scope, c"toLowerCase")?;
-        if crate::stream::is_function(scope, method) {
+        if js::function::is_callable(method) {
             let lowered = Function::call(scope, family, method, js::function::EmptyArgs)?;
             lowered
                 .is_string()
@@ -494,7 +409,7 @@ fn address_arg(
     name: &str,
     family: Option<HandleValue<'_>>,
 ) -> Result<SockAddr, Thrown> {
-    if let Some(address) = socket_address_of(scope, value)? {
+    if let Some(address) = socket_address_of(scope, value) {
         return Ok(address);
     }
     validate_string(scope, value, name)?;
@@ -516,7 +431,7 @@ fn family_or_default<'s>(
 ) -> Result<HandleValue<'s>, ExnThrown> {
     match family {
         Some(family) => Ok(scope.root_value(family.get())),
-        None => string(scope, "ipv4"),
+        None => js::class::get_or_init_atom(scope, c"ipv4"),
     }
 }
 
@@ -560,86 +475,57 @@ fn parse_cidr(scope: &Scope<'_>, cidr: HandleValue<'_>) -> Result<(String, f64, 
     Ok((address.to_string(), number, address.contains(':')))
 }
 
-/// The elements of the array `array`, read by index up to its `length`.
-fn elements<'s>(
-    scope: &'s Scope<'_>,
-    array: Object<'_>,
-) -> Result<Vec<HandleValue<'s>>, ExnThrown> {
-    let length = array.get_property(scope, c"length")?;
-    let length = f64::from_jsval_throwing(scope, length, ())? as u32;
-    (0..length)
-        .map(|index| array.get_element(scope, index))
-        .collect()
-}
-
-/// `value` as an array object, if `Array.isArray` accepts it.
-fn as_array<'s>(
-    scope: &'s Scope<'_>,
-    value: HandleValue<'_>,
-) -> Result<Option<Object<'s>>, ExnThrown> {
-    if !js::Array::is_array_value(scope, value)? {
-        return Ok(None);
-    }
-    Ok(Object::from_value(scope, *value).ok())
-}
-
-/// `addSubnet(network, prefix, family)` on `this`.
+/// `addSubnet(network, prefix, family)` on `list`.
 fn add_subnet(
     scope: &Scope<'_>,
-    this: Object<'_>,
+    list: &BlockList<'_>,
     network: HandleValue<'_>,
     prefix: HandleValue<'_>,
     family: Option<HandleValue<'_>>,
 ) -> Result<(), Thrown> {
     let network = address_arg(scope, network, "network", family)?;
     let prefix = prefix_arg(scope, network, prefix)?;
-    block_list(scope, this)?
-        .data_mut()
-        .rules
-        .subnets
-        .insert(0, (network, prefix));
+    list.data_mut().rules.subnets.insert(0, (network, prefix));
     Ok(())
 }
 
-/// `removeSubnet(network, prefix, family)` on `this`.
+/// `removeSubnet(network, prefix, family)` on `list`.
 fn remove_subnet(
     scope: &Scope<'_>,
-    this: Object<'_>,
+    list: &BlockList<'_>,
     network: HandleValue<'_>,
     prefix: HandleValue<'_>,
     family: Option<HandleValue<'_>>,
 ) -> Result<(), Thrown> {
     let network = address_arg(scope, network, "network", family)?;
     let prefix = prefix_arg(scope, network, prefix)?;
-    block_list(scope, this)?
-        .data_mut()
-        .rules
-        .remove_subnet(network, prefix);
+    list.data_mut().rules.remove_subnet(network, prefix);
     Ok(())
 }
 
-/// `addSubnet` for the address, prefix length and family `parse_cidr` gives.
+/// `addSubnet` for the address, prefix length and family `parse_cidr` gives, or `removeSubnet`
+/// if `remove`.
 fn add_cidr(
     scope: &Scope<'_>,
-    this: Object<'_>,
+    list: &BlockList<'_>,
     (address, prefix, ipv6): (String, f64, bool),
     remove: bool,
 ) -> Result<(), Thrown> {
-    let network = string(scope, &address)?;
+    let network = address.as_str().to_jsval_throwing(scope)?;
     let prefix = scope.root_value(js::value::from_f64(prefix));
-    let family = string(scope, if ipv6 { "ipv6" } else { "ipv4" })?;
+    let family = js::class::get_or_init_atom(scope, if ipv6 { c"ipv6" } else { c"ipv4" })?;
     if remove {
-        remove_subnet(scope, this, network, prefix, Some(family))
+        remove_subnet(scope, list, network, prefix, Some(family))
     } else {
-        add_subnet(scope, this, network, prefix, Some(family))
+        add_subnet(scope, list, network, prefix, Some(family))
     }
 }
 
-/// `addRange(start, end, family)` on `this`, with the `SocketAddress`es or strings `start` and
+/// `addRange(start, end, family)` on `list`, with the `SocketAddress`es or strings `start` and
 /// `end`.
 fn add_range(
     scope: &Scope<'_>,
-    this: Object<'_>,
+    list: &BlockList<'_>,
     start: HandleValue<'_>,
     end: HandleValue<'_>,
     family: Option<HandleValue<'_>>,
@@ -647,16 +533,15 @@ fn add_range(
     let start_address = address_arg(scope, start, "start", family)?;
     let end_address = address_arg(scope, end, "end", family)?;
     if compare(start_address.ip, end_address.ip) == Some(Ordering::Greater) {
-        let start = match socket_address_of(scope, start)? {
-            Some(_) => scope.root_value(start.get()),
-            None => new_socket_address(scope, start_address)?,
+        let start = match socket_address_of(scope, start) {
+            Some(_) => start,
+            None => new_socket_address(scope, start_address)?.to_jsval_throwing(scope)?,
         };
         return Err(
             NodeError::invalid_arg_value(scope, "start", start, "must come before end").into(),
         );
     }
-    block_list(scope, this)?
-        .data_mut()
+    list.data_mut()
         .rules
         .ranges
         .insert(0, (start_address, end_address));
@@ -667,36 +552,18 @@ fn add_range(
 fn new_socket_address<'s>(
     scope: &'s Scope<'_>,
     address: SockAddr,
-) -> Result<HandleValue<'s>, ExnThrown> {
-    let class = socket_address_class::class_constructor(scope)?;
-    let proto = Object::from_value(scope, *class.get_property(scope, c"prototype")?)
-        .map_err(|e| e.throw(scope))?;
-    let object = Object::new_plain(scope)?;
-    object.set_prototype(scope, proto.handle())?;
-    attach_address(scope, object, address)?;
-    object.to_jsval_throwing(scope)
+) -> Result<SocketAddress<'s>, ExnThrown> {
+    js::class::create_instance_with::<SocketAddressImpl>(scope, |_| SocketAddressImpl { address })
 }
 
-/// Make `address` the address of the `SocketAddress` `object`.
-fn attach_address(
-    scope: &Scope<'_>,
-    object: Object<'_>,
-    address: SockAddr,
-) -> Result<(), ExnThrown> {
-    let handle = js::class::create_instance_with::<SocketAddressHandleImpl>(scope, |_| {
-        SocketAddressHandleImpl { address }
-    })?;
-    set_handle(scope, object, handle.to_jsval_throwing(scope)?)
-}
-
-/// The rules of `this` as an array of strings.
-fn rules_array<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<HandleValue<'s>, Thrown> {
-    let rules = block_list(scope, this)?.data().rules.describe();
+/// The rules of `list` as an array of strings.
+fn rules_array<'s>(scope: &'s Scope<'_>, list: &BlockList<'_>) -> Result<js::Array<'s>, ExnThrown> {
+    let rules = list.data().rules.describe();
     let values = rules
         .iter()
-        .map(|rule| string(scope, rule))
+        .map(|rule| rule.as_str().to_jsval_throwing(scope))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(js::Array::with_contents(scope, &values)?.to_jsval_throwing(scope)?)
+    js::Array::with_contents(scope, &values)
 }
 
 /// A rule string `fromJSON` adds: a subnet, an address or a range, each in the family `ipv6`
@@ -856,19 +723,16 @@ fn json_items(scope: &Scope<'_>, data: HandleValue<'_>) -> Result<Vec<String>, T
             value,
         ))
     };
-    let parsed;
     let array = if data.is_string() {
-        let json = scope.global().obj(scope, c"JSON")?.ok_or(ExnThrown)?;
-        parsed = call_method(scope, json, c"parse", &[data])?;
-        as_array(scope, parsed)?.ok_or_else(|| invalid(parsed))?
+        let text = js::JSString::from_value(scope, data)?;
+        js::json::parse_js_string(scope, text.handle())?
     } else {
-        as_array(scope, data)?.ok_or_else(|| invalid(data))?
+        data
     };
-    let items = elements(scope, array)?;
+    let items = array_elements(scope, array)?.ok_or_else(|| invalid(array))?;
     let mut strings = Vec::with_capacity(items.len());
     for item in items {
         if !item.is_string() {
-            let array = array.to_jsval_throwing(scope)?;
             return Err(invalid(array));
         }
         strings.push(String::from_jsval_throwing(scope, item, ())?);
@@ -876,7 +740,7 @@ fn json_items(scope: &Scope<'_>, data: HandleValue<'_>) -> Result<Vec<String>, T
     Ok(strings)
 }
 
-/// The body of a custom `util.inspect` method: `this` itself at a negative depth, and otherwise
+/// The body of a custom `util.inspect` method: `[name]` at a negative depth, and otherwise
 /// `name` followed by `util.inspect` of what `shown` gives, one level deeper.
 fn inspect_as<'s>(
     scope: &'s Scope<'_>,
@@ -887,44 +751,29 @@ fn inspect_as<'s>(
     let this = scope.root_value(args.this());
     let depth = args.get(0);
     if depth.is_number() && depth.to_number() < 0.0 {
-        return Ok(this.get());
+        // Node.js returns the object, which it shows as `[name]` because of its own symbol key.
+        return format!("[{name}]").as_str().to_jsval_raw_throwing(scope);
     }
-    let options = scope.root_value(args.get(1).get());
-    let nested = Object::new_plain(scope)?;
-    let depth = match Object::from_value(scope, *options) {
-        Ok(object) => {
-            let assign = scope.global().obj(scope, c"Object")?.ok_or(ExnThrown)?;
-            call_method(
-                scope,
-                assign,
-                c"assign",
-                &[nested.to_jsval_throwing(scope)?, options],
-            )?;
-            object.get_property(scope, c"depth")?
+    let mut options = crate::inspect::InspectOptions::current(scope)?;
+    let depth = match Object::from_value(scope, args.get(1)) {
+        Ok(given) => {
+            options = options.read(scope, given)?;
+            given.get_property(scope, c"depth")?
         }
         Err(_) => HandleValue::undefined(),
     };
-    if depth.is_null() || depth.is_undefined() {
-        nested.set_property(scope, c"depth", js::value::null())?;
+    let depth = if depth.is_null() || depth.is_undefined() {
+        HandleValue::null()
     } else {
-        nested.set_property(
-            scope,
-            c"depth",
-            f64::from_jsval_throwing(scope, depth, ())? - 1.0,
-        )?;
-    }
+        let depth = f64::from_jsval_throwing(scope, depth, ())? - 1.0;
+        scope.root_value(js::value::from_f64(depth))
+    };
+    options.set(scope, c"depth", depth)?;
     let value = shown(scope, this).map_err(|error| error.throw(scope))?;
-    let value = value.to_jsval_throwing(scope)?;
-    let util = core_runtime::module::builtin_namespace(scope, "node:util")?.ok_or(ExnThrown)?;
-    let inspect = util.get_property(scope, c"inspect")?;
-    let text = Function::call(
-        scope,
-        HandleValue::undefined(),
-        inspect,
-        &[value, nested.to_jsval_throwing(scope)?],
-    )?;
-    let text = String::from_jsval_throwing(scope, text, ())?;
-    Ok(string(scope, &format!("{name} {text}"))?.get())
+    let text = crate::inspect::inspect(scope, value.to_jsval_throwing(scope)?, options)?;
+    format!("{name} {text}")
+        .as_str()
+        .to_jsval_raw_throwing(scope)
 }
 
 /// `BlockList.prototype[util.inspect.custom]`.
@@ -934,9 +783,12 @@ fn inspect_block_list(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     inspect_as(scope, &args, "BlockList", |scope, this| {
-        let this = Object::from_value(scope, *this).map_err(|e| Thrown::from(e.throw(scope)))?;
+        let list = as_block_list(scope, this).ok_or_else(|| {
+            js::error::TypeError("The receiver is not a BlockList".into()).throw(scope);
+            Thrown::Pending
+        })?;
         let shown = Object::new_plain(scope)?;
-        shown.set_property(scope, c"rules", rules_array(scope, this)?)?;
+        shown.set_property(scope, c"rules", *rules_array(scope, &list)?)?;
         Ok(shown)
     })
 }
@@ -966,91 +818,16 @@ fn socket_address_json<'s>(
     Ok(json)
 }
 
-/// Define the accessor `name` on `proto`, whose getter, named `get <name>`, runs `getter`.
-fn define_getter(
-    scope: &Scope<'_>,
-    proto: Object<'_>,
-    name: &CStr,
-    getter: js::function::Callback,
-) -> Result<(), ExnThrown> {
-    let function_name = std::ffi::CString::new(format!("get {}", name.to_string_lossy()))
-        .expect("property names have no NULs");
-    let function = Function::new_callback(scope, &function_name, 0, getter, ())?;
-    proto.define_accessor_by_name(scope, name, Some(*function), None, 0)
-}
-
 /// Define `object[util.inspect.custom]` as `body`.
 fn define_inspect(
     scope: &Scope<'_>,
     object: Object<'_>,
     body: js::function::Callback,
 ) -> Result<(), ExnThrown> {
-    let symbol = crate::symbol(scope, crate::inspect::INSPECT_CUSTOM, true)?;
+    let symbol = crate::inspect::INSPECT_CUSTOM.value(scope)?;
     let function = Function::new_callback(scope, c"[nodejs.util.inspect.custom]", 2, body, ())?;
     let key = scope.root_id(js::id::value_to_id(scope, symbol)?);
     object.set_property_by_id(scope, key, (*function).to_jsval_throwing(scope)?)
-}
-
-/// The getter of `SocketAddress.prototype[$name]`, which returns what `$value` gives for the
-/// address.
-macro_rules! address_getter {
-    ($fn_name:ident, |$scope:ident, $address:ident| $value:expr) => {
-        fn $fn_name(
-            $scope: &Scope<'_>,
-            args: CallbackArgs<'_>,
-            _payload: HandleValue,
-        ) -> Result<Value, ExnThrown> {
-            let this = $scope.root_value(args.this());
-            let $address = this_address($scope, this).map_err(|error| error.throw($scope))?;
-            $value
-        }
-    };
-}
-
-address_getter!(get_address, |scope, address| Ok(string(
-    scope,
-    &address.address()
-)?
-.get()));
-address_getter!(get_port, |_scope, address| Ok(js::value::from_f64(
-    f64::from(address.port)
-)));
-address_getter!(get_family, |scope, address| Ok(string(
-    scope,
-    address.family()
-)?
-.get()));
-address_getter!(get_flowlabel, |_scope, address| Ok(js::value::from_f64(
-    f64::from(address.flowlabel)
-)));
-
-/// `BlockList.prototype.rules`.
-fn get_rules(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let this =
-        Object::from_value(scope, scope.root_value(args.this())).map_err(|e| e.throw(scope))?;
-    Ok(rules_array(scope, this)
-        .map_err(|error| error.throw(scope))?
-        .get())
-}
-
-/// `BlockList.prototype.size`.
-fn get_size(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let this =
-        Object::from_value(scope, scope.root_value(args.this())).map_err(|e| e.throw(scope))?;
-    let size = block_list(scope, this)
-        .map_err(|error| error.throw(scope))?
-        .data()
-        .rules
-        .size();
-    Ok(js::value::from_f64(size as f64))
 }
 
 /// The CIDR ranges of the private, loopback, link-local and unique local addresses.
@@ -1065,27 +842,32 @@ const PRIVATE_RANGES: [&str; 8] = [
     "fc00::/7",
 ];
 
-#[core_runtime::jsfunction_class(name = "SocketAddress", class_syntax)]
-pub mod socket_address_class {
-    use super::*;
+/// `value`, or `undefined` for a missing argument.
+fn arg<'a>(value: Option<HandleValue<'a>>) -> HandleValue<'a> {
+    value.unwrap_or(HandleValue::undefined())
+}
 
+/// <https://nodejs.org/api/net.html#class-netsocketaddress>
+#[core_runtime::jsclass(hidden)]
+pub struct SocketAddress {
+    #[no_trace]
+    address: SockAddr,
+}
+
+#[core_runtime::jsmethods]
+impl SocketAddress {
     /// <https://nodejs.org/api/net.html#new-netsocketaddressoptions>: the address
     /// `options.address` (default `127.0.0.1`, or `::` if `options.family` isn't `ipv4`) of the
     /// family `options.family` (default `ipv4`), with `options.port` and `options.flowlabel`.
     #[constructor]
-    pub fn create<'s>(
-        scope: &'s Scope<'_>,
-        args: &CallArgs,
-        options: Option<HandleValue<'_>>,
-    ) -> Result<Object<'s>, Thrown> {
-        let this = instance(scope, args, "SocketAddress")?;
-        let options = match options {
+    fn new(&self, scope: &Scope<'_>, options: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+        let options = match options.filter(|options| !options.is_undefined()) {
             Some(options) => validate_plain_object(scope, options, "options", false)?,
             None => Object::new_plain(scope)?,
         };
         let family = options.get_property(scope, c"family")?;
         let family = if family.is_undefined() {
-            string(scope, "ipv4")?
+            js::class::get_or_init_atom(scope, c"ipv4")?
         } else {
             family
         };
@@ -1093,9 +875,9 @@ pub mod socket_address_class {
         let address = if !address.is_undefined() {
             address
         } else if family.is_string() && String::from_jsval_throwing(scope, family, ())? == "ipv4" {
-            string(scope, "127.0.0.1")?
+            js::class::get_or_init_atom(scope, c"127.0.0.1")?
         } else {
-            string(scope, "::")?
+            js::class::get_or_init_atom(scope, c"::")?
         };
         let zero = scope.root_value(js::value::from_f64(0.0));
         let port = options.get_property(scope, c"port")?;
@@ -1116,34 +898,52 @@ pub mod socket_address_class {
             )
             .into());
         };
-        let address = make_address(scope, ipv6, address, port, flowlabel)?;
-        attach_address(scope, this, address)?;
-        Ok(this)
+        self.data_mut().address = make_address(scope, ipv6, address, port, flowlabel)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn address(&self) -> String {
+        self.data().address.address()
+    }
+
+    #[getter]
+    fn port(&self) -> f64 {
+        f64::from(self.data().address.port)
+    }
+
+    #[getter]
+    fn family(&self) -> &'static str {
+        self.data().address.family()
+    }
+
+    #[getter]
+    fn flowlabel(&self) -> f64 {
+        f64::from(self.data().address.flowlabel)
     }
 
     /// <https://nodejs.org/api/net.html#socketaddresstojson>
+    #[allow(clippy::wrong_self_convention)]
     #[method(name = "toJSON")]
-    pub fn to_json<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<Object<'s>, Thrown> {
-        let this = this.to_jsval_throwing(scope)?;
-        let address = this_address(scope, this)?;
-        Ok(socket_address_json(scope, address)?)
+    fn to_json<'r>(&self, scope: &'r Scope<'_>) -> Result<Object<'r>, ExnThrown> {
+        socket_address_json(scope, self.data().address)
     }
 
     /// Whether `value` is a `SocketAddress`.
-    #[static_method]
-    pub fn is_socket_address(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
-        Ok(socket_address_of(scope, value)?.is_some())
+    #[static_method(length = 1)]
+    fn is_socket_address(scope: &Scope<'_>, value: Option<HandleValue<'_>>) -> bool {
+        socket_address_of(scope, arg(value)).is_some()
     }
 
     /// <https://nodejs.org/api/net.html#socketaddressparseinput>: the address and port of the
     /// host of the URL `http://<input>`, or `undefined` if that isn't a valid URL with an IP
     /// address. The port of a URL that names port 80 is 0.
-    #[static_method]
-    pub fn parse<'s>(
+    #[static_method(length = 1)]
+    fn parse<'s>(
         scope: &'s Scope<'_>,
-        input: HandleValue<'_>,
+        input: Option<HandleValue<'_>>,
     ) -> Result<HandleValue<'s>, Thrown> {
-        let input = validate_string(scope, input, "input")?;
+        let input = validate_string(scope, arg(input), "input")?;
         let Ok(url) = url::Url::parse(&format!("http://{input}")) else {
             return Ok(HandleValue::undefined());
         };
@@ -1162,76 +962,78 @@ pub mod socket_address_class {
             parse_ipv4(host).map(IpAddr::V4)
         };
         match ip {
-            Some(ip) => Ok(new_socket_address(
-                scope,
-                SockAddr {
+            Some(ip) => {
+                let address = SockAddr {
                     ip,
                     port,
                     flowlabel: 0,
-                },
-            )?),
+                };
+                Ok(new_socket_address(scope, address)?.to_jsval_throwing(scope)?)
+            }
             None => Ok(HandleValue::undefined()),
         }
     }
-
-    /// Define the address accessors and the inspection method.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        define_getter(scope, proto, c"address", get_address)?;
-        define_getter(scope, proto, c"port", get_port)?;
-        define_getter(scope, proto, c"family", get_family)?;
-        define_getter(scope, proto, c"flowlabel", get_flowlabel)?;
-        define_inspect(scope, proto, inspect_socket_address)
-    }
 }
 
-#[core_runtime::jsfunction_class(name = "BlockList", class_syntax)]
-pub mod block_list_class {
-    use super::*;
+/// <https://nodejs.org/api/net.html#class-netblocklist>
+#[core_runtime::jsclass(hidden)]
+pub struct BlockList {
+    #[no_trace]
+    rules: Rules,
+}
 
+#[core_runtime::jsmethods]
+impl BlockList {
     /// <https://nodejs.org/api/net.html#class-netblocklist>: a list without rules.
     #[constructor]
-    pub fn create<'s>(scope: &'s Scope<'_>, args: &CallArgs) -> Result<Object<'s>, Thrown> {
-        let this = instance(scope, args, "BlockList")?;
-        let handle = js::class::create_instance_with::<BlockListHandleImpl>(scope, |_| {
-            BlockListHandleImpl {
-                rules: Rules::default(),
-            }
-        })?;
-        set_handle(scope, this, handle.to_jsval_throwing(scope)?)?;
-        Ok(this)
+    fn construct() -> Self {
+        Self {
+            rules: Rules::default(),
+        }
     }
 
     /// Whether `value` is a `BlockList`.
-    #[static_method]
-    pub fn is_block_list(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
-        Ok(handle_of::<BlockListHandle>(scope, value)?.is_some())
+    #[static_method(length = 1)]
+    fn is_block_list(scope: &Scope<'_>, value: Option<HandleValue<'_>>) -> bool {
+        as_block_list(scope, arg(value)).is_some()
+    }
+
+    /// <https://nodejs.org/api/net.html#blocklistrules>
+    #[getter]
+    fn rules<'r>(&self, scope: &'r Scope<'_>) -> Result<js::Array<'r>, ExnThrown> {
+        rules_array(scope, self)
+    }
+
+    /// The number of rules.
+    #[getter]
+    fn size(&self) -> f64 {
+        self.data().rules.size() as f64
     }
 
     /// <https://nodejs.org/api/net.html#blocklistaddaddressaddress-family>
-    pub fn add_address(
+    #[method(length = 1)]
+    fn add_address(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
-        address: HandleValue<'_>,
+        address: Option<HandleValue<'_>>,
         family: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let address = address_arg(scope, address, "address", family)?;
-        block_list(scope, this)?
-            .data_mut()
-            .rules
-            .add_address(address);
+        let address = address_arg(scope, arg(address), "address", family)?;
+        self.data_mut().rules.add_address(address);
         Ok(())
     }
 
     /// Block each of `addresses`, `SocketAddress`es or strings in the family `family`, once all
     /// of them are valid.
-    pub fn add_addresses(
+    #[method(length = 1)]
+    fn add_addresses(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
-        addresses: HandleValue<'_>,
+        addresses: Option<HandleValue<'_>>,
         family: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let Some(array) = as_array(scope, addresses)? else {
+        let addresses = arg(addresses);
+        let Some(items) = array_elements(scope, addresses)? else {
             return Err(NodeError::invalid_arg_type(
                 scope,
                 "addresses",
@@ -1243,139 +1045,128 @@ pub mod block_list_class {
         let family = family_or_default(scope, family)?;
         validate_string(scope, family, "family")?;
         let mut parsed = Vec::new();
-        for (index, address) in elements(scope, array)?.into_iter().enumerate() {
+        for (index, address) in items.into_iter().enumerate() {
             let name = format!("addresses[{index}]");
             parsed.push(address_arg(scope, address, &name, Some(family))?);
         }
-        let handle = block_list(scope, this)?;
-        let mut state = handle.data_mut();
+        let mut data = self.data_mut();
         for address in parsed {
-            state.rules.add_address(address);
+            data.rules.add_address(address);
         }
         Ok(())
     }
 
     /// <https://nodejs.org/api/net.html#blocklistaddrangestart-end-family>
-    pub fn add_range(
+    #[method(length = 2)]
+    fn add_range(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
-        start: HandleValue<'_>,
-        end: HandleValue<'_>,
+        start: Option<HandleValue<'_>>,
+        end: Option<HandleValue<'_>>,
         family: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        super::add_range(scope, this, start, end, family)
+        add_range(scope, self, arg(start), arg(end), family)
     }
 
     /// <https://nodejs.org/api/net.html#blocklistaddsubnetnet-prefix-family>
-    pub fn add_subnet(
+    #[method(length = 2)]
+    fn add_subnet(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
-        network: HandleValue<'_>,
-        prefix: HandleValue<'_>,
+        network: Option<HandleValue<'_>>,
+        prefix: Option<HandleValue<'_>>,
         family: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        super::add_subnet(scope, this, network, prefix, family)
+        add_subnet(scope, self, arg(network), arg(prefix), family)
     }
 
     /// Block the subnet `cidr`, such as `10.0.0.0/8`, which is IPv6 if it contains a `:`.
-    #[method(name = "addCIDR")]
-    pub fn add_cidr(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        cidr: HandleValue<'_>,
-    ) -> Result<(), Thrown> {
-        let cidr = parse_cidr(scope, cidr)?;
-        super::add_cidr(scope, this, cidr, false)
+    #[method(name = "addCIDR", length = 1)]
+    fn add_cidr(&self, scope: &Scope<'_>, cidr: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+        let cidr = parse_cidr(scope, arg(cidr))?;
+        add_cidr(scope, self, cidr, false)
     }
 
     /// `addCIDR` for each of `cidrs`, once all of them are CIDR strings.
-    #[method(name = "addCIDRs")]
-    pub fn add_cidrs(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        cidrs: HandleValue<'_>,
-    ) -> Result<(), Thrown> {
-        let Some(array) = as_array(scope, cidrs)? else {
+    #[method(name = "addCIDRs", length = 1)]
+    fn add_cidrs(&self, scope: &Scope<'_>, cidrs: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+        let cidrs = arg(cidrs);
+        let Some(items) = array_elements(scope, cidrs)? else {
             return Err(
                 NodeError::invalid_arg_type(scope, "cidrs", "an instance of Array", cidrs).into(),
             );
         };
         let mut parsed = Vec::new();
-        for (index, cidr) in elements(scope, array)?.into_iter().enumerate() {
+        for (index, cidr) in items.into_iter().enumerate() {
             validate_string(scope, cidr, &format!("cidrs[{index}]"))?;
             parsed.push(parse_cidr(scope, cidr)?);
         }
         for cidr in parsed {
-            super::add_cidr(scope, this, cidr, false)?;
+            add_cidr(scope, self, cidr, false)?;
         }
         Ok(())
     }
 
     /// Remove the rule blocking `address`, and the one blocking its IPv4 or IPv4-mapped IPv6
     /// counterpart.
-    pub fn remove_address(
+    #[method(length = 1)]
+    fn remove_address(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
-        address: HandleValue<'_>,
+        address: Option<HandleValue<'_>>,
         family: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let address = address_arg(scope, address, "address", family)?;
-        block_list(scope, this)?
-            .data_mut()
-            .rules
-            .remove_address(address);
+        let address = address_arg(scope, arg(address), "address", family)?;
+        self.data_mut().rules.remove_address(address);
         Ok(())
     }
 
     /// Remove the latest range rule from `start` to `end`, whose addresses, ports and flow labels
     /// are equal to these.
-    pub fn remove_range(
+    #[method(length = 2)]
+    fn remove_range(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
-        start: HandleValue<'_>,
-        end: HandleValue<'_>,
+        start: Option<HandleValue<'_>>,
+        end: Option<HandleValue<'_>>,
         family: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let start = address_arg(scope, start, "start", family)?;
-        let end = address_arg(scope, end, "end", family)?;
-        block_list(scope, this)?
-            .data_mut()
-            .rules
-            .remove_range(start, end);
+        let start = address_arg(scope, arg(start), "start", family)?;
+        let end = address_arg(scope, arg(end), "end", family)?;
+        self.data_mut().rules.remove_range(start, end);
         Ok(())
     }
 
     /// Remove the latest subnet rule of `network` and `prefix`.
-    pub fn remove_subnet(
+    #[method(length = 2)]
+    fn remove_subnet(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
-        network: HandleValue<'_>,
-        prefix: HandleValue<'_>,
+        network: Option<HandleValue<'_>>,
+        prefix: Option<HandleValue<'_>>,
         family: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        super::remove_subnet(scope, this, network, prefix, family)
+        remove_subnet(scope, self, arg(network), arg(prefix), family)
     }
 
     /// `removeSubnet` for the subnet `cidr`.
-    #[method(name = "removeCIDR")]
-    pub fn remove_cidr(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        cidr: HandleValue<'_>,
-    ) -> Result<(), Thrown> {
-        let cidr = parse_cidr(scope, cidr)?;
-        super::add_cidr(scope, this, cidr, true)
+    #[method(name = "removeCIDR", length = 1)]
+    fn remove_cidr(&self, scope: &Scope<'_>, cidr: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+        let cidr = parse_cidr(scope, arg(cidr))?;
+        add_cidr(scope, self, cidr, true)
     }
 
     /// <https://nodejs.org/api/net.html#blocklistcheckaddress-family>: a string address is IPv4
     /// if `family` is `ipv4` in any case, and IPv6 otherwise. An invalid one isn't blocked.
-    pub fn check(
+    #[method(length = 1)]
+    fn check(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
-        address: HandleValue<'_>,
+        address: Option<HandleValue<'_>>,
         family: Option<HandleValue<'_>>,
     ) -> Result<bool, Thrown> {
-        let ip = match socket_address_of(scope, address)? {
+        let address = arg(address);
+        let ip = match socket_address_of(scope, address) {
             Some(address) => Some(address.ip),
             None => {
                 let text = validate_string(scope, address, "address")?;
@@ -1387,75 +1178,72 @@ pub mod block_list_class {
                 }
             }
         };
-        Ok(match ip {
-            Some(ip) => block_list(scope, this)?.data().rules.blocks(ip),
-            None => false,
-        })
+        Ok(ip.is_some_and(|ip| self.data().rules.blocks(ip)))
     }
 
     /// Remove every rule.
-    pub fn clear(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
-        block_list(scope, this)?.data_mut().rules = Rules::default();
-        Ok(())
+    #[method]
+    fn clear(&self) {
+        self.data_mut().rules = Rules::default();
     }
 
     /// The rules, as `rules` shows them.
+    #[allow(clippy::wrong_self_convention)]
     #[method(name = "toJSON")]
-    pub fn to_json<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<HandleValue<'s>, Thrown> {
-        rules_array(scope, this)
+    fn to_json<'r>(&self, scope: &'r Scope<'_>) -> Result<js::Array<'r>, ExnThrown> {
+        rules_array(scope, self)
     }
 
     /// Add the rules described by `data`, an array of the strings `rules` produces or that array
     /// as JSON. Strings that describe no rule are skipped.
-    #[method(name = "fromJSON")]
-    pub fn from_json(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        data: HandleValue<'_>,
-    ) -> Result<(), Thrown> {
-        for item in json_items(scope, data)? {
+    #[allow(clippy::wrong_self_convention)]
+    #[method(name = "fromJSON", length = 1)]
+    fn from_json(&self, scope: &Scope<'_>, data: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+        for item in json_items(scope, arg(data))? {
+            let ipv6 = |ipv6: bool| {
+                ipv6.then(|| js::class::get_or_init_atom(scope, c"ipv6"))
+                    .transpose()
+            };
             match json_rule(&item) {
-                Some(JsonRule::Subnet(network, prefix, ipv6)) => {
-                    let network = string(scope, &network)?;
+                Some(JsonRule::Subnet(network, prefix, is_ipv6)) => {
+                    let network = network.as_str().to_jsval_throwing(scope)?;
                     let prefix = scope.root_value(js::value::from_f64(prefix));
-                    let family = ipv6.then(|| string(scope, "ipv6")).transpose()?;
-                    super::add_subnet(scope, this, network, prefix, family)?;
+                    add_subnet(scope, self, network, prefix, ipv6(is_ipv6)?)?;
                 }
-                Some(JsonRule::Address(address, ipv6)) => {
-                    let address = string(scope, &address)?;
-                    let family = ipv6.then(|| string(scope, "ipv6")).transpose()?;
-                    let address = address_arg(scope, address, "address", family)?;
-                    block_list(scope, this)?
-                        .data_mut()
-                        .rules
-                        .add_address(address);
+                Some(JsonRule::Address(address, is_ipv6)) => {
+                    let address = address.as_str().to_jsval_throwing(scope)?;
+                    let address = address_arg(scope, address, "address", ipv6(is_ipv6)?)?;
+                    self.data_mut().rules.add_address(address);
                 }
-                Some(JsonRule::Range(start, end, ipv6)) => {
-                    let start = string(scope, &start)?;
-                    let end = string(scope, &end)?;
-                    let family = ipv6.then(|| string(scope, "ipv6")).transpose()?;
-                    super::add_range(scope, this, start, end, family)?;
+                Some(JsonRule::Range(start, end, is_ipv6)) => {
+                    let start = start.as_str().to_jsval_throwing(scope)?;
+                    let end = end.as_str().to_jsval_throwing(scope)?;
+                    add_range(scope, self, start, end, ipv6(is_ipv6)?)?;
                 }
                 None => {}
             }
         }
         Ok(())
     }
+}
 
-    /// Define `rules`, `size`, `PRIVATE_RANGES` and the inspection method.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        define_getter(scope, proto, c"rules", get_rules)?;
-        define_getter(scope, proto, c"size", get_size)?;
-        define_inspect(scope, proto, inspect_block_list)?;
-        let ranges = js::Array::with_contents(scope, &PRIVATE_RANGES)?;
-        ranges.freeze(scope)?;
-        ctor.define_property(
-            scope,
-            c"PRIVATE_RANGES",
-            *ranges,
-            js::class_spec::JSPROP_ENUMERATE as u32,
-        )?;
-        Ok(())
-    }
+/// Register `BlockList` and `SocketAddress` on `global`, with their inspection methods and
+/// `BlockList.PRIVATE_RANGES`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
+    BlockList::add_to_global(scope, global);
+    SocketAddress::add_to_global(scope, global);
+    let proto = js::class::get_prototype_object_for::<BlockListImpl>(scope)
+        .expect("registering the class creates its prototype");
+    define_inspect(scope, proto, inspect_block_list)?;
+    let ranges = js::Array::with_contents(scope, &PRIVATE_RANGES)?;
+    ranges.freeze(scope)?;
+    BlockList::class_constructor(scope)?.define_property(
+        scope,
+        c"PRIVATE_RANGES",
+        *ranges,
+        js::class_spec::JSPROP_ENUMERATE as u32,
+    )?;
+    let proto = js::class::get_prototype_object_for::<SocketAddressImpl>(scope)
+        .expect("registering the class creates its prototype");
+    define_inspect(scope, proto, inspect_socket_address)
 }

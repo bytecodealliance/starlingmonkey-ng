@@ -145,7 +145,7 @@ fn internal_binding(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let name = String::from_jsval(scope, args.get(0), ()).unwrap_or_default();
+    let name = String::from_jsval_throwing(scope, args.get(0), ())?;
     if !BINDINGS.contains(&name.as_str()) {
         let error = NodeError::new(
             ErrorKind::Error,
@@ -225,8 +225,9 @@ fn buffer_fill(
         }
     };
     let buffer = Object::from_value(scope, arg(0)).map_err(|e| e.throw(scope))?;
-    let length = buffer.get_property(scope, c"length")?.to_number();
-    let (start, end) = (arg(2).to_number(), arg(3).to_number());
+    let length = f64::from_jsval_throwing(scope, buffer.get_property(scope, c"length")?, ())?;
+    let start = f64::from_jsval_throwing(scope, arg(2), ())?;
+    let end = f64::from_jsval_throwing(scope, arg(3), ())?;
     if !(start >= 0.0 && start <= end && end <= length) {
         let error = NodeError::new(
             ErrorKind::RangeError,
@@ -240,12 +241,15 @@ fn buffer_fill(
     } else {
         HandleValue::undefined()
     };
-    Function::call_by_name(
+    crate::buffer::buffer::fill(
         scope,
-        buffer.handle(),
-        c"fill",
-        &[arg(1), arg(2), arg(3), encoding],
-    )?;
+        buffer,
+        arg(1),
+        Some(arg(2)),
+        Some(arg(3)),
+        Some(encoding),
+    )
+    .map_err(|error| error.throw(scope))?;
     Ok(js::value::undefined())
 }
 
@@ -267,7 +271,7 @@ fn add_constants(scope: &Scope<'_>, binding: Object<'_>) -> Result<(), ExnThrown
 /// Add the members of the `uv` binding to `binding`: a `UV_` constant for each libuv error code,
 /// and `errname`.
 fn add_uv(scope: &Scope<'_>, binding: Object<'_>) -> Result<(), ExnThrown> {
-    for (name, code) in uv_errors(scope)? {
+    for (name, code) in uv_errors() {
         let key = std::ffi::CString::new(format!("UV_{name}")).map_err(|_| ExnThrown)?;
         binding.set_property_by_name(scope, &key, code)?;
     }
@@ -275,37 +279,35 @@ fn add_uv(scope: &Scope<'_>, binding: Object<'_>) -> Result<(), ExnThrown> {
     binding.set_property(scope, c"errname", *errname)
 }
 
-/// The libuv error codes and their numbers: the negated `os.constants.errno` values, and
-/// [`UV_ERRORS`].
-fn uv_errors(scope: &Scope<'_>) -> Result<Vec<(String, i32)>, ExnThrown> {
-    let constants = crate::os::constants(scope)?;
-    let errno = constants.get_property(scope, c"errno")?;
-    let errno = Object::from_value(scope, errno).map_err(|e| e.throw(scope))?;
-    let mut errors = Vec::new();
-    for key in errno.own_keys(scope)? {
-        let id = scope.root_id(js::id::value_to_id(scope, key)?);
-        let value = errno.get_property_by_id(scope, id)?;
-        let name = String::from_jsval(scope, key, ()).map_err(|e| e.throw(scope))?;
-        errors.push((name, -value.to_int32()));
-    }
-    errors.extend(
-        UV_ERRORS
-            .iter()
-            .map(|&(name, code)| (name.to_string(), code)),
-    );
-    Ok(errors)
+/// The libuv error codes and their numbers: the negated `errno` values of
+/// [`crate::os::errno_table`], and [`UV_ERRORS`].
+fn uv_errors() -> impl Iterator<Item = (&'static str, i32)> {
+    crate::os::errno_table()
+        .iter()
+        .map(|(name, errno)| (name.to_str().unwrap_or_default(), -errno))
+        .chain(UV_ERRORS.iter().copied())
 }
 
-/// `uv.errname(code)`: the name of libuv error code `code`, or `Unknown system error <code>`.
+/// `uv.errname(code)`: the name of libuv error code `code`, converted to an int32, or `Unknown
+/// system error <code>`. Node.js aborts the process for a code that isn't negative, and this
+/// throws `ERR_OUT_OF_RANGE` instead.
 fn uv_errname(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let code = args.get(0).to_number();
-    let name = uv_errors(scope)?
-        .into_iter()
-        .find(|&(_, value)| f64::from(value) == code)
-        .map_or_else(|| format!("Unknown system error {code}"), |(name, _)| name);
+    let code = i32::from_jsval_throwing(
+        scope,
+        args.get(0),
+        js::conversion::ConversionBehavior::Default,
+    )?;
+    if code >= 0 {
+        let received = crate::errors::out_of_range_received(f64::from(code));
+        return Err(NodeError::out_of_range("err", "a negative integer", &received).throw(scope));
+    }
+    let name = uv_errors().find(|&(_, value)| value == code).map_or_else(
+        || format!("Unknown system error {code}"),
+        |(name, _)| name.to_string(),
+    );
     name.as_str().to_jsval_raw_throwing(scope)
 }

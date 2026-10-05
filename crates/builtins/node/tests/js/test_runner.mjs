@@ -59,7 +59,9 @@ test("subtests", async (t) => {
   await t.test("second", async () => {
     await new Promise((resolve) => setTimeout(resolve, 1));
   });
-  t.test("not awaited", () => {});
+  t.test("not awaited", (t) => {
+    t.after(() => log.push("not awaited after"));
+  });
 });
 
 test("failing subtest", async (t) => {
@@ -120,6 +122,16 @@ describe("suite", () => {
     it("deep", () => {});
   });
   it.skip("skipped in suite", () => {});
+});
+
+// The suite's timeout cancels the test that runs, whose hooks still run, and the one that didn't
+// start.
+describe("suite timeout", { timeout: 20 }, () => {
+  it("cancelled", async (t) => {
+    t.after(() => log.push("cancelled after"));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  it("never started", () => {});
 });
 
 test("mock.fn", (t) => {
@@ -224,14 +236,18 @@ const expected = `
   ✔ nested (*ms)
   ﹣ skipped in suite (*ms) # SKIP
 ✔ suite (*ms)
+▶ suite timeout
+  ✖ cancelled (*ms)
+  ✖ never started
+✖ suite timeout (*ms)
 ✔ mock.fn (*ms)
 ✔ mock.method (*ms)
 ✔ mock restored after the test (*ms)
-ℹ tests 26
-ℹ suites 2
+ℹ tests 28
+ℹ suites 3
 ℹ pass 13
 ℹ fail 7
-ℹ cancelled 2
+ℹ cancelled 4
 ℹ skipped 3
 ℹ todo 1
 ℹ duration_ms *
@@ -266,6 +282,15 @@ const expected = `
 ✖ uncaught (*ms)
   Error: thrown from a timer
       at *
+
+✖ cancelled (*ms)
+  'test did not finish before its parent and was cancelled'
+
+✖ never started
+  'test did not finish before its parent and was cancelled'
+
+✖ suite timeout (*ms)
+  'test timed out after 20ms'
 `.slice(1);
 
 // The durations and stack frames vary, and errors have one stack frame line per frame. Node.js
@@ -288,6 +313,12 @@ eq(log.includes("beforeEach skipped"), false, "beforeEach skips skipped tests");
 eq(log.includes("beforeEach inner"), true, "beforeEach runs for subtests");
 eq(log.includes("skipped body ran"), false, "skipped tests don't run");
 eq(log.includes("left out ran"), false, "runOnly leaves out subtests without only");
+const cancelledHooks = ["afterEach not awaited", "not awaited after", "afterEach cancelled", "cancelled after"];
+deepEq(
+  log.filter((entry) => cancelledHooks.includes(entry)),
+  cancelledHooks,
+  "cancelled tests run their remaining hooks once",
+);
 eq(log.find((entry) => typeof entry === "object").aborted, true, "the signal is aborted after the test");
 eq(process.exitCode, 1, "failures set the exit code");
 process.exitCode = 0;

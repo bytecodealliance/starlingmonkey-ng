@@ -21,8 +21,6 @@ use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
-use crate::stream::{call_method, Props};
-
 use crate::errors::{ErrorKind, NodeError, Thrown};
 
 /// The methods Node's HTTP parser supports, in order.
@@ -193,8 +191,8 @@ fn validate_name(scope: &Scope<'_>, name: HandleValue<'_>) -> Result<String, Thr
 
 /// Check that `value` is a valid value for the header `name`, or each element of it is.
 fn validate_value(scope: &Scope<'_>, name: &str, value: HandleValue<'_>) -> Result<(), Thrown> {
-    if let Some(array) = outgoing::as_array(scope, value)? {
-        for item in outgoing::elements(scope, array)? {
+    if let Some(items) = crate::support::array_elements(scope, value)? {
+        for item in items {
             module::validate_header_value(scope, name.to_string(), item)?;
         }
         return Ok(());
@@ -236,7 +234,6 @@ fn request<'s>(
     if https {
         let defaults = Object::new_plain(scope)?;
         defaults.set_property(scope, c"_defaultAgent", global_agent(scope, true)?)?;
-        let assign = scope.global().obj(scope, c"Object")?.ok_or(ExnThrown)?;
         let options_index = if args.first().is_some_and(|arg| arg.is_object())
             && client::url_of(scope, args[0])?.is_none()
         {
@@ -247,14 +244,9 @@ fn request<'s>(
         let given = args
             .get(options_index)
             .copied()
-            .filter(|arg| arg.is_object() && !crate::stream::is_function(scope, *arg));
-        if let Some(given) = given {
-            call_method(
-                scope,
-                assign,
-                c"assign",
-                &[defaults.to_jsval_throwing(scope)?, given],
-            )?;
+            .filter(|arg| arg.is_object() && !js::function::is_callable(*arg));
+        if let Some(given) = given.and_then(|given| Object::from_value(scope, *given).ok()) {
+            defaults.assign(scope, given)?;
             args[options_index] = defaults.to_jsval_throwing(scope)?;
         } else {
             args.insert(
@@ -273,7 +265,7 @@ fn get<'s>(
     https: bool,
 ) -> Result<Object<'s>, ExnThrown> {
     let request = request(scope, args, https)?;
-    call_method(scope, request, c"end", &[])?;
+    Function::call_by_name(scope, request.handle(), c"end", js::function::EmptyArgs)?;
     Ok(request)
 }
 
@@ -299,6 +291,7 @@ pub mod module {
     pub use super::server::server_class as Server;
 
     /// <https://nodejs.org/api/http.html#httpcreateserveroptions-requestlistener>
+    #[function(length = 2)]
     pub fn create_server<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -307,6 +300,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/http.html#httprequesturl-options-callback>
+    #[function(length = 3)]
     pub fn request<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -315,6 +309,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/http.html#httpgeturl-options-callback>
+    #[function(length = 3)]
     pub fn get<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -323,15 +318,14 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/http.html#httpvalidateheadernamename-label>
+    #[function(length = 0)]
     pub fn validate_header_name(
         scope: &Scope<'_>,
         name: HandleValue<'_>,
         label: Option<String>,
     ) -> Result<(), Thrown> {
         let text: String = if name.is_symbol() {
-            let string = scope.global().val(scope, c"String")?;
-            let text = Function::call(scope, js::value::undefined(), string, &[name])?;
-            js::conversion::FromJSVal::from_jsval(scope, text, ())?
+            crate::inspect::symbol_to_string(scope, name)
         } else {
             js::conversion::FromJSVal::from_jsval(scope, name, ())?
         };
@@ -350,6 +344,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/http.html#httpvalidateheadervaluename-value>
+    #[function(length = 0)]
     pub fn validate_header_value(
         scope: &Scope<'_>,
         name: String,
@@ -385,6 +380,7 @@ pub mod https {
 
     /// <https://nodejs.org/api/https.html#httpscreateserveroptions-requestlistener>: the TLS
     /// options are ignored, since the host terminates TLS.
+    #[function(length = 2)]
     pub fn create_server<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -401,6 +397,7 @@ pub mod https {
     }
 
     /// <https://nodejs.org/api/https.html#httpsgeturl-options-callback>
+    #[function(length = 3)]
     pub fn get<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -450,19 +447,28 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     crate::stub::register_implemented_with::<module::js_module>(scope, name, &tables)
 }
 
-/// Register the classes of `node:http` on `global`.
+/// Intern the keys of the property templates of the messages.
+pub(crate) fn register_templates(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    incoming::MESSAGE_PROPERTIES.register(scope)?;
+    outgoing::OUTGOING_PROPERTIES.register(scope)?;
+    outgoing::RESPONSE_PROPERTIES.register(scope)?;
+    client::REQUEST_PROPERTIES.register(scope)
+}
+
+/// Register the internal classes of `node:http` on `global`.
 pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
-    client::SendCancel::add_to_global(scope, global);
+    connection::ConnectionState::add_to_global(scope, global);
+    connection::ParserHandle::add_to_global(scope, global);
+    host_socket::register_class(scope, global);
+    incoming::IncomingState::add_to_global(scope, global);
+    outgoing::OutgoingState::add_to_global(scope, global);
+    server::HttpServerState::add_to_global(scope, global);
+    outgoing::outgoing_message_class::register(scope)?;
+    outgoing::server_response_class::register(scope)?;
+    incoming::incoming_message_class::register(scope)?;
     client::client_request_class::register(scope)?;
     client::agent_class::register(scope)?;
     client::https_agent_class::register(scope)?;
-    connection::ParserHandle::add_to_global(scope, global);
-    host_socket::host_socket_class::register(scope)?;
-    incoming::ResponseBody::add_to_global(scope, global);
-    incoming::incoming_message_class::register(scope)?;
-    outgoing::BodyInterest::add_to_global(scope, global);
-    outgoing::outgoing_message_class::register(scope)?;
-    outgoing::server_response_class::register(scope)?;
     server::server_class::register(scope)?;
     Ok(())
 }

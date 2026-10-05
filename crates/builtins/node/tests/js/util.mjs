@@ -178,4 +178,60 @@ throws(() => util.styleText(1, "x"), "ERR_INVALID_ARG_VALUE", "styleText format"
 throws(() => util.getSystemErrorName("x"), "ERR_INVALID_ARG_TYPE", "getSystemErrorName type");
 throws(() => util.stripVTControlCharacters(1), "ERR_INVALID_ARG_TYPE", "stripVTControlCharacters type");
 eq(util.stripVTControlCharacters("\u001b(B x"), " x", "stripVTControlCharacters charset");
+eq(util.stripVTControlCharacters("\u00e9\u009b31m\u6f22\u001b]0;t\u0007y\u001b[1;2"), "\u00e9\u6f22y", "stripVTControlCharacters around non-ASCII text");
+eq(util.stripVTControlCharacters(`\u001b[1${";".repeat(1e6)}m`), "", "stripVTControlCharacters of a million parameters");
+eq(util.stripVTControlCharacters(`\u001b[1${";".repeat(1e6)}é`).length, 1e6 + 1, "a million parameters without a final character");
+eq(util.stripVTControlCharacters("\u001b[12;34;x"), ";x", "parameters before a character that isn't final");
+eq(util.stripVTControlCharacters("\u001b[12345m"), "m", "parameters of more than four digits");
+let thrown;
+try {
+  inspect({ a: { [inspect.custom]() { throw 1; } } });
+} catch (error) {
+  thrown = error;
+}
+eq(thrown, 1, "inspect passes on a primitive thrown by a custom inspector");
+const byteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength");
+Object.defineProperty(ArrayBuffer.prototype, "byteLength", { get() { return {}; }, configurable: true });
+const hidden = inspect(new Uint8Array(1), { showHidden: true });
+Object.defineProperty(ArrayBuffer.prototype, "byteLength", byteLength);
+eq(hidden.includes("[buffer]: ArrayBuffer { [byteLength]: [object Object] }"), true, "a byteLength getter returning an object");
 throws(() => util.formatWithOptions(() => {}, "x"), "ERR_INVALID_ARG_TYPE", "formatWithOptions function");
+
+// Values nested deeper than the native stack allows.
+const nested = (make) => {
+  let value = null;
+  for (let i = 0; i < 100000; i++) value = make(value);
+  return value;
+};
+const interrupted = "Inspection interrupted prematurely. Maximum call stack size exceeded.]";
+eq(inspect(nested((a) => ({ a })), { depth: null }).includes(`a: [Object: ${interrupted}`), true, "deep object");
+eq(inspect(nested((a) => [a]), { depth: null }).includes(`[Array: ${interrupted}`), true, "deep array");
+eq(inspect(nested((a) => ({ __proto__: null, a })), { depth: null }).includes(`[[Object: null prototype]: ${interrupted}`), true, "deep null-prototype object");
+throws(() => inspect(nested((a) => new Proxy(a ?? {}, {})), { showProxy: true, depth: null }), RangeError, "deep proxy chain");
+eq(throws(() => isDeepStrictEqual(nested((a) => [a]), nested((a) => [a])), RangeError).message, "Maximum call stack size exceeded", "deep isDeepStrictEqual of arrays");
+eq(throws(() => isDeepStrictEqual(nested((a) => ({ a })), nested((a) => ({ a }))), RangeError).message, "Maximum call stack size exceeded", "deep isDeepStrictEqual of objects");
+
+// Depths of proxies and of values inspected without one.
+eq(format("%o", new Proxy({}, {})), "Proxy [ {}, {} ]", "%o of a proxy");
+eq(inspect({ a: { b: new Proxy({ c: {} }, {}) } }, { showProxy: true }), "{ a: { b: Proxy [ [Object], {} ] } }", "nested proxy");
+eq(inspect(Object.defineProperty(function () {}, "name", { value: { x: 1 } })), "[Function: {\n  x: 1\n}]", "function named by an object");
+eq(inspect(Object.assign(new Error("e"), { stack: { s: 1 } })), "[Error: e\n    {\n      s: 1\n    }]", "error with an object stack");
+
+// Proxies, detached buffers and symbol names.
+const traps = [];
+const tracing = new Proxy({ a: 1 }, { get: (target, key) => (traps.push(key), target[key]) });
+eq(format("%s", tracing), "{ a: 1 }", "%s of a proxy");
+eq(traps.length, 0, "%s doesn't run proxy traps");
+const revocable = Proxy.revocable({}, {});
+revocable.revoke();
+eq(format("%s", revocable.proxy), "<Revoked Proxy>", "%s of a revoked proxy");
+const detached = new ArrayBuffer(4);
+structuredClone(detached, { transfer: [detached] });
+eq(inspect(detached), "ArrayBuffer { (detached), [byteLength]: 0 }", "detached ArrayBuffer");
+class SymbolNamed {}
+Object.defineProperty(SymbolNamed, "name", { value: Symbol("s") });
+eq(inspect(new SymbolNamed()), "Symbol(s) {}", "class named by a symbol");
+
+// `parseArgs` rejects `options` and option configurations that are arrays or functions.
+throws(() => util.parseArgs({ args: [], options: [] }), "ERR_INVALID_ARG_TYPE", "parseArgs rejects array options");
+throws(() => util.parseArgs({ args: [], options: { a: () => {} } }), "ERR_INVALID_ARG_TYPE", "parseArgs rejects a function option");

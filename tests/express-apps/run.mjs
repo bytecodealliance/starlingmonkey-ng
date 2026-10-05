@@ -27,7 +27,7 @@
 // also export `spinMasks`, which `--mode=spin` adds to `masks`.
 
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, readdirSync, realpathSync } from 'node:fs';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve, dirname } from 'node:path';
@@ -111,6 +111,13 @@ async function waitForPort(port, child, timeoutMs = 30000) {
   throw new Error(`port ${port} not listening after ${timeoutMs} ms`);
 }
 
+/** The real path of `appDir`'s `node_modules`, in a list, if it is a symbolic link. */
+function linkedNodeModules(appDir) {
+  const nodeModules = join(appDir, 'node_modules');
+  if (!existsSync(nodeModules)) return [];
+  const real = realpathSync(nodeModules);
+  return real === join(realpathSync(appDir), 'node_modules') ? [] : [real];
+}
 function isText(type) {
   return /^(text\/|application\/(json|javascript|xml|x-ndjson|x-www-form-urlencoded))|\+json|\+xml/.test(
     type || '',
@@ -256,6 +263,9 @@ function startApp(kind, appDir, scenario, port, env) {
     argv = [
       'run',
       `--dir=${appDir}::/app`,
+      // WASI doesn't follow a symbolic link out of a preopened directory, so a linked
+      // `node_modules` is preopened at its guest path.
+      ...linkedNodeModules(appDir).map((host) => `--dir=${host}::/app/node_modules`),
       ...(env.DATA_DIR ? [`--dir=${env.DATA_DIR}::${env.DATA_DIR}`] : []),
       '-Sinherit-network=y,tcp=y,udp=y,http=y,p3=y,inherit-env=y',
       '-Wcomponent-model-async=y',

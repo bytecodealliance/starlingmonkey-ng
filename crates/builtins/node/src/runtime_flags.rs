@@ -8,6 +8,7 @@
 //! is accepted without effect, or is rejected: see `docs/node-compat.md`.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 /// The settings the Node.js runtime flags make.
 #[derive(Clone, Debug)]
@@ -64,7 +65,7 @@ impl Default for RuntimeFlags {
 }
 
 js::instance_local! {
-    static FLAGS: RefCell<Option<RuntimeFlags>> = const { RefCell::new(None) };
+    static FLAGS: RefCell<Option<Rc<RuntimeFlags>>> = const { RefCell::new(None) };
 }
 
 /// The flags that are accepted without effect.
@@ -112,13 +113,13 @@ pub fn set(flags: &[String], http_listen: bool) -> Result<(), String> {
     for flag in flags {
         apply(&mut settings, flag)?;
     }
-    FLAGS.with(|cell| *cell.borrow_mut() = Some(settings));
+    FLAGS.with(|cell| *cell.borrow_mut() = Some(Rc::new(settings)));
     Ok(())
 }
 
-/// The settings of the flags [`set`] last parsed, or the defaults if it wasn't called.
-pub(crate) fn get() -> RuntimeFlags {
-    FLAGS.with(|cell| cell.borrow().clone().unwrap_or_default())
+/// The settings [`set`] last made, or the defaults if it wasn't called.
+pub(crate) fn get() -> Rc<RuntimeFlags> {
+    FLAGS.with(|cell| cell.borrow_mut().get_or_insert_default().clone())
 }
 
 /// Apply `flag` to `settings`.

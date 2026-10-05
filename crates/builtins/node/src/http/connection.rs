@@ -3,45 +3,93 @@
 //! The connections of a listening `http.Server`, ported from Node.js's `lib/_http_server.js`.
 //!
 //! The server's `connection` listener reads the socket's `data` events into a [`Parser`] held in
-//! a `ParserHandle` under the socket's `parser`. Each request head becomes an `IncomingMessage`
-//! with a `ServerResponse`, emitted as a `request` event. The connection's state is a plain
-//! object under the socket's `_starlingHttp`: the server, the parser, the requests waiting for
-//! their responses (`incoming`), the responses waiting for the socket (`outgoing`), the request
-//! being parsed (`current`), the bytes the waiting responses queued (`outgoingData`), and the
-//! socket listeners. The server's open connections are its `_starlingConnections`.
+//! a `ParserHandle`, which is the socket's `parser`. Each request head becomes an
+//! `IncomingMessage` with a `ServerResponse`, emitted as a `request` event. A connection's state
+//! is a [`ConnectionState`], the payload of the socket listeners: the server, the parser, the
+//! requests waiting for their responses, the responses waiting for the socket, and the bytes the
+//! waiting responses queued.
+
+use std::collections::VecDeque;
+use std::time::Duration;
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
-use super::incoming::{incoming_message_class, set_header_lines};
-use super::outgoing::{elements, emit_close_job, server_response_class};
+use super::incoming::{set_join_duplicates, set_lines, MessageHead};
+use super::outgoing::{emit_close_tick, ConnectionFields};
 use super::parser::{Event, Head, ParseError, Parser};
+use super::server::{server_class, HttpServerState};
 use crate::buffer::new_buffer;
 use crate::errors::{ErrorKind, NodeError};
-use crate::stream::{call_method, closure, has_method, string, truthy, Captures, Props};
 
-/// The request parser of a connection.
+/// The request parser of a connection, which is its socket's `parser`.
 #[core_runtime::jsclass(hidden)]
 pub struct ParserHandle {
     #[no_trace]
     parser: Parser,
+    /// The request being parsed.
+    incoming: Option<Heap<js::object::Object>>,
 }
 
 #[core_runtime::jsmethods]
 impl ParserHandle {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
+    /// The request being parsed, or `null`.
+    #[getter]
+    fn incoming<'r>(&self, scope: &'r Scope<'_>) -> HandleValue<'r> {
+        match self.data().incoming.get(scope) {
+            Some(incoming) => scope.root_value(incoming.as_value()),
+            None => HandleValue::null(),
+        }
     }
+
+    #[setter]
+    fn set_incoming(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
+        self.data_mut().incoming = Object::from_value(scope, *value).ok().map(Heap::from);
+    }
+}
+
+/// The state of a connection of a listening server.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct ConnectionState {
+    server: Heap<js::object::Object>,
+    socket: Heap<js::object::Object>,
+    /// The parser, until the connection is upgraded or closed.
+    parser: Option<Heap<ParserHandleImpl>>,
+    /// The requests waiting for their responses.
+    incoming: VecDeque<Heap<js::object::Object>>,
+    /// The responses waiting for the socket.
+    outgoing: VecDeque<Heap<js::object::Object>>,
+    /// The response the socket writes: the socket's `_httpMessage`.
+    pub(super) current: Option<Heap<js::object::Object>>,
+    /// The socket listeners, which an upgrade removes: `data`, `end`, `close`, `drain`, `error`
+    /// and `timeout`.
+    listeners: Vec<Heap<js::object::Object>>,
+    /// The `_onPendingData` of the responses.
+    pending_data: Option<Heap<js::object::Object>>,
+    /// The bytes the waiting responses queued.
+    #[no_trace]
+    outgoing_data: f64,
+    #[no_trace]
+    requests_count: f64,
+    #[no_trace]
+    keep_alive_timeout_set: bool,
+    /// Whether the server paused the socket, which its `_paused` mirrors.
+    #[no_trace]
+    paused: bool,
+}
+
+#[core_runtime::jsmethods]
+impl ConnectionState {}
+
+/// The socket of the connection `state`.
+pub(super) fn socket_of<'s>(scope: &'s Scope<'_>, state: ConnectionState<'_>) -> Object<'s> {
+    state.data().socket.get(scope)
 }
 
 /// The largest request head a server accepts by default, in bytes.
@@ -50,75 +98,27 @@ const DEFAULT_MAX_HEADER_SIZE: f64 = 16384.0;
 /// The most header lines a request may have by default.
 const DEFAULT_MAX_HEADERS: usize = 1000;
 
-/// The connection state of `socket`, if a server handles its requests.
-fn state_of<'s>(scope: &'s Scope<'_>, socket: Object<'_>) -> Result<Option<Object<'s>>, ExnThrown> {
-    socket.obj(scope, c"_starlingHttp")
-}
+/// The milliseconds after which a connection of a closed server that is still between requests
+/// is destroyed.
+const CLOSING_IDLE_DELAY: u64 = 500;
 
-/// The parser of the connection `state`, unless it was freed.
-fn parser_of<'s>(
-    scope: &'s Scope<'_>,
-    state: Object<'_>,
-) -> Result<Option<ParserHandle<'s>>, ExnThrown> {
-    Ok(state
-        .obj(scope, c"parser")?
-        .and_then(|handle| handle.cast::<ParserHandle>().ok()))
-}
+/// The socket listeners of a connection, in the order of [`ConnectionState::listeners`].
+const LISTENERS: [(&std::ffi::CStr, js::function::Callback, u32); 6] = [
+    (c"data", socket_on_data, 1),
+    (c"end", socket_on_end, 0),
+    (c"close", socket_on_close, 0),
+    (c"drain", socket_on_drain, 0),
+    (c"error", socket_on_error, 1),
+    (c"timeout", socket_on_timeout, 0),
+];
 
-/// A shared function of the current global for `body`, with `nargs` arguments, so listeners added
-/// with it can be removed with it.
-fn shared<'s>(
-    scope: &'s Scope<'_>,
-    body: js::function::Callback,
-    nargs: u32,
-) -> Result<Object<'s>, ExnThrown> {
-    let function =
-        js::class::get_or_init_shared_function(scope, body as *const () as usize, |scope| {
-            Function::new_callback(scope, c"", nargs, body, ())
-        })?;
-    Ok(*function)
-}
-
-/// `array.length`.
-fn length(scope: &Scope<'_>, array: Object<'_>) -> Result<u32, ExnThrown> {
-    array
-        .cast::<js::Array>()
-        .map_err(|_| js::error::TypeError("unexpected object".into()).throw(scope))?
-        .length(scope)
-}
-
-/// Remove `item` from `array`, if it is in it.
-fn remove_from(scope: &Scope<'_>, array: Object<'_>, item: Object<'_>) -> Result<(), ExnThrown> {
-    let index = call_method(scope, array, c"indexOf", &[item.to_jsval_throwing(scope)?])?;
-    if index.is_number() && index.to_number() >= 0.0 {
-        let one = scope.root_value(js::value::from_f64(1.0));
-        call_method(scope, array, c"splice", &[index, one])?;
+/// The number `value` is if it is a number, and `default` otherwise.
+fn number_or(value: HandleValue<'_>, default: f64) -> f64 {
+    if value.is_number() {
+        value.to_number()
+    } else {
+        default
     }
-    Ok(())
-}
-
-/// The open connections of `server`, created on first use.
-pub(super) fn connections<'s>(
-    scope: &'s Scope<'_>,
-    server: Object<'_>,
-) -> Result<Object<'s>, ExnThrown> {
-    if let Some(list) = server.obj(scope, c"_starlingConnections")? {
-        return Ok(list);
-    }
-    let list = *js::Array::new(scope, 0)?;
-    server.define_property(scope, c"_starlingConnections", list, 0)?;
-    Ok(list)
-}
-
-/// Call `socket.on(event, listener)`, or another listener method such as `removeListener`.
-fn listen(
-    scope: &Scope<'_>,
-    socket: Object<'_>,
-    method: &'static std::ffi::CStr,
-    event: &str,
-    listener: Object<'_>,
-) -> Result<(), ExnThrown> {
-    crate::stream::listen(scope, socket, method, event, listener)
 }
 
 /// The `connection` listener of an `http.Server`, whose `this` is the server: handle the
@@ -128,28 +128,22 @@ pub(super) fn on_connection(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let server = crate::stream::this_object(scope, &args)?;
+    let server = crate::support::this_object(scope, &args)?;
     let socket = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
     socket.set_property(scope, c"server", server)?;
-    let timeout = server.val(scope, c"timeout")?;
-    if truthy(scope, timeout) && has_method(scope, socket, c"setTimeout")? {
-        call_method(scope, socket, c"setTimeout", &[timeout])?;
+    let timeout = server.get_property(scope, c"timeout")?;
+    if js::conversion::to_boolean(timeout)
+        && crate::support::has_method(scope, socket, c"setTimeout")?
+    {
+        Function::call_by_name(scope, socket.handle(), c"setTimeout", &[timeout])?;
     }
-    listen(
-        scope,
-        socket,
-        c"on",
-        "timeout",
-        shared(scope, socket_on_timeout, 0)?,
-    )?;
-
-    let max_header_size = server.val(scope, c"maxHeaderSize")?;
-    let max_header_size = if max_header_size.is_number() && max_header_size.to_number() > 0.0 {
-        max_header_size.to_number()
+    let max_header_size = number_or(server.get_property(scope, c"maxHeaderSize")?, 0.0);
+    let max_header_size = if max_header_size > 0.0 {
+        max_header_size
     } else {
         DEFAULT_MAX_HEADER_SIZE
     };
-    let max_headers = server.val(scope, c"maxHeadersCount")?;
+    let max_headers = server.get_property(scope, c"maxHeadersCount")?;
     let max_headers = if max_headers.is_number() {
         let pairs = super::to_int32(max_headers.to_number()).wrapping_shl(1);
         (pairs > 0).then_some(pairs as usize / 2)
@@ -159,55 +153,31 @@ pub(super) fn on_connection(
     let parser =
         js::class::create_instance_with::<ParserHandleImpl>(scope, |_| ParserHandleImpl {
             parser: Parser::new(max_header_size as usize, max_headers),
+            incoming: None,
         })?;
-    parser.set_property(scope, c"incoming", js::value::null())?;
     socket.set_property(scope, c"parser", parser)?;
-
-    let state = Object::new_plain(scope)?;
-    state.set_property(scope, c"server", server)?;
-    state.set_property(scope, c"socket", socket)?;
-    state.set_property(scope, c"parser", parser)?;
-    state.set_property(scope, c"incoming", *js::Array::new(scope, 0)?)?;
-    state.set_property(scope, c"outgoing", *js::Array::new(scope, 0)?)?;
-    state.set_property(scope, c"current", js::value::null())?;
-    state.set_property(scope, c"outgoingData", 0)?;
-    state.set_property(scope, c"requestsCount", 0)?;
-    state.set_property(scope, c"keepAliveTimeoutSet", false)?;
-    socket.define_property(scope, c"_starlingHttp", state, 0)?;
-
-    for (name, event, body, nargs) in [
-        (
-            c"onData",
-            "data",
-            socket_on_data as js::function::Callback,
-            1,
-        ),
-        (c"onEnd", "end", socket_on_end, 0),
-        (c"onClose", "close", socket_on_close, 0),
-        (c"onDrain", "drain", socket_on_drain, 0),
-    ] {
-        let listener = closure(scope, nargs, body, &[state.to_jsval_raw_throwing(scope)?])?;
-        state.set_property(scope, name, listener)?;
-        listen(scope, socket, c"on", event, listener)?;
-        if event == "data" {
-            listen(
-                scope,
-                socket,
-                c"on",
-                "error",
-                shared(scope, socket_on_error, 1)?,
-            )?;
-        }
+    let state =
+        js::class::create_instance_with::<ConnectionStateImpl>(scope, |_| ConnectionStateImpl {
+            server: Heap::from(server),
+            socket: Heap::from(socket),
+            parser: Some(Heap::from(parser)),
+            ..Default::default()
+        })?;
+    for (event, body, nargs) in LISTENERS {
+        let listener = Function::new_callback(scope, c"", nargs, body, state)?;
+        crate::events::listen(scope, socket, c"on", event, *listener)?;
+        state.data_mut().listeners.push(Heap::from(*listener));
     }
-    let set_encoding = shared(scope, socket_set_encoding, 0)?;
+    let pending_data =
+        Function::new_callback(scope, c"updateOutgoingData", 1, on_pending_data, state)?;
+    state.data_mut().pending_data = Some(Heap::from(*pending_data));
+    let set_encoding = crate::support::shared_function(scope, socket_set_encoding, 0)?;
     socket.set_property(scope, c"setEncoding", set_encoding)?;
     socket.set_property(scope, c"_paused", false)?;
-    call_method(
-        scope,
-        connections(scope, server)?,
-        c"push",
-        &[socket.to_jsval_throwing(scope)?],
-    )?;
+    server_class::state_of(scope, server)?
+        .data_mut()
+        .connections
+        .push(Heap::from(state.as_object()));
     Ok(js::value::undefined())
 }
 
@@ -226,6 +196,18 @@ fn socket_set_encoding(
     .throw(scope))
 }
 
+/// The `_onPendingData` of the responses of a connection, whose payload is the connection: add
+/// the argument to the bytes the waiting responses queued.
+fn on_pending_data(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let state = cast_payload::<ConnectionState>(scope, payload);
+    update_outgoing_data(scope, state, number_or(args.get(0), 0.0))?;
+    Ok(js::value::undefined())
+}
+
 /// The error for the parse error `error` of the bytes `raw`, as Node.js's parser and
 /// `prepareError` create it.
 fn parse_error_value<'s>(
@@ -233,10 +215,8 @@ fn parse_error_value<'s>(
     error: &ParseError,
     raw: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let message = std::ffi::CString::new(format!("Parse Error: {}", error.reason))
-        .expect("reasons have no NUL");
-    js::error::throw_plain_error(scope, &message);
-    let value = crate::stream::take_exception(scope);
+    let message = format!("Parse Error: {}", error.reason);
+    let value = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &message)?;
     let object = Object::from_value(scope, *value).map_err(|e| e.throw(scope))?;
     object.set_property(scope, c"bytesParsed", error.bytes_parsed as f64)?;
     object.set_property(scope, c"code", error.code)?;
@@ -245,58 +225,62 @@ fn parse_error_value<'s>(
     Ok(value)
 }
 
-/// The `data` listener of a connection, whose captures are `[state]`: parse the chunk and handle
-/// what it completes, as Node.js's `socketOnData` and the parser callbacks do. Parsing stops once
-/// the socket is destroyed or upgraded.
+/// The `data` listener of a connection, whose payload is the connection: parse the chunk and
+/// handle what it completes, as Node.js's `socketOnData` and the parser callbacks do. Parsing
+/// stops once the socket is destroyed or upgraded.
 fn socket_on_data(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    let Some(handle) = parser_of(scope, state)? else {
+    let state = cast_payload::<ConnectionState>(scope, payload);
+    let Some(handle) = state.data().parser.get(scope) else {
         return Ok(js::value::undefined());
     };
-    let socket = state.obj(scope, c"socket")?.ok_or(ExnThrown)?;
+    let socket = state.data().socket.get(scope);
     let chunk = args.get(0);
-    let Some(bytes) = Object::from_value(scope, chunk)
+    let Some(view) = Object::from_value(scope, chunk)
         .ok()
         .and_then(js::ArrayBufferView::from_object)
-        .map(|view| view.copy_bytes(scope))
-        .transpose()?
     else {
         return Ok(js::value::undefined());
     };
-    handle.data_mut().parser.feed(&bytes);
+    {
+        let mut data = handle.data_mut();
+        let parser = &mut data.parser;
+        view.with_bytes(|bytes| parser.feed(bytes));
+    }
+    let tcp = crate::net::socket::is_tcp(scope, socket)?;
     loop {
-        let same = match parser_of(scope, state)? {
-            Some(current) => current.handle().get() == handle.handle().get(),
-            None => false,
-        };
-        if !same || socket.flag(scope, c"destroyed")? {
+        let same = state.data().parser.as_ref().is_some_and(|current| {
+            current.get(scope).as_object().handle().get() == handle.as_object().handle().get()
+        });
+        if !same || socket_destroyed(scope, socket)? {
             break;
         }
         let event = handle.data_mut().parser.next();
         match event {
             Ok(None) => break,
             Ok(Some(Event::Head(head))) => {
-                if on_head(scope, state, socket, head)? {
+                if on_head(scope, state, handle, socket, head)? {
                     break;
                 }
             }
             Ok(Some(Event::Body(body))) => {
                 on_body(scope, state, socket, &body)?;
-                drain_after_callback(scope, socket)?;
+                if tcp {
+                    js::jobs::run_jobs(scope);
+                }
             }
             Ok(Some(Event::Complete(trailers))) => {
-                if !trailers.is_empty() {
-                    drain_after_callback(scope, socket)?;
+                if !trailers.is_empty() && tcp {
+                    js::jobs::run_jobs(scope);
                 }
-                on_complete(scope, state, socket, &trailers)?;
+                on_complete(scope, state, handle, trailers)?;
             }
             Err(error) => {
                 let error = parse_error_value(scope, &error, chunk)?;
-                socket_error(scope, socket, error)?;
+                socket_error(scope, state, error)?;
                 break;
             }
         }
@@ -304,50 +288,69 @@ fn socket_on_data(
     Ok(js::value::undefined())
 }
 
-/// Run the tick queue and the microtasks, if `socket` is a TCP socket. The server calls this after
-/// a body chunk and before the end of a request with trailers, which matches the order of events
-/// Node.js emits for a TCP connection. Microtasks don't run when this is called from a promise
-/// reaction.
-fn drain_after_callback(scope: &Scope<'_>, socket: Object<'_>) -> Result<(), ExnThrown> {
-    if socket.has_own_property(scope, c"_starlingHandle")? {
-        js::jobs::run_jobs(scope);
+/// Whether `socket` was destroyed.
+fn socket_destroyed(scope: &Scope<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
+    if let Some(state) = crate::net::socket::state_of(scope, socket)? {
+        return Ok(state.data().destroyed());
     }
-    Ok(())
+    Ok(js::conversion::to_boolean(
+        socket.get_property(scope, c"destroyed")?,
+    ))
 }
 
 /// Handle the request head `head`, as Node.js's `parserOnHeadersComplete` does. Returns whether
 /// the connection was upgraded.
 fn on_head(
     scope: &Scope<'_>,
-    state: Object<'_>,
+    state: ConnectionState<'_>,
+    handle: ParserHandle<'_>,
     socket: Object<'_>,
     head: Head,
 ) -> Result<bool, ExnThrown> {
-    let server = state.obj(scope, c"server")?.ok_or(ExnThrown)?;
-    let class = match server.obj(scope, c"_starlingIncomingMessage")? {
-        Some(class) => class,
-        None => incoming_message_class::class_constructor(scope)?,
+    let server = state.data().server.get(scope);
+    let class = server_class::state_of(scope, server)?
+        .data()
+        .incoming_class
+        .get(scope);
+    let socket_value = socket.to_jsval_throwing(scope)?;
+    let mut head = head;
+    let req = match class {
+        Some(class) => {
+            let req = Function::construct(scope, class, &[socket_value])?;
+            req.set_property(scope, c"httpVersionMajor", head.major)?;
+            req.set_property(scope, c"httpVersionMinor", head.minor)?;
+            let version = format!("{}.{}", head.major, head.minor);
+            req.set_property(scope, c"httpVersion", version.as_str())?;
+            let join =
+                js::conversion::to_boolean(server.get_property(scope, c"joinDuplicateHeaders")?);
+            set_join_duplicates(scope, req, join)?;
+            req.set_property(scope, c"url", head.url.as_str())?;
+            req.set_property(scope, c"upgrade", head.upgrade)?;
+            set_lines(scope, req, std::mem::take(&mut head.headers), false)?;
+            req.set_property(scope, c"method", head.method.as_str())?;
+            req
+        }
+        None => {
+            let join =
+                js::conversion::to_boolean(server.get_property(scope, c"joinDuplicateHeaders")?);
+            let fields = MessageHead {
+                version: Some((u32::from(head.major), u32::from(head.minor))),
+                method: Some(&head.method),
+                url: Some(&head.url),
+                upgrade: Some(head.upgrade),
+                join_duplicates: Some(join),
+                headers: Some(std::mem::take(&mut head.headers)),
+                ..MessageHead::default()
+            };
+            super::incoming::new_message(scope, socket_value, fields)?
+        }
     };
-    let req = Function::construct(scope, class, &[socket.to_jsval_throwing(scope)?])?;
-    req.define_property(scope, c"_starlingWire", true, 0)?;
-    req.set_property(scope, c"httpVersionMajor", head.major)?;
-    req.set_property(scope, c"httpVersionMinor", head.minor)?;
-    let version = format!("{}.{}", head.major, head.minor);
-    req.set_property(scope, c"httpVersion", version.as_str())?;
-    let join = truthy(scope, server.val(scope, c"joinDuplicateHeaders")?);
-    req.set_property(scope, c"joinDuplicateHeaders", join)?;
-    req.set_property(scope, c"url", head.url.as_str())?;
-    req.set_property(scope, c"upgrade", head.upgrade)?;
-    set_header_lines(scope, req, &head.headers, false, join)?;
-    req.set_property(scope, c"method", head.method.as_str())?;
-    state.set_property(scope, c"current", req)?;
-    if let Some(parser) = state.obj(scope, c"parser")? {
-        parser.set_property(scope, c"incoming", req)?;
-    }
-    if !on_incoming(scope, state, socket, req, head.keep_alive)? {
+    super::incoming::set_wire_source(scope, req, state)?;
+    handle.data_mut().incoming = Some(Heap::from(req));
+    if !on_incoming(scope, state, socket, req, &head.method, head.keep_alive)? {
         return Ok(false);
     }
-    upgrade(scope, state, socket, server, req)?;
+    upgrade(scope, state, socket, server, req, &head.method)?;
     Ok(true)
 }
 
@@ -355,46 +358,37 @@ fn on_head(
 /// listeners, with the bytes after the request head, or destroy it if the server has none.
 fn upgrade(
     scope: &Scope<'_>,
-    state: Object<'_>,
+    state: ConnectionState<'_>,
     socket: Object<'_>,
     server: Object<'_>,
     req: Object<'_>,
+    method: &str,
 ) -> Result<(), ExnThrown> {
-    let rest = match parser_of(scope, state)? {
+    let rest = match state.data().parser.get(scope) {
         Some(handle) => handle.data_mut().parser.take_rest(),
         None => Vec::new(),
     };
-    for (name, event) in [
-        (c"onData", "data"),
-        (c"onEnd", "end"),
-        (c"onClose", "close"),
-        (c"onDrain", "drain"),
-    ] {
-        if let Some(listener) = state.obj(scope, name)? {
-            listen(scope, socket, c"removeListener", event, listener)?;
-        }
+    let listeners: Vec<Object<'_>> = state
+        .data()
+        .listeners
+        .iter()
+        .map(|listener| listener.get(scope))
+        .collect();
+    for ((event, _, _), listener) in LISTENERS.iter().zip(listeners) {
+        crate::events::listen(scope, socket, c"removeListener", event, listener)?;
     }
-    listen(
-        scope,
-        socket,
-        c"removeListener",
-        "error",
-        shared(scope, socket_on_error, 1)?,
-    )?;
-    listen(
-        scope,
-        socket,
-        c"removeListener",
-        "timeout",
-        shared(scope, socket_on_timeout, 0)?,
-    )?;
-    free_parser(scope, state, socket)?;
-    let connect = crate::stream::is_str(scope, req.val(scope, c"method")?, c"CONNECT")?;
-    let event = if connect { "connect" } else { "upgrade" };
-    if crate::stream::listener_count(scope, server, string(scope, event)?)? > 0.0 {
+    free_parser(scope, state)?;
+    let event = if method == "CONNECT" {
+        c"connect"
+    } else {
+        c"upgrade"
+    };
+    if crate::events::listener_count(scope, server, js::class::get_or_init_atom(scope, event)?)?
+        > 0.0
+    {
         let head = new_buffer(scope, &rest)?.to_jsval_throwing(scope)?;
         socket.set_property(scope, c"readableFlowing", js::value::null())?;
-        crate::stream::emit(
+        crate::events::emit(
             scope,
             server,
             event,
@@ -405,17 +399,24 @@ fn upgrade(
             ],
         )?;
     } else {
-        call_method(scope, socket, c"destroy", &[])?;
+        Function::call_by_name(scope, socket.handle(), c"destroy", js::function::EmptyArgs)?;
     }
     Ok(())
 }
 
 /// Release the parser of the connection `state`, and stop tracking the connection.
-fn free_parser(scope: &Scope<'_>, state: Object<'_>, socket: Object<'_>) -> Result<(), ExnThrown> {
-    state.set_property(scope, c"parser", js::value::null())?;
+fn free_parser(scope: &Scope<'_>, state: ConnectionState<'_>) -> Result<(), ExnThrown> {
+    let (socket, server) = {
+        let mut data = state.data_mut();
+        data.parser = None;
+        (data.socket.get(scope), data.server.get(scope))
+    };
     socket.set_property(scope, c"parser", js::value::null())?;
-    if let Some(server) = state.obj(scope, c"server")? {
-        remove_from(scope, connections(scope, server)?, socket)?;
+    if let Some(server) = server_class::try_state_of(scope, server)? {
+        let state_object = state.as_object();
+        server.data_mut().connections.retain(|connection| {
+            connection.get(scope).handle().get() != state_object.handle().get()
+        });
     }
     Ok(())
 }
@@ -424,20 +425,24 @@ fn free_parser(scope: &Scope<'_>, state: Object<'_>, socket: Object<'_>) -> Resu
 /// socket if the request's buffer is full, as Node.js's `parserOnBody` does.
 fn on_body(
     scope: &Scope<'_>,
-    state: Object<'_>,
+    state: ConnectionState<'_>,
     socket: Object<'_>,
     body: &[u8],
 ) -> Result<(), ExnThrown> {
-    let Some(req) = state.obj(scope, c"current")? else {
+    let req = match state.data().parser.get(scope) {
+        Some(handle) => handle.data().incoming.get(scope),
+        None => None,
+    };
+    let Some(req) = req else {
         return Ok(());
     };
-    if req.flag(scope, c"_dumped")? {
+    if js::conversion::to_boolean(req.get_property(scope, c"_dumped")?) {
         return Ok(());
     }
     let chunk = new_buffer(scope, body)?.to_jsval_throwing(scope)?;
-    let more = call_method(scope, req, c"push", &[chunk])?;
-    if !truthy(scope, more) {
-        call_method(scope, socket, c"pause", &[])?;
+    let more = Function::call_by_name(scope, req.handle(), c"push", &[chunk])?;
+    if !js::conversion::to_boolean(more) {
+        Function::call_by_name(scope, socket.handle(), c"pause", js::function::EmptyArgs)?;
     }
     Ok(())
 }
@@ -446,26 +451,37 @@ fn on_body(
 /// `parserOnMessageComplete` does.
 fn on_complete(
     scope: &Scope<'_>,
-    state: Object<'_>,
-    socket: Object<'_>,
-    trailers: &[(String, String)],
+    state: ConnectionState<'_>,
+    handle: ParserHandle<'_>,
+    trailers: Vec<(String, String)>,
 ) -> Result<(), ExnThrown> {
-    if let Some(req) = state.obj(scope, c"current")? {
+    let req = handle.data().incoming.get(scope);
+    if let Some(req) = req {
         req.set_property(scope, c"complete", true)?;
         if !trailers.is_empty() {
-            let join = req.flag(scope, c"joinDuplicateHeaders")?;
-            set_header_lines(scope, req, trailers, true, join)?;
+            set_lines(scope, req, trailers, true)?;
         }
-        call_method(scope, req, c"push", &[scope.root_value(js::value::null())])?;
+        Function::call_by_name(scope, req.handle(), c"push", &[HandleValue::null()])?;
     }
-    read_start(scope, socket)
+    read_start(scope, state)
 }
 
-/// Resume `socket` unless the server paused it or it isn't readable, as Node.js's `readStart`
-/// does.
-pub(super) fn read_start(scope: &Scope<'_>, socket: Object<'_>) -> Result<(), ExnThrown> {
-    if !socket.flag(scope, c"_paused")? && socket.flag(scope, c"readable")? {
-        call_method(scope, socket, c"resume", &[])?;
+/// Resume the socket of the connection `state` unless the server paused it or it isn't
+/// readable, as Node.js's `readStart` does.
+pub(super) fn read_start(scope: &Scope<'_>, state: ConnectionState<'_>) -> Result<(), ExnThrown> {
+    let (paused, socket) = {
+        let data = state.data();
+        (data.paused, data.socket.get(scope))
+    };
+    if paused {
+        return Ok(());
+    }
+    let readable = match crate::stream::state::ReadableSide::try_of(scope, socket)? {
+        Some(side) => side.get().is_readable(),
+        None => js::conversion::to_boolean(socket.get_property(scope, c"readable")?),
+    };
+    if readable {
+        Function::call_by_name(scope, socket.handle(), c"resume", js::function::EmptyArgs)?;
     }
     Ok(())
 }
@@ -477,17 +493,21 @@ fn should_upgrade(
     server: Object<'_>,
     req: Object<'_>,
 ) -> Result<bool, ExnThrown> {
-    let callback = server.val(scope, c"shouldUpgradeCallback")?;
-    if crate::stream::is_function(scope, callback) {
-        let result = crate::stream::call(
+    let callback = server.get_property(scope, c"shouldUpgradeCallback")?;
+    if js::function::is_callable(callback) {
+        let result = Function::call(
             scope,
             server.to_jsval_throwing(scope)?,
             callback,
             &[req.to_jsval_throwing(scope)?],
         )?;
-        return Ok(truthy(scope, result));
+        return Ok(js::conversion::to_boolean(result));
     }
-    Ok(crate::stream::listener_count(scope, server, string(scope, "upgrade")?)? > 0.0)
+    Ok(crate::events::listener_count(
+        scope,
+        server,
+        js::class::get_or_init_atom(scope, c"upgrade")?,
+    )? > 0.0)
 }
 
 /// The default `shouldUpgradeCallback` of a server, whose `this` is the server: whether it has
@@ -497,193 +517,196 @@ pub(super) fn default_should_upgrade(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let server = crate::stream::this_object(scope, &args)?;
-    let count = crate::stream::listener_count(scope, server, string(scope, "upgrade")?)?;
+    let server = crate::support::this_object(scope, &args)?;
+    let count = crate::events::listener_count(
+        scope,
+        server,
+        js::class::get_or_init_atom(scope, c"upgrade")?,
+    )?;
     Ok(js::value::from_bool(count > 0.0))
 }
 
-/// The value of the header `name` of `req`, or `undefined`.
-fn header<'s>(
-    scope: &'s Scope<'_>,
-    req: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<HandleValue<'s>, ExnThrown> {
-    match req.obj(scope, c"headers")? {
-        Some(headers) => headers.val(scope, name),
-        None => Ok(scope.root_value(js::value::undefined())),
-    }
+/// Pause the socket of the connection `state` for the server, and record it in `_paused`.
+fn pause(
+    scope: &Scope<'_>,
+    state: ConnectionState<'_>,
+    socket: Object<'_>,
+) -> Result<(), ExnThrown> {
+    state.data_mut().paused = true;
+    socket.set_property(scope, c"_paused", true)?;
+    Function::call_by_name(scope, socket.handle(), c"pause", js::function::EmptyArgs)?;
+    Ok(())
 }
 
 /// Create the response to `req` and emit the request, as Node.js's `parserOnIncoming` does.
 /// Returns whether the connection is upgraded instead.
 fn on_incoming(
     scope: &Scope<'_>,
-    state: Object<'_>,
+    state: ConnectionState<'_>,
     socket: Object<'_>,
     req: Object<'_>,
+    method: &str,
     keep_alive: bool,
 ) -> Result<bool, ExnThrown> {
-    let server = state.obj(scope, c"server")?.ok_or(ExnThrown)?;
+    let server = state.data().server.get(scope);
     reset_socket_timeout(scope, server, socket, state)?;
-    if req.flag(scope, c"upgrade")? {
-        let connect = crate::stream::is_str(scope, req.val(scope, c"method")?, c"CONNECT")?;
-        let upgrade = connect || should_upgrade(scope, server, req)?;
+    if js::conversion::to_boolean(req.get_property(scope, c"upgrade")?) {
+        let upgrade = method == "CONNECT" || should_upgrade(scope, server, req)?;
         req.set_property(scope, c"upgrade", upgrade)?;
         if upgrade {
             return Ok(true);
         }
     }
-    let incoming = state.obj(scope, c"incoming")?.ok_or(ExnThrown)?;
-    call_method(scope, incoming, c"push", &[req.to_jsval_throwing(scope)?])?;
-    if !socket.flag(scope, c"_paused")? {
-        let need_drain = match socket.obj(scope, c"_writableState")? {
-            Some(writable) => writable.flag(scope, c"needDrain")?,
-            None => false,
-        };
-        let high_water_mark = socket.num(scope, c"writableHighWaterMark")?;
-        if need_drain || state.num(scope, c"outgoingData")? >= high_water_mark {
-            socket.set_property(scope, c"_paused", true)?;
-            call_method(scope, socket, c"pause", &[])?;
+    state.data_mut().incoming.push_back(Heap::from(req));
+    let high_water_mark = match crate::stream::state::WritableSide::try_of(scope, socket)? {
+        Some(side) => side.get().high_water_mark,
+        None => number_or(socket.get_property(scope, c"writableHighWaterMark")?, 0.0),
+    };
+    if !state.data().paused {
+        let need_drain = crate::stream::writable_need_drain(scope, socket)?;
+        if need_drain || state.data().outgoing_data >= high_water_mark {
+            pause(scope, state, socket)?;
         }
     }
 
-    let class = match server.obj(scope, c"_starlingServerResponse")? {
-        Some(class) => class,
-        None => server_response_class::class_constructor(scope)?,
+    let response_class = server_class::state_of(scope, server)?
+        .data()
+        .response_class
+        .get(scope);
+    let reject = server.get_property(scope, c"rejectNonStandardBodyWrites")?;
+    let req_value = req.to_jsval_throwing(scope)?;
+    let keep_alive_timeout = server.get_property(scope, c"keepAliveTimeout")?;
+    let max_requests = server.get_property(scope, c"maxRequestsPerSocket")?;
+    let res = match response_class {
+        Some(response_class) => {
+            let options = Object::new_plain(scope)?;
+            options.set_property(scope, c"highWaterMark", high_water_mark)?;
+            options.set_property(scope, c"rejectNonStandardBodyWrites", reject)?;
+            let options = options.to_jsval_throwing(scope)?;
+            let res = Function::construct(scope, response_class, &[req_value, options])?;
+            super::outgoing::state_of(scope, res)?.data_mut().connection = Some(Heap::from(state));
+            res.set_property(scope, c"_keepAliveTimeout", keep_alive_timeout)?;
+            res.set_property(scope, c"_maxRequestsPerSocket", max_requests)?;
+            let pending_data = state.data().pending_data.get(scope);
+            if let Some(pending_data) = pending_data {
+                res.set_property(scope, c"_onPendingData", pending_data)?;
+            }
+            res.set_property(scope, c"shouldKeepAlive", keep_alive)?;
+            res
+        }
+        None => {
+            let fields = ConnectionFields {
+                keep_alive,
+                keep_alive_timeout,
+                max_requests_per_socket: max_requests,
+                on_pending_data: state.data().pending_data.get(scope),
+            };
+            let reject = js::conversion::to_boolean(reject);
+            let res =
+                super::outgoing::new_response(scope, req, Some(fields), high_water_mark, reject)?;
+            super::outgoing::state_of(scope, res)?.data_mut().connection = Some(Heap::from(state));
+            res
+        }
     };
-    let options = Object::new_plain(scope)?;
-    options.set_property(
-        scope,
-        c"highWaterMark",
-        socket.val(scope, c"writableHighWaterMark")?,
-    )?;
-    let reject = server.val(scope, c"rejectNonStandardBodyWrites")?;
-    options.set_property(scope, c"rejectNonStandardBodyWrites", reject)?;
-    let res = Function::construct(
-        scope,
-        class,
-        &[
-            req.to_jsval_throwing(scope)?,
-            options.to_jsval_throwing(scope)?,
-        ],
-    )?;
-    res.define_property(scope, c"_starlingWire", true, 0)?;
-    res.define_property(
-        scope,
-        c"_starlingRejectBodyWrites",
-        truthy(scope, reject),
-        0,
-    )?;
-    res.define_property(scope, c"_starlingHttp", state, 0)?;
-    res.set_property(
-        scope,
-        c"_keepAliveTimeout",
-        server.val(scope, c"keepAliveTimeout")?,
-    )?;
-    let max_requests = server.val(scope, c"maxRequestsPerSocket")?;
-    res.set_property(scope, c"_maxRequestsPerSocket", max_requests)?;
-    res.set_property(scope, c"shouldKeepAlive", keep_alive)?;
-    res.set_property(scope, c"socket", js::value::null())?;
-    res.set_property(scope, c"connection", js::value::null())?;
-    if truthy(scope, socket.val(scope, c"_httpMessage")?) {
-        let outgoing = state.obj(scope, c"outgoing")?.ok_or(ExnThrown)?;
-        call_method(scope, outgoing, c"push", &[res.to_jsval_throwing(scope)?])?;
+    let writing = state.data().current.is_some();
+    if writing {
+        state.data_mut().outgoing.push_back(Heap::from(res));
     } else {
-        call_method(
+        Function::call_by_name(
             scope,
-            res,
+            res.handle(),
             c"assignSocket",
             &[socket.to_jsval_throwing(scope)?],
         )?;
     }
-    let on_finish = closure(
-        scope,
-        0,
-        res_on_finish,
-        &[
-            req.to_jsval_raw_throwing(scope)?,
-            res.to_jsval_raw_throwing(scope)?,
-            socket.to_jsval_raw_throwing(scope)?,
-            state.to_jsval_raw_throwing(scope)?,
-            server.to_jsval_raw_throwing(scope)?,
-        ],
-    )?;
-    listen(scope, res, c"on", "finish", on_finish)?;
+    let on_finish = crate::support::shared_function(scope, res_on_finish, 0)?;
+    crate::events::listen(scope, res, c"on", c"finish", on_finish)?;
 
-    let req_value = req.to_jsval_throwing(scope)?;
     let res_value = res.to_jsval_throwing(scope)?;
     let mut handled = false;
-    if req.num(scope, c"httpVersionMajor")? == 1.0 && req.num(scope, c"httpVersionMinor")? == 1.0 {
-        if server.flag(scope, c"requireHostHeader")? && header(scope, req, c"host")?.is_undefined()
-        {
+    let major = number_or(req.get_property(scope, c"httpVersionMajor")?, 0.0);
+    let minor = number_or(req.get_property(scope, c"httpVersionMinor")?, 0.0);
+    if major == 1.0 && minor == 1.0 {
+        let require_host =
+            js::conversion::to_boolean(server.get_property(scope, c"requireHostHeader")?);
+        if require_host && super::incoming::header_text(scope, req, "host")?.is_none() {
             let headers = js::Array::with_contents(
                 scope,
-                &[string(scope, "Connection")?, string(scope, "close")?],
+                &[
+                    js::class::get_or_init_atom(scope, c"Connection")?,
+                    js::class::get_or_init_atom(scope, c"close")?,
+                ],
             )?;
             let status = scope.root_value(js::value::from_f64(400.0));
-            call_method(
+            Function::call_by_name(
                 scope,
-                res,
+                res.handle(),
                 c"writeHead",
                 &[status, headers.to_jsval_throwing(scope)?],
             )?;
-            call_method(scope, res, c"end", &[])?;
+            Function::call_by_name(scope, res.handle(), c"end", js::function::EmptyArgs)?;
             return Ok(false);
         }
-        let max = if max_requests.is_number() {
-            max_requests.to_number()
-        } else {
-            0.0
-        };
+        let max = number_or(max_requests, 0.0);
         let count = if max > 0.0 {
-            let count = state.num(scope, c"requestsCount")? + 1.0;
-            state.set_property(scope, c"requestsCount", count)?;
+            let count = {
+                let mut data = state.data_mut();
+                data.requests_count += 1.0;
+                data.requests_count
+            };
             res.set_property(scope, c"maxRequestsOnConnectionReached", max <= count)?;
             count
         } else {
             0.0
         };
-        let expect = header(scope, req, c"expect")?;
+        let expect = super::incoming::header_text(scope, req, "expect")?;
         if max > 0.0 && max < count {
             handled = true;
-            crate::stream::emit(
+            crate::events::emit(
                 scope,
                 server,
-                "dropRequest",
+                c"dropRequest",
                 &[req_value, socket.to_jsval_throwing(scope)?],
             )?;
             let status = scope.root_value(js::value::from_f64(503.0));
-            call_method(scope, res, c"writeHead", &[status])?;
-            call_method(scope, res, c"end", &[])?;
-        } else if !expect.is_undefined() {
+            Function::call_by_name(scope, res.handle(), c"writeHead", &[status])?;
+            Function::call_by_name(scope, res.handle(), c"end", js::function::EmptyArgs)?;
+        } else if let Some(expect) = expect {
             handled = true;
-            let expect = String::from_jsval(scope, expect, ()).unwrap_or_default();
             if super::wire::has_word(&expect, "100-continue") {
                 res.set_property(scope, c"_expect_continue", true)?;
-                let listeners =
-                    crate::stream::listener_count(scope, server, string(scope, "checkContinue")?)?;
+                let listeners = crate::events::listener_count(
+                    scope,
+                    server,
+                    js::class::get_or_init_atom(scope, c"checkContinue")?,
+                )?;
                 if listeners > 0.0 {
-                    crate::stream::emit(scope, server, "checkContinue", &[req_value, res_value])?;
+                    crate::events::emit(scope, server, c"checkContinue", &[req_value, res_value])?;
                 } else {
-                    call_method(scope, res, c"writeContinue", &[])?;
-                    crate::stream::emit(scope, server, "request", &[req_value, res_value])?;
+                    Function::call_by_name(
+                        scope,
+                        res.handle(),
+                        c"writeContinue",
+                        js::function::EmptyArgs,
+                    )?;
+                    crate::events::emit(scope, server, c"request", &[req_value, res_value])?;
                 }
-            } else if crate::stream::listener_count(
+            } else if crate::events::listener_count(
                 scope,
                 server,
-                string(scope, "checkExpectation")?,
+                js::class::get_or_init_atom(scope, c"checkExpectation")?,
             )? > 0.0
             {
-                crate::stream::emit(scope, server, "checkExpectation", &[req_value, res_value])?;
+                crate::events::emit(scope, server, c"checkExpectation", &[req_value, res_value])?;
             } else {
                 let status = scope.root_value(js::value::from_f64(417.0));
-                call_method(scope, res, c"writeHead", &[status])?;
-                call_method(scope, res, c"end", &[])?;
+                Function::call_by_name(scope, res.handle(), c"writeHead", &[status])?;
+                Function::call_by_name(scope, res.handle(), c"end", js::function::EmptyArgs)?;
             }
         }
     }
     if !handled {
-        crate::stream::emit(scope, server, "request", &[req_value, res_value])?;
+        crate::events::emit(scope, server, c"request", &[req_value, res_value])?;
     }
     Ok(false)
 }
@@ -693,228 +716,232 @@ fn reset_socket_timeout(
     scope: &Scope<'_>,
     server: Object<'_>,
     socket: Object<'_>,
-    state: Object<'_>,
+    state: ConnectionState<'_>,
 ) -> Result<(), ExnThrown> {
-    if !state.flag(scope, c"keepAliveTimeoutSet")? {
+    if !std::mem::take(&mut state.data_mut().keep_alive_timeout_set) {
         return Ok(());
     }
-    let timeout = server.val(scope, c"timeout")?;
-    let timeout = if truthy(scope, timeout) {
+    let timeout = server.get_property(scope, c"timeout")?;
+    let timeout = if js::conversion::to_boolean(timeout) {
         timeout
     } else {
         scope.root_value(js::value::from_f64(0.0))
     };
-    call_method(scope, socket, c"setTimeout", &[timeout])?;
-    state.set_property(scope, c"keepAliveTimeoutSet", false)?;
+    Function::call_by_name(scope, socket.handle(), c"setTimeout", &[timeout])?;
     Ok(())
 }
 
 /// Close `socket` once it wrote everything, through its `destroySoon` if it has one.
 fn destroy_soon(scope: &Scope<'_>, socket: Object<'_>) -> Result<(), ExnThrown> {
-    if has_method(scope, socket, c"destroySoon")? {
-        call_method(scope, socket, c"destroySoon", &[])?;
+    let method = if crate::support::has_method(scope, socket, c"destroySoon")? {
+        c"destroySoon"
     } else {
-        call_method(scope, socket, c"end", &[])?;
-    }
+        c"end"
+    };
+    Function::call_by_name(scope, socket.handle(), method, js::function::EmptyArgs)?;
     Ok(())
 }
 
-/// The `finish` listener of a response, whose captures are `[req, res, socket, state, server]`:
-/// read the rest of the request if nothing reads it, detach the response from the socket, and
-/// close the connection if the response was the last, or give the socket to the next response,
-/// as Node.js's `resOnFinish` does. Between requests, the socket times out after the server's
+/// The `finish` listener of a response of a connection, whose `this` is the response: read the
+/// rest of the request if nothing reads it, detach the response from the socket, and close the
+/// connection if the response was the last, or give the socket to the next response, as
+/// Node.js's `resOnFinish` does. Between requests, the socket times out after the server's
 /// `keepAliveTimeout` plus `keepAliveTimeoutBuffer`. After a response that finishes once `close`
 /// was called on the server, the connection is destroyed if it is still between requests
 /// [`CLOSING_IDLE_DELAY`] milliseconds later.
 fn res_on_finish(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let req = captures.obj(0)?;
-    let res = captures.obj(1)?;
-    let socket = captures.obj(2)?;
-    let state = captures.obj(3)?;
-    let server = captures.obj(4)?;
-    let incoming = state.obj(scope, c"incoming")?.ok_or(ExnThrown)?;
-    remove_from(scope, incoming, req)?;
-    let resume_scheduled = match req.obj(scope, c"_readableState")? {
-        Some(readable) => readable.flag(scope, c"resumeScheduled")?,
-        None => false,
+    let res = crate::support::this_object(scope, &args)?;
+    let response = super::outgoing::state_of(scope, res)?;
+    let (req, state) = {
+        let data = response.data();
+        (data.request.get(scope), data.connection.get(scope))
     };
-    if !req.flag(scope, c"_consuming")? && !resume_scheduled {
-        call_method(scope, req, c"_dump", &[])?;
+    let (Some(req), Some(state)) = (req, state) else {
+        return Ok(js::value::undefined());
+    };
+    let (socket, server) = {
+        let mut data = state.data_mut();
+        data.incoming.pop_front();
+        (data.socket.get(scope), data.server.get(scope))
+    };
+    let resume_scheduled = crate::stream::readable_resume_scheduled(scope, req)?;
+    if !js::conversion::to_boolean(req.get_property(scope, c"_consuming")?) && !resume_scheduled {
+        Function::call_by_name(scope, req.handle(), c"_dump", js::function::EmptyArgs)?;
     }
-    call_method(
+    Function::call_by_name(
         scope,
-        res,
+        res.handle(),
         c"detachSocket",
         &[socket.to_jsval_throwing(scope)?],
     )?;
-    clear_incoming(scope, req)?;
-    let job = Function::new_callback(scope, c"", 0, emit_close_job, res)?;
-    js::jobs::queue_tick(scope, job.to_jsval_throwing(scope)?, &[])?;
-    let outgoing = state.obj(scope, c"outgoing")?.ok_or(ExnThrown)?;
-    if res.flag(scope, c"_last")? {
+    clear_incoming(scope, state, req)?;
+    js::jobs::queue_native_tick(scope, emit_close_tick, res, &[])?;
+    let (waiting, next) = {
+        let mut data = state.data_mut();
+        let waiting = !data.outgoing.is_empty();
+        let next = data.outgoing.front().map(|next| next.get(scope));
+        drop(data.outgoing.pop_front());
+        (waiting, next)
+    };
+    if js::conversion::to_boolean(res.get_property(scope, c"_last")?) {
         destroy_soon(scope, socket)?;
-    } else if length(scope, outgoing)? == 0 {
-        if server.flag(scope, c"_starlingClosing")? {
-            let check = closure(
+    } else if !waiting {
+        let closing = server_class::state_of(scope, server)?.data().closing;
+        if closing {
+            let check = crate::support::shared_function(scope, close_if_idle, 0)?;
+            let check = js::Callable::from_jsval(scope, check.to_jsval_throwing(scope)?, ())
+                .map_err(|e| e.throw(scope))?;
+            if let Some(id) = core_runtime::event_loop::timer::start_timer(
                 scope,
-                0,
-                close_if_idle,
-                &[socket.to_jsval_raw_throwing(scope)?],
-            )?;
-            let set = scope.global().val(scope, c"setTimeout")?;
-            let delay = scope.root_value(js::value::from_f64(CLOSING_IDLE_DELAY));
-            let timer = Function::call(
-                scope,
-                js::value::undefined(),
-                set,
-                &[check.to_jsval_throwing(scope)?, delay],
-            )?;
-            if let Ok(timer) = Object::from_value(scope, *timer) {
-                if has_method(scope, timer, c"unref")? {
-                    call_method(scope, timer, c"unref", &[])?;
-                }
+                check,
+                state.as_object().to_jsval_throwing(scope)?,
+                &[],
+                Duration::from_millis(CLOSING_IDLE_DELAY),
+                false,
+                None,
+            ) {
+                core_runtime::event_loop::with_active_event_loop(|el| {
+                    el.set_js_timer_ref(id, false)
+                });
             }
             return Ok(js::value::undefined());
         }
-        let timeout = server.val(scope, c"keepAliveTimeout")?;
-        let timeout = if timeout.is_number() && timeout.to_number() >= 0.0 {
-            timeout.to_number()
-        } else {
-            0.0
-        };
-        let buffer = server.val(scope, c"keepAliveTimeoutBuffer")?;
+        let timeout = number_or(server.get_property(scope, c"keepAliveTimeout")?, 0.0).max(0.0);
+        let buffer = server.get_property(scope, c"keepAliveTimeoutBuffer")?;
         let buffer = if buffer.is_number() && buffer.to_number() >= 0.0 {
             buffer.to_number()
         } else {
             1000.0
         };
-        if timeout != 0.0 && has_method(scope, socket, c"setTimeout")? {
+        if timeout != 0.0 && crate::support::has_method(scope, socket, c"setTimeout")? {
             let delay = scope.root_value(js::value::from_f64(timeout + buffer));
-            call_method(scope, socket, c"setTimeout", &[delay])?;
-            state.set_property(scope, c"keepAliveTimeoutSet", true)?;
+            Function::call_by_name(scope, socket.handle(), c"setTimeout", &[delay])?;
+            state.data_mut().keep_alive_timeout_set = true;
         }
-    } else {
-        let next = call_method(scope, outgoing, c"shift", &[])?;
-        if let Ok(next) = Object::from_value(scope, *next) {
-            call_method(
-                scope,
-                next,
-                c"assignSocket",
-                &[socket.to_jsval_throwing(scope)?],
-            )?;
-        }
-    }
-    Ok(js::value::undefined())
-}
-
-/// The milliseconds after which a connection of a closed server that is still between requests
-/// is destroyed.
-const CLOSING_IDLE_DELAY: f64 = 500.0;
-
-/// The timer callback of a connection of a closed server, whose captures are `[socket]`: destroy
-/// the socket if it is between requests and has no response in progress.
-fn close_if_idle(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let socket = Captures::of(scope, payload)?.obj(0)?;
-    if socket.flag(scope, c"destroyed")? || truthy(scope, socket.val(scope, c"_httpMessage")?) {
-        return Ok(js::value::undefined());
-    }
-    let active = match state_of(scope, socket)? {
-        Some(state) => match parser_of(scope, state)? {
-            Some(handle) => handle.data().parser.active(),
-            None => true,
-        },
-        None => true,
-    };
-    if !active {
-        call_method(scope, socket, c"destroy", &[])?;
-    }
-    Ok(js::value::undefined())
-}
-
-/// Clear the `incoming` request of the parser of the socket of `req` once `req` ended, as
-/// Node.js's `clearIncoming` does.
-fn clear_incoming(scope: &Scope<'_>, req: Object<'_>) -> Result<(), ExnThrown> {
-    let Some(socket) = req.obj(scope, c"socket")? else {
-        return Ok(());
-    };
-    let Some(parser) = socket.obj(scope, c"parser")? else {
-        return Ok(());
-    };
-    let incoming = parser.val(scope, c"incoming")?;
-    if !crate::stream::same(scope, incoming, req.to_jsval_throwing(scope)?)? {
-        return Ok(());
-    }
-    if req.flag(scope, c"readableEnded")? {
-        parser.set_property(scope, c"incoming", js::value::null())?;
-    } else {
-        listen(
+    } else if let Some(next) = next {
+        Function::call_by_name(
             scope,
-            req,
-            c"on",
-            "end",
-            shared(scope, clear_incoming_on_end, 0)?,
+            next.handle(),
+            c"assignSocket",
+            &[socket.to_jsval_throwing(scope)?],
         )?;
     }
-    Ok(())
+    Ok(js::value::undefined())
 }
 
-/// The `end` listener of a request whose `incoming` parser entry waits for its end, whose `this`
-/// is the request.
-fn clear_incoming_on_end(
+/// The timer callback for a connection of a closed server, whose `this` is the connection:
+/// destroy the socket if it is between requests and has no response in progress.
+fn close_if_idle(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let req = crate::stream::this_object(scope, &args)?;
-    clear_incoming(scope, req)?;
+    let this = crate::support::this_object(scope, &args)?;
+    let state = this
+        .cast::<ConnectionState>()
+        .map_err(|_| js::error::TypeError("not a connection".into()).throw(scope))?;
+    let (socket, writing, active) = {
+        let data = state.data();
+        let active = match data.parser.get(scope) {
+            Some(handle) => handle.data().parser.active(),
+            None => true,
+        };
+        (data.socket.get(scope), data.current.is_some(), active)
+    };
+    if socket_destroyed(scope, socket)? || writing || active {
+        return Ok(js::value::undefined());
+    }
+    Function::call_by_name(scope, socket.handle(), c"destroy", js::function::EmptyArgs)?;
     Ok(js::value::undefined())
 }
 
-/// The `end` listener of a connection, whose captures are `[state]`: report a request the peer
-/// cut off, and otherwise end the socket, as Node.js's `socketOnEnd` does.
+/// Clear the request the parser of the connection `state` parses if it is `req`, once `req`
+/// ended, as Node.js's `clearIncoming` does.
+fn clear_incoming(
+    scope: &Scope<'_>,
+    state: ConnectionState<'_>,
+    req: Object<'_>,
+) -> Result<(), ExnThrown> {
+    let Some(handle) = state.data().parser.get(scope) else {
+        return Ok(());
+    };
+    let parsing = handle
+        .data()
+        .incoming
+        .get(scope)
+        .is_some_and(|incoming| incoming.handle().get() == req.handle().get());
+    if !parsing {
+        return Ok(());
+    }
+    let ended = crate::stream::state::ReadableSide::try_of(scope, req)?
+        .is_some_and(|side| side.has(crate::stream::state::R::END_EMITTED));
+    if ended {
+        handle.data_mut().incoming = None;
+    } else {
+        let listener = Function::new_callback(scope, c"", 0, clear_incoming_on_end, state)?;
+        crate::events::listen(scope, req, c"on", c"end", *listener)?;
+    }
+    Ok(())
+}
+
+/// The `end` listener of a request whose parser waits for its end, whose `this` is the request
+/// and whose payload is the connection.
+fn clear_incoming_on_end(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let req = crate::support::this_object(scope, &args)?;
+    clear_incoming(scope, cast_payload::<ConnectionState>(scope, payload), req)?;
+    Ok(js::value::undefined())
+}
+
+/// The `end` listener of a connection, whose payload is the connection: report a request the
+/// peer cut off, and otherwise end the socket, as Node.js's `socketOnEnd` does.
 fn socket_on_end(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    let socket = state.obj(scope, c"socket")?.ok_or(ExnThrown)?;
-    let server = state.obj(scope, c"server")?.ok_or(ExnThrown)?;
-    let result = match parser_of(scope, state)? {
+    let state = cast_payload::<ConnectionState>(scope, payload);
+    let (socket, server) = {
+        let data = state.data();
+        (data.socket.get(scope), data.server.get(scope))
+    };
+    let result = match state.data().parser.get(scope) {
         Some(handle) => handle.data_mut().parser.finish(),
         None => Ok(()),
     };
     if let Err(error) = result {
         let raw = new_buffer(scope, &[])?.to_jsval_throwing(scope)?;
         let error = parse_error_value(scope, &error, raw)?;
-        socket_error(scope, socket, error)?;
+        socket_error(scope, state, error)?;
         return Ok(js::value::undefined());
     }
-    let outgoing = state.obj(scope, c"outgoing")?.ok_or(ExnThrown)?;
-    if !server.flag(scope, c"httpAllowHalfOpen")? {
-        call_method(scope, socket, c"end", &[])?;
-    } else if length(scope, outgoing)? > 0 {
-        let last = elements(scope, outgoing)?.pop().ok_or(ExnThrown)?;
-        let last = Object::from_value(scope, *last).map_err(|e| e.throw(scope))?;
+    let (last, current) = {
+        let data = state.data();
+        (
+            data.outgoing.back().map(|last| last.get(scope)),
+            data.current.get(scope),
+        )
+    };
+    if !js::conversion::to_boolean(server.get_property(scope, c"httpAllowHalfOpen")?) {
+        Function::call_by_name(scope, socket.handle(), c"end", js::function::EmptyArgs)?;
+    } else if let Some(last) = last {
         last.set_property(scope, c"_last", true)?;
-    } else if let Some(message) = socket.obj(scope, c"_httpMessage")? {
+    } else if let Some(message) = current {
         message.set_property(scope, c"_last", true)?;
     } else {
-        call_method(scope, socket, c"end", &[])?;
+        Function::call_by_name(scope, socket.handle(), c"end", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
 }
 
-/// The `close` listener of a connection, whose captures are `[state]`: release the parser and
+/// The `close` listener of a connection, whose payload is the connection: release the parser and
 /// destroy the requests and responses still waiting with an `ECONNRESET` error, as Node.js's
 /// `socketOnClose` does.
 fn socket_on_close(
@@ -922,21 +949,23 @@ fn socket_on_close(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    let socket = state.obj(scope, c"socket")?.ok_or(ExnThrown)?;
-    free_parser(scope, state, socket)?;
-    for name in [c"incoming", c"outgoing"] {
-        let queue = state.obj(scope, name)?.ok_or(ExnThrown)?;
-        let messages = elements(scope, queue)?;
-        state.set_property(scope, name, *js::Array::new(scope, 0)?)?;
-        for message in messages {
-            let message = Object::from_value(scope, *message).map_err(|e| e.throw(scope))?;
-            let error = crate::stream::error_value(
-                scope,
-                NodeError::new(ErrorKind::Error, "ECONNRESET", "aborted"),
-            )?;
-            call_method(scope, message, c"destroy", &[error])?;
-        }
+    let state = cast_payload::<ConnectionState>(scope, payload);
+    free_parser(scope, state)?;
+    let waiting: Vec<Object<'_>> = {
+        let mut data = state.data_mut();
+        let waiting = data
+            .incoming
+            .iter()
+            .chain(&data.outgoing)
+            .map(|message| message.get(scope))
+            .collect();
+        data.incoming.clear();
+        data.outgoing.clear();
+        waiting
+    };
+    for message in waiting {
+        let error = NodeError::new(ErrorKind::Error, "ECONNRESET", "aborted").to_value(scope)?;
+        Function::call_by_name(scope, message.handle(), c"destroy", &[error])?;
     }
     Ok(js::value::undefined())
 }
@@ -944,63 +973,60 @@ fn socket_on_close(
 /// Resume the socket of the connection `state` once the responses waiting for it queue less than
 /// its high water mark, and emit `drain` on its current response once that has nothing left to
 /// write, as Node.js's `socketOnDrain` does.
-fn drain(scope: &Scope<'_>, state: Object<'_>) -> Result<(), ExnThrown> {
-    let Some(socket) = state.obj(scope, c"socket")? else {
-        return Ok(());
+fn drain(scope: &Scope<'_>, state: ConnectionState<'_>) -> Result<(), ExnThrown> {
+    let (socket, paused, outgoing_data, current) = {
+        let data = state.data();
+        (
+            data.socket.get(scope),
+            data.paused,
+            data.outgoing_data,
+            data.current.get(scope),
+        )
     };
-    let need_pause =
-        state.num(scope, c"outgoingData")? > socket.num(scope, c"writableHighWaterMark")?;
-    if socket.flag(scope, c"_paused")? && !need_pause {
+    let high_water_mark = match crate::stream::state::WritableSide::try_of(scope, socket)? {
+        Some(side) => side.get().high_water_mark,
+        None => number_or(socket.get_property(scope, c"writableHighWaterMark")?, 0.0),
+    };
+    if paused && outgoing_data <= high_water_mark {
+        state.data_mut().paused = false;
         socket.set_property(scope, c"_paused", false)?;
-        call_method(scope, socket, c"resume", &[])?;
+        Function::call_by_name(scope, socket.handle(), c"resume", js::function::EmptyArgs)?;
     }
-    let Some(message) = socket.obj(scope, c"_httpMessage")? else {
+    let Some(message) = current else {
         return Ok(());
     };
-    let pending = message.num(scope, c"outputSize")? + socket.num(scope, c"writableLength")?;
-    if !message.flag(scope, c"finished")?
-        && message.flag(scope, c"writableNeedDrain")?
-        && pending == 0.0
-    {
-        message.set_property(scope, c"writableNeedDrain", false)?;
-        call_method(scope, message, c"emit", &[string(scope, "drain")?])?;
+    let response = super::outgoing::state_of(scope, message)?;
+    let (ended, need_drain, output) = {
+        let data = response.data();
+        (data.ended, data.need_drain, data.output_size)
+    };
+    let pending = output + super::outgoing::socket_writable_length(scope, socket)?;
+    if !ended && need_drain && pending == 0.0 {
+        response.data_mut().need_drain = false;
+        crate::events::emit(scope, message, c"drain", &[])?;
     }
     Ok(())
 }
 
-/// The `drain` listener of a connection, whose captures are `[state]`.
+/// The `drain` listener of a connection, whose payload is the connection.
 fn socket_on_drain(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    drain(scope, state)?;
+    drain(scope, cast_payload::<ConnectionState>(scope, payload))?;
     Ok(js::value::undefined())
 }
 
-/// Add `delta` to the bytes the responses of the connection of `message` queued, and resume the
+/// Add `delta` to the bytes the responses of the connection `state` queued, and resume the
 /// socket or emit `drain` as that allows.
 pub(super) fn update_outgoing_data(
     scope: &Scope<'_>,
-    message: Object<'_>,
+    state: ConnectionState<'_>,
     delta: f64,
 ) -> Result<(), ExnThrown> {
-    let Some(state) = message.obj(scope, c"_starlingHttp")? else {
-        return Ok(());
-    };
-    let total = state.num(scope, c"outgoingData")? + delta;
-    state.set_property(scope, c"outgoingData", total)?;
+    state.data_mut().outgoing_data += delta;
     drain(scope, state)
-}
-
-/// A listener that does nothing, which keeps a socket's later errors from being thrown.
-fn noop(
-    _scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    Ok(js::value::undefined())
 }
 
 /// The response a server writes to a connection whose request failed with the error code `code`.
@@ -1017,123 +1043,122 @@ fn error_response(code: &str) -> &'static [u8] {
     }
 }
 
-/// Report the error `error` of the connection of `socket` as Node.js's `socketOnError` does: emit
+/// Report the error `error` of the connection `state` as Node.js's `socketOnError` does: emit
 /// `clientError` on the server with the error and the socket, or, without listeners, write the
 /// response for the error unless the current response sent its header, and destroy the socket.
 fn socket_error(
     scope: &Scope<'_>,
-    socket: Object<'_>,
+    state: ConnectionState<'_>,
     error: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    listen(
+    let (socket, server, error_listener, current) = {
+        let data = state.data();
+        (
+            data.socket.get(scope),
+            data.server.get(scope),
+            data.listeners.get(4).map(|listener| listener.get(scope)),
+            data.current.get(scope),
+        )
+    };
+    if let Some(listener) = error_listener {
+        crate::events::listen(scope, socket, c"removeListener", c"error", listener)?;
+    }
+    let error_event = js::class::get_or_init_atom(scope, c"error")?;
+    let noop = crate::support::noop_function(scope)?;
+    let noops = Function::call_by_name(
         scope,
-        socket,
-        c"removeListener",
-        "error",
-        shared(scope, socket_on_error, 1)?,
-    )?;
-    let error_event = string(scope, "error")?;
-    let noop = shared(scope, noop, 0)?;
-    let noops = call_method(
-        scope,
-        socket,
+        socket.handle(),
         c"listenerCount",
         &[error_event, noop.to_jsval_throwing(scope)?],
     )?;
-    if !truthy(scope, noops) {
-        listen(scope, socket, c"on", "error", noop)?;
+    if !js::conversion::to_boolean(noops) {
+        crate::events::listen(scope, socket, c"on", c"error", noop)?;
     }
-    let Some(server) = socket.obj(scope, c"server")? else {
-        call_method(scope, socket, c"destroy", &[error])?;
-        return Ok(());
-    };
-    let handled = crate::stream::emit(
+    let handled = crate::events::emit(
         scope,
         server,
-        "clientError",
+        c"clientError",
         &[error, socket.to_jsval_throwing(scope)?],
     )?;
     if handled {
         return Ok(());
     }
-    let header_sent = match socket.obj(scope, c"_httpMessage")? {
+    let header_sent = match current {
         Some(message) => {
-            message.val(scope, c"_header")?.is_string()
-                && !message.flag(scope, c"_starlingHeaderPending")?
+            let response = super::outgoing::state_of(scope, message)?;
+            let data = response.data();
+            data.header_stored && data.header.is_none()
         }
         None => false,
     };
-    if socket.flag(scope, c"writable")? && !header_sent {
+    let writable = match crate::stream::state::WritableSide::try_of(scope, socket)? {
+        Some(side) => side.get().is_writable(),
+        None => js::conversion::to_boolean(socket.get_property(scope, c"writable")?),
+    };
+    if writable && !header_sent {
         let code = match Object::from_value(scope, *error) {
-            Ok(error) => crate::stream::rust_string(scope, error.val(scope, c"code")?),
+            Ok(error) => crate::support::rust_string(scope, error.get_property(scope, c"code")?),
             Err(_) => None,
         };
         let response = error_response(code.as_deref().unwrap_or_default());
         let response = new_buffer(scope, response)?.to_jsval_throwing(scope)?;
-        call_method(scope, socket, c"write", &[response])?;
+        Function::call_by_name(scope, socket.handle(), c"write", &[response])?;
     }
-    call_method(scope, socket, c"destroy", &[error])?;
+    Function::call_by_name(scope, socket.handle(), c"destroy", &[error])?;
     Ok(())
 }
 
-/// The `error` listener of a connection, whose `this` is the socket.
+/// The `error` listener of a connection, whose payload is the connection.
 fn socket_on_error(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
-    _payload: HandleValue,
+    payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let socket = crate::stream::this_object(scope, &args)?;
-    socket_error(scope, socket, args.get(0))?;
+    socket_error(
+        scope,
+        cast_payload::<ConnectionState>(scope, payload),
+        args.get(0),
+    )?;
     Ok(js::value::undefined())
 }
 
-/// The `timeout` listener of a connection, whose `this` is the socket: emit `timeout` with the
-/// socket on the request being parsed, the current response and the server, and destroy the
+/// The `timeout` listener of a connection, whose payload is the connection: emit `timeout` with
+/// the socket on the request being parsed, the current response and the server, and destroy the
 /// socket if none of them has a listener, as Node.js's `socketOnTimeout` does.
 fn socket_on_timeout(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let socket = crate::stream::this_object(scope, &args)?;
+    let state = cast_payload::<ConnectionState>(scope, payload);
+    let (socket, server, req, res) = {
+        let data = state.data();
+        let req = match data.parser.get(scope) {
+            Some(handle) => handle.data().incoming.get(scope),
+            None => None,
+        };
+        (
+            data.socket.get(scope),
+            data.server.get(scope),
+            req,
+            data.current.get(scope),
+        )
+    };
     let socket_value = socket.to_jsval_throwing(scope)?;
     let mut handled = false;
-    if let Some(parser) = socket.obj(scope, c"parser")? {
-        if let Some(req) = parser.obj(scope, c"incoming")? {
-            if !req.flag(scope, c"complete")? {
-                handled |= crate::stream::emit(scope, req, "timeout", &[socket_value])?;
-            }
+    if let Some(req) = req {
+        if !js::conversion::to_boolean(req.get_property(scope, c"complete")?) {
+            handled |= crate::events::emit(scope, req, c"timeout", &[socket_value])?;
         }
     }
-    if let Some(res) = socket.obj(scope, c"_httpMessage")? {
-        handled |= crate::stream::emit(scope, res, "timeout", &[socket_value])?;
+    if let Some(res) = res {
+        handled |= crate::events::emit(scope, res, c"timeout", &[socket_value])?;
     }
-    if let Some(server) = socket.obj(scope, c"server")? {
-        handled |= crate::stream::emit(scope, server, "timeout", &[socket_value])?;
-    }
+    handled |= crate::events::emit(scope, server, c"timeout", &[socket_value])?;
     if !handled {
-        call_method(scope, socket, c"destroy", &[])?;
+        Function::call_by_name(scope, socket.handle(), c"destroy", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
-}
-
-/// The `close` listener a response adds to its socket, whose `this` is the socket: emit `close`
-/// on the socket's current response.
-fn on_response_socket_close(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let socket = crate::stream::this_object(scope, &args)?;
-    if let Some(message) = socket.obj(scope, c"_httpMessage")? {
-        super::outgoing::emit_close(scope, message)?;
-    }
-    Ok(js::value::undefined())
-}
-
-/// The shared `close` listener a response adds to the socket it is assigned.
-pub(super) fn response_close_listener<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    shared(scope, on_response_socket_close, 0)
 }
 
 /// Destroy the open connections of `server`, or only those between requests and without a
@@ -1143,44 +1168,50 @@ pub(super) fn close_connections(
     server: Object<'_>,
     idle_only: bool,
 ) -> Result<(), ExnThrown> {
-    let Some(list) = server.obj(scope, c"_starlingConnections")? else {
-        return Ok(());
-    };
-    for socket in elements(scope, list)? {
-        let socket = Object::from_value(scope, *socket).map_err(|e| e.throw(scope))?;
-        if idle_only {
-            let active = match state_of(scope, socket)? {
-                Some(state) => match parser_of(scope, state)? {
-                    Some(handle) => handle.data().parser.active(),
-                    None => false,
-                },
+    let connections: Vec<Object<'_>> = server_class::state_of(scope, server)?
+        .data()
+        .connections
+        .iter()
+        .map(|connection| connection.get(scope))
+        .collect();
+    for connection in connections {
+        let Ok(state) = connection.cast::<ConnectionState>() else {
+            continue;
+        };
+        let (socket, active, current) = {
+            let data = state.data();
+            let active = match data.parser.get(scope) {
+                Some(handle) => handle.data().parser.active(),
                 None => false,
             };
+            (data.socket.get(scope), active, data.current.get(scope))
+        };
+        if idle_only {
             if active {
                 continue;
             }
-            if let Some(message) = socket.obj(scope, c"_httpMessage")? {
-                if !message.flag(scope, c"finished")? {
+            if let Some(message) = current {
+                if !super::outgoing::state_of(scope, message)?.data().ended {
                     continue;
                 }
             }
         }
-        call_method(scope, socket, c"destroy", &[])?;
+        Function::call_by_name(scope, socket.handle(), c"destroy", js::function::EmptyArgs)?;
     }
     Ok(())
 }
 
-/// The interval callback of a listening server, whose captures are `[server]`: fail the requests
-/// that exceeded the server's `headersTimeout` or `requestTimeout` with
-/// `ERR_HTTP_REQUEST_TIMEOUT`, as Node.js's `checkConnections` does.
+/// The callback of the timer that checks the connections of a listening server, whose `this` is
+/// the server: fail the requests that exceeded the server's `headersTimeout` or `requestTimeout`
+/// with `ERR_HTTP_REQUEST_TIMEOUT`, as Node.js's `checkConnections` does.
 fn check_connections(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let server = Captures::of(scope, payload)?.obj(0)?;
+    let server = crate::support::this_object(scope, &args)?;
     let timeout = |name: &'static std::ffi::CStr| -> Result<f64, ExnThrown> {
-        let value = server.val(scope, name)?;
+        let value = server.get_property(scope, name)?;
         Ok(
             if value.is_number() && value.to_number().is_finite() && value.to_number() >= 0.0 {
                 value.to_number()
@@ -1194,16 +1225,18 @@ fn check_connections(
     if headers_timeout == 0.0 && request_timeout == 0.0 {
         return Ok(js::value::undefined());
     }
-    let Some(list) = server.obj(scope, c"_starlingConnections")? else {
-        return Ok(js::value::undefined());
-    };
+    let connections: Vec<Object<'_>> = server_class::state_of(scope, server)?
+        .data()
+        .connections
+        .iter()
+        .map(|connection| connection.get(scope))
+        .collect();
     let now = super::parser::now_ms();
-    for socket in elements(scope, list)? {
-        let socket = Object::from_value(scope, *socket).map_err(|e| e.throw(scope))?;
-        let Some(state) = state_of(scope, socket)? else {
+    for connection in connections {
+        let Ok(state) = connection.cast::<ConnectionState>() else {
             continue;
         };
-        let Some(handle) = parser_of(scope, state)? else {
+        let Some(handle) = state.data().parser.get(scope) else {
             continue;
         };
         let expired = {
@@ -1215,64 +1248,62 @@ fn check_connections(
             expired
         };
         if expired {
-            let error = crate::stream::error_value(
-                scope,
-                NodeError::new(
-                    ErrorKind::Error,
-                    "ERR_HTTP_REQUEST_TIMEOUT",
-                    "Request timeout",
-                ),
-            )?;
-            socket_error(scope, socket, error)?;
+            let error = NodeError::new(
+                ErrorKind::Error,
+                "ERR_HTTP_REQUEST_TIMEOUT",
+                "Request timeout",
+            )
+            .to_value(scope)?;
+            socket_error(scope, state, error)?;
         }
     }
     Ok(js::value::undefined())
 }
 
 /// The `listening` listener of an `http.Server`, whose `this` is the server: check its
-/// connections for timed-out requests every `connectionsCheckingInterval` milliseconds, with an
-/// interval that doesn't keep the event loop alive.
+/// connections for timed-out requests every `connectionsCheckingInterval` milliseconds, with a
+/// timer that doesn't keep the event loop alive.
 pub(super) fn on_listening(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let server = crate::stream::this_object(scope, &args)?;
+    let server = crate::support::this_object(scope, &args)?;
     if !super::server::listens_itself() {
         return Ok(js::value::undefined());
     }
     stop_checking(scope, server)?;
-    let check = closure(
+    let interval = number_or(
+        server.get_property(scope, c"connectionsCheckingInterval")?,
+        0.0,
+    );
+    let check = crate::support::shared_function(scope, check_connections, 0)?;
+    let check = js::Callable::from_jsval(scope, check.to_jsval_throwing(scope)?, ())
+        .map_err(|e| e.throw(scope))?;
+    let delay = Duration::from_millis(interval.max(1.0) as u64);
+    let id = core_runtime::event_loop::timer::start_timer(
         scope,
-        0,
-        check_connections,
-        &[server.to_jsval_raw_throwing(scope)?],
-    )?;
-    let interval = server.val(scope, c"connectionsCheckingInterval")?;
-    let set = scope.global().val(scope, c"setInterval")?;
-    let timer = Function::call(
-        scope,
-        js::value::undefined(),
-        set,
-        &[check.to_jsval_throwing(scope)?, interval],
-    )?;
-    if let Ok(timer) = Object::from_value(scope, *timer) {
-        if has_method(scope, timer, c"unref")? {
-            call_method(scope, timer, c"unref", &[])?;
-        }
+        check,
+        server.to_jsval_throwing(scope)?,
+        &[],
+        delay,
+        true,
+        None,
+    );
+    if let Some(id) = id {
+        core_runtime::event_loop::with_active_event_loop(|el| el.set_js_timer_ref(id, false));
     }
-    server
-        .define_property(scope, c"_starlingCheckInterval", timer, 0)
-        .map(|()| js::value::undefined())
+    server_class::state_of(scope, server)?
+        .data_mut()
+        .check_timer = id;
+    Ok(js::value::undefined())
 }
 
 /// Stop checking the connections of `server` for timed-out requests.
 pub(super) fn stop_checking(scope: &Scope<'_>, server: Object<'_>) -> Result<(), ExnThrown> {
-    let timer = server.val(scope, c"_starlingCheckInterval")?;
-    if !timer.is_undefined() {
-        let clear = scope.global().val(scope, c"clearInterval")?;
-        Function::call(scope, js::value::undefined(), clear, &[timer])?;
-        server.set_property(scope, c"_starlingCheckInterval", js::value::undefined())?;
+    let state: HttpServerState<'_> = server_class::state_of(scope, server)?;
+    if let Some(id) = state.data_mut().check_timer.take() {
+        core_runtime::event_loop::with_active_event_loop(|el| el.clear_js_timer(id));
     }
     Ok(())
 }

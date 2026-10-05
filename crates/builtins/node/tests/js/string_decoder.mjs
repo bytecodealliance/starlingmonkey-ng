@@ -39,3 +39,13 @@ eq(wrapped.encoding, "utf8", "encoding of a decoder initialized by call");
 eq(wrapped.write(euro.subarray(0, 2)) + wrapped.end(euro.subarray(2)), "€", "a called decoder decodes");
 throws(() => StringDecoder.prototype.write.call({}, Buffer.from("a")), "ERR_INVALID_THIS", "methods need a decoder");
 eq(Object.keys(new StringDecoder()).includes("encoding"), true, "encoding is an own property");
+
+// Small typed arrays keep their bytes inline, where a GC can move them.
+const inline = new StringDecoder("utf8");
+for (let i = 0; i < 50; i++) {
+  eq(inline.write(new Uint8Array([0x68, 0xc3, 0xa9, 0x6c])), "hél", "decoding a small typed array");
+}
+const target = Buffer.alloc(16);
+const rope = "ab".repeat(3) + "ü";
+eq(target.write(rope), 8, "writing a rope as UTF-8");
+eq(target.toString("utf8", 0, 8), "abababü", "the written rope");

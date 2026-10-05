@@ -22,8 +22,7 @@ const MEMORY: f64 = 4294967296.0;
 
 /// `process.env[name]`, if it is a non-empty string.
 fn env_var(scope: &Scope<'_>, name: &str) -> Result<Option<String>, ExnThrown> {
-    let Ok(process) = Object::from_value(scope, *scope.global().get_property(scope, c"process")?)
-    else {
+    let Ok(process) = Object::from_value(scope, *crate::process::process_value(scope)?) else {
         return Ok(None);
     };
     let Ok(env) = Object::from_value(scope, *process.get_property(scope, c"env")?) else {
@@ -164,127 +163,146 @@ const DARWIN_ERRNO: &[(&std::ffi::CStr, i32)] = &[
     (c"EXDEV", 18),
 ];
 
-/// The `os.constants` object: the signal numbers and `errno` values of macOS if `process.platform`
-/// is `darwin`, and of Linux otherwise, and the process priorities.
+/// Linux's signal numbers.
+const SIGNALS: &[(&std::ffi::CStr, i32)] = &[
+    (c"SIGHUP", 1),
+    (c"SIGINT", 2),
+    (c"SIGQUIT", 3),
+    (c"SIGILL", 4),
+    (c"SIGTRAP", 5),
+    (c"SIGABRT", 6),
+    (c"SIGIOT", 6),
+    (c"SIGBUS", 7),
+    (c"SIGFPE", 8),
+    (c"SIGKILL", 9),
+    (c"SIGUSR1", 10),
+    (c"SIGSEGV", 11),
+    (c"SIGUSR2", 12),
+    (c"SIGPIPE", 13),
+    (c"SIGALRM", 14),
+    (c"SIGTERM", 15),
+    (c"SIGCHLD", 17),
+    (c"SIGCONT", 18),
+    (c"SIGSTOP", 19),
+    (c"SIGTSTP", 20),
+    (c"SIGTTIN", 21),
+    (c"SIGTTOU", 22),
+    (c"SIGURG", 23),
+    (c"SIGXCPU", 24),
+    (c"SIGXFSZ", 25),
+    (c"SIGVTALRM", 26),
+    (c"SIGPROF", 27),
+    (c"SIGWINCH", 28),
+    (c"SIGIO", 29),
+    (c"SIGPOLL", 29),
+    (c"SIGPWR", 30),
+    (c"SIGSYS", 31),
+];
+
+/// Linux's `errno` values.
+const ERRNO: &[(&std::ffi::CStr, i32)] = &[
+    (c"EPERM", 1),
+    (c"ENOENT", 2),
+    (c"ESRCH", 3),
+    (c"EINTR", 4),
+    (c"EIO", 5),
+    (c"ENXIO", 6),
+    (c"E2BIG", 7),
+    (c"ENOEXEC", 8),
+    (c"EBADF", 9),
+    (c"ECHILD", 10),
+    (c"EAGAIN", 11),
+    (c"EWOULDBLOCK", 11),
+    (c"ENOMEM", 12),
+    (c"EACCES", 13),
+    (c"EFAULT", 14),
+    (c"EBUSY", 16),
+    (c"EEXIST", 17),
+    (c"EXDEV", 18),
+    (c"ENODEV", 19),
+    (c"ENOTDIR", 20),
+    (c"EISDIR", 21),
+    (c"EINVAL", 22),
+    (c"ENFILE", 23),
+    (c"EMFILE", 24),
+    (c"ENOTTY", 25),
+    (c"ETXTBSY", 26),
+    (c"EFBIG", 27),
+    (c"ENOSPC", 28),
+    (c"ESPIPE", 29),
+    (c"EROFS", 30),
+    (c"EMLINK", 31),
+    (c"EPIPE", 32),
+    (c"EDOM", 33),
+    (c"ERANGE", 34),
+    (c"EDEADLK", 35),
+    (c"ENAMETOOLONG", 36),
+    (c"ENOLCK", 37),
+    (c"ENOSYS", 38),
+    (c"ENOTEMPTY", 39),
+    (c"ELOOP", 40),
+    (c"ENOTSUP", 95),
+    (c"EOPNOTSUPP", 95),
+    (c"EADDRINUSE", 98),
+    (c"EADDRNOTAVAIL", 99),
+    (c"ENETDOWN", 100),
+    (c"ENETUNREACH", 101),
+    (c"ECONNABORTED", 103),
+    (c"ECONNRESET", 104),
+    (c"ENOBUFS", 105),
+    (c"EISCONN", 106),
+    (c"ENOTCONN", 107),
+    (c"ETIMEDOUT", 110),
+    (c"ECONNREFUSED", 111),
+    (c"EHOSTUNREACH", 113),
+    (c"EALREADY", 114),
+    (c"EINPROGRESS", 115),
+    (c"ECANCELED", 125),
+];
+
+/// The process priorities.
+const PRIORITY: &[(&std::ffi::CStr, i32)] = &[
+    (c"PRIORITY_LOW", 19),
+    (c"PRIORITY_BELOW_NORMAL", 10),
+    (c"PRIORITY_NORMAL", 0),
+    (c"PRIORITY_ABOVE_NORMAL", -7),
+    (c"PRIORITY_HIGH", -14),
+    (c"PRIORITY_HIGHEST", -20),
+];
+
+/// The `errno` values of macOS if `process.platform` is `darwin`, and of Linux otherwise.
+pub(crate) fn errno_table() -> &'static [(&'static std::ffi::CStr, i32)] {
+    if crate::process::platform() == "darwin" {
+        DARWIN_ERRNO
+    } else {
+        ERRNO
+    }
+}
+
+/// The marker of the realm's `os.constants` object.
+struct ConstantsMarker;
+
+/// The `os.constants` object, the same one for every caller in a realm: the signal numbers and
+/// `errno` values of macOS if `process.platform` is `darwin`, and of Linux otherwise, the process
+/// priorities and the `dlopen` flags, in objects without a prototype. `signals` is frozen.
 pub(crate) fn constants<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    const SIGNALS: &[(&std::ffi::CStr, i32)] = &[
-        (c"SIGHUP", 1),
-        (c"SIGINT", 2),
-        (c"SIGQUIT", 3),
-        (c"SIGILL", 4),
-        (c"SIGTRAP", 5),
-        (c"SIGABRT", 6),
-        (c"SIGIOT", 6),
-        (c"SIGBUS", 7),
-        (c"SIGFPE", 8),
-        (c"SIGKILL", 9),
-        (c"SIGUSR1", 10),
-        (c"SIGSEGV", 11),
-        (c"SIGUSR2", 12),
-        (c"SIGPIPE", 13),
-        (c"SIGALRM", 14),
-        (c"SIGTERM", 15),
-        (c"SIGCHLD", 17),
-        (c"SIGCONT", 18),
-        (c"SIGSTOP", 19),
-        (c"SIGTSTP", 20),
-        (c"SIGTTIN", 21),
-        (c"SIGTTOU", 22),
-        (c"SIGURG", 23),
-        (c"SIGXCPU", 24),
-        (c"SIGXFSZ", 25),
-        (c"SIGVTALRM", 26),
-        (c"SIGPROF", 27),
-        (c"SIGWINCH", 28),
-        (c"SIGIO", 29),
-        (c"SIGPOLL", 29),
-        (c"SIGPWR", 30),
-        (c"SIGSYS", 31),
-    ];
-    const ERRNO: &[(&std::ffi::CStr, i32)] = &[
-        (c"EPERM", 1),
-        (c"ENOENT", 2),
-        (c"ESRCH", 3),
-        (c"EINTR", 4),
-        (c"EIO", 5),
-        (c"ENXIO", 6),
-        (c"E2BIG", 7),
-        (c"ENOEXEC", 8),
-        (c"EBADF", 9),
-        (c"ECHILD", 10),
-        (c"EAGAIN", 11),
-        (c"EWOULDBLOCK", 11),
-        (c"ENOMEM", 12),
-        (c"EACCES", 13),
-        (c"EFAULT", 14),
-        (c"EBUSY", 16),
-        (c"EEXIST", 17),
-        (c"EXDEV", 18),
-        (c"ENODEV", 19),
-        (c"ENOTDIR", 20),
-        (c"EISDIR", 21),
-        (c"EINVAL", 22),
-        (c"ENFILE", 23),
-        (c"EMFILE", 24),
-        (c"ENOTTY", 25),
-        (c"ETXTBSY", 26),
-        (c"EFBIG", 27),
-        (c"ENOSPC", 28),
-        (c"ESPIPE", 29),
-        (c"EROFS", 30),
-        (c"EMLINK", 31),
-        (c"EPIPE", 32),
-        (c"EDOM", 33),
-        (c"ERANGE", 34),
-        (c"EDEADLK", 35),
-        (c"ENAMETOOLONG", 36),
-        (c"ENOLCK", 37),
-        (c"ENOSYS", 38),
-        (c"ENOTEMPTY", 39),
-        (c"ELOOP", 40),
-        (c"ENOTSUP", 95),
-        (c"EOPNOTSUPP", 95),
-        (c"EADDRINUSE", 98),
-        (c"EADDRNOTAVAIL", 99),
-        (c"ENETDOWN", 100),
-        (c"ENETUNREACH", 101),
-        (c"ECONNABORTED", 103),
-        (c"ECONNRESET", 104),
-        (c"ENOBUFS", 105),
-        (c"EISCONN", 106),
-        (c"ENOTCONN", 107),
-        (c"ETIMEDOUT", 110),
-        (c"ECONNREFUSED", 111),
-        (c"EHOSTUNREACH", 113),
-        (c"EALREADY", 114),
-        (c"EINPROGRESS", 115),
-        (c"ECANCELED", 125),
-    ];
-    const PRIORITY: &[(&std::ffi::CStr, i32)] = &[
-        (c"PRIORITY_LOW", 19),
-        (c"PRIORITY_BELOW_NORMAL", 10),
-        (c"PRIORITY_NORMAL", 0),
-        (c"PRIORITY_ABOVE_NORMAL", -7),
-        (c"PRIORITY_HIGH", -14),
-        (c"PRIORITY_HIGHEST", -20),
-    ];
-    let table = |entries: &[(&'static std::ffi::CStr, i32)]| -> Result<Object<'s>, ExnThrown> {
+    if let Some(constants) = js::class::realm_object::<ConstantsMarker>(scope) {
+        return Ok(constants);
+    }
+    let null_object = || -> Result<Object<'s>, ExnThrown> {
         let object = Object::new_plain(scope)?;
+        object.set_prototype(scope, js::native::HandleObject::null())?;
+        Ok(object)
+    };
+    let table = |entries: &[(&'static std::ffi::CStr, i32)]| -> Result<Object<'s>, ExnThrown> {
+        let object = null_object()?;
         for (name, value) in entries {
             object.set_property(scope, name, *value)?;
         }
         Ok(object)
     };
-    let constants = Object::new_plain(scope)?;
     let darwin = crate::process::platform() == "darwin";
-    let (signals, errno) = if darwin {
-        (DARWIN_SIGNALS, DARWIN_ERRNO)
-    } else {
-        (SIGNALS, ERRNO)
-    };
-    constants.set_property(scope, c"signals", table(signals)?)?;
-    constants.set_property(scope, c"errno", table(errno)?)?;
-    constants.set_property(scope, c"priority", table(PRIORITY)?)?;
+    let signals = if darwin { DARWIN_SIGNALS } else { SIGNALS };
     let dlopen: &[(&std::ffi::CStr, i32)] = if darwin {
         &[
             (c"RTLD_LAZY", 1),
@@ -301,8 +319,15 @@ pub(crate) fn constants<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrow
             (c"RTLD_DEEPBIND", 8),
         ]
     };
-    constants.set_property(scope, c"dlopen", table(dlopen)?)?;
+    let constants = null_object()?;
     constants.set_property(scope, c"UV_UDP_REUSEADDR", 4)?;
+    constants.set_property(scope, c"dlopen", table(dlopen)?)?;
+    constants.set_property(scope, c"errno", table(errno_table())?)?;
+    let signals = table(signals)?;
+    signals.freeze(scope)?;
+    constants.set_property(scope, c"signals", signals)?;
+    constants.set_property(scope, c"priority", table(PRIORITY)?)?;
+    js::class::register_realm_object::<ConstantsMarker>(scope, constants);
     Ok(constants)
 }
 
@@ -442,6 +467,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/os.html#osuserinfooptions>: `uid` and `gid` are -1, and the rest
     /// comes from `USER`, `HOME` and `SHELL`.
+    #[function(length = 1)]
     pub fn user_info<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
         let info = Object::new_plain(scope)?;
         info.set_property(scope, c"uid", -1)?;
@@ -458,6 +484,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/os.html#osgetprioritypid>: always the normal priority, 0, for a
     /// `pid` that is a 32-bit integer.
+    #[function(length = 1)]
     pub fn get_priority(scope: &Scope<'_>, pid: Option<HandleValue<'_>>) -> Result<i32, Thrown> {
         if let Some(pid) = pid.filter(|pid| !pid.is_undefined()) {
             crate::errors::validate_integer(scope, pid, "pid", -2147483648.0, 2147483647.0)?;
@@ -466,6 +493,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/os.html#ossetprioritypid-priority>: has no effect.
+    #[function(length = 2)]
     pub fn set_priority() {}
 }
 

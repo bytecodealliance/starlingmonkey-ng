@@ -16,6 +16,9 @@ use js::error::ExnThrown;
 use js::function::Callback;
 use js::gc::scope::Scope;
 use js::{Function, Object};
+use web_globals::events::custom_event::CustomEventImpl;
+use web_globals::events::event::EventImpl;
+use web_globals::events::event_target::EventTargetImpl;
 
 pub(crate) use binding::process_binding;
 
@@ -23,8 +26,8 @@ pub(crate) use binding::process_binding;
 enum Source {
     /// The export of this name of the builtin module of this name.
     Module(&'static str, &'static CStr),
-    /// The global of this name.
-    Global(&'static CStr),
+    /// The constructor this function returns.
+    Class(for<'s> fn(&'s Scope<'_>) -> Result<Object<'s>, ExnThrown>),
     /// A native function with this length.
     Native(Callback, u32),
 }
@@ -44,9 +47,15 @@ const MEMBERS: &[(&str, &[(&CStr, Source)])] = &[
     (
         "node:internal/event_target",
         &[
-            (c"CustomEvent", Global(c"CustomEvent")),
-            (c"Event", Global(c"Event")),
-            (c"EventTarget", Global(c"EventTarget")),
+            (
+                c"CustomEvent",
+                Class(js::class::class_constructor::<CustomEventImpl>),
+            ),
+            (c"Event", Class(js::class::class_constructor::<EventImpl>)),
+            (
+                c"EventTarget",
+                Class(js::class::class_constructor::<EventTargetImpl>),
+            ),
         ],
     ),
     (
@@ -183,7 +192,7 @@ fn module_value<'s>(scope: &'s Scope<'_>, name: &str) -> Result<Object<'s>, ExnT
         let member_value = match source {
             Module(module, export) => crate::internal_modules::module_default(scope, module)?
                 .get_property(scope, export)?,
-            Global(global) => scope.global().get_property(scope, global)?,
+            Class(constructor) => constructor(scope)?.to_jsval_throwing(scope)?,
             Native(callback, length) => {
                 Function::new_callback(scope, member, *length, *callback, ())?
                     .to_jsval_throwing(scope)?
@@ -193,8 +202,7 @@ fn module_value<'s>(scope: &'s Scope<'_>, name: &str) -> Result<Object<'s>, ExnT
     }
     match name {
         "node:internal/buffer" => {
-            let buffer = scope.global().get_property(scope, c"Buffer")?;
-            let buffer = Object::from_value(scope, buffer).map_err(|_| ExnThrown)?;
+            let buffer = crate::buffer::buffer::class_constructor(scope)?;
             let species = js::symbol::get_well_known_key(scope, js::native::SymbolCode::species);
             let species = buffer.get_property_by_id(scope, scope.root_id(species))?;
             value.set_property(scope, c"FastBuffer", species)?;
@@ -226,7 +234,7 @@ pub(crate) fn register(scope: &Scope<'_>, name: &'static str) -> bool {
     let register = || -> Result<(), ExnThrown> {
         let &(_, _, kind, exports) = crate::stub::flagged_entry(name).ok_or(ExnThrown)?;
         let value = match kind {
-            crate::stub::ExportKind::Class | crate::stub::ExportKind::Function => {
+            crate::stub::ExportKind::Class(_) | crate::stub::ExportKind::Function(_) => {
                 let export = name.rsplit('/').next().unwrap_or(name);
                 let stub = crate::stub::stub_value(scope, name, export, kind)?;
                 Object::from_value(scope, stub).map_err(|_| ExnThrown)?
@@ -250,6 +258,8 @@ pub(crate) fn register(scope: &Scope<'_>, name: &'static str) -> bool {
                 "internal/test/binding",
             )?;
         }
+        // SAFETY: the caller guarantees the module loader is initialized, and every value is
+        // rooted.
         core_runtime::module::register_synthetic_module(scope, name, &values)
     };
     register().is_ok()

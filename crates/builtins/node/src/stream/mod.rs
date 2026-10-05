@@ -3,10 +3,10 @@
 //! `node:stream` and `node:stream/promises`. See <https://nodejs.org/api/stream.html>.
 //!
 //! The implementation follows Node.js v24's `lib/internal/streams` (MIT license, Copyright
-//! Node.js contributors), function by function. A stream's state is in `_readableState` and
-//! `_writableState` objects with a property per field, under the names Node's states expose, so
-//! code that inspects them reads the same values. `process.nextTick` work runs in the tick queue of
-//! `process.nextTick`.
+//! Node.js contributors), function by function. A stream's state is the Rust data of
+//! [`state::StreamState`], which its `_readableState` and `_writableState` views expose with
+//! Node's names, so code that inspects them reads the same values. `process.nextTick` work runs
+//! in the tick queue of `process.nextTick`.
 
 mod adapters;
 mod destroy;
@@ -18,60 +18,172 @@ mod legacy;
 mod operators;
 mod pipeline;
 mod readable;
-mod state;
-mod util;
+pub(crate) mod state;
+pub(crate) mod util;
 mod writable;
 
+pub(crate) use destroy::stream_destroyed;
 pub(crate) use duplex::{duplex as duplex_class, init_duplex, init_transform, transform};
 pub(crate) use eos::eos as end_of_stream;
 pub(crate) use legacy::stream as stream_class;
-pub(crate) use readable::readable as readable_class;
-pub(crate) use util::{
-    as_object, call, call_method, closure, emit, error_value, has_method, is_function, is_str,
-    listen, listener_count, next_tick, next_tick_call, rust_string, same, string, take_exception,
-    this_object, truthy, Captures, Props,
-};
+pub(crate) use readable::{init_new_readable, readable as readable_class};
 pub(crate) use writable::writable as writable_class;
 
 use js::conversion::ToJSVal;
 use js::error::ExnThrown;
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
+use js::Object;
 
 use crate::errors::{validate_abort_signal, NodeError, Thrown};
-use util::is_node_stream;
+use util::{is_node_stream, sides, Field};
 
-/// The abort listener of [`add_abort_signal`], whose captures are `[stream, signal]`: destroy the
-/// stream with an `AbortError`.
+/// Register the stream module's classes for `global`: its internal classes, and the stream
+/// classes' constructors.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
+    state::register_classes(scope, global);
+    AbortSignalLink::add_to_global(scope, global);
+    destroy::ConstructState::add_to_global(scope, global);
+    destroy::DestroyRequest::add_to_global(scope, global);
+    duplex::FlushState::add_to_global(scope, global);
+    duplex::TransformWrite::add_to_global(scope, global);
+    duplex_pair::DuplexSide::add_to_global(scope, global);
+    eos::EosState::add_to_global(scope, global);
+    eos::FinishedState::add_to_global(scope, global);
+    legacy::LegacyPipeState::add_to_global(scope, global);
+    pipeline::DestroyerState::add_to_global(scope, global);
+    pipeline::FinalStageState::add_to_global(scope, global);
+    pipeline::PipeLinkState::add_to_global(scope, global);
+    pipeline::PipelineState::add_to_global(scope, global);
+    readable::DisposeState::add_to_global(scope, global);
+    readable::IteratorState::add_to_global(scope, global);
+    readable::IteratorStep::add_to_global(scope, global);
+    readable::PipeState::add_to_global(scope, global);
+    readable::WrapState::add_to_global(scope, global);
+    writable::WritevCallbacks::add_to_global(scope, global);
+    adapters::DestroyDone::add_to_global(scope, global);
+    adapters::FromWebState::add_to_global(scope, global);
+    adapters::ReadableToWebState::add_to_global(scope, global);
+    adapters::WebWrite::add_to_global(scope, global);
+    adapters::WritableToWebState::add_to_global(scope, global);
+    from::FromClose::add_to_global(scope, global);
+    operators::register_classes(scope, global);
+    from::FromState::add_to_global(scope, global);
+    legacy::stream::register(scope)?;
+    readable::readable::register(scope)?;
+    writable::writable::register(scope)?;
+    duplex::duplex::register(scope)?;
+    duplex::transform::register(scope)?;
+    duplex::pass_through::register(scope)?;
+    Ok(())
+}
+
+/// The writable state's `needDrain` of `stream`, or `false` for a stream without one.
+pub(crate) fn writable_need_drain(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+) -> Result<bool, ExnThrown> {
+    match sides(scope, stream)?.writable {
+        Some(side) => side.need_drain(scope),
+        None => Ok(false),
+    }
+}
+
+/// The readable state's `resumeScheduled` of `stream`, or `false` for a stream without one.
+pub(crate) fn readable_resume_scheduled(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+) -> Result<bool, ExnThrown> {
+    Ok(match state::ReadableSide::try_of(scope, stream)? {
+        Some(side) => side.has(state::R::RESUME_SCHEDULED),
+        None => false,
+    })
+}
+
+/// The readable state's `autoDestroy` of `stream`, or `None` for a stream without one.
+pub(crate) fn readable_auto_destroy(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+) -> Result<Option<bool>, ExnThrown> {
+    match sides(scope, stream)?.readable {
+        Some(side) => Ok(Some(side.truthy(scope, Field::AutoDestroy)?)),
+        None => Ok(None),
+    }
+}
+
+/// The writable state's `autoDestroy` of `stream`, or `None` for a stream without one.
+pub(crate) fn writable_auto_destroy(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+) -> Result<Option<bool>, ExnThrown> {
+    match sides(scope, stream)?.writable {
+        Some(side) => Ok(Some(side.truthy(scope, Field::AutoDestroy)?)),
+        None => Ok(None),
+    }
+}
+
+/// Set the writable state's `corked` count of `stream`, if it has a writable state.
+pub(crate) fn set_writable_corked(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    corked: f64,
+) -> Result<(), ExnThrown> {
+    match sides(scope, stream)?.writable {
+        Some(util::Side::Writable(side)) => side.get_mut().corked = corked,
+        Some(util::Side::Foreign(state)) => state.set_property(scope, c"corked", corked)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The link [`add_abort_signal`] makes between a stream and a signal: the abort listener, which
+/// `finished` removes.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct AbortSignalLink {
+    stream: Heap<js::object::Object>,
+    signal: Heap<js::object::Object>,
+    listener: Option<Heap<js::object::Object>>,
+}
+
+#[core_runtime::jsmethods]
+impl AbortSignalLink {}
+
+/// The abort listener of [`add_abort_signal`], whose payload is an [`AbortSignalLink`]: destroy
+/// the stream with an `AbortError`.
 fn on_abort(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let stream = captures.obj(0)?;
-    let reason = captures.obj(1)?.val(scope, c"reason")?;
+    let link = cast_payload::<AbortSignalLink>(scope, payload);
+    let (stream, signal) = {
+        let data = link.data();
+        (data.stream.get(scope), data.signal.get(scope))
+    };
+    let reason = signal.get_property(scope, c"reason")?;
     let error = crate::errors::abort_error(scope, Some(reason))?;
-    util::call_method(scope, stream, c"destroy", &[error])?;
+    js::Function::call_by_name(scope, stream.handle(), c"destroy", &[error])?;
     Ok(js::value::undefined())
 }
 
-/// The `finished` callback of [`add_abort_signal`], whose captures are `[signal, listener]`.
+/// The `finished` callback of [`add_abort_signal`], whose payload is an [`AbortSignalLink`]:
+/// remove the abort listener.
 fn remove_abort_listener(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    listen(
-        scope,
-        captures.obj(0)?,
-        c"removeEventListener",
-        "abort",
-        captures.obj(1)?,
-    )?;
+    let link = cast_payload::<AbortSignalLink>(scope, payload);
+    let (signal, listener) = {
+        let data = link.data();
+        (data.signal.get(scope), data.listener.get(scope))
+    };
+    if let Some(listener) = listener {
+        crate::events::listen(scope, signal, c"removeEventListener", c"abort", listener)?;
+    }
     Ok(js::value::undefined())
 }
 
@@ -92,38 +204,39 @@ pub(crate) fn add_abort_signal<'s>(
         )
         .into());
     }
-    let Some(signal_object) = as_object(scope, signal) else {
+    let Ok(signal_object) = js::Object::from_value(scope, signal) else {
         return Ok(stream);
     };
-    let stream_object = as_object(scope, stream).expect("streams are objects");
-    let listener = closure(
-        scope,
-        0,
-        on_abort,
-        &[
-            stream_object.to_jsval_raw_throwing(scope)?,
-            signal_object.to_jsval_raw_throwing(scope)?,
-        ],
-    )?;
-    if truthy(scope, signal_object.get_property(scope, c"aborted")?) {
-        util::call(
+    let stream_object = js::Object::from_value(scope, stream).expect("streams are objects");
+    let link =
+        js::class::create_instance_with::<AbortSignalLinkImpl>(scope, |_| AbortSignalLinkImpl {
+            stream: Heap::from(stream_object),
+            signal: Heap::from(signal_object),
+            listener: None,
+        })?;
+    if js::conversion::to_boolean(signal_object.get_property(scope, c"aborted")?) {
+        on_abort(
             scope,
-            HandleValue::undefined(),
-            listener.to_jsval_throwing(scope)?,
-            &[],
+            CallbackArgs::from_values(&[]),
+            link.to_jsval_throwing(scope)?,
         )?;
     } else {
-        listen(scope, signal_object, c"addEventListener", "abort", listener)?;
-        let remove = closure(
+        let listener = js::Function::new_callback(scope, c"", 0, on_abort, link)?;
+        link.data_mut().listener = Some(Heap::from(*listener));
+        crate::events::listen(
             scope,
-            1,
-            remove_abort_listener,
-            &[
-                signal_object.to_jsval_raw_throwing(scope)?,
-                listener.to_jsval_raw_throwing(scope)?,
-            ],
+            signal_object,
+            c"addEventListener",
+            c"abort",
+            *listener,
         )?;
-        eos::eos(scope, stream, None, remove.to_jsval_throwing(scope)?)?;
+        let payload = link.to_jsval_throwing(scope)?;
+        eos::eos_native(
+            scope,
+            stream_object,
+            eos::EosOptions::default(),
+            eos::EosCallback::Native(remove_abort_listener, payload),
+        )?;
     }
     Ok(stream)
 }
@@ -153,6 +266,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/stream.html#streamfinishedstream-options-callback>: returns the
     /// cleanup function.
+    #[function(length = 3)]
     pub fn finished<'s>(
         scope: &'s Scope<'_>,
         stream: Option<HandleValue<'_>>,
@@ -168,6 +282,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/stream.html#streamaddabortsignalsignal-stream>
+    #[function(length = 2)]
     pub fn add_abort_signal<'s>(
         scope: &'s Scope<'_>,
         signal: Option<HandleValue<'_>>,
@@ -179,6 +294,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/stream.html#streamdestroystream-error>
+    #[function(length = 2)]
     pub fn destroy(
         scope: &Scope<'_>,
         stream: Option<HandleValue<'_>>,
@@ -190,6 +306,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/stream.html#streamduplexpairoptions>
+    #[function(length = 1)]
     pub fn duplex_pair<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'s>>,
@@ -239,38 +356,33 @@ pub mod module {
 
     /// <https://nodejs.org/api/stream.html#streamisdisturbedstream>
     pub fn is_disturbed(scope: &Scope<'_>, stream: HandleValue<'_>) -> Result<bool, ExnThrown> {
-        let Some(stream) = as_object(scope, stream) else {
+        let Ok(stream) = js::Object::from_value(scope, stream) else {
             return Ok(false);
         };
         Ok(
-            truthy(scope, stream.get_property(scope, c"readableDidRead")?)
-                || truthy(scope, stream.get_property(scope, c"readableAborted")?),
+            js::conversion::to_boolean(stream.get_property(scope, c"readableDidRead")?)
+                || js::conversion::to_boolean(stream.get_property(scope, c"readableAborted")?),
         )
     }
 
     /// <https://nodejs.org/api/stream.html#streamiserroredstream>
     pub fn is_errored(scope: &Scope<'_>, stream: HandleValue<'_>) -> Result<bool, ExnThrown> {
-        let Some(stream) = as_object(scope, stream) else {
+        let Ok(stream) = js::Object::from_value(scope, stream) else {
             return Ok(false);
         };
-        for (property, state, field) in [
-            (Some(c"readableErrored"), None, None),
-            (Some(c"writableErrored"), None, None),
-            (None, Some(c"_readableState"), Some(c"errorEmitted")),
-            (None, Some(c"_writableState"), Some(c"errorEmitted")),
-            (None, Some(c"_readableState"), Some(c"errored")),
-            (None, Some(c"_writableState"), Some(c"errored")),
-        ] {
-            let value = match (property, state, field) {
-                (Some(property), _, _) => stream.val(scope, property)?,
-                (None, Some(state), Some(field)) => match stream.obj(scope, state)? {
-                    Some(state) => state.val(scope, field)?,
-                    None => continue,
-                },
-                _ => continue,
-            };
-            if !value.is_null() && !value.is_undefined() {
-                return Ok(truthy(scope, value));
+        for property in [c"readableErrored", c"writableErrored"] {
+            let value = stream.get_property(scope, property)?;
+            if !value.is_null_or_undefined() {
+                return Ok(js::conversion::to_boolean(value));
+            }
+        }
+        let sides = sides(scope, stream)?;
+        for field in [Field::ErrorEmitted, Field::Errored] {
+            for side in [sides.readable, sides.writable].into_iter().flatten() {
+                let value = side.get(scope, field)?;
+                if !value.is_null_or_undefined() {
+                    return Ok(js::conversion::to_boolean(value));
+                }
             }
         }
         Ok(false)
@@ -278,12 +390,13 @@ pub mod module {
 
     #[function(name = "_isArrayBufferView")]
     pub fn is_array_buffer_view(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        super::readable::is_array_buffer_view(scope, value)
+        js::ArrayBufferView::from_value(scope, value).is_some()
     }
 
     #[function(name = "_isUint8Array")]
     pub fn is_uint8_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        as_object(scope, value).is_some_and(|object| object.cast::<js::Uint8Array>().is_ok())
+        js::Object::from_value(scope, value)
+            .is_ok_and(|object| object.cast::<js::Uint8Array>().is_ok())
     }
 
     #[function(name = "_uint8ArrayToBuffer")]
@@ -313,6 +426,7 @@ pub mod promises {
 
     /// <https://nodejs.org/api/stream.html#streamfinishedstream-options>: an invalid
     /// `options.cleanup` throws, and other invalid arguments reject the promise.
+    #[function(length = 2)]
     pub fn finished<'s>(
         scope: &'s Scope<'_>,
         stream: HandleValue<'_>,
@@ -327,7 +441,7 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let promises = || -> Result<HandleValue<'_>, ExnThrown> {
         let namespace = core_runtime::module::builtin_namespace(scope, "node:stream/promises")?
             .ok_or(ExnThrown)?;
-        namespace.val(scope, c"default")
+        namespace.get_property(scope, c"default")
     };
     let Ok(promises) = promises() else {
         return false;
@@ -337,17 +451,4 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         name,
         &[("promises", promises)],
     )
-}
-
-/// Register the classes of `node:stream`.
-pub(crate) fn register_classes(scope: &Scope<'_>) -> Result<(), ExnThrown> {
-    legacy::stream::register(scope)?;
-    readable::readable_state::register(scope)?;
-    readable::readable::register(scope)?;
-    writable::writable_state::register(scope)?;
-    writable::writable::register(scope)?;
-    duplex::duplex::register(scope)?;
-    duplex::transform::register(scope)?;
-    duplex::pass_through::register(scope)?;
-    Ok(())
 }

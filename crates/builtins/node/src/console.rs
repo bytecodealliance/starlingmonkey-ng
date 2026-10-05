@@ -15,27 +15,33 @@ use js::{Function, Object};
 
 use crate::errors::{ErrorKind, NodeError};
 use crate::inspect::InspectOptions;
-use crate::stream::{
-    call_method, has_method, is_function, string, take_exception, truthy, Captures, Props,
-};
+use crate::support::{has_method, Props};
+
+/// The realm object marker of the `console` object [`install`] wraps.
+struct GlobalConsole;
+
+/// The `console` object [`install`] wrapped, even if the global's `console` property was
+/// reassigned since.
+pub(crate) fn console_object<'s>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
+    js::class::realm_object::<GlobalConsole>(scope)
+}
 
 /// Wrap the methods of `global`'s `console`, if it has one.
 pub(crate) fn install(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     let Some(console) = global.obj(scope, c"console")? else {
         return Ok(());
     };
+    js::class::register_realm_object::<GlobalConsole>(scope, console);
     for name in [c"log", c"info", c"debug", c"warn", c"error", c"trace"] {
         let original = console.val(scope, name)?;
-        if !is_function(scope, original) {
+        if !js::function::is_callable(original) {
             continue;
         }
-        let payload = js::Array::with_contents(scope, &[original])?;
-        let wrapper = Function::new_callback(scope, name, 0, formatted, *payload)?;
+        let wrapper = Function::new_callback(scope, name, 0, formatted, original)?;
         console.set_property(scope, name, *wrapper)?;
     }
     let log = console.val(scope, c"log")?;
-    let payload = js::Array::with_contents(scope, &[log])?;
-    let dir = Function::new_callback(scope, c"dir", 0, dir, *payload)?;
+    let dir = Function::new_callback(scope, c"dir", 0, dir, log)?;
     console.set_property(scope, c"dir", *dir)?;
     let assert = Function::new_callback(scope, c"assert", 0, assert, ())?;
     console.set_property(scope, c"assert", *assert)?;
@@ -84,7 +90,7 @@ fn console_class(
         }
     }
     let console = Object::new_plain(scope)?;
-    if let Some(global) = scope.global().obj(scope, c"console")? {
+    if let Some(global) = console_object(scope) {
         for name in [
             c"group",
             c"groupCollapsed",
@@ -109,38 +115,34 @@ fn console_class(
         (c"error", stderr),
         (c"trace", stderr),
     ] {
-        let payload = js::Array::with_contents(scope, &[stream])?;
-        let method = Function::new_callback(scope, name, 0, write_formatted, *payload)?;
+        let method = Function::new_callback(scope, name, 0, write_formatted, stream)?;
         console.set_property(scope, name, *method)?;
     }
-    let payload = js::Array::with_contents(scope, &[stdout])?;
-    let dir = Function::new_callback(scope, c"dir", 0, write_dir, *payload)?;
+    let dir = Function::new_callback(scope, c"dir", 0, write_dir, stdout)?;
     console.set_property(scope, c"dir", *dir)?;
     let assert = Function::new_callback(scope, c"assert", 0, assert, ())?;
     console.set_property(scope, c"assert", *assert)?;
     Ok(console.as_value())
 }
 
-/// A method of a `Console`, whose captures are `[stream]`: write the arguments formatted by
+/// A method of a `Console`, whose payload is `stream`: write the arguments formatted by
 /// `util.format` and a newline to `stream`.
 fn write_formatted(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
-    payload: HandleValue,
+    stream: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.get(0)?;
     let arguments = crate::callback_args(&args);
-    let text = crate::inspect::format(scope, &arguments, &InspectOptions::current(scope)?)?;
+    let text = crate::inspect::format_current(scope, &arguments)?;
     write_line(scope, stream, &text)
 }
 
-/// `dir(object, options)` of a `Console`, whose captures are `[stdout]`.
+/// `dir(object, options)` of a `Console`, whose payload is `stdout`.
 fn write_dir(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
-    payload: HandleValue,
+    stream: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.get(0)?;
     let mut options = InspectOptions::current(scope)?;
     if let Ok(given) = Object::from_value(scope, args.get(1)) {
         options = options.read(scope, given)?;
@@ -154,36 +156,35 @@ fn write_dir(
 /// with Node's default `ignoreErrors`.
 fn write_line(scope: &Scope<'_>, stream: HandleValue<'_>, text: &str) -> Result<Value, ExnThrown> {
     let stream = Object::from_value(scope, stream).map_err(|e| e.throw(scope))?;
-    let line = string(scope, &format!("{text}\n"))?;
-    if call_method(scope, stream, c"write", &[line]).is_err() {
-        take_exception(scope);
+    let line = js::conversion::ToJSVal::to_jsval_throwing(&format!("{text}\n"), scope)?;
+    if Function::call_by_name(scope, stream.handle(), c"write", &[line]).is_err() {
+        js::exception::take_pending_or_undefined(scope);
     }
     Ok(js::value::undefined())
 }
 
-/// A wrapped method, whose captures are `[original]`: call the runtime's method with the
+/// A wrapped method, whose payload is `original`: call the runtime's method with the
 /// arguments formatted by `util.format`.
 fn formatted(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
-    payload: HandleValue,
+    original: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let original = Captures::of(scope, payload)?.get(0)?;
     let arguments = crate::callback_args(&args);
-    let text = crate::inspect::format(scope, &arguments, &InspectOptions::current(scope)?)?;
+    let text = crate::inspect::format_current(scope, &arguments)?;
     let this = scope.root_value(args.this());
-    Function::call(scope, this, original, &[string(scope, &text)?])?;
+    Function::call(
+        scope,
+        this,
+        original,
+        &[js::conversion::ToJSVal::to_jsval_throwing(&text, scope)?],
+    )?;
     Ok(js::value::undefined())
 }
 
-/// `console.dir(object, options)`, whose captures are `[log]`: print `util.inspect` of `object`
+/// `console.dir(object, options)`, whose payload is `log`: print `util.inspect` of `object`
 /// with `options` and without custom inspection.
-fn dir(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let log = Captures::of(scope, payload)?.get(0)?;
+fn dir(scope: &Scope<'_>, args: CallbackArgs<'_>, log: HandleValue) -> Result<Value, ExnThrown> {
     let mut options = InspectOptions::current(scope)?;
     if let Ok(given) = Object::from_value(scope, args.get(1)) {
         options = options.read(scope, given)?;
@@ -191,14 +192,19 @@ fn dir(
     options.custom_inspect = false;
     let text = crate::inspect::inspect(scope, args.get(0), options)?;
     let this = scope.root_value(args.this());
-    Function::call(scope, this, log, &[string(scope, &text)?])?;
+    Function::call(
+        scope,
+        this,
+        log,
+        &[js::conversion::ToJSVal::to_jsval_throwing(&text, scope)?],
+    )?;
     Ok(js::value::undefined())
 }
 
 /// `console.assert(value, ...args)`: if `value` is falsy, call `console.warn` with the arguments,
 /// the first prefixed with `Assertion failed: `, or with just `Assertion failed`.
 fn assert(scope: &Scope<'_>, args: CallbackArgs<'_>, _: HandleValue) -> Result<Value, ExnThrown> {
-    if truthy(scope, args.get(0)) {
+    if js::conversion::to_boolean(args.get(0)) {
         return Ok(js::value::undefined());
     }
     let mut arguments = crate::callback_args(&args);
@@ -212,12 +218,12 @@ fn assert(scope: &Scope<'_>, args: CallbackArgs<'_>, _: HandleValue) -> Result<V
             format!("Assertion failed: {first}")
         }
     };
-    let prefix = string(scope, &prefix)?;
+    let prefix = js::conversion::ToJSVal::to_jsval_throwing(&prefix, scope)?;
     match arguments.first_mut() {
         Some(first) => *first = prefix,
         None => arguments.push(prefix),
     }
     let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
-    call_method(scope, this, c"warn", &arguments)?;
+    Function::call_by_name(scope, this.handle(), c"warn", &arguments)?;
     Ok(js::value::undefined())
 }

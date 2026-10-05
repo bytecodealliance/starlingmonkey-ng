@@ -15,8 +15,8 @@ use std::io::ErrorKind as IoErrorKind;
 
 use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
-use js::gc::handle::RootedHeap;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::{Heap, RootedHeap};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
@@ -25,7 +25,7 @@ use js::{Function, Object};
 use platform::fs::{FileKind, FsError, Stat};
 
 use super::ops::{copy_file_blocking, set_mode, time_of_seconds};
-use super::{path_arg, refuse_blocking, UvError, Variant};
+use super::{path_arg, refuse_blocking, UvError};
 use crate::errors::{
     describe_value, validate_function, validate_integer, validate_plain_object, ErrorKind,
     NodeError, Thrown,
@@ -125,7 +125,7 @@ pub(super) enum CpError {
         message: String,
         path: String,
     },
-    /// An `Error` with the code `code`, as Node's C++ implementation throws.
+    /// A plain `Error` with the code `code`, as Node's C++ implementation throws.
     Plain { code: &'static str, message: String },
 }
 
@@ -170,7 +170,18 @@ impl ThrowException for CpError {
         match self {
             CpError::Uv(error) => error.throw(scope),
             CpError::Plain { code, message } => {
-                NodeError::new(ErrorKind::Error, code, message).throw(scope)
+                let plain = || -> Result<ExnThrown, ExnThrown> {
+                    let error =
+                        js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &message)?;
+                    let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
+                    object.set_property(scope, c"code", code)?;
+                    Ok(js::exception::set_pending(
+                        scope,
+                        error,
+                        js::native::ExceptionStackBehavior::Capture,
+                    ))
+                };
+                plain().unwrap_or_else(|thrown| thrown)
             }
             CpError::System {
                 key,
@@ -206,23 +217,13 @@ fn system_error_value<'s>(
         "{}: cp returned {code} ({message}) {path}",
         system_error_prefix(key)
     );
-    let error = crate::stream::error_value(scope, NodeError::new(ErrorKind::Error, key, text))?;
-    let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
-    object.define_property(scope, c"name", "SystemError", 0)?;
-    let to_string =
-        Function::new_callback(scope, c"toString", 0, super::system_error_to_string, ())?;
-    object.define_property(scope, c"toString", to_string, 0)?;
-    let info = Object::new_plain(scope)?;
-    info.set_property(scope, c"message", message)?;
-    info.set_property(scope, c"path", path)?;
-    info.set_property(scope, c"syscall", "cp")?;
-    info.set_property(scope, c"errno", errno)?;
-    info.set_property(scope, c"code", code)?;
-    object.set_property(scope, c"info", info)?;
-    object.set_property(scope, c"errno", errno)?;
-    object.set_property(scope, c"syscall", "cp")?;
-    object.set_property(scope, c"path", path)?;
-    Ok(error)
+    crate::errors::system_error(scope, key, text, |info| {
+        info.set_property(scope, c"message", message)?;
+        info.set_property(scope, c"path", path)?;
+        info.set_property(scope, c"syscall", "cp")?;
+        info.set_property(scope, c"errno", errno)?;
+        info.set_property(scope, c"code", code)
+    })
 }
 
 // ============================================================================
@@ -694,59 +695,27 @@ fn symlink_to_subdirectory(resolved_dest: &str, resolved_src: &str, dest: &str) 
     )
 }
 
+/// A copy in progress: the walk, the `filter` option and the object it is called on, and the
+/// promise or the callback that receives the copy's outcome.
 #[core_runtime::jsclass(hidden)]
 pub struct CopyWalk {
     /// The copy, or `None` while [`AsyncCopy::advance`] runs.
     #[no_trace]
     walker: Option<Box<AsyncCopy>>,
+    filter: Heap<Value>,
+    filter_this: Heap<Value>,
+    /// The promise for the copy's completion, for `fsPromises.cp`.
+    promise: Option<Heap<js::promise::Promise>>,
+    /// The callback of `fs.cp`.
+    callback: Option<Heap<js::object::Object>>,
 }
 
 #[core_runtime::jsmethods]
-impl CopyWalk {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
-    }
-}
+impl CopyWalk {}
 
-/// The indices of the array of values a copy in progress uses on the JS thread, which is the
-/// payload of its reactions: the [`CopyWalk`], the `filter` function, the object `filter` is called
-/// on, the promise for the copy's completion, and whether that promise is fulfilled with the
-/// arguments of a callback.
-const WALK: u32 = 0;
-const FILTER: u32 = 1;
-const FILTER_THIS: u32 = 2;
-const PROMISE: u32 = 3;
-const CALLBACK: u32 = 4;
-
-/// The [`CopyWalk`] of the copy `context` describes.
-fn copy_walk<'s>(scope: &'s Scope<'_>, context: Object<'_>) -> Result<CopyWalk<'s>, ExnThrown> {
-    let walk = context.get_element(scope, WALK)?;
-    Object::from_value(scope, *walk)
-        .map_err(|e| e.throw(scope))?
-        .cast::<CopyWalk>()
-        .map_err(|_| js::error::TypeError("not a copy".into()).throw(scope))
-}
-
-/// The promise for the completion of the copy `context` describes.
-fn copy_promise<'s>(
-    scope: &'s Scope<'_>,
-    context: Object<'_>,
-) -> Result<js::Promise<'s>, ExnThrown> {
-    let promise = context.get_element(scope, PROMISE)?;
-    Object::from_value(scope, *promise)
-        .map_err(|e| e.throw(scope))?
-        .cast::<js::Promise>()
-        .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))
-}
-
-/// Start the copy of `src` to `dest` and return the promise for its completion. For
-/// [`Variant::Callback`], the promise is fulfilled with an array of the callback's arguments
-/// after the error.
+/// Start the copy of `src` to `dest`. Its outcome settles the returned promise, or is passed to
+/// `callback` if there is one: the error, or `null` and `undefined`.
+#[allow(clippy::too_many_arguments)]
 fn start<'s>(
     scope: &'s Scope<'_>,
     src: String,
@@ -754,40 +723,66 @@ fn start<'s>(
     options: Options,
     filter_this: Object<'_>,
     filter: HandleValue<'_>,
-    variant: Variant,
-) -> Result<js::Promise<'s>, ExnThrown> {
-    let promise = js::Promise::new_pending(scope)?;
+    callback: Option<Object<'_>>,
+) -> Result<Option<js::Promise<'s>>, ExnThrown> {
+    let promise = match callback {
+        Some(_) => None,
+        None => Some(js::Promise::new_pending(scope)?),
+    };
     let walker = Box::new(AsyncCopy::new(src.clone(), dest.clone(), options));
     let walk = js::class::create_instance_with::<CopyWalkImpl>(scope, |_| CopyWalkImpl {
         walker: Some(walker),
+        filter: Heap::from(filter.get()),
+        filter_this: Heap::from(filter_this.to_jsval_raw_throwing(scope).unwrap_or_default()),
+        promise: promise.map(Heap::from),
+        callback: callback.map(Heap::from),
     })?;
-    let context = js::Array::with_contents(
-        scope,
-        &[
-            walk.to_jsval_throwing(scope)?,
-            scope.root_value(filter.get()),
-            filter_this.to_jsval_throwing(scope)?,
-            promise.to_jsval_throwing(scope)?,
-            scope.root_value(js::value::from_bool(variant == Variant::Callback)),
-        ],
-    )?;
     // Node calls `filter` on the source path before `cp` returns.
     match options.filter {
-        true => call_filter(scope, *context, &src, &dest)?,
-        false => step(scope, *context, None)?,
+        true => call_filter(scope, walk, &src, &dest)?,
+        false => step(scope, walk, None)?,
     }
     Ok(promise)
 }
 
-/// Run [`AsyncCopy::advance`] with `decision` off the JS thread, and continue on the JS thread
-/// with [`after_step`] or [`fail_copy`].
-fn step(scope: &Scope<'_>, context: Object<'_>, decision: Option<bool>) -> Result<(), ExnThrown> {
-    let walker = copy_walk(scope, context)?
+/// Settle the copy `walk` with `error`, or as a success if there is none.
+fn finish_copy(
+    scope: &Scope<'_>,
+    walk: CopyWalk<'_>,
+    error: Option<HandleValue<'_>>,
+) -> Result<(), ExnThrown> {
+    let (callback, promise) = {
+        let data = walk.data();
+        let callback = data.callback.as_ref().map(|callback| callback.get(scope));
+        let promise = data.promise.as_ref().map(|promise| promise.get(scope));
+        (callback, promise)
+    };
+    let outcome = error.unwrap_or(HandleValue::undefined());
+    if let Some(callback) = callback {
+        return match error {
+            Some(error) => crate::support::call_reporting(scope, callback, &[error]).map(drop),
+            None => {
+                crate::support::call_reporting(scope, callback, &[HandleValue::null(), outcome])
+                    .map(drop)
+            }
+        };
+    }
+    match (promise, error) {
+        (Some(promise), Some(_)) => promise.reject(scope, outcome),
+        (Some(promise), None) => promise.resolve(scope, outcome),
+        (None, _) => Ok(()),
+    }
+}
+
+/// Run [`AsyncCopy::advance`] with `decision` off the JS thread, and continue the copy on the JS
+/// thread: finish it, call `filter`, or fail it.
+fn step(scope: &Scope<'_>, walk: CopyWalk<'_>, decision: Option<bool>) -> Result<(), ExnThrown> {
+    let walker = walk
         .data_mut()
         .walker
         .take()
         .expect("one step runs at a time");
-    let context_root = RootedHeap::<js::object::Object>::new(context);
+    let walk_root = RootedHeap::<js::object::Object>::new(walk.as_object());
     let interest = super::hold_event_loop();
     let future = async move {
         let (walker, result) = platform::fs::offload(move || {
@@ -798,104 +793,73 @@ fn step(scope: &Scope<'_>, context: Object<'_>, decision: Option<bool>) -> Resul
         .await;
         PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
             drop(interest);
-            copy_walk(scope, context_root.get(scope))?.data_mut().walker = Some(walker);
+            let walk = walk_root
+                .get(scope)
+                .cast::<CopyWalk>()
+                .map_err(|_| js::error::TypeError("not a copy".into()).throw(scope))?;
+            walk.data_mut().walker = Some(walker);
             match result {
-                Ok(Next::Done) => Ok(HandleValue::undefined()),
-                Ok(Next::Filter(src, dest)) => {
-                    let src = js::JSString::from_str(scope, &src)?.to_jsval_throwing(scope)?;
-                    let dest = js::JSString::from_str(scope, &dest)?.to_jsval_throwing(scope)?;
-                    js::Array::with_contents(scope, &[src, dest])?.to_jsval_throwing(scope)
+                Ok(Next::Done) => finish_copy(scope, walk, None)?,
+                Ok(Next::Filter(src, dest)) => call_filter(scope, walk, &src, &dest)?,
+                Err(error) => {
+                    error.throw(scope);
+                    let error = js::exception::take_pending_or_undefined(scope);
+                    finish_copy(scope, walk, Some(error))?;
                 }
-                Err(error) => Err(error.throw(scope)),
             }
+            Ok(HandleValue::undefined())
         }))
     };
-    let promise = js::Promise::new_pending(scope)?;
-    promise.spawn_polled(PromiseFuture::new(future));
-    let context = context.to_jsval_throwing(scope)?;
-    let on_step = Function::new_callback(scope, c"", 1, after_step, *context)?;
-    let on_error = Function::new_callback(scope, c"", 1, fail_copy, *context)?;
-    promise.add_reactions(scope, Some(*on_step), Some(*on_error))
+    js::Promise::new_pending(scope)?.spawn_polled(PromiseFuture::new(future));
+    Ok(())
 }
 
-/// The fulfillment reaction of a step, whose payload is the copy's context: finish the copy if
-/// the step was fulfilled with `undefined`, and otherwise call `filter` with the source and
-/// destination paths in the array it was fulfilled with.
-fn after_step(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let context = Object::from_value(scope, *payload).map_err(|e| e.throw(scope))?;
-    let value = scope.root_value(args.get(0).get());
-    if value.is_undefined() {
-        let promise = copy_promise(scope, context)?;
-        let value = match context.get_element(scope, CALLBACK)?.to_boolean() {
-            true => js::Array::with_contents(scope, &[HandleValue::undefined()])?
-                .to_jsval_throwing(scope)?,
-            false => HandleValue::undefined(),
-        };
-        promise.resolve(scope, value)?;
-        return Ok(js::value::undefined());
-    }
-    let paths = Object::from_value(scope, *value).map_err(|e| e.throw(scope))?;
-    let path = |index| -> Result<String, ExnThrown> {
-        js::JSString::from_value(scope, paths.get_element(scope, index)?)?.to_utf8(scope)
-    };
-    call_filter(scope, context, &path(0)?, &path(1)?)?;
-    Ok(js::value::undefined())
-}
-
-/// The rejection reaction of a step or of `filter`'s result, whose payload is the copy's context:
-/// reject the copy's promise with the error.
+/// The rejection reaction of `filter`'s result, whose payload is the copy's [`CopyWalk`]: fail
+/// the copy with the error.
 fn fail_copy(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let context = Object::from_value(scope, *payload).map_err(|e| e.throw(scope))?;
-    copy_promise(scope, context)?.reject(scope, args.get(0))?;
+    let walk = cast_payload::<CopyWalk>(scope, payload);
+    finish_copy(scope, walk, Some(args.get(0)))?;
     Ok(js::value::undefined())
 }
 
 /// Call `filter` with `src` and `dest`, and continue the copy with its result once that settles.
-/// An exception `filter` throws rejects the copy's promise.
+/// An exception `filter` throws fails the copy.
 fn call_filter(
     scope: &Scope<'_>,
-    context: Object<'_>,
+    walk: CopyWalk<'_>,
     src: &str,
     dest: &str,
 ) -> Result<(), ExnThrown> {
-    let filter = context.get_element(scope, FILTER)?;
-    let this = context.get_element(scope, FILTER_THIS)?;
+    let (filter, this) = {
+        let data = walk.data();
+        (data.filter.get(scope), data.filter_this.get(scope))
+    };
     let src = js::JSString::from_str(scope, src)?.to_jsval_throwing(scope)?;
     let dest = js::JSString::from_str(scope, dest)?.to_jsval_throwing(scope)?;
-    let context_value = context.to_jsval_throwing(scope)?;
     let result = match Function::call(scope, this, filter, &[src, dest]) {
-        Ok(result) => js::Promise::new_resolved_with_value(scope, result)?,
+        Ok(result) => js::Promise::call_original_resolve(scope, result)?,
         Err(ExnThrown) => js::Promise::new_rejected_with_pending_error(scope)?,
     };
-    let on_value = Function::new_callback(scope, c"", 1, after_filter, *context_value)?;
-    let on_error = Function::new_callback(scope, c"", 1, fail_copy, *context_value)?;
+    let on_value = Function::new_callback(scope, c"", 1, after_filter, walk)?;
+    let on_error = Function::new_callback(scope, c"", 1, fail_copy, walk)?;
     result.add_reactions(scope, Some(*on_value), Some(*on_error))
 }
 
-/// The fulfillment reaction of `filter`'s result, whose payload is the copy's context: continue
-/// the copy with the result's truthiness as the decision.
+/// The fulfillment reaction of `filter`'s result, whose payload is the copy's [`CopyWalk`]:
+/// continue the copy with the result's truthiness as the decision.
 fn after_filter(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let context = Object::from_value(scope, *payload).map_err(|e| e.throw(scope))?;
-    let decision = crate::stream::truthy(scope, args.get(0));
-    step(scope, context, Some(decision))?;
+    let walk = cast_payload::<CopyWalk>(scope, payload);
+    let decision = js::conversion::to_boolean(args.get(0));
+    step(scope, walk, Some(decision))?;
     Ok(js::value::undefined())
-}
-
-/// Argument `index`, or `undefined`.
-fn arg<'a>(args: &[HandleValue<'a>], index: usize) -> HandleValue<'a> {
-    args.get(index).copied().unwrap_or(HandleValue::undefined())
 }
 
 /// The body of `fs.cp(src, dest[, options], callback)`.
@@ -906,44 +870,30 @@ pub(super) fn cp_callback(
 ) -> Result<Value, ExnThrown> {
     let values = crate::callback_args(&args);
     let run = || -> Result<(), Thrown> {
-        let (options, callback) = match crate::stream::is_function(scope, arg(&values, 2)) {
-            true => (None, arg(&values, 2)),
-            false => (Some(arg(&values, 2)), arg(&values, 3)),
+        let (options, callback) = match js::function::is_callable(super::ops::arg(&values, 2)) {
+            true => (None, super::ops::arg(&values, 2)),
+            false => (
+                Some(super::ops::arg(&values, 2)),
+                super::ops::arg(&values, 3),
+            ),
         };
         validate_function(scope, callback, "cb")?;
         let (options, filter_this, filter) = parse_options(scope, options)?;
-        let src = path_arg(scope, arg(&values, 0), "src")?;
-        let dest = path_arg(scope, arg(&values, 1), "dest")?;
+        let src = path_arg(scope, super::ops::arg(&values, 0), "src")?;
+        let dest = path_arg(scope, super::ops::arg(&values, 1), "dest")?;
         if cfg!(target_arch = "wasm32") {
             refuse_blocking("cp")?;
         }
-        let promise = start(
+        let callback = Object::from_value(scope, *callback)?;
+        start(
             scope,
             src,
             dest,
             options,
             filter_this,
             filter,
-            Variant::Callback,
+            Some(callback),
         )?;
-        let on_values = Function::new_callback(
-            scope,
-            c"",
-            1,
-            super::call_back_with_values,
-            *js::Array::with_contents(
-                scope,
-                &[callback, scope.root_value(js::value::from_bool(true))],
-            )?,
-        )?;
-        let on_error = Function::new_callback(
-            scope,
-            c"",
-            1,
-            super::call_back_with_error,
-            *js::Array::with_contents(scope, &[callback])?,
-        )?;
-        promise.then(scope, Some(*on_values), Some(*on_error))?;
         Ok(())
     };
     run().map_err(|thrown| thrown.throw(scope))?;
@@ -958,21 +908,15 @@ pub(super) fn cp_promise(
 ) -> Result<Value, ExnThrown> {
     let values = crate::callback_args(&args);
     let run = || -> Result<js::Promise<'_>, Thrown> {
-        let (options, filter_this, filter) = parse_options(scope, Some(arg(&values, 2)))?;
-        let src = path_arg(scope, arg(&values, 0), "src")?;
-        let dest = path_arg(scope, arg(&values, 1), "dest")?;
+        let (options, filter_this, filter) =
+            parse_options(scope, Some(super::ops::arg(&values, 2)))?;
+        let src = path_arg(scope, super::ops::arg(&values, 0), "src")?;
+        let dest = path_arg(scope, super::ops::arg(&values, 1), "dest")?;
         if cfg!(target_arch = "wasm32") {
             refuse_blocking("cp")?;
         }
-        Ok(start(
-            scope,
-            src,
-            dest,
-            options,
-            filter_this,
-            filter,
-            Variant::Promise,
-        )?)
+        let promise = start(scope, src, dest, options, filter_this, filter, None)?;
+        Ok(promise.expect("a copy without a callback has a promise"))
     };
     let promise = match run() {
         Ok(promise) => promise,
@@ -1023,9 +967,10 @@ pub(super) fn cp_sync(
 ) -> Result<Value, ExnThrown> {
     let values = crate::callback_args(&args);
     let run = || -> Result<(), Thrown> {
-        let (options, filter_this, filter) = parse_options(scope, Some(arg(&values, 2)))?;
-        let src = path_arg(scope, arg(&values, 0), "src")?;
-        let dest = path_arg(scope, arg(&values, 1), "dest")?;
+        let (options, filter_this, filter) =
+            parse_options(scope, Some(super::ops::arg(&values, 2)))?;
+        let src = path_arg(scope, super::ops::arg(&values, 0), "src")?;
+        let dest = path_arg(scope, super::ops::arg(&values, 1), "dest")?;
         refuse_blocking("cpSync")?;
         let mut call_filter = |src: &str, dest: &str| -> Result<bool, Thrown> {
             let src = js::JSString::from_str(scope, src)?.to_jsval_throwing(scope)?;
@@ -1044,7 +989,7 @@ pub(super) fn cp_sync(
                 )
                 .into());
             }
-            Ok(crate::stream::truthy(scope, result))
+            Ok(js::conversion::to_boolean(result))
         };
         match copy_sync(&src, &dest, &options, &mut call_filter) {
             Ok(()) => Ok(()),

@@ -170,3 +170,38 @@ paused.emit("d", 3);
 paused.emit("end");
 for await (const value of pausedIterator) flow.push(value[0]);
 deepEq(flow, ["paused", 1, 2, 3], "a closed iterator doesn't resume the emitter");
+
+// Values from user code that aren't numbers.
+eq(listenerCount({ listenerCount() { return "x"; } }, "a"), "x", "listenerCount returns the method's result");
+const descriptor = Object.getOwnPropertyDescriptor(EventEmitter, "defaultMaxListeners");
+eq(typeof descriptor.get + typeof descriptor.set + descriptor.enumerable + descriptor.configurable, "functionfunctiontruefalse", "defaultMaxListeners is an accessor");
+throws(() => { EventEmitter.defaultMaxListeners = "x"; }, "ERR_INVALID_ARG_TYPE", "defaultMaxListeners takes numbers");
+throws(() => { EventEmitter.defaultMaxListeners = NaN; }, "ERR_OUT_OF_RANGE", "defaultMaxListeners rejects NaN");
+eq(events.getMaxListeners(new EventTarget()), 10, "the default limit of an EventTarget");
+events.setMaxListeners(4);
+eq(EventEmitter.defaultMaxListeners, 4, "setMaxListeners sets the default");
+EventEmitter.defaultMaxListeners = 10;
+const stringLimit = new EventEmitter();
+stringLimit._maxListeners = "abc";
+eq(stringLimit.getMaxListeners(), "abc", "getMaxListeners returns _maxListeners as it is");
+stringLimit.on("a", () => {});
+stringLimit.on("a", () => {});
+eq(stringLimit.listenerCount("a"), 2, "a limit that isn't a number");
+
+// `getEventListeners` and `listenerCount` read an `EventTarget`'s listeners, and reject objects
+// that are neither an emitter nor a target.
+const listedTarget = new EventTarget();
+const targetListener = () => {};
+listedTarget.addEventListener("t", targetListener);
+listedTarget.addEventListener("t", () => {}, { once: true });
+deepEq(getEventListeners(listedTarget, "t").length, 2, "getEventListeners of an EventTarget");
+eq(getEventListeners(listedTarget, "t")[0], targetListener, "getEventListeners returns the listeners");
+deepEq(getEventListeners(listedTarget, "none"), [], "getEventListeners of an event without listeners");
+eq(listenerCount(listedTarget, "t"), 2, "listenerCount of an EventTarget");
+throws(() => listenerCount({}, "x"), "ERR_INVALID_ARG_TYPE", "listenerCount of a plain object");
+throws(() => listenerCount([], "x"), "ERR_INVALID_ARG_TYPE", "listenerCount of an array");
+throws(() => on(new EventEmitter(), "x", []), "ERR_INVALID_ARG_TYPE", "on rejects array options");
+for (const options of [[], () => {}]) {
+  const rejection = await once(new EventEmitter(), "x", options).then(() => "resolved", (error) => error.code);
+  eq(rejection, "ERR_INVALID_ARG_TYPE", "once rejects options that aren't plain objects");
+}

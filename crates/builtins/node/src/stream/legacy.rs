@@ -4,40 +4,54 @@
 
 use js::conversion::ToJSVal;
 use js::error::ExnThrown;
-use js::function::{Callback, CallbackArgs};
+use js::function::{cast_payload, Callback, CallbackArgs};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
-use js::Object;
+use js::{Function, Object};
 
 use super::readable::prepend_listener;
-use super::util::{
-    as_object, call_method, closure, emit, has_method, listen, listener_count, string, truthy,
-    type_error, Captures,
-};
 use crate::errors::Thrown;
+use crate::events::{listen, listener_count};
+use crate::support::has_method;
 
-/// The captures of the listeners legacy `pipe` adds: `[source, dest, ondata, ondrain, onend,
-/// onclose, onerror, cleanup, didOnEnd]`.
-mod captures {
-    pub(super) const SOURCE: u32 = 0;
-    pub(super) const DEST: u32 = 1;
-    pub(super) const ONDATA: u32 = 2;
-    pub(super) const ONDRAIN: u32 = 3;
-    pub(super) const ONEND: u32 = 4;
-    pub(super) const ONCLOSE: u32 = 5;
-    pub(super) const ONERROR: u32 = 6;
-    pub(super) const CLEANUP: u32 = 7;
-    pub(super) const DID_ON_END: u32 = 8;
-    pub(super) const COUNT: usize = 9;
+/// The state of a legacy `pipe`: the source, the destination, the listeners it adds, and whether
+/// it ended or destroyed the destination.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct LegacyPipeState {
+    source: Heap<js::object::Object>,
+    dest: Heap<js::object::Object>,
+    ondata: Heap<js::object::Object>,
+    ondrain: Heap<js::object::Object>,
+    onend: Heap<js::object::Object>,
+    onclose: Heap<js::object::Object>,
+    onerror: Heap<js::object::Object>,
+    cleanup: Heap<js::object::Object>,
+    #[no_trace]
+    did_on_end: bool,
 }
 
-/// The legacy `pipe` array of a listener's captures `[pipe]`.
-fn pipe_array<'s>(
-    scope: &'s Scope<'_>,
-    payload: HandleValue<'_>,
-) -> Result<Captures<'s>, ExnThrown> {
-    Captures::of(scope, Captures::of(scope, payload)?.get(0)?)
+#[core_runtime::jsmethods]
+impl LegacyPipeState {
+    fn new(
+        &self,
+        scope: &Scope<'_>,
+        source: Object<'_>,
+        dest: Object<'_>,
+    ) -> Result<(), ExnThrown> {
+        let listener = |body: Callback| Function::new_callback(scope, c"", 1, body, self);
+        let data = self.data();
+        data.source.set(source);
+        data.dest.set(dest);
+        data.ondata.set(*listener(ondata)?);
+        data.ondrain.set(*listener(ondrain)?);
+        data.onend.set(*listener(onend)?);
+        data.onclose.set(*listener(onclose)?);
+        data.onerror.set(*listener(onerror)?);
+        data.cleanup.set(*listener(cleanup)?);
+        Ok(())
+    }
 }
 
 fn ondata(
@@ -45,13 +59,15 @@ fn ondata(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let pipe = pipe_array(scope, payload)?;
-    let source = pipe.obj(captures::SOURCE)?;
-    let dest = pipe.obj(captures::DEST)?;
-    if truthy(scope, dest.get_property(scope, c"writable")?) {
-        let written = call_method(scope, dest, c"write", &[args.get(0)])?;
+    let pipe = cast_payload::<LegacyPipeState>(scope, payload);
+    let (source, dest) = {
+        let data = pipe.data();
+        (data.source.get(scope), data.dest.get(scope))
+    };
+    if js::conversion::to_boolean(dest.get_property(scope, c"writable")?) {
+        let written = Function::call_by_name(scope, dest.handle(), c"write", &[args.get(0)])?;
         if written.is_boolean() && !written.to_boolean() && has_method(scope, source, c"pause")? {
-            call_method(scope, source, c"pause", &[])?;
+            Function::call_by_name(scope, source.handle(), c"pause", js::function::EmptyArgs)?;
         }
     }
     Ok(js::value::undefined())
@@ -62,13 +78,26 @@ fn ondrain(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let source = pipe_array(scope, payload)?.obj(captures::SOURCE)?;
-    if truthy(scope, source.get_property(scope, c"readable")?)
+    let source = cast_payload::<LegacyPipeState>(scope, payload)
+        .data()
+        .source
+        .get(scope);
+    if js::conversion::to_boolean(source.get_property(scope, c"readable")?)
         && has_method(scope, source, c"resume")?
     {
-        call_method(scope, source, c"resume", &[])?;
+        Function::call_by_name(scope, source.handle(), c"resume", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
+}
+
+/// Mark the pipe ended, and return its destination unless it was already.
+fn end_once<'s>(scope: &'s Scope<'_>, pipe: LegacyPipeState<'_>) -> Option<Object<'s>> {
+    let mut data = pipe.data_mut();
+    if data.did_on_end {
+        return None;
+    }
+    data.did_on_end = true;
+    Some(data.dest.get(scope))
 }
 
 fn onend(
@@ -76,10 +105,9 @@ fn onend(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let pipe = pipe_array(scope, payload)?;
-    if !pipe.flag(captures::DID_ON_END)? {
-        pipe.set(captures::DID_ON_END, true)?;
-        call_method(scope, pipe.obj(captures::DEST)?, c"end", &[])?;
+    let pipe = cast_payload::<LegacyPipeState>(scope, payload);
+    if let Some(dest) = end_once(scope, pipe) {
+        Function::call_by_name(scope, dest.handle(), c"end", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
 }
@@ -89,12 +117,10 @@ fn onclose(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let pipe = pipe_array(scope, payload)?;
-    if !pipe.flag(captures::DID_ON_END)? {
-        pipe.set(captures::DID_ON_END, true)?;
-        let dest = pipe.obj(captures::DEST)?;
+    let pipe = cast_payload::<LegacyPipeState>(scope, payload);
+    if let Some(dest) = end_once(scope, pipe) {
         if has_method(scope, dest, c"destroy")? {
-            call_method(scope, dest, c"destroy", &[])?;
+            Function::call_by_name(scope, dest.handle(), c"destroy", js::function::EmptyArgs)?;
         }
     }
     Ok(js::value::undefined())
@@ -105,13 +131,13 @@ fn onerror(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let this = as_object(scope, scope.root_value(args.this()));
+    let this = Object::from_value(scope, args.this()).ok();
     let error = scope.root_value(args.get(0).get());
-    cleanup(scope, args, payload)?;
+    cleanup_pipe(scope, cast_payload::<LegacyPipeState>(scope, payload))?;
     if let Some(this) = this {
-        let event = string(scope, "error")?;
+        let event = js::class::get_or_init_atom(scope, c"error")?;
         if listener_count(scope, this, event)? == 0.0 {
-            emit(scope, this, "error", &[error])?;
+            crate::events::emit(scope, this, c"error", &[error])?;
         }
     }
     Ok(js::value::undefined())
@@ -122,24 +148,39 @@ fn cleanup(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use captures::*;
-    let pipe = pipe_array(scope, payload)?;
-    let source = pipe.obj(SOURCE)?;
-    let dest = pipe.obj(DEST)?;
-    for (emitter, event, index) in [
-        (source, "data", ONDATA),
-        (dest, "drain", ONDRAIN),
-        (source, "end", ONEND),
-        (source, "close", ONCLOSE),
-        (source, "error", ONERROR),
-        (dest, "error", ONERROR),
-        (source, "end", CLEANUP),
-        (source, "close", CLEANUP),
-        (dest, "close", CLEANUP),
-    ] {
-        listen(scope, emitter, c"removeListener", event, pipe.obj(index)?)?;
-    }
+    cleanup_pipe(scope, cast_payload::<LegacyPipeState>(scope, payload))?;
     Ok(js::value::undefined())
+}
+
+/// Remove the listeners the pipe added.
+fn cleanup_pipe(scope: &Scope<'_>, pipe: LegacyPipeState<'_>) -> Result<(), ExnThrown> {
+    let (source, dest, ondata, ondrain, onend, onclose, onerror, cleanup) = {
+        let data = pipe.data();
+        (
+            data.source.get(scope),
+            data.dest.get(scope),
+            data.ondata.get(scope),
+            data.ondrain.get(scope),
+            data.onend.get(scope),
+            data.onclose.get(scope),
+            data.onerror.get(scope),
+            data.cleanup.get(scope),
+        )
+    };
+    for (emitter, event, listener) in [
+        (source, c"data", ondata),
+        (dest, c"drain", ondrain),
+        (source, c"end", onend),
+        (source, c"close", onclose),
+        (source, c"error", onerror),
+        (dest, c"error", onerror),
+        (source, c"end", cleanup),
+        (source, c"close", cleanup),
+        (dest, c"close", cleanup),
+    ] {
+        listen(scope, emitter, c"removeListener", event, listener)?;
+    }
+    Ok(())
 }
 
 #[core_runtime::jsfunction_class(name = "Stream", extends = "crate::events::event_emitter")]
@@ -147,7 +188,7 @@ pub mod stream {
     use super::*;
 
     /// <https://nodejs.org/api/stream.html#stream>: an `EventEmitter`.
-    #[constructor]
+    #[constructor(length = 1)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -158,51 +199,49 @@ pub mod stream {
 
     /// The legacy `pipe`: write `data` to `dest`, pausing on backpressure, and end or destroy
     /// `dest` once this ends or closes.
+    #[method(length = 2)]
     pub fn pipe<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
         dest: HandleValue<'s>,
         options: Option<HandleValue<'_>>,
     ) -> Result<HandleValue<'s>, ExnThrown> {
-        use captures::*;
-        let pipe = js::Array::with_contents(scope, &[js::value::undefined(); COUNT])?;
-        let pipe_value = scope.root_value((*pipe).to_jsval_raw_throwing(scope)?);
-        let state = Captures::of(scope, (*pipe).to_jsval_throwing(scope)?)?;
-        state.set(SOURCE, this)?;
-        state.set(DEST, dest)?;
-        state.set(DID_ON_END, false)?;
-        for (index, body) in [
-            (ONDATA, ondata as Callback),
-            (ONDRAIN, ondrain),
-            (ONEND, onend),
-            (ONCLOSE, onclose),
-            (ONERROR, onerror),
-            (CLEANUP, cleanup),
-        ] {
-            state.set(index, closure(scope, 1, body, &[pipe_value.get()])?)?;
-        }
-        listen(scope, this, c"on", "data", state.obj(ONDATA)?)?;
-        let dest_object =
-            as_object(scope, dest).ok_or_else(|| type_error(scope, "dest.on is not a function"))?;
-        listen(scope, dest_object, c"on", "drain", state.obj(ONDRAIN)?)?;
+        let dest_object = Object::from_value(scope, dest).map_err(|_| {
+            js::error::TypeError(String::from("dest.on is not a function")).throw(scope)
+        })?;
+        let pipe = LegacyPipeState::new(scope, this, dest_object)?;
+        let (ondata, ondrain, onend, onclose, onerror, cleanup) = {
+            let data = pipe.data();
+            (
+                data.ondata.get(scope),
+                data.ondrain.get(scope),
+                data.onend.get(scope),
+                data.onclose.get(scope),
+                data.onerror.get(scope),
+                data.cleanup.get(scope),
+            )
+        };
+        listen(scope, this, c"on", c"data", ondata)?;
+        listen(scope, dest_object, c"on", c"drain", ondrain)?;
         let end_option = options
-            .and_then(|options| as_object(scope, options))
+            .and_then(|options| Object::from_value(scope, options).ok())
             .map(|options| options.get_property(scope, c"end"))
             .transpose()?;
         let keep_open = end_option.is_some_and(|end| end.is_boolean() && !end.to_boolean());
-        if !truthy(scope, dest_object.get_property(scope, c"_isStdio")?) && !keep_open {
-            listen(scope, this, c"on", "end", state.obj(ONEND)?)?;
-            listen(scope, this, c"on", "close", state.obj(ONCLOSE)?)?;
+        if !js::conversion::to_boolean(dest_object.get_property(scope, c"_isStdio")?) && !keep_open
+        {
+            listen(scope, this, c"on", c"end", onend)?;
+            listen(scope, this, c"on", c"close", onclose)?;
         }
-        prepend_listener(scope, this, "error", state.obj(ONERROR)?)?;
-        prepend_listener(scope, dest_object, "error", state.obj(ONERROR)?)?;
-        listen(scope, this, c"on", "end", state.obj(CLEANUP)?)?;
-        listen(scope, this, c"on", "close", state.obj(CLEANUP)?)?;
-        listen(scope, dest_object, c"on", "close", state.obj(CLEANUP)?)?;
-        emit(
+        prepend_listener(scope, this, c"error", onerror)?;
+        prepend_listener(scope, dest_object, c"error", onerror)?;
+        listen(scope, this, c"on", c"end", cleanup)?;
+        listen(scope, this, c"on", c"close", cleanup)?;
+        listen(scope, dest_object, c"on", c"close", cleanup)?;
+        crate::events::emit(
             scope,
             dest_object,
-            "pipe",
+            c"pipe",
             &[this.to_jsval_throwing(scope)?],
         )?;
         Ok(dest)

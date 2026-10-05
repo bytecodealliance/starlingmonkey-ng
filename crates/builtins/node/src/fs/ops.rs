@@ -30,13 +30,13 @@ const NOT_PROMISE: u8 = SYNC | CALLBACK;
 type Parse = fn(&Scope<'_>, &[HandleValue<'_>], Variant) -> Result<Prepared, Thrown>;
 
 /// An operation: the name of its callback and promise functions, the name of its synchronous
-/// function, the variants it has functions for, the `length` of the synchronous function, and
-/// its parser.
+/// function, the variants it has functions for, the `length` of its synchronous, callback and
+/// promise functions, and its parser.
 pub(super) struct OpDef {
     pub(super) name: &'static str,
     pub(super) sync: &'static str,
     pub(super) variants: u8,
-    pub(super) nargs: u32,
+    pub(super) lengths: [u32; 3],
     pub(super) parse: Parse,
 }
 
@@ -44,53 +44,65 @@ const fn op(
     name: &'static str,
     sync: &'static str,
     variants: u8,
-    nargs: u32,
+    lengths: [u32; 3],
     parse: Parse,
 ) -> OpDef {
     OpDef {
         name,
         sync,
         variants,
-        nargs,
+        lengths,
         parse,
     }
 }
 
 pub(super) const OPS: [OpDef; 34] = [
-    op("access", "accessSync", ALL, 2, access),
-    op("appendFile", "appendFileSync", ALL, 3, append_file),
-    op("chmod", "chmodSync", ALL, 2, chmod),
-    op("chown", "chownSync", ALL, 3, chown),
-    op("close", "closeSync", NOT_PROMISE, 1, close),
-    op("copyFile", "copyFileSync", ALL, 3, copy_file),
-    op("exists", "existsSync", NOT_PROMISE, 1, exists),
-    op("fchmod", "fchmodSync", NOT_PROMISE, 2, fchmod),
-    op("fchown", "fchownSync", NOT_PROMISE, 3, fchown),
-    op("fdatasync", "fdatasyncSync", NOT_PROMISE, 1, fdatasync),
-    op("fstat", "fstatSync", NOT_PROMISE, 2, fstat),
-    op("fsync", "fsyncSync", NOT_PROMISE, 1, fsync),
-    op("ftruncate", "ftruncateSync", NOT_PROMISE, 2, ftruncate),
-    op("futimes", "futimesSync", NOT_PROMISE, 3, futimes),
-    op("link", "linkSync", ALL, 2, link),
-    op("lstat", "lstatSync", ALL, 2, lstat),
-    op("mkdir", "mkdirSync", ALL, 2, mkdir),
-    op("mkdtemp", "mkdtempSync", ALL, 2, mkdtemp),
-    op("open", "openSync", NOT_PROMISE, 3, open),
-    op("read", "readSync", NOT_PROMISE, 5, read),
-    op("readFile", "readFileSync", ALL, 2, read_file),
-    op("readdir", "readdirSync", ALL, 2, readdir),
-    op("readlink", "readlinkSync", ALL, 2, readlink),
-    op("realpath", "realpathSync", ALL, 2, realpath),
-    op("rename", "renameSync", ALL, 2, rename),
-    op("rm", "rmSync", ALL, 2, rm),
-    op("rmdir", "rmdirSync", ALL, 2, rmdir),
-    op("stat", "statSync", ALL, 2, stat),
-    op("symlink", "symlinkSync", ALL, 3, symlink),
-    op("truncate", "truncateSync", ALL, 2, truncate),
-    op("unlink", "unlinkSync", ALL, 1, unlink),
-    op("utimes", "utimesSync", ALL, 3, utimes),
-    op("write", "writeSync", NOT_PROMISE, 5, write),
-    op("writeFile", "writeFileSync", ALL, 3, write_file),
+    op("access", "accessSync", ALL, [2, 3, 1], access),
+    op("appendFile", "appendFileSync", ALL, [3, 4, 3], append_file),
+    op("chmod", "chmodSync", ALL, [2, 3, 2], chmod),
+    op("chown", "chownSync", ALL, [3, 4, 3], chown),
+    op("close", "closeSync", NOT_PROMISE, [1, 1, 1], close),
+    op("copyFile", "copyFileSync", ALL, [3, 4, 3], copy_file),
+    op("exists", "existsSync", NOT_PROMISE, [1, 2, 1], exists),
+    op("fchmod", "fchmodSync", NOT_PROMISE, [2, 3, 2], fchmod),
+    op("fchown", "fchownSync", NOT_PROMISE, [3, 4, 3], fchown),
+    op(
+        "fdatasync",
+        "fdatasyncSync",
+        NOT_PROMISE,
+        [1, 2, 1],
+        fdatasync,
+    ),
+    op("fstat", "fstatSync", NOT_PROMISE, [1, 1, 1], fstat),
+    op("fsync", "fsyncSync", NOT_PROMISE, [1, 2, 1], fsync),
+    op(
+        "ftruncate",
+        "ftruncateSync",
+        NOT_PROMISE,
+        [1, 1, 1],
+        ftruncate,
+    ),
+    op("futimes", "futimesSync", NOT_PROMISE, [3, 4, 3], futimes),
+    op("link", "linkSync", ALL, [2, 3, 2], link),
+    op("lstat", "lstatSync", ALL, [1, 1, 1], lstat),
+    op("mkdir", "mkdirSync", ALL, [2, 3, 2], mkdir),
+    op("mkdtemp", "mkdtempSync", ALL, [2, 3, 2], mkdtemp),
+    op("open", "openSync", NOT_PROMISE, [3, 4, 3], open),
+    op("read", "readSync", NOT_PROMISE, [5, 6, 5], read),
+    op("readFile", "readFileSync", ALL, [2, 3, 2], read_file),
+    op("readdir", "readdirSync", ALL, [2, 3, 2], readdir),
+    op("readlink", "readlinkSync", ALL, [2, 3, 2], readlink),
+    op("realpath", "realpathSync", ALL, [2, 3, 2], realpath),
+    op("rename", "renameSync", ALL, [2, 3, 2], rename),
+    op("rm", "rmSync", ALL, [2, 3, 2], rm),
+    op("rmdir", "rmdirSync", ALL, [2, 3, 2], rmdir),
+    op("stat", "statSync", ALL, [1, 1, 1], stat),
+    op("symlink", "symlinkSync", ALL, [3, 4, 3], symlink),
+    op("truncate", "truncateSync", ALL, [2, 3, 1], truncate),
+    op("unlink", "unlinkSync", ALL, [1, 2, 1], unlink),
+    op("utimes", "utimesSync", ALL, [3, 4, 3], utimes),
+    op("write", "writeSync", NOT_PROMISE, [5, 6, 5], write),
+    op("writeFile", "writeFileSync", ALL, [3, 4, 3], write_file),
 ];
 
 /// The index of the operation named `name` in [`OPS`].
@@ -138,7 +150,7 @@ fn wasi_file(
 }
 
 /// Argument `index`, or `undefined`.
-fn arg<'a>(args: &[HandleValue<'a>], index: usize) -> HandleValue<'a> {
+pub(super) fn arg<'a>(args: &[HandleValue<'a>], index: usize) -> HandleValue<'a> {
     args.get(index).copied().unwrap_or(HandleValue::undefined())
 }
 
@@ -173,7 +185,13 @@ fn position_arg(
         return Ok(None);
     };
     if value.is_number() {
-        let number = validate_integer(scope, value, "position", -1.0, 9007199254740991.0)?;
+        let number = validate_integer(
+            scope,
+            value,
+            "position",
+            -1.0,
+            crate::errors::MAX_SAFE_INTEGER,
+        )?;
         return Ok((number >= 0.0).then_some(number as u64));
     }
     let Some(read_length) = read_length else {
@@ -680,9 +698,14 @@ fn fstat(
 /// negative lengths.
 fn length_arg(scope: &Scope<'_>, args: &[HandleValue<'_>], index: usize) -> Result<u64, Thrown> {
     match opt(args, index) {
-        Some(length) => Ok(
-            validate_integer(scope, length, "len", f64::MIN, 9007199254740991.0)?.max(0.0) as u64,
-        ),
+        Some(length) => Ok(validate_integer(
+            scope,
+            length,
+            "len",
+            f64::MIN,
+            crate::errors::MAX_SAFE_INTEGER,
+        )?
+        .max(0.0) as u64),
         None => Ok(0),
     }
 }
@@ -899,7 +922,7 @@ fn stat_path(
 ) -> Result<Prepared, Thrown> {
     let path = path_arg(scope, arg(args, 0), "path")?;
     let throw_if_no_entry = match option(scope, opt(args, 1), c"throwIfNoEntry")? {
-        Some(value) => crate::stream::truthy(scope, value),
+        Some(value) => js::conversion::to_boolean(value),
         None => true,
     };
     on_wasi!(

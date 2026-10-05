@@ -4,9 +4,9 @@
 //! `isIP`, `isIPv4` and `isIPv6`.
 //! See <https://nodejs.org/api/net.html>.
 
-mod blocklist;
+pub(crate) mod blocklist;
 pub(crate) mod server;
-mod socket;
+pub(crate) mod socket;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -17,61 +17,8 @@ use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{ErrorKind, NodeError, Thrown};
-use crate::stream::call_method;
 
 pub(crate) use server::{listen_args, on_close};
-pub(crate) use socket::throw_net_error;
-
-/// `value` as Node.js's `determineSpecificType` describes primitives in error messages, such as
-/// `type number (70000)` or `type string ('abc')`.
-pub(crate) fn specific_type(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
-    if value.is_null() {
-        return "null".into();
-    }
-    if value.is_undefined() {
-        return "undefined".into();
-    }
-    if value.is_string() {
-        let text = String::from_jsval(scope, value, ()).unwrap_or_default();
-        let text = if text.encode_utf16().count() > 28 {
-            format!("{}...", text.chars().take(25).collect::<String>())
-        } else {
-            text
-        };
-        if !text.contains('\'') {
-            return format!("type string ('{text}')");
-        }
-        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-        return format!("type string (\"{escaped}\")");
-    }
-    if let Ok(object) = Object::from_value(scope, *value) {
-        let name = object
-            .get_property(scope, c"constructor")
-            .ok()
-            .and_then(|ctor| Object::from_value(scope, ctor).ok())
-            .and_then(|ctor| ctor.get_property(scope, c"name").ok())
-            .and_then(|name| String::from_jsval(scope, name, ()).ok())
-            .unwrap_or_else(|| "Object".into());
-        return format!("an instance of {name}");
-    }
-    if value.is_symbol() {
-        return "type symbol (Symbol())".into();
-    }
-    if value.is_number() && value.to_number() == 0.0 && value.to_number().is_sign_negative() {
-        return "type number (-0)".into();
-    }
-    let (kind, suffix) = if value.is_number() {
-        ("number", "")
-    } else if value.is_boolean() {
-        ("boolean", "")
-    } else {
-        ("bigint", "n")
-    };
-    let text = js::JSString::from_value(scope, value)
-        .and_then(|text| text.to_utf8(scope))
-        .unwrap_or_default();
-    format!("type {kind} ({text}{suffix})")
-}
 
 /// The port `value`, a number or a string, as Node.js's `validatePort` checks it, or
 /// `ERR_SOCKET_BAD_PORT` naming the port `name`, such as `Port` or `options.port`.
@@ -101,7 +48,7 @@ pub(crate) fn validate_port(
             "ERR_SOCKET_BAD_PORT",
             format!(
                 "{name} should be >= 0 and < 65536. Received {}.",
-                specific_type(scope, value)
+                crate::errors::describe_value(scope, value)
             ),
         )
         .into());
@@ -120,11 +67,14 @@ fn is_pipe_name(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, Throw
     Ok(number.is_nan() || number < 0.0)
 }
 
-/// The key under which the arrays `net._normalizeArgs` returns are marked with `true`.
+/// The private symbol under which the arrays `net._normalizeArgs` returns are marked with `true`.
+static NORMALIZED_ARGS: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"normalizedArgs");
+
+/// The symbol that marks the arrays `net._normalizeArgs` returns, which `internal/net` exports.
 pub(crate) fn normalized_args_symbol<'s>(
     scope: &'s Scope<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    crate::symbol(scope, "nodejs.net.normalizedArgs", true)
+    NORMALIZED_ARGS.value(scope)
 }
 
 /// The options and the listener of `value`, if it is an array `net._normalizeArgs` returned.
@@ -138,8 +88,7 @@ pub(crate) fn normalized_args<'s>(
     if !js::Array::is_array(scope, array.handle())? {
         return Ok(None);
     }
-    let key = scope.root_id(js::id::value_to_id(scope, normalized_args_symbol(scope)?)?);
-    let marked = array.get_property_by_id(scope, key)?;
+    let marked = array.get_property_by_id(scope, NORMALIZED_ARGS.id(scope)?)?;
     if !(marked.is_boolean() && marked.to_boolean()) {
         return Ok(None);
     }
@@ -149,43 +98,29 @@ pub(crate) fn normalized_args<'s>(
     )))
 }
 
-/// The key of the shared object that holds the auto-select-family settings.
-static AUTO_SELECT_KEY: u8 = 0;
+js::instance_local! {
+    /// Whether auto-select-family is enabled, and its attempt timeout in milliseconds, once
+    /// `net` set them. Until then they are the defaults the Node.js runtime flags give.
+    static AUTO_SELECT: std::cell::Cell<Option<(bool, f64)>> = const { std::cell::Cell::new(None) };
+}
 
 /// The auto-select-family settings: whether it is enabled, `true` by default, and the attempt
 /// timeout, 250 milliseconds by default. The Node.js runtime flags can change both defaults.
-fn auto_select(scope: &Scope<'_>) -> Result<(bool, f64), ExnThrown> {
-    let settings = auto_select_settings(scope)?;
-    let family = settings.get_property(scope, c"family")?;
-    let timeout = settings.get_property(scope, c"timeout")?;
-    Ok((
-        family.is_boolean() && family.to_boolean(),
-        timeout.to_number(),
-    ))
-}
-
-/// Set the auto-select-family setting `name` to `value`.
-fn set_auto_select<'s>(
-    scope: &'s Scope<'_>,
-    name: &'static std::ffi::CStr,
-    value: impl js::conversion::ToJSVal<'s>,
-) -> Result<(), ExnThrown> {
-    auto_select_settings(scope)?.set_property(scope, name, value)
-}
-
-/// The shared object of the auto-select-family settings.
-fn auto_select_settings<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    js::class::get_or_init_shared_object(scope, &AUTO_SELECT_KEY as *const u8 as usize, |scope| {
+fn auto_select() -> (bool, f64) {
+    AUTO_SELECT.get().unwrap_or_else(|| {
         let flags = crate::runtime_flags::get();
-        let settings = Object::new_plain(scope)?;
-        settings.set_property(scope, c"family", flags.network_family_autoselection)?;
-        settings.set_property(
-            scope,
-            c"timeout",
+        (
+            flags.network_family_autoselection,
             flags.network_family_autoselection_attempt_timeout,
-        )?;
-        Ok(settings)
+        )
     })
+}
+
+/// Set the auto-select-family settings to what `update` makes of them.
+fn set_auto_select(update: impl FnOnce(&mut (bool, f64))) {
+    let mut settings = auto_select();
+    update(&mut settings);
+    AUTO_SELECT.set(Some(settings));
 }
 
 /// A new socket connected with the `connect` arguments `args`, as `net.connect` does.
@@ -193,7 +128,7 @@ fn connect<'s>(scope: &'s Scope<'_>, args: &[HandleValue<'_>]) -> Result<Object<
     let class = socket::socket_class::class_constructor(scope)?;
     let options = args
         .first()
-        .filter(|first| first.is_object() && !crate::stream::is_function(scope, **first))
+        .filter(|first| first.is_object() && !js::function::is_callable(**first))
         .map(|options| scope.root_value(options.get()));
     let socket = match options {
         Some(options) => Function::construct(scope, class, &[options])?,
@@ -201,12 +136,12 @@ fn connect<'s>(scope: &'s Scope<'_>, args: &[HandleValue<'_>]) -> Result<Object<
     };
     if let Some(options) = options.and_then(|options| Object::from_value(scope, *options).ok()) {
         let timeout = options.get_property(scope, c"timeout")?;
-        if crate::stream::truthy(scope, timeout) {
+        if js::conversion::to_boolean(timeout) {
             let timeout = scope.root_value(timeout.get());
-            call_method(scope, socket, c"setTimeout", &[timeout])?;
+            Function::call_by_name(scope, socket.handle(), c"setTimeout", &[timeout])?;
         }
     }
-    call_method(scope, socket, c"connect", args)?;
+    Function::call_by_name(scope, socket.handle(), c"connect", args)?;
     Ok(socket)
 }
 
@@ -237,37 +172,32 @@ pub(crate) fn is_ipv6(input: &str) -> bool {
 pub mod module {
     use super::*;
 
-    pub use super::blocklist::block_list_class as BlockList;
-    pub use super::blocklist::socket_address_class as SocketAddress;
+    pub use super::blocklist::BlockList;
+    pub use super::blocklist::SocketAddress;
     pub use super::server::server_class as Server;
     pub use super::socket::socket_class as Socket;
     pub use super::socket::socket_class as Stream;
 
     /// <https://nodejs.org/api/net.html#netgetdefaultautoselectfamily>: connecting tries the
     /// addresses a host resolves to in turn, whatever this setting is.
-    pub fn get_default_auto_select_family(scope: &Scope<'_>) -> Result<bool, ExnThrown> {
-        Ok(super::auto_select(scope)?.0)
+    pub fn get_default_auto_select_family() -> bool {
+        super::auto_select().0
     }
 
     /// <https://nodejs.org/api/net.html#netsetdefaultautoselectfamilyvalue>
-    pub fn set_default_auto_select_family(scope: &Scope<'_>, value: bool) -> Result<(), ExnThrown> {
-        super::set_auto_select(scope, c"family", value)
+    pub fn set_default_auto_select_family(value: bool) {
+        super::set_auto_select(|settings| settings.0 = value);
     }
 
     /// <https://nodejs.org/api/net.html#netgetdefaultautoselectfamilyattempttimeout>
-    pub fn get_default_auto_select_family_attempt_timeout(
-        scope: &Scope<'_>,
-    ) -> Result<f64, ExnThrown> {
-        Ok(super::auto_select(scope)?.1)
+    pub fn get_default_auto_select_family_attempt_timeout() -> f64 {
+        super::auto_select().1
     }
 
     /// <https://nodejs.org/api/net.html#netsetdefaultautoselectfamilyattempttimeoutvalue>: values
     /// below 10 become 10.
-    pub fn set_default_auto_select_family_attempt_timeout(
-        scope: &Scope<'_>,
-        value: f64,
-    ) -> Result<(), ExnThrown> {
-        super::set_auto_select(scope, c"timeout", value.max(10.0))
+    pub fn set_default_auto_select_family_attempt_timeout(value: f64) {
+        super::set_auto_select(|settings| settings.1 = value.max(10.0));
     }
 
     /// <https://nodejs.org/api/net.html#netconnect>
@@ -287,6 +217,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/net.html#netcreateserveroptions-connectionlistener>
+    #[function(length = 2)]
     pub fn create_server<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -310,22 +241,21 @@ pub mod module {
         let args = Object::from_value(scope, args)?;
         let length = args.get_property(scope, c"length")?.to_number() as u32;
         let first = args.get_element(scope, 0)?;
-        let options =
-            if length > 0 && first.is_object() && !crate::stream::is_function(scope, first) {
-                Object::from_value(scope, first)?
-            } else {
-                let options = Object::new_plain(scope)?;
-                if length > 0 && super::is_pipe_name(scope, first)? {
-                    options.set_property(scope, c"path", first)?;
-                } else if length > 0 {
-                    options.set_property(scope, c"port", first)?;
-                    let host = args.get_element(scope, 1)?;
-                    if length > 1 && host.is_string() {
-                        options.set_property(scope, c"host", host)?;
-                    }
+        let options = if length > 0 && first.is_object() && !js::function::is_callable(first) {
+            Object::from_value(scope, first)?
+        } else {
+            let options = Object::new_plain(scope)?;
+            if length > 0 && super::is_pipe_name(scope, first)? {
+                options.set_property(scope, c"path", first)?;
+            } else if length > 0 {
+                options.set_property(scope, c"port", first)?;
+                let host = args.get_element(scope, 1)?;
+                if length > 1 && host.is_string() {
+                    options.set_property(scope, c"host", host)?;
                 }
-                options
-            };
+            }
+            options
+        };
         let last = if length > 0 {
             args.get_element(scope, length - 1)?
         } else {
@@ -338,11 +268,7 @@ pub mod module {
         };
         let normalized =
             js::Array::with_contents(scope, &[options.to_jsval_throwing(scope)?, listener])?;
-        let key = scope.root_id(js::id::value_to_id(
-            scope,
-            super::normalized_args_symbol(scope)?,
-        )?);
-        normalized.set_property_by_id(scope, key, true)?;
+        normalized.set_property_by_id(scope, super::NORMALIZED_ARGS.id(scope)?, true)?;
         Ok(*normalized)
     }
 
@@ -373,14 +299,10 @@ pub mod module {
 
 /// Register the classes of `node:net` on `global`.
 pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
-    blocklist::BlockListHandle::add_to_global(scope, global);
-    blocklist::SocketAddressHandle::add_to_global(scope, global);
-    blocklist::block_list_class::register(scope)?;
-    blocklist::socket_address_class::register(scope)?;
-    server::ListenerHandle::add_to_global(scope, global);
+    blocklist::register_classes(scope, global)?;
+    server::ServerState::add_to_global(scope, global);
+    socket::SocketState::add_to_global(scope, global);
     server::server_class::register(scope)?;
-    socket::PendingConnect::add_to_global(scope, global);
-    socket::SocketHandle::add_to_global(scope, global);
     socket::socket_class::register(scope)?;
     Ok(())
 }

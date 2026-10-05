@@ -3780,6 +3780,110 @@ fn wait_until_work_does_not_hold_a_connection_slot() {
     handle.stop();
 }
 
+/// With `--node-compat`, an unreferenced `setInterval` at top level keeps firing for as long as
+/// the server runs, as it does in Node.js while a server listens. Caches purge their entries this
+/// way.
+#[test]
+fn an_unreferenced_repeating_timer_keeps_running_between_requests() {
+    let handler = r#"globalThis.ticks = 0;
+    setInterval(() => { globalThis.ticks += 1; }, 20).unref();
+    addEventListener('fetch', (event) => {
+        event.respondWith(new Response('ticks=' + globalThis.ticks));
+    });"#;
+    let port = 18535;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            eval_script: Some(handler.to_string()),
+            legacy_script: true,
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+    let ticks = || -> u32 {
+        request(port, "GET", "/", "")
+            .strip_prefix("ticks=")
+            .and_then(|n| n.parse().ok())
+            .expect("a tick count")
+    };
+
+    let mut samples = vec![ticks()];
+    for _ in 0..2 {
+        std::thread::sleep(Duration::from_millis(300));
+        samples.push(ticks());
+    }
+
+    // Serving a request also steps the script's loop, which fires an expired timer once, so the
+    // count has to grow by more than the requests account for.
+    assert!(
+        samples.windows(2).all(|pair| pair[1] >= pair[0] + 5),
+        "the unreferenced interval must fire while the server idles (went {samples:?})"
+    );
+
+    handle.stop();
+}
+
+/// With `--node-compat`, a request handler that clears a top-level `setInterval` stops it, and a
+/// `refresh()` restarts a top-level `setTimeout` on the script's event loop, so that it fires once,
+/// a full delay after the last refresh.
+#[test]
+fn a_request_clears_and_refreshes_top_level_node_timers() {
+    let handler = r#"globalThis.ticks = 0;
+    globalThis.errors = 0;
+    process.on('uncaughtException', () => { globalThis.errors += 1; });
+    const interval = setInterval(() => { globalThis.ticks += 1; }, 20);
+    globalThis.fired = 0;
+    const timeout = setTimeout(() => { globalThis.fired += 1; }, 3000);
+    addEventListener('fetch', (event) => {
+        const path = new URL(event.request.url).pathname;
+        if (path === '/clear') clearInterval(interval);
+        if (path === '/refresh') timeout.refresh();
+        const count = path === '/clear' || path === '/'
+            ? globalThis.ticks + globalThis.errors
+            : globalThis.fired;
+        event.respondWith(new Response('ticks=' + count));
+    });"#;
+    let port = 18539;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            eval_script: Some(handler.to_string()),
+            legacy_script: true,
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    // A cleared interval that kept firing would call its cleared callback, which throws.
+    let cleared = ticks_at(port, "/clear");
+    for _ in 0..5 {
+        assert_eq!(
+            ticks_at(port, "/refresh"),
+            0,
+            "the timeout fired while refreshed"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        cleared,
+        ticks_at(port, "/"),
+        "the cleared interval kept firing"
+    );
+
+    let fired = eventually(port, "/fired", |answer| answer != "ticks=0");
+    assert_eq!(fired, "ticks=1");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        ticks_at(port, "/fired"),
+        1,
+        "the refreshed timeout fired more than once"
+    );
+
+    handle.stop();
+}
+
 /// With `--node-compat`, a served request can't block on host I/O, such as a `require` with a
 /// computed specifier that reads a file, or `fs.readFileSync`, unless `--allow-blocking-host-io`
 /// allows it. A `require` with a literal specifier loads the source read while the top level ran.
@@ -4037,6 +4141,54 @@ fn node_http_servers_respond_to_served_requests() {
         2,
         "{missing}"
     );
+
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--node-compat` and `--web-security-restrictions`, a `ServerResponse` sends the
+/// `Set-Cookie` headers a handler sets, which a web `Response`'s headers refuse.
+#[test]
+fn node_http_responses_send_set_cookie_under_web_security_restrictions() {
+    let dir =
+        std::env::temp_dir().join(format!("starling-serve-node-cookie-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("server.cjs"),
+        r#"require('http').createServer((req, res) => {
+            res.setHeader('Set-Cookie', ['x=1', 'y=2']);
+            if (req.url === '/stream') {
+                res.write('a');
+                setTimeout(() => res.end('b'), 5);
+            } else {
+                res.end('done');
+            }
+        }).listen(0);
+        "#,
+    )
+    .unwrap();
+    let port = 18485;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            script_path: dir.join("server.cjs").to_string_lossy().into_owned(),
+            serve: Some(port),
+            node_compat: true,
+            web_security_restrictions: Some(true),
+            ..Default::default()
+        },
+        port,
+    );
+
+    for path in ["/whole", "/stream"] {
+        let response = raw_request(
+            port,
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let lower = response.to_ascii_lowercase();
+        assert!(lower.contains("set-cookie: x=1"), "{response}");
+        assert!(lower.contains("set-cookie: y=2"), "{response}");
+    }
 
     handle.stop();
     let _ = std::fs::remove_dir_all(&dir);

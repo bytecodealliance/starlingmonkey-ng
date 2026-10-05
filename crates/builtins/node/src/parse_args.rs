@@ -10,8 +10,10 @@ use js::gc::scope::Scope;
 use js::prelude::{HandleObject, HandleValue};
 use js::Object;
 
-use crate::errors::{validate_object, ErrorKind, NodeError, Thrown};
-use crate::stream::{rust_string, string, truthy, Props};
+use crate::errors::{
+    validate_boolean, validate_plain_object, validate_string, ErrorKind, NodeError, Thrown,
+};
+use crate::support::{rust_string, Props};
 
 /// An option of the `options` config.
 struct OptionConfig<'s> {
@@ -40,12 +42,17 @@ enum Token {
     },
 }
 
+/// Node.js's `objectGetOwn(object, name)`: `object[name]` if `object` has an own property
+/// `name`, and `undefined` otherwise.
 fn property<'s>(
     scope: &'s Scope<'_>,
     object: Object<'_>,
     name: &str,
 ) -> Result<HandleValue<'s>, ExnThrown> {
     let name = CString::new(name).map_err(|_| ExnThrown)?;
+    if !object.has_own_property_by_name(scope, &name)? {
+        return Ok(HandleValue::undefined());
+    }
     object.get_property_by_name(scope, &name)
 }
 
@@ -70,60 +77,116 @@ fn strings(scope: &Scope<'_>, array: Object<'_>, from: u32) -> Result<Vec<String
 }
 
 fn array_length(scope: &Scope<'_>, array: Object<'_>) -> Result<u32, ExnThrown> {
-    let length = array.get_property(scope, c"length")?;
-    Ok(f64::from_jsval(scope, length, ()).map_err(|_| ExnThrown)? as u32)
+    match array.cast::<js::Array>() {
+        Ok(array) => array.length(scope),
+        Err(_) => {
+            let length = array.get_property(scope, c"length")?;
+            Ok(f64::from_jsval(scope, length, ()).map_err(|_| ExnThrown)? as u32)
+        }
+    }
 }
 
 fn parse_error(code: &'static str, message: String) -> NodeError {
     NodeError::new(ErrorKind::TypeError, code, message)
 }
 
+/// Node.js's `validateArray` for the element `value` of `name`, followed by `validate` on each
+/// element, with errors naming the elements `name[index]`.
+fn validate_elements(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+    validate: impl Fn(HandleValue<'_>, &str) -> Result<(), Thrown>,
+) -> Result<(), Thrown> {
+    let array = Object::from_value(scope, *value)
+        .ok()
+        .filter(|array| js::Array::is_array(scope, array.handle()).unwrap_or(false))
+        .ok_or_else(|| NodeError::invalid_arg_type(scope, name, "an instance of Array", value))?;
+    for index in 0..array_length(scope, array)? {
+        validate(
+            array.get_element(scope, index)?,
+            &format!("{name}[{index}]"),
+        )?;
+    }
+    Ok(())
+}
+
 /// `util.parseArgs(config)`: the `values` and `positionals` of `config.args`, which defaults to
-/// `process.argv` without its first two elements, and the `tokens` if `config.tokens` is truthy.
+/// `process.argv` without its first two elements, and the `tokens` if `config.tokens` is true.
+/// The members of `config` are read as own properties, `null` ones as missing, and a `config`
+/// that isn't an object has none. A `null` `config` throws a `TypeError`.
 pub(crate) fn parse_args<'s>(
     scope: &'s Scope<'_>,
     config: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, Thrown> {
     let config = match config {
-        Some(config) if !config.is_undefined() => Some(validate_object(scope, config, "config")?),
-        _ => None,
+        Some(config) if config.is_null() => {
+            let message = "Cannot convert undefined or null to object";
+            return Err(js::error::TypeError(message.into()).throw(scope).into());
+        }
+        Some(config) => Object::from_value(scope, *config).ok(),
+        None => None,
     };
     let get = |name: &str| -> Result<Option<HandleValue<'s>>, ExnThrown> {
         match config {
             Some(config) => {
                 let value = property(scope, config, name)?;
-                Ok((!value.is_undefined()).then_some(value))
+                Ok((!value.is_null_or_undefined()).then_some(value))
             }
             None => Ok(None),
         }
     };
     let args = match get("args")? {
-        Some(args) => strings(scope, validate_object(scope, args, "args")?, 0)?,
-        None => match scope
-            .global()
-            .obj(scope, c"process")?
-            .and_then(|process| process.obj(scope, c"argv").transpose())
+        Some(args) => {
+            let array = Object::from_value(scope, *args)
+                .ok()
+                .filter(|array| js::Array::is_array(scope, array.handle()).unwrap_or(false))
+                .ok_or_else(|| {
+                    NodeError::invalid_arg_type(scope, "args", "an instance of Array", args)
+                })?;
+            strings(scope, array, 0)?
+        }
+        None => match Object::from_value(scope, *crate::process::process_value(scope)?)
+            .ok()
+            .map(|process| process.obj(scope, c"argv"))
+            .transpose()?
+            .flatten()
         {
-            Some(argv) => strings(scope, argv?, 2)?,
+            Some(argv) => strings(scope, argv, 2)?,
             None => Vec::new(),
         },
     };
-    let strict = get("strict")?.is_none_or(|value| truthy(scope, value));
-    let allow_positionals = get("allowPositionals")?.map_or(!strict, |value| truthy(scope, value));
-    let allow_negative = get("allowNegative")?.is_some_and(|value| truthy(scope, value));
-    let return_tokens = get("tokens")?.is_some_and(|value| truthy(scope, value));
+    let boolean = |name: &str, default: bool| -> Result<bool, Thrown> {
+        match get(name)? {
+            Some(value) => validate_boolean(scope, value, name),
+            None => Ok(default),
+        }
+    };
+    let strict_value = get("strict")?;
+    let strict = strict_value.is_none_or(|value| !value.is_boolean() || value.to_boolean());
+    let allow_positionals_value = get("allowPositionals")?;
+    if let Some(value) = strict_value {
+        validate_boolean(scope, value, "strict")?;
+    }
+    if let Some(value) = allow_positionals_value {
+        validate_boolean(scope, value, "allowPositionals")?;
+    }
+    let allow_positionals = allow_positionals_value.map_or(!strict, |value| value.to_boolean());
+    let return_tokens = boolean("tokens", false)?;
+    let allow_negative = boolean("allowNegative", false)?;
 
     let mut options = Vec::new();
     if let Some(given) = get("options")? {
-        let given = validate_object(scope, given, "options")?;
+        let given = validate_plain_object(scope, given, "options", false)?;
         for key in given.own_keys(scope)? {
             let name = String::from_jsval(scope, key, ()).map_err(|e| e.throw(scope))?;
-            let option = validate_object(
+            let option = validate_plain_object(
                 scope,
                 property(scope, given, &name)?,
                 &format!("options.{name}"),
+                false,
             )?;
-            let kind = rust_string(scope, option.val(scope, c"type")?);
+            let kind = rust_string(scope, property(scope, option, "type")?);
             let string = match kind.as_deref() {
                 Some("string") => true,
                 Some("boolean") => false,
@@ -131,64 +194,43 @@ pub(crate) fn parse_args<'s>(
                     return Err(NodeError::invalid_arg_type(
                         scope,
                         &format!("options.{name}.type"),
-                        "one of: 'string', 'boolean'",
-                        option.val(scope, c"type")?,
+                        "('string|boolean')",
+                        property(scope, option, "type")?,
                     )
                     .into());
                 }
             };
-            let short = rust_string(scope, option.val(scope, c"short")?);
-            if short
-                .as_ref()
-                .is_some_and(|short| short.chars().count() != 1)
-            {
-                return Err(NodeError::invalid_arg_value(
-                    scope,
-                    &format!("options.{name}.short"),
-                    option.val(scope, c"short")?,
-                    "must be a single character",
-                )
-                .into());
+            let mut short = None;
+            if option.has_own_property(scope, c"short")? {
+                let label = format!("options.{name}.short");
+                let value = option.get_property(scope, c"short")?;
+                let text = validate_string(scope, value, &label)?;
+                if text.encode_utf16().count() != 1 {
+                    let reason = "must be a single character";
+                    return Err(NodeError::invalid_arg_value(scope, &label, value, reason).into());
+                }
+                short = Some(text);
             }
-            let multiple = truthy(scope, option.val(scope, c"multiple")?);
-            let default = option.val(scope, c"default")?;
+            let multiple = property(scope, option, "multiple")?;
+            if option.has_own_property(scope, c"multiple")? {
+                validate_boolean(scope, multiple, &format!("options.{name}.multiple"))?;
+            }
+            let multiple = js::conversion::to_boolean(multiple);
+            let default = property(scope, option, "default")?;
             if !default.is_undefined() {
-                let element_valid = |value: HandleValue<'_>| {
+                let label = format!("options.{name}.default");
+                let validate = |value: HandleValue<'_>, label: &str| -> Result<(), Thrown> {
                     if string {
-                        value.is_string()
+                        validate_string(scope, value, label)?;
                     } else {
-                        value.is_boolean()
+                        validate_boolean(scope, value, label)?;
                     }
+                    Ok(())
                 };
-                let valid = if multiple {
-                    match Object::from_value(scope, *default) {
-                        Ok(list) if js::Array::is_array(scope, list.handle())? => {
-                            let length = array_length(scope, list)?;
-                            let mut all = true;
-                            for index in 0..length {
-                                all &= element_valid(list.get_element(scope, index)?);
-                            }
-                            all
-                        }
-                        _ => false,
-                    }
+                if multiple {
+                    validate_elements(scope, default, &label, validate)?;
                 } else {
-                    element_valid(default)
-                };
-                if !valid {
-                    let kind = match (string, multiple) {
-                        (true, false) => "of type string",
-                        (false, false) => "of type boolean",
-                        (true, true) => "an instance of Array",
-                        (false, true) => "an instance of Array",
-                    };
-                    return Err(NodeError::invalid_arg_type(
-                        scope,
-                        &format!("options.{name}.default"),
-                        kind,
-                        default,
-                    )
-                    .into());
+                    validate(default, &label)?;
                 }
             }
             options.push(OptionConfig {
@@ -201,6 +243,10 @@ pub(crate) fn parse_args<'s>(
         }
     }
     let find = |name: &str| options.iter().find(|option| option.name == name);
+    // Whether the option `name` with `value` sets `NAME` to `false`, as `--no-NAME` does.
+    let negates = |name: &str, value: &Option<String>| {
+        allow_negative && name.starts_with("no-") && value.is_none()
+    };
     let long_of_short = |short: &str| {
         options
             .iter()
@@ -340,14 +386,16 @@ pub(crate) fn parse_args<'s>(
                 inline_value,
                 ..
             } => {
-                let negated = allow_negative
-                    && name.starts_with("no-")
-                    && find(&name[3..]).is_none_or(|option| !option.string)
-                    && value.is_none();
-                let name = if negated { &name[3..] } else { name.as_str() };
-                let option = find(name);
                 if strict {
-                    let Some(option) = option else {
+                    // A missing option `no-NAME` is the negation of the boolean option `NAME`.
+                    let checked = match find(name) {
+                        Some(option) => Some(option),
+                        None if allow_negative && name.starts_with("no-") => {
+                            find(&name[3..]).filter(|option| !option.string)
+                        }
+                        None => None,
+                    };
+                    let Some(option) = checked else {
                         let hint = if allow_positionals {
                             format!(
                                 ". To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- \"{raw_name}\""
@@ -361,9 +409,10 @@ pub(crate) fn parse_args<'s>(
                         )
                         .into());
                     };
+                    let long = &option.name;
                     let short_and_long = match &option.short {
-                        Some(short) => format!("-{short}, --{name}"),
-                        None => format!("--{name}"),
+                        Some(short) => format!("-{short}, --{long}"),
+                        None => format!("--{long}"),
                     };
                     if option.string && value.is_none() {
                         return Err(parse_error(
@@ -379,38 +428,39 @@ pub(crate) fn parse_args<'s>(
                         )
                         .into());
                     }
-                    if option.string
-                        && *inline_value == Some(false)
-                        && value
-                            .as_deref()
-                            .is_some_and(|value| value.len() > 1 && value.starts_with('-'))
+                    if *inline_value != Some(true)
+                        && value.as_deref().is_some_and(|value| {
+                            value.starts_with('-') && value.encode_utf16().count() > 1
+                        })
                     {
-                        let example = match &option.short {
-                            Some(short) if raw_name.len() == 2 => {
-                                format!("'--{name}=-XYZ' or '-{short}-XYZ'")
-                            }
-                            _ => format!("'--{name}=-XYZ'"),
+                        let example = if raw_name.starts_with("--") {
+                            format!("'{raw_name}=-XYZ'")
+                        } else {
+                            format!("'--{name}=-XYZ' or '{raw_name}-XYZ'")
                         };
                         return Err(parse_error(
                             "ERR_PARSE_ARGS_INVALID_OPTION_VALUE",
                             format!(
-                                "Option '{short_and_long}' argument is ambiguous.\nDid you forget to specify the option argument for '{raw_name}'?\nTo specify an option argument starting with a dash use {example}."
+                                "Option '{raw_name}' argument is ambiguous.\nDid you forget to specify the option argument for '{raw_name}'?\nTo specify an option argument starting with a dash use {example}."
                             ),
                         )
                         .into());
                     }
                 }
+                if name == "__proto__" {
+                    continue;
+                }
+                let negated = negates(name, value);
+                let name = if negated { &name[3..] } else { name.as_str() };
                 let stored = match value {
-                    Some(value) if option.is_none_or(|option| option.string) => {
-                        string(scope, value)?
-                    }
-                    _ => scope.root_value(js::value::from_bool(!negated)),
+                    Some(value) => js::conversion::ToJSVal::to_jsval_throwing(value, scope)?,
+                    None => scope.root_value(js::value::from_bool(!negated)),
                 };
-                if option.is_some_and(|option| option.multiple) {
+                if find(name).is_some_and(|option| option.multiple) {
                     let existing = property(scope, values, name)?;
                     let list = match Object::from_value(scope, *existing) {
-                        Ok(list) => list,
-                        Err(_) => {
+                        Ok(list) if js::conversion::to_boolean(existing) => list,
+                        _ => {
                             let list = *js::Array::new(scope, 0)?;
                             set(scope, values, name, list)?;
                             list
@@ -430,14 +480,18 @@ pub(crate) fn parse_args<'s>(
                     )
                     .into());
                 }
-                positionals.set_element(scope, positional_count, string(scope, value)?)?;
+                positionals.set_element(
+                    scope,
+                    positional_count,
+                    js::conversion::ToJSVal::to_jsval_throwing(value, scope)?,
+                )?;
                 positional_count += 1;
             }
             Token::Terminator { .. } => {}
         }
     }
     for option in &options {
-        if let Some(default) = option.default {
+        if let Some(default) = option.default.filter(|_| option.name != "__proto__") {
             if property(scope, values, &option.name)?.is_undefined() {
                 set(scope, values, &option.name, default)?;
             }
@@ -459,19 +513,30 @@ pub(crate) fn parse_args<'s>(
                     value,
                     inline_value,
                 } => {
-                    entry.set_property(scope, c"kind", string(scope, "option")?)?;
-                    let negated = allow_negative
-                        && name.starts_with("no-")
-                        && find(&name[3..]).is_none_or(|option| !option.string)
-                        && value.is_none();
+                    entry.set_property(
+                        scope,
+                        c"kind",
+                        js::class::get_or_init_atom(scope, c"option")?,
+                    )?;
+                    let negated = name != "__proto__" && negates(name, value);
                     let name = if negated { &name[3..] } else { name.as_str() };
-                    entry.set_property(scope, c"name", string(scope, name)?)?;
-                    entry.set_property(scope, c"rawName", string(scope, raw_name)?)?;
+                    entry.set_property(
+                        scope,
+                        c"name",
+                        js::conversion::ToJSVal::to_jsval_throwing(name, scope)?,
+                    )?;
+                    entry.set_property(
+                        scope,
+                        c"rawName",
+                        js::conversion::ToJSVal::to_jsval_throwing(raw_name, scope)?,
+                    )?;
                     entry.set_property(scope, c"index", *index as f64)?;
                     match value {
-                        Some(value) => {
-                            entry.set_property(scope, c"value", string(scope, value)?)?
-                        }
+                        Some(value) => entry.set_property(
+                            scope,
+                            c"value",
+                            js::conversion::ToJSVal::to_jsval_throwing(value, scope)?,
+                        )?,
                         None => entry.set_property(scope, c"value", js::value::undefined())?,
                     }
                     match inline_value {
@@ -482,12 +547,24 @@ pub(crate) fn parse_args<'s>(
                     }
                 }
                 Token::Positional { index, value } => {
-                    entry.set_property(scope, c"kind", string(scope, "positional")?)?;
+                    entry.set_property(
+                        scope,
+                        c"kind",
+                        js::class::get_or_init_atom(scope, c"positional")?,
+                    )?;
                     entry.set_property(scope, c"index", *index as f64)?;
-                    entry.set_property(scope, c"value", string(scope, value)?)?;
+                    entry.set_property(
+                        scope,
+                        c"value",
+                        js::conversion::ToJSVal::to_jsval_throwing(value, scope)?,
+                    )?;
                 }
                 Token::Terminator { index } => {
-                    entry.set_property(scope, c"kind", string(scope, "option-terminator")?)?;
+                    entry.set_property(
+                        scope,
+                        c"kind",
+                        js::class::get_or_init_atom(scope, c"option-terminator")?,
+                    )?;
                     entry.set_property(scope, c"index", *index as f64)?;
                 }
             }

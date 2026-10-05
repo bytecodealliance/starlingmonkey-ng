@@ -7,62 +7,116 @@
 //! `_eventsCount`, and `_maxListeners`. Any object can therefore be an emitter, including one the
 //! prototype's methods were copied onto.
 
+use std::ffi::CStr;
+
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
-use js::native::{HandleId, HandleObject, Value};
+use js::native::{HandleId, Value};
+use js::object::{PropertyInit, PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
+use js::symbol::CachedSymbol;
 use js::{Function, Object};
 
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
 
-/// The number of listeners per event above which adding one prints a warning, unless an emitter
-/// sets its own limit.
-const DEFAULT_MAX_LISTENERS: f64 = 10.0;
-
-/// The key of the object holding the `kCapture` symbol in the global's shared objects.
-static CAPTURE_KEY: u8 = 0;
-
-/// The object holding the symbols of an emitter's own state properties: `kCapture`, whether it
-/// captures rejections, and `shapeMode`, whether it had its own `_events` before initialization.
-/// It also holds the symbol of the listener limit `setMaxListeners` stores on an `EventTarget`.
-fn state_symbols<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    js::class::get_or_init_shared_object(scope, &CAPTURE_KEY as *const u8 as usize, |scope| {
-        let holder = Object::new_plain(scope)?;
-        holder.set_property(scope, c"capture", crate::symbol(scope, "kCapture", false)?)?;
-        holder.set_property(
-            scope,
-            c"shapeMode",
-            crate::symbol(scope, "shapeMode", false)?,
-        )?;
-        let limit = crate::symbol(scope, "events.maxEventTargetListeners", false)?;
-        holder.set_property(scope, c"maxEventTargetListeners", limit)?;
-        Ok(holder)
-    })
+js::instance_local! {
+    /// `EventEmitter.defaultMaxListeners`: the number of listeners per event above which adding
+    /// one prints a warning, unless an emitter sets its own limit.
+    static DEFAULT_MAX_LISTENERS: std::cell::Cell<f64> = const { std::cell::Cell::new(10.0) };
 }
+
+/// `kCapture`, the symbol an emitter's own property records whether it captures rejections under.
+static K_CAPTURE: CachedSymbol = CachedSymbol::new(c"kCapture");
+
+/// `shapeMode`, the symbol an emitter's own property records whether it had its own `_events`
+/// before initialization under.
+static SHAPE_MODE: CachedSymbol = CachedSymbol::new(c"shapeMode");
+
+/// The own properties that initialization creates on an emitter without `_events`, in Node's
+/// order.
+pub(crate) static EMITTER_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"_events"),
+    TemplateKey::Name(c"_eventsCount"),
+    TemplateKey::Symbol(&SHAPE_MODE),
+    TemplateKey::Name(c"_maxListeners"),
+    TemplateKey::Symbol(&K_CAPTURE),
+]);
+
+/// Initialize `emitter`, which this crate created without `_events`, as `EventEmitter.init()`
+/// does without options: with no listeners. It reads `_maxListeners` through the prototype chain,
+/// and `kCapture` from `EventEmitter.prototype`.
+pub(crate) fn init_new_emitter(scope: &Scope<'_>, emitter: Object<'_>) -> Result<(), ExnThrown> {
+    // SAFETY: the caller guarantees the requirements of `Define`. Only the writer's own reads run
+    // JavaScript that can reach `emitter`, until it finishes.
+    let mut properties =
+        unsafe { emitter.property_writer(scope, &EMITTER_PROPERTIES, PropertyInit::Define) }?;
+    properties.write(scope, c"_events", Object::new_with_null_prototype(scope)?)?;
+    properties.write(scope, c"_eventsCount", 0)?;
+    properties.write(scope, &SHAPE_MODE, false)?;
+    let max = properties.get(scope, c"_maxListeners")?;
+    if bool::from_jsval(scope, max, ()).unwrap_or(false) {
+        properties.skip(c"_maxListeners");
+    } else {
+        properties.write(scope, c"_maxListeners", js::value::undefined())?;
+    }
+    let proto = emitter_constructor(scope)?.get_property(scope, c"prototype")?;
+    let proto = Object::from_value(scope, proto).map_err(|e| e.throw(scope))?;
+    let capture = proto.get_property_by_id(scope, capture_symbol(scope)?)?;
+    properties.write(scope, &K_CAPTURE, capture)?;
+    properties.finish(scope)
+}
+
+/// The symbol of the listener limit `setMaxListeners` stores on an `EventTarget`.
+static MAX_EVENT_TARGET_LISTENERS: CachedSymbol =
+    CachedSymbol::new(c"events.maxEventTargetListeners");
+
+/// `EventEmitter.errorMonitor`.
+static ERROR_MONITOR: CachedSymbol = CachedSymbol::new(c"events.errorMonitor");
+
+/// `EventEmitter.captureRejectionSymbol`, `Symbol.for('nodejs.rejection')`.
+pub(crate) static REJECTION: CachedSymbol = CachedSymbol::registered(c"nodejs.rejection");
 
 /// Set `emitter`'s `shapeMode` property.
 fn set_shape_mode(scope: &Scope<'_>, emitter: Object<'_>, value: bool) -> Result<(), ExnThrown> {
-    let key = event_key(
-        scope,
-        state_symbols(scope)?.get_property(scope, c"shapeMode")?,
-    )?;
-    emitter.set_property_by_id(scope, key, value)
+    emitter.set_property_by_id(scope, SHAPE_MODE.id(scope)?, value)
 }
 
 /// `kCapture`, the symbol an emitter's own property records whether it captures rejections under.
 fn capture_symbol<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
-    event_key(
-        scope,
-        state_symbols(scope)?.get_property(scope, c"capture")?,
-    )
+    K_CAPTURE.id(scope)
 }
 
 /// Whether `emitter` captures rejections of the promises its listeners return.
 fn captures_rejections(scope: &Scope<'_>, emitter: Object<'_>) -> Result<bool, ExnThrown> {
     let key = capture_symbol(scope)?;
-    Ok(is_true(emitter.get_property_by_id(scope, key)?))
+    Ok(crate::support::is_true(
+        emitter.get_property_by_id(scope, key)?,
+    ))
+}
+
+/// The emission whose listener returned a promise that [`add_catch`] watches: the emitter, the
+/// event name, and the event's arguments.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct RejectionState {
+    emitter: Heap<js::object::Object>,
+    name: Heap<Value>,
+    args: Vec<Heap<Value>>,
+}
+
+#[core_runtime::jsmethods]
+impl RejectionState {}
+
+/// Call `emitter.emit('error', error)`.
+fn emit_error(
+    scope: &Scope<'_>,
+    emitter: Object<'_>,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let name = js::class::get_or_init_atom(scope, c"error")?;
+    call_emit(scope, emitter, &[name, error])
 }
 
 /// Node.js's `addCatch`: if `emitter` captures rejections, emit a rejection of `result`, the value
@@ -83,102 +137,126 @@ fn add_catch(
     };
     let caught = (|| -> Result<(), ExnThrown> {
         let then = promise.get_property(scope, c"then")?;
-        if !Object::from_value(scope, then).is_ok_and(|then| then.is_callable()) {
+        if !js::function::is_callable(then) {
             return Ok(());
         }
-        let mut state = vec![emitter.to_jsval_throwing(scope)?, name];
-        state.extend_from_slice(args);
-        let state = js::Array::with_contents(scope, &state)?;
-        let on_rejected = Function::new_callback(scope, c"", 1, rejected, *state)?;
-        let undefined = scope.root_value(js::value::undefined());
+        let state =
+            js::class::create_instance_with::<RejectionStateImpl>(scope, |_| RejectionStateImpl {
+                emitter: Heap::from(emitter),
+                name: Heap::from(name.get()),
+                args: args.iter().map(|arg| Heap::from(arg.get())).collect(),
+            })?;
+        let on_rejected = Function::new_callback(scope, c"", 1, rejected, state)?;
         Function::call(
             scope,
             promise,
             then,
-            &[undefined, on_rejected.to_jsval_throwing(scope)?],
+            &[
+                HandleValue::undefined(),
+                (*on_rejected).to_jsval_throwing(scope)?,
+            ],
         )?;
         Ok(())
     })();
     if caught.is_err() {
         let error = js::exception::take_pending_or_undefined(scope);
-        let error_name = scope.root_value(js::JSString::from_str(scope, "error")?.as_value());
-        emit_event(scope, emitter, error_name, &[error])?;
+        emit_error(scope, emitter, error)?;
     }
     Ok(())
 }
 
-/// The rejection handler [`add_catch`] attaches, whose payload is `[emitter, name, ...args]`:
-/// queue Node.js's `emitUnhandledRejectionOrErr` with the reason as a tick.
+/// The rejection handler [`add_catch`] attaches, whose payload is a [`RejectionState`]: queue
+/// Node.js's `emitUnhandledRejectionOrErr` with the reason as a tick.
 fn rejected(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
-    state.set_property(scope, c"reason", args.get(0))?;
-    let emit = Function::new_callback(
-        scope,
-        c"emitUnhandledRejectionOrErr",
-        0,
-        emit_rejection,
-        state,
-    )?;
-    let process = Object::from_value(scope, scope.global().get_property(scope, c"process")?)
-        .map_err(|e| e.throw(scope))?;
-    Function::call_by_name(
-        scope,
-        process.handle(),
-        c"nextTick",
-        &[emit.to_jsval_throwing(scope)?],
-    )?;
+    js::jobs::queue_native_tick(scope, emit_rejection, payload, &[args.get(0)])?;
     Ok(js::value::undefined())
 }
 
-/// Node.js's `emitUnhandledRejectionOrErr`, whose payload is `[emitter, name, ...args]` with the
-/// rejection `reason`: call the emitter's `Symbol.for('nodejs.rejection')` method with the reason,
-/// the event name and its arguments, or else emit the reason as an `error` event without
-/// capturing rejections.
+/// Node.js's `emitUnhandledRejectionOrErr`, whose payload is a [`RejectionState`] and whose
+/// argument is the rejection reason: call the emitter's `Symbol.for('nodejs.rejection')` method
+/// with the reason, the event name and its arguments, or else emit the reason as an `error` event
+/// without capturing rejections.
 fn emit_rejection(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
+    args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
-    let emitter =
-        Object::from_value(scope, state.get_element(scope, 0)?).map_err(|e| e.throw(scope))?;
-    let reason = state.get_property(scope, c"reason")?;
-    let length = array_length(scope, state)?;
-    let rejection_key = event_key(scope, crate::symbol(scope, "nodejs.rejection", true)?)?;
+    let state = js::function::cast_payload::<RejectionState>(scope, payload);
+    let reason = args.get(0);
+    let (emitter, name, event_args) = {
+        let data = state.data();
+        let event_args: Vec<HandleValue<'_>> = data.args.iter().map(|arg| arg.get(scope)).collect();
+        (data.emitter.get(scope), data.name.get(scope), event_args)
+    };
+    let rejection_key = REJECTION.id(scope)?;
     let handler = emitter.get_property_by_id(scope, rejection_key)?;
-    if Object::from_value(scope, handler).is_ok_and(|handler| handler.is_callable()) {
-        let mut args = vec![reason];
-        for index in 1..length {
-            args.push(state.get_element(scope, index)?);
-        }
-        Function::call(scope, emitter, handler, &args)?;
+    if js::function::is_callable(handler) {
+        let mut call_args = vec![reason, name];
+        call_args.extend(event_args);
+        Function::call(scope, emitter, handler, &call_args)?;
         return Ok(js::value::undefined());
     }
     let key = capture_symbol(scope)?;
     let previous = emitter.get_property_by_id(scope, key)?;
     emitter.set_property_by_id(scope, key, false)?;
-    let error_name = scope.root_value(js::JSString::from_str(scope, "error")?.as_value());
-    let result = emit_event(scope, emitter, error_name, &[reason]);
+    let result = emit_error(scope, emitter, reason);
     emitter.set_property_by_id(scope, key, previous)?;
-    result.map_err(|thrown| thrown.throw(scope))?;
+    result?;
     Ok(js::value::undefined())
+}
+
+/// Emit `event` on `emitter` with `args`, through its `emit` method. Returns whether `event` had
+/// listeners.
+pub(crate) fn emit(
+    scope: &Scope<'_>,
+    emitter: Object<'_>,
+    event: &'static CStr,
+    args: &[HandleValue<'_>],
+) -> Result<bool, ExnThrown> {
+    let mut all = Vec::with_capacity(args.len() + 1);
+    all.push(js::class::get_or_init_atom(scope, event)?);
+    all.extend_from_slice(args);
+    let result = Function::call_by_name(scope, emitter.handle(), c"emit", &all)?;
+    Ok(js::conversion::to_boolean(result))
+}
+
+/// Call the method `method` of `emitter` with `event` and `listener`, such as `on` or
+/// `removeListener`.
+pub(crate) fn listen(
+    scope: &Scope<'_>,
+    emitter: Object<'_>,
+    method: &'static CStr,
+    event: &'static CStr,
+    listener: Object<'_>,
+) -> Result<(), ExnThrown> {
+    let event = js::class::get_or_init_atom(scope, event)?;
+    let listener = listener.to_jsval_throwing(scope)?;
+    Function::call_by_name(scope, emitter.handle(), method, &[event, listener])?;
+    Ok(())
+}
+
+/// `emitter.listenerCount(event)`.
+pub(crate) fn listener_count(
+    scope: &Scope<'_>,
+    emitter: Object<'_>,
+    event: HandleValue<'_>,
+) -> Result<f64, ExnThrown> {
+    let count = Function::call_by_name(scope, emitter.handle(), c"listenerCount", &[event])?;
+    Ok(if count.is_number() {
+        count.to_number()
+    } else {
+        0.0
+    })
 }
 
 /// The property key of `name`, an event name.
 fn event_key<'s>(scope: &'s Scope<'_>, name: HandleValue<'_>) -> Result<HandleId<'s>, ExnThrown> {
     let id = js::id::value_to_id(scope, name)?;
     Ok(scope.root_id(id))
-}
-
-/// A new object with no prototype, like `Object.create(null)`.
-fn null_prototype_object<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let object = Object::new_plain(scope)?;
-    object.set_prototype(scope, HandleObject::null())?;
-    Ok(object)
 }
 
 /// `emitter._events`, or `None` if it isn't an object.
@@ -193,12 +271,12 @@ fn events_object<'s>(
 /// `emitter._eventsCount`, as a number.
 fn events_count(scope: &Scope<'_>, emitter: Object<'_>) -> Result<f64, ExnThrown> {
     let count = emitter.get_property(scope, c"_eventsCount")?;
-    Ok(f64::from_jsval(scope, count, ()).unwrap_or(0.0))
+    f64::from_jsval_throwing(scope, count, ())
 }
 
 /// Reset `emitter` to having no listeners.
 fn reset_events(scope: &Scope<'_>, emitter: Object<'_>) -> Result<(), ExnThrown> {
-    emitter.set_property(scope, c"_events", null_prototype_object(scope)?)?;
+    emitter.set_property(scope, c"_events", Object::new_with_null_prototype(scope)?)?;
     emitter.set_property(scope, c"_eventsCount", 0)
 }
 
@@ -207,7 +285,7 @@ fn ensure_events<'s>(scope: &'s Scope<'_>, emitter: Object<'_>) -> Result<Object
     if let Some(events) = events_object(scope, emitter)? {
         return Ok(events);
     }
-    let events = null_prototype_object(scope)?;
+    let events = Object::new_with_null_prototype(scope)?;
     emitter.set_property(scope, c"_events", events)?;
     emitter.set_property(scope, c"_eventsCount", 0)?;
     Ok(events)
@@ -224,19 +302,15 @@ fn listener_values<'s>(
     let Ok(object) = Object::from_value(scope, stored) else {
         return Ok(Vec::new());
     };
-    if !js::Array::is_array(scope, object.handle())? {
-        return Ok(vec![stored]);
+    match as_array(object) {
+        Some(array) => array.to_vec(scope),
+        None => Ok(vec![stored]),
     }
-    let length = array_length(scope, object)?;
-    (0..length)
-        .map(|index| object.get_element(scope, index))
-        .collect()
 }
 
-/// The `length` of the array `array`.
-fn array_length(scope: &Scope<'_>, array: Object<'_>) -> Result<u32, ExnThrown> {
-    let length = array.get_property(scope, c"length")?;
-    Ok(f64::from_jsval(scope, length, ()).map_err(|_| ExnThrown)? as u32)
+/// `object` as an array, if it is one.
+fn as_array(object: Object<'_>) -> Option<js::Array<'_>> {
+    object.cast::<js::Array>().ok()
 }
 
 /// The listener a `once` wrapper calls: `wrapper`'s `listener` property if it is a `once` wrapper, and
@@ -254,11 +328,6 @@ fn unwrap_listener<'s>(
     Ok(wrapper)
 }
 
-/// Whether `value` is `true`.
-fn is_true(value: HandleValue<'_>) -> bool {
-    value.is_boolean() && value.to_boolean()
-}
-
 /// Whether `a` and `b` are the same value, by `===`.
 fn same_value(scope: &Scope<'_>, a: HandleValue<'_>, b: HandleValue<'_>) -> bool {
     js::comparison::strictly_equal(scope, a, b).unwrap_or(false)
@@ -269,15 +338,39 @@ pub fn emitter_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnTh
     event_emitter::class_constructor(scope)
 }
 
-/// The listener limit of `emitter`: its `_maxListeners`, or `EventEmitter.defaultMaxListeners`.
-fn max_listeners(scope: &Scope<'_>, emitter: Object<'_>) -> Result<f64, ExnThrown> {
+/// Node.js's `_getMaxListeners`: the listener limit of `emitter`, its `_maxListeners`, which can be
+/// any value, or `EventEmitter.defaultMaxListeners` if that is `undefined`.
+fn max_listeners<'s>(
+    scope: &'s Scope<'_>,
+    emitter: Object<'_>,
+) -> Result<HandleValue<'s>, ExnThrown> {
     let own = emitter.get_property(scope, c"_maxListeners")?;
     if !own.is_undefined() {
-        return Ok(f64::from_jsval(scope, own, ()).unwrap_or(DEFAULT_MAX_LISTENERS));
+        return Ok(own);
     }
-    let ctor = emitter_constructor(scope)?;
-    let default = ctor.get_property(scope, c"defaultMaxListeners")?;
-    Ok(f64::from_jsval(scope, default, ()).unwrap_or(DEFAULT_MAX_LISTENERS))
+    Ok(scope.root_value(js::value::from_f64(DEFAULT_MAX_LISTENERS.get())))
+}
+
+/// The getter of `EventEmitter.defaultMaxListeners`.
+fn get_default_max_listeners(
+    _: &Scope<'_>,
+    _: CallbackArgs<'_>,
+    _: HandleValue,
+) -> Result<Value, ExnThrown> {
+    Ok(js::value::from_f64(DEFAULT_MAX_LISTENERS.get()))
+}
+
+/// The setter of `EventEmitter.defaultMaxListeners`, which validates the value as
+/// `validateNumber(value, 'defaultMaxListeners', 0)` does.
+fn set_default_max_listeners(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let value = crate::errors::validate_number(scope, args.get(0), "defaultMaxListeners", 0.0)
+        .map_err(|error| error.throw(scope))?;
+    DEFAULT_MAX_LISTENERS.set(value);
+    Ok(js::value::undefined())
 }
 
 /// Call `emitter.emit(...args)` through the method, so a subclass's override runs.
@@ -318,13 +411,13 @@ pub fn add_listener<'s>(
         return Ok(emitter);
     }
     // A second listener turns the stored function into an array, which later ones are added to.
-    let array = match Object::from_value(scope, existing)
-        .ok()
-        .filter(|existing| js::Array::is_array(scope, existing.handle()).unwrap_or(false))
-    {
+    let array = match Object::from_value(scope, existing).ok().and_then(as_array) {
         Some(array) => {
-            let method = if prepend { c"unshift" } else { c"push" };
-            Function::call_by_name(scope, array.handle(), method, &[listener])?;
+            if prepend {
+                array.unshift(scope, listener)?;
+            } else {
+                array.push(scope, listener)?;
+            }
             array
         }
         None => {
@@ -333,16 +426,19 @@ pub fn add_listener<'s>(
             } else {
                 [existing, listener]
             };
-            let array = *js::Array::with_contents(scope, &pair)?;
-            events.set_property_by_id(scope, key, array)?;
+            let array = js::Array::with_contents(scope, &pair)?;
+            events.set_property_by_id(scope, key, *array)?;
             array
         }
     };
 
     // Warn once per event about a possible leak.
-    let limit = max_listeners(scope, emitter)?;
-    let count = array_length(scope, array)?;
-    if limit > 0.0 && f64::from(count) > limit && !is_true(array.get_property(scope, c"warned")?) {
+    let limit = f64::from_jsval_throwing(scope, max_listeners(scope, emitter)?, ())?;
+    let count = array.length(scope)?;
+    if limit > 0.0
+        && f64::from(count) > limit
+        && !crate::support::is_true(array.get_property(scope, c"warned")?)
+    {
         array.set_property(scope, c"warned", true)?;
         warn_max_listeners(scope, emitter, name, count, limit)?;
     }
@@ -372,12 +468,11 @@ fn warn_max_listeners(
         "Possible EventEmitter memory leak detected. {count} {name} listeners added to [{class}]. \
          MaxListeners is {limit}. Use emitter.setMaxListeners() to increase limit"
     );
-    let process = scope.global().get_property(scope, c"process")?;
+    let process = crate::process::process_value(scope)?;
     let Ok(process) = Object::from_value(scope, process) else {
         return crate::process::emit_warning(scope, &message, "MaxListenersExceededWarning");
     };
-    let error_class = scope.global().get_property(scope, c"Error")?;
-    let error_class = Object::from_value(scope, error_class).map_err(|e| e.throw(scope))?;
+    let error_class = crate::stack_trace::error_constructor(scope)?;
     let message = js::JSString::from_str(scope, &message)?.to_jsval_throwing(scope)?;
     let warning = Function::construct(scope, error_class, &[message])?;
     warning.set_property(scope, c"name", "MaxListenersExceededWarning")?;
@@ -395,7 +490,7 @@ fn warn_max_listeners(
 
 /// `String(value)`, which gives a symbol's description where `ToString` throws.
 fn string_of(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<String, ExnThrown> {
-    let string = scope.global().get_property(scope, c"String")?;
+    let string = crate::support::class_object(scope, js::class_spec::JSProtoKey::JSProto_String)?;
     let result = Function::call(scope, js::value::undefined(), string, &[value])?;
     js::JSString::from_value(scope, *result)?.to_utf8(scope)
 }
@@ -416,25 +511,32 @@ pub fn remove_listener<'s>(
     if stored.is_undefined() {
         return Ok(emitter);
     }
-    let is_array = Object::from_value(scope, stored)
-        .is_ok_and(|stored| js::Array::is_array(scope, stored.handle()).unwrap_or(false));
+    let array = Object::from_value(scope, stored).ok().and_then(as_array);
     let matches = |candidate: HandleValue<'_>| {
         same_value(scope, candidate, listener)
             || unwrap_listener(scope, candidate)
                 .is_ok_and(|original| same_value(scope, original, listener))
     };
     // A single listener is reported unwrapped, and one of several as `listener` was given.
-    let reported = if !is_array {
+    let reported = if let Some(array) = array {
+        let listeners = array.to_vec(scope)?;
+        let Some(position) = listeners.iter().rposition(|candidate| matches(*candidate)) else {
+            return Ok(emitter);
+        };
+        array.remove(scope, position as u32, 1)?;
+        if array.length(scope)? == 1 {
+            let only = array.get_element(scope, 0)?;
+            events.set_property_by_id(scope, key, only)?;
+        }
+        listener
+    } else {
         if !matches(stored) {
             return Ok(emitter);
         }
         let count = events_count(scope, emitter)? - 1.0;
         emitter.set_property(scope, c"_eventsCount", count)?;
-        let shape_mode = event_key(
-            scope,
-            state_symbols(scope)?.get_property(scope, c"shapeMode")?,
-        )?;
-        if is_true(emitter.get_property_by_id(scope, shape_mode)?) {
+        let shape_mode = SHAPE_MODE.id(scope)?;
+        if crate::support::is_true(emitter.get_property_by_id(scope, shape_mode)?) {
             events.set_property_by_id(scope, key, js::value::undefined())?;
         } else if count == 0.0 {
             reset_events(scope, emitter)?;
@@ -442,24 +544,6 @@ pub fn remove_listener<'s>(
             events.delete_property_by_id(scope, key)?;
         }
         unwrap_listener(scope, stored)?
-    } else {
-        let listeners = listener_values(scope, stored)?;
-        let Some(position) = listeners.iter().rposition(|candidate| matches(*candidate)) else {
-            return Ok(emitter);
-        };
-        let remaining: Vec<_> = listeners
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != position)
-            .map(|(_, value)| *value)
-            .collect();
-        if remaining.len() == 1 {
-            events.set_property_by_id(scope, key, remaining[0])?;
-        } else {
-            let array = js::Array::with_contents(scope, &remaining)?;
-            events.set_property_by_id(scope, key, *array)?;
-        }
-        listener
     };
     // Whether to emit depends on the events object from before a reset.
     if !events
@@ -487,12 +571,11 @@ pub fn emit_event(
     let events = events_object(scope, emitter)?;
     if is_error {
         if let Some(events) = events {
-            let monitor = emitter_constructor(scope)?.get_property(scope, c"errorMonitor")?;
-            if monitor.is_symbol() {
-                let key = event_key(scope, monitor)?;
-                if !events.get_property_by_id(scope, key)?.is_undefined() {
-                    emit_event(scope, emitter, monitor, args)?;
-                }
+            let key = ERROR_MONITOR.id(scope)?;
+            if !events.get_property_by_id(scope, key)?.is_undefined() {
+                let mut monitor_args = vec![ERROR_MONITOR.value(scope)?];
+                monitor_args.extend_from_slice(args);
+                call_emit(scope, emitter, &monitor_args)?;
             }
         }
     }
@@ -549,54 +632,75 @@ fn unhandled_error(scope: &Scope<'_>, error: Option<HandleValue<'_>>) -> Thrown 
                 return Thrown::Pending;
             }
         }
-        js::exception::set_pending(
-            scope,
-            exception,
-            js::native::ExceptionStackBehavior::DoNotCapture,
-        );
+        js::exception::throw_value(scope, exception);
     }
     let ExnThrown = thrown;
     Thrown::Pending
 }
 
-/// The body of a `once` wrapper: remove the wrapper, then call the listener once. The payload is
-/// the wrapper's state object, holding `target`, `type`, `listener`, `wrapper` and `fired`.
+/// The state of a `once` wrapper, Node's `onceWrapper` `this`: the emitter, the event name, the
+/// listener, the wrapper, and whether it fired.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct OnceState {
+    target: Heap<js::object::Object>,
+    name: Heap<Value>,
+    listener: Heap<Value>,
+    wrapper: Option<Heap<js::object::Object>>,
+    #[no_trace]
+    fired: bool,
+}
+
+#[core_runtime::jsmethods]
+impl OnceState {}
+
+/// The body of a `once` wrapper, whose payload is a [`OnceState`]: remove the wrapper, then call
+/// the listener once.
 fn once_wrapper(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
-    if is_true(state.get_property(scope, c"fired")?) {
+    let state = js::function::cast_payload::<OnceState>(scope, payload);
+    if state.data().fired {
         return Ok(js::value::undefined());
     }
-    state.set_property(scope, c"fired", true)?;
-    let target = Object::from_value(scope, state.get_property(scope, c"target")?)
-        .map_err(|e| e.throw(scope))?;
-    let name = state.get_property(scope, c"type")?;
-    let wrapper = state.get_property(scope, c"wrapper")?;
+    let (target, name, wrapper) = {
+        let data = state.data();
+        (
+            data.target.get(scope),
+            data.name.get(scope),
+            data.wrapper.get(scope),
+        )
+    };
+    let wrapper = match wrapper {
+        Some(wrapper) => scope.root_value(wrapper.as_value()),
+        None => HandleValue::undefined(),
+    };
     Function::call_by_name(scope, target.handle(), c"removeListener", &[name, wrapper])?;
-    let listener = state.get_property(scope, c"listener")?;
+    state.data_mut().fired = true;
+    let listener = state.data().listener.get(scope);
     let call_args: Vec<_> = (0..args.len()).map(|index| args.get(index)).collect();
     let result = Function::call(scope, target, listener, &call_args)?;
     Ok(result.get())
 }
 
 /// A wrapper for `listener` that removes itself from `target`'s `name` listeners before calling
-/// it. Node's `_onceWrap`.
+/// it, with the listener as its `listener` property. Node's `_onceWrap`.
 fn once_wrap<'s>(
     scope: &'s Scope<'_>,
     target: Object<'_>,
     name: HandleValue<'_>,
     listener: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let state = Object::new_plain(scope)?;
-    state.set_property(scope, c"fired", false)?;
-    state.set_property(scope, c"target", target)?;
-    state.set_property(scope, c"type", name)?;
-    state.set_property(scope, c"listener", listener)?;
+    let state = js::class::create_instance_with::<OnceStateImpl>(scope, |_| OnceStateImpl {
+        target: Heap::from(target),
+        name: Heap::from(name.get()),
+        listener: Heap::from(listener.get()),
+        wrapper: None,
+        fired: false,
+    })?;
     let wrapper = Function::new_callback(scope, c"bound onceWrapper", 0, once_wrapper, state)?;
-    state.set_property(scope, c"wrapper", *wrapper)?;
+    state.data_mut().wrapper = Some(Heap::from(*wrapper));
     wrapper.set_property(scope, c"listener", listener)?;
     (*wrapper).to_jsval_throwing(scope)
 }
@@ -629,7 +733,7 @@ pub mod event_emitter {
     /// <https://nodejs.org/api/events.html#class-eventemitter>: initialize `this` as an emitter
     /// with no listeners, unless it already has its own `_events`. `options.captureRejections`
     /// makes it emit rejections of the promises its listeners return as `error` events.
-    #[constructor]
+    #[constructor(length = 1)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -669,6 +773,16 @@ pub mod event_emitter {
             this.set_property_by_id(scope, key, proto.get_property_by_id(scope, key)?)?;
         }
         Ok(())
+    }
+
+    /// `EventEmitter.init(options)`: initialize `this` as an emitter, as the constructor does.
+    #[static_method(name = "init", length = 1)]
+    pub fn init_static(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        init(scope, this, options)
     }
 
     /// <https://nodejs.org/api/events.html#emitteronEventname-listener>
@@ -748,6 +862,7 @@ pub mod event_emitter {
     }
 
     /// <https://nodejs.org/api/events.html#emitterremovealllistenerseventname>
+    #[method(length = 1)]
     pub fn remove_all_listeners<'s>(
         scope: &'s Scope<'_>,
         this: Object<'s>,
@@ -811,6 +926,7 @@ pub mod event_emitter {
     }
 
     /// <https://nodejs.org/api/events.html#emitteremiteventname-args>
+    #[method(length = 0)]
     pub fn emit(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -826,23 +942,16 @@ pub mod event_emitter {
         this: Object<'s>,
         n: HandleValue<'_>,
     ) -> Result<Object<'s>, Thrown> {
-        if !n.is_number() {
-            return Err(
-                NodeError::invalid_arg_type(scope, "setMaxListeners", "of type number", n).into(),
-            );
-        }
-        let number = n.to_number();
-        if number.is_nan() || number < 0.0 {
-            return Err(
-                NodeError::out_of_range("setMaxListeners", ">= 0", &number.to_string()).into(),
-            );
-        }
+        crate::errors::validate_number(scope, n, "setMaxListeners", 0.0)?;
         this.set_property(scope, c"_maxListeners", n)?;
         Ok(this)
     }
 
     /// <https://nodejs.org/api/events.html#emittergetmaxlisteners>
-    pub fn get_max_listeners(scope: &Scope<'_>, this: Object<'_>) -> Result<f64, Thrown> {
+    pub fn get_max_listeners<'s>(
+        scope: &'s Scope<'_>,
+        this: Object<'_>,
+    ) -> Result<HandleValue<'s>, Thrown> {
         Ok(max_listeners(scope, this)?)
     }
 
@@ -867,6 +976,7 @@ pub mod event_emitter {
     }
 
     /// <https://nodejs.org/api/events.html#emitterlistenercounteventname-listener>
+    #[method(length = 2)]
     pub fn listener_count(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -919,11 +1029,17 @@ pub mod event_emitter {
             remove_listener,
             js::class_spec::JSPROP_ENUMERATE as u32,
         )?;
-        ctor.set_property(scope, c"defaultMaxListeners", DEFAULT_MAX_LISTENERS)?;
-        let monitor = crate::symbol(scope, "events.errorMonitor", false)?;
-        ctor.set_property(scope, c"errorMonitor", monitor)?;
-        let capture = crate::symbol(scope, "nodejs.rejection", true)?;
-        ctor.set_property(scope, c"captureRejectionSymbol", capture)?;
+        let getter = Function::new_callback(scope, c"get", 0, get_default_max_listeners, ())?;
+        let setter = Function::new_callback(scope, c"set", 1, set_default_max_listeners, ())?;
+        ctor.define_accessor(
+            scope,
+            c"defaultMaxListeners",
+            Some(*getter),
+            Some(*setter),
+            (js::class_spec::JSPROP_ENUMERATE | js::class_spec::JSPROP_PERMANENT) as u32,
+        )?;
+        ctor.set_property(scope, c"errorMonitor", ERROR_MONITOR.value(scope)?)?;
+        ctor.set_property(scope, c"captureRejectionSymbol", REJECTION.value(scope)?)?;
         ctor.set_property(scope, c"captureRejections", false)?;
         ctor.set_property(scope, c"usingDomains", false)?;
         ctor.set_property(scope, c"EventEmitter", ctor)?;
@@ -936,12 +1052,9 @@ fn is_event_target(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, Ex
     let Ok(object) = Object::from_value(scope, *value) else {
         return Ok(false);
     };
-    let event_target = scope.global().get_property(scope, c"EventTarget")?;
-    let Ok(event_target) = Object::from_value(scope, event_target) else {
-        return Ok(false);
-    };
-    let Ok(prototype) = Object::from_value(scope, event_target.get_property(scope, c"prototype")?)
-    else {
+    let Some(prototype) = js::class::get_prototype_object_for::<
+        web_globals::events::event_target::EventTargetImpl,
+    >(scope) else {
         return Ok(false);
     };
     let mut current = object.get_prototype(scope)?;
@@ -954,10 +1067,28 @@ fn is_event_target(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, Ex
     Ok(false)
 }
 
+/// The callbacks of the listeners of `target`, an object [`is_event_target`] accepts, for the
+/// event type `name`. An object that inherits from `EventTarget.prototype` without being an
+/// `EventTarget` has none, and a symbol `name` has none.
+fn event_target_listeners<'s>(
+    scope: &'s Scope<'_>,
+    target: HandleValue<'_>,
+    name: HandleValue<'_>,
+) -> Result<Vec<Object<'s>>, ExnThrown> {
+    let Ok(target) = web_globals::events::event_target::EventTarget::from_jsval(scope, target, ())
+    else {
+        return Ok(Vec::new());
+    };
+    if name.is_symbol() {
+        return Ok(Vec::new());
+    }
+    let name = js::JSString::from_value(scope, name)?.to_utf8(scope)?;
+    Ok(target.listeners_for(scope, &name))
+}
+
 /// The key of the listener limit `setMaxListeners` stores on an `EventTarget`.
 fn event_target_limit_key<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
-    let symbol = state_symbols(scope)?.get_property(scope, c"maxEventTargetListeners")?;
-    event_key(scope, symbol)
+    MAX_EVENT_TARGET_LISTENERS.id(scope)
 }
 
 /// `ERR_INVALID_ARG_TYPE` for an argument `name` that is neither an `EventEmitter` nor an
@@ -986,7 +1117,7 @@ fn with_method<'s>(
     node_args,
     name = "node:events",
     default = "EventEmitter",
-    mirror = "errorMonitor, captureRejectionSymbol, captureRejections, defaultMaxListeners, usingDomains"
+    mirror = "errorMonitor, captureRejectionSymbol, captureRejections, defaultMaxListeners, usingDomains, init"
 )]
 pub mod module {
     use super::*;
@@ -1003,11 +1134,18 @@ pub mod module {
             let listeners = Function::call_by_name(scope, object.handle(), c"listeners", &[name])?;
             return Ok(scope.root_value(listeners.get()));
         }
+        if is_event_target(scope, emitter)? {
+            let listeners = event_target_listeners(scope, emitter, name)?;
+            return Ok(js::Array::with_contents(scope, &listeners)?.to_jsval_throwing(scope)?);
+        }
         Err(not_an_emitter(scope, "emitter", emitter))
     }
 
     /// <https://nodejs.org/api/events.html#eventsgetmaxlistenersemitterortarget>
-    pub fn get_max_listeners(scope: &Scope<'_>, emitter: HandleValue<'_>) -> Result<f64, Thrown> {
+    pub fn get_max_listeners<'s>(
+        scope: &'s Scope<'_>,
+        emitter: HandleValue<'_>,
+    ) -> Result<HandleValue<'s>, Thrown> {
         if let Some(object) = with_method(scope, emitter, c"getMaxListeners")? {
             return Ok(max_listeners(scope, object)?);
         }
@@ -1015,12 +1153,9 @@ pub mod module {
             let target = Object::from_value(scope, *emitter)?;
             let limit = target.get_property_by_id(scope, event_target_limit_key(scope)?)?;
             if limit.is_number() {
-                return Ok(limit.to_number());
+                return Ok(limit);
             }
-            let ctor = emitter_constructor(scope)?;
-            return Ok(ctor
-                .get_property(scope, c"defaultMaxListeners")?
-                .to_number());
+            return Ok(scope.root_value(js::value::from_f64(DEFAULT_MAX_LISTENERS.get())));
         }
         Err(not_an_emitter(scope, "emitter", emitter))
     }
@@ -1032,21 +1167,13 @@ pub mod module {
         n: Option<HandleValue<'_>>,
         targets: RestArgs<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let ctor = emitter_constructor(scope)?;
         let n = match n.filter(|n| !n.is_undefined()) {
             Some(n) => n,
-            None => ctor.get_property(scope, c"defaultMaxListeners")?,
+            None => scope.root_value(js::value::from_f64(DEFAULT_MAX_LISTENERS.get())),
         };
-        if !n.is_number() {
-            let error = NodeError::invalid_arg_type(scope, "setMaxListeners", "of type number", n);
-            return Err(error.into());
-        }
-        if n.to_number().is_nan() || n.to_number() < 0.0 {
-            let received = n.to_number().to_string();
-            return Err(NodeError::out_of_range("setMaxListeners", ">= 0", &received).into());
-        }
+        let number = crate::errors::validate_number(scope, n, "setMaxListeners", 0.0)?;
         if targets.is_empty() {
-            ctor.set_property(scope, c"defaultMaxListeners", n)?;
+            DEFAULT_MAX_LISTENERS.set(number);
             return Ok(());
         }
         for target in targets.iter() {
@@ -1085,16 +1212,19 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/events.html#eventslistenercountemitter-eventname>
-    pub fn listener_count(
-        scope: &Scope<'_>,
+    pub fn listener_count<'s>(
+        scope: &'s Scope<'_>,
         emitter: HandleValue<'_>,
         name: HandleValue<'_>,
-    ) -> Result<u32, Thrown> {
+    ) -> Result<HandleValue<'s>, Thrown> {
         if let Some(object) = with_method(scope, emitter, c"listenerCount")? {
             let count = Function::call_by_name(scope, object.handle(), c"listenerCount", &[name])?;
-            return Ok(count.to_number() as u32);
+            return Ok(scope.root_value(count.get()));
         }
-        let object = crate::errors::validate_object(scope, emitter, "emitter")?;
-        Ok(listeners_of(scope, object, name, true)?.len() as u32)
+        if is_event_target(scope, emitter)? {
+            let count = event_target_listeners(scope, emitter, name)?.len() as f64;
+            return Ok(scope.root_value(js::value::from_f64(count)));
+        }
+        Err(not_an_emitter(scope, "emitter", emitter))
     }
 }

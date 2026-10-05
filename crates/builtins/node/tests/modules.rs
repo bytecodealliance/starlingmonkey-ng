@@ -45,8 +45,24 @@ fn fs() {
 }
 
 #[test]
+fn fs_finalize() {
+    run_js_with_flags(
+        "fs_finalize.mjs",
+        &["--allow-node-runtime-flags", "--expose-gc"],
+    );
+}
+
+#[test]
 fn diagnostics_channel() {
     run_js("diagnostics_channel.mjs");
+}
+
+#[test]
+fn diagnostics_channel_gc() {
+    run_js_with_flags(
+        "diagnostics_channel_gc.mjs",
+        &["--allow-node-runtime-flags", "--expose-gc"],
+    );
 }
 
 #[test]
@@ -77,6 +93,11 @@ fn path() {
 #[test]
 fn process() {
     run_js("process.mjs");
+}
+
+#[test]
+fn promisify() {
+    run_js("promisify.mjs");
 }
 
 #[test]

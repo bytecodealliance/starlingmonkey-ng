@@ -250,6 +250,45 @@ try {
   await handle.close();
   eq(handle.fd, -1, "close resets the descriptor");
   eq(await fsp.readFile(`${dir}/promise.txt`, "utf8"), "Promised", "FileHandle writes");
+
+  // A FileHandle's streams reference its descriptor and end when it closes, so a closed
+  // handle's stream can't write to a file that reuses the descriptor.
+  const streamed = await fsp.open(`${dir}/streamed.txt`, "w");
+  const handleStream = streamed.createWriteStream();
+  const handleEvents = [];
+  for (const event of ["finish", "close", "error"]) {
+    handleStream.on(event, (error) => handleEvents.push(`${event} ${error?.code ?? ""}`));
+  }
+  await new Promise((resolve) => handleStream.write("first", resolve));
+  const closing = streamed.close();
+  deepEq(
+    [streamed.fd >= 0, handleStream.writableEnded, streamed.close() === closing],
+    [true, true, true],
+    "a FileHandle closed under a stream keeps its descriptor until the stream closes",
+  );
+  await closing;
+  writeFileSync(`${dir}/other.txt`, "original");
+  const other = await fsp.open(`${dir}/other.txt`, "r+");
+  const late = await new Promise((resolve) => handleStream.write("CLOBBER", resolve));
+  await other.close();
+  deepEq(
+    [...handleEvents, late?.code],
+    ["finish ", "close ", "ERR_STREAM_WRITE_AFTER_END"],
+    "a write after the FileHandle closed",
+  );
+  deepEq(
+    [streamed.fd, readFileSync(`${dir}/streamed.txt`, "utf8"), readFileSync(`${dir}/other.txt`, "utf8")],
+    [-1, "first", "original"],
+    "a stream of a closed FileHandle doesn't write to another file",
+  );
+  const reading = await fsp.open(`${dir}/streamed.txt`, "r");
+  const readEvents = [];
+  const handleReader = reading.createReadStream();
+  for (const event of ["end", "close", "error"]) {
+    handleReader.on(event, (error) => readEvents.push(`${event} ${error?.code ?? ""}`));
+  }
+  await reading.close();
+  deepEq([readEvents, handleReader.destroyed], [["close "], true], "closing a FileHandle destroys its read stream");
   await fsp.rm(`${dir}/a`, { recursive: true });
   eq(existsSync(`${dir}/a`), false, "promise rm");
 
@@ -342,6 +381,8 @@ try {
   eq(watcher._handle, null, "close drops the handle");
 
   const fileWatcher = fs.watch(`${dir}/stream.txt`, { encoding: "buffer" });
+  // The watcher keeps reporting to its own callback after `_handle.onchange` is replaced.
+  fileWatcher._handle.onchange = () => {};
   change = nextChange(fileWatcher);
   fs.appendFileSync(`${dir}/stream.txt`, "?");
   const [fileEvent, fileName] = await change;

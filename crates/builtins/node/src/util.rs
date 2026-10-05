@@ -2,16 +2,17 @@
 
 //! `node:util` and `node:util/types`. See <https://nodejs.org/api/util.html>.
 
-use std::cell::RefCell;
-use std::collections::HashSet;
 use std::ffi::CStr;
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
+use js::object::ESClass;
 use js::prelude::HandleValue;
+use js::typedarray::ViewKind;
 use js::{Function, Object};
 
 use crate::errors::{
@@ -22,11 +23,26 @@ use crate::inspect::{self, InspectOptions};
 
 /// The symbol a function's promisified version is stored under,
 /// `Symbol.for('nodejs.util.promisify.custom')`.
-const PROMISIFY_CUSTOM: &str = "nodejs.util.promisify.custom";
+pub(crate) static PROMISIFY_CUSTOM: js::symbol::CachedSymbol =
+    js::symbol::CachedSymbol::registered(c"nodejs.util.promisify.custom");
 
-js::instance_local! {
-    /// The deprecation codes `deprecate` has emitted a warning for.
-    static CODES_WARNED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+/// Node's internal `customPromisifyArgs` symbol. A function's property under it names the values
+/// its callback passes after the error, and its promisified version resolves with an object of
+/// them.
+pub(crate) static CUSTOM_PROMISIFY_ARGS: js::symbol::CachedSymbol =
+    js::symbol::CachedSymbol::new(c"customPromisifyArgs");
+
+/// Define `function[customPromisifyArgs]` as an array of `names`, non-enumerable, non-writable and
+/// non-configurable, as Node.js defines it on its functions.
+pub(crate) fn define_promisify_args(
+    scope: &Scope<'_>,
+    function: Object<'_>,
+    names: &[&str],
+) -> Result<(), ExnThrown> {
+    let names = js::Array::with_contents(scope, names)?;
+    let id = CUSTOM_PROMISIFY_ARGS.id(scope)?;
+    let attrs = js::class_spec::JSPROP_READONLY | js::class_spec::JSPROP_PERMANENT;
+    function.define_value_by_id(scope, id, names.to_jsval_throwing(scope)?, attrs as u32)
 }
 
 /// The body of `util.inspect(value, options)`. A boolean `options` is `showHidden`, and a third
@@ -79,24 +95,70 @@ fn default_options_set(
     Ok(js::value::undefined())
 }
 
-/// The body of a promisified function, whose payload is the original function: call it with the
-/// arguments and a callback that settles the returned promise. A promise returned by the original
-/// function emits the `DEP0174` warning.
+/// The state of a function `util.promisify` returned for a function with `customPromisifyArgs`.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct Promisified {
+    original: Heap<js::object::Object>,
+    /// The original function's `customPromisifyArgs`.
+    names: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl Promisified {}
+
+/// The state of the callback a promisified function with `customPromisifyArgs` passes on.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct PromisifySettle {
+    promise: Heap<js::promise::Promise>,
+    /// The original function's `customPromisifyArgs`.
+    names: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl PromisifySettle {}
+
+/// The body of a promisified function, whose payload is the original function, or its
+/// [`Promisified`] state if it has `customPromisifyArgs`: call it with the arguments and a
+/// callback that settles the returned promise. A promise returned by the original function emits
+/// the `DEP0174` warning.
 fn promisified(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let promise = js::Promise::new_pending(scope)?;
-    let settle = Function::new_callback(scope, c"callback", 2, settle_promise, *promise)?;
+    let state = Object::from_value(scope, *payload)
+        .map_err(|e| e.throw(scope))?
+        .cast::<Promisified>()
+        .ok();
+    let (original, settle) = match state {
+        Some(state) => {
+            let (original, names) = {
+                let data = state.data();
+                (data.original.get(scope), data.names.get(scope))
+            };
+            let settle = js::class::create_instance_with::<PromisifySettleImpl>(scope, |_| {
+                PromisifySettleImpl {
+                    promise: Heap::from(promise),
+                    names: Heap::from(names.get()),
+                }
+            })?;
+            let settle = Function::new_callback(scope, c"", 1, settle_with_names, settle)?;
+            (original.to_jsval_throwing(scope)?, settle)
+        }
+        None => (
+            payload,
+            Function::new_callback(scope, c"", 1, settle_promise, *promise)?,
+        ),
+    };
     let mut call_args = crate::callback_args(&args);
     call_args.push((*settle).to_jsval_throwing(scope)?);
-    match Function::call(scope, args.this(), payload, &call_args) {
+    match Function::call(scope, args.this(), original, &call_args) {
         Ok(result) => {
             if Object::from_value(scope, *result)
                 .is_ok_and(|result| js::Promise::is_promise(result.handle()))
             {
-                emit_warning(
+                crate::process::deprecation_warning(
                     scope,
                     "Calling promisify on a function that returns a Promise is likely a mistake.",
                     "DEP0174",
@@ -106,21 +168,6 @@ fn promisified(
         Err(ExnThrown) => promise.reject_with_pending(scope)?,
     }
     promise.to_jsval_raw_throwing(scope)
-}
-
-/// Call `process.emitWarning(message, 'DeprecationWarning', code)`.
-fn emit_warning(scope: &Scope<'_>, message: &str, code: &str) -> Result<(), ExnThrown> {
-    let Ok(process) = Object::from_value(scope, *scope.global().get_property(scope, c"process")?)
-    else {
-        return Ok(());
-    };
-    Function::call_by_name(
-        scope,
-        process.handle(),
-        c"emitWarning",
-        &[message, "DeprecationWarning", code],
-    )?;
-    Ok(())
 }
 
 /// The callback a promisified function passes on, whose payload is the promise: reject it with a
@@ -140,42 +187,80 @@ fn settle_promise(
     Ok(js::value::undefined())
 }
 
-/// `Object.defineProperties(target, Object.getOwnPropertyDescriptors(source))`, with each
-/// descriptor passed to `adjust` first.
+/// The callback a promisified function with `customPromisifyArgs` passes on, whose payload is a
+/// [`PromisifySettle`]. A truthy first argument rejects the promise. Otherwise, a call with more
+/// than two arguments resolves it with an object that maps the `customPromisifyArgs` names to the
+/// arguments after the first, in order, and any other call resolves it with the second argument.
+/// Names that aren't an object map nothing.
+fn settle_with_names(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let state = cast_payload::<PromisifySettle>(scope, payload);
+    let (promise, names) = {
+        let data = state.data();
+        (data.promise.get(scope), data.names.get(scope))
+    };
+    let error = args.get(0);
+    if bool::from_jsval(scope, error, ()).unwrap_or(false) {
+        promise.reject(scope, error)?;
+        return Ok(js::value::undefined());
+    }
+    if args.len() <= 2 {
+        promise.resolve(scope, args.get(1))?;
+        return Ok(js::value::undefined());
+    }
+    let values = || -> Result<Object<'_>, ExnThrown> {
+        let result = Object::new_plain(scope)?;
+        let Ok(names) = Object::from_value(scope, *names) else {
+            return Ok(result);
+        };
+        let length = f64::from_jsval_throwing(scope, names.get_property(scope, c"length")?, ())?;
+        let mut index = 0;
+        while f64::from(index) < length {
+            let name = names.get_element(scope, index)?;
+            let id = scope.root_id(js::id::value_to_id(scope, name)?);
+            result.set_property_by_id(scope, id, args.get(index + 1))?;
+            index += 1;
+        }
+        Ok(result)
+    };
+    match values() {
+        Ok(result) => promise.resolve(scope, result)?,
+        Err(ExnThrown) => promise.reject_with_pending(scope)?,
+    }
+    Ok(js::value::undefined())
+}
+
+/// `Object.defineProperties(target, Object.getOwnPropertyDescriptors(source))`, with the
+/// descriptor of each property with a string key passed to `adjust` first.
 fn copy_descriptors(
     scope: &Scope<'_>,
     target: Object<'_>,
     source: Object<'_>,
     adjust: impl Fn(&Scope<'_>, &str, Object<'_>) -> Result<(), ExnThrown>,
 ) -> Result<(), ExnThrown> {
-    let object = Object::from_value(scope, *scope.global().get_property(scope, c"Object")?)
-        .map_err(|e| e.throw(scope))?;
-    let descriptors = Function::call_by_name(
-        scope,
-        object.handle(),
-        c"getOwnPropertyDescriptors",
-        &[source.to_jsval_throwing(scope)?],
-    )?;
-    let descriptors = Object::from_value(scope, *descriptors).map_err(|e| e.throw(scope))?;
-    for key in descriptors.own_keys(scope)? {
+    let mut descriptors = Vec::new();
+    for key in source.own_keys(scope)? {
         let id = scope.root_id(js::id::value_to_id(scope, key)?);
-        let descriptor = descriptors.get_property_by_id(scope, id)?;
-        let descriptor = Object::from_value(scope, *descriptor).map_err(|e| e.throw(scope))?;
-        descriptor.set_prototype(scope, js::native::HandleObject::null())?;
-        if !key.is_symbol() {
-            let name = String::from_jsval(scope, key, ()).map_err(|_| ExnThrown)?;
-            adjust(scope, &name, descriptor)?;
+        let descriptor = source.own_property_descriptor_value(scope, id)?;
+        let Ok(object) = Object::from_value(scope, *descriptor) else {
+            continue;
+        };
+        object.set_prototype(scope, js::native::HandleObject::null())?;
+        if let Some(name) = crate::support::rust_string(scope, key) {
+            adjust(scope, &name, object)?;
+        }
+        descriptors.push((key, id, descriptor));
+    }
+    for (key, id, descriptor) in descriptors {
+        if !target.define_property_from_descriptor(scope, id, descriptor)? {
+            let key = crate::errors::js_string(scope, key)?;
+            let message = format!("Cannot redefine property: {key}");
+            return Err(js::error::TypeError(message).throw(scope));
         }
     }
-    Function::call_by_name(
-        scope,
-        object.handle(),
-        c"defineProperties",
-        &[
-            target.to_jsval_throwing(scope)?,
-            descriptors.to_jsval_throwing(scope)?,
-        ],
-    )?;
     Ok(())
 }
 
@@ -198,15 +283,25 @@ fn promisify_callback(
 ) -> Result<Value, ExnThrown> {
     let run = || -> Result<Value, Thrown> {
         let original = validate_function(scope, args.get(0), "original")?;
-        let custom = crate::symbol(scope, PROMISIFY_CUSTOM, true)?;
-        let custom_id = scope.root_id(js::id::value_to_id(scope, custom)?);
+        let custom = PROMISIFY_CUSTOM.value(scope)?;
+        let custom_id = PROMISIFY_CUSTOM.id(scope)?;
         let existing = original.get_property_by_id(scope, custom_id)?;
         if bool::from_jsval(scope, existing, ()).unwrap_or(false) {
             let existing = validate_function(scope, existing, "util.promisify.custom")?;
             define_custom(scope, existing, custom, existing.to_jsval_throwing(scope)?)?;
             return Ok(existing.to_jsval_raw_throwing(scope)?);
         }
-        let function = Function::new_callback(scope, c"fn", 0, promisified, original)?;
+        let names = original.get_property_by_id(scope, CUSTOM_PROMISIFY_ARGS.id(scope)?)?;
+        let function = if names.is_undefined() {
+            Function::new_callback(scope, c"fn", 0, promisified, original)?
+        } else {
+            let state =
+                js::class::create_instance_with::<PromisifiedImpl>(scope, |_| PromisifiedImpl {
+                    original: Heap::from(original),
+                    names: Heap::from(names.get()),
+                })?;
+            Function::new_callback(scope, c"fn", 0, promisified, state)?
+        };
         if let Some(proto) = original.get_prototype(scope)? {
             function.set_prototype(scope, proto.handle())?;
         }
@@ -217,8 +312,21 @@ fn promisify_callback(
     run().map_err(|error| error.throw(scope))
 }
 
+/// The state of a call of a callbackified function: its callback, and the `this` of the call,
+/// which the callback is called with.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct CallbackifyCall {
+    callback: Heap<js::object::Object>,
+    this: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl CallbackifyCall {}
+
 /// The body of a callbackified function, whose payload is the original async function: call it
-/// with all arguments but the last, a callback called with the outcome.
+/// with all arguments but the last, the callback, and call the result's `then` with reactions that
+/// queue a call of the callback with the outcome in the tick queue. A result that isn't an object
+/// throws a `TypeError`.
 fn callbackified(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -230,16 +338,22 @@ fn callbackified(
             .pop()
             .unwrap_or(scope.root_value(js::value::undefined()));
         let callback = validate_function(scope, callback, "last argument")?;
-        let result = Function::call(scope, args.this(), payload, &call_args)?;
-        let promise_ctor =
-            Object::from_value(scope, scope.global().get_property(scope, c"Promise")?)?;
-        let promise = Function::call_by_name(scope, promise_ctor.handle(), c"resolve", &[result])?;
-        let promise = Object::from_value(scope, promise)?;
-        let on_fulfilled = Function::new_callback(scope, c"", 1, callbackify_fulfilled, callback)?;
-        let on_rejected = Function::new_callback(scope, c"", 1, callbackify_rejected, callback)?;
+        let this = scope.root_value(args.this());
+        let call = js::class::create_instance_with::<CallbackifyCallImpl>(scope, |_| {
+            CallbackifyCallImpl {
+                callback: Heap::from(callback),
+                this: Heap::from(this.get()),
+            }
+        })?;
+        let result = Function::call(scope, this, payload, &call_args)?;
+        let result = Object::from_value(scope, *result).map_err(|_| {
+            js::error::TypeError("ReflectApply(...).then is not a function".into()).throw(scope)
+        })?;
+        let on_fulfilled = Function::new_callback(scope, c"", 1, callbackify_fulfilled, call)?;
+        let on_rejected = Function::new_callback(scope, c"", 1, callbackify_rejected, call)?;
         Function::call_by_name(
             scope,
-            promise.handle(),
+            result.handle(),
             c"then",
             &[*on_fulfilled, *on_rejected],
         )?;
@@ -248,86 +362,136 @@ fn callbackified(
     run().map_err(|error| error.throw(scope))
 }
 
+/// The fulfillment reaction of a callbackified function's result, whose payload is the
+/// [`CallbackifyCall`]: queue the call of the callback with `null` and the value.
 fn callbackify_fulfilled(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let null = scope.root_value(js::value::null());
-    Function::call(scope, js::value::undefined(), payload, &[null, args.get(0)])?;
+    js::jobs::queue_native_tick(scope, call_back_fulfilled, payload, &[args.get(0)])?;
     Ok(js::value::undefined())
 }
 
+/// The rejection reaction of a callbackified function's result, whose payload is the
+/// [`CallbackifyCall`]: queue the call of the callback with the reason.
 fn callbackify_rejected(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
+    js::jobs::queue_native_tick(scope, call_back_rejected, payload, &[args.get(0)])?;
+    Ok(js::value::undefined())
+}
+
+/// The tick that calls a callbackified function's callback with `null` and the value, whose
+/// payload is the [`CallbackifyCall`].
+fn call_back_fulfilled(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let call = cast_payload::<CallbackifyCall>(scope, payload);
+    let (callback, this) = {
+        let data = call.data();
+        (data.callback.get(scope), data.this.get(scope))
+    };
+    let null = scope.root_value(js::value::null());
+    Function::call(scope, this, callback, &[null, args.get(0)])?;
+    Ok(js::value::undefined())
+}
+
+/// The tick that calls a callbackified function's callback with the rejection reason, whose
+/// payload is the [`CallbackifyCall`]. A falsy reason is wrapped in an `ERR_FALSY_VALUE_REJECTION`
+/// error whose `reason` is the reason, because a falsy first argument reports success.
+fn call_back_rejected(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let call = cast_payload::<CallbackifyCall>(scope, payload);
+    let (callback, this) = {
+        let data = call.data();
+        (data.callback.get(scope), data.this.get(scope))
+    };
     let mut reason = args.get(0);
-    // We wrap a falsy rejection reason in an error, because a falsy first callback argument
-    // reports success.
-    if !bool::from_jsval(scope, reason, ()).unwrap_or(false) {
+    if !js::conversion::to_boolean(reason) {
         let error = NodeError::new(
             ErrorKind::Error,
             "ERR_FALSY_VALUE_REJECTION",
             "Promise was rejected with falsy value",
         )
-        .throw(scope);
-        let wrapped = js::exception::take_pending(scope).ok_or(error)?;
-        if let Ok(object) = Object::from_value(scope, wrapped) {
-            object.set_property(scope, c"reason", reason)?;
-        }
-        reason = wrapped;
+        .to_value(scope)?;
+        Object::from_value(scope, *error)
+            .map_err(|e| e.throw(scope))?
+            .set_property(scope, c"reason", reason)?;
+        reason = error;
     }
-    Function::call(scope, js::value::undefined(), payload, &[reason])?;
+    Function::call(scope, this, callback, &[reason])?;
     Ok(js::value::undefined())
 }
 
-/// The body of a deprecated function, whose payload is `[function, message, code, warned]`:
-/// emit the deprecation warning the first time, unless `process.noDeprecation` is set or another
-/// function deprecated with the same code has emitted it, then call the function.
+/// The state of a function `util.deprecate` returned.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct Deprecated {
+    /// The deprecated function.
+    function: Heap<Value>,
+    message: Heap<Value>,
+    /// The deprecation code, or `None` if there is none.
+    #[no_trace]
+    code: Option<String>,
+    /// Whether the function's deprecation warning was handled.
+    #[no_trace]
+    warned: bool,
+}
+
+#[core_runtime::jsmethods]
+impl Deprecated {}
+
+/// The body of a deprecated function, whose payload is its [`Deprecated`] state: emit the
+/// deprecation warning the first time, unless `process.noDeprecation` is set or another function
+/// deprecated with the same code has emitted it, then call or construct the function.
 fn deprecated(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Object::from_value(scope, *payload).map_err(|e| e.throw(scope))?;
-    let process = Object::from_value(scope, *scope.global().get_property(scope, c"process")?);
+    let state = cast_payload::<Deprecated>(scope, payload);
+    let process = Object::from_value(scope, *crate::process::process_value(scope)?);
     let silenced = match &process {
-        Ok(process) => bool::from_jsval(scope, process.get_property(scope, c"noDeprecation")?, ())
-            .unwrap_or(false),
+        Ok(process) => js::conversion::to_boolean(process.get_property(scope, c"noDeprecation")?),
         Err(_) => true,
     };
-    let warned = state.get_element(scope, 3)?;
-    if !silenced && !(warned.is_boolean() && warned.to_boolean()) {
-        state.set_element(scope, 3, true)?;
-        let message = state.get_element(scope, 1)?;
-        let kind =
-            scope.root_value(js::JSString::from_str(scope, "DeprecationWarning")?.as_value());
-        let code = state.get_element(scope, 2)?;
-        let first = if code.is_undefined() {
-            true
-        } else {
-            let code = String::from_jsval(scope, code, ()).map_err(|_| ExnThrown)?;
-            CODES_WARNED.with(|codes| codes.borrow_mut().insert(code))
+    if !silenced && !state.data().warned {
+        state.data_mut().warned = true;
+        let (message, code) = {
+            let data = state.data();
+            (data.message.get(scope), data.code.clone())
         };
+        let first = code.as_deref().is_none_or(crate::process::mark_code_warned);
         if let (true, Ok(process)) = (first, process) {
-            if code.is_undefined() {
-                Function::call_by_name(scope, process.handle(), c"emitWarning", &[message, kind])?;
-            } else {
-                Function::call_by_name(
-                    scope,
-                    process.handle(),
-                    c"emitWarning",
-                    &[message, kind, code],
-                )?;
-            }
+            let kind = js::class::get_or_init_atom(scope, c"DeprecationWarning")?;
+            match code {
+                Some(code) => {
+                    let code = scope.root_value(js::JSString::from_str(scope, &code)?.as_value());
+                    let args = [message, kind, code];
+                    Function::call_by_name(scope, process.handle(), c"emitWarning", &args)?
+                }
+                None => {
+                    let args = [message, kind];
+                    Function::call_by_name(scope, process.handle(), c"emitWarning", &args)?
+                }
+            };
         }
     }
-    let function = state.get_element(scope, 0)?;
+    let function = state.data().function.get(scope);
     let call_args = crate::callback_args(&args);
     if args.is_constructing() {
-        return Function::construct(scope, function, &call_args)?.to_jsval_raw_throwing(scope);
+        let new_target =
+            Object::from_value(scope, args.new_target()).map_err(|e| e.throw(scope))?;
+        let object =
+            Function::construct_with_new_target(scope, function, new_target.handle(), &call_args)?;
+        return object.to_jsval_raw_throwing(scope);
     }
     Ok(Function::call(scope, args.this(), function, &call_args)?.get())
 }
@@ -505,18 +669,25 @@ fn style_codes(name: &str) -> Option<(u8, u8)> {
     })
 }
 
-/// The length of the escape sequence Node.js's `ansi` pattern matches at `start` of `chars`, if
-/// any: an OSC sequence (`ESC ]` up to BEL, `ESC \` or `0x9c`), or `ESC` or `0x9b` followed by
-/// any of `[]()#;?`, optional numeric parameters and a final character.
-fn ansi_sequence_at(chars: &[char], start: usize) -> Option<usize> {
-    let introducer = chars[start];
-    if introducer == '\u{1b}' && chars.get(start + 1) == Some(&']') {
-        let mut index = start + 2;
-        while index < chars.len() {
-            match chars[index] {
-                '\u{7}' | '\u{9c}' => return Some(index + 1),
-                '\u{1b}' if chars.get(index + 1) == Some(&'\\') => return Some(index + 2),
-                _ => index += 1,
+/// The character at byte `index` of `text` and the byte index after it, if `index` is the start
+/// of a character.
+fn char_at(text: &str, index: usize) -> Option<(char, usize)> {
+    let c = text.get(index..)?.chars().next()?;
+    Some((c, index + c.len_utf8()))
+}
+
+/// The byte index after the escape sequence Node.js's `ansi` pattern matches at byte `start` of
+/// `text`, if any: an OSC sequence (`ESC ]` up to BEL, `ESC \` or `0x9c`), or `ESC` or `0x9b`
+/// followed by any of `[]()#;?`, optional numeric parameters and a final character.
+fn ansi_sequence_at(text: &str, start: usize) -> Option<usize> {
+    let (introducer, after) = char_at(text, start)?;
+    if introducer == '\u{1b}' && text.as_bytes().get(after) == Some(&b']') {
+        let mut index = after + 1;
+        while let Some((c, next)) = char_at(text, index) {
+            match c {
+                '\u{7}' | '\u{9c}' => return Some(next),
+                '\u{1b}' if text.as_bytes().get(next) == Some(&b'\\') => return Some(next + 1),
+                _ => index = next,
             }
         }
     }
@@ -524,7 +695,7 @@ fn ansi_sequence_at(chars: &[char], start: usize) -> Option<usize> {
         return None;
     }
     let is_final = |index: usize| -> Option<usize> {
-        let c = *chars.get(index)?;
+        let (c, next) = char_at(text, index)?;
         let matches = c.is_ascii_digit()
             || ('A'..='P').contains(&c)
             || ('R'..='T').contains(&c)
@@ -533,14 +704,19 @@ fn ansi_sequence_at(chars: &[char], start: usize) -> Option<usize> {
             || ('f'..='n').contains(&c)
             || ('q'..='u').contains(&c)
             || "y=><~".contains(c);
-        matches.then_some(index + 1)
+        matches.then_some(next)
     };
-    let mut prefix_end = start + 1;
-    while prefix_end < chars.len() && "[]()#;?".contains(chars[prefix_end]) {
+    // The prefix characters are ASCII, so every byte index up to `prefix_end` starts a character.
+    let mut prefix_end = after;
+    while text
+        .as_bytes()
+        .get(prefix_end)
+        .is_some_and(|byte| b"[]()#;?".contains(byte))
+    {
         prefix_end += 1;
     }
-    for parameters in (start + 1..=prefix_end).rev() {
-        if let Some(end) = ansi_parameters(chars, parameters, &is_final) {
+    for parameters in (after..=prefix_end).rev() {
+        if let Some(end) = ansi_parameters(text.as_bytes(), parameters, &is_final) {
             return Some(end);
         }
         if let Some(end) = is_final(parameters) {
@@ -550,17 +726,18 @@ fn ansi_sequence_at(chars: &[char], start: usize) -> Option<usize> {
     None
 }
 
-/// The end of `\d{1,4}(?:[;:]\d{0,4})*` at `start` followed by a character `is_final` matches,
-/// at the end a backtracking regular expression engine finds, or `None` if `start` holds no
-/// digit. `is_final` returns the index after the character it matches, and matches every digit.
+/// The end of `\d{1,4}(?:[;:]\d{0,4})*` at byte `start` of `bytes` followed by a character
+/// `is_final` matches, at the end a backtracking regular expression engine finds, or `None` if
+/// `start` holds no digit. `is_final` returns the byte index after the character it matches, and
+/// matches every digit.
 fn ansi_parameters(
-    chars: &[char],
+    bytes: &[u8],
     start: usize,
     is_final: &dyn Fn(usize) -> Option<usize>,
 ) -> Option<usize> {
     let digits = |from: usize| {
         let mut count = 0;
-        while count < 4 && chars.get(from + count).is_some_and(char::is_ascii_digit) {
+        while count < 4 && bytes.get(from + count).is_some_and(u8::is_ascii_digit) {
             count += 1;
         }
         count
@@ -571,7 +748,7 @@ fn ansi_parameters(
     }
     let mut at = start + first;
     let mut last_digit_end = at;
-    while matches!(chars.get(at), Some(';' | ':')) {
+    while matches!(bytes.get(at), Some(b';' | b':')) {
         let count = digits(at + 1);
         at += 1 + count;
         if count > 0 {
@@ -583,24 +760,37 @@ fn ansi_parameters(
     Some(is_final(at).unwrap_or(last_digit_end))
 }
 
-/// `text` without ANSI escape sequences, as Node.js's `stripVTControlCharacters` removes them.
-pub fn strip_vt_control_characters(text: &str) -> String {
-    if !text.contains(['\u{1b}', '\u{9b}']) {
-        return text.to_string();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
+/// Call `part` with each part of `text` between the ANSI escape sequences that Node.js's
+/// `stripVTControlCharacters` removes, in order.
+pub(crate) fn for_each_visible_part<'t>(text: &'t str, mut part: impl FnMut(&'t str)) {
+    let mut start = 0;
     let mut index = 0;
-    while index < chars.len() {
-        match ansi_sequence_at(&chars, index) {
-            Some(end) => index = end,
-            None => {
-                out.push(chars[index]);
-                index += 1;
+    while let Some(offset) = text[index..].find(['\u{1b}', '\u{9b}']) {
+        let at = index + offset;
+        match ansi_sequence_at(text, at) {
+            Some(end) => {
+                if start < at {
+                    part(&text[start..at]);
+                }
+                start = end;
+                index = end;
             }
+            None => index = at + char_at(text, at).map_or(1, |(c, _)| c.len_utf8()),
         }
     }
-    out
+    if start < text.len() {
+        part(&text[start..]);
+    }
+}
+
+/// `text` without ANSI escape sequences, as Node.js's `stripVTControlCharacters` removes them, or
+/// `None` if allocating the result fails.
+pub fn strip_vt_control_characters(text: &str) -> Option<String> {
+    let mut out = String::new();
+    // The result is never longer than `text`, so nothing below reallocates.
+    out.try_reserve_exact(text.len()).ok()?;
+    for_each_visible_part(text, |part| out.push_str(part));
+    Some(out)
 }
 
 /// Node.js's `replaceCloseCode`: each `close` in `text` that doesn't end it replaced by `open`,
@@ -682,17 +872,9 @@ fn is_boxed(
     })
 }
 
-/// The view `value` is, if it is one.
-fn view_of<'s>(scope: &'s Scope<'_>, value: HandleValue<'_>) -> Option<js::ArrayBufferView<'s>> {
-    Object::from_value(scope, *value)
-        .ok()
-        .and_then(js::ArrayBufferView::from_object)
-}
-
-/// Whether `value` is a typed array of the kind named `name`.
-fn is_typed_array_of(scope: &Scope<'_>, value: HandleValue<'_>, name: &str) -> bool {
-    view_of(scope, value)
-        .is_some_and(|view| view.view_kind().is_typed_array() && view.view_kind().name() == name)
+/// Whether `value` is a typed array of `kind`.
+fn is_typed_array_of(scope: &Scope<'_>, value: HandleValue<'_>, kind: ViewKind) -> bool {
+    js::ArrayBufferView::from_value(scope, value).is_some_and(|view| view.view_kind() == kind)
 }
 
 #[core_runtime::jsmodule(node_args, name = "node:util/types", default_namespace)]
@@ -700,6 +882,7 @@ pub mod types {
     use super::*;
 
     /// <https://nodejs.org/api/util.html#utiltypesisanyarraybuffervalue>
+    #[function(length = 0)]
     pub fn is_any_array_buffer(
         scope: &Scope<'_>,
         value: HandleValue<'_>,
@@ -709,10 +892,12 @@ pub mod types {
         })
     }
     /// <https://nodejs.org/api/util.html#utiltypesisarraybuffervalue>
+    #[function(length = 0)]
     pub fn is_array_buffer(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         object_is(scope, value, |object| Ok(inspect::is_array_buffer(object)))
     }
     /// <https://nodejs.org/api/util.html#utiltypesissharedarraybuffervalue>
+    #[function(length = 0)]
     pub fn is_shared_array_buffer(
         scope: &Scope<'_>,
         value: HandleValue<'_>,
@@ -723,61 +908,68 @@ pub mod types {
     }
     /// <https://nodejs.org/api/util.html#utiltypesisarraybufferviewvalue>
     pub fn is_array_buffer_view(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        view_of(scope, value).is_some()
+        js::ArrayBufferView::from_value(scope, value).is_some()
     }
     /// <https://nodejs.org/api/util.html#utiltypesistypedarrayvalue>
     pub fn is_typed_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        view_of(scope, value).is_some_and(|view| view.view_kind().is_typed_array())
+        js::ArrayBufferView::from_value(scope, value)
+            .is_some_and(|view| view.view_kind().is_typed_array())
     }
     /// <https://nodejs.org/api/util.html#utiltypesisdataviewvalue>
     pub fn is_data_view(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        view_of(scope, value).is_some_and(|view| !view.view_kind().is_typed_array())
+        js::ArrayBufferView::from_value(scope, value)
+            .is_some_and(|view| !view.view_kind().is_typed_array())
     }
     /// <https://nodejs.org/api/util.html#utiltypesisuint8arrayvalue>
     pub fn is_uint8_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Uint8Array")
+        is_typed_array_of(scope, value, ViewKind::Uint8)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisuint8clampedarrayvalue>
     pub fn is_uint8_clamped_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Uint8ClampedArray")
+        is_typed_array_of(scope, value, ViewKind::Uint8Clamped)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisuint16arrayvalue>
     pub fn is_uint16_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Uint16Array")
+        is_typed_array_of(scope, value, ViewKind::Uint16)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisuint32arrayvalue>
     pub fn is_uint32_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Uint32Array")
+        is_typed_array_of(scope, value, ViewKind::Uint32)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisint8arrayvalue>
     pub fn is_int8_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Int8Array")
+        is_typed_array_of(scope, value, ViewKind::Int8)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisint16arrayvalue>
     pub fn is_int16_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Int16Array")
+        is_typed_array_of(scope, value, ViewKind::Int16)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisint32arrayvalue>
     pub fn is_int32_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Int32Array")
+        is_typed_array_of(scope, value, ViewKind::Int32)
+    }
+    /// <https://nodejs.org/api/util.html#utiltypesisfloat16arrayvalue>
+    pub fn is_float16_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
+        is_typed_array_of(scope, value, ViewKind::Float16)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisfloat32arrayvalue>
     pub fn is_float32_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Float32Array")
+        is_typed_array_of(scope, value, ViewKind::Float32)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisfloat64arrayvalue>
     pub fn is_float64_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "Float64Array")
+        is_typed_array_of(scope, value, ViewKind::Float64)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisbigint64arrayvalue>
     pub fn is_big_int64_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "BigInt64Array")
+        is_typed_array_of(scope, value, ViewKind::BigInt64)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisbiguint64arrayvalue>
     pub fn is_big_uint64_array(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-        is_typed_array_of(scope, value, "BigUint64Array")
+        is_typed_array_of(scope, value, ViewKind::BigUint64)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisargumentsobjectvalue>
+    #[function(length = 0)]
     pub fn is_arguments_object(
         scope: &Scope<'_>,
         value: HandleValue<'_>,
@@ -785,6 +977,7 @@ pub mod types {
         object_is(scope, value, |object| inspect::is_arguments(scope, object))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisasyncfunctionvalue>
+    #[function(length = 0)]
     pub fn is_async_function(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         object_is(scope, value, |object| {
             Ok(object.is_callable()
@@ -796,6 +989,7 @@ pub mod types {
         })
     }
     /// <https://nodejs.org/api/util.html#utiltypesisgeneratorfunctionvalue>
+    #[function(length = 0)]
     pub fn is_generator_function(
         scope: &Scope<'_>,
         value: HandleValue<'_>,
@@ -810,6 +1004,7 @@ pub mod types {
         })
     }
     /// <https://nodejs.org/api/util.html#utiltypesisgeneratorobjectvalue>
+    #[function(length = 0)]
     pub fn is_generator_object(
         scope: &Scope<'_>,
         value: HandleValue<'_>,
@@ -817,67 +1012,87 @@ pub mod types {
         has_tag(scope, value, &["Generator", "AsyncGenerator"])
     }
     /// <https://nodejs.org/api/util.html#utiltypesisdatevalue>
+    #[function(length = 0)]
     pub fn is_date(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         object_is(scope, value, |object| inspect::is_date(scope, object))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisregexpvalue>
+    #[function(length = 0)]
     pub fn is_reg_exp(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         object_is(scope, value, |object| inspect::is_regexp(scope, object))
     }
     /// <https://nodejs.org/api/util.html#utiltypesismapvalue>
+    #[function(length = 0)]
     pub fn is_map(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         object_is(scope, value, |object| inspect::is_map(scope, object))
     }
     /// <https://nodejs.org/api/util.html#utiltypesissetvalue>
+    #[function(length = 0)]
     pub fn is_set(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         object_is(scope, value, |object| inspect::is_set(scope, object))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisweakmapvalue>
+    #[function(length = 0)]
     pub fn is_weak_map(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         object_is(scope, value, |object| inspect::is_weak_map(scope, object))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisweaksetvalue>
+    #[function(length = 0)]
     pub fn is_weak_set(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         object_is(scope, value, |object| inspect::is_weak_set(scope, object))
     }
     /// <https://nodejs.org/api/util.html#utiltypesismapiteratorvalue>
+    #[function(length = 0)]
     pub fn is_map_iterator(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
-        has_tag(scope, value, &["Map Iterator"])
+        object_is(scope, value, |object| {
+            Ok(inspect::es_class(scope, object) == ESClass::MapIterator)
+        })
     }
     /// <https://nodejs.org/api/util.html#utiltypesissetiteratorvalue>
+    #[function(length = 0)]
     pub fn is_set_iterator(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
-        has_tag(scope, value, &["Set Iterator"])
+        object_is(scope, value, |object| {
+            Ok(inspect::es_class(scope, object) == ESClass::SetIterator)
+        })
     }
     /// <https://nodejs.org/api/util.html#utiltypesispromisevalue>
+    #[function(length = 0)]
     pub fn is_promise(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
         Object::from_value(scope, *value)
             .is_ok_and(|object| js::Promise::is_promise(object.handle()))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisnativeerrorvalue>
+    #[function(length = 0)]
     pub fn is_native_error(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
         value.is_object() && js::exception::is_error_object(scope, value)
     }
     /// <https://nodejs.org/api/util.html#utiltypesisnumberobjectvalue>
+    #[function(length = 0)]
     pub fn is_number_object(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         is_boxed(scope, value, Some(inspect::Boxed::Number))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisstringobjectvalue>
+    #[function(length = 0)]
     pub fn is_string_object(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         is_boxed(scope, value, Some(inspect::Boxed::String))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisbooleanobjectvalue>
+    #[function(length = 0)]
     pub fn is_boolean_object(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         is_boxed(scope, value, Some(inspect::Boxed::Boolean))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisbigintobjectvalue>
+    #[function(length = 0)]
     pub fn is_big_int_object(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         is_boxed(scope, value, Some(inspect::Boxed::BigInt))
     }
     /// <https://nodejs.org/api/util.html#utiltypesissymbolobjectvalue>
+    #[function(length = 0)]
     pub fn is_symbol_object(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
         is_boxed(scope, value, Some(inspect::Boxed::Symbol))
     }
     /// <https://nodejs.org/api/util.html#utiltypesisboxedprimitivevalue>
+    #[function(length = 0)]
     pub fn is_boxed_primitive(
         scope: &Scope<'_>,
         value: HandleValue<'_>,
@@ -885,6 +1100,7 @@ pub mod types {
         is_boxed(scope, value, None)
     }
     /// <https://nodejs.org/api/util.html#utiltypesismodulenamespaceobjectvalue>
+    #[function(length = 0)]
     pub fn is_module_namespace_object(
         scope: &Scope<'_>,
         value: HandleValue<'_>,
@@ -895,23 +1111,23 @@ pub mod types {
                 && inspect::has_builtin_tag(scope, object, &["Module"])?)
         })
     }
-    /// <https://nodejs.org/api/util.html#utiltypesisproxyvalue>: always `false`, as the `js` crate
-    /// has no proxy check.
-    pub fn is_proxy() -> bool {
-        false
+    /// <https://nodejs.org/api/util.html#utiltypesisproxyvalue>
+    #[function(length = 0)]
+    pub fn is_proxy(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
+        Object::from_value(scope, *value).is_ok_and(|object| object.is_proxy())
     }
     /// <https://nodejs.org/api/util.html#utiltypesisexternalvalue>: there are no external values,
     /// so always `false`.
     pub fn is_external() -> bool {
         false
     }
-    /// <https://nodejs.org/api/util.html#utiltypesiskeyobjectvalue>: `false`, as `node:crypto`
-    /// key objects aren't implemented.
-    pub fn is_key_object() -> bool {
-        false
+    /// <https://nodejs.org/api/util.html#utiltypesiskeyobjectvalue>
+    pub fn is_key_object(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
+        crate::crypto::key_object(scope, value).is_some()
     }
     /// <https://nodejs.org/api/util.html#utiltypesiscryptokeyvalue>: `false`, as Web Crypto keys
     /// aren't implemented.
+    #[function(length = 1)]
     pub fn is_crypto_key() -> bool {
         false
     }
@@ -923,7 +1139,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/util.html#utilformatformat-args>
     pub fn format(scope: &Scope<'_>, args: RestArgs<HandleValue<'_>>) -> Result<String, ExnThrown> {
-        inspect::format(scope, &args, &InspectOptions::current(scope)?)
+        inspect::format_current(scope, &args)
     }
 
     /// <https://nodejs.org/api/util.html#utilformatwithoptionsinspectoptions-format-args>
@@ -939,6 +1155,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/util.html#utilisdeepstrictequalval1-val2-options>: a truthy
     /// `skipPrototype` leaves prototypes uncompared.
+    #[function(length = 3)]
     pub fn is_deep_strict_equal(
         scope: &Scope<'_>,
         a: HandleValue<'_>,
@@ -967,7 +1184,7 @@ pub mod module {
         let super_proto = Object::from_value(scope, super_proto).map_err(|_| {
             NodeError::invalid_arg_type(scope, "superCtor.prototype", "of type object", super_proto)
         })?;
-        ctor.set_property(scope, c"super_", super_ctor)?;
+        ctor.define_property(scope, c"super_", super_ctor, 0)?;
         let proto = Object::from_value(scope, ctor.get_property(scope, c"prototype")?)?;
         proto.set_prototype(scope, super_proto.handle())?;
         Ok(())
@@ -1018,9 +1235,7 @@ pub mod module {
             }
             None => 10,
         };
-        let error_class = scope.global().get_property(scope, c"Error")?;
-        let error_class =
-            Object::from_value(scope, error_class).map_err(|e| Thrown::from(e.throw(scope)))?;
+        let error_class = crate::stack_trace::error_constructor(scope)?;
         let error = Function::construct(scope, error_class, &[] as &[HandleValue<'_>])?;
         let stack = crate::stack_trace::without_hook(|| error.get_property(scope, c"stack"))?;
         let stack = String::from_jsval(scope, stack, ()).unwrap_or_default();
@@ -1053,6 +1268,7 @@ pub mod module {
     /// `length`, `fn` as its prototype, and `fn.prototype`, if it has one, as its `prototype`.
     /// With the option `modifyPrototype: false`, it has none of these, and its `prototype` is an
     /// object of its own.
+    #[function(length = 3)]
     pub fn deprecate<'s>(
         scope: &'s Scope<'_>,
         function: HandleValue<'_>,
@@ -1061,9 +1277,6 @@ pub mod module {
         options: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
         let function = validate_function(scope, function, "fn")?;
-        if let Some(code) = code.filter(|code| !code.is_undefined()) {
-            validate_string(scope, code, "code")?;
-        }
         let modify_prototype =
             match options.and_then(|options| Object::from_value(scope, options).ok()) {
                 Some(options) => {
@@ -1072,17 +1285,18 @@ pub mod module {
                 }
                 None => true,
             };
-        let state = js::Array::with_contents(
-            scope,
-            &[
-                function.to_jsval_raw_throwing(scope)?,
-                message.map_or(js::value::undefined(), |message| message.get()),
-                code.map_or(js::value::undefined(), |code| code.get()),
-                js::value::from_bool(false),
-            ],
-        )?;
+        let code = match code.filter(|code| !code.is_undefined()) {
+            Some(code) => Some(validate_string(scope, code, "code")?),
+            None => None,
+        };
+        let state = js::class::create_instance_with::<DeprecatedImpl>(scope, |_| DeprecatedImpl {
+            function: Heap::from(function.to_jsval_raw_throwing(scope).unwrap_or_default()),
+            message: Heap::from(message.map_or(js::value::undefined(), |message| message.get())),
+            code,
+            warned: false,
+        })?;
         let wrapper =
-            Function::new_constructor_callback(scope, c"deprecated", 0, deprecated, *state)?;
+            Function::new_constructor_callback(scope, c"deprecated", 0, deprecated, state)?;
         if !modify_prototype {
             let prototype = Object::new_plain(scope)?;
             prototype.define_property(scope, c"constructor", *wrapper, 0)?;
@@ -1107,6 +1321,7 @@ pub mod module {
     /// <https://nodejs.org/api/util.html#utildebuglogsection-callback>: a logger that prints to
     /// stderr if `NODE_DEBUG` enables `section`, and does nothing otherwise. Its `enabled`
     /// property is `true` in the first case.
+    #[function(length = 2)]
     pub fn debuglog<'s>(scope: &'s Scope<'_>, section: String) -> Result<Object<'s>, ExnThrown> {
         let enabled = debug_enabled(&section);
         let logger = if enabled {
@@ -1119,6 +1334,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/util.html#utildebugsection>: `debuglog`.
+    #[function(length = 2)]
     pub fn debug<'s>(scope: &'s Scope<'_>, section: String) -> Result<Object<'s>, ExnThrown> {
         debuglog(scope, section)
     }
@@ -1129,14 +1345,16 @@ pub mod module {
         scope: &Scope<'_>,
         text: HandleValue<'_>,
     ) -> Result<String, Thrown> {
-        Ok(strip_vt_control_characters(&validate_string(
-            scope, text, "str",
-        )?))
+        strip_vt_control_characters(&validate_string(scope, text, "str")?).ok_or_else(|| {
+            js::exception::report_out_of_memory(scope);
+            Thrown::Pending
+        })
     }
 
     /// <https://nodejs.org/api/util.html#utilstyletextformat-text-options>: always styled,
     /// whether or not the output is a terminal, so `options.stream` is not consulted. `format` is
     /// a style name, `'none'`, a `#RGB` or `#RRGGBB` color, or an array of these.
+    #[function(length = 3)]
     pub fn style_text(
         scope: &Scope<'_>,
         format: HandleValue<'_>,
@@ -1235,7 +1453,7 @@ pub mod module {
             return Err(NodeError::invalid_arg_type(scope, "err", "of type number", err).into());
         }
         let errno = err.to_number();
-        if errno >= 0.0 || errno.fract() != 0.0 || errno.abs() > 9007199254740991.0 {
+        if errno >= 0.0 || errno.fract() != 0.0 || errno.abs() > crate::errors::MAX_SAFE_INTEGER {
             return Err(NodeError::out_of_range(
                 "err",
                 "a negative integer",
@@ -1243,15 +1461,11 @@ pub mod module {
             )
             .into());
         }
-        let constants = crate::os::constants(scope)?;
-        let table = Object::from_value(scope, constants.get_property(scope, c"errno")?)?;
-        for key in table.own_keys(scope)? {
-            let id = scope.root_id(js::id::value_to_id(scope, key)?);
-            let value =
-                f64::from_jsval(scope, table.get_property_by_id(scope, id)?, ()).unwrap_or(0.0);
-            if value == -errno {
-                return Ok(String::from_jsval(scope, key, ())?);
-            }
+        let name = crate::os::errno_table()
+            .iter()
+            .find(|(_, value)| f64::from(*value) == -errno);
+        if let Some((name, _)) = name {
+            return Ok(name.to_string_lossy().into_owned());
         }
         Ok(format!(
             "Unknown system error {}",
@@ -1392,29 +1606,31 @@ fn define_color_tables(scope: &Scope<'_>, inspect: Object<'_>) -> Result<(), Exn
     inspect.set_property(scope, c"styles", styles)
 }
 
+/// Register the classes of `node:util`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) {
+    Deprecated::add_to_global(scope, global);
+    Promisified::add_to_global(scope, global);
+    PromisifySettle::add_to_global(scope, global);
+    CallbackifyCall::add_to_global(scope, global);
+}
+
 /// Register `node:util`. `inspect` and `promisify` have the `custom` symbols as properties,
 /// `inspect` also the `defaultOptions` accessor and the `colors` and `styles` tables, and `types`, `TextEncoder` and `TextDecoder` are
 /// `node:util/types`' `default` export and the global's classes.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let overrides = || -> Result<Vec<(&'static str, HandleValue<'_>)>, ExnThrown> {
         let inspect = Function::new_callback(scope, c"inspect", 2, inspect_callback, ())?;
-        inspect.set_property(
-            scope,
-            c"custom",
-            crate::symbol(scope, inspect::INSPECT_CUSTOM, true)?,
-        )?;
+        inspect.set_property(scope, c"custom", inspect::INSPECT_CUSTOM.value(scope)?)?;
+        js::class::register_realm_object::<inspect::InspectFunction>(scope, *inspect);
         let defaults = InspectOptions::default().to_object(scope)?;
         defaults.delete_property(scope, c"stylize")?;
+        js::class::register_realm_object::<inspect::DefaultOptions>(scope, defaults);
         let getter = Function::new_callback(scope, c"get", 0, default_options_get, defaults)?;
         let setter = Function::new_callback(scope, c"set", 1, default_options_set, defaults)?;
         inspect.define_accessor(scope, c"defaultOptions", Some(*getter), Some(*setter), 0)?;
         define_color_tables(scope, *inspect)?;
         let promisify = Function::new_callback(scope, c"promisify", 1, promisify_callback, ())?;
-        promisify.set_property(
-            scope,
-            c"custom",
-            crate::symbol(scope, PROMISIFY_CUSTOM, true)?,
-        )?;
+        promisify.set_property(scope, c"custom", PROMISIFY_CUSTOM.value(scope)?)?;
         let types = core_runtime::module::builtin_namespace(scope, "node:util/types")?
             .ok_or(ExnThrown)?
             .get_property(scope, c"default")?;
@@ -1424,11 +1640,11 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
             ("types", types),
             (
                 "TextEncoder",
-                scope.global().get_property(scope, c"TextEncoder")?,
+                web_globals::encoding::text_encoder_constructor(scope)?.to_jsval_throwing(scope)?,
             ),
             (
                 "TextDecoder",
-                scope.global().get_property(scope, c"TextDecoder")?,
+                web_globals::encoding::text_decoder_constructor(scope)?.to_jsval_throwing(scope)?,
             ),
         ])
     };

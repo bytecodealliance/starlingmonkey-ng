@@ -12,16 +12,13 @@
 
 use digest::DynDigest;
 use js::conversion::{FromJSVal, ToJSVal};
-use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::error::ExnThrown;
 use js::gc::scope::Scope;
-use js::native::{CallArgs, Value};
 use js::prelude::HandleValue;
-use js::{ArrayBufferView, Function, Object};
+use js::{ArrayBufferView, Object};
 
 use crate::buffer::{decode_bytes, encode_string, new_buffer, Encoding};
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
-use crate::stream::{is_function, string};
 
 /// A new hasher for the digest `name`, and the digest's block size in bytes, or `None` for a
 /// digest that isn't supported. Names are case-insensitive, and may have an `RSA-` prefix or a
@@ -143,17 +140,16 @@ fn data_bytes(
     }
     let view = Object::from_value(scope, *data)
         .ok()
-        .and_then(ArrayBufferView::from_object);
-    match view {
-        Some(view) => Ok(view.copy_bytes(scope)?),
-        None => Err(NodeError::invalid_arg_type(
-            scope,
-            name,
-            "of type string or an instance of Buffer, TypedArray, or DataView",
-            data,
-        )
-        .into()),
-    }
+        .and_then(ArrayBufferView::from_object)
+        .ok_or_else(|| {
+            NodeError::invalid_arg_type(
+                scope,
+                name,
+                "of type string or an instance of Buffer, TypedArray, or DataView",
+                data,
+            )
+        })?;
+    Ok(view.copy_bytes(scope)?)
 }
 
 /// `bytes` as a `Buffer`, or as a string in the encoding `encoding` names. An unknown encoding
@@ -177,7 +173,7 @@ fn output<'s>(
     }
 }
 
-/// The state of a `Hash`, which it holds in its `_starlingNative` property.
+/// The state of a `Hash`.
 #[core_runtime::jsclass(hidden)]
 pub struct NativeHash {
     /// The hasher, or `None` once `digest` was called.
@@ -189,14 +185,9 @@ pub struct NativeHash {
 }
 
 #[core_runtime::jsmethods]
-impl NativeHash {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(illegal_constructor())
-    }
-}
+impl NativeHash {}
 
-/// The state of an `Hmac`, which it holds in its `_starlingNative` property.
+/// The state of an `Hmac`.
 #[core_runtime::jsclass(hidden)]
 pub struct NativeHmac {
     /// The inner hasher, or `None` once `digest` was called.
@@ -209,114 +200,94 @@ pub struct NativeHmac {
 }
 
 #[core_runtime::jsmethods]
-impl NativeHmac {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(illegal_constructor())
-    }
-}
+impl NativeHmac {}
 
-/// `ERR_ILLEGAL_CONSTRUCTOR`.
-fn illegal_constructor() -> NodeError {
-    NodeError::new(
-        ErrorKind::TypeError,
-        "ERR_ILLEGAL_CONSTRUCTOR",
-        "Illegal constructor",
-    )
-}
-
-/// The `_starlingNative` property of `this`, or `ERR_INVALID_THIS` naming `class` if it isn't an
-/// object.
-fn native_of<'s>(
-    scope: &'s Scope<'_>,
-    this: Object<'_>,
-    class: &str,
-) -> Result<Object<'s>, Thrown> {
-    let native = this.get_property(scope, c"_starlingNative")?;
-    Object::from_value(scope, *native).map_err(|_| invalid_this(class).into())
-}
-
-/// `ERR_INVALID_THIS` naming `class`.
-fn invalid_this(class: &str) -> NodeError {
-    NodeError::new(
-        ErrorKind::TypeError,
-        "ERR_INVALID_THIS",
-        format!("Value of \"this\" must be of type {class}"),
-    )
-}
-
-/// The state of the `Hash` `this`.
-fn hash_state<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<NativeHash<'s>, Thrown> {
-    native_of(scope, this, "Hash")?
-        .cast::<NativeHash>()
-        .map_err(|_| invalid_this("Hash").into())
-}
-
-/// The state of the `Hmac` `this`.
-fn hmac_state_of<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<NativeHmac<'s>, Thrown> {
-    native_of(scope, this, "Hmac")?
-        .cast::<NativeHmac>()
-        .map_err(|_| invalid_this("Hmac").into())
-}
-
-/// Make `this` a `Hash` of the digest `algorithm`, with `hasher` as its state.
+/// Make `this` a `Hash` of the digest `algorithm`, with `hasher` as its state and `options` as
+/// its own `_options`.
 fn init_hash(
     scope: &Scope<'_>,
     this: Object<'_>,
     hasher: Box<dyn DynDigest>,
     algorithm: String,
+    options: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let native = js::class::create_instance_with::<NativeHashImpl>(scope, |_| NativeHashImpl {
+    *hash_class::state_of(scope, this)?.data_mut() = NativeHashImpl {
         hasher: Some(hasher),
         algorithm,
-    })?;
-    this.define_property(scope, c"_starlingNative", native, 0)
+    };
+    this.set_property(scope, c"_options", options)
 }
 
-/// A new `Hash` of the digest `algorithm`, with `hasher` as its state.
+/// A new `Hash` of the digest `algorithm`, with `hasher` as its state and `options` as its own
+/// `_options`.
 fn new_hash<'s>(
     scope: &'s Scope<'_>,
     hasher: Box<dyn DynDigest>,
     algorithm: String,
-) -> Result<HandleValue<'s>, ExnThrown> {
-    let prototype = hash_class::class_constructor(scope)?.get_property(scope, c"prototype")?;
-    let object = Object::new_plain(scope)?;
-    object.set_prototype(
-        scope,
-        Object::from_value(scope, prototype)
-            .map_err(|e| e.throw(scope))?
-            .handle(),
-    )?;
-    init_hash(scope, object, hasher, algorithm)?;
-    object.to_jsval_throwing(scope)
+    options: HandleValue<'_>,
+) -> Result<Object<'s>, ExnThrown> {
+    let object = hash_class::new_instance(scope)?;
+    init_hash(scope, object, hasher, algorithm, options)?;
+    Ok(object)
 }
 
-#[core_runtime::jsfunction_class(name = "Hash", self_construct)]
+/// Make `this` an `Hmac` of the digest `algorithm` keyed with `key`, with `options` as its own
+/// `_options`.
+fn init_hmac(
+    scope: &Scope<'_>,
+    this: Object<'_>,
+    algorithm: HandleValue<'_>,
+    key: HandleValue<'_>,
+    options: Option<HandleValue<'_>>,
+) -> Result<(), Thrown> {
+    let name = crate::errors::validate_string(scope, algorithm, "hmac")?;
+    let encoding = string_option(scope, options, c"encoding", "options.encoding")?;
+    let key = secret_key_bytes(scope, key, encoding.as_deref())?;
+    let (inner, outer) = hmac_state(&name, &key).ok_or_else(|| invalid_digest(&name))?;
+    *hmac_class::state_of(scope, this)?.data_mut() = NativeHmacImpl {
+        inner: Some(inner),
+        outer: Some(outer),
+    };
+    let options = options.unwrap_or(HandleValue::undefined());
+    Ok(this.set_property(scope, c"_options", options)?)
+}
+
+#[core_runtime::jsfunction_class(
+    name = "Hash",
+    self_construct,
+    state = "NativeHash",
+    invalid_this = "crate::errors::invalid_this"
+)]
 pub mod hash_class {
     use super::*;
 
     /// <https://nodejs.org/api/crypto.html#class-hash>: a hash of the digest `algorithm`.
-    #[constructor]
+    /// Emits DEP0179 the first time.
+    #[constructor(length = 2)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
         algorithm: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
+        crate::process::deprecate_once(scope, "crypto.Hash constructor is deprecated.", "DEP0179")?;
         let name = crate::errors::validate_string(scope, algorithm, "algorithm")?;
         let Some((hasher, _)) = hasher(&name) else {
             return Err(unsupported_digest(scope, "Digest method not supported"));
         };
-        Ok(init_hash(scope, this, hasher, name)?)
+        let options = options.unwrap_or(HandleValue::undefined());
+        Ok(init_hash(scope, this, hasher, name, options)?)
     }
 
     /// <https://nodejs.org/api/crypto.html#hashupdatedata-inputencoding>
+    #[method(length = 2)]
     pub fn update<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
         data: HandleValue<'_>,
         encoding: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
-        let state = hash_state(scope, this)?;
+        let state = state_of(scope, this)?;
         if state.data().hasher.is_none() {
             return Err(finalized().into());
         }
@@ -327,12 +298,13 @@ pub mod hash_class {
     }
 
     /// <https://nodejs.org/api/crypto.html#hashdigestencoding>
+    #[method(length = 1)]
     pub fn digest<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
         encoding: Option<HandleValue<'_>>,
     ) -> Result<HandleValue<'s>, Thrown> {
-        let hasher = hash_state(scope, this)?
+        let hasher = state_of(scope, this)?
             .data_mut()
             .hasher
             .take()
@@ -341,25 +313,31 @@ pub mod hash_class {
     }
 
     /// <https://nodejs.org/api/crypto.html#hashcopyoptions>
-    pub fn copy<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<HandleValue<'s>, Thrown> {
+    #[method(length = 1)]
+    pub fn copy<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<Object<'s>, Thrown> {
         let state = {
-            let state = hash_state(scope, this)?;
+            let state = state_of(scope, this)?;
             let data = state.data();
             let hasher = data.hasher.as_ref().ok_or_else(finalized)?.box_clone();
             (hasher, data.algorithm.clone())
         };
-        Ok(new_hash(scope, state.0, state.1)?)
+        Ok(new_hash(scope, state.0, state.1, HandleValue::undefined())?)
     }
 }
 
-#[core_runtime::jsfunction_class(name = "Hmac", self_construct)]
+#[core_runtime::jsfunction_class(
+    name = "Hmac",
+    self_construct,
+    state = "NativeHmac",
+    invalid_this = "crate::errors::invalid_this"
+)]
 pub mod hmac_class {
     use super::*;
 
     /// <https://nodejs.org/api/crypto.html#class-hmac>: an HMAC of the digest `algorithm` keyed
     /// with `key`, a secret `KeyObject` or the bytes of a string in `options.encoding`, a
-    /// `Buffer`, a `TypedArray`, a `DataView` or an `ArrayBuffer`.
-    #[constructor]
+    /// `Buffer`, a `TypedArray`, a `DataView` or an `ArrayBuffer`. Emits DEP0181 the first time.
+    #[constructor(length = 3)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -367,27 +345,19 @@ pub mod hmac_class {
         key: HandleValue<'_>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let name = crate::errors::validate_string(scope, algorithm, "hmac")?;
-        let encoding = string_option(scope, options, c"encoding", "options.encoding")?;
-        let key = secret_key_bytes(scope, key, encoding.as_deref())?;
-        let (inner, outer) = hmac_state(&name, &key).ok_or_else(|| invalid_digest(&name))?;
-        let native =
-            js::class::create_instance_with::<NativeHmacImpl>(scope, |_| NativeHmacImpl {
-                inner: Some(inner),
-                outer: Some(outer),
-            })?;
-        this.define_property(scope, c"_starlingNative", native, 0)?;
-        Ok(())
+        crate::process::deprecate_once(scope, "crypto.Hmac constructor is deprecated.", "DEP0181")?;
+        init_hmac(scope, this, algorithm, key, options)
     }
 
     /// <https://nodejs.org/api/crypto.html#hmacupdatedata-inputencoding>
+    #[method(length = 2)]
     pub fn update<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
         data: HandleValue<'_>,
         encoding: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
-        let state = hmac_state_of(scope, this)?;
+        let state = state_of(scope, this)?;
         if state.data().inner.is_none() {
             return Err(finalized().into());
         }
@@ -398,13 +368,14 @@ pub mod hmac_class {
     }
 
     /// <https://nodejs.org/api/crypto.html#hmacdigestencoding>
+    #[method(length = 1)]
     pub fn digest<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
         encoding: Option<HandleValue<'_>>,
     ) -> Result<HandleValue<'s>, Thrown> {
         let (inner, mut outer) = {
-            let state = hmac_state_of(scope, this)?;
+            let state = state_of(scope, this)?;
             let mut data = state.data_mut();
             let inner = data.inner.take().ok_or_else(finalized)?;
             (inner, data.outer.take().ok_or_else(finalized)?)
@@ -503,8 +474,8 @@ fn secret_key_bytes(
     key: HandleValue<'_>,
     encoding: Option<&str>,
 ) -> Result<Vec<u8>, Thrown> {
-    if let Some(handle) = key_handle(scope, key)? {
-        let data = handle.data();
+    if let Some(key) = key_object(scope, key) {
+        let data = key.data();
         if data.kind != KeyKind::Secret {
             return Err(NodeError::new(
                 ErrorKind::TypeError,
@@ -555,222 +526,121 @@ impl KeyKind {
     }
 }
 
-/// The key material of a `KeyObject`, which it holds under the symbol `Symbol(kHandle)`.
-#[core_runtime::jsclass(hidden)]
-pub struct KeyObjectHandle {
-    /// The key's type, which the `KeyObject` constructor sets.
+/// A `KeyObject`: its type and its material. See <https://nodejs.org/api/crypto.html#class-keyobject>.
+#[core_runtime::jsclass(
+    name = "KeyObject",
+    hidden,
+    invalid_this = "crate::errors::invalid_this"
+)]
+pub struct KeyObject {
     #[no_trace]
     kind: KeyKind,
-    /// The key's bytes.
     #[no_trace]
     bytes: Vec<u8>,
 }
 
-#[core_runtime::jsmethods]
-impl KeyObjectHandle {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(illegal_constructor())
-    }
-}
-
-/// The key of the shared object that holds the symbol [`key_handle_symbol`] returns.
-static KEY_HANDLE_KEY: u8 = 0;
-
-/// The symbol `Symbol(kHandle)`, under which a `KeyObject` keeps its handle.
-fn key_handle_symbol<'s>(scope: &'s Scope<'_>) -> Result<js::native::HandleId<'s>, ExnThrown> {
-    let key = &KEY_HANDLE_KEY as *const u8 as usize;
-    let holder = js::class::get_or_init_shared_object(scope, key, |scope| {
-        let holder = Object::new_plain(scope)?;
-        holder.set_property(scope, c"symbol", crate::symbol(scope, "kHandle", false)?)?;
-        Ok(holder)
-    })?;
-    let symbol = holder.get_property(scope, c"symbol")?;
-    Ok(scope.root_id(js::id::value_to_id(scope, symbol)?))
-}
-
-/// The handle of `value`, if it is a `KeyObject`.
-fn key_handle<'s>(
-    scope: &'s Scope<'_>,
-    value: HandleValue<'_>,
-) -> Result<Option<KeyObjectHandle<'s>>, ExnThrown> {
-    let Ok(object) = Object::from_value(scope, *value) else {
-        return Ok(None);
-    };
-    let handle = object.get_property_by_id(scope, key_handle_symbol(scope)?)?;
-    Ok(Object::from_value(scope, *handle)
-        .ok()
-        .and_then(|handle| handle.cast::<KeyObjectHandle>().ok()))
-}
-
-/// The handle of the `KeyObject` `this`, or `ERR_INVALID_THIS` if it isn't one.
-fn this_key_handle<'s>(
-    scope: &'s Scope<'_>,
-    this: HandleValue<'_>,
-) -> Result<KeyObjectHandle<'s>, Thrown> {
-    key_handle(scope, this)?.ok_or_else(|| invalid_this("KeyObject").into())
-}
-
-/// A new secret `KeyObject` of `bytes`.
-fn new_secret_key<'s>(scope: &'s Scope<'_>, bytes: Vec<u8>) -> Result<Object<'s>, ExnThrown> {
-    let handle =
-        js::class::create_instance_with::<KeyObjectHandleImpl>(scope, |_| KeyObjectHandleImpl {
-            kind: KeyKind::Secret,
-            bytes,
-        })?;
-    let class = secret_key_object_class::class_constructor(scope)?;
-    Function::construct(scope, class, &[handle.to_jsval_throwing(scope)?])
-}
-
-/// Make the object a `KeyObject` constructor creates for `args` a key of the type `kind` with
-/// `handle`, as Node.js's `KeyObject` constructor checks them.
-fn init_key_object<'s>(
-    scope: &'s Scope<'_>,
-    args: &js::native::CallArgs,
-    class: &str,
+/// Node.js's `KeyObject` constructor checks: `ERR_INVALID_ARG_VALUE` for a `kind` other than
+/// `secret`, `public` and `private`, and `ERR_INVALID_ARG_TYPE` for any `handle`, as only
+/// Node.js's internal key handles are accepted.
+fn check_key_object_args(
+    scope: &Scope<'_>,
     kind: HandleValue<'_>,
     handle: HandleValue<'_>,
-) -> Result<Object<'s>, Thrown> {
-    if !args.is_constructing() {
-        js::error::TypeError(format!(
-            "Class constructor {class} cannot be invoked without 'new'"
-        ))
-        .throw(scope);
-        return Err(Thrown::Pending);
+) -> Thrown {
+    let parsed = crate::support::rust_string(scope, kind).and_then(|kind| KeyKind::parse(&kind));
+    if parsed.is_none() {
+        return NodeError::invalid_arg_value(scope, "type", kind, "is invalid").into();
     }
-    let name = if kind.is_string() {
-        KeyKind::parse(&String::from_jsval(scope, kind, ())?)
-    } else {
-        None
-    };
-    let Some(kind) = name else {
-        return Err(NodeError::invalid_arg_value(scope, "type", kind, "is invalid").into());
-    };
-    let key = Object::from_value(scope, *handle)
-        .ok()
-        .and_then(|object| object.cast::<KeyObjectHandle>().ok());
-    let Some(key) = key else {
-        return Err(NodeError::invalid_arg_type(scope, "handle", "of type object", handle).into());
-    };
-    key.data_mut().kind = kind;
-    let this = Object::new_plain_for_constructor(scope, args, 0)?;
-    this.set_property_by_id(scope, key_handle_symbol(scope)?, handle)?;
-    Ok(this)
+    NodeError::invalid_arg_type(scope, "handle", "of type object", handle).into()
 }
 
-/// The getter of `KeyObject.prototype.type`.
-fn key_type_getter(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let this = scope.root_value(args.this());
-    let handle = this_key_handle(scope, this).map_err(|thrown| thrown.throw(scope))?;
-    let kind = handle.data().kind;
-    Ok(*string(scope, kind.name())?)
-}
-
-/// The getter of `SecretKeyObject.prototype.symmetricKeySize`.
-fn symmetric_key_size_getter(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let this = scope.root_value(args.this());
-    let handle = this_key_handle(scope, this).map_err(|thrown| thrown.throw(scope))?;
-    let size = handle.data().bytes.len();
-    Ok(js::value::from_f64(size as f64))
-}
-
-#[core_runtime::jsfunction_class(name = "KeyObject", class_syntax)]
-pub mod key_object_class {
-    use super::*;
-
-    /// <https://nodejs.org/api/crypto.html#class-keyobject>: a key of the type `kind`, `secret`,
-    /// `public` or `private`, whose material is `handle`. Only `createSecretKey` creates
-    /// handles.
+#[core_runtime::jsmethods(node_args)]
+impl KeyObject {
+    /// <https://nodejs.org/api/crypto.html#class-keyobject>: always throws, as only
+    /// `createSecretKey` creates keys.
     #[constructor]
-    pub fn create<'s>(
-        scope: &'s Scope<'_>,
-        args: &CallArgs,
+    pub fn create(
+        scope: &Scope<'_>,
         kind: HandleValue<'_>,
         handle: HandleValue<'_>,
-    ) -> Result<Object<'s>, Thrown> {
-        init_key_object(scope, args, "KeyObject", kind, handle)
+    ) -> Result<Self, Thrown> {
+        Err(check_key_object_args(scope, kind, handle))
+    }
+
+    /// <https://nodejs.org/api/crypto.html#static-method-keyobjectfromkey>: always throws
+    /// `ERR_INVALID_ARG_TYPE`, as `CryptoKey` isn't implemented.
+    #[static_method(length = 1)]
+    pub fn from(scope: &Scope<'_>, key: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+        let key = key.unwrap_or(HandleValue::undefined());
+        Err(NodeError::invalid_arg_type(scope, "key", "an instance of CryptoKey", key).into())
+    }
+
+    /// <https://nodejs.org/api/crypto.html#keyobjecttype>
+    #[getter(name = "type")]
+    pub fn kind(&self) -> &'static str {
+        self.data().kind.name()
     }
 
     /// <https://nodejs.org/api/crypto.html#keyobjectequalsotherkeyobject>: whether both keys
     /// have the same type and material.
+    #[method(length = 1)]
     pub fn equals(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
         other: Option<HandleValue<'_>>,
     ) -> Result<bool, Thrown> {
-        let this = this.to_jsval_throwing(scope)?;
-        let mine = this_key_handle(scope, this)?;
         let other = other.unwrap_or(HandleValue::undefined());
-        let Some(theirs) = key_handle(scope, other)? else {
+        let Some(theirs) = key_object(scope, other) else {
             let expected = "an instance of KeyObject";
             return Err(
                 NodeError::invalid_arg_type(scope, "otherKeyObject", expected, other).into(),
             );
         };
-        let (mine, theirs) = (mine.data(), theirs.data());
+        let (mine, theirs) = (self.data(), theirs.data());
         Ok(mine.kind == theirs.kind && mine.bytes == theirs.bytes)
-    }
-
-    /// Define the `type` getter and `Symbol.toStringTag`.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let getter = Function::new_callback(scope, c"get type", 0, key_type_getter, ())?;
-        proto.define_accessor(scope, c"type", Some(*getter), None, 0)?;
-        js::class::define_well_known_symbol_property(
-            scope,
-            proto,
-            js::native::SymbolCode::toStringTag,
-            "KeyObject",
-        )
     }
 }
 
-#[core_runtime::jsfunction_class(
+/// A secret `KeyObject`. See <https://nodejs.org/api/crypto.html#class-keyobject>.
+#[core_runtime::jsclass(
     name = "SecretKeyObject",
-    extends = "super::key_object_class",
-    class_syntax
+    hidden,
+    extends = KeyObject,
+    invalid_this = "crate::errors::invalid_this"
 )]
-pub mod secret_key_object_class {
-    use super::*;
+pub struct SecretKeyObject {
+    parent: KeyObjectImpl,
+}
 
-    /// A secret key whose material is `handle`.
+#[core_runtime::jsmethods(node_args)]
+impl SecretKeyObject {
+    /// Always throws, as only `createSecretKey` creates keys.
     #[constructor]
-    pub fn create<'s>(
-        scope: &'s Scope<'_>,
-        args: &CallArgs,
-        handle: Option<HandleValue<'_>>,
-    ) -> Result<Object<'s>, Thrown> {
-        let secret = string(scope, "secret")?;
+    pub fn create(scope: &Scope<'_>, handle: Option<HandleValue<'_>>) -> Result<Self, Thrown> {
+        let secret = js::class::get_or_init_atom(scope, c"secret")?;
         let handle = handle.unwrap_or(HandleValue::undefined());
-        init_key_object(scope, args, "SecretKeyObject", secret, handle)
+        Err(check_key_object_args(scope, secret, handle))
+    }
+
+    /// <https://nodejs.org/api/crypto.html#keyobjectsymmetrickeysize>
+    #[getter]
+    pub fn symmetric_key_size(&self) -> f64 {
+        self.data().parent.bytes.len() as f64
     }
 
     /// <https://nodejs.org/api/crypto.html#keyobjectexportoptions>: the key's bytes as a
     /// `Buffer`, or as a JSON Web Key if `options.format` is `jwk`.
-    pub fn export<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
+    #[method]
+    pub fn export<'r>(
+        &self,
+        scope: &'r Scope<'_>,
         options: Option<HandleValue<'_>>,
-    ) -> Result<HandleValue<'s>, Thrown> {
-        let this = this.to_jsval_throwing(scope)?;
-        let bytes = this_key_handle(scope, this)?.data().bytes.clone();
+    ) -> Result<HandleValue<'r>, Thrown> {
+        let bytes = self.data().parent.bytes.clone();
         if let Some(options) = options.filter(|options| !options.is_undefined()) {
             let options = crate::errors::validate_plain_object(scope, options, "options", true)?;
             let format = options.get_property(scope, c"format")?;
-            let name = if format.is_string() {
-                Some(String::from_jsval(scope, format, ())?)
-            } else {
-                None
-            };
-            match name.as_deref() {
+            match crate::support::rust_string(scope, format).as_deref() {
                 _ if format.is_undefined() => {}
                 Some("buffer") => {}
                 Some("jwk") => {
@@ -794,19 +664,47 @@ pub mod secret_key_object_class {
         }
         Ok(new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?)
     }
+}
 
-    /// Define the `symmetricKeySize` getter.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let getter = Function::new_callback(
-            scope,
-            c"get symmetricKeySize",
-            0,
-            symmetric_key_size_getter,
-            (),
-        )?;
-        proto.define_accessor(scope, c"symmetricKeySize", Some(*getter), None, 0)
-    }
+/// `value` as a `KeyObject`, if it is one.
+pub(crate) fn key_object<'s>(
+    scope: &'s Scope<'_>,
+    value: HandleValue<'_>,
+) -> Option<KeyObject<'s>> {
+    Object::from_value(scope, *value)
+        .ok()
+        .and_then(|object| object.cast::<KeyObject>().ok())
+}
+
+/// A new secret `KeyObject` of `bytes`.
+fn new_secret_key<'s>(scope: &'s Scope<'_>, bytes: Vec<u8>) -> Result<Object<'s>, ExnThrown> {
+    let key =
+        js::class::create_instance_with::<SecretKeyObjectImpl>(scope, |_| SecretKeyObjectImpl {
+            parent: KeyObjectImpl {
+                kind: KeyKind::Secret,
+                bytes,
+            },
+        })?;
+    Ok(key.as_object())
+}
+
+/// Register the classes of `node:crypto`, and define `Symbol.toStringTag` on
+/// `KeyObject.prototype`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
+    NativeHash::add_to_global(scope, global);
+    NativeHmac::add_to_global(scope, global);
+    KeyObject::add_to_global(scope, global);
+    SecretKeyObject::add_to_global(scope, global);
+    hash_class::register(scope)?;
+    hmac_class::register(scope)?;
+    let proto = js::class::get_prototype_object_for::<KeyObjectImpl>(scope)
+        .expect("KeyObject was registered above");
+    js::class::define_well_known_symbol_property(
+        scope,
+        proto,
+        js::native::SymbolCode::toStringTag,
+        "KeyObject",
+    )
 }
 
 /// Node.js's `assertSize`: `value`, a number of elements of `element_size` bytes, as a byte count
@@ -829,20 +727,12 @@ fn validate_size(
     Ok(number)
 }
 
-/// The body of the microtask that calls an async random function's callback, whose payload is
-/// The body of the microtask that calls `randomInt`'s callback, whose payload is
 /// Call `callback` with `null` and `value` in a later turn of the event loop, as `setImmediate`
 /// does.
 fn defer(scope: &Scope<'_>, callback: Object<'_>, value: HandleValue<'_>) -> Result<(), ExnThrown> {
-    let set_immediate = scope.global().get_property(scope, c"setImmediate")?;
     let null = scope.root_value(js::value::null());
     let callback = callback.to_jsval_throwing(scope)?;
-    Function::call(
-        scope,
-        js::value::undefined(),
-        set_immediate,
-        &[callback, null, value],
-    )?;
+    crate::timers::create_immediate(scope, callback, &[null, value])?;
     Ok(())
 }
 
@@ -854,12 +744,34 @@ enum DeriveError {
     /// message "Deriving bits failed", thrown by the synchronous forms and passed to the callback
     /// by the others.
     Failed,
+    /// A failed allocation of the derivation's memory, which is reported as `Failed` is, with
+    /// OpenSSL's message for a failed allocation.
+    OutOfMemory,
+}
+
+impl DeriveError {
+    /// The message of the plain `Error` of `Failed` and `OutOfMemory`.
+    fn message(&self) -> &'static std::ffi::CStr {
+        match self {
+            DeriveError::OutOfMemory => c"error:078C0100:common libcrypto routines::malloc failure",
+            _ => c"Deriving bits failed",
+        }
+    }
 }
 
 impl From<NodeError> for DeriveError {
     fn from(error: NodeError) -> Self {
         DeriveError::Invalid(error)
     }
+}
+
+/// A `Vec` with room for `length` bytes, or `DeriveError::OutOfMemory` if allocating it fails.
+fn derived_key_buffer(length: usize) -> Result<Vec<u8>, DeriveError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|_| DeriveError::OutOfMemory)?;
+    Ok(output)
 }
 
 /// PBKDF2 as RFC 8018 defines it, with HMAC of the digest `name` as the pseudorandom function.
@@ -874,7 +786,7 @@ fn pbkdf2_bytes(
     if length == 0 {
         return Err(DeriveError::Failed);
     }
-    let mut output = Vec::with_capacity(length);
+    let mut output = derived_key_buffer(length)?;
     let mut block_index = 1u32;
     while output.len() < length {
         let mut u = hmac_digest(&state, &[salt, &block_index.to_be_bytes()]);
@@ -915,7 +827,7 @@ fn hkdf_bytes(
     let extract = hmac_state(name, salt).ok_or_else(|| invalid_digest(name))?;
     let prk = hmac_digest(&extract, &[key]);
     let expand = hmac_state(name, &prk).ok_or_else(|| invalid_digest(name))?;
-    let mut output = Vec::with_capacity(length);
+    let mut output = derived_key_buffer(length)?;
     let mut previous = Vec::new();
     let mut counter = 1u8;
     while output.len() < length {
@@ -961,7 +873,10 @@ fn invalid_scrypt_params(memory: bool) -> NodeError {
     )
 }
 
-/// Check `params` as OpenSSL's `EVP_PBE_scrypt_ex` does.
+/// Check `params` as OpenSSL's `EVP_PBE_scrypt_ex` does: `N` must be a power of two of at least
+/// 2, `r` and `p` must not be 0, `p * r` must be below 2^30, `N` below 2^(16 * r), the `p` blocks
+/// of `128 * r` bytes at most `i32::MAX` bytes, and those blocks with the `32 * r * (N + 2)` words
+/// of the mixing vectors at most `maxmem` bytes, or the address space if that is smaller.
 fn check_scrypt_params(params: &ScryptParams) -> Result<(), NodeError> {
     let ScryptParams {
         cost: n,
@@ -976,12 +891,16 @@ fn check_scrypt_params(params: &ScryptParams) -> Result<(), NodeError> {
     if p > PR_MAX / r || (16 * r <= 63 && n >= 1 << (16 * r)) {
         return Err(invalid_scrypt_params(true));
     }
-    let blocks = p as f64 * 128.0 * r as f64;
-    let vectors = 32.0 * r as f64 * (n as f64 + 2.0) * 4.0;
-    if blocks + vectors > max_memory {
+    let blocks = p * 128 * r;
+    if blocks > i32::MAX as u64 || n + 2 > u64::MAX / 128 / r {
         return Err(invalid_scrypt_params(true));
     }
-    Ok(())
+    let vectors = 32 * r * (n + 2) * 4;
+    let max_memory = (max_memory as u64).min(usize::MAX as u64);
+    match blocks.checked_add(vectors) {
+        Some(total) if total <= max_memory => Ok(()),
+        _ => Err(invalid_scrypt_params(true)),
+    }
 }
 
 /// The Salsa20/8 core of RFC 7914 applied to `block` in place.
@@ -1043,17 +962,21 @@ fn block_mix(input: &[u32], output: &mut [u32], r: usize) {
     }
 }
 
-/// scryptROMix of RFC 7914 on `block`, `128 * r` bytes, with the cost `n`.
-fn ro_mix(block: &mut [u8], r: usize, n: usize) {
+/// scryptROMix of RFC 7914 on `block`, `128 * r` bytes, with the cost `n`. Fails if allocating
+/// the `32 * r * (n + 2)` words it uses fails.
+fn ro_mix(block: &mut [u8], r: usize, n: usize) -> Result<(), DeriveError> {
     let words = 32 * r;
-    let mut x: Vec<u32> = block
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| u32::from_le_bytes(*chunk))
-        .collect();
-    let mut v = vec![0u32; words * n];
-    let mut y = vec![0u32; words];
+    let zeroed = |length: Option<usize>| {
+        length
+            .and_then(crate::support::try_filled_vec::<u32>)
+            .ok_or(DeriveError::OutOfMemory)
+    };
+    let mut x = zeroed(Some(words))?;
+    for (word, chunk) in x.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*chunk);
+    }
+    let mut v = zeroed(words.checked_mul(n))?;
+    let mut y = zeroed(Some(words))?;
     for i in 0..n {
         v[i * words..(i + 1) * words].copy_from_slice(&x);
         block_mix(&x, &mut y, r);
@@ -1071,6 +994,7 @@ fn ro_mix(block: &mut [u8], r: usize, n: usize) {
     for (chunk, word) in block.as_chunks_mut::<4>().0.iter_mut().zip(x) {
         *chunk = word.to_le_bytes();
     }
+    Ok(())
 }
 
 /// scrypt as RFC 7914 defines it, with parameters [`check_scrypt_params`] accepted.
@@ -1088,7 +1012,7 @@ fn scrypt_bytes(
     let p = params.parallelization as usize;
     let mut blocks = pbkdf2_bytes("sha256", password, salt, 1, p * 128 * r)?;
     for block in blocks.chunks_exact_mut(128 * r) {
-        ro_mix(block, r, params.cost as usize);
+        ro_mix(block, r, params.cost as usize)?;
     }
     pbkdf2_bytes("sha256", password, &blocks, 1, length)
 }
@@ -1164,8 +1088,13 @@ fn scrypt_options(scope: &Scope<'_>, options: HandleValue<'_>) -> Result<ScryptP
     }
     let max_memory = options.get_property(scope, c"maxmem")?;
     if !max_memory.is_undefined() {
-        let max_memory =
-            crate::errors::validate_integer(scope, max_memory, "maxmem", 0.0, 9007199254740991.0)?;
+        let max_memory = crate::errors::validate_integer(
+            scope,
+            max_memory,
+            "maxmem",
+            0.0,
+            crate::errors::MAX_SAFE_INTEGER,
+        )?;
         if max_memory != 0.0 {
             params.max_memory = max_memory;
         }
@@ -1186,15 +1115,15 @@ fn derived_sync<'s>(
         }
         Ok(bytes) => Ok(new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?),
         Err(DeriveError::Invalid(error)) => Err(error.into()),
-        Err(DeriveError::Failed) => {
-            js::error::throw_plain_error(scope, c"Deriving bits failed");
+        Err(error) => {
+            js::error::throw_plain_error(scope, error.message());
             Err(Thrown::Pending)
         }
     }
 }
 
 /// Pass the result of a key derivation to `callback` in a later turn of the event loop: `null`
-/// and a `Buffer`, or an `ArrayBuffer` if `array_buffer`, or the "Deriving bits failed" error.
+/// and a `Buffer`, or an `ArrayBuffer` if `array_buffer`, or the error of a failed derivation.
 /// An [`DeriveError::Invalid`] error is thrown instead.
 fn derived_async(
     scope: &Scope<'_>,
@@ -1208,17 +1137,11 @@ fn derived_async(
         }
         Ok(bytes) => new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?,
         Err(DeriveError::Invalid(error)) => return Err(error.into()),
-        Err(DeriveError::Failed) => {
-            js::error::throw_plain_error(scope, c"Deriving bits failed");
-            let error = crate::stream::take_exception(scope);
-            let set_immediate = scope.global().get_property(scope, c"setImmediate")?;
+        Err(error) => {
+            js::error::throw_plain_error(scope, error.message());
+            let error = js::exception::take_pending_or_undefined(scope);
             let callback = callback.to_jsval_throwing(scope)?;
-            Function::call(
-                scope,
-                js::value::undefined(),
-                set_immediate,
-                &[callback, error],
-            )?;
+            crate::timers::create_immediate(scope, callback, &[error])?;
             return Ok(());
         }
     };
@@ -1276,8 +1199,8 @@ fn hkdf_args(
     length: HandleValue<'_>,
 ) -> Result<Result<Vec<u8>, DeriveError>, Thrown> {
     let digest = crate::errors::validate_string(scope, digest, "digest")?;
-    let key = match key_handle(scope, key)? {
-        Some(handle) => handle.data().bytes.clone(),
+    let key = match key_object(scope, key) {
+        Some(key) => key.data().bytes.clone(),
         None => byte_source(scope, key, None)?.ok_or_else(|| {
             let expected = "of type string or an instance of SecretKeyObject, ArrayBuffer, \
                             TypedArray, DataView, or Buffer";
@@ -1324,9 +1247,10 @@ pub mod module {
 
     pub use super::hash_class as Hash;
     pub use super::hmac_class as Hmac;
-    pub use super::key_object_class as KeyObject;
+    pub use super::KeyObject;
 
     /// <https://nodejs.org/api/crypto.html#cryptocreatesecretkeykey-encoding>
+    #[function(length = 2)]
     pub fn create_secret_key<'s>(
         scope: &'s Scope<'_>,
         key: HandleValue<'_>,
@@ -1345,11 +1269,12 @@ pub mod module {
 
     /// <https://nodejs.org/api/crypto.html#cryptopbkdf2password-salt-iterations-keylen-digest-callback>:
     /// derives the key synchronously, and calls `callback` in a later turn of the event loop.
+    #[function(length = 6)]
     pub fn pbkdf2(scope: &Scope<'_>, args: RestArgs<HandleValue<'_>>) -> Result<(), Thrown> {
         let undefined = HandleValue::undefined();
         let arg = |index: usize| args.get(index).copied().unwrap_or(undefined);
         let (mut digest, mut callback) = (arg(4), arg(5));
-        if is_function(scope, digest) {
+        if js::function::is_callable(digest) {
             callback = digest;
             digest = undefined;
         }
@@ -1359,6 +1284,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptopbkdf2syncpassword-salt-iterations-keylen-digest>
+    #[function(length = 5)]
     pub fn pbkdf2_sync<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -1371,6 +1297,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/crypto.html#cryptoscryptpassword-salt-keylen-options-callback>:
     /// derives the key synchronously, and calls `callback` in a later turn of the event loop.
+    #[function(length = 4)]
     pub fn scrypt(scope: &Scope<'_>, args: RestArgs<HandleValue<'_>>) -> Result<(), Thrown> {
         let undefined = HandleValue::undefined();
         let arg = |index: usize| args.get(index).copied().unwrap_or(undefined);
@@ -1385,6 +1312,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptoscryptsyncpassword-salt-keylen-options>
+    #[function(length = 3)]
     pub fn scrypt_sync<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -1398,6 +1326,7 @@ pub mod module {
     /// <https://nodejs.org/api/crypto.html#cryptohkdfdigest-ikm-salt-info-keylen-callback>:
     /// derives the key synchronously, and calls `callback` with an `ArrayBuffer` in a later turn
     /// of the event loop.
+    #[function(length = 6)]
     pub fn hkdf(scope: &Scope<'_>, args: RestArgs<HandleValue<'_>>) -> Result<(), Thrown> {
         let undefined = HandleValue::undefined();
         let arg = |index: usize| args.get(index).copied().unwrap_or(undefined);
@@ -1408,6 +1337,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/crypto.html#cryptohkdfsyncdigest-ikm-salt-info-keylen>: the key as
     /// an `ArrayBuffer`.
+    #[function(length = 5)]
     pub fn hkdf_sync<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -1419,33 +1349,37 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptocreatehashalgorithm-options>
+    #[function(length = 2)]
     pub fn create_hash<'s>(
         scope: &'s Scope<'_>,
         algorithm: HandleValue<'_>,
-    ) -> Result<HandleValue<'s>, Thrown> {
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
         let name = crate::errors::validate_string(scope, algorithm, "algorithm")?;
         let Some((hasher, _)) = hasher(&name) else {
             return Err(unsupported_digest(scope, "Digest method not supported"));
         };
-        Ok(new_hash(scope, hasher, name)?)
+        let options = options.unwrap_or(HandleValue::undefined());
+        Ok(new_hash(scope, hasher, name, options)?)
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptocreatehmacalgorithm-key-options>
+    #[function(length = 3)]
     pub fn create_hmac<'s>(
         scope: &'s Scope<'_>,
         algorithm: HandleValue<'s>,
         key: HandleValue<'s>,
         options: Option<HandleValue<'s>>,
-    ) -> Result<HandleValue<'s>, Thrown> {
-        let ctor = hmac_class::class_constructor(scope)?;
-        let options = options.unwrap_or(HandleValue::undefined());
-        let hmac = Function::construct(scope, ctor, &[algorithm, key, options])?;
-        Ok(hmac.to_jsval_throwing(scope)?)
+    ) -> Result<Object<'s>, Thrown> {
+        let hmac = hmac_class::new_instance(scope)?;
+        init_hmac(scope, hmac, algorithm, key, options)?;
+        Ok(hmac)
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptohashalgorithm-data-outputencoding>: the digest of
     /// `data` in one call, as hex unless `options`, or its `outputEncoding`, names another encoding
     /// or `buffer`.
+    #[function(length = 3)]
     pub fn hash<'s>(
         scope: &'s Scope<'_>,
         algorithm: HandleValue<'_>,
@@ -1521,6 +1455,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptorandombytessize-callback>
+    #[function(length = 2)]
     pub fn random_bytes<'s>(
         scope: &'s Scope<'_>,
         size: HandleValue<'_>,
@@ -1531,9 +1466,11 @@ pub mod module {
             Some(callback) => Some(validate_function(scope, callback, "callback")?),
             None => None,
         };
-        let mut bytes = vec![0u8; size];
-        platform::random::fill(&mut bytes);
-        let buffer = new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?;
+        let buffer = crate::buffer::new_buffer_with(scope, size, |bytes| {
+            platform::random::fill(bytes);
+            Ok(())
+        })?;
+        let buffer = buffer.to_jsval_throwing(scope)?;
         if let Some(callback) = callback {
             defer(scope, callback, buffer)?;
             return Ok(scope.root_value(js::value::undefined()));
@@ -1608,6 +1545,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptorandomfillbuffer-offset-size-callback>
+    #[function(length = 4)]
     pub fn random_fill(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1631,13 +1569,14 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptorandomuuidoptions>
-    #[function(name = "randomUUID")]
+    #[function(name = "randomUUID", length = 1)]
     pub fn random_uuid() -> String {
         platform::random::uuid_v4()
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptorandomintmin-max-callback>: `min` may be left
     /// out. The callback gets `undefined` and the integer.
+    #[function(length = 3)]
     pub fn random_int<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -1661,7 +1600,8 @@ pub mod module {
         };
         let safe_integer = |value: HandleValue<'_>, name: &str| -> Result<f64, Thrown> {
             let number = value.is_number().then(|| value.to_number());
-            match number.filter(|n| n.fract() == 0.0 && n.abs() <= 9007199254740991.0) {
+            match number.filter(|n| n.fract() == 0.0 && n.abs() <= crate::errors::MAX_SAFE_INTEGER)
+            {
                 Some(number) => Ok(number),
                 None => {
                     Err(NodeError::invalid_arg_type(scope, name, "a safe integer", value).into())
@@ -1697,20 +1637,21 @@ pub mod module {
 
     /// <https://nodejs.org/api/crypto.html#cryptotimingsafeequala-b>: compares every byte,
     /// whatever the result.
+    #[function(length = 0)]
     pub fn timing_safe_equal(
         scope: &Scope<'_>,
         a: HandleValue<'_>,
         b: HandleValue<'_>,
     ) -> Result<bool, Thrown> {
         let bytes = |value: HandleValue<'_>, name: &str| -> Result<Vec<u8>, Thrown> {
-            let bytes = match Object::from_value(scope, *value) {
-                Ok(object) => js::typedarray::copy_buffer_source_bytes(scope, object)?,
-                Err(_) => None,
-            };
-            bytes.ok_or_else(|| {
-                let expected = "an instance of ArrayBuffer, Buffer, TypedArray, or DataView";
-                NodeError::invalid_arg_type(scope, name, expected, value).into()
-            })
+            let object = Object::from_value(scope, *value)
+                .ok()
+                .filter(|object| js::typedarray::is_buffer_source(*object))
+                .ok_or_else(|| {
+                    let expected = "an instance of ArrayBuffer, Buffer, TypedArray, or DataView";
+                    NodeError::invalid_arg_type(scope, name, expected, value)
+                })?;
+            Ok(js::typedarray::copy_buffer_source_bytes(scope, object)?.unwrap_or_default())
         };
         let a = bytes(a, "buf1")?;
         let b = bytes(b, "buf2")?;
@@ -1732,21 +1673,38 @@ pub mod module {
     /// `crypto.getRandomValues`.
     pub fn get_random_values<'s>(
         scope: &'s Scope<'_>,
-        array: HandleValue<'_>,
+        array: HandleValue<'s>,
     ) -> Result<HandleValue<'s>, ExnThrown> {
-        let captured = webcrypto(scope)?;
-        let crypto = captured.get_property(scope, c"crypto")?;
-        let crypto = Object::from_value(scope, crypto).map_err(|e| e.throw(scope))?;
-        let get_random_values = captured.get_property(scope, c"getRandomValues")?;
-        let result = Function::call(scope, crypto, get_random_values, &[array])?;
-        Ok(scope.root_value(result.get()))
+        let view = Object::from_value(scope, *array)
+            .ok()
+            .and_then(|object| object.cast::<js::ArrayBufferView>().ok())
+            .filter(|view| view.view_kind().is_integer_array());
+        let Some(view) = view else {
+            return Err(web_globals::dom_exception::throw_dom_exception(
+                scope,
+                "TypeMismatchError",
+                "The data argument must be an integer-type TypedArray",
+            ));
+        };
+        if view.byte_length() > 65536 {
+            return Err(web_globals::dom_exception::throw_dom_exception(
+                scope,
+                "QuotaExceededError",
+                "The requested length exceeds 65,536 bytes",
+            ));
+        }
+        view.with_bytes_mut(platform::random::fill);
+        Ok(array)
     }
 }
 
 /// Register `node:crypto`, whose `webcrypto` and `crypto` are the global `crypto`.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let overrides = || -> Result<Vec<(&'static str, HandleValue<'_>)>, ExnThrown> {
-        let crypto = webcrypto(scope)?.get_property(scope, c"crypto")?;
+        let crypto = match web_globals::crypto::crypto_object(scope) {
+            Some(crypto) => crypto.to_jsval_throwing(scope)?,
+            None => HandleValue::undefined(),
+        };
         let mut overrides = vec![("webcrypto", crypto)];
         if let Ok(object) = Object::from_value(scope, crypto) {
             let subtle = object.get_property(scope, c"subtle")?;
@@ -1780,22 +1738,4 @@ fn define_random_bytes_aliases(scope: &Scope<'_>, name: &str) -> Result<(), ExnT
         crypto.define_property(scope, alias, random_bytes, 0)?;
     }
     Ok(())
-}
-
-/// The key of the captured `crypto` global in the global's shared objects.
-static WEBCRYPTO_KEY: u8 = 0;
-
-/// The `crypto` global and its `getRandomValues` as they were when first asked for, so that
-/// reassigning the global doesn't change `node:crypto`.
-fn webcrypto<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    js::class::get_or_init_shared_object(scope, &WEBCRYPTO_KEY as *const u8 as usize, |scope| {
-        let captured = Object::new_plain(scope)?;
-        let crypto = scope.global().get_property(scope, c"crypto")?;
-        captured.set_property(scope, c"crypto", crypto)?;
-        if let Ok(object) = Object::from_value(scope, crypto) {
-            let get_random_values = object.get_property(scope, c"getRandomValues")?;
-            captured.set_property(scope, c"getRandomValues", get_random_values)?;
-        }
-        Ok(captured)
-    })
 }

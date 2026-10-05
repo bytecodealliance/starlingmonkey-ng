@@ -101,7 +101,7 @@ pub mod stats_class {
     use super::*;
 
     /// <https://nodejs.org/api/fs.html#class-fsstats>: the fields, in [`FIELDS`] order.
-    #[constructor]
+    #[constructor(length = 14)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -171,8 +171,7 @@ pub(super) fn stats_value<'s>(
     scope: &'s Scope<'_>,
     stat: &Stat,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let class = stats_class::class_constructor(scope)?;
-    let stats = Function::construct(scope, class, js::function::EmptyArgs)?;
+    let stats = stats_class::new_instance(scope)?;
     let values = [
         stat.dev as f64,
         f64::from(stat.mode),
@@ -197,8 +196,8 @@ pub(super) fn stats_value<'s>(
 
 /// The key of the property of a `Dirent` that holds its type, a `UV_DIRENT_*` constant.
 fn type_key<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
-    let symbol = crate::symbol(scope, "nodejs.fs.dirent.type", true)?;
-    Ok(scope.root_id(js::id::value_to_id(scope, symbol)?))
+    static K_TYPE: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"type");
+    K_TYPE.id(scope)
 }
 
 /// Whether the type of the `Dirent` `this` is `kind`.
@@ -221,6 +220,19 @@ fn dirent_type(kind: FileKind) -> u8 {
     }
 }
 
+/// Make `this` a `Dirent` named `name` of the type `type` in the directory `path`.
+fn init_dirent(
+    scope: &Scope<'_>,
+    this: Object<'_>,
+    name: HandleValue<'_>,
+    r#type: HandleValue<'_>,
+    path: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    this.set_property(scope, c"name", name)?;
+    this.set_property(scope, c"parentPath", path)?;
+    this.set_property_by_id(scope, type_key(scope)?, r#type)
+}
+
 #[core_runtime::jsfunction_class(name = "Dirent", class_syntax)]
 pub mod dirent_class {
     use super::*;
@@ -235,9 +247,7 @@ pub mod dirent_class {
         r#type: HandleValue<'_>,
         path: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        this.set_property(scope, c"name", name)?;
-        this.set_property(scope, c"parentPath", path)?;
-        this.set_property_by_id(scope, type_key(scope)?, r#type)
+        init_dirent(scope, this, name, r#type, path)
     }
 
     pub fn is_file(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
@@ -286,9 +296,10 @@ pub(crate) fn new_dirent<'s>(
     } else {
         kind
     };
-    let class = dirent_class::class_constructor(scope)?;
+    let dirent = dirent_class::new_instance(scope)?;
     let kind = scope.root_value(js::value::from_f64(kind));
-    Ok(Function::construct(scope, class, &[name, kind, parent])?.to_jsval_throwing(scope)?)
+    init_dirent(scope, dirent, name, kind, parent)?;
+    Ok(dirent.to_jsval_throwing(scope)?)
 }
 
 /// A new `Dirent` for `entry`, with the name in `encoding`.
@@ -297,9 +308,10 @@ pub(super) fn dirent_value<'s>(
     entry: &Entry,
     encoding: Option<Encoding>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let class = dirent_class::class_constructor(scope)?;
+    let dirent = dirent_class::new_instance(scope)?;
     let name = text_value(scope, &entry.name, encoding)?;
     let kind = scope.root_value(js::value::from_f64(f64::from(dirent_type(entry.kind))));
     let parent = js::JSString::from_str(scope, &entry.parent)?.to_jsval_throwing(scope)?;
-    Function::construct(scope, class, &[name, kind, parent])?.to_jsval_throwing(scope)
+    init_dirent(scope, dirent, name, kind, parent)?;
+    dirent.to_jsval_throwing(scope)
 }

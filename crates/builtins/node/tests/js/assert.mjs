@@ -117,3 +117,16 @@ eq(throws(() => strictEqual(1, 2, "custom")).message, "custom\n\n1 !== 2\n", "cu
 eq(assert.strict.strict, assert.strict, "strict.strict");
 eq(throws(() => assert.fail()).message, "Failed", "fail");
 eq(throws(() => assert.fail("boom")).message, "boom", "fail message");
+const deepArray = () => {
+  let value = 0;
+  for (let i = 0; i < 100000; i++) value = [value];
+  return value;
+};
+eq(throws(() => deepStrictEqual(deepArray(), deepArray()), RangeError).message, "Maximum call stack size exceeded", "deep deepStrictEqual");
+let thrownByTrap;
+try {
+  deepStrictEqual({ a: new Proxy({}, { ownKeys() { throw 1; } }) }, { a: {} });
+} catch (error) {
+  thrownByTrap = error;
+}
+eq(thrownByTrap, 1, "deepStrictEqual passes on a primitive thrown by a proxy trap");

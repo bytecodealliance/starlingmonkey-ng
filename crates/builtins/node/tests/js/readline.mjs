@@ -58,6 +58,39 @@ const once = (emitter, event) => new Promise((resolve) => emitter.once(event, re
   deepEq(lines, ["a", "b", "c"], "for await over the lines");
 }
 
+// Leaving a loop early detaches the iterator and leaves the interface open.
+{
+  const input = new PassThrough();
+  const rl = readline.createInterface({ input });
+  eq(rl[Symbol.asyncIterator](), rl[Symbol.asyncIterator](), "one iterator per interface");
+  input.write("start\nnext\n");
+  for await (const line of rl) {
+    if (line === "start") break;
+  }
+  eq(rl.closed, undefined, "break leaves the interface open");
+  eq(rl.listenerCount("line"), 0, "break removes the line listener");
+  const answer = new Promise((resolve) => rl.question("name? ", resolve));
+  input.write("Ada\n");
+  eq(await answer, "Ada", "questions after a loop ended early");
+  rl.close();
+}
+
+// The signal option.
+{
+  const controller = new AbortController();
+  const rl = readline.createInterface({ input: new PassThrough(), signal: controller.signal });
+  const closed = once(rl, "close");
+  controller.abort();
+  await closed;
+  eq(rl.closed, true, "aborting closes the interface");
+  const aborted = readline.createInterface({ input: new PassThrough(), signal: AbortSignal.abort() });
+  eq(aborted.closed, undefined, "an aborted signal closes the interface later");
+  await new Promise((resolve) => process.nextTick(resolve));
+  eq(aborted.closed, true, "an aborted signal closes the interface in a tick");
+  throws(() => readline.createInterface({ input: new PassThrough(), signal: 5 }), "ERR_INVALID_ARG_TYPE", "the signal option is validated");
+  readline.createInterface({ input: new PassThrough(), signal: 0 }).close();
+}
+
 // The promise API.
 {
   const input = new PassThrough();

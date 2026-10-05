@@ -7,13 +7,16 @@
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::{CallbackArgs, EmptyArgs};
+use js::function::{cast_payload, CallbackArgs, EmptyArgs};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::{CallArgs, Value};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
-use crate::errors::{validate_function, validate_plain_object, ErrorKind, NodeError, Thrown};
+use crate::errors::{
+    js_string, validate_function, validate_plain_object, ErrorKind, NodeError, Thrown,
+};
 use crate::inspect::{self, Compact, Getters, InspectOptions};
 
 /// `value` as `util.inspect` shows it with the current default options.
@@ -33,14 +36,6 @@ fn inspect_value(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<String, Ex
     options.sorted = true;
     options.getters = Getters::All;
     inspect::inspect(scope, value, options)
-}
-
-/// `String(value)`, which converts a symbol to its description.
-fn js_string(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<String, ExnThrown> {
-    if value.is_symbol() {
-        return Ok(inspect::symbol_to_string(scope, value));
-    }
-    String::from_jsval(scope, value, ()).map_err(|_| ExnThrown)
 }
 
 /// Whether `value` is an object whose `typeof` is `'object'`.
@@ -63,14 +58,6 @@ fn type_of(scope: &Scope<'_>, value: HandleValue<'_>) -> &'static str {
     }
 }
 
-/// Whether `value` is an `Error`.
-fn is_error(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
-    match Object::from_value(scope, *value) {
-        Ok(object) => inspect::is_error(scope, object),
-        Err(_) => Ok(false),
-    }
-}
-
 /// Whether `value` is a `RegExp`.
 fn is_regexp(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
     match Object::from_value(scope, *value) {
@@ -89,22 +76,17 @@ fn regexp_matches(
     Ok(!Function::call_by_name(scope, regexp.handle(), c"exec", &[text])?.is_null())
 }
 
-/// `value instanceof ctor`, `false` for a primitive `value`.
-fn instance_of(
-    scope: &Scope<'_>,
-    value: HandleValue<'_>,
-    ctor: Object<'_>,
-) -> Result<bool, ExnThrown> {
-    match Object::from_value(scope, *value) {
-        Ok(object) => inspect::instance_of(scope, object, ctor),
-        Err(_) => Ok(false),
+/// Whether the realm's `Error` constructor is in the prototype chain of `ctor`.
+fn derives_from_error(scope: &Scope<'_>, ctor: Object<'_>) -> Result<bool, ExnThrown> {
+    let error_ctor = crate::stack_trace::error_constructor(scope)?;
+    let mut current = ctor.get_prototype(scope)?;
+    while let Some(candidate) = current {
+        if candidate.as_raw() == error_ctor.as_raw() {
+            return Ok(true);
+        }
+        current = candidate.get_prototype(scope)?;
     }
-}
-
-/// The global `Error` constructor.
-fn error_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    Object::from_value(scope, *scope.global().get_property(scope, c"Error")?)
-        .map_err(|e| e.throw(scope))
+    Ok(false)
 }
 
 /// The UTF-16 length of `text`.
@@ -430,8 +412,8 @@ fn truncate_units(text: &str, count: usize) -> String {
     String::from_utf16_lossy(&units)
 }
 
-/// Throw `message` if it is an `Error`, as Node.js's `innerFail` does, and the `AssertionError`
-/// of `options` otherwise.
+/// Throw `message` if it is an `Error`, as Node.js's `innerFail` does, and a new `AssertionError`
+/// otherwise. `generated` overrides the error's `generatedMessage`.
 #[allow(clippy::too_many_arguments)]
 fn fail_with(
     scope: &Scope<'_>,
@@ -442,24 +424,14 @@ fn fail_with(
     generated: Option<bool>,
 ) -> Thrown {
     let message = message.filter(|message| !message.is_undefined());
-    if let Some(error) = message.filter(|message| is_error(scope, *message).unwrap_or(false)) {
-        js::exception::set_pending(
-            scope,
-            error,
-            js::native::ExceptionStackBehavior::DoNotCapture,
-        );
+    if let Some(error) = message.filter(|message| js::exception::is_error_object(scope, *message)) {
+        js::exception::throw_value(scope, error);
         return Thrown::Pending;
     }
     let build = || -> Result<HandleValue<'_>, ExnThrown> {
-        let options = Object::new_plain(scope)?;
-        if let Some(message) = message {
-            options.set_property(scope, c"message", message)?;
-        }
-        options.set_property(scope, c"actual", actual)?;
-        options.set_property(scope, c"expected", expected)?;
-        options.set_property(scope, c"operator", operator)?;
-        let ctor = assertion_error::class_constructor(scope)?;
-        let error = Function::construct(scope, ctor, &[options])?;
+        let operator = scope.root_value(js::JSString::from_str(scope, operator)?.as_value());
+        let message = message.unwrap_or(HandleValue::undefined());
+        let error = new_assertion_error(scope, message, actual, expected, operator, None)?;
         if let Some(generated) = generated {
             error.set_property(scope, c"generatedMessage", generated)?;
         }
@@ -573,12 +545,7 @@ fn comparison<'s>(
     keys: &[HandleValue<'_>],
     actual: Option<Object<'_>>,
 ) -> Result<Object<'s>, ExnThrown> {
-    let class = Function::new_callback(scope, c"Comparison", 0, comparison_constructor, ())?;
-    let proto = Object::new_plain(scope)?;
-    proto.define_property(scope, c"constructor", *class, 0)?;
-    class.set_property(scope, c"prototype", proto)?;
-    let result = Object::new_plain(scope)?;
-    result.set_prototype(scope, proto.handle())?;
+    let result = js::class::create_instance_with::<ComparisonImpl>(scope, |_| ComparisonImpl {})?;
     for key in keys {
         let id = scope.root_id(js::id::value_to_id(scope, *key)?);
         if !object.has_property_by_id(scope, id)? {
@@ -594,17 +561,15 @@ fn comparison<'s>(
         }
         result.set_property_by_id(scope, id, shown)?;
     }
-    Ok(result)
+    Ok(result.as_object())
 }
 
-/// The body of the `Comparison` constructor messages use.
-fn comparison_constructor(
-    _scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    Ok(js::value::undefined())
-}
+/// The class of the objects [`comparison`] creates, which shows their class name in messages.
+#[core_runtime::jsclass(name = "Comparison", hidden)]
+pub(crate) struct Comparison {}
+
+#[core_runtime::jsmethods]
+impl Comparison {}
 
 /// Node.js's `compareExceptionKey`.
 #[allow(clippy::too_many_arguments)]
@@ -717,21 +682,15 @@ fn expected_exception(
                 if key.is_symbol() {
                     continue;
                 }
-                let descriptor = Function::call_by_name(
-                    scope,
-                    expected_object.handle(),
-                    c"propertyIsEnumerable",
-                    &[key],
-                );
-                let enumerable = match descriptor {
-                    Ok(enumerable) => enumerable.is_boolean() && enumerable.to_boolean(),
-                    Err(ExnThrown) => return Err(Thrown::Pending),
-                };
-                if enumerable {
+                let id = scope.root_id(js::id::value_to_id(scope, key)?);
+                if expected_object
+                    .own_property_descriptor(scope, id)?
+                    .is_some_and(|property| property.enumerable)
+                {
                     keys.push(key);
                 }
             }
-            if instance_of(scope, expected, error_constructor(scope)?)? {
+            if crate::stack_trace::error_constructor(scope)?.instance_of(scope, expected)? {
                 keys.push(generated(scope, "name")?);
                 keys.push(generated(scope, "message")?);
             } else if keys.is_empty() {
@@ -765,28 +724,16 @@ fn expected_exception(
         }
     } else {
         let prototype = expected_object.get_property(scope, c"prototype")?;
-        if !prototype.is_undefined() && instance_of(scope, actual, expected_object)? {
+        if !prototype.is_undefined() && expected_object.instance_of(scope, actual)? {
             return Ok(());
         }
-        let error_ctor = error_constructor(scope)?;
-        let derived_from_error = {
-            let mut current = expected_object.get_prototype(scope)?;
-            let mut found = false;
-            while let Some(candidate) = current {
-                if candidate.as_raw() == error_ctor.as_raw() {
-                    found = true;
-                    break;
-                }
-                current = candidate.get_prototype(scope)?;
-            }
-            found
-        };
+        let derived_from_error = derives_from_error(scope, expected_object)?;
         let expected_name = js_string(scope, expected_object.get_property(scope, c"name")?)?;
         if derived_from_error {
             let mut text = format!(
                 "The error is expected to be an instance of \"{expected_name}\". Received "
             );
-            if is_error(scope, actual)? {
+            if js::exception::is_error_object(scope, actual) {
                 let actual_object =
                     Object::from_value(scope, *actual).map_err(|e| e.throw(scope))?;
                 let ctor = actual_object.get_property(scope, c"constructor")?;
@@ -836,7 +783,7 @@ fn expected_exception(
                 "The {name}validation function is expected to return \"true\". Received {}",
                 show(scope, result)?
             );
-            if is_error(scope, actual)? {
+            if js::exception::is_error_object(scope, actual) {
                 text.push_str(&format!(
                     "\n\nCaught error:\n\n{}",
                     js_string(scope, actual)?
@@ -975,16 +922,11 @@ fn has_matching_error(
         .into());
     };
     let prototype = expected_object.get_property(scope, c"prototype")?;
-    if !prototype.is_undefined() && instance_of(scope, actual, expected_object)? {
+    if !prototype.is_undefined() && expected_object.instance_of(scope, actual)? {
         return Ok(true);
     }
-    let error_ctor = error_constructor(scope)?;
-    let mut current = expected_object.get_prototype(scope)?;
-    while let Some(candidate) = current {
-        if candidate.as_raw() == error_ctor.as_raw() {
-            return Ok(false);
-        }
-        current = candidate.get_prototype(scope)?;
+    if derives_from_error(scope, expected_object)? {
+        return Ok(false);
     }
     let this = Object::new_plain(scope)?;
     let result = Function::call(scope, this, expected, &[actual])?;
@@ -1041,35 +983,44 @@ fn expects_no_error(
             None,
         ));
     }
-    js::exception::set_pending(
-        scope,
-        actual,
-        js::native::ExceptionStackBehavior::DoNotCapture,
-    );
+    js::exception::throw_value(scope, actual);
     Err(Thrown::Pending)
 }
 
-/// The body of `rejects`' and `doesNotReject`'s reaction to the awaited promise. The payload is
-/// `[result promise, expected, message, rejects, message given]`, and the reaction's first
-/// argument the outcome.
+/// The state of a `rejects` or `doesNotReject` call that awaits its target.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct RejectsState {
+    /// The promise the call returned.
+    result: Option<Heap<js::promise::Promise>>,
+    expected: Heap<Value>,
+    message: Option<Heap<Value>>,
+    /// Whether the call is `rejects`, not `doesNotReject`.
+    #[no_trace]
+    rejects: bool,
+}
+
+#[core_runtime::jsmethods]
+impl RejectsState {}
+
+/// The body of `rejects`' and `doesNotReject`'s reaction to the awaited promise, whose payload is
+/// a [`RejectsState`] and whose first argument is the outcome.
 fn settle_rejects(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
     rejected: bool,
 ) -> Result<Value, ExnThrown> {
-    let state = Object::from_value(scope, *payload).map_err(|e| e.throw(scope))?;
-    let result = Object::from_value(scope, *state.get_element(scope, 0)?)
-        .map_err(|e| e.throw(scope))?
-        .cast::<js::Promise>()
-        .map_err(|_| js::error::TypeError("the result is not a promise".into()).throw(scope))?;
-    let expected = state.get_element(scope, 1)?;
-    let message = state.get_element(scope, 2)?;
-    let rejects = state.get_element(scope, 3)?.to_boolean();
-    let message_given = state.get_element(scope, 4)?.to_boolean();
+    let state = cast_payload::<RejectsState>(scope, payload);
+    let (result, expected, message, rejects) = {
+        let data = state.data();
+        let result = data.result.as_ref().map(|result| result.get(scope));
+        let expected = data.expected.get(scope);
+        let message = data.message.as_ref().map(|message| message.get(scope));
+        (result, expected, message, data.rejects)
+    };
+    let result = result.ok_or(ExnThrown)?;
     let outcome = args.get(0);
     let expected = (!expected.is_undefined()).then_some(expected);
-    let message = message_given.then_some(message);
     let actual = rejected.then_some(outcome);
     let checked = if rejects {
         expects_error(scope, actual, expected, message, "rejects")
@@ -1166,29 +1117,83 @@ fn await_rejection<'s>(
             ));
         }
     };
-    let promise_ctor = Object::from_value(scope, *scope.global().get_property(scope, c"Promise")?)
-        .map_err(|e| e.throw(scope))?;
-    let awaited = Function::call_by_name(scope, promise_ctor.handle(), c"resolve", &[awaited])?;
-    let awaited = Object::from_value(scope, *awaited).map_err(|e| e.throw(scope))?;
-    let state = js::Array::with_contents(
-        scope,
-        &[
-            result.to_jsval_raw_throwing(scope)?,
-            expected.map_or(js::value::undefined(), |expected| expected.get()),
-            message.map_or(js::value::undefined(), |message| message.get()),
-            js::value::from_bool(rejects),
-            js::value::from_bool(message.is_some()),
-        ],
-    )?;
-    let on_fulfilled = Function::new_callback(scope, c"", 1, rejects_fulfilled, *state)?;
-    let on_rejected = Function::new_callback(scope, c"", 1, rejects_rejected, *state)?;
-    Function::call_by_name(
-        scope,
-        awaited.handle(),
-        c"then",
-        &[*on_fulfilled, *on_rejected],
-    )?;
+    let awaited = js::Promise::call_original_resolve(scope, awaited)?;
+    let state = js::class::create_instance_with::<RejectsStateImpl>(scope, |_| RejectsStateImpl {
+        result: Some(Heap::from(result)),
+        expected: Heap::from(expected.unwrap_or(HandleValue::undefined()).get()),
+        message: message.map(|message| Heap::from(message.get())),
+        rejects,
+    })?;
+    let on_fulfilled = Function::new_callback(scope, c"", 1, rejects_fulfilled, state)?;
+    let on_rejected = Function::new_callback(scope, c"", 1, rejects_rejected, state)?;
+    awaited.add_reactions(scope, Some(*on_fulfilled), Some(*on_rejected))?;
     Ok(result)
+}
+
+/// A new `AssertionError` with the prototype `proto`, or `AssertionError.prototype` if `proto` is
+/// `None`, without its `diff` property. Its message is `message` if that is neither `null` nor
+/// `undefined`, followed by a diff for the operators `deepStrictEqual`, `strictEqual` and
+/// `partialDeepStrictEqual`. Otherwise the message is generated from `actual`, `expected` and
+/// `operator`.
+fn assertion_error_without_diff<'s>(
+    scope: &'s Scope<'_>,
+    message: HandleValue<'_>,
+    actual: HandleValue<'_>,
+    expected: HandleValue<'_>,
+    operator: HandleValue<'_>,
+    proto: Option<Object<'_>>,
+) -> Result<Object<'s>, ExnThrown> {
+    let operator_text = if operator.is_undefined() {
+        "undefined".to_string()
+    } else {
+        js_string(scope, operator)?
+    };
+    let custom_diff = matches!(
+        operator_text.as_str(),
+        "deepStrictEqual" | "strictEqual" | "partialDeepStrictEqual"
+    );
+    let text = if !message.is_null() && !message.is_undefined() {
+        let message = js_string(scope, message)?;
+        if custom_diff {
+            create_err_diff(scope, actual, expected, &operator_text, Some(&message))?
+        } else {
+            message
+        }
+    } else {
+        generate_message(scope, actual, expected, &operator_text)?
+    };
+    let error = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &text)?;
+    let error = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
+    let proto = match proto {
+        Some(proto) => proto,
+        None => assertion_error::prototype_object(scope)?,
+    };
+    error.set_prototype(scope, proto.handle())?;
+    error.set_property(
+        scope,
+        c"generatedMessage",
+        !js::conversion::to_boolean(message),
+    )?;
+    error.define_property(scope, c"name", "AssertionError", 0)?;
+    error.set_property(scope, c"code", "ERR_ASSERTION")?;
+    error.set_property(scope, c"actual", actual)?;
+    error.set_property(scope, c"expected", expected)?;
+    error.set_property(scope, c"operator", operator)?;
+    Ok(error)
+}
+
+/// [`assertion_error_without_diff`], with its `diff` property.
+fn new_assertion_error<'s>(
+    scope: &'s Scope<'_>,
+    message: HandleValue<'_>,
+    actual: HandleValue<'_>,
+    expected: HandleValue<'_>,
+    operator: HandleValue<'_>,
+    proto: Option<Object<'_>>,
+) -> Result<Object<'s>, ExnThrown> {
+    let error = assertion_error_without_diff(scope, message, actual, expected, operator, proto)?;
+    error.set_property(scope, c"diff", "simple")?;
+    Ok(error)
 }
 
 #[core_runtime::jsfunction_class(name = "AssertionError", class_syntax)]
@@ -1204,6 +1209,10 @@ pub mod assertion_error {
         args: &CallArgs,
         options: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
+        if !args.is_constructing() {
+            let message = "Class constructor AssertionError cannot be invoked without 'new'";
+            return Err(js::error::TypeError(message.into()).throw(scope).into());
+        }
         let options = validate_plain_object(
             scope,
             options.unwrap_or(HandleValue::undefined()),
@@ -1214,62 +1223,37 @@ pub mod assertion_error {
         let actual = options.get_property(scope, c"actual")?;
         let expected = options.get_property(scope, c"expected")?;
         let operator = options.get_property(scope, c"operator")?;
-        let operator_text = if operator.is_undefined() {
-            "undefined".to_string()
-        } else {
-            js_string(scope, operator)?
-        };
-        let custom_diff = matches!(
-            operator_text.as_str(),
-            "deepStrictEqual" | "strictEqual" | "partialDeepStrictEqual"
-        );
-        let text = if !message.is_null() && !message.is_undefined() {
-            let message = js_string(scope, message)?;
-            if custom_diff {
-                create_err_diff(scope, actual, expected, &operator_text, Some(&message))?
-            } else {
-                message
+        let new_target = scope.root_value(args.new_target().get());
+        let proto = match Object::from_value(scope, *new_target) {
+            Ok(new_target) => {
+                Object::from_value(scope, *new_target.get_property(scope, c"prototype")?).ok()
             }
-        } else {
-            generate_message(scope, actual, expected, &operator_text)?
+            Err(_) => None,
         };
-        let error = Function::construct(scope, error_constructor(scope)?, &[text.as_str()])?;
-        let mut proto = None;
-        if args.is_constructing() {
-            let new_target = scope.root_value(args.new_target().get());
-            if let Ok(new_target) = Object::from_value(scope, *new_target) {
-                proto =
-                    Object::from_value(scope, *new_target.get_property(scope, c"prototype")?).ok();
-            }
-        }
-        let proto = match proto {
-            Some(proto) => proto,
-            None => Object::from_value(
-                scope,
-                *class_constructor(scope)?.get_property(scope, c"prototype")?,
-            )?,
-        };
-        error.set_prototype(scope, proto.handle())?;
-        let generated = !bool::from_jsval(scope, message, ()).unwrap_or(false);
-        error.set_property(scope, c"generatedMessage", generated)?;
-        error.set_property(scope, c"code", "ERR_ASSERTION")?;
-        error.set_property(scope, c"actual", actual)?;
-        error.set_property(scope, c"expected", expected)?;
-        error.set_property(scope, c"operator", operator)?;
-        error.set_property(scope, c"diff", "simple")?;
-        Ok(error)
+        Ok(new_assertion_error(
+            scope, message, actual, expected, operator, proto,
+        )?)
     }
 
-    /// Make `AssertionError.prototype` inherit from `Error.prototype`, with `name`
-    /// `AssertionError`.
+    /// `AssertionError.prototype.toString()`: `` `${name} [${code}]: ${message}` ``.
+    #[method(name = "toString")]
+    pub fn to_string(scope: &Scope<'_>, this: Object<'_>) -> Result<String, ExnThrown> {
+        let name = js_string(scope, this.get_property(scope, c"name")?)?;
+        let code = js_string(scope, this.get_property(scope, c"code")?)?;
+        let message = js_string(scope, this.get_property(scope, c"message")?)?;
+        Ok(format!("{name} [{code}]: {message}"))
+    }
+
+    /// Make `AssertionError` inherit from `Error`, and give it the `length` 1.
     #[setup]
     pub fn setup(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let error_ctor = error_constructor(scope)?;
+        let error_ctor = crate::stack_trace::error_constructor(scope)?;
         let error_proto = Object::from_value(scope, *error_ctor.get_property(scope, c"prototype")?)
             .map_err(|e| e.throw(scope))?;
         proto.set_prototype(scope, error_proto.handle())?;
         ctor.set_prototype(scope, error_ctor.handle())?;
-        proto.set_property(scope, c"name", "AssertionError")
+        let readonly = js::class_spec::JSPROP_READONLY as u32;
+        ctor.define_property(scope, c"length", 1, readonly)
     }
 }
 
@@ -1426,133 +1410,120 @@ fn check_match(
     ))
 }
 
-/// The context of a function `CallTracker.calls` tracks: a plain object with the tracked calls in
-/// `calls`, the expected count in `expected`, the function's name in `name` and an `Error` from the
-/// `calls` call in `stack`.
-fn tracker_context<'s>(
-    scope: &'s Scope<'_>,
+/// A function `CallTracker.calls` tracks: its calls as frozen `{ thisArg, arguments }` objects,
+/// the expected number of calls, its name, and an `Error` created by the `calls` call.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct CallTrackerContext {
+    calls: Vec<Heap<js::object::Object>>,
+    #[no_trace]
     expected: f64,
-    name: &str,
-) -> Result<Object<'s>, ExnThrown> {
-    let context = Object::new_plain(scope)?;
-    context.set_property(scope, c"calls", js::Array::new(scope, 0)?)?;
-    context.set_property(scope, c"expected", expected)?;
-    context.set_property(scope, c"name", name)?;
-    let error_class = scope.global().get_property(scope, c"Error")?;
-    let error_class = Object::from_value(scope, error_class).map_err(|e| e.throw(scope))?;
-    let stack = Function::construct(scope, error_class, js::function::EmptyArgs)?;
-    context.set_property(scope, c"stack", stack)?;
-    Ok(context)
+    #[no_trace]
+    name: String,
+    stack: Heap<Value>,
 }
 
-/// The `apply` trap of a tracked function's proxy, whose captures are `[context]`: record the
-/// call's `this` and a frozen copy of its arguments, then call the function.
+#[core_runtime::jsmethods]
+impl CallTrackerContext {}
+
+impl<'s> CallTrackerContext<'s> {
+    /// The calls as a frozen array.
+    fn frozen_calls<'r>(&self, scope: &'r Scope<'_>) -> Result<js::Array<'r>, ExnThrown> {
+        let calls: Vec<Object<'_>> = self
+            .data()
+            .calls
+            .iter()
+            .map(|call| call.get(scope))
+            .collect();
+        let array = js::Array::with_contents(scope, &calls)?;
+        array.freeze(scope)?;
+        Ok(array)
+    }
+
+    /// An object describing how the number of calls differs from the expected one, or `None` if
+    /// the function was called the expected number of times.
+    fn report<'r>(&self, scope: &'r Scope<'_>) -> Result<Option<Object<'r>>, ExnThrown> {
+        let (actual, expected, name, stack) = {
+            let data = self.data();
+            let stack = data.stack.get(scope);
+            (
+                data.calls.len() as f64,
+                data.expected,
+                data.name.clone(),
+                stack,
+            )
+        };
+        if actual == expected {
+            return Ok(None);
+        }
+        let report = Object::new_plain(scope)?;
+        let message = format!(
+            "Expected the {name} function to be executed {} time(s) but was executed {} time(s).",
+            crate::errors::number_to_string(expected),
+            crate::errors::number_to_string(actual),
+        );
+        report.set_property(scope, c"message", message.as_str())?;
+        report.set_property(scope, c"actual", actual)?;
+        report.set_property(scope, c"expected", expected)?;
+        report.set_property(scope, c"operator", name.as_str())?;
+        report.set_property(scope, c"stack", stack)?;
+        Ok(Some(report))
+    }
+}
+
+/// The `apply` trap of a tracked function's proxy, whose payload is its [`CallTrackerContext`]:
+/// record the call's `this` and a frozen copy of its arguments, then call the function.
 fn tracked_apply(
     scope: &Scope<'_>,
-    args: js::function::CallbackArgs<'_>,
+    args: CallbackArgs<'_>,
     payload: HandleValue,
-) -> Result<js::native::Value, ExnThrown> {
-    let context = crate::stream::Captures::of(scope, payload)?.obj(0)?;
+) -> Result<Value, ExnThrown> {
+    let context = cast_payload::<CallTrackerContext>(scope, payload);
     let target = args.get(0);
     let this = args.get(1);
-    let list = Object::from_value(scope, *args.get(2)).map_err(|e| e.throw(scope))?;
-    let object_ctor = scope.global().get_property(scope, c"Object")?;
-    let object_ctor = Object::from_value(scope, object_ctor).map_err(|e| e.throw(scope))?;
-    let copy = crate::stream::call_method(scope, list, c"slice", &[])?;
-    crate::stream::call_method(scope, object_ctor, c"freeze", &[copy])?;
+    let list = Object::from_value(scope, *args.get(2))
+        .map_err(|e| e.throw(scope))?
+        .cast::<js::Array>()
+        .map_err(|_| js::error::TypeError("the arguments are not an array".into()).throw(scope))?;
+    let arguments = list.to_vec(scope)?;
+    let copy = js::Array::with_contents(scope, &arguments)?;
+    copy.freeze(scope)?;
     let call = Object::new_plain(scope)?;
     call.set_property(scope, c"thisArg", this)?;
-    call.set_property(scope, c"arguments", copy)?;
-    crate::stream::call_method(
-        scope,
-        object_ctor,
-        c"freeze",
-        &[call.to_jsval_throwing(scope)?],
-    )?;
-    let calls = context.get_property(scope, c"calls")?;
-    let calls = Object::from_value(scope, *calls).map_err(|e| e.throw(scope))?;
-    crate::stream::call_method(scope, calls, c"push", &[call.to_jsval_throwing(scope)?])?;
-    let reflect = scope.global().get_property(scope, c"Reflect")?;
-    let reflect = Object::from_value(scope, reflect).map_err(|e| e.throw(scope))?;
-    let result =
-        crate::stream::call_method(scope, reflect, c"apply", &[target, this, args.get(2)])?;
+    call.set_property(scope, c"arguments", *copy)?;
+    call.freeze(scope)?;
+    context.data_mut().calls.push(Heap::from(call));
+    let result = Function::call(scope, this, target, &arguments[..])?;
     Ok(result.get())
 }
 
-/// The report of `context`: an object describing the mismatch, or `None` if the function was
-/// called the expected number of times.
-fn context_report<'s>(
-    scope: &'s Scope<'_>,
-    context: Object<'_>,
-) -> Result<Option<Object<'s>>, ExnThrown> {
-    let calls = context.get_property(scope, c"calls")?;
-    let calls = Object::from_value(scope, *calls).map_err(|e| e.throw(scope))?;
-    let actual = crate::stream::Props::num(&calls, scope, c"length")?;
-    let expected = crate::stream::Props::num(&context, scope, c"expected")?;
-    if actual == expected {
-        return Ok(None);
-    }
-    let name =
-        String::from_jsval(scope, context.get_property(scope, c"name")?, ()).unwrap_or_default();
-    let report = Object::new_plain(scope)?;
-    let message = format!(
-        "Expected the {name} function to be executed {} time(s) but was executed {} time(s).",
-        crate::errors::number_to_string(expected),
-        crate::errors::number_to_string(actual),
-    );
-    report.set_property(scope, c"message", message.as_str())?;
-    report.set_property(scope, c"actual", actual)?;
-    report.set_property(scope, c"expected", expected)?;
-    report.set_property(scope, c"operator", name.as_str())?;
-    report.set_property(scope, c"stack", context.get_property(scope, c"stack")?)?;
-    Ok(Some(report))
+/// A `CallTracker`: the contexts of the functions it tracks, and a `WeakMap` from each tracked
+/// function to its context. See <https://nodejs.org/api/assert.html#class-assertcalltracker>.
+#[core_runtime::jsclass(name = "CallTracker", hidden)]
+pub struct CallTracker {
+    checks: Vec<Heap<CallTrackerContextImpl>>,
+    tracked: Option<Heap<js::collections::weak_map::WeakMap>>,
 }
 
-/// <https://nodejs.org/api/assert.html#class-assertcalltracker>: a deprecated tracker of how
-/// often functions are called. Its state is the array of contexts in `_starlingChecks` and the
-/// `WeakMap` from tracked functions to contexts in `_starlingTracked`.
-#[core_runtime::jsfunction_class(name = "CallTracker", class_syntax)]
-pub mod call_tracker {
-    use super::*;
-
-    /// Emits DEP0173 the first time a tracker is created, as `util.deprecate` does.
+#[core_runtime::jsmethods(node_args)]
+impl CallTracker {
+    /// Emits DEP0173 the first time a tracker is created.
     #[constructor]
-    pub fn init(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        if !DEPRECATION_WARNED.replace(true) {
-            let process = scope.global().get_property(scope, c"process")?;
-            if let Ok(process) = Object::from_value(scope, process) {
-                crate::stream::call_method(
-                    scope,
-                    process,
-                    c"emitWarning",
-                    &[
-                        crate::stream::string(scope, "assert.CallTracker is deprecated.")?,
-                        crate::stream::string(scope, "DeprecationWarning")?,
-                        crate::stream::string(scope, "DEP0173")?,
-                    ],
-                )?;
-            }
-        }
-        this.define_property(scope, c"_starlingChecks", js::Array::new(scope, 0)?, 0)?;
-        let weak_map = scope.global().get_property(scope, c"WeakMap")?;
-        let weak_map = Object::from_value(scope, weak_map).map_err(|e| e.throw(scope))?;
-        let tracked = Function::construct(scope, weak_map, js::function::EmptyArgs)?;
-        this.define_property(scope, c"_starlingTracked", tracked, 0)
+    pub fn new(&self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
+        crate::process::deprecate_once(scope, "assert.CallTracker is deprecated.", "DEP0173")?;
+        let tracked = js::WeakMap::new(scope)?;
+        self.data_mut().tracked = Some(Heap::from(tracked));
+        Ok(())
     }
 
     /// <https://nodejs.org/api/assert.html#trackercallsfn-exact>
-    pub fn calls<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
-        function: Option<HandleValue<'s>>,
-        expected: Option<HandleValue<'s>>,
-    ) -> Result<HandleValue<'s>, Thrown> {
-        let process = scope.global().get_property(scope, c"process")?;
-        if Object::from_value(scope, process).is_ok_and(|process| {
-            process
-                .get_property(scope, c"_exiting")
-                .is_ok_and(|exiting| exiting.is_boolean() && exiting.to_boolean())
-        }) {
+    #[method(length = 1)]
+    pub fn calls<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+        function: Option<HandleValue<'r>>,
+        expected: Option<HandleValue<'r>>,
+    ) -> Result<Object<'r>, Thrown> {
+        if crate::process::exiting(scope)? {
             return Err(NodeError::new(
                 ErrorKind::Error,
                 "ERR_UNAVAILABLE_DURING_EXIT",
@@ -1567,114 +1538,84 @@ pub mod call_tracker {
         };
         let expected = match expected.filter(|expected| !expected.is_undefined()) {
             Some(expected) => {
-                crate::errors::validate_integer(scope, expected, "expected", 1.0, 4294967295.0)?;
-                expected.to_number()
+                crate::errors::validate_integer(scope, expected, "expected", 1.0, 4294967295.0)?
             }
             None => 1.0,
         };
         let function = match function {
             Some(function) => function,
-            None => {
-                let noop = Function::new_callback(scope, c"", 0, noop, ())?;
-                noop.to_jsval_throwing(scope)?
-            }
+            None => crate::support::noop_function(scope)?.to_jsval_throwing(scope)?,
         };
         let name = Object::from_value(scope, *function)
             .ok()
             .and_then(|function| function.get_property(scope, c"name").ok())
-            .and_then(|name| String::from_jsval(scope, name, ()).ok())
+            .and_then(|name| crate::support::rust_string(scope, name))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "calls".to_string());
-        let context = tracker_context(scope, expected, &name)?;
+        let stack = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, "")?;
+        let context = js::class::create_instance_with::<CallTrackerContextImpl>(scope, |_| {
+            CallTrackerContextImpl {
+                calls: Vec::new(),
+                expected,
+                name,
+                stack: Heap::from(stack.get()),
+            }
+        })?;
         let handler = Object::new_plain(scope)?;
         handler.set_prototype(scope, js::native::HandleObject::null())?;
-        let apply = crate::stream::closure(
-            scope,
-            3,
-            tracked_apply,
-            &[context.to_jsval_throwing(scope)?],
-        )?;
-        handler.set_property(scope, c"apply", apply)?;
-        let proxy_ctor = scope.global().get_property(scope, c"Proxy")?;
-        let proxy_ctor = Object::from_value(scope, proxy_ctor)?;
+        let apply = Function::new_callback(scope, c"", 3, tracked_apply, context)?;
+        handler.set_property(scope, c"apply", *apply)?;
+        let proxy = js::class::get_class_object(scope, js::class_spec::JSProtoKey::JSProto_Proxy)?;
+        let proxy = Object::from_handle(proxy).ok_or(ExnThrown)?;
         let tracked = Function::construct(
             scope,
-            proxy_ctor,
-            &[function, handler.to_jsval_throwing(scope)?],
+            proxy,
+            &[function.get(), handler.to_jsval_raw_throwing(scope)?],
         )?;
-        let checks = this.get_property(scope, c"_starlingChecks")?;
-        let checks = Object::from_value(scope, *checks)?;
-        crate::stream::call_method(scope, checks, c"push", &[context.to_jsval_throwing(scope)?])?;
-        let map = this.get_property(scope, c"_starlingTracked")?;
-        let map = Object::from_value(scope, *map)?;
-        crate::stream::call_method(
+        let map = {
+            let mut data = self.data_mut();
+            data.checks.push(Heap::from(context));
+            data.tracked.as_ref().map(|map| map.get(scope))
+        };
+        let map = map.ok_or(ExnThrown)?;
+        map.insert(
             scope,
-            map,
-            c"set",
-            &[
-                tracked.to_jsval_throwing(scope)?,
-                context.to_jsval_throwing(scope)?,
-            ],
+            tracked.to_jsval_throwing(scope)?,
+            context.to_jsval_throwing(scope)?,
         )?;
-        Ok(tracked.to_jsval_throwing(scope)?)
+        Ok(tracked)
     }
 
     /// <https://nodejs.org/api/assert.html#trackergetcallsfn>
-    pub fn get_calls<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
+    #[method]
+    pub fn get_calls<'r>(
+        &self,
+        scope: &'r Scope<'_>,
         tracked: HandleValue<'_>,
-    ) -> Result<HandleValue<'s>, Thrown> {
-        let context = tracked_context(scope, this, tracked)?;
-        let calls = context.get_property(scope, c"calls")?;
-        let calls = Object::from_value(scope, *calls)?;
-        let copy = crate::stream::call_method(scope, calls, c"slice", &[])?;
-        let object_ctor = scope.global().get_property(scope, c"Object")?;
-        let object_ctor = Object::from_value(scope, object_ctor)?;
-        Ok(crate::stream::call_method(
-            scope,
-            object_ctor,
-            c"freeze",
-            &[copy],
-        )?)
+    ) -> Result<js::Array<'r>, Thrown> {
+        Ok(self.context(scope, tracked)?.frozen_calls(scope)?)
     }
 
     /// <https://nodejs.org/api/assert.html#trackerreport>
-    pub fn report<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<Object<'s>, ExnThrown> {
-        let checks = this.get_property(scope, c"_starlingChecks")?;
-        let checks = Object::from_value(scope, *checks).map_err(|e| e.throw(scope))?;
-        let length = crate::stream::Props::num(&checks, scope, c"length")? as u32;
-        let mut reports = Vec::new();
-        for index in 0..length {
-            let context = Object::from_value(scope, *checks.get_element(scope, index)?)
-                .map_err(|e| e.throw(scope))?;
-            if let Some(report) = context_report(scope, context)? {
-                reports.push(report.to_jsval_throwing(scope)?);
+    #[method]
+    pub fn report<'r>(&self, scope: &'r Scope<'_>) -> Result<js::Array<'r>, ExnThrown> {
+        let mut reports: Vec<Object<'r>> = Vec::new();
+        for context in self.contexts(scope) {
+            if let Some(report) = context.report(scope)? {
+                reports.push(report);
             }
         }
-        Ok(*js::Array::with_contents(scope, &reports)?)
+        js::Array::with_contents(scope, &reports)
     }
 
     /// <https://nodejs.org/api/assert.html#trackerresetfn>
-    pub fn reset(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        tracked: Option<HandleValue<'_>>,
-    ) -> Result<(), Thrown> {
-        let reset = |context: Object<'_>| -> Result<(), ExnThrown> {
-            context.set_property(scope, c"calls", js::Array::new(scope, 0)?)
-        };
+    #[method(length = 1)]
+    pub fn reset(&self, scope: &Scope<'_>, tracked: Option<HandleValue<'_>>) -> Result<(), Thrown> {
         match tracked.filter(|tracked| !tracked.is_undefined()) {
-            Some(tracked) => reset(tracked_context(scope, this, tracked)?)?,
+            Some(tracked) => self.context(scope, tracked)?.data_mut().calls.clear(),
             None => {
-                let checks = this.get_property(scope, c"_starlingChecks")?;
-                let checks = Object::from_value(scope, *checks)?;
-                let length = crate::stream::Props::num(&checks, scope, c"length")? as u32;
-                for index in 0..length {
-                    reset(Object::from_value(
-                        scope,
-                        *checks.get_element(scope, index)?,
-                    )?)?;
+                for context in self.contexts(scope) {
+                    context.data_mut().calls.clear();
                 }
             }
         }
@@ -1682,30 +1623,26 @@ pub mod call_tracker {
     }
 
     /// <https://nodejs.org/api/assert.html#trackerverify>
-    pub fn verify(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
-        let reports = report(scope, this)?;
-        let length = crate::stream::Props::num(&reports, scope, c"length")? as u32;
-        if length == 0 {
-            return Ok(());
+    #[method]
+    pub fn verify(&self, scope: &Scope<'_>) -> Result<(), Thrown> {
+        let mut reports = Vec::new();
+        for context in self.contexts(scope) {
+            if let Some(report) = context.report(scope)? {
+                reports.push(report);
+            }
         }
-        let message = if length == 1 {
-            let first = Object::from_value(scope, *reports.get_element(scope, 0)?)?;
-            first.get_property(scope, c"message")?
-        } else {
-            crate::stream::string(
+        let message = match reports.as_slice() {
+            [] => return Ok(()),
+            [report] => report.get_property(scope, c"message")?,
+            _ => js::class::get_or_init_atom(
                 scope,
-                "Functions were not called the expected number of times",
-            )?
+                c"Functions were not called the expected number of times",
+            )?,
         };
-        let options = Object::new_plain(scope)?;
-        options.set_property(scope, c"message", message)?;
-        let class = assertion_error::class_constructor(scope)?;
-        let error = Function::construct(scope, class, &[options.to_jsval_throwing(scope)?])?;
-        for name in [c"actual", c"expected", c"operator"] {
-            error.set_property(scope, name, js::value::undefined())?;
-        }
-        for index in 0..length {
-            let report = Object::from_value(scope, *reports.get_element(scope, index)?)?;
+        let undefined = HandleValue::undefined();
+        let error =
+            assertion_error_without_diff(scope, message, undefined, undefined, undefined, None)?;
+        for (index, report) in reports.iter().enumerate() {
             for (field, key) in [
                 ("message", c"message"),
                 ("actual", c"actual"),
@@ -1718,42 +1655,61 @@ pub mod call_tracker {
                 error.set_property_by_name(scope, &name, report.get_property(scope, key)?)?;
             }
         }
+        error.set_property(scope, c"diff", "simple")?;
         js::exception::set_pending(
             scope,
             error.to_jsval_throwing(scope)?,
-            js::native::ExceptionStackBehavior::DoNotCapture,
+            js::native::ExceptionStackBehavior::Capture,
         );
         Err(Thrown::Pending)
     }
 }
 
-/// The context of the function `tracked` that `CallTracker` `this` tracks, or
-/// `ERR_INVALID_ARG_VALUE` if it tracks no such function.
-fn tracked_context<'s>(
-    scope: &'s Scope<'_>,
-    this: Object<'_>,
-    tracked: HandleValue<'_>,
-) -> Result<Object<'s>, Thrown> {
-    let map = this.get_property(scope, c"_starlingTracked")?;
-    let map = Object::from_value(scope, *map)?;
-    let context = crate::stream::call_method(scope, map, c"get", &[tracked])?;
-    Object::from_value(scope, *context).map_err(|_| {
-        NodeError::invalid_arg_value(scope, "tracked", tracked, "is not a tracked function").into()
-    })
+impl<'s> CallTracker<'s> {
+    /// The contexts of the tracked functions.
+    fn contexts<'r>(&self, scope: &'r Scope<'_>) -> Vec<CallTrackerContext<'r>> {
+        self.data()
+            .checks
+            .iter()
+            .map(|context| context.get(scope))
+            .collect()
+    }
+
+    /// The context of the tracked function `tracked`, or `ERR_INVALID_ARG_VALUE` if this tracker
+    /// doesn't track it.
+    fn context<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+        tracked: HandleValue<'_>,
+    ) -> Result<CallTrackerContext<'r>, Thrown> {
+        let map = self.data().tracked.as_ref().map(|map| map.get(scope));
+        let map = map.ok_or(ExnThrown)?;
+        let context = if tracked.is_object() {
+            map.lookup(scope, scope.root_value(tracked.get()))?
+        } else {
+            HandleValue::undefined()
+        };
+        if context.is_undefined() {
+            return Err(NodeError::invalid_arg_value(
+                scope,
+                "tracked",
+                tracked,
+                "is not a tracked function",
+            )
+            .into());
+        }
+        Ok(cast_payload::<CallTrackerContext>(scope, context))
+    }
 }
 
-/// The function `CallTracker.calls` tracks when given none.
-fn noop(
-    _scope: &Scope<'_>,
-    _args: js::function::CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<js::native::Value, ExnThrown> {
-    Ok(js::value::undefined())
-}
-
-js::instance_local! {
-    /// Set once a `CallTracker` was created, and DEP0173 emitted.
-    static DEPRECATION_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Register the classes of `node:assert`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
+    assertion_error::register(scope)?;
+    Comparison::add_to_global(scope, global);
+    RejectsState::add_to_global(scope, global);
+    CallTrackerContext::add_to_global(scope, global);
+    CallTracker::add_to_global(scope, global);
+    Ok(())
 }
 
 #[core_runtime::jsmodule(node_args, name = "node:assert", default = "ok")]
@@ -1761,7 +1717,7 @@ pub mod module {
     use super::*;
 
     pub use super::assertion_error as AssertionError;
-    pub use super::call_tracker as CallTracker;
+    pub use super::CallTracker;
 
     /// <https://nodejs.org/api/assert.html#assertokvalue-message>
     pub fn ok(
@@ -1773,6 +1729,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertequalactual-expected-message>
+    #[function(length = 3)]
     pub fn equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1783,6 +1740,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertnotequalactual-expected-message>
+    #[function(length = 3)]
     pub fn not_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1793,6 +1751,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertstrictequalactual-expected-message>
+    #[function(length = 3)]
     pub fn strict_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1803,6 +1762,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertnotstrictequalactual-expected-message>
+    #[function(length = 3)]
     pub fn not_strict_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1813,6 +1773,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertdeepequalactual-expected-message>
+    #[function(length = 3)]
     pub fn deep_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1823,6 +1784,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertnotdeepequalactual-expected-message>
+    #[function(length = 3)]
     pub fn not_deep_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1833,6 +1795,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertdeepstrictequalactual-expected-message>
+    #[function(length = 3)]
     pub fn deep_strict_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1843,6 +1806,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertnotdeepstrictequalactual-expected-message>
+    #[function(length = 3)]
     pub fn not_deep_strict_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1893,11 +1857,13 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertfailmessage>
+    #[function(length = 5)]
     pub fn fail(scope: &Scope<'_>, message: Option<HandleValue<'_>>) -> Result<(), Thrown> {
         assert_fail(scope, message)
     }
 
     /// <https://nodejs.org/api/assert.html#assertmatchstring-regexp-message>
+    #[function(length = 3)]
     pub fn r#match(
         scope: &Scope<'_>,
         string: HandleValue<'_>,
@@ -1908,6 +1874,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/assert.html#assertdoesnotmatchstring-regexp-message>
+    #[function(length = 3)]
     pub fn does_not_match(
         scope: &Scope<'_>,
         string: HandleValue<'_>,
@@ -1928,7 +1895,7 @@ pub mod strict {
     use super::*;
 
     pub use super::assertion_error as AssertionError;
-    pub use super::call_tracker as CallTracker;
+    pub use super::CallTracker;
 
     /// <https://nodejs.org/api/assert.html#assertokvalue-message>
     pub fn ok(
@@ -1940,6 +1907,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertequalactual-expected-message>
+    #[function(length = 3)]
     pub fn equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1950,6 +1918,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertnotequalactual-expected-message>
+    #[function(length = 3)]
     pub fn not_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1960,6 +1929,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertstrictequalactual-expected-message>
+    #[function(length = 3)]
     pub fn strict_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1970,6 +1940,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertnotstrictequalactual-expected-message>
+    #[function(length = 3)]
     pub fn not_strict_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1980,6 +1951,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertdeepequalactual-expected-message>
+    #[function(length = 3)]
     pub fn deep_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -1990,6 +1962,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertnotdeepequalactual-expected-message>
+    #[function(length = 3)]
     pub fn not_deep_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -2000,6 +1973,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertdeepstrictequalactual-expected-message>
+    #[function(length = 3)]
     pub fn deep_strict_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -2010,6 +1984,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertnotdeepstrictequalactual-expected-message>
+    #[function(length = 3)]
     pub fn not_deep_strict_equal(
         scope: &Scope<'_>,
         actual: HandleValue<'_>,
@@ -2060,11 +2035,13 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertfailmessage>
+    #[function(length = 5)]
     pub fn fail(scope: &Scope<'_>, message: Option<HandleValue<'_>>) -> Result<(), Thrown> {
         assert_fail(scope, message)
     }
 
     /// <https://nodejs.org/api/assert.html#assertmatchstring-regexp-message>
+    #[function(length = 3)]
     pub fn r#match(
         scope: &Scope<'_>,
         string: HandleValue<'_>,
@@ -2075,6 +2052,7 @@ pub mod strict {
     }
 
     /// <https://nodejs.org/api/assert.html#assertdoesnotmatchstring-regexp-message>
+    #[function(length = 3)]
     pub fn does_not_match(
         scope: &Scope<'_>,
         string: HandleValue<'_>,

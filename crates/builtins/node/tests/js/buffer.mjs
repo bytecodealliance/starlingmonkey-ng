@@ -34,6 +34,11 @@ eq(Buffer.from([0xff, 0xfe]).toString("utf8"), "��", "invalid UTF-8 is repla
 eq(Buffer.from("😀").length, 4, "astral characters");
 deepEq([...Buffer.from([1, 2, 300, -1])], [1, 2, 44, 255], "from(array) wraps bytes");
 deepEq([...Buffer.from({ length: 2, 0: 7, 1: 8 })], [7, 8], "from(array-like)");
+deepEq([...Buffer.from({ length: 3, 0: 257, 1: "3" })], [1, 3, 0], "from(array-like) converts the elements");
+const sparseList = [];
+sparseList.length = 2 ** 32 - 1;
+throws(() => Buffer.concat(sparseList), "ERR_INVALID_ARG_TYPE", "concat of a long sparse array");
+eq(Buffer.alloc(5, "ab").toString(), "ababa", "alloc with a fill");
 deepEq([...Buffer.from(Buffer.from([1, 2]).toJSON())], [1, 2], "from(toJSON())");
 const arrayBuffer = new ArrayBuffer(8);
 const shared = Buffer.from(arrayBuffer, 2, 4);
@@ -84,6 +89,31 @@ eq(haystack.indexOf(Buffer.from("a b")), 8, "indexOf buffer");
 eq(haystack.indexOf(0x62), 10, "indexOf number");
 eq(haystack.includes("buffer") && !haystack.includes("nope"), true, "includes");
 deepEq(Buffer.from("ab").toJSON(), { type: "Buffer", data: [97, 98] }, "toJSON");
+
+// The `*Write` methods. UTF-8, Latin-1 and ASCII check the range of `offset` and `length` before
+// truncating them, and the others clamp `length` and reject a negative index, as Node.js does.
+const writeResult = (method, text, ...args) => {
+  const target = Buffer.alloc(4);
+  try {
+    return [target[method](text, ...args), target.toString("hex")];
+  } catch (error) {
+    return [error.code, error.message];
+  }
+};
+const outOfBounds = (name) => ["ERR_BUFFER_OUT_OF_BOUNDS", `"${name}" is outside of buffer bounds`];
+deepEq(writeResult("utf8Write", "abc", 0, 100), outOfBounds("length"), "utf8Write rejects a long length");
+deepEq(writeResult("utf8Write", "abc", NaN), [0, "00000000"], "utf8Write with a NaN offset writes nothing");
+deepEq(writeResult("latin1Write", "abc", -0.5), outOfBounds("offset"), "latin1Write checks offsets before truncating");
+deepEq(writeResult("asciiWrite", "abc", 1.7, 1.9), [1, "00610000"], "asciiWrite truncates");
+deepEq(writeResult("base64Write", "YWJj", 0, 100), [3, "61626300"], "base64Write clamps the length");
+deepEq(writeResult("hexWrite", "616263", 1, Infinity), [3, "00616263"], "hexWrite clamps an infinite length");
+deepEq(writeResult("ucs2Write", "ab", 0, 100), [4, "61006200"], "ucs2Write clamps the length");
+deepEq(writeResult("hexWrite", "6162", -1), ["ERR_OUT_OF_RANGE", "Index out of range"], "hexWrite rejects a negative offset");
+deepEq(writeResult("base64urlWrite", "YWJj", 0, -1), ["ERR_OUT_OF_RANGE", "Index out of range"], "base64urlWrite rejects a negative length");
+deepEq(writeResult("hexWrite", "6162", 5), outOfBounds("offset"), "hexWrite rejects an offset past the end");
+deepEq(writeResult("utf8Write", 5, -1), outOfBounds("offset"), "utf8Write checks the range before the string");
+deepEq(writeResult("hexWrite", 5, -1), ["ERR_INVALID_ARG_TYPE", "argument must be a string"], "hexWrite checks the string first");
+deepEq(writeResult("write", 5), ["ERR_INVALID_ARG_TYPE", "argument must be a string"], "write of a number");
 deepEq([...Buffer.from([1, 2, 3, 4]).swap16()], [2, 1, 4, 3], "swap16");
 throws(() => Buffer.from([1, 2, 3]).swap16(), "ERR_INVALID_BUFFER_SIZE", "swap16 size");
 

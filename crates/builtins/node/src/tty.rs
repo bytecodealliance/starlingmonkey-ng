@@ -3,8 +3,8 @@
 //! `node:tty`'s `isatty`, and `ReadStream`, which `process.stdin` is. See
 //! <https://nodejs.org/api/tty.html>.
 //!
-//! A `ReadStream` for descriptor 0 reads standard input through `platform::process::Stdin`. It
-//! reads only while it flows or has `readable` listeners, and pausing it cancels the read in
+//! A `ReadStream` is a `net.Socket` that reads standard input through `platform::process::Stdin`.
+//! It reads only while it flows or has `readable` listeners, and pausing it cancels the read in
 //! progress, so a paused `process.stdin` doesn't keep the event loop running.
 
 use std::io::IsTerminal;
@@ -12,15 +12,14 @@ use std::io::IsTerminal;
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
-use js::gc::handle::RootedHeap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
-use js::promise::{PromiseFuture, PromiseOutcome};
 use js::{Function, Object};
 
 use crate::errors::{ErrorKind, NodeError, Thrown};
-use crate::stream::{call_method, closure, string, Captures, Props};
+use crate::net::socket::{Link, SocketState};
+use crate::support::{spawn_cancellable, until_cancelled, Canceller};
 
 /// Whether `fd` is a standard stream connected to a terminal.
 fn is_terminal(fd: f64) -> bool {
@@ -32,204 +31,178 @@ fn is_terminal(fd: f64) -> bool {
     }
 }
 
-/// The standard input of a `ReadStream`, which a read in progress takes.
-#[core_runtime::jsclass(hidden)]
-pub struct StdinHandle {
-    #[no_trace]
+/// The standard input of a `ReadStream`, opened on the first read, which a read in progress
+/// takes, and the cancellation of that read.
+#[derive(Default)]
+pub(crate) struct StdinLink {
     stdin: Option<platform::process::Stdin>,
-    /// Cancels the read in progress.
-    #[no_trace]
-    cancel: Option<futures_channel::oneshot::Sender<()>>,
+    /// Whether standard input was opened, so a missing `stdin` is held by the read in progress.
+    opened: bool,
+    cancel: Option<Canceller>,
+    /// Whether `unref` was called, so the stream doesn't read until `ref` is.
+    unref: bool,
 }
 
-#[core_runtime::jsmethods]
-impl StdinHandle {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
-    }
-}
-
-/// The standard input handle of `stream`, created on first use.
-fn handle_of<'s>(scope: &'s Scope<'_>, stream: Object<'_>) -> Result<StdinHandle<'s>, ExnThrown> {
-    if let Some(handle) = stream.obj(scope, c"_starlingStdin")? {
-        if let Ok(handle) = handle.cast::<StdinHandle>() {
-            return Ok(handle);
-        }
-    }
-    let handle = js::class::create_instance_with::<StdinHandleImpl>(scope, |_| StdinHandleImpl {
-        stdin: Some(platform::process::Stdin::open()),
-        cancel: None,
-    })?;
-    stream.define_property(
-        scope,
-        c"_starlingStdin",
-        handle.to_jsval_throwing(scope)?,
-        0,
-    )?;
-    Ok(handle)
+/// The state of the `ReadStream` `stream`.
+fn state_of<'s>(scope: &'s Scope<'_>, stream: Object<'s>) -> Result<SocketState<'s>, ExnThrown> {
+    crate::net::socket::socket_class::state_of(scope, stream)
 }
 
 /// Whether `stream` is to be read: it flows, or has `readable` listeners.
 fn should_read(scope: &Scope<'_>, stream: Object<'_>) -> Result<bool, ExnThrown> {
-    if stream.flag(scope, c"readableFlowing")? {
+    let flowing = crate::stream::state::ReadableSide::try_of(scope, stream)?
+        .is_some_and(|side| side.get().flowing == Some(true));
+    if flowing {
         return Ok(true);
     }
-    let listeners = call_method(
-        scope,
-        stream,
-        c"listenerCount",
-        &[string(scope, "readable")?],
-    )?;
-    Ok(listeners.to_number() > 0.0)
+    let readable = js::class::get_or_init_atom(scope, c"readable")?;
+    Ok(crate::events::listener_count(scope, stream, readable)? > 0.0)
 }
 
-/// The fulfillment reaction of a read, whose captures are `[stream]`: push the `Buffer` read, or
-/// `null` at the end. A cancelled read is fulfilled with `undefined`. Unless the input ended, a
-/// read requested while this one held standard input is started now.
-fn on_read(
+/// Set whether a read waits until the stream can read.
+fn set_pending(state: &SocketState<'_>, pending: bool) {
+    state.data_mut().read_pending = pending;
+}
+
+/// The completion of a read: push the `Buffer` read, or `null` at the end, or destroy the
+/// stream with the error. A cancelled read pushes nothing. Unless the input ended, a read
+/// requested while this one held standard input is started now.
+fn read_done(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    let outcome = args.get(0);
+    stream: Object<'_>,
+    result: Result<HandleValue<'_>, HandleValue<'_>>,
+) -> Result<(), ExnThrown> {
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            Function::call_by_name(scope, stream.handle(), c"destroy", &[error])?;
+            return Ok(());
+        }
+    };
     if !outcome.is_undefined() {
-        call_method(scope, stream, c"push", &[outcome])?;
+        Function::call_by_name(scope, stream.handle(), c"push", &[outcome])?;
     }
-    if !outcome.is_null()
-        && !stream.flag(scope, c"destroyed")?
-        && stream.flag(scope, c"_starlingReadPending")?
-        && should_read(scope, stream)?
-    {
-        start_read(scope, stream)?;
+    if outcome.is_null() {
+        return Ok(());
     }
-    Ok(js::value::undefined())
-}
-
-/// The rejection reaction of a read, whose captures are `[stream]`: destroy the stream with the
-/// error.
-fn on_read_error(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    call_method(scope, stream, c"destroy", &[args.get(0)])?;
-    Ok(js::value::undefined())
+    let state = state_of(scope, stream)?;
+    let pending = state.data().read_pending && !state.data().destroyed();
+    if pending && should_read(scope, stream)? {
+        start_read(scope, stream, &state)?;
+    }
+    Ok(())
 }
 
 /// Read the next bytes of standard input into `stream`. While `stream` is unreferenced, or a
 /// cancelled read still holds standard input, the read is marked pending instead.
-fn start_read(scope: &Scope<'_>, stream: Object<'_>) -> Result<(), ExnThrown> {
-    if stream.flag(scope, c"_starlingUnref")? {
-        return stream.set_property(scope, c"_starlingReadPending", true);
-    }
-    stream.set_property(scope, c"_starlingReadPending", false)?;
-    let handle = handle_of(scope, stream)?;
-    let (sender, cancelled) = futures_channel::oneshot::channel();
-    let Some(mut stdin) = ({
-        let mut state = handle.data_mut();
-        let stdin = state.stdin.take();
-        if stdin.is_some() {
-            state.cancel = Some(sender);
-        }
-        stdin
-    }) else {
-        return stream.set_property(scope, c"_starlingReadPending", true);
-    };
-    let target = RootedHeap::<js::object::Object>::new(*handle);
-    let future = async move {
-        let read = async { Some(stdin.read().await) };
-        let cancel = async {
-            let _ = cancelled.await;
-            None
+fn start_read(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    state: &SocketState<'_>,
+) -> Result<(), ExnThrown> {
+    let stdin = {
+        let mut data = state.data_mut();
+        let Link::Stdin(link) = &mut data.link else {
+            return Ok(());
         };
-        let result = futures_lite::future::or(read, cancel).await;
-        PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
-            if let Ok(handle) = target.get(scope).cast::<StdinHandle>() {
-                let mut state = handle.data_mut();
-                state.cancel = None;
-                state.stdin = Some(stdin);
+        if link.unref {
+            None
+        } else if !link.opened {
+            link.opened = true;
+            Some(platform::process::Stdin::open())
+        } else {
+            link.stdin.take()
+        }
+    };
+    let Some(mut stdin) = stdin else {
+        set_pending(state, true);
+        return Ok(());
+    };
+    set_pending(state, false);
+    let canceller = spawn_cancellable(
+        scope,
+        stream,
+        |cancelled| async move {
+            let result = until_cancelled(cancelled, stdin.read()).await;
+            Some((stdin, result))
+        },
+        |scope, stream, (stdin, result)| {
+            let state = state_of(scope, stream)?;
+            if let Link::Stdin(link) = &mut state.data_mut().link {
+                link.cancel = None;
+                link.stdin = Some(stdin);
             }
             match result {
-                None => Ok(scope.root_value(js::value::undefined())),
+                None => Ok(HandleValue::undefined()),
                 Some(Ok(Some(bytes))) => {
                     crate::buffer::new_buffer(scope, &bytes)?.to_jsval_throwing(scope)
                 }
-                Some(Ok(None)) => Ok(scope.root_value(js::value::null())),
+                Some(Ok(None)) => Ok(HandleValue::null()),
                 Some(Err(error)) => Err(crate::fs::UvError::new(error, "read").throw(scope)),
             }
-        }))
-    };
-    let promise = js::Promise::new_pending(scope)?;
-    promise.spawn(PromiseFuture::new(future));
-    let on_read = closure(scope, 1, on_read, &[stream.to_jsval_raw_throwing(scope)?])?;
-    let on_error = closure(
-        scope,
-        1,
-        on_read_error,
-        &[stream.to_jsval_raw_throwing(scope)?],
+        },
+        read_done,
     )?;
-    promise.then(scope, Some(on_read), Some(on_error))?;
-    Ok(())
-}
-
-/// Cancel the read in progress of `stream`, if any.
-fn cancel_read(scope: &Scope<'_>, stream: Object<'_>) -> Result<(), ExnThrown> {
-    if let Some(handle) = stream
-        .obj(scope, c"_starlingStdin")?
-        .and_then(|handle| handle.cast::<StdinHandle>().ok())
-    {
-        if let Some(cancel) = handle.data_mut().cancel.take() {
-            let _ = cancel.send(());
-            stream.set_property(scope, c"_starlingReadPending", true)?;
-        }
+    if let Link::Stdin(link) = &mut state.data_mut().link {
+        link.cancel = Some(canceller);
     }
     Ok(())
 }
 
-/// The `pause` listener of a `ReadStream`, whose captures are `[stream]`: cancel the read in
+/// Cancel the read in progress of the stream of `state`, if any, so a read starts again once the
+/// stream can read.
+fn cancel_read(state: &SocketState<'_>) {
+    let cancelled = match &mut state.data_mut().link {
+        Link::Stdin(link) => link.cancel.take().is_some(),
+        _ => false,
+    };
+    if cancelled {
+        set_pending(state, true);
+    }
+}
+
+/// The `pause` listener of a `ReadStream`, whose `this` is the stream: cancel the read in
 /// progress.
 fn on_pause(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    cancel_read(scope, Captures::of(scope, payload)?.obj(0)?)?;
+    let stream = crate::support::this_object(scope, &args)?;
+    if let Some(state) = crate::net::socket::socket_class::try_state_of(scope, stream)? {
+        cancel_read(&state);
+    }
     Ok(js::value::undefined())
 }
 
-/// The `resume` listener of a `ReadStream`, whose captures are `[stream]`: start the read `_read`
+/// The `resume` listener of a `ReadStream`, whose `this` is the stream: start the read `_read`
 /// deferred while the stream was paused.
 fn on_resume(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    if stream.flag(scope, c"_starlingReadPending")? {
-        start_read(scope, stream)?;
+    let stream = crate::support::this_object(scope, &args)?;
+    if let Some(state) = crate::net::socket::socket_class::try_state_of(scope, stream)? {
+        if state.data().read_pending {
+            start_read(scope, stream, &state)?;
+        }
     }
     Ok(js::value::undefined())
 }
 
 #[core_runtime::jsfunction_class(
     name = "ReadStream",
-    extends = "crate::stream::readable_class",
+    extends = "crate::net::socket::socket_class",
     self_construct
 )]
 pub mod read_stream_class {
     use super::*;
 
-    /// <https://nodejs.org/api/tty.html#class-ttyreadstream>: a stream of the descriptor `fd`.
-    /// A value that isn't an integer from 0 to 2**31 - 1 is `ERR_INVALID_FD`. Only descriptor 0,
-    /// standard input, can be read.
-    #[constructor]
+    /// <https://nodejs.org/api/tty.html#class-ttyreadstream>: a socket that reads the
+    /// descriptor `fd`. A value that isn't an integer from 0 to 2**31 - 1 is `ERR_INVALID_FD`.
+    /// Only descriptor 0, standard input, can be read.
+    #[constructor(length = 2)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -241,61 +214,36 @@ pub mod read_stream_class {
                 NodeError::not_implemented("ReadStream for descriptors other than 0").into(),
             );
         }
-        crate::stream::readable_class::init(scope, this, None)?;
+        let options = Object::new_plain(scope)?;
+        options.set_property(scope, c"writable", false)?;
+        crate::net::socket::socket_class::init(
+            scope,
+            this,
+            Some(options.to_jsval_throwing(scope)?),
+        )?;
+        state_of(scope, this)?.data_mut().link = Link::Stdin(StdinLink::default());
         this.set_property(scope, c"fd", fd)?;
         // Node.js's standard input has `isTTY` only when it is a terminal.
         if is_terminal(fd) {
             this.set_property(scope, c"isTTY", true)?;
         }
         this.set_property(scope, c"isRaw", false)?;
-        this.set_property(scope, c"_starlingReadPending", false)?;
-        this.set_property(scope, c"_starlingUnref", false)?;
-        let pause = closure(
-            scope,
-            0,
-            super::on_pause,
-            &[this.to_jsval_raw_throwing(scope)?],
-        )?;
-        call_method(
-            scope,
-            this,
-            c"on",
-            &[string(scope, "pause")?, pause.to_jsval_throwing(scope)?],
-        )?;
-        let resume = closure(
-            scope,
-            0,
-            super::on_resume,
-            &[this.to_jsval_raw_throwing(scope)?],
-        )?;
-        call_method(
-            scope,
-            this,
-            c"on",
-            &[string(scope, "resume")?, resume.to_jsval_throwing(scope)?],
-        )?;
+        let pause = crate::support::shared_function(scope, on_pause, 0)?;
+        crate::events::listen(scope, this, c"on", c"pause", pause)?;
+        let resume = crate::support::shared_function(scope, on_resume, 0)?;
+        crate::events::listen(scope, this, c"on", c"resume", resume)?;
         Ok(())
     }
 
     #[method(name = "_read")]
     pub fn read_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        let state = state_of(scope, this)?;
         if super::should_read(scope, this)? {
-            super::start_read(scope, this)
+            super::start_read(scope, this, &state)
         } else {
-            this.set_property(scope, c"_starlingReadPending", true)
+            set_pending(&state, true);
+            Ok(())
         }
-    }
-
-    #[method(name = "_destroy")]
-    pub fn destroy_impl(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        error: HandleValue<'_>,
-        callback: HandleValue<'_>,
-    ) -> Result<(), ExnThrown> {
-        super::cancel_read(scope, this)?;
-        Function::call(scope, js::value::undefined(), callback, &[error])?;
-        Ok(())
     }
 
     /// <https://nodejs.org/api/tty.html#readstreamsetrawmodemode>: records `mode` in `isRaw`.
@@ -312,17 +260,24 @@ pub mod read_stream_class {
     /// `socket.unref()`: stop reading standard input until `ref` is called, so a pending read
     /// doesn't keep the event loop running.
     pub fn unref<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
-        this.set_property(scope, c"_starlingUnref", true)?;
-        super::cancel_read(scope, this)?;
+        let state = state_of(scope, this)?;
+        if let Link::Stdin(link) = &mut state.data_mut().link {
+            link.unref = true;
+        }
+        super::cancel_read(&state);
         Ok(this)
     }
 
     /// `socket.ref()`: read standard input again after `unref`, if the stream is to be read.
     #[method(name = "ref")]
     pub fn ref_impl<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
-        this.set_property(scope, c"_starlingUnref", false)?;
-        if this.flag(scope, c"_starlingReadPending")? && super::should_read(scope, this)? {
-            super::start_read(scope, this)?;
+        let state = state_of(scope, this)?;
+        if let Link::Stdin(link) = &mut state.data_mut().link {
+            link.unref = false;
+        }
+        let pending = state.data().read_pending;
+        if pending && super::should_read(scope, this)? {
+            super::start_read(scope, this, &state)?;
         }
         Ok(this)
     }
@@ -358,9 +313,9 @@ fn stdin_getter(
 ) -> Result<Value, ExnThrown> {
     let process =
         Object::from_value(scope, scope.root_value(args.this())).map_err(|e| e.throw(scope))?;
-    let class = read_stream_class::class_constructor(scope)?;
-    let zero = scope.root_value(js::value::from_f64(0.0));
-    let stdin = Function::construct(scope, class, &[zero])?;
+    let stdin = read_stream_class::new_instance(scope)?;
+    let fd = scope.root_value(js::value::from_f64(0.0));
+    read_stream_class::init(scope, stdin, Some(fd)).map_err(|thrown| thrown.throw(scope))?;
     process.define_property(
         scope,
         c"stdin",
@@ -389,6 +344,7 @@ pub mod module {
     /// <https://nodejs.org/api/tty.html#ttyisattyfd>: whether `fd` is a standard stream connected
     /// to a terminal. Other file descriptors are never terminals, and values that aren't numbers
     /// are `false` without being converted.
+    #[function(length = 1)]
     pub fn isatty(fd: Option<js::prelude::HandleValue<'_>>) -> bool {
         fd.filter(|fd| fd.is_number())
             .is_some_and(|fd| super::is_terminal(fd.to_number()))

@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use core_runtime::module::{builtin_module, resolve_require, SourceFormat};
+use core_runtime::module::{builtin_module, resolve_require, ResolveError, SourceFormat};
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
@@ -57,6 +57,11 @@ fn module_not_found(specifier: &str, reason: &str) -> NodeError {
     )
 }
 
+/// The error of a `require` whose specifier failed to resolve with `error`.
+fn resolve_failed(error: ResolveError) -> NodeError {
+    NodeError::new(ErrorKind::Error, error.kind.require_code(), error.message)
+}
+
 js::instance_local! {
     /// The sources [`prefetch_requires`] read, by canonical path.
     static PREFETCHED: RefCell<BTreeMap<PathBuf, String>> = const { RefCell::new(BTreeMap::new()) };
@@ -75,12 +80,10 @@ fn read_source(path: &Path) -> Result<String, NodeError> {
     if let Some(source) = PREFETCHED.with_borrow(|sources| sources.get(path).cloned()) {
         return Ok(source);
     }
-    if let Some(reason) = core_runtime::event_loop::blocking_host_io_refusal() {
-        return Err(NodeError::new(
-            ErrorKind::Error,
-            "ERR_BLOCKING_NOT_ALLOWED",
-            format!("Loading '{}' would block {reason}", path.display()),
-        ));
+    if let Some(error) =
+        crate::errors::blocking_not_allowed(&format!("Loading '{}'", path.display()))
+    {
+        return Err(error);
     }
     read_file(path)
 }
@@ -194,12 +197,12 @@ fn prefetch_requires(dir: &Path, source: &str) {
 
 /// The path and format `specifier` resolves to from `dir`: the resolution
 /// [`prefetch_requires`] found, or the result of resolving it now.
-fn resolve(specifier: &str, dir: &Path) -> Result<(PathBuf, SourceFormat), String> {
+fn resolve(specifier: &str, dir: &Path) -> Result<(PathBuf, SourceFormat), NodeError> {
     let key = (dir.to_path_buf(), specifier.to_string());
     if let Some(resolution) = RESOLVED.with_borrow(|resolved| resolved.get(&key).cloned()) {
         return Ok(resolution);
     }
-    resolve_require(specifier, dir).map_err(|error| error.message)
+    resolve_require(specifier, dir).map_err(resolve_failed)
 }
 
 /// What loading a module file produced.
@@ -251,6 +254,7 @@ fn load_file<'s>(
         &[key.as_str().to_jsval_throwing(scope)?, parent_value],
     )?;
     module.set_property(scope, c"filename", key.as_str())?;
+    set_node_module_paths(scope, module, path.parent().unwrap_or(Path::new("/")))?;
     cache.set_property_by_name(scope, &c_key, module)?;
     if js::class::realm_object::<MainModule>(scope).is_none()
         && core_runtime::module::entry_path().as_deref() == Some(key.as_str())
@@ -273,11 +277,7 @@ fn load_file<'s>(
             let exception = js::exception::take_pending(scope);
             let _ = cache.delete_property_by_name(scope, &c_key);
             if let Some(exception) = exception {
-                js::exception::set_pending(
-                    scope,
-                    exception,
-                    js::native::ExceptionStackBehavior::DoNotCapture,
-                );
+                js::exception::throw_value(scope, exception);
             }
             Err(error)
         }
@@ -364,8 +364,7 @@ fn require_from<'s>(
         return Ok(namespace.get_property(scope, c"default")?);
     }
     let base = module_dir(scope, parent)?;
-    let (path, format) =
-        resolve(specifier, &base).map_err(|reason| module_not_found(specifier, &reason))?;
+    let (path, format) = resolve(specifier, &base)?;
     match load_file(scope, &path, format, Some(parent))? {
         Loaded::Exports(exports) => Ok(exports),
         Loaded::EsModule => {
@@ -433,8 +432,7 @@ fn resolve_callback(
             return Ok(name.to_jsval_raw_throwing(scope)?);
         }
         let base = module_dir(scope, parent)?;
-        let (path, _) =
-            resolve(&specifier, &base).map_err(|reason| module_not_found(&specifier, &reason))?;
+        let (path, _) = resolve(&specifier, &base)?;
         Ok(path
             .to_string_lossy()
             .as_ref()
@@ -457,8 +455,50 @@ fn make_require<'s>(scope: &'s Scope<'_>, module: Object<'s>) -> Result<Object<'
         Some(main) => require.set_property(scope, c"main", main)?,
         None => require.set_property(scope, c"main", js::value::undefined())?,
     }
-    module.set_property(scope, c"require", *require)?;
     Ok(*require)
+}
+
+/// Set `module.paths` to Node.js's `Module._nodeModulePaths(dir)`: the `node_modules` directory
+/// of `dir` and of each directory above it, except in directories named `node_modules`.
+fn set_node_module_paths(
+    scope: &Scope<'_>,
+    module: Object<'_>,
+    dir: &Path,
+) -> Result<(), ExnThrown> {
+    let paths: Vec<String> = dir
+        .ancestors()
+        .filter(|dir| dir.file_name().is_none_or(|name| name != "node_modules"))
+        .map(|dir| dir.join("node_modules").to_string_lossy().into_owned())
+        .collect();
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    module.set_property(scope, c"paths", js::Array::with_contents(scope, &paths)?)
+}
+
+/// The key of the parent of a module, which its `parent` accessor reads, Node.js's
+/// `kModuleParent`.
+static MODULE_PARENT: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"kModuleParent");
+
+/// The getter of `Module.prototype.parent`.
+fn get_parent(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = crate::support::this_object(scope, &args)?;
+    Ok(this
+        .get_property_by_id(scope, MODULE_PARENT.id(scope)?)?
+        .get())
+}
+
+/// The setter of `Module.prototype.parent`.
+fn set_parent(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = crate::support::this_object(scope, &args)?;
+    this.set_property_by_id(scope, MODULE_PARENT.id(scope)?, args.get(0))?;
+    Ok(js::value::undefined())
 }
 
 /// The path a `createRequire` argument names: an absolute path, a `file:` URL string, or a URL
@@ -598,20 +638,21 @@ pub mod module_class {
         this.set_property(scope, c"id", id.as_str())?;
         this.set_property(scope, c"path", path.as_str())?;
         this.set_property(scope, c"exports", Object::new_plain(scope)?)?;
+        let parent = parent.unwrap_or(HandleValue::undefined());
+        this.set_property_by_id(scope, MODULE_PARENT.id(scope)?, parent)?;
+        if let Ok(parent) = Object::from_value(scope, *parent) {
+            let siblings = parent.get_property(scope, c"children")?;
+            let siblings = Object::from_value(scope, *siblings)
+                .ok()
+                .and_then(|siblings| siblings.cast::<js::Array>().ok());
+            if let Some(siblings) = siblings {
+                siblings.push(scope, this)?;
+            }
+        }
         this.set_property(scope, c"filename", js::value::null())?;
         this.set_property(scope, c"loaded", false)?;
         let children = js::Array::with_contents(scope, &[] as &[Value])?;
         this.set_property(scope, c"children", children)?;
-        let paths = js::Array::with_contents(scope, &[] as &[Value])?;
-        this.set_property(scope, c"paths", paths)?;
-        let parent = parent.and_then(|parent| Object::from_value(scope, parent).ok());
-        if let Some(parent) = parent {
-            this.set_property(scope, c"parent", parent)?;
-            let siblings = parent.get_property(scope, c"children")?;
-            if let Ok(siblings) = Object::from_value(scope, siblings) {
-                Function::call_by_name(scope, siblings.handle(), c"push", &[this])?;
-            }
-        }
         Ok(())
     }
 
@@ -625,6 +666,8 @@ pub mod module_class {
         let ctor = class_constructor(scope)?;
         let module = Function::construct(scope, ctor, &[path.as_str()])?;
         module.set_property(scope, c"filename", path.as_str())?;
+        let dir = Path::new(&path).parent().unwrap_or(Path::new("/"));
+        set_node_module_paths(scope, module, dir)?;
         Ok(make_require(scope, module)?)
     }
 
@@ -647,7 +690,7 @@ pub mod module_class {
     ) -> Result<HandleValue<'s>, Thrown> {
         let id = validate_string(scope, id, "id")?;
         if id.is_empty() {
-            let value = crate::stream::string(scope, "")?;
+            let value = js::class::get_or_init_atom(scope, c"")?;
             return Err(NodeError::invalid_arg_value(
                 scope,
                 "id",
@@ -675,7 +718,7 @@ pub mod module_class {
 
     /// `module._compile(content, filename)`: run `content` as the CommonJS source of this module,
     /// whose file is `filename`.
-    #[method(name = "_compile")]
+    #[method(name = "_compile", length = 3)]
     pub fn compile(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -697,7 +740,10 @@ pub mod module_class {
     /// The static members that aren't functions: `_cache`, `_extensions`, `builtinModules`,
     /// `constants`, `globalPaths` and `Module`.
     #[setup]
-    pub fn setup(scope: &Scope<'_>, ctor: Object<'_>, _proto: Object<'_>) -> Result<(), ExnThrown> {
+    pub fn setup(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
+        let getter = Function::new_callback(scope, c"get parent", 0, get_parent, ())?;
+        let setter = Function::new_callback(scope, c"set parent", 1, set_parent, ())?;
+        proto.define_accessor(scope, c"parent", Some(*getter), Some(*setter), 0)?;
         let extensions = Object::new_plain(scope)?;
         extensions.set_prototype(scope, js::native::HandleObject::null())?;
         for name in [c".js", c".json", c".node"] {

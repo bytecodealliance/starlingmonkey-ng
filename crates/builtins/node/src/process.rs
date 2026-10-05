@@ -12,13 +12,15 @@
 //! values again on their first use after a resume, so `node:process`' `env` and `argv` exports
 //! stay current as well. Values assigned to `process.env`'s properties are converted to strings.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::io::{IsTerminal, Write};
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
@@ -76,6 +78,13 @@ js::instance_local! {
     static RESUME_GENERATION: Cell<u32> = const { Cell::new(0) };
     /// The monotonic clock reading `process.uptime()` counts from.
     static START_NS: Cell<Option<u64>> = const { Cell::new(None) };
+    /// The command-line arguments after the script path, which `process.argv` ends with.
+    static SCRIPT_ARGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Set the command-line arguments after the script path, which `process.argv` ends with.
+pub fn set_script_args(args: &[String]) {
+    SCRIPT_ARGS.with(|cell| *cell.borrow_mut() = args.to_vec());
 }
 
 /// The resume fixup registered by [`crate::register`].
@@ -84,10 +93,22 @@ pub(crate) fn on_resume() {
     START_NS.with(|start| start.set(Some(platform::clock::monotonic_ns())));
 }
 
+/// The nanoseconds since the process started, which `process.uptime()` counts.
+fn uptime_ns() -> u64 {
+    let start = START_NS.with(|start| *start.get().get_or_insert(0));
+    platform::clock::monotonic_ns().saturating_sub(start)
+}
+
+/// The whole milliseconds since the process started, the clock Node's timers record their start
+/// times in.
+pub(crate) fn uptime_ms() -> f64 {
+    (uptime_ns() / 1_000_000) as f64
+}
+
 /// Emit a process warning with `message` and the warning name `kind`, through
 /// `process.emitWarning` if the global has a `process`, and to stderr otherwise.
 pub fn emit_warning(scope: &Scope<'_>, message: &str, kind: &str) -> Result<(), ExnThrown> {
-    let process = scope.global().get_property(scope, c"process")?;
+    let process = process_value(scope)?;
     if let Ok(process) = Object::from_value(scope, process) {
         let emit = process.get_property(scope, c"emitWarning")?;
         if Object::from_value(scope, emit).is_ok_and(|emit| emit.is_callable()) {
@@ -99,13 +120,50 @@ pub fn emit_warning(scope: &Scope<'_>, message: &str, kind: &str) -> Result<(), 
     Ok(())
 }
 
+js::instance_local! {
+    /// The codes of the deprecation warnings [`deprecate_once`] emitted.
+    static CODES_WARNED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// Emit the deprecation warning `code` with `message` through `process.emitWarning`, unless one
+/// with the same code was emitted already or `process.noDeprecation` is set, as the functions
+/// Node's internal `deprecate` returns do.
+pub(crate) fn deprecate_once(
+    scope: &Scope<'_>,
+    message: &str,
+    code: &str,
+) -> Result<(), ExnThrown> {
+    if code_warned(code) {
+        return Ok(());
+    }
+    let process = process_value(scope)?;
+    let Ok(process) = Object::from_value(scope, process) else {
+        return Ok(());
+    };
+    if js::conversion::to_boolean(process.get_property(scope, c"noDeprecation")?) {
+        return Ok(());
+    }
+    mark_code_warned(code);
+    deprecation_warning(scope, message, code)
+}
+
+/// Whether a deprecation warning with `code` was emitted.
+pub(crate) fn code_warned(code: &str) -> bool {
+    CODES_WARNED.with_borrow(|codes| codes.contains(code))
+}
+
+/// Record that a deprecation warning with `code` was emitted. Returns whether none was before.
+pub(crate) fn mark_code_warned(code: &str) -> bool {
+    CODES_WARNED.with_borrow_mut(|codes| codes.insert(code.to_string()))
+}
+
 /// Emit the deprecation warning `code` with `message` through `process.emitWarning`.
 pub(crate) fn deprecation_warning(
     scope: &Scope<'_>,
     message: &str,
     code: &str,
 ) -> Result<(), ExnThrown> {
-    let process = scope.global().get_property(scope, c"process")?;
+    let process = process_value(scope)?;
     let Ok(process) = Object::from_value(scope, process) else {
         return Ok(());
     };
@@ -118,23 +176,27 @@ pub(crate) fn deprecation_warning(
 
 /// Whether the innermost frame of the JS stack is in a `node_modules` directory.
 pub(crate) fn called_from_node_modules(scope: &Scope<'_>) -> Result<bool, ExnThrown> {
-    let error_class = scope.global().get_property(scope, c"Error")?;
-    let Ok(error_class) = Object::from_value(scope, error_class) else {
-        return Ok(false);
-    };
-    let error = Function::construct(scope, error_class, js::function::EmptyArgs)?;
-    let stack =
-        String::from_jsval(scope, error.get_property(scope, c"stack")?, ()).unwrap_or_default();
-    Ok(stack
-        .lines()
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| line.contains("/node_modules/")))
+    Ok(js::stack::current_frame_source(scope)?
+        .is_some_and(|source| source.contains("/node_modules/")))
 }
 
-/// The global's `process` object.
+/// Marker keying the realm's `process` object, which [`install`] registers.
+struct ProcessObject;
+
+/// The realm's `process` object. It stays the modules' `process` whatever the global's `process`
+/// property holds, as in Node.js.
 fn global_process<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let process = scope.global().get_property(scope, c"process")?;
-    Object::from_value(scope, process).map_err(|e| e.throw(scope))
+    js::class::realm_object::<ProcessObject>(scope)
+        .ok_or_else(|| js::error::TypeError("process is not installed".into()).throw(scope))
+}
+
+/// The realm's `process` object, as [`global_process`] returns it, or `undefined` before
+/// [`install`] creates it.
+pub(crate) fn process_value<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+    match js::class::realm_object::<ProcessObject>(scope) {
+        Some(process) => process.to_jsval_throwing(scope),
+        None => Ok(HandleValue::undefined()),
+    }
 }
 
 /// A `process.hrtime()` reading `[seconds, nanoseconds]`, relative to `previous` if given.
@@ -172,7 +234,7 @@ fn emit_exit(scope: &Scope<'_>, process: Object<'_>) -> u8 {
         }
         process.set_property(scope, c"_exiting", true)?;
         let code = exit_code_if_set(scope, process).unwrap_or(0);
-        let exit = scope.root_value(js::JSString::from_str(scope, "exit")?.as_value());
+        let exit = js::class::get_or_init_atom(scope, c"exit")?;
         let code = scope.root_value(js::value::from_i32(code.into()));
         Function::call_by_name(scope, process.handle(), c"emit", &[exit, code])?;
         Ok(())
@@ -188,6 +250,14 @@ fn emit_exit(scope: &Scope<'_>, process: Object<'_>) -> u8 {
 fn is_exiting(scope: &Scope<'_>, process: Object<'_>) -> Result<bool, ExnThrown> {
     let exiting = process.get_property(scope, c"_exiting")?;
     Ok(exiting.is_boolean() && exiting.to_boolean())
+}
+
+/// Whether the global `process` object's `_exiting` is `true`.
+pub(crate) fn exiting(scope: &Scope<'_>) -> Result<bool, ExnThrown> {
+    match Object::from_value(scope, process_value(scope)?) {
+        Ok(process) => is_exiting(scope, process),
+        Err(_) => Ok(false),
+    }
 }
 
 /// `process.exitCode` as an exit code, or `None` if it isn't set to an integer.
@@ -251,7 +321,7 @@ fn before_exit(scope: &Scope<'_>) {
     };
     let code = exit_code(scope, process, None).unwrap_or(0);
     let emitted = (|| -> Result<(), ExnThrown> {
-        let event = scope.root_value(js::JSString::from_str(scope, "beforeExit")?.as_value());
+        let event = js::class::get_or_init_atom(scope, c"beforeExit")?;
         let code = scope.root_value(js::value::from_i32(code.into()));
         Function::call_by_name(scope, process.handle(), c"emit", &[event, code])?;
         Ok(())
@@ -275,25 +345,30 @@ fn exit(scope: &Scope<'_>) {
 }
 
 /// Whether `process` has listeners for `event`.
-fn has_listeners(scope: &Scope<'_>, process: Object<'_>, event: &str) -> Result<bool, ExnThrown> {
-    let event = scope.root_value(js::JSString::from_str(scope, event)?.as_value());
-    let count = Function::call_by_name(scope, process.handle(), c"listenerCount", &[event])?;
-    Ok(count.to_number() > 0.0)
+fn has_listeners(
+    scope: &Scope<'_>,
+    process: Object<'_>,
+    event: &'static CStr,
+) -> Result<bool, ExnThrown> {
+    let event = js::class::get_or_init_atom(scope, event)?;
+    Ok(crate::events::listener_count(scope, process, event)? > 0.0)
 }
 
 /// Emit `event` on `process` with `args`. Returns whether a listener threw.
-fn emit(scope: &Scope<'_>, process: Object<'_>, event: &str, args: &[HandleValue<'_>]) -> bool {
+fn emit(
+    scope: &Scope<'_>,
+    process: Object<'_>,
+    event: &'static CStr,
+    args: &[HandleValue<'_>],
+) -> bool {
     let emitted = (|| -> Result<(), ExnThrown> {
-        let mut values = vec![scope.root_value(js::JSString::from_str(scope, event)?.as_value())];
-        values.extend(args.iter().map(|arg| scope.root_value(arg.get())));
+        let mut values: Vec<HandleValue<'_>> = vec![js::class::get_or_init_atom(scope, event)?];
+        values.extend(args.iter().copied());
         Function::call_by_name(scope, process.handle(), c"emit", &values)?;
         Ok(())
     })();
     emitted.is_err()
 }
-
-/// The `rejection_handled` lifecycle hook, which does nothing.
-fn rejection_handled(_scope: &Scope<'_>, _promise: js::Promise<'_>, _id: u64) {}
 
 /// The `uncaught` lifecycle hook: emit `unhandledRejection` for a rejection if something listens,
 /// or else call the `process.setUncaughtExceptionCaptureCallback` callback if one is set, or else
@@ -310,21 +385,21 @@ fn uncaught(
     error: HandleValue<'_>,
     rejection: Option<core_runtime::lifecycle::Rejection<'_>>,
 ) -> bool {
-    let promise = rejection.map(|rejection| rejection.promise);
     let Ok(process) = global_process(scope) else {
         return false;
     };
+    let promise = rejection.map(|rejection| rejection.promise);
     let abort = crate::runtime_flags::get().abort_on_uncaught_exception
         && capture_callback(scope).is_none();
     if abort && promise.is_none() {
         abort_uncaught(scope, error);
     }
     let threw = match promise {
-        Some(promise) if has_listeners(scope, process, "unhandledRejection").unwrap_or(false) => {
+        Some(promise) if has_listeners(scope, process, c"unhandledRejection").unwrap_or(false) => {
             Some(emit(
                 scope,
                 process,
-                "unhandledRejection",
+                c"unhandledRejection",
                 &[error, promise],
             ))
         }
@@ -333,17 +408,14 @@ fn uncaught(
             let undefined = scope.root_value(js::value::undefined());
             Some(Function::call(scope, undefined, callback, &[error]).is_err())
         }
-        _ if has_listeners(scope, process, "uncaughtException").unwrap_or(false) => {
+        _ if has_listeners(scope, process, c"uncaughtException").unwrap_or(false) => {
             let origin = if promise.is_some() {
-                "unhandledRejection"
+                c"unhandledRejection"
             } else {
-                "uncaughtException"
+                c"uncaughtException"
             };
-            match js::JSString::from_str(scope, origin) {
-                Ok(origin) => {
-                    let origin = scope.root_value(origin.as_value());
-                    Some(emit(scope, process, "uncaughtException", &[error, origin]))
-                }
+            match js::class::get_or_init_atom(scope, origin) {
+                Ok(origin) => Some(emit(scope, process, c"uncaughtException", &[error, origin])),
                 Err(_) => Some(true),
             }
         }
@@ -366,7 +438,7 @@ fn uncaught(
                     process.set_property(scope, c"_exiting", true)?;
                     process.set_property(scope, c"exitCode", 1)?;
                     let code = scope.root_value(js::value::from_i32(1));
-                    emit(scope, process, "exit", &[code]);
+                    emit(scope, process, c"exit", &[code]);
                 }
                 Ok(())
             })();
@@ -379,6 +451,9 @@ fn uncaught(
         }
     }
 }
+
+/// The `rejection_handled` lifecycle hook, which does nothing.
+fn rejection_handled(_scope: &Scope<'_>, _promise: js::Promise<'_>, _id: u64) {}
 
 /// Print uncaught exception `error` as Node.js does under `--abort-on-uncaught-exception`, as
 /// `Uncaught` followed by the error's string and the frames of its stack, and abort the process.
@@ -425,11 +500,6 @@ fn exit_code(
     Ok(code as i64 as u8)
 }
 
-/// Whether `value` is truthy, as JS's `ToBoolean` converts it.
-fn truthy(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-    bool::from_jsval(scope, value, ()).unwrap_or(false)
-}
-
 js::instance_local! {
     /// Set once a printed warning was followed by the hint about the tracing flags.
     static TRACE_HINT_SHOWN: Cell<bool> = const { Cell::new(false) };
@@ -448,7 +518,7 @@ fn emit_warning_now(
         print_warning(scope, warning)?;
     }
     let process = global_process(scope)?;
-    let event = scope.root_value(js::JSString::from_str(scope, "warning")?.as_value());
+    let event = js::class::get_or_init_atom(scope, c"warning")?;
     Function::call_by_name(scope, process.handle(), c"emit", &[event, warning])?;
     Ok(js::value::undefined())
 }
@@ -457,7 +527,7 @@ fn emit_warning_now(
 fn print_warning(scope: &Scope<'_>, warning: HandleValue<'_>) -> Result<(), ExnThrown> {
     let object = Object::from_value(scope, warning).map_err(|e| e.throw(scope))?;
     let code = object.get_property(scope, c"code")?;
-    let code = if truthy(scope, code) {
+    let code = if js::conversion::to_boolean(code) {
         format!(
             "[{}] ",
             js::JSString::from_value(scope, code)?.to_utf8(scope)?
@@ -467,11 +537,10 @@ fn print_warning(scope: &Scope<'_>, warning: HandleValue<'_>) -> Result<(), ExnT
     };
     // A warning whose `toString` isn't a function is converted by `Error.prototype.toString`.
     let mut to_string = object.get_property(scope, c"toString")?;
-    if !Object::from_value(scope, to_string).is_ok_and(|function| function.is_callable()) {
-        let error = scope.global().get_property(scope, c"Error")?;
-        let error = Object::from_value(scope, error).map_err(|e| e.throw(scope))?;
-        let prototype = error.get_property(scope, c"prototype")?;
-        let prototype = Object::from_value(scope, prototype).map_err(|e| e.throw(scope))?;
+    if !js::function::is_callable(to_string) {
+        let prototype =
+            js::class::get_class_prototype(scope, js::class_spec::JSProtoKey::JSProto_Error)?;
+        let prototype = Object::from_handle(prototype).ok_or(ExnThrown)?;
         to_string = prototype.get_property(scope, c"toString")?;
     }
     let text = Function::call(scope, warning, to_string, js::function::EmptyArgs)?;
@@ -512,27 +581,32 @@ fn print_warning(scope: &Scope<'_>, warning: HandleValue<'_>) -> Result<(), ExnT
     Ok(())
 }
 
-/// The key of the global's state object for `process.exitCode` and the uncaught exception
-/// capture callback.
-static PROCESS_STATE_KEY: u8 = 0;
+/// The state of the global's `process` that Node keeps in its own module scope: `process.exitCode`
+/// and the uncaught exception capture callback.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct ProcessState {
+    exit_code: Heap<Value>,
+    capture: Option<Heap<js::object::Object>>,
+}
 
-/// The global's state object for `process.exitCode`, under `exitCode`, and the uncaught exception
-/// capture callback, under `capture`.
-fn process_state<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    js::class::get_or_init_shared_object(scope, &PROCESS_STATE_KEY as *const u8 as usize, |scope| {
-        Object::new_plain(scope)
-    })
+#[core_runtime::jsmethods]
+impl ProcessState {}
+
+/// Marker keying the realm's [`ProcessState`], which [`install`] registers.
+struct ProcessStateObject;
+
+/// The global's [`ProcessState`].
+fn process_state<'s>(scope: &'s Scope<'_>) -> Result<ProcessState<'s>, ExnThrown> {
+    js::class::realm_object::<ProcessStateObject>(scope)
+        .and_then(|state| state.cast::<ProcessState>().ok())
+        .ok_or_else(|| js::error::TypeError("process is not installed".into()).throw(scope))
 }
 
 /// The callback `process.setUncaughtExceptionCaptureCallback` set, if one is set.
-fn capture_callback<'s>(scope: &'s Scope<'_>) -> Option<HandleValue<'s>> {
-    let callback = process_state(scope)
-        .ok()?
-        .get_property(scope, c"capture")
-        .ok()?;
-    Object::from_value(scope, callback)
-        .is_ok_and(|callback| callback.is_callable())
-        .then_some(callback)
+fn capture_callback<'s>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
+    let state = process_state(scope).ok()?;
+    let callback = state.data().capture.as_ref()?.get(scope);
+    Some(callback)
 }
 
 /// The `process.exitCode` getter.
@@ -541,9 +615,7 @@ fn get_exit_code(
     _args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    Ok(process_state(scope)?
-        .get_property(scope, c"exitCode")?
-        .get())
+    Ok(process_state(scope)?.data().exit_code.get(scope).get())
 }
 
 /// The `process.exitCode` setter: `undefined` for `null` and `undefined`, and otherwise an integer,
@@ -556,24 +628,22 @@ fn set_exit_code_property(
     let code = args.get(0);
     let state = process_state(scope)?;
     if code.is_null() || code.is_undefined() {
-        state.set_property(scope, c"exitCode", js::value::undefined())?;
+        state.data().exit_code.set(js::value::undefined());
         return Ok(js::value::undefined());
     }
     let mut value = code;
     if code.is_string() {
         let number = f64::from_jsval(scope, code, ()).map_err(|e| e.throw(scope))?;
-        let empty = js::JSString::from_value(scope, code)?
-            .to_utf8(scope)?
-            .is_empty();
+        let empty = js::JSString::from_value(scope, code)?.is_empty();
         if !empty && !number.is_nan() {
             value = scope.root_value(js::value::from_f64(number));
         }
     }
-    const MAX_SAFE_INTEGER: f64 = 9007199254740991.0;
+    use crate::errors::MAX_SAFE_INTEGER;
     let number =
         crate::errors::validate_integer(scope, value, "code", -MAX_SAFE_INTEGER, MAX_SAFE_INTEGER)
             .map_err(|error| error.throw(scope))?;
-    state.set_property(scope, c"exitCode", number)?;
+    state.data().exit_code.set(js::value::from_f64(number));
     Ok(js::value::undefined())
 }
 
@@ -602,6 +672,7 @@ pub mod functions {
     }
 
     /// <https://nodejs.org/api/process.html#processchdirdirectory>
+    #[function(length = 1)]
     pub fn chdir(scope: &Scope<'_>, directory: Option<HandleValue<'_>>) -> Result<(), Thrown> {
         let undefined = scope.root_value(js::value::undefined());
         let directory = validate_string(scope, directory.unwrap_or(undefined), "directory")?;
@@ -616,6 +687,7 @@ pub mod functions {
 
     /// <https://nodejs.org/api/process.html#processexitcode>: sets `process.exitCode` to
     /// `code` if it is given.
+    #[function(length = 1)]
     pub fn exit(scope: &Scope<'_>, code: Option<HandleValue<'_>>) -> Result<(), Thrown> {
         let process = global_process(scope)?;
         if let Some(code) = code {
@@ -660,6 +732,7 @@ pub mod functions {
     }
 
     /// <https://nodejs.org/api/process.html#processhrtimetime>
+    #[function(length = 1)]
     pub fn hrtime<'s>(
         scope: &'s Scope<'_>,
         time: Option<HandleValue<'_>>,
@@ -670,8 +743,7 @@ pub mod functions {
 
     /// <https://nodejs.org/api/process.html#processuptime>
     pub fn uptime() -> f64 {
-        let start = START_NS.with(|start| *start.get().get_or_insert(0));
-        platform::clock::monotonic_ns().saturating_sub(start) as f64 / 1e9
+        uptime_ns() as f64 / 1e9
     }
 
     /// <https://nodejs.org/api/process.html#processmemoryusage>: the heap figures are not
@@ -692,6 +764,7 @@ pub mod functions {
 
     /// <https://nodejs.org/api/process.html#processcpuusagepreviousvalue>: not tracked, and reads
     /// 0.
+    #[function(length = 1)]
     pub fn cpu_usage<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
         let usage = Object::new_plain(scope)?;
         usage.set_property(scope, c"user", 0)?;
@@ -701,6 +774,7 @@ pub mod functions {
 
     /// <https://nodejs.org/api/process.html#processemitwarningwarning-options>: emits `warning`
     /// on `process` in a tick, after printing the warning to stderr.
+    #[function(length = 4)]
     pub fn emit_warning(
         scope: &Scope<'_>,
         warning: Option<HandleValue<'_>>,
@@ -723,7 +797,7 @@ pub mod functions {
                     detail = Some(value);
                 }
                 kind = options.get_property(scope, c"type")?;
-                if !truthy(scope, kind) {
+                if !js::conversion::to_boolean(kind) {
                     kind = undefined;
                 }
             }
@@ -770,16 +844,16 @@ pub mod functions {
         let object = Object::from_value(scope, warning)?;
         let name = object.get_property(scope, c"name")?;
         if name.is_string() && String::from_jsval(scope, name, ())? == "DeprecationWarning" {
-            if truthy(scope, process.get_property(scope, c"noDeprecation")?) {
+            if js::conversion::to_boolean(process.get_property(scope, c"noDeprecation")?) {
                 return Ok(());
             }
-            if truthy(scope, process.get_property(scope, c"throwDeprecation")?) {
-                js::exception::set_pending(
+            if js::conversion::to_boolean(process.get_property(scope, c"throwDeprecation")?) {
+                return Ok(js::jobs::queue_native_tick(
                     scope,
+                    crate::support::throw_in_tick,
                     warning,
-                    js::native::ExceptionStackBehavior::Capture,
-                );
-                return Err(Thrown::Pending);
+                    &[],
+                )?);
             }
         }
         Ok(js::jobs::queue_native_tick(
@@ -791,6 +865,7 @@ pub mod functions {
     }
 
     /// <https://nodejs.org/api/process.html#processumaskmask>: always the default `0o022`.
+    #[function(length = 1)]
     pub fn umask() -> u32 {
         0o022
     }
@@ -816,17 +891,21 @@ pub mod functions {
     }
 
     /// <https://nodejs.org/api/process.html#processsetuncaughtexceptioncapturecallbackfn>
+    #[function(length = 1)]
     pub fn set_uncaught_exception_capture_callback(
         scope: &Scope<'_>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let callback = callback.unwrap_or_else(|| scope.root_value(js::value::undefined()));
+        let callback = callback.unwrap_or(HandleValue::undefined());
         let state = process_state(scope)?;
         if callback.is_null() {
-            state.set_property(scope, c"capture", js::value::undefined())?;
+            state.data_mut().capture = None;
             return Ok(());
         }
-        if !Object::from_value(scope, callback).is_ok_and(|callback| callback.is_callable()) {
+        let Some(callback) = Object::from_value(scope, callback)
+            .ok()
+            .filter(|callback| callback.is_callable())
+        else {
             return Err(NodeError::invalid_arg_type(
                 scope,
                 "fn",
@@ -834,7 +913,7 @@ pub mod functions {
                 callback,
             )
             .into());
-        }
+        };
         if capture_callback(scope).is_some() {
             return Err(NodeError::new(
                 ErrorKind::Error,
@@ -844,7 +923,8 @@ pub mod functions {
             )
             .into());
         }
-        Ok(state.set_property(scope, c"capture", callback)?)
+        state.data_mut().capture = Some(Heap::from(callback));
+        Ok(())
     }
 
     /// <https://nodejs.org/api/process.html#processhasuncaughtexceptioncapturecallback>
@@ -873,6 +953,7 @@ pub mod functions {
 
     /// <https://nodejs.org/api/process.html#processkillpid-signal>: there are no other processes
     /// to signal.
+    #[function(length = 2)]
     pub fn kill() -> Result<(), NodeError> {
         Err(NodeError::not_implemented("process.kill()"))
     }
@@ -926,15 +1007,30 @@ const HOST_VIEWS: &[HostView] = &[
 /// The keys of the [`HOST_VIEWS`] proxies in the global's shared objects.
 static HOST_VIEW_KEYS: [u8; 2] = [0, 0];
 
-/// The traps of a [`HostView`] proxy, each of which calls the `Reflect` function of its name.
-const HOST_VIEW_TRAPS: [&CStr; 7] = [
-    c"get",
-    c"set",
-    c"has",
-    c"deleteProperty",
-    c"defineProperty",
-    c"ownKeys",
-    c"getOwnPropertyDescriptor",
+/// The state of a [`HostView`] proxy, the payload of its traps.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct HostViewState {
+    /// The view's index in [`HOST_VIEWS`].
+    #[no_trace]
+    index: usize,
+    target: Heap<js::object::Object>,
+    /// The resume generation the target was filled in, if it was filled.
+    #[no_trace]
+    generation: Option<u32>,
+}
+
+#[core_runtime::jsmethods]
+impl HostViewState {}
+
+/// The traps of a [`HostView`] proxy, by name.
+const HOST_VIEW_TRAPS: [(&CStr, js::function::Callback); 7] = [
+    (c"get", host_view_get),
+    (c"set", host_view_set),
+    (c"has", host_view_has),
+    (c"deleteProperty", host_view_delete),
+    (c"defineProperty", host_view_define),
+    (c"ownKeys", host_view_own_keys),
+    (c"getOwnPropertyDescriptor", host_view_descriptor),
 ];
 
 /// The global's proxy for the [`HostView`] at `index` in [`HOST_VIEWS`], created on first use.
@@ -946,31 +1042,27 @@ fn host_view<'s>(scope: &'s Scope<'_>, index: usize) -> Result<Object<'s>, ExnTh
         } else {
             Object::new_plain(scope)?
         };
-        let state = Object::new_plain(scope)?;
-        state.set_property(scope, c"index", index as u32)?;
-        state.set_property(scope, c"target", target)?;
+        let state =
+            js::class::create_instance_with::<HostViewStateImpl>(scope, |_| HostViewStateImpl {
+                index,
+                target: Heap::from(target),
+                generation: None,
+            })?;
         let handler = Object::new_plain(scope)?;
-        for (trap, name) in HOST_VIEW_TRAPS.iter().enumerate() {
-            let payload = js::Array::with_contents(
-                scope,
-                &[
-                    state.to_jsval_raw_throwing(scope)?,
-                    js::value::from_i32(trap as i32),
-                ],
-            )?;
-            let function = Function::new_callback(scope, name, 0, host_view_trap, *payload)?;
+        for (name, trap) in HOST_VIEW_TRAPS {
+            let function = Function::new_callback(scope, name, 0, trap, state)?;
             handler.set_property(scope, name, *function)?;
         }
-        let proxy = scope.global().get_property(scope, c"Proxy")?;
-        let proxy = Function::construct(
+        let proxy = js::class::get_class_object(scope, js::class_spec::JSProtoKey::JSProto_Proxy)?;
+        let proxy = Object::from_handle(proxy).ok_or(ExnThrown)?;
+        Function::construct(
             scope,
-            Object::from_value(scope, proxy).map_err(|e| e.throw(scope))?,
+            proxy,
             &[
-                target.to_jsval_throwing(scope)?,
-                handler.to_jsval_throwing(scope)?,
+                target.to_jsval_raw_throwing(scope)?,
+                handler.to_jsval_raw_throwing(scope)?,
             ],
-        )?;
-        Ok(proxy)
+        )
     })
 }
 
@@ -979,34 +1071,53 @@ js::instance_local! {
     static ENV_VALUE_WARNED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// A trap of a [`HostView`] proxy, whose payload is `[state, trap]`: fill the target if this is
-/// the proxy's first use since the last resume, then call the `Reflect` function named by the
-/// trap's index in [`HOST_VIEW_TRAPS`] with the trap's arguments, after converting the value to a
-/// string if the view coerces it. With `--pending-deprecation`, setting a value that isn't a
-/// string, number or boolean emits DEP0104 once per instance.
-fn host_view_trap(
+/// The view, target and property key of a call of a [`HostView`] trap, whose payload is the
+/// [`HostViewState`] and whose second argument is the key. The target is filled first if this is
+/// the proxy's first use since the last resume.
+fn host_view_call<'s>(
+    scope: &'s Scope<'_>,
+    args: &CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<(&'static HostView, Object<'s>, js::native::HandleId<'s>), ExnThrown> {
+    let state = cast_payload::<HostViewState>(scope, payload);
+    let (view, target, filled) = {
+        let data = state.data();
+        (
+            &HOST_VIEWS[data.index],
+            data.target.get(scope),
+            data.generation,
+        )
+    };
+    let generation = RESUME_GENERATION.with(Cell::get);
+    if filled != Some(generation) {
+        (view.fill)(scope, target)?;
+        state.data_mut().generation = Some(generation);
+    }
+    let id = scope.root_id(js::id::value_to_id(scope, args.get(1))?);
+    Ok((view, target, id))
+}
+
+/// The `get` trap of a [`HostView`] proxy.
+fn host_view_get(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let payload = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
-    let state =
-        Object::from_value(scope, payload.get_element(scope, 0)?).map_err(|e| e.throw(scope))?;
-    let trap = payload.get_element(scope, 1)?.to_int32() as usize;
-    let view = &HOST_VIEWS[state.get_property(scope, c"index")?.to_int32() as usize];
-    let target = Object::from_value(scope, state.get_property(scope, c"target")?)
-        .map_err(|e| e.throw(scope))?;
-    let generation = RESUME_GENERATION.with(Cell::get);
-    let filled = state.get_property(scope, c"generation")?;
-    if !(filled.is_number() && filled.to_number() == f64::from(generation)) {
-        (view.fill)(scope, target)?;
-        state.set_property(scope, c"generation", generation)?;
-    }
-    let mut call_args: Vec<HandleValue<'_>> =
-        (0..args.len()).map(|index| args.get(index)).collect();
-    let name = HOST_VIEW_TRAPS[trap];
-    if view.coerce && name == c"set" && call_args.len() > 2 {
-        let value = call_args[2];
+    let (_, target, id) = host_view_call(scope, &args, payload)?;
+    Ok(target.get_property_by_id(scope, id)?.get())
+}
+
+/// The `set` trap of a [`HostView`] proxy: set the value, converted to a string if the view
+/// coerces it. With `--pending-deprecation`, setting a `process.env` value that isn't a string,
+/// number or boolean emits DEP0104 once per instance.
+fn host_view_set(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let (view, target, id) = host_view_call(scope, &args, payload)?;
+    let value = args.get(2);
+    if view.coerce {
         if !(value.is_string() || value.is_number() || value.is_boolean())
             && crate::runtime_flags::get().pending_deprecation
             && !ENV_VALUE_WARNED.replace(true)
@@ -1019,31 +1130,95 @@ fn host_view_trap(
                 "DEP0104",
             )?;
         }
-        let value = js::JSString::from_value(scope, call_args[2])?;
-        call_args[2] = value.to_jsval_throwing(scope)?;
-        call_args.truncate(3);
+        let value = js::JSString::from_value(scope, value)?;
+        target.set_property_by_id(scope, id, value)?;
+    } else {
+        target.set_property_by_id(scope, id, value)?;
     }
-    if view.coerce && name == c"defineProperty" && call_args.len() > 2 {
-        if let Ok(descriptor) = Object::from_value(scope, call_args[2]) {
-            if descriptor.has_property(scope, c"value")? {
-                let value = descriptor.get_property(scope, c"value")?;
-                let value = js::JSString::from_value(scope, value)?;
+    Ok(js::value::from_bool(true))
+}
+
+/// The `has` trap of a [`HostView`] proxy.
+fn host_view_has(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let (_, target, id) = host_view_call(scope, &args, payload)?;
+    Ok(js::value::from_bool(target.has_property_by_id(scope, id)?))
+}
+
+/// The `deleteProperty` trap of a [`HostView`] proxy.
+fn host_view_delete(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let (_, target, id) = host_view_call(scope, &args, payload)?;
+    target.delete_property_by_id(scope, id)?;
+    Ok(js::value::from_bool(true))
+}
+
+/// The `defineProperty` trap of a [`HostView`] proxy: define the property, with a `value`
+/// converted to a string if the view coerces it.
+fn host_view_define(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let (view, target, id) = host_view_call(scope, &args, payload)?;
+    let mut descriptor = args.get(2);
+    if view.coerce {
+        if let Ok(given) = Object::from_value(scope, descriptor) {
+            if given.has_property(scope, c"value")? {
+                let value = js::JSString::from_value(scope, given.get_property(scope, c"value")?)?;
                 let copy = Object::new_plain(scope)?;
                 for field in [c"writable", c"enumerable", c"configurable"] {
-                    if descriptor.has_property(scope, field)? {
-                        copy.set_property(scope, field, descriptor.get_property(scope, field)?)?;
+                    if given.has_property(scope, field)? {
+                        copy.set_property(scope, field, given.get_property(scope, field)?)?;
                     }
                 }
-                copy.set_property(scope, c"value", value.to_jsval_throwing(scope)?)?;
-                call_args[2] = copy.to_jsval_throwing(scope)?;
+                copy.set_property(scope, c"value", value)?;
+                descriptor = copy.to_jsval_throwing(scope)?;
             }
         }
     }
-    let reflect = scope.global().get_property(scope, c"Reflect")?;
-    let reflect = Object::from_value(scope, reflect).map_err(|e| e.throw(scope))?;
-    let function = reflect.get_property(scope, name)?;
-    let undefined = scope.root_value(js::value::undefined());
-    Ok(Function::call(scope, undefined, function, &call_args)?.get())
+    let defined = target.define_property_from_descriptor(scope, id, descriptor)?;
+    Ok(js::value::from_bool(defined))
+}
+
+/// The `ownKeys` trap of a [`HostView`] proxy.
+fn host_view_own_keys(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let state = cast_payload::<HostViewState>(scope, payload);
+    let (view, target, filled) = {
+        let data = state.data();
+        (
+            &HOST_VIEWS[data.index],
+            data.target.get(scope),
+            data.generation,
+        )
+    };
+    let generation = RESUME_GENERATION.with(Cell::get);
+    if filled != Some(generation) {
+        (view.fill)(scope, target)?;
+        state.data_mut().generation = Some(generation);
+    }
+    let keys = target.own_keys(scope)?;
+    js::Array::with_contents(scope, &keys)?.to_jsval_raw_throwing(scope)
+}
+
+/// The `getOwnPropertyDescriptor` trap of a [`HostView`] proxy.
+fn host_view_descriptor(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let (_, target, id) = host_view_call(scope, &args, payload)?;
+    Ok(target.own_property_descriptor_value(scope, id)?.get())
 }
 
 /// Replace the contents of `env`, a plain object, with the environment variables.
@@ -1062,13 +1237,20 @@ fn fill_env(scope: &Scope<'_>, env: Object<'_>) -> Result<(), ExnThrown> {
     Ok(())
 }
 
-/// Replace the contents of `argv`, an array, with the program and the entry module's path, if it
-/// has one.
+/// Replace the contents of `argv`, an array, with the program, the entry module's path, if it
+/// has one, and the arguments [`set_script_args`] set.
 fn fill_argv(scope: &Scope<'_>, argv: Object<'_>) -> Result<(), ExnThrown> {
     argv.set_property(scope, c"length", 0)?;
     argv.set_element(scope, 0, exec_path().as_str())?;
+    let mut index = 1;
     if let Some(entry) = core_runtime::module::entry_path() {
-        argv.set_element(scope, 1, entry.as_str())?;
+        argv.set_element(scope, index, entry.as_str())?;
+        index += 1;
+    }
+    let args = SCRIPT_ARGS.with(|cell| cell.borrow().clone());
+    for arg in &args {
+        argv.set_element(scope, index, arg.as_str())?;
+        index += 1;
     }
     Ok(())
 }
@@ -1078,7 +1260,8 @@ fn compute_env(scope: &Scope<'_>) -> Result<Value, ExnThrown> {
     host_view(scope, 0)?.to_jsval_raw_throwing(scope)
 }
 
-/// `process.argv`: a proxy of an array of the program and the entry module's path, if it has one.
+/// `process.argv`: a proxy of an array of the program, the entry module's path, if it has one, and
+/// the arguments after it.
 fn compute_argv(scope: &Scope<'_>) -> Result<Value, ExnThrown> {
     host_view(scope, 1)?.to_jsval_raw_throwing(scope)
 }
@@ -1100,35 +1283,55 @@ fn exec_path() -> String {
         .unwrap_or_else(|| "starlingmonkey".into())
 }
 
-/// The getter of a [`LazyProperty`], whose payload is its state object: the property's index in
-/// [`LAZY_PROPERTIES`], and the cached value and the resume generation it was computed in.
+/// The state of a [`LazyProperty`], the payload of its accessors.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct LazyValue {
+    /// The property's index in [`LAZY_PROPERTIES`].
+    #[no_trace]
+    index: usize,
+    value: Heap<Value>,
+    /// The resume generation the value was computed or assigned in, if it was.
+    #[no_trace]
+    generation: Option<u32>,
+}
+
+#[core_runtime::jsmethods]
+impl LazyValue {}
+
+/// The getter of a [`LazyProperty`], whose payload is its [`LazyValue`]: the value, computed again
+/// if it wasn't computed or assigned since the last resume.
 fn lazy_get(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
+    let state = cast_payload::<LazyValue>(scope, payload);
     let generation = RESUME_GENERATION.with(Cell::get);
-    let cached = state.get_property(scope, c"generation")?;
-    if f64::from_jsval(scope, cached, ()).ok() == Some(generation.into()) {
-        return Ok(state.get_property(scope, c"value")?.get());
+    let (index, cached) = {
+        let data = state.data();
+        (data.index, data.generation)
+    };
+    if cached == Some(generation) {
+        return Ok(state.data().value.get(scope).get());
     }
-    let index = f64::from_jsval(scope, state.get_property(scope, c"index")?, ()).unwrap_or(0.0);
-    let value = scope.root_value((LAZY_PROPERTIES[index as usize].compute)(scope)?);
-    state.set_property(scope, c"value", value)?;
-    state.set_property(scope, c"generation", generation)?;
+    let value = scope.root_value((LAZY_PROPERTIES[index].compute)(scope)?);
+    let mut data = state.data_mut();
+    data.value.set(value.get());
+    data.generation = Some(generation);
     Ok(value.get())
 }
 
-/// The setter of a [`LazyProperty`]: replace the value until the next resume.
+/// The setter of a [`LazyProperty`], whose payload is its [`LazyValue`]: replace the value until
+/// the next resume.
 fn lazy_set(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
-    state.set_property(scope, c"value", args.get(0))?;
-    state.set_property(scope, c"generation", RESUME_GENERATION.with(Cell::get))?;
+    let state = cast_payload::<LazyValue>(scope, payload);
+    let mut data = state.data_mut();
+    data.value.set(args.get(0).get());
+    data.generation = Some(RESUME_GENERATION.with(Cell::get));
     Ok(js::value::undefined())
 }
 
@@ -1207,7 +1410,7 @@ fn stream_write(
         .ok()
         .and_then(js::ArrayBufferView::from_object)
     {
-        view.with_bytes(<[u8]>::to_vec)
+        view.copy_bytes(scope)?
     } else {
         return Err(NodeError::invalid_arg_type(
             scope,
@@ -1254,8 +1457,17 @@ fn config<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
 /// Install the `process` global on `global`: the [`functions`] namespace, made an `EventEmitter`
 /// and given its data properties, and stubs for the other members Node.js's `process` has.
 pub fn install(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
+    ProcessState::add_to_global(scope, global);
+    LazyValue::add_to_global(scope, global);
+    HostViewState::add_to_global(scope, global);
+    let state = js::class::create_instance_with::<ProcessStateImpl>(scope, |_| {
+        ProcessStateImpl::default()
+    })?;
+    js::class::register_realm_object::<ProcessStateObject>(scope, state.as_object());
     functions::add_to_global(scope, global);
-    let process = global_process(scope)?;
+    let process = global.get_property(scope, c"process")?;
+    let process = Object::from_value(scope, process).map_err(|e| e.throw(scope))?;
+    js::class::register_realm_object::<ProcessObject>(scope, process);
 
     let emitter = crate::events::emitter_constructor(scope)?;
     let proto = emitter.get_property(scope, c"prototype")?;
@@ -1335,8 +1547,11 @@ pub fn install(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     )?;
 
     for (index, property) in LAZY_PROPERTIES.iter().enumerate() {
-        let state = Object::new_plain(scope)?;
-        state.set_property(scope, c"index", index as u32)?;
+        let state = js::class::create_instance_with::<LazyValueImpl>(scope, |_| LazyValueImpl {
+            index,
+            value: Heap::default(),
+            generation: None,
+        })?;
         let getter = Function::new_callback(scope, property.name, 0, lazy_get, state)?;
         let setter = Function::new_callback(scope, property.name, 1, lazy_set, state)?;
         process.define_accessor(

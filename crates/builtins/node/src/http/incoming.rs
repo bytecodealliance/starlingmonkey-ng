@@ -1,22 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! `IncomingMessage`: a served request, read from the web `Request`'s body stream, or a client
-//! response, read from the `platform::http` response body.
+//! `IncomingMessage`: a request a listening server parses from its socket, a served request, read
+//! from the body the host received, or a client response, read from the `platform::http`
+//! response body.
+//!
+//! A message's state is an [`IncomingState`], which extends the state of the stream with where
+//! its body comes from, and its header lines, from which `headers`, `trailers`,
+//! `headersDistinct` and `trailersDistinct` are built when they are first read.
 
-use js::conversion::{FromJSVal, ToJSVal};
+use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
-use js::gc::handle::RootedHeap;
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
+use js::object::{PropertyInit, PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
-use js::promise::{PromiseFuture, PromiseOutcome};
 use js::{Function, Object};
 use platform::http::IncomingBody;
+use web_globals::signals::abort_controller::{AbortController, AbortControllerImpl};
+use web_streams::readable::default_reader::DefaultReaderImpl;
 
 use crate::buffer::new_buffer;
 use crate::errors::Thrown;
-use crate::stream::{call_method, closure, string, Captures, Props};
+use crate::stream::state::{ReadableSide, StreamState, StreamStateImpl, R};
+use crate::support::{spawn_cancellable, until_cancelled, Canceller};
 
 /// The headers of which Node.js keeps only the first value.
 const SINGLE_VALUED: [&str; 18] = [
@@ -40,38 +48,346 @@ const SINGLE_VALUED: [&str; 18] = [
     "user-agent",
 ];
 
-/// Set `headers` and `rawHeaders` of `message` from the header list `list`. Duplicates of
-/// [`SINGLE_VALUED`] headers are dropped, `set-cookie` values are collected in an array, `cookie`
-/// values are joined with `; `, and other values with `, `.
-pub(super) fn set_headers(
-    scope: &Scope<'_>,
-    message: Object<'_>,
-    list: &[(String, String)],
-) -> Result<(), ExnThrown> {
-    set_header_lines(scope, message, list, false, false)
+/// Where a message's body comes from.
+#[derive(Default)]
+pub(crate) enum Source {
+    /// Nowhere: the message has no body.
+    #[default]
+    None,
+    /// The socket a listening server parses the message from, which pushes the body.
+    Wire,
+    /// A body the host received, which a read in progress takes, and the URL its errors name.
+    Host {
+        body: Option<IncomingBody>,
+        url: Option<String>,
+    },
+    /// The body stream of a served request that was read before, through `reader`.
+    Web,
 }
 
-/// Set `headers` and `rawHeaders` of `message` from the header list `list`, or `trailers` and
-/// `rawTrailers` if `trailers`, as [`set_headers`] does. With `join_duplicates`, duplicates of
-/// [`SINGLE_VALUED`] headers are joined with `, ` too.
-pub(super) fn set_header_lines(
+/// The state of an `IncomingMessage`.
+#[core_runtime::jsclass(hidden, extends = StreamState)]
+pub(crate) struct IncomingState {
+    parent: StreamStateImpl,
+    #[no_trace]
+    pub(super) source: Source,
+    /// The reader of the body stream, for [`Source::Web`].
+    reader: Option<Heap<DefaultReaderImpl>>,
+    /// The cancellation of the body read in progress.
+    #[no_trace]
+    read_cancel: Option<Canceller>,
+    /// The connection of [`Source::Wire`].
+    wire: Option<Heap<super::connection::ConnectionStateImpl>>,
+    /// The header lines, which `rawHeaders` holds too.
+    #[no_trace]
+    pub(super) raw_headers: Vec<(String, String)>,
+    /// The trailer lines, which `rawTrailers` holds too.
+    #[no_trace]
+    raw_trailers: Vec<(String, String)>,
+    /// Whether duplicates of the single-valued headers are joined with `, `.
+    #[no_trace]
+    join_duplicates: bool,
+    headers: Option<Heap<Value>>,
+    trailers: Option<Heap<Value>>,
+    headers_distinct: Option<Heap<Value>>,
+    trailers_distinct: Option<Heap<Value>>,
+    /// The controller of `signal`, once it was read.
+    abort_controller: Option<Heap<AbortControllerImpl>>,
+}
+
+#[core_runtime::jsmethods]
+impl IncomingState {}
+
+impl IncomingStateImpl {
+    /// The value of the accessor whose index in [`LINE_ACCESSORS`] is `index`, if it was set or
+    /// built.
+    fn line_value(&mut self, index: usize) -> &mut Option<Heap<Value>> {
+        match index {
+            0 => &mut self.headers,
+            1 => &mut self.trailers,
+            2 => &mut self.headers_distinct,
+            _ => &mut self.trailers_distinct,
+        }
+    }
+}
+
+/// The state of `message`, or `ERR_INVALID_THIS`.
+pub(super) fn state_of<'s>(
+    scope: &'s Scope<'_>,
+    message: Object<'s>,
+) -> Result<IncomingState<'s>, ExnThrown> {
+    incoming_message_class::state_of(scope, message)
+}
+
+/// The value Node.js's `headers` has for the header lowercased as `lower` in `lines`: the first
+/// value of a single-valued header, unless `join` joins its duplicates, the values of `cookie`
+/// joined with `; `, and the values of other headers joined with `, `. `set-cookie` values are
+/// joined with `, ` here, where `headers` keeps them in an array.
+fn joined_value(lines: &[(String, String)], lower: &str, join: bool) -> Option<String> {
+    let mut found = lines
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(lower))
+        .map(|(_, value)| value.as_str());
+    let first = found.next()?;
+    if !join && SINGLE_VALUED.contains(&lower) {
+        return Some(first.to_string());
+    }
+    let separator = if lower == "cookie" { "; " } else { ", " };
+    Some(found.fold(first.to_string(), |mut joined, value| {
+        joined.push_str(separator);
+        joined.push_str(value);
+        joined
+    }))
+}
+
+/// The value `req.headers[name]` has, from the header lines of `req` if it is an
+/// `IncomingMessage`, and from its `headers` otherwise.
+pub(super) fn header_text(
+    scope: &Scope<'_>,
+    req: Object<'_>,
+    name: &str,
+) -> Result<Option<String>, ExnThrown> {
+    if let Some(state) = incoming_message_class::try_state_of(scope, req)? {
+        let data = state.data();
+        return Ok(joined_value(&data.raw_headers, name, data.join_duplicates));
+    }
+    let headers = req.get_property(scope, c"headers")?;
+    let Ok(headers) = Object::from_value(scope, *headers) else {
+        return Ok(None);
+    };
+    let key = name.to_jsval_throwing(scope)?;
+    let value = crate::http::get_by_key(scope, headers, key)?;
+    Ok(crate::support::rust_string(scope, value))
+}
+
+/// Set the header lines of `message` to `lines`, and its `rawHeaders` to them, or its trailer
+/// lines and `rawTrailers` if `trailers`.
+pub(super) fn set_lines(
     scope: &Scope<'_>,
     message: Object<'_>,
-    list: &[(String, String)],
+    lines: Vec<(String, String)>,
     trailers: bool,
-    join_duplicates: bool,
 ) -> Result<(), ExnThrown> {
-    let mut raw = Vec::with_capacity(list.len() * 2);
-    let mut joined: Vec<(String, Vec<&str>)> = Vec::new();
-    for (name, value) in list {
+    let raw = store_lines(scope, &state_of(scope, message)?, lines, trailers)?;
+    let name = if trailers {
+        c"rawTrailers"
+    } else {
+        c"rawHeaders"
+    };
+    message.set_property(scope, name, *raw)
+}
+
+/// Store `lines` as the header lines of `state`, or its trailer lines if `trailers`, and return
+/// them as a `rawHeaders` array.
+fn store_lines<'s>(
+    scope: &'s Scope<'_>,
+    state: &IncomingState<'_>,
+    lines: Vec<(String, String)>,
+    trailers: bool,
+) -> Result<js::Array<'s>, ExnThrown> {
+    let mut raw = Vec::with_capacity(lines.len() * 2);
+    for (name, value) in &lines {
         raw.push(js::JSString::from_str(scope, name)?.to_jsval_throwing(scope)?);
         raw.push(js::JSString::from_str(scope, value)?.to_jsval_throwing(scope)?);
+    }
+    let raw = js::Array::with_contents(scope, &raw)?;
+    {
+        let mut data = state.data_mut();
+        if trailers {
+            data.raw_trailers = lines;
+            data.trailers = None;
+            data.trailers_distinct = None;
+        } else {
+            data.raw_headers = lines;
+            data.headers = None;
+            data.headers_distinct = None;
+        }
+    }
+    Ok(raw)
+}
+
+/// Set whether duplicates of the single-valued headers of `message` are joined, and its
+/// `joinDuplicateHeaders`.
+pub(super) fn set_join_duplicates(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    join: bool,
+) -> Result<(), ExnThrown> {
+    state_of(scope, message)?.data_mut().join_duplicates = join;
+    message.set_property(scope, c"joinDuplicateHeaders", join)
+}
+
+/// Make the socket of the connection `connection` the body source of `message`, which a
+/// listening server parses.
+pub(super) fn set_wire_source(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    connection: super::connection::ConnectionState<'_>,
+) -> Result<(), ExnThrown> {
+    let state = state_of(scope, message)?;
+    let mut data = state.data_mut();
+    data.source = Source::Wire;
+    data.wire = Some(Heap::from(connection));
+    Ok(())
+}
+
+/// Make `body` the body `message` reads from, whose errors name `url`.
+pub(super) fn set_host_source(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    body: IncomingBody,
+    url: Option<String>,
+) -> Result<(), ExnThrown> {
+    state_of(scope, message)?.data_mut().source = Source::Host {
+        body: Some(body),
+        url,
+    };
+    Ok(())
+}
+
+/// Make the body stream `stream` of a served request the body `message` reads from.
+pub(super) fn set_web_source(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    stream: web_streams::readable::ReadableStream<'_>,
+) -> Result<(), ExnThrown> {
+    let reader = web_streams::readable::native_read::acquire_native_reader(scope, &stream)?;
+    let state = state_of(scope, message)?;
+    let mut data = state.data_mut();
+    data.source = Source::Web;
+    data.reader = Some(Heap::from(reader));
+    Ok(())
+}
+
+/// Push `chunk`, a `Buffer`, onto `message`, or end it for `null`.
+fn push(scope: &Scope<'_>, message: Object<'_>, chunk: HandleValue<'_>) -> Result<(), ExnThrown> {
+    if chunk.is_null() {
+        message.set_property(scope, c"complete", true)?;
+    }
+    Function::call_by_name(scope, message.handle(), c"push", &[chunk])?;
+    Ok(())
+}
+
+/// The completion of a read of a host body: push the chunk read, or `null` at the end, or
+/// destroy the message with the error.
+fn host_read_done(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    result: Result<HandleValue<'_>, HandleValue<'_>>,
+) -> Result<(), ExnThrown> {
+    state_of(scope, message)?.data_mut().read_cancel = None;
+    match result {
+        Ok(chunk) => push(scope, message, chunk),
+        Err(error) => {
+            Function::call_by_name(scope, message.handle(), c"destroy", &[error])?;
+            Ok(())
+        }
+    }
+}
+
+/// Read the next chunk of the host body of `message`, unless a read is in progress.
+fn read_host_body(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    state: &IncomingState<'_>,
+) -> Result<(), ExnThrown> {
+    let body = match &mut state.data_mut().source {
+        Source::Host { body, .. } => body.take(),
+        _ => None,
+    };
+    let Some(mut body) = body else {
+        return Ok(());
+    };
+    let canceller = spawn_cancellable(
+        scope,
+        message,
+        |cancelled| async move {
+            let chunk = until_cancelled(cancelled, body.next_chunk()).await?;
+            Some((body, chunk))
+        },
+        |scope, message, (body, chunk)| {
+            let state = state_of(scope, message)?;
+            let url = match &mut state.data_mut().source {
+                Source::Host {
+                    body: source, url, ..
+                } => {
+                    if matches!(chunk, Ok(Some(_))) {
+                        *source = Some(body);
+                    }
+                    url.clone()
+                }
+                _ => None,
+            };
+            match chunk {
+                Ok(Some(bytes)) => new_buffer(scope, &bytes)?.to_jsval_throwing(scope),
+                Ok(None) => Ok(HandleValue::null()),
+                Err(error) => Err(super::client::transport_error(
+                    scope,
+                    &error.0,
+                    url.as_deref(),
+                )),
+            }
+        },
+        host_read_done,
+    )?;
+    state.data_mut().read_cancel = Some(canceller);
+    Ok(())
+}
+
+/// The read steps of the body stream of a served request, whose payload is the message.
+const WEB_READ_STEPS: web_streams::readable::native_read::NativeReadSteps =
+    web_streams::readable::native_read::NativeReadSteps {
+        chunk: web_chunk,
+        close: web_close,
+        error: web_error,
+    };
+
+/// Push the bytes of `chunk`, a chunk of the body stream of a served request, onto `message`.
+fn web_chunk(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    chunk: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let bytes = match Object::from_value(scope, *chunk)
+        .ok()
+        .and_then(js::ArrayBufferView::from_object)
+    {
+        Some(view) => view.copy_bytes(scope)?,
+        None => Vec::new(),
+    };
+    let buffer = new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?;
+    push(scope, message, buffer)
+}
+
+/// End `message` at the end of the body stream of a served request.
+fn web_close(scope: &Scope<'_>, message: Object<'_>) -> Result<(), ExnThrown> {
+    push(scope, message, HandleValue::null())
+}
+
+/// Destroy `message` with the error of the body stream of a served request.
+fn web_error(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    Function::call_by_name(scope, message.handle(), c"destroy", &[error])?;
+    Ok(())
+}
+
+/// Build the value of `headers` or `trailers` from `lines`, as Node.js's `_addHeaderLine`
+/// does: duplicates of single-valued headers are dropped unless `join`, `set-cookie` values are
+/// collected in an array, `cookie` values are joined with `; `, and other values with `, `.
+fn headers_object<'s>(
+    scope: &'s Scope<'_>,
+    lines: &[(String, String)],
+    join: bool,
+) -> Result<Object<'s>, ExnThrown> {
+    let mut joined: Vec<(String, Vec<&str>)> = Vec::new();
+    for (name, value) in lines {
         let lower = name.to_ascii_lowercase();
         match joined.iter_mut().find(|(name, _)| *name == lower) {
             Some((_, values))
-                if join_duplicates
-                    || lower == "set-cookie"
-                    || !SINGLE_VALUED.contains(&lower.as_str()) =>
+                if join || lower == "set-cookie" || !SINGLE_VALUED.contains(&lower.as_str()) =>
             {
                 values.push(value)
             }
@@ -81,7 +397,6 @@ pub(super) fn set_header_lines(
     }
     let headers = Object::new_plain(scope)?;
     for (name, values) in joined {
-        let key = std::ffi::CString::new(name.as_str()).expect("header names are tokens");
         let value = if name == "set-cookie" {
             let values = values
                 .iter()
@@ -92,396 +407,97 @@ pub(super) fn set_header_lines(
             let separator = if name == "cookie" { "; " } else { ", " };
             js::JSString::from_str(scope, &values.join(separator))?.to_jsval_throwing(scope)?
         };
-        headers.define_property_by_name(
-            scope,
-            &key,
-            value,
-            js::class_spec::JSPROP_ENUMERATE as u32,
-        )?;
+        let key = js::JSString::from_str(scope, &name)?.to_jsval_throwing(scope)?;
+        crate::http::set_by_key(scope, headers, key, value)?;
     }
-    let (name, raw_name) = if trailers {
-        (c"trailers", c"rawTrailers")
-    } else {
-        (c"headers", c"rawHeaders")
-    };
-    message.set_property(scope, name, headers)?;
-    message.set_property(scope, raw_name, *js::Array::with_contents(scope, &raw)?)?;
-    Ok(())
+    Ok(headers)
 }
 
-/// The response body of a client request, which `_read` takes while a read is in progress.
-#[core_runtime::jsclass(hidden)]
-pub struct ResponseBody {
-    #[no_trace]
-    body: Option<IncomingBody>,
-}
-
-#[core_runtime::jsmethods]
-impl ResponseBody {
-    #[constructor]
-    fn new() -> Result<Self, crate::errors::NodeError> {
-        Err(crate::errors::NodeError::new(
-            crate::errors::ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
+/// Build the value of `headersDistinct` or `trailersDistinct` from `lines`, without a
+/// prototype: each lowercase name with the array of its values.
+fn distinct_object<'s>(
+    scope: &'s Scope<'_>,
+    lines: &[(String, String)],
+) -> Result<Object<'s>, ExnThrown> {
+    let mut grouped: Vec<(String, Vec<&str>)> = Vec::new();
+    for (name, value) in lines {
+        let lower = name.to_ascii_lowercase();
+        match grouped.iter_mut().find(|(name, _)| *name == lower) {
+            Some((_, values)) => values.push(value),
+            None => grouped.push((lower, vec![value])),
+        }
     }
-}
-
-/// Make `body` the body `message` reads from.
-pub(super) fn set_response_body(
-    scope: &Scope<'_>,
-    message: Object<'_>,
-    body: IncomingBody,
-) -> Result<(), ExnThrown> {
-    let handle = js::class::create_instance_with::<ResponseBodyImpl>(scope, |_| {
-        ResponseBodyImpl { body: Some(body) }
-    })?;
-    message.define_property(scope, c"_starlingBody", handle.to_jsval_throwing(scope)?, 0)
-}
-
-/// Push `chunk`, a `Buffer`, onto `message`, or end it for `null`.
-fn push(scope: &Scope<'_>, message: Object<'_>, chunk: HandleValue<'_>) -> Result<(), ExnThrown> {
-    if chunk.is_null() {
-        message.set_property(scope, c"complete", true)?;
+    let distinct = Object::new_with_null_prototype(scope)?;
+    for (name, values) in grouped {
+        let values = values
+            .iter()
+            .map(|value| js::JSString::from_str(scope, value)?.to_jsval_throwing(scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        let values = js::Array::with_contents(scope, &values)?.to_jsval_throwing(scope)?;
+        let key = js::JSString::from_str(scope, &name)?.to_jsval_throwing(scope)?;
+        crate::http::set_by_key(scope, distinct, key, values)?;
     }
-    call_method(scope, message, c"push", &[chunk])?;
-    Ok(())
+    Ok(distinct)
 }
 
-/// The fulfillment reaction of a body read, whose captures are `[message]`: push the chunk the
-/// promise was fulfilled with, a `Buffer` or `null`.
-fn on_chunk(
+/// The names of the accessors [`get_lines`] and [`set_lines_value`] implement, in the order of
+/// their payloads.
+const LINE_ACCESSORS: [&std::ffi::CStr; 4] = [
+    c"headers",
+    c"trailers",
+    c"headersDistinct",
+    c"trailersDistinct",
+];
+
+/// The getter of the accessor whose index in [`LINE_ACCESSORS`] is the payload: the value set,
+/// or the object built from the header or trailer lines.
+fn get_lines(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let message = Captures::of(scope, payload)?.obj(0)?;
-    push(scope, message, args.get(0))?;
-    Ok(js::value::undefined())
-}
-
-/// The rejection reaction of a body read, whose captures are `[message]`: destroy the message
-/// with the error.
-fn on_read_error(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let message = Captures::of(scope, payload)?.obj(0)?;
-    call_method(scope, message, c"destroy", &[args.get(0)])?;
-    Ok(js::value::undefined())
-}
-
-/// The fulfillment reaction of a web stream read, whose captures are `[message]`: push the
-/// bytes of the result's `value`, or end the message once the result is `done`.
-fn on_web_chunk(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let message = Captures::of(scope, payload)?.obj(0)?;
-    let result = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
-    if result.flag(scope, c"done")? {
-        push(scope, message, scope.root_value(js::value::null()))?;
+    let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
+    let Some(state) = incoming_message_class::try_state_of(scope, this)? else {
         return Ok(js::value::undefined());
-    }
-    let value = result.val(scope, c"value")?;
-    let chunk = match Object::from_value(scope, *value) {
-        Ok(array) if array.cast::<js::Uint8Array>().is_ok() => {
-            let buffer = crate::buffer::buffer::class_constructor(scope)?;
-            let proto = buffer.obj(scope, c"prototype")?.ok_or(ExnThrown)?;
-            array.set_prototype(scope, proto.handle())?;
-            value
-        }
-        _ => new_buffer(scope, &[])?.to_jsval_throwing(scope)?,
     };
-    push(scope, message, chunk)?;
-    Ok(js::value::undefined())
-}
-
-/// Read the next chunk of the client response body `handle` into `message`.
-fn read_response_body(
-    scope: &Scope<'_>,
-    message: Object<'_>,
-    handle: Object<'_>,
-) -> Result<(), ExnThrown> {
-    let body_handle = handle
-        .cast::<ResponseBody>()
-        .map_err(|_| js::error::TypeError("unexpected object".into()).throw(scope))?;
-    let Some(mut body) = body_handle.data_mut().body.take() else {
-        // A read is in progress, or the body ended.
-        return Ok(());
+    let index = payload.to_number() as usize;
+    let stored = state
+        .data_mut()
+        .line_value(index)
+        .as_ref()
+        .map(|value| value.get(scope));
+    if let Some(stored) = stored.filter(|stored| js::conversion::to_boolean(*stored)) {
+        return Ok(stored.get());
+    }
+    let (lines, join) = {
+        let data = state.data();
+        let lines = if index.is_multiple_of(2) {
+            data.raw_headers.clone()
+        } else {
+            data.raw_trailers.clone()
+        };
+        (lines, data.join_duplicates)
     };
-    let handle = RootedHeap::<js::object::Object>::new(handle);
-    let message_url = RootedHeap::<js::object::Object>::new(message);
-    let future = async move {
-        let chunk: Result<Option<platform::http::BodyBytes>, platform::http::Error> =
-            body.next_chunk().await;
-        PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| match chunk {
-            Ok(Some(bytes)) => {
-                if let Ok(handle) = handle.get(scope).cast::<ResponseBody>() {
-                    handle.data_mut().body = Some(body);
-                }
-                new_buffer(scope, &bytes)?.to_jsval_throwing(scope)
-            }
-            Ok(None) => Ok(scope.root_value(js::value::null())),
-            Err(error) => {
-                let url = match message_url.get(scope).obj(scope, c"req")? {
-                    Some(request) => {
-                        let url = request.val(scope, c"_starlingUrl")?;
-                        url.is_string()
-                            .then(|| String::from_jsval_throwing(scope, url, ()))
-                            .transpose()?
-                    }
-                    None => None,
-                };
-                Err(super::client::transport_error(
-                    scope,
-                    &error.0,
-                    url.as_deref(),
-                ))
-            }
-        }))
-    };
-    let promise = js::Promise::new_pending(scope)?;
-    promise.spawn(PromiseFuture::new(future));
-    let on_chunk = closure(scope, 1, on_chunk, &[message.to_jsval_raw_throwing(scope)?])?;
-    let on_error = closure(
-        scope,
-        1,
-        on_read_error,
-        &[message.to_jsval_raw_throwing(scope)?],
-    )?;
-    promise.then(scope, Some(on_chunk), Some(on_error))?;
-    Ok(())
-}
-
-#[core_runtime::jsfunction_class(
-    name = "IncomingMessage",
-    extends = "crate::stream::readable_class"
-)]
-pub mod incoming_message_class {
-    use super::*;
-
-    /// <https://nodejs.org/api/http.html#class-httpincomingmessage>: a message from `socket`.
-    #[constructor]
-    pub fn init(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        socket: Option<HandleValue<'_>>,
-    ) -> Result<(), Thrown> {
-        crate::stream::readable_class::init(scope, this, None)?;
-        let socket = socket.unwrap_or_else(|| scope.root_value(js::value::undefined()));
-        this.set_property(scope, c"socket", socket)?;
-        this.set_property(scope, c"client", socket)?;
-        this.set_property(scope, c"httpVersion", "1.1")?;
-        this.set_property(scope, c"httpVersionMajor", 1)?;
-        this.set_property(scope, c"httpVersionMinor", 1)?;
-        this.set_property(scope, c"headers", Object::new_plain(scope)?)?;
-        this.set_property(scope, c"rawHeaders", *js::Array::new(scope, 0)?)?;
-        this.set_property(scope, c"trailers", Object::new_plain(scope)?)?;
-        this.set_property(scope, c"rawTrailers", *js::Array::new(scope, 0)?)?;
-        this.set_property(scope, c"complete", false)?;
-        this.set_property(scope, c"aborted", false)?;
-        this.set_property(scope, c"url", "")?;
-        for name in [c"method", c"statusCode", c"statusMessage"] {
-            this.set_property(scope, name, js::value::null())?;
-        }
-        Ok(())
-    }
-
-    /// Read the next chunk from the body source: a web stream reader, a client response body,
-    /// the socket of a request a listening server parses, which this resumes unless the server
-    /// paused it, or none, which ends the message.
-    #[method(name = "_read")]
-    pub fn read_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        this.set_property(scope, c"_consuming", true)?;
-        if this.flag(scope, c"_starlingWire")? {
-            if let Some(socket) = this.obj(scope, c"socket")? {
-                super::super::connection::read_start(scope, socket)?;
-            }
-            return Ok(());
-        }
-        if let Some(reader) = this.obj(scope, c"_starlingReader")? {
-            let read = call_method(scope, reader, c"read", &[])?;
-            let promise = Object::from_value(scope, *read)
-                .map_err(|e| e.throw(scope))?
-                .cast::<js::Promise>()
-                .map_err(|_| js::error::TypeError("unexpected object".into()).throw(scope))?;
-            let on_chunk = closure(
-                scope,
-                1,
-                on_web_chunk,
-                &[this.to_jsval_raw_throwing(scope)?],
-            )?;
-            let on_error = closure(
-                scope,
-                1,
-                on_read_error,
-                &[this.to_jsval_raw_throwing(scope)?],
-            )?;
-            promise.then(scope, Some(on_chunk), Some(on_error))?;
-            return Ok(());
-        }
-        if let Some(handle) = this.obj(scope, c"_starlingBody")? {
-            return read_response_body(scope, this, handle);
-        }
-        push(scope, this, scope.root_value(js::value::null()))
-    }
-
-    /// <https://nodejs.org/api/http.html#messagesettimeoutmsecs-callback>: sets the timeout of
-    /// the socket of a request a listening server parses. `callback` becomes a `timeout`
-    /// listener. The timeout has no effect for other messages.
-    pub fn set_timeout<'s>(
-        scope: &Scope<'_>,
-        this: Object<'s>,
-        msecs: Option<HandleValue<'_>>,
-        callback: Option<HandleValue<'_>>,
-    ) -> Result<Object<'s>, ExnThrown> {
-        if let Some(callback) =
-            callback.filter(|callback| crate::stream::is_function(scope, *callback))
-        {
-            call_method(scope, this, c"on", &[string(scope, "timeout")?, callback])?;
-        }
-        if let Some(socket) = this.obj(scope, c"socket")? {
-            if crate::stream::has_method(scope, socket, c"setTimeout")? {
-                let msecs = msecs.unwrap_or_else(|| scope.root_value(js::value::undefined()));
-                call_method(scope, socket, c"setTimeout", &[msecs])?;
-            }
-        }
-        Ok(this)
-    }
-
-    /// Set `aborted` and emit `aborted` if the message didn't end, then call `callback` with
-    /// `error` in the tick queue. The error is passed on only if the message has an `error`
-    /// listener. An aborted request that a listening server parses destroys its socket with
-    /// `error`.
-    #[method(name = "_destroy")]
-    pub fn destroy_impl(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        error: HandleValue<'_>,
-        callback: HandleValue<'_>,
-    ) -> Result<(), ExnThrown> {
-        if !this.flag(scope, c"readableEnded")? || !this.flag(scope, c"complete")? {
-            this.set_property(scope, c"aborted", true)?;
-            call_method(scope, this, c"emit", &[string(scope, "aborted")?])?;
-        }
-        if this.flag(scope, c"aborted")? && this.flag(scope, c"_starlingWire")? {
-            if let Some(socket) = this.obj(scope, c"socket")? {
-                if !socket.flag(scope, c"destroyed")? {
-                    call_method(scope, socket, c"destroy", &[error])?;
-                }
-            }
-        }
-        let call = closure(
-            scope,
-            0,
-            super::call_destroy_callback,
-            &[
-                this.to_jsval_raw_throwing(scope)?,
-                error.get(),
-                callback.get(),
-            ],
-        )?;
-        js::jobs::queue_tick(scope, call.to_jsval_throwing(scope)?, &[])
-    }
-
-    /// Define `connection`, an alias of `socket`, and `headersDistinct` and `trailersDistinct`.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let getter = Function::new_callback(scope, c"connection", 0, super::get_connection, ())?;
-        let setter = Function::new_callback(scope, c"connection", 1, super::set_connection, ())?;
-        proto.define_accessor(scope, c"connection", Some(*getter), Some(*setter), 0)?;
-        for (index, name) in [c"headersDistinct", c"trailersDistinct"].iter().enumerate() {
-            let payload = index as f64;
-            let getter = Function::new_callback(scope, name, 0, super::get_distinct, payload)?;
-            let setter = Function::new_callback(scope, name, 1, super::set_distinct, payload)?;
-            proto.define_accessor(scope, name, Some(*getter), Some(*setter), 0)?;
-        }
-        Ok(())
-    }
-
-    /// Read the rest of the message and drop it, unless that already started.
-    #[method(name = "_dump")]
-    pub fn dump(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        if this.flag(scope, c"_dumped")? {
-            return Ok(());
-        }
-        this.set_property(scope, c"_dumped", true)?;
-        call_method(
-            scope,
-            this,
-            c"removeAllListeners",
-            &[string(scope, "data")?],
-        )?;
-        call_method(scope, this, c"resume", &[])?;
-        Ok(())
-    }
-}
-
-/// The raw list property and the property that holds the value set for `headersDistinct`, for
-/// the payload 0, and for `trailersDistinct`, for the payload 1.
-fn distinct_names(payload: HandleValue<'_>) -> (&'static std::ffi::CStr, &'static std::ffi::CStr) {
-    if payload.to_number() == 0.0 {
-        (c"rawHeaders", c"_starlingHeadersDistinct")
+    let built = if index < 2 {
+        headers_object(scope, &lines, join)?
     } else {
-        (c"rawTrailers", c"_starlingTrailersDistinct")
-    }
+        distinct_object(scope, &lines)?
+    };
+    *state.data_mut().line_value(index) = Some(Heap::from(built.as_value()));
+    Ok(built.as_value())
 }
 
-/// The getter of `headersDistinct` and `trailersDistinct`: the value set, or a null-prototype
-/// object mapping each lowercase name of the raw list to the array of its values.
-fn get_distinct(
+/// The setter of the accessor whose index in [`LINE_ACCESSORS`] is the payload.
+fn set_lines_value(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
-    let (raw, stored) = distinct_names(payload);
-    if let Some(value) = this.obj(scope, stored)? {
-        return value.to_jsval_raw_throwing(scope);
+    if let Some(state) = incoming_message_class::try_state_of(scope, this)? {
+        let value = args.get(0);
+        *state.data_mut().line_value(payload.to_number() as usize) = Some(Heap::from(value.get()));
     }
-    let distinct = super::outgoing::null_object(scope)?;
-    if let Some(list) = this.obj(scope, raw)? {
-        let items = super::outgoing::elements(scope, list)?;
-        for pair in items.chunks(2) {
-            let [name, value] = pair else { continue };
-            let name = String::from_jsval(scope, *name, ())
-                .unwrap_or_default()
-                .to_lowercase();
-            let key = crate::stream::string(scope, &name)?;
-            let existing = crate::http::get_by_key(scope, distinct, key)?;
-            match Object::from_value(scope, *existing) {
-                Ok(values) => {
-                    call_method(scope, values, c"push", &[*value])?;
-                }
-                Err(_) => {
-                    let values = js::Array::with_contents(scope, &[*value])?;
-                    crate::http::set_by_key(
-                        scope,
-                        distinct,
-                        key,
-                        values.to_jsval_throwing(scope)?,
-                    )?;
-                }
-            }
-        }
-    }
-    this.define_property(scope, stored, distinct, 0)?;
-    distinct.to_jsval_raw_throwing(scope)
-}
-
-/// The setter of `headersDistinct` and `trailersDistinct`.
-fn set_distinct(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
-    let (_, stored) = distinct_names(payload);
-    this.define_property(scope, stored, args.get(0), 0)?;
     Ok(js::value::undefined())
 }
 
@@ -492,7 +508,7 @@ fn get_connection(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
-    Ok(this.val(scope, c"socket")?.get())
+    Ok(this.get_property(scope, c"socket")?.get())
 }
 
 /// The setter of `connection`: set `socket`.
@@ -506,21 +522,392 @@ fn set_connection(
     Ok(js::value::undefined())
 }
 
-/// The tick callback of `_destroy`, whose captures are `[message, error, callback]`: call the
-/// callback with the error if the message has an `error` listener, and without it otherwise.
-fn call_destroy_callback(
+/// Abort the signal of `message`, if `signal` was read.
+fn abort_signal(scope: &Scope<'_>, state: &IncomingState<'_>) -> Result<(), ExnThrown> {
+    let controller = state.data().abort_controller.get(scope);
+    if let Some(controller) = controller {
+        controller.abort(
+            scope,
+            HandleValue::undefined(),
+            web_globals::events::algorithms::ScriptStackState::NonEmpty,
+        )?;
+    }
+    Ok(())
+}
+
+/// The `close` listener the signal of a message adds to its socket, whose payload is the
+/// message: abort the signal unless the message is complete.
+fn on_socket_close(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let message = captures.obj(0)?;
-    let listeners = call_method(scope, message, c"listenerCount", &[string(scope, "error")?])?;
-    let args = if listeners.is_number() && listeners.to_number() > 0.0 {
-        vec![captures.get(1)?]
-    } else {
-        Vec::new()
-    };
-    Function::call(scope, js::value::undefined(), captures.get(2)?, &args)?;
+    let message = js::function::cast_payload::<js::Object>(scope, payload);
+    if !js::conversion::to_boolean(message.get_property(scope, c"complete")?) {
+        abort_signal(scope, &state_of(scope, message)?)?;
+    }
     Ok(js::value::undefined())
+}
+
+/// The getter of `signal`: an `AbortSignal` that aborts if the message is destroyed before it
+/// ended, or its socket closes before it is complete.
+fn get_signal(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
+    let state = state_of(scope, this)?;
+    let controller = state.data().abort_controller.get(scope);
+    if let Some(controller) = controller {
+        return Ok(controller.signal(scope).as_value());
+    }
+    let controller = AbortController::new(scope)?;
+    state.data_mut().abort_controller = Some(Heap::from(controller));
+    let (destroyed, ended) = match ReadableSide::try_of(scope, this)? {
+        Some(side) => (side.has(R::DESTROYED), side.has(R::END_EMITTED)),
+        None => (false, false),
+    };
+    let complete = js::conversion::to_boolean(this.get_property(scope, c"complete")?);
+    if destroyed && (!ended || !complete) {
+        abort_signal(scope, &state)?;
+    } else if let Ok(socket) = Object::from_value(scope, *this.get_property(scope, c"socket")?) {
+        let destroyed = js::conversion::to_boolean(socket.get_property(scope, c"destroyed")?);
+        if destroyed {
+            abort_signal(scope, &state)?;
+        } else {
+            let listener = Function::new_callback(scope, c"", 0, on_socket_close, this)?;
+            crate::events::listen(scope, socket, c"once", c"close", *listener)?;
+        }
+    }
+    Ok(controller.signal(scope).as_value())
+}
+
+/// Initialize `message` as the `IncomingMessage` constructor does for `socket`, creating its
+/// properties as `init` creates them, with the fields of `head`. With [`PropertyInit::Define`],
+/// `message` is an instance this crate created that has no own properties yet.
+fn init_message(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    socket: HandleValue<'_>,
+    head: MessageHead<'_>,
+    init: PropertyInit,
+) -> Result<(), Thrown> {
+    let socket_object = Object::from_value(scope, *socket).ok();
+    // The high water mark of a socket of this crate is read from its state.
+    let socket_mark = match (init, socket_object) {
+        (PropertyInit::Define, Some(socket)) => {
+            ReadableSide::try_of(scope, socket)?.map(|side| side.high_water_mark())
+        }
+        _ => None,
+    };
+    let options = match socket_object {
+        Some(socket) if socket_mark.is_none() => {
+            let options = Object::new_plain(scope)?;
+            let mark = socket.get_property(scope, c"readableHighWaterMark")?;
+            options.set_property(scope, c"highWaterMark", mark)?;
+            Some(options.to_jsval_throwing(scope)?)
+        }
+        _ => None,
+    };
+    match init {
+        PropertyInit::Define => {
+            crate::stream::init_new_readable(scope, message, options, socket_mark)?
+        }
+        PropertyInit::Assign => crate::stream::readable_class::init(scope, message, options)?,
+    }
+    ReadableSide::of(scope, message)?.set(R::READING_MORE, true);
+    let state = state_of(scope, message)?;
+    let raw_headers = match head.headers {
+        Some(lines) => store_lines(scope, &state, lines, false)?,
+        None => js::Array::new(scope, 0)?,
+    };
+    let join = head.join_duplicates.unwrap_or(false);
+    state.data_mut().join_duplicates = join;
+    let null = HandleValue::null();
+    // SAFETY: the caller guarantees the requirements of `Define`, and no JavaScript runs before
+    // the writer finishes.
+    let mut properties = unsafe { message.property_writer(scope, &MESSAGE_PROPERTIES, init) }?;
+    properties.write(scope, c"socket", socket)?;
+    match head.version {
+        Some((major, minor)) => {
+            properties.write(scope, c"httpVersionMajor", major)?;
+            properties.write(scope, c"httpVersionMinor", minor)?;
+            let version = if (major, minor) == (1, 1) {
+                js::class::get_or_init_atom(scope, c"1.1")?
+            } else {
+                format!("{major}.{minor}")
+                    .as_str()
+                    .to_jsval_throwing(scope)?
+            };
+            properties.write(scope, c"httpVersion", version)?;
+        }
+        None => {
+            properties.write(scope, c"httpVersionMajor", null)?;
+            properties.write(scope, c"httpVersionMinor", null)?;
+            properties.write(scope, c"httpVersion", null)?;
+        }
+    }
+    properties.write(scope, c"complete", false)?;
+    properties.write(scope, c"rawHeaders", *raw_headers)?;
+    properties.write(scope, c"rawTrailers", *js::Array::new(scope, 0)?)?;
+    properties.write(scope, c"joinDuplicateHeaders", join)?;
+    properties.write(scope, c"aborted", false)?;
+    match head.upgrade {
+        Some(upgrade) => properties.write(scope, c"upgrade", upgrade)?,
+        None => properties.write(scope, c"upgrade", null)?,
+    }
+    properties.write(scope, c"url", head.url.unwrap_or(""))?;
+    match head.method {
+        Some(method) => properties.write(scope, c"method", method)?,
+        None => properties.write(scope, c"method", null)?,
+    }
+    match head.status {
+        Some((code, text)) => {
+            properties.write(scope, c"statusCode", f64::from(code))?;
+            properties.write(scope, c"statusMessage", text)?;
+        }
+        None => {
+            properties.write(scope, c"statusCode", null)?;
+            properties.write(scope, c"statusMessage", null)?;
+        }
+    }
+    properties.write(scope, c"client", socket)?;
+    properties.write(scope, c"_consuming", false)?;
+    properties.write(scope, c"_dumped", false)?;
+    properties.finish(scope)?;
+    Ok(())
+}
+
+#[core_runtime::jsfunction_class(
+    name = "IncomingMessage",
+    extends = "crate::stream::readable_class",
+    state = "IncomingState",
+    invalid_this = "crate::errors::invalid_this"
+)]
+pub mod incoming_message_class {
+    use super::*;
+
+    /// <https://nodejs.org/api/http.html#class-httpincomingmessage>: a message from `socket`,
+    /// buffering as much as the socket does.
+    #[constructor(length = 1)]
+    pub fn init(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        socket: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        let socket = socket.unwrap_or(HandleValue::undefined());
+        init_message(
+            scope,
+            this,
+            socket,
+            MessageHead::default(),
+            PropertyInit::Assign,
+        )
+    }
+
+    /// Read the next chunk from the body source: a host body or a body stream, or the socket of
+    /// a request a listening server parses, which this resumes unless the server paused it. A
+    /// message without a body source ends.
+    #[method(name = "_read")]
+    pub fn read_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        if !js::conversion::to_boolean(this.get_property(scope, c"_consuming")?) {
+            ReadableSide::of(scope, this)?.set(R::READING_MORE, false);
+            this.set_property(scope, c"_consuming", true)?;
+        }
+        let state = state_of(scope, this)?;
+        let (kind, connection, reader) = {
+            let data = state.data();
+            let kind = match &data.source {
+                Source::None => 0,
+                Source::Wire => 1,
+                Source::Host { .. } => 2,
+                Source::Web => 3,
+            };
+            (kind, data.wire.get(scope), data.reader.get(scope))
+        };
+        match kind {
+            1 => match connection {
+                Some(connection) => super::super::connection::read_start(scope, connection),
+                None => Ok(()),
+            },
+            2 => read_host_body(scope, this, &state),
+            3 => match reader {
+                Some(reader) => web_streams::readable::native_read::native_reader_read(
+                    scope,
+                    reader,
+                    WEB_READ_STEPS,
+                    this,
+                ),
+                None => Ok(()),
+            },
+            _ => push(scope, this, HandleValue::null()),
+        }
+    }
+
+    /// <https://nodejs.org/api/http.html#messagesettimeoutmsecs-callback>: sets the timeout of
+    /// the socket. `callback` becomes a `timeout` listener.
+    #[method(length = 2)]
+    pub fn set_timeout<'s>(
+        scope: &Scope<'_>,
+        this: Object<'s>,
+        msecs: Option<HandleValue<'_>>,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        if let Some(callback) = callback.filter(|callback| js::function::is_callable(*callback)) {
+            let callback = Object::from_value(scope, *callback).map_err(|e| e.throw(scope))?;
+            crate::events::listen(scope, this, c"on", c"timeout", callback)?;
+        }
+        if let Ok(socket) = Object::from_value(scope, *this.get_property(scope, c"socket")?) {
+            if crate::support::has_method(scope, socket, c"setTimeout")? {
+                let msecs = msecs.unwrap_or(HandleValue::undefined());
+                Function::call_by_name(scope, socket.handle(), c"setTimeout", &[msecs])?;
+            }
+        }
+        Ok(this)
+    }
+
+    /// Set `aborted` and emit `aborted` if the message didn't end, then call `callback` with
+    /// `error` in the tick queue. The error is passed on only if the message has an `error`
+    /// listener. An aborted message destroys its socket with `error`, unless the socket was
+    /// destroyed.
+    #[method(name = "_destroy")]
+    pub fn destroy_impl(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        error: HandleValue<'_>,
+        callback: HandleValue<'_>,
+    ) -> Result<(), ExnThrown> {
+        let state = state_of(scope, this)?;
+        state.data_mut().read_cancel = None;
+        let ended = ReadableSide::of(scope, this)?.has(R::END_EMITTED);
+        if !ended || !js::conversion::to_boolean(this.get_property(scope, c"complete")?) {
+            this.set_property(scope, c"aborted", true)?;
+            crate::events::emit(scope, this, c"aborted", &[])?;
+            abort_signal(scope, &state)?;
+        }
+        let aborted = js::conversion::to_boolean(this.get_property(scope, c"aborted")?);
+        if aborted {
+            let connection = state.data().wire.get(scope);
+            let socket =
+                connection.map(|connection| super::super::connection::socket_of(scope, connection));
+            if let Some(socket) = socket {
+                if !js::conversion::to_boolean(socket.get_property(scope, c"destroyed")?) {
+                    Function::call_by_name(scope, socket.handle(), c"destroy", &[error])?;
+                }
+            }
+        }
+        js::jobs::queue_native_tick(scope, call_destroy_callback, this, &[error, callback])
+    }
+
+    /// Define `connection`, an alias of `socket`, `headers`, `trailers`, `headersDistinct`,
+    /// `trailersDistinct`, and `signal`.
+    #[setup]
+    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
+        let getter = Function::new_callback(scope, c"connection", 0, get_connection, ())?;
+        let setter = Function::new_callback(scope, c"connection", 1, set_connection, ())?;
+        proto.define_accessor(scope, c"connection", Some(*getter), Some(*setter), 0)?;
+        for (index, name) in LINE_ACCESSORS.iter().enumerate() {
+            let payload = index as f64;
+            let getter = Function::new_callback(scope, name, 0, get_lines, payload)?;
+            let setter = Function::new_callback(scope, name, 1, set_lines_value, payload)?;
+            proto.define_accessor(scope, name, Some(*getter), Some(*setter), 0)?;
+        }
+        let getter = Function::new_callback(scope, c"signal", 0, get_signal, ())?;
+        proto.define_accessor(scope, c"signal", Some(*getter), None, 0)
+    }
+
+    /// Read the rest of the message and drop it, unless that already started.
+    #[method(name = "_dump")]
+    pub fn dump(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        if js::conversion::to_boolean(this.get_property(scope, c"_dumped")?) {
+            return Ok(());
+        }
+        this.set_property(scope, c"_dumped", true)?;
+        Function::call_by_name(
+            scope,
+            this.handle(),
+            c"removeAllListeners",
+            &[js::class::get_or_init_atom(scope, c"data")?],
+        )?;
+        Function::call_by_name(scope, this.handle(), c"resume", js::function::EmptyArgs)?;
+        Ok(())
+    }
+}
+
+/// The tick callback of `_destroy`, whose payload is the message and whose arguments are the
+/// error and the callback: call the callback with the error if the message has an `error`
+/// listener, and without it otherwise.
+fn call_destroy_callback(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let message = js::function::cast_payload::<js::Object>(scope, payload);
+    let error = js::class::get_or_init_atom(scope, c"error")?;
+    let listeners = crate::events::listener_count(scope, message, error)?;
+    let callback = args.get(1);
+    if listeners > 0.0 {
+        Function::call(scope, HandleValue::undefined(), callback, &[args.get(0)])?;
+    } else {
+        Function::call(
+            scope,
+            HandleValue::undefined(),
+            callback,
+            js::function::EmptyArgs,
+        )?;
+    }
+    Ok(js::value::undefined())
+}
+
+/// The own properties the `IncomingMessage` constructor creates after those of `Readable`, in
+/// Node's order.
+pub(crate) static MESSAGE_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"socket"),
+    TemplateKey::Name(c"httpVersionMajor"),
+    TemplateKey::Name(c"httpVersionMinor"),
+    TemplateKey::Name(c"httpVersion"),
+    TemplateKey::Name(c"complete"),
+    TemplateKey::Name(c"rawHeaders"),
+    TemplateKey::Name(c"rawTrailers"),
+    TemplateKey::Name(c"joinDuplicateHeaders"),
+    TemplateKey::Name(c"aborted"),
+    TemplateKey::Name(c"upgrade"),
+    TemplateKey::Name(c"url"),
+    TemplateKey::Name(c"method"),
+    TemplateKey::Name(c"statusCode"),
+    TemplateKey::Name(c"statusMessage"),
+    TemplateKey::Name(c"client"),
+    TemplateKey::Name(c"_consuming"),
+    TemplateKey::Name(c"_dumped"),
+]);
+
+/// The head of a message that [`new_message`] creates. A field that is `None` keeps the value the
+/// constructor gives it.
+#[derive(Default)]
+pub(super) struct MessageHead<'a> {
+    /// `httpVersionMajor` and `httpVersionMinor`, from which `httpVersion` is made.
+    pub version: Option<(u32, u32)>,
+    pub method: Option<&'a str>,
+    pub url: Option<&'a str>,
+    pub upgrade: Option<bool>,
+    /// `statusCode` and `statusMessage`.
+    pub status: Option<(u16, &'a str)>,
+    /// `joinDuplicateHeaders`, which is also stored in the state.
+    pub join_duplicates: Option<bool>,
+    /// The header lines, stored in the state and as `rawHeaders`.
+    pub headers: Option<Vec<(String, String)>>,
+}
+
+/// A new `IncomingMessage` from `socket` with `head`, as `new IncomingMessage(socket)` creates it
+/// with the module's own constructor and the assignments of `head`'s fields that follow it.
+pub(super) fn new_message<'s>(
+    scope: &'s Scope<'_>,
+    socket: HandleValue<'_>,
+    head: MessageHead<'_>,
+) -> Result<Object<'s>, ExnThrown> {
+    let message = incoming_message_class::new_instance(scope)?;
+    init_message(scope, message, socket, head, PropertyInit::Define)
+        .map_err(|thrown| thrown.throw(scope))?;
+    Ok(message)
 }

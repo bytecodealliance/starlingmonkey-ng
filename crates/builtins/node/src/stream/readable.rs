@@ -4,31 +4,23 @@
 
 use std::ffi::CStr;
 
+use js::class_spec::JSPROP_ENUMERATE;
 use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
-use js::function::{Callback, CallbackArgs};
+use js::function::{cast_payload, Callback, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
+use js::object::PropertyInit;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use super::destroy::{self, error_or_destroy, error_or_destroy_with};
-use super::util::{
-    as_object, call, call_method, closure, emit, has_method, is_function, is_true, listen,
-    listener_count, next_tick, required_obj, rust_string, same, states, string, take_exception,
-    this_object, truthy, type_error, Captures, Props,
-};
+use super::eos::{EosCallback, EosOptions};
+use super::state::{ReadablePart, ReadableSide, StreamState, WritableSide, R, W};
 use crate::errors::{ErrorKind, NodeError, Thrown};
-
-/// `stream._readableState`.
-pub(crate) fn readable_state<'s>(
-    scope: &'s Scope<'_>,
-    stream: Object<'_>,
-) -> Result<Object<'s>, ExnThrown> {
-    stream
-        .obj(scope, c"_readableState")?
-        .ok_or_else(|| js::error::TypeError("not a Readable".into()).throw(scope))
-}
+use crate::events::{listen, listener_count};
+use crate::support::{has_method, is_true, rust_string, this_object};
 
 /// `Buffer.concat(parts)`.
 fn concat_buffers<'s>(
@@ -47,11 +39,6 @@ pub(crate) fn is_buffer(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<boo
     crate::buffer::buffer::is_buffer(scope, value).map_err(|error| error.throw(scope))
 }
 
-/// Whether `value` is an `ArrayBufferView`.
-pub(crate) fn is_array_buffer_view(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-    as_object(scope, value).is_some_and(|object| js::ArrayBufferView::from_object(object).is_some())
-}
-
 /// `Buffer.from(value, ...args)`, with up to two further arguments.
 pub(crate) fn buffer_from<'s>(
     scope: &'s Scope<'_>,
@@ -68,11 +55,11 @@ pub(crate) fn view_to_buffer<'s>(
     scope: &'s Scope<'_>,
     view: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let object =
-        as_object(scope, view).ok_or_else(|| type_error(scope, "view is not an object"))?;
-    let buffer = object.val(scope, c"buffer")?;
-    let offset = object.val(scope, c"byteOffset")?;
-    let length = object.val(scope, c"byteLength")?;
+    let object = Object::from_value(scope, view)
+        .map_err(|_| js::error::TypeError(String::from("view is not an object")).throw(scope))?;
+    let buffer = object.get_property(scope, c"buffer")?;
+    let offset = object.get_property(scope, c"byteOffset")?;
+    let length = object.get_property(scope, c"byteLength")?;
     buffer_from(scope, &[buffer, offset, length])
 }
 
@@ -81,27 +68,14 @@ pub(crate) fn is_encoding(scope: &Scope<'_>, encoding: HandleValue<'_>) -> Resul
     Ok(crate::buffer::buffer::is_encoding(scope, encoding))
 }
 
-/// `ERR_UNKNOWN_ENCODING` for `encoding`.
-pub(crate) fn unknown_encoding(scope: &Scope<'_>, encoding: HandleValue<'_>) -> NodeError {
-    let name = js::JSString::from_value(scope, encoding)
-        .and_then(|name| name.to_utf8(scope))
-        .unwrap_or_default();
-    NodeError::new(
-        ErrorKind::TypeError,
-        "ERR_UNKNOWN_ENCODING",
-        format!("Unknown encoding: {name}"),
-    )
-}
+pub(crate) use crate::buffer::unknown_encoding;
 
 /// A new `StringDecoder` for `encoding`.
 fn new_decoder<'s>(
     scope: &'s Scope<'_>,
-    encoding: HandleValue<'s>,
+    encoding: HandleValue<'_>,
 ) -> Result<Object<'s>, ExnThrown> {
-    let namespace = core_runtime::module::builtin_namespace(scope, "node:string_decoder")?
-        .ok_or_else(|| type_error(scope, "node:string_decoder is not available"))?;
-    let ctor = required_obj(scope, namespace, c"StringDecoder")?;
-    js::Function::construct(scope, ctor, &[encoding])
+    crate::string_decoder::new_decoder(scope, encoding).map_err(|error| error.throw(scope))
 }
 
 /// The length of `chunk`: a string's length in UTF-16 code units, or a buffer's in bytes.
@@ -109,7 +83,7 @@ pub(crate) fn chunk_length(scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<
     if chunk.is_string() {
         return Ok(js::JSString::from_value(scope, chunk)?.len() as f64);
     }
-    let Some(object) = as_object(scope, chunk) else {
+    let Ok(object) = Object::from_value(scope, chunk) else {
         return Ok(0.0);
     };
     // A typed array's `length` is its element count, which is read directly unless the object has
@@ -119,7 +93,12 @@ pub(crate) fn chunk_length(scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<
             return Ok(view.array_length() as f64);
         }
     }
-    object.num(scope, c"length")
+    let length = object.get_property(scope, c"length")?;
+    Ok(if length.is_number() {
+        length.to_number()
+    } else {
+        0.0
+    })
 }
 
 /// The length `chunk` adds to the buffered length of a stream in `object_mode` or not.
@@ -145,183 +124,99 @@ pub(crate) fn invalid_chunk(scope: &Scope<'_>, chunk: HandleValue<'_>) -> NodeEr
     )
 }
 
-/// Append `value` to the array `array`.
-pub(crate) fn array_push(
-    scope: &Scope<'_>,
-    array: Object<'_>,
-    value: HandleValue<'_>,
-) -> Result<(), ExnThrown> {
-    let length = array.num(scope, c"length")? as u32;
-    array.set_element(scope, length, value)
-}
-
-#[core_runtime::jsfunction_class(name = "ReadableState")]
-pub mod readable_state {
-    use super::*;
-
-    /// The state of a `Readable`, or of a `Duplex`'s readable side if `is_duplex`.
-    #[constructor]
-    pub fn init(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        options: Option<HandleValue<'_>>,
-        _stream: Option<HandleValue<'_>>,
-        is_duplex: Option<bool>,
-    ) -> Result<(), Thrown> {
-        let options = options.and_then(|options| as_object(scope, options));
-        let is_duplex = is_duplex.unwrap_or(false);
-        let option = |name: &'static CStr| -> Result<HandleValue<'_>, ExnThrown> {
-            match options {
-                Some(options) => options.val(scope, name),
-                None => Ok(HandleValue::undefined()),
-            }
-        };
-        let object_mode = truthy(scope, option(c"objectMode")?)
-            || (is_duplex && truthy(scope, option(c"readableObjectMode")?));
-        this.set_flag(scope, c"objectMode", object_mode)?;
-        let high_water_mark = match options {
-            Some(options) => super::super::state::high_water_mark(
-                scope,
-                options,
-                c"readableHighWaterMark",
-                is_duplex,
-                object_mode,
-            )?,
-            None => super::super::state::default_high_water_mark(false),
-        };
-        this.set_property(scope, c"highWaterMark", high_water_mark)?;
-        this.set_property(
-            scope,
-            c"buffer",
-            *js::Array::with_contents(scope, &[] as &[Value])?,
-        )?;
-        this.set_property(scope, c"bufferIndex", 0)?;
-        this.set_property(scope, c"length", 0)?;
-        this.set_property(
-            scope,
-            c"pipes",
-            *js::Array::with_contents(scope, &[] as &[Value])?,
-        )?;
-        this.set_property(scope, c"flowing", js::value::null())?;
-        for name in [
-            c"ended",
-            c"endEmitted",
-            c"reading",
-            c"needReadable",
-            c"emittedReadable",
-            c"readableListening",
-            c"resumeScheduled",
-            c"errorEmitted",
-            c"destroyed",
-            c"closed",
-            c"closeEmitted",
-            c"multiAwaitDrain",
-            c"readingMore",
-            c"dataEmitted",
-            c"_dataListening",
-        ] {
-            this.set_flag(scope, name, false)?;
-        }
-        this.set_flag(scope, c"constructed", true)?;
-        this.set_flag(scope, c"sync", true)?;
-        let emit_close = option(c"emitClose")?;
-        this.set_flag(
-            scope,
-            c"emitClose",
-            !(emit_close.is_boolean() && !emit_close.to_boolean()),
-        )?;
-        let auto_destroy = option(c"autoDestroy")?;
-        this.set_flag(
-            scope,
-            c"autoDestroy",
-            !(auto_destroy.is_boolean() && !auto_destroy.to_boolean()),
-        )?;
-        this.set_property(scope, c"errored", js::value::null())?;
-        this.set_property(scope, c"_paused", js::value::null())?;
-        let default_encoding = option(c"defaultEncoding")?;
-        let default_name = rust_string(scope, default_encoding);
-        if default_encoding.is_null()
-            || default_encoding.is_undefined()
-            || matches!(default_name.as_deref(), Some("utf8" | "utf-8"))
-        {
-            this.set_property(scope, c"defaultEncoding", "utf8")?;
-        } else if is_encoding(scope, default_encoding)? {
-            this.set_property(scope, c"defaultEncoding", default_encoding)?;
-        } else {
-            return Err(unknown_encoding(scope, default_encoding).into());
-        }
-        this.set_property(scope, c"awaitDrainWriters", js::value::null())?;
-        let encoding = option(c"encoding")?;
-        if truthy(scope, encoding) {
-            this.set_property(scope, c"decoder", new_decoder(scope, encoding)?)?;
-            this.set_property(scope, c"encoding", encoding)?;
-        } else {
-            this.set_property(scope, c"decoder", js::value::null())?;
-            this.set_property(scope, c"encoding", js::value::null())?;
-        }
-        Ok(())
-    }
-
-    /// Define the legacy `pipesCount` and `paused` accessors.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let pipes_count =
-            Function::new_callback(scope, c"get pipesCount", 0, state_pipes_count, ())?;
-        proto.define_accessor(scope, c"pipesCount", Some(*pipes_count), None, 0)?;
-        let get_paused = Function::new_callback(scope, c"get paused", 0, state_get_paused, ())?;
-        let set_paused = Function::new_callback(scope, c"set paused", 1, state_set_paused, ())?;
-        proto.define_accessor(scope, c"paused", Some(*get_paused), Some(*set_paused), 0)
+/// `options[name]`, or `undefined` without options.
+fn option<'s>(
+    scope: &'s Scope<'_>,
+    options: Option<Object<'_>>,
+    name: &'static CStr,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    match options {
+        Some(options) => options.get_property(scope, name),
+        None => Ok(HandleValue::undefined()),
     }
 }
 
-/// `state.pipesCount`.
-fn state_pipes_count(
+/// Whether `value` is anything but `false`, as Node's `options.x !== false` tests it.
+fn not_false(value: HandleValue<'_>) -> bool {
+    !(value.is_boolean() && !value.to_boolean())
+}
+
+/// Give `holder`'s state a readable part for `options`: Node's `new ReadableState()`, of a
+/// `Duplex`'s readable side if `is_duplex`.
+pub(crate) fn init_readable_part(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = this_object(scope, &args)?;
-    let pipes = required_obj(scope, state, c"pipes")?;
-    Ok(js::value::from_f64(pipes.num(scope, c"length")?))
+    holder: StreamState<'_>,
+    options: Option<HandleValue<'_>>,
+    is_duplex: bool,
+) -> Result<(), Thrown> {
+    let options = options.and_then(|options| Object::from_value(scope, *options).ok());
+    let mut flags = R::EMIT_CLOSE | R::AUTO_DESTROY | R::CONSTRUCTED | R::SYNC;
+    let object_mode = js::conversion::to_boolean(option(scope, options, c"objectMode")?)
+        || (is_duplex
+            && js::conversion::to_boolean(option(scope, options, c"readableObjectMode")?));
+    flags.set(R::OBJECT_MODE, object_mode);
+    let high_water_mark = match options {
+        Some(options) => super::state::high_water_mark(
+            scope,
+            options,
+            c"readableHighWaterMark",
+            is_duplex,
+            object_mode,
+        )?,
+        None => super::state::default_high_water_mark(false),
+    };
+    flags.set(
+        R::EMIT_CLOSE,
+        not_false(option(scope, options, c"emitClose")?),
+    );
+    flags.set(
+        R::AUTO_DESTROY,
+        not_false(option(scope, options, c"autoDestroy")?),
+    );
+    let default_encoding = option(scope, options, c"defaultEncoding")?;
+    let default_encoding = if default_encoding.is_null_or_undefined() {
+        None
+    } else if is_encoding(scope, default_encoding)? {
+        super::state::default_encoding_field(scope, default_encoding)?
+    } else {
+        return Err(unknown_encoding(scope, default_encoding));
+    };
+    let encoding = option(scope, options, c"encoding")?;
+    let (decoder, encoding) = if js::conversion::to_boolean(encoding) {
+        (Some(new_decoder(scope, encoding)?), Some(encoding))
+    } else {
+        (None, None)
+    };
+    let buffer = js::Array::new(scope, 0)?;
+    let pipes = js::Array::new(scope, 0)?;
+    holder.data_mut().readable = Some(ReadablePart {
+        flags,
+        flowing: None,
+        paused: None,
+        high_water_mark,
+        length: 0.0,
+        buffer_index: 0.0,
+        buffer: Heap::from(buffer),
+        pipes: Heap::from(pipes),
+        await_drain_writers: Heap::from(js::value::null()),
+        errored: None,
+        default_encoding: default_encoding.map(|value| Heap::from(value.get())),
+        decoder: decoder.map(Heap::from),
+        encoding: encoding.map(|encoding| Heap::from(encoding.get())),
+        readable: Heap::default(),
+    });
+    Ok(())
 }
 
-/// `state.paused`.
-fn state_get_paused(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = this_object(scope, &args)?;
-    Ok(js::value::from_bool(state.flag(scope, c"_paused")?))
-}
-
-/// `state.paused = value`.
-fn state_set_paused(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = this_object(scope, &args)?;
-    state.set_flag(scope, c"_paused", truthy(scope, args.get(0)))?;
-    Ok(js::value::undefined())
-}
-
-/// Whether `state` is flowing: `state.flowing === true`.
-fn flowing(scope: &Scope<'_>, state: Object<'_>) -> Result<bool, ExnThrown> {
-    state.flag(scope, c"flowing")
-}
-
-/// Whether `state.flowing` was set to `false` explicitly: the stream was paused.
-fn paused_flowing(scope: &Scope<'_>, state: Object<'_>) -> Result<bool, ExnThrown> {
-    let value = state.get_property(scope, c"flowing")?;
-    Ok(value.is_boolean() && !value.to_boolean())
+/// Whether the stream is flowing: `state.flowing === true`.
+fn flowing(side: ReadableSide<'_>) -> bool {
+    side.get().flowing == Some(true)
 }
 
 /// Node's `canPushMore`.
-fn can_push_more(scope: &Scope<'_>, state: Object<'_>) -> Result<bool, ExnThrown> {
-    let length = state.num(scope, c"length")?;
-    Ok(!state.flag(scope, c"ended")?
-        && (length < state.num(scope, c"highWaterMark")? || length == 0.0))
+fn can_push_more(side: ReadableSide<'_>) -> bool {
+    let part = side.get();
+    !part.flags.contains(R::ENDED) && (part.length < part.high_water_mark || part.length == 0.0)
 }
 
 /// Node's `readableAddChunk`, for `push` and `unshift` (if `add_to_front`).
@@ -332,40 +227,47 @@ fn readable_add_chunk(
     encoding: Option<HandleValue<'_>>,
     add_to_front: bool,
 ) -> Result<bool, ExnThrown> {
-    let state = readable_state(scope, stream)?;
+    let side = ReadableSide::of(scope, stream)?;
     if chunk.is_null() {
-        state.set_flag(scope, c"reading", false)?;
-        on_eof_chunk(scope, stream, state)?;
+        side.set(R::READING, false);
+        on_eof_chunk(scope, stream, side)?;
         return Ok(false);
     }
-    let object_mode = state.flag(scope, c"objectMode")?;
+    let object_mode = side.has(R::OBJECT_MODE);
     let mut chunk = scope.root_value(chunk.get());
     let mut encoding = match encoding {
-        Some(encoding) if truthy(scope, encoding) => scope.root_value(encoding.get()),
-        _ => string(scope, "")?,
+        Some(encoding) if js::conversion::to_boolean(encoding) => scope.root_value(encoding.get()),
+        _ => js::class::get_or_init_atom(scope, c"")?,
     };
     if !object_mode {
         if chunk.is_string() {
-            if !truthy(scope, encoding) {
-                encoding = state.val(scope, c"defaultEncoding")?;
+            if !js::conversion::to_boolean(encoding) {
+                encoding = side.default_encoding(scope)?;
             }
-            let state_encoding = state.val(scope, c"encoding")?;
-            if !same(scope, state_encoding, encoding)? {
-                if add_to_front && truthy(scope, state_encoding) {
+            let state_encoding = side.encoding(scope).unwrap_or(HandleValue::null());
+            if !js::comparison::strictly_equal(scope, state_encoding, encoding)? {
+                if add_to_front && js::conversion::to_boolean(state_encoding) {
                     let buffer = buffer_from(scope, &[chunk, encoding])?;
-                    let buffer = as_object(scope, buffer)
-                        .ok_or_else(|| type_error(scope, "Buffer.from returned a primitive"))?;
-                    chunk = call_method(scope, buffer, c"toString", &[state_encoding])?;
+                    let buffer = Object::from_value(scope, buffer).map_err(|_| {
+                        js::error::TypeError(String::from("Buffer.from returned a primitive"))
+                            .throw(scope)
+                    })?;
+                    chunk = Function::call_by_name(
+                        scope,
+                        buffer.handle(),
+                        c"toString",
+                        &[state_encoding],
+                    )?;
                 } else {
                     chunk = buffer_from(scope, &[chunk, encoding])?;
-                    encoding = string(scope, "")?;
+                    encoding = js::class::get_or_init_atom(scope, c"")?;
                 }
             }
         } else if is_buffer(scope, chunk)? {
-            encoding = string(scope, "")?;
-        } else if is_array_buffer_view(scope, chunk) {
+            encoding = js::class::get_or_init_atom(scope, c"")?;
+        } else if js::ArrayBufferView::from_value(scope, chunk).is_some() {
             chunk = view_to_buffer(scope, chunk)?;
-            encoding = string(scope, "")?;
+            encoding = js::class::get_or_init_atom(scope, c"")?;
         } else if !chunk.is_undefined() {
             error_or_destroy_with(scope, stream, invalid_chunk(scope, chunk), false)?;
             return Ok(false);
@@ -378,7 +280,7 @@ fn readable_add_chunk(
     };
     if object_mode || length > 0.0 {
         if add_to_front {
-            if state.flag(scope, c"endEmitted")? {
+            if side.has(R::END_EMITTED) {
                 error_or_destroy_with(
                     scope,
                     stream,
@@ -389,14 +291,12 @@ fn readable_add_chunk(
                     ),
                     false,
                 )?;
-            } else if state.flag(scope, c"destroyed")?
-                || truthy(scope, state.get_property(scope, c"errored")?)
-            {
+            } else if side.has(R::DESTROYED) || side.is_errored() {
                 return Ok(false);
             } else {
-                add_chunk(scope, stream, state, chunk, true)?;
+                add_chunk(scope, stream, side, chunk, true)?;
             }
-        } else if state.flag(scope, c"ended")? {
+        } else if side.has(R::ENDED) {
             error_or_destroy_with(
                 scope,
                 stream,
@@ -408,40 +308,46 @@ fn readable_add_chunk(
                 false,
             )?;
             return Ok(false);
-        } else if state.flag(scope, c"destroyed")?
-            || truthy(scope, state.get_property(scope, c"errored")?)
-        {
+        } else if side.has(R::DESTROYED) || side.is_errored() {
             return Ok(false);
         } else {
-            state.set_flag(scope, c"reading", false)?;
-            let decoder = state.obj(scope, c"decoder")?;
-            match decoder {
-                Some(decoder) if !truthy(scope, encoding) => {
-                    chunk = call_method(scope, decoder, c"write", &[chunk])?;
+            side.set(R::READING, false);
+            match side.decoder(scope) {
+                Some(decoder) if !js::conversion::to_boolean(encoding) => {
+                    chunk = Function::call_by_name(scope, decoder.handle(), c"write", &[chunk])?;
                     if object_mode || chunk_length(scope, chunk)? != 0.0 {
-                        add_chunk(scope, stream, state, chunk, false)?;
+                        add_chunk(scope, stream, side, chunk, false)?;
                     } else {
-                        maybe_read_more(scope, stream, state)?;
+                        maybe_read_more(scope, stream, side)?;
                     }
                 }
-                _ => add_chunk(scope, stream, state, chunk, false)?,
+                _ => add_chunk(scope, stream, side, chunk, false)?,
             }
         }
     } else if !add_to_front {
-        state.set_flag(scope, c"reading", false)?;
-        maybe_read_more(scope, stream, state)?;
+        side.set(R::READING, false);
+        maybe_read_more(scope, stream, side)?;
     }
-    can_push_more(scope, state)
+    Ok(can_push_more(side))
+}
+
+/// `awaitDrainWriters` as a `Set`, if it is one.
+fn await_drain_set<'s>(scope: &'s Scope<'_>, side: ReadableSide<'_>) -> Option<js::Set<'s>> {
+    let writers = side.await_drain_writers(scope);
+    Object::from_value(scope, *writers)
+        .ok()?
+        .cast::<js::Set>()
+        .ok()
 }
 
 /// Clear the writers the stream waits for `drain` from.
-fn clear_await_drain(scope: &Scope<'_>, state: Object<'_>) -> Result<(), ExnThrown> {
-    if state.flag(scope, c"multiAwaitDrain")? {
-        if let Some(writers) = state.obj(scope, c"awaitDrainWriters")? {
-            call_method(scope, writers, c"clear", &[])?;
+fn clear_await_drain(scope: &Scope<'_>, side: ReadableSide<'_>) -> Result<(), ExnThrown> {
+    if side.has(R::MULTI_AWAIT_DRAIN) {
+        if let Some(writers) = await_drain_set(scope, side) {
+            writers.clear(scope)?;
         }
     } else {
-        state.set_property(scope, c"awaitDrainWriters", js::value::null())?;
+        side.set_await_drain_writers(HandleValue::null());
     }
     Ok(())
 }
@@ -451,77 +357,86 @@ fn clear_await_drain(scope: &Scope<'_>, state: Object<'_>) -> Result<(), ExnThro
 fn add_chunk(
     scope: &Scope<'_>,
     stream: Object<'_>,
-    state: Object<'_>,
+    side: ReadableSide<'_>,
     chunk: HandleValue<'_>,
     add_to_front: bool,
 ) -> Result<(), ExnThrown> {
-    if flowing(scope, state)?
-        && !state.flag(scope, c"sync")?
-        && state.flag(scope, c"_dataListening")?
-        && state.num(scope, c"length")? == 0.0
-    {
-        clear_await_drain(scope, state)?;
-        state.set_flag(scope, c"dataEmitted", true)?;
-        emit(scope, stream, "data", &[chunk])?;
+    let emit_now = {
+        let part = side.get();
+        part.flowing == Some(true)
+            && !part.flags.contains(R::SYNC)
+            && part.flags.contains(R::DATA_LISTENING)
+            && part.length == 0.0
+    };
+    if emit_now {
+        clear_await_drain(scope, side)?;
+        side.set(R::DATA_EMITTED, true);
+        crate::events::emit(scope, stream, c"data", &[chunk])?;
     } else {
-        let object_mode = state.flag(scope, c"objectMode")?;
-        let length = state.num(scope, c"length")? + added_length(scope, chunk, object_mode)?;
-        state.set_property(scope, c"length", length)?;
-        let buffer = required_obj(scope, state, c"buffer")?;
+        let added = added_length(scope, chunk, side.has(R::OBJECT_MODE))?;
+        side.get_mut().length += added;
+        let buffer = side.buffer(scope);
         if add_to_front {
-            let index = state.num(scope, c"bufferIndex")?;
+            let index = side.get().buffer_index;
             if index > 0.0 {
-                state.set_property(scope, c"bufferIndex", index - 1.0)?;
+                side.get_mut().buffer_index = index - 1.0;
                 buffer.set_element(scope, (index - 1.0) as u32, chunk)?;
             } else {
-                call_method(scope, buffer, c"unshift", &[chunk])?;
+                buffer.unshift(scope, chunk)?;
             }
         } else {
-            array_push(scope, buffer, chunk)?;
+            buffer.push(scope, chunk)?;
         }
-        if state.flag(scope, c"needReadable")? {
-            emit_readable(scope, stream)?;
+        if side.has(R::NEED_READABLE) {
+            emit_readable(scope, stream, side)?;
         }
     }
-    maybe_read_more(scope, stream, state)
+    maybe_read_more(scope, stream, side)
 }
 
 /// Node's `onEofChunk`: end the stream, flushing the decoder.
-fn on_eof_chunk(scope: &Scope<'_>, stream: Object<'_>, state: Object<'_>) -> Result<(), ExnThrown> {
-    if state.flag(scope, c"ended")? {
+fn on_eof_chunk(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    side: ReadableSide<'_>,
+) -> Result<(), ExnThrown> {
+    if side.has(R::ENDED) {
         return Ok(());
     }
-    if let Some(decoder) = state.obj(scope, c"decoder")? {
-        let chunk = call_method(scope, decoder, c"end", &[])?;
-        if !chunk.is_undefined() && !chunk.is_null() && chunk_length(scope, chunk)? > 0.0 {
-            let buffer = required_obj(scope, state, c"buffer")?;
-            array_push(scope, buffer, chunk)?;
-            let object_mode = state.flag(scope, c"objectMode")?;
-            let length = state.num(scope, c"length")? + added_length(scope, chunk, object_mode)?;
-            state.set_property(scope, c"length", length)?;
+    if let Some(decoder) = side.decoder(scope) {
+        let chunk =
+            Function::call_by_name(scope, decoder.handle(), c"end", js::function::EmptyArgs)?;
+        if !chunk.is_null_or_undefined() && chunk_length(scope, chunk)? > 0.0 {
+            side.buffer(scope).push(scope, chunk)?;
+            let added = added_length(scope, chunk, side.has(R::OBJECT_MODE))?;
+            side.get_mut().length += added;
         }
     }
-    state.set_flag(scope, c"ended", true)?;
-    if state.flag(scope, c"sync")? {
-        emit_readable(scope, stream)
+    side.set(R::ENDED, true);
+    if side.has(R::SYNC) {
+        emit_readable(scope, stream, side)
     } else {
-        state.set_flag(scope, c"needReadable", false)?;
-        state.set_flag(scope, c"emittedReadable", true)?;
-        emit_readable_now(scope, stream)
+        side.set(R::NEED_READABLE, false);
+        side.set(R::EMITTED_READABLE, true);
+        emit_readable_now(scope, stream, side)
     }
 }
 
-/// Node's `emitReadable`: emit `readable` in a microtask, once.
-fn emit_readable(scope: &Scope<'_>, stream: Object<'_>) -> Result<(), ExnThrown> {
-    let state = readable_state(scope, stream)?;
-    state.set_flag(scope, c"needReadable", false)?;
-    if !state.flag(scope, c"emittedReadable")? {
-        state.set_flag(scope, c"emittedReadable", true)?;
-        next_tick(
-            scope,
-            emit_readable_tick,
-            &[stream.to_jsval_raw_throwing(scope)?],
-        )?;
+/// Queue `body` in the tick queue with `stream` as its payload.
+fn tick(scope: &Scope<'_>, body: Callback, stream: Object<'_>) -> Result<(), ExnThrown> {
+    js::jobs::queue_native_tick(scope, body, stream, &[])
+}
+
+/// Node's `emitReadable`: emit `readable` in a tick, once.
+fn emit_readable(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    side: ReadableSide<'_>,
+) -> Result<(), ExnThrown> {
+    side.set(R::NEED_READABLE, false);
+    if !side.has(R::EMITTED_READABLE) {
+        side.set(R::EMITTED_READABLE, true);
+        tick(scope, emit_readable_tick, stream)?;
     }
     Ok(())
 }
@@ -531,45 +446,56 @@ fn emit_readable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    emit_readable_now(scope, Captures::of(scope, payload)?.obj(0)?)?;
+    let stream = cast_payload::<Object>(scope, payload);
+    let side = ReadableSide::of(scope, stream)?;
+    emit_readable_now(scope, stream, side)?;
     Ok(js::value::undefined())
 }
 
 /// Node's `emitReadable_`.
-fn emit_readable_now(scope: &Scope<'_>, stream: Object<'_>) -> Result<(), ExnThrown> {
-    let state = readable_state(scope, stream)?;
-    let errored = truthy(scope, state.get_property(scope, c"errored")?);
-    if !state.flag(scope, c"destroyed")?
-        && !errored
-        && (state.num(scope, c"length")? > 0.0 || state.flag(scope, c"ended")?)
-    {
-        emit(scope, stream, "readable", &[])?;
-        state.set_flag(scope, c"emittedReadable", false)?;
+fn emit_readable_now(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    side: ReadableSide<'_>,
+) -> Result<(), ExnThrown> {
+    let emit = {
+        let part = side.get();
+        !part.flags.contains(R::DESTROYED)
+            && part.errored.is_none()
+            && (part.length > 0.0 || part.flags.contains(R::ENDED))
+    };
+    if emit {
+        crate::events::emit(scope, stream, c"readable", &[])?;
+        side.set(R::EMITTED_READABLE, false);
     }
-    if !flowing(scope, state)?
-        && !state.flag(scope, c"ended")?
-        && state.num(scope, c"length")? <= state.num(scope, c"highWaterMark")?
-    {
-        state.set_flag(scope, c"needReadable", true)?;
+    let need_readable = {
+        let part = side.get();
+        part.flowing != Some(true)
+            && !part.flags.contains(R::ENDED)
+            && part.length <= part.high_water_mark
+    };
+    if need_readable {
+        side.set(R::NEED_READABLE, true);
     }
-    flow(scope, stream)
+    flow(scope, stream, side)
 }
 
-/// Node's `maybeReadMore`: read ahead in a microtask, once.
+/// Node's `maybeReadMore`: read ahead in a tick, once.
 fn maybe_read_more(
     scope: &Scope<'_>,
     stream: Object<'_>,
-    state: Object<'_>,
+    side: ReadableSide<'_>,
 ) -> Result<(), ExnThrown> {
-    if !state.flag(scope, c"readingMore")? && state.flag(scope, c"constructed")? {
-        state.set_flag(scope, c"readingMore", true)?;
-        next_tick(
-            scope,
-            maybe_read_more_tick,
-            &[stream.to_jsval_raw_throwing(scope)?],
-        )?;
+    if !side.has(R::READING_MORE) && side.has(R::CONSTRUCTED) {
+        side.set(R::READING_MORE, true);
+        tick(scope, maybe_read_more_tick, stream)?;
     }
     Ok(())
+}
+
+/// The value `0`, rooted.
+fn zero<'s>(scope: &'s Scope<'_>) -> HandleValue<'s> {
+    scope.root_value(js::value::from_i32(0))
 }
 
 /// Node's `maybeReadMore_`: call `read(0)` while that fills the buffer and it's below the high
@@ -579,42 +505,50 @@ fn maybe_read_more_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    let state = readable_state(scope, stream)?;
-    let zero = scope.root_value(js::value::from_f64(0.0));
+    let stream = cast_payload::<Object>(scope, payload);
+    let side = ReadableSide::of(scope, stream)?;
+    let zero = zero(scope);
     loop {
-        if state.flag(scope, c"reading")? || state.flag(scope, c"ended")? {
+        let (length, more) = {
+            let part = side.get();
+            let length = part.length;
+            let more = !part.flags.intersects(R::READING | R::ENDED)
+                && (length < part.high_water_mark || (part.flowing == Some(true) && length == 0.0));
+            (length, more)
+        };
+        if !more {
             break;
         }
-        let length = state.num(scope, c"length")?;
-        if !(length < state.num(scope, c"highWaterMark")?
-            || (flowing(scope, state)? && length == 0.0))
-        {
-            break;
-        }
-        call_method(scope, stream, c"read", &[zero])?;
-        if length == state.num(scope, c"length")? {
+        Function::call_by_name(scope, stream.handle(), c"read", &[zero])?;
+        if length == side.length() {
             break;
         }
     }
-    state.set_flag(scope, c"readingMore", false)?;
+    side.set(R::READING_MORE, false);
     Ok(js::value::undefined())
 }
 
 /// Node's `howMuchToRead`. `n` is NaN for "everything".
-fn how_much_to_read(scope: &Scope<'_>, n: f64, state: Object<'_>) -> Result<f64, ExnThrown> {
-    let length = state.num(scope, c"length")?;
-    let ended = state.flag(scope, c"ended")?;
+fn how_much_to_read(scope: &Scope<'_>, n: f64, side: ReadableSide<'_>) -> Result<f64, ExnThrown> {
+    let (length, ended, object_mode, flowing) = {
+        let part = side.get();
+        (
+            part.length,
+            part.flags.contains(R::ENDED),
+            part.flags.contains(R::OBJECT_MODE),
+            part.flowing == Some(true),
+        )
+    };
     if n <= 0.0 || (length == 0.0 && ended) {
         return Ok(0.0);
     }
-    if state.flag(scope, c"objectMode")? {
+    if object_mode {
         return Ok(1.0);
     }
     if n.is_nan() {
-        if flowing(scope, state)? && length > 0.0 {
-            let buffer = required_obj(scope, state, c"buffer")?;
-            let first = buffer.get_element(scope, state.num(scope, c"bufferIndex")? as u32)?;
+        if flowing && length > 0.0 {
+            let index = side.get().buffer_index as u32;
+            let first = side.buffer(scope).get_element(scope, index)?;
             return chunk_length(scope, first);
         }
         return Ok(length);
@@ -663,7 +597,7 @@ pub(crate) fn read<'s>(
     stream: Object<'_>,
     n: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let state = readable_state(scope, stream)?;
+    let side = ReadableSide::of(scope, stream)?;
     let mut n = if n.is_undefined() {
         f64::NAN
     } else if n.is_number() && n.to_number().fract() == 0.0 {
@@ -672,18 +606,24 @@ pub(crate) fn read<'s>(
         parse_int(&js::JSString::from_value(scope, n)?.to_utf8(scope)?)
     };
     let n_orig = n;
-    if n > state.num(scope, c"highWaterMark")? {
+    if n > side.high_water_mark() {
         let mark = compute_new_high_water_mark(scope, n)?;
-        state.set_property(scope, c"highWaterMark", mark)?;
+        side.get_mut().high_water_mark = mark;
     }
     if n != 0.0 {
-        state.set_flag(scope, c"emittedReadable", false)?;
+        side.set(R::EMITTED_READABLE, false);
     }
-    let length = state.num(scope, c"length")?;
-    let mark = state.num(scope, c"highWaterMark")?;
-    let ended = state.flag(scope, c"ended")?;
+    let (length, mark, ended, need_readable) = {
+        let part = side.get();
+        (
+            part.length,
+            part.high_water_mark,
+            part.flags.contains(R::ENDED),
+            part.flags.contains(R::NEED_READABLE),
+        )
+    };
     if n == 0.0
-        && state.flag(scope, c"needReadable")?
+        && need_readable
         && ((if mark != 0.0 {
             length >= mark
         } else {
@@ -691,75 +631,70 @@ pub(crate) fn read<'s>(
         }) || ended)
     {
         if length == 0.0 && ended {
-            end_readable(scope, stream)?;
+            end_readable(scope, stream, side)?;
         } else {
-            emit_readable(scope, stream)?;
+            emit_readable(scope, stream, side)?;
         }
         return Ok(HandleValue::null());
     }
-    n = how_much_to_read(scope, n, state)?;
-    if n == 0.0 && state.flag(scope, c"ended")? {
-        if state.num(scope, c"length")? == 0.0 {
-            end_readable(scope, stream)?;
+    n = how_much_to_read(scope, n, side)?;
+    if n == 0.0 && side.has(R::ENDED) {
+        if side.length() == 0.0 {
+            end_readable(scope, stream, side)?;
         }
         return Ok(HandleValue::null());
     }
-    let mut do_read = state.flag(scope, c"needReadable")?;
-    let length = state.num(scope, c"length")?;
-    if length == 0.0 || length - n < state.num(scope, c"highWaterMark")? {
-        do_read = true;
-    }
-    let blocked = state.flag(scope, c"reading")?
-        || state.flag(scope, c"ended")?
-        || state.flag(scope, c"destroyed")?
-        || truthy(scope, state.get_property(scope, c"errored")?)
-        || !state.flag(scope, c"constructed")?;
+    let (do_read, blocked) = {
+        let part = side.get();
+        let do_read = part.flags.contains(R::NEED_READABLE)
+            || part.length == 0.0
+            || part.length - n < part.high_water_mark;
+        let blocked = part.flags.intersects(R::READING | R::ENDED | R::DESTROYED)
+            || part.errored.is_some()
+            || !part.flags.contains(R::CONSTRUCTED);
+        (do_read, blocked)
+    };
     if !blocked && do_read {
-        state.set_flag(scope, c"reading", true)?;
-        state.set_flag(scope, c"sync", true)?;
-        if state.num(scope, c"length")? == 0.0 {
-            state.set_flag(scope, c"needReadable", true)?;
+        side.set(R::READING | R::SYNC, true);
+        if side.length() == 0.0 {
+            side.set(R::NEED_READABLE, true);
         }
-        let mark = state.val(scope, c"highWaterMark")?;
-        if call_method(scope, stream, c"_read", &[mark]).is_err() {
-            let error = take_exception(scope);
+        let mark = scope.root_value(js::value::from_f64(side.high_water_mark()));
+        if Function::call_by_name(scope, stream.handle(), c"_read", &[mark]).is_err() {
+            let error = js::exception::take_pending_or_undefined(scope);
             error_or_destroy(scope, stream, error, false)?;
         }
-        state.set_flag(scope, c"sync", false)?;
-        if !state.flag(scope, c"reading")? {
-            n = how_much_to_read(scope, n_orig, state)?;
+        side.set(R::SYNC, false);
+        if !side.has(R::READING) {
+            n = how_much_to_read(scope, n_orig, side)?;
         }
     }
     let ret = if n > 0.0 {
-        from_list(scope, n, state)?
+        from_list(scope, n, side)?
     } else {
         HandleValue::null()
     };
     if ret.is_null() {
-        if state.num(scope, c"length")? <= state.num(scope, c"highWaterMark")? {
-            state.set_flag(scope, c"needReadable", true)?;
+        if side.length() <= side.high_water_mark() {
+            side.set(R::NEED_READABLE, true);
         }
         n = 0.0;
     } else {
-        let length = state.num(scope, c"length")? - n;
-        state.set_property(scope, c"length", length)?;
-        clear_await_drain(scope, state)?;
+        side.get_mut().length -= n;
+        clear_await_drain(scope, side)?;
     }
-    if state.num(scope, c"length")? == 0.0 {
-        if !state.flag(scope, c"ended")? {
-            state.set_flag(scope, c"needReadable", true)?;
+    if side.length() == 0.0 {
+        if !side.has(R::ENDED) {
+            side.set(R::NEED_READABLE, true);
         }
         let differs = !(n_orig == n || (n_orig.is_nan() && n.is_nan()));
-        if differs && state.flag(scope, c"ended")? {
-            end_readable(scope, stream)?;
+        if differs && side.has(R::ENDED) {
+            end_readable(scope, stream, side)?;
         }
     }
-    if !ret.is_null()
-        && !state.flag(scope, c"errorEmitted")?
-        && !state.flag(scope, c"closeEmitted")?
-    {
-        state.set_flag(scope, c"dataEmitted", true)?;
-        emit(scope, stream, "data", &[ret])?;
+    if !ret.is_null() && !side.any(R::ERROR_EMITTED | R::CLOSE_EMITTED) {
+        side.set(R::DATA_EMITTED, true);
+        crate::events::emit(scope, stream, c"data", &[ret])?;
     }
     Ok(ret)
 }
@@ -768,16 +703,22 @@ pub(crate) fn read<'s>(
 fn from_list<'s>(
     scope: &'s Scope<'_>,
     n: f64,
-    state: Object<'_>,
+    side: ReadableSide<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    if state.num(scope, c"length")? == 0.0 {
+    let (total, mut index, object_mode, decoding) = {
+        let part = side.get();
+        (
+            part.length,
+            part.buffer_index as u32,
+            part.flags.contains(R::OBJECT_MODE),
+            part.decoder.is_some(),
+        )
+    };
+    if total == 0.0 {
         return Ok(HandleValue::null());
     }
-    let buffer = required_obj(scope, state, c"buffer")?;
-    let len = buffer.num(scope, c"length")? as u32;
-    let mut index = state.num(scope, c"bufferIndex")? as u32;
-    let total = state.num(scope, c"length")?;
-    let decoding = state.obj(scope, c"decoder")?.is_some();
+    let buffer = side.buffer(scope);
+    let len = buffer.length(scope)?;
     let take = |index: &mut u32| -> Result<HandleValue<'s>, ExnThrown> {
         let value = buffer.get_element(scope, *index)?;
         buffer.set_element(scope, *index, js::value::null())?;
@@ -785,7 +726,7 @@ fn from_list<'s>(
         Ok(value)
     };
     let ret;
-    if state.flag(scope, c"objectMode")? {
+    if object_mode {
         ret = take(&mut index)?;
     } else if n.is_nan() || n >= total {
         if decoding {
@@ -808,10 +749,8 @@ fn from_list<'s>(
         let first = buffer.get_element(scope, index)?;
         let first_length = chunk_length(scope, first)?;
         if n < first_length {
-            let start = scope.root_value(js::value::from_f64(0.0));
-            let end = scope.root_value(js::value::from_f64(n));
-            ret = slice(scope, first, &[start, end])?;
-            let rest = slice(scope, first, &[end])?;
+            ret = slice(scope, first, 0.0, Some(n))?;
+            let rest = slice(scope, first, n, None)?;
             buffer.set_element(scope, index, rest)?;
         } else if n == first_length {
             ret = take(&mut index)?;
@@ -825,10 +764,8 @@ fn from_list<'s>(
                     parts.push(take(&mut index)?);
                     remaining -= data_length;
                 } else {
-                    let start = scope.root_value(js::value::from_f64(0.0));
-                    let end = scope.root_value(js::value::from_f64(remaining));
-                    parts.push(slice(scope, data, &[start, end])?);
-                    let rest = slice(scope, data, &[end])?;
+                    parts.push(slice(scope, data, 0.0, Some(remaining))?);
+                    let rest = slice(scope, data, remaining, None)?;
                     buffer.set_element(scope, index, rest)?;
                     remaining = 0.0;
                 }
@@ -845,51 +782,56 @@ fn from_list<'s>(
         }
     }
     if index == len {
-        buffer.set_property(scope, c"length", 0)?;
-        state.set_property(scope, c"bufferIndex", 0)?;
+        buffer.set_length(scope, 0)?;
+        side.get_mut().buffer_index = 0.0;
     } else if index > 1024 {
-        let start = scope.root_value(js::value::from_f64(0.0));
-        let count = scope.root_value(js::value::from_f64(f64::from(index)));
-        call_method(scope, buffer, c"splice", &[start, count])?;
-        state.set_property(scope, c"bufferIndex", 0)?;
+        buffer.remove(scope, 0, index)?;
+        side.get_mut().buffer_index = 0.0;
     } else {
-        state.set_property(scope, c"bufferIndex", index)?;
+        side.get_mut().buffer_index = f64::from(index);
     }
     Ok(ret)
 }
 
-/// `value.slice(...args)` for a string or `Buffer`.
+/// `value.slice(start, end)` for a string or `Buffer`.
 fn slice<'s>(
     scope: &'s Scope<'_>,
     value: HandleValue<'_>,
-    args: &[HandleValue<'_>],
+    start: f64,
+    end: Option<f64>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
     if value.is_string() {
         let text = js::JSString::from_value(scope, value)?;
-        let start = (args[0].to_number() as usize).min(text.len());
-        let end = args
-            .get(1)
-            .map_or(text.len(), |end| end.to_number() as usize)
+        let start = (start as usize).min(text.len());
+        let end = end
+            .map_or(text.len(), |end| end as usize)
             .clamp(start, text.len());
         return text
             .substring(scope, start, end - start)?
             .to_jsval_throwing(scope);
     }
-    let object = as_object(scope, value)
-        .ok_or_else(|| type_error(scope, "chunk.slice is not a function"))?;
-    call_method(scope, object, c"slice", args)
+    let object = Object::from_value(scope, value).map_err(|_| {
+        js::error::TypeError(String::from("chunk.slice is not a function")).throw(scope)
+    })?;
+    let start = scope.root_value(js::value::from_f64(start));
+    match end {
+        Some(end) => {
+            let end = scope.root_value(js::value::from_f64(end));
+            Function::call_by_name(scope, object.handle(), c"slice", &[start, end])
+        }
+        None => Function::call_by_name(scope, object.handle(), c"slice", &[start]),
+    }
 }
 
-/// Node's `endReadable`: emit `end` in a microtask.
-fn end_readable(scope: &Scope<'_>, stream: Object<'_>) -> Result<(), ExnThrown> {
-    let state = readable_state(scope, stream)?;
-    if !state.flag(scope, c"endEmitted")? {
-        state.set_flag(scope, c"ended", true)?;
-        next_tick(
-            scope,
-            end_readable_tick,
-            &[stream.to_jsval_raw_throwing(scope)?],
-        )?;
+/// Node's `endReadable`: emit `end` in a tick.
+fn end_readable(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    side: ReadableSide<'_>,
+) -> Result<(), ExnThrown> {
+    if !side.has(R::END_EMITTED) {
+        side.set(R::ENDED, true);
+        tick(scope, end_readable_tick, stream)?;
     }
     Ok(())
 }
@@ -901,39 +843,36 @@ fn end_readable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    let state = readable_state(scope, stream)?;
-    let errored = truthy(scope, state.get_property(scope, c"errored")?);
-    if !errored
-        && !state.flag(scope, c"closeEmitted")?
-        && !state.flag(scope, c"endEmitted")?
-        && state.num(scope, c"length")? == 0.0
+    let stream = cast_payload::<Object>(scope, payload);
+    let side = ReadableSide::of(scope, stream)?;
+    let emit = {
+        let part = side.get();
+        part.errored.is_none()
+            && !part.flags.intersects(R::CLOSE_EMITTED | R::END_EMITTED)
+            && part.length == 0.0
+    };
+    if !emit {
+        return Ok(js::value::undefined());
+    }
+    side.set(R::END_EMITTED, true);
+    crate::events::emit(scope, stream, c"end", &[])?;
+    let allow_half_open = stream.get_property(scope, c"allowHalfOpen")?;
+    if js::conversion::to_boolean(stream.get_property(scope, c"writable")?)
+        && allow_half_open.is_boolean()
+        && !allow_half_open.to_boolean()
     {
-        state.set_flag(scope, c"endEmitted", true)?;
-        emit(scope, stream, "end", &[])?;
-        let allow_half_open = stream.get_property(scope, c"allowHalfOpen")?;
-        if truthy(scope, stream.get_property(scope, c"writable")?)
-            && allow_half_open.is_boolean()
-            && !allow_half_open.to_boolean()
-        {
-            next_tick(
-                scope,
-                end_writable_tick,
-                &[stream.to_jsval_raw_throwing(scope)?],
-            )?;
-        } else if state.flag(scope, c"autoDestroy")? {
-            let auto_destroy = match stream.obj(scope, c"_writableState")? {
-                None => true,
-                Some(w) => {
-                    let writable = w.get_property(scope, c"writable")?;
-                    w.flag(scope, c"autoDestroy")?
-                        && (w.flag(scope, c"finished")?
-                            || (writable.is_boolean() && !writable.to_boolean()))
-                }
-            };
-            if auto_destroy {
-                call_method(scope, stream, c"destroy", &[])?;
+        tick(scope, end_writable_tick, stream)?;
+    } else if side.has(R::AUTO_DESTROY) {
+        let auto_destroy = match WritableSide::of_state(side.0) {
+            None => true,
+            Some(w) => {
+                let part = w.get();
+                part.flags.contains(W::AUTO_DESTROY)
+                    && (part.flags.contains(W::FINISHED) || part.writable == Some(false))
             }
+        };
+        if auto_destroy {
+            Function::call_by_name(scope, stream.handle(), c"destroy", js::function::EmptyArgs)?;
         }
     }
     Ok(js::value::undefined())
@@ -945,21 +884,22 @@ fn end_writable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    let writable = truthy(scope, stream.get_property(scope, c"writable")?)
-        && !truthy(scope, stream.get_property(scope, c"writableEnded")?)
-        && !truthy(scope, stream.get_property(scope, c"destroyed")?);
+    let stream = cast_payload::<Object>(scope, payload);
+    let writable = js::conversion::to_boolean(stream.get_property(scope, c"writable")?)
+        && !js::conversion::to_boolean(stream.get_property(scope, c"writableEnded")?)
+        && !js::conversion::to_boolean(stream.get_property(scope, c"destroyed")?);
     if writable {
-        call_method(scope, stream, c"end", &[])?;
+        Function::call_by_name(scope, stream.handle(), c"end", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
 }
 
 /// Node's `flow`: read while flowing and reads return data.
-fn flow(scope: &Scope<'_>, stream: Object<'_>) -> Result<(), ExnThrown> {
-    let state = readable_state(scope, stream)?;
-    while flowing(scope, state)? {
-        if call_method(scope, stream, c"read", &[])?.is_null() {
+fn flow(scope: &Scope<'_>, stream: Object<'_>, side: ReadableSide<'_>) -> Result<(), ExnThrown> {
+    while flowing(side) {
+        if Function::call_by_name(scope, stream.handle(), c"read", js::function::EmptyArgs)?
+            .is_null()
+        {
             break;
         }
     }
@@ -968,16 +908,16 @@ fn flow(scope: &Scope<'_>, stream: Object<'_>) -> Result<(), ExnThrown> {
 
 /// `readable.resume()`.
 pub(crate) fn resume<'s>(scope: &Scope<'_>, stream: Object<'s>) -> Result<Object<'s>, ExnThrown> {
-    let state = readable_state(scope, stream)?;
-    if !flowing(scope, state)? {
-        let listening = state.flag(scope, c"readableListening")?;
-        state.set_flag(scope, c"flowing", !listening)?;
-        if !state.flag(scope, c"resumeScheduled")? {
-            state.set_flag(scope, c"resumeScheduled", true)?;
-            next_tick(scope, resume_tick, &[stream.to_jsval_raw_throwing(scope)?])?;
+    let side = ReadableSide::of(scope, stream)?;
+    if !flowing(side) {
+        let listening = side.has(R::READABLE_LISTENING);
+        side.get_mut().flowing = Some(!listening);
+        if !side.has(R::RESUME_SCHEDULED) {
+            side.set(R::RESUME_SCHEDULED, true);
+            tick(scope, resume_tick, stream)?;
         }
     }
-    state.set_flag(scope, c"_paused", false)?;
+    side.get_mut().paused = Some(false);
     Ok(stream)
 }
 
@@ -987,29 +927,29 @@ fn resume_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    let state = readable_state(scope, stream)?;
-    let zero = scope.root_value(js::value::from_f64(0.0));
-    if !state.flag(scope, c"reading")? {
-        call_method(scope, stream, c"read", &[zero])?;
+    let stream = cast_payload::<Object>(scope, payload);
+    let side = ReadableSide::of(scope, stream)?;
+    let zero = zero(scope);
+    if !side.has(R::READING) {
+        Function::call_by_name(scope, stream.handle(), c"read", &[zero])?;
     }
-    state.set_flag(scope, c"resumeScheduled", false)?;
-    emit(scope, stream, "resume", &[])?;
-    flow(scope, stream)?;
-    if flowing(scope, state)? && !state.flag(scope, c"reading")? {
-        call_method(scope, stream, c"read", &[zero])?;
+    side.set(R::RESUME_SCHEDULED, false);
+    crate::events::emit(scope, stream, c"resume", &[])?;
+    flow(scope, stream, side)?;
+    if flowing(side) && !side.has(R::READING) {
+        Function::call_by_name(scope, stream.handle(), c"read", &[zero])?;
     }
     Ok(js::value::undefined())
 }
 
 /// `readable.pause()`.
 pub(crate) fn pause<'s>(scope: &Scope<'_>, stream: Object<'s>) -> Result<Object<'s>, ExnThrown> {
-    let state = readable_state(scope, stream)?;
-    if !paused_flowing(scope, state)? {
-        state.set_flag(scope, c"flowing", false)?;
-        emit(scope, stream, "pause", &[])?;
+    let side = ReadableSide::of(scope, stream)?;
+    if side.get().flowing != Some(false) {
+        side.get_mut().flowing = Some(false);
+        crate::events::emit(scope, stream, c"pause", &[])?;
     }
-    state.set_flag(scope, c"_paused", true)?;
+    side.get_mut().paused = Some(true);
     Ok(stream)
 }
 
@@ -1019,18 +959,25 @@ fn update_readable_listening(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    let state = readable_state(scope, stream)?;
-    let readable = string(scope, "readable")?;
+    let stream = cast_payload::<Object>(scope, payload);
+    let side = ReadableSide::of(scope, stream)?;
+    let readable = js::class::get_or_init_atom(scope, c"readable")?;
     let listening = listener_count(scope, stream, readable)? > 0.0;
-    state.set_flag(scope, c"readableListening", listening)?;
-    let paused = state.get_property(scope, c"_paused")?;
-    if paused.is_boolean() && !paused.to_boolean() && state.flag(scope, c"resumeScheduled")? {
-        state.set_flag(scope, c"flowing", true)?;
-    } else if state.flag(scope, c"_dataListening")? {
-        call_method(scope, stream, c"resume", &[] as &[HandleValue<'_>])?;
+    side.set(R::READABLE_LISTENING, listening);
+    let (paused, resume_scheduled, data_listening) = {
+        let part = side.get();
+        (
+            part.paused,
+            part.flags.contains(R::RESUME_SCHEDULED),
+            part.flags.contains(R::DATA_LISTENING),
+        )
+    };
+    if paused == Some(false) && resume_scheduled {
+        side.get_mut().flowing = Some(true);
+    } else if data_listening {
+        Function::call_by_name(scope, stream.handle(), c"resume", js::function::EmptyArgs)?;
     } else if !listening {
-        state.set_property(scope, c"flowing", js::value::null())?;
+        side.get_mut().flowing = None;
     }
     Ok(js::value::undefined())
 }
@@ -1041,9 +988,8 @@ fn read_zero_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    let zero = scope.root_value(js::value::from_f64(0.0));
-    call_method(scope, stream, c"read", &[zero])?;
+    let stream = cast_payload::<Object>(scope, payload);
+    Function::call_by_name(scope, stream.handle(), c"read", &[zero(scope)])?;
     Ok(js::value::undefined())
 }
 
@@ -1056,34 +1002,26 @@ pub(crate) fn on<'s>(
     listener: HandleValue<'_>,
 ) -> Result<Object<'s>, Thrown> {
     let result = crate::events::add_listener(scope, stream, event, listener, false)?;
-    let state = readable_state(scope, stream)?;
+    let side = ReadableSide::of(scope, stream)?;
     match rust_string(scope, event).as_deref() {
         Some("data") => {
-            state.set_flag(scope, c"_dataListening", true)?;
-            let readable = string(scope, "readable")?;
+            side.set(R::DATA_LISTENING, true);
+            let readable = js::class::get_or_init_atom(scope, c"readable")?;
             if listener_count(scope, stream, readable)? > 0.0 {
-                state.set_flag(scope, c"readableListening", true)?;
+                side.set(R::READABLE_LISTENING, true);
             }
-            if !paused_flowing(scope, state)? {
-                call_method(scope, stream, c"resume", &[] as &[HandleValue<'_>])?;
+            if side.get().flowing != Some(false) {
+                Function::call_by_name(scope, stream.handle(), c"resume", js::function::EmptyArgs)?;
             }
         }
-        Some("readable")
-            if !state.flag(scope, c"endEmitted")?
-                && !state.flag(scope, c"readableListening")? =>
-        {
-            state.set_flag(scope, c"readableListening", true)?;
-            state.set_flag(scope, c"needReadable", true)?;
-            state.set_flag(scope, c"flowing", false)?;
-            state.set_flag(scope, c"emittedReadable", false)?;
-            if state.num(scope, c"length")? > 0.0 {
-                emit_readable(scope, stream)?;
-            } else if !state.flag(scope, c"reading")? {
-                next_tick(
-                    scope,
-                    read_zero_tick,
-                    &[stream.to_jsval_raw_throwing(scope)?],
-                )?;
+        Some("readable") if !side.any(R::END_EMITTED | R::READABLE_LISTENING) => {
+            side.set(R::READABLE_LISTENING | R::NEED_READABLE, true);
+            side.get_mut().flowing = Some(false);
+            side.set(R::EMITTED_READABLE, false);
+            if side.length() > 0.0 {
+                emit_readable(scope, stream, side)?;
+            } else if !side.has(R::READING) {
+                tick(scope, read_zero_tick, stream)?;
             }
         }
         _ => {}
@@ -1099,15 +1037,11 @@ pub(crate) fn remove_listener<'s>(
     listener: HandleValue<'_>,
 ) -> Result<Object<'s>, Thrown> {
     let result = crate::events::remove_listener(scope, stream, event, listener)?;
-    let state = readable_state(scope, stream)?;
+    let side = ReadableSide::of(scope, stream)?;
     match rust_string(scope, event).as_deref() {
-        Some("readable") => next_tick(
-            scope,
-            update_readable_listening,
-            &[stream.to_jsval_raw_throwing(scope)?],
-        )?,
+        Some("readable") => tick(scope, update_readable_listening, stream)?,
         Some("data") if listener_count(scope, stream, event)? == 0.0 => {
-            state.set_flag(scope, c"_dataListening", false)?;
+            side.set(R::DATA_LISTENING, false);
         }
         _ => {}
     }
@@ -1120,61 +1054,72 @@ pub(crate) fn set_encoding<'s>(
     stream: Object<'s>,
     encoding: HandleValue<'_>,
 ) -> Result<Object<'s>, ExnThrown> {
-    let state = readable_state(scope, stream)?;
+    let side = ReadableSide::of(scope, stream)?;
     let decoder = new_decoder(scope, encoding)?;
-    state.set_property(scope, c"decoder", decoder)?;
-    state.set_property(
-        scope,
-        c"encoding",
-        decoder.get_property(scope, c"encoding")?,
-    )?;
-    let buffer = required_obj(scope, state, c"buffer")?;
-    let len = buffer.num(scope, c"length")? as u32;
+    let decoder_encoding = decoder.get_property(scope, c"encoding")?;
+    {
+        let mut part = side.get_mut();
+        part.decoder = Some(Heap::from(decoder));
+        part.encoding = js::conversion::to_boolean(decoder_encoding)
+            .then(|| Heap::from(decoder_encoding.get()));
+    }
+    let buffer = side.buffer(scope);
+    let len = buffer.length(scope)?;
     let mut content = js::JSString::empty(scope);
-    for index in state.num(scope, c"bufferIndex")? as u32..len {
+    for index in side.get().buffer_index as u32..len {
         let data = buffer.get_element(scope, index)?;
-        let written = call_method(scope, decoder, c"write", &[data])?;
+        let written = Function::call_by_name(scope, decoder.handle(), c"write", &[data])?;
         content = content.concat(scope, js::JSString::from_value(scope, written)?)?;
     }
-    if state.flag(scope, c"ended")? {
-        let rest = call_method(scope, decoder, c"end", &[] as &[HandleValue<'_>])?;
+    if side.has(R::ENDED) {
+        let rest =
+            Function::call_by_name(scope, decoder.handle(), c"end", js::function::EmptyArgs)?;
         content = content.concat(scope, js::JSString::from_value(scope, rest)?)?;
     }
-    buffer.set_property(scope, c"length", 0)?;
-    state.set_property(scope, c"bufferIndex", 0)?;
+    buffer.set_length(scope, 0)?;
+    side.get_mut().buffer_index = 0.0;
     if !content.is_empty() {
-        array_push(scope, buffer, content.to_jsval_throwing(scope)?)?;
+        buffer.push(scope, content.to_jsval_throwing(scope)?)?;
     }
-    state.set_property(scope, c"length", content.len() as f64)?;
+    side.get_mut().length = content.len() as f64;
     Ok(stream)
 }
 
-/// The listeners `pipe` adds, as captures: `[src, dest, ondata, onend, unpipe, onunpipe, onerror,
-/// onclose, onfinish, ondrain, cleanedUp]`.
-mod pipe_captures {
-    pub(super) const SRC: u32 = 0;
-    pub(super) const DEST: u32 = 1;
-    pub(super) const ONDATA: u32 = 2;
-    pub(super) const ONEND: u32 = 3;
-    pub(super) const UNPIPE: u32 = 4;
-    pub(super) const ONUNPIPE: u32 = 5;
-    pub(super) const ONERROR: u32 = 6;
-    pub(super) const ONCLOSE: u32 = 7;
-    pub(super) const ONFINISH: u32 = 8;
-    pub(super) const ONDRAIN: u32 = 9;
-    pub(super) const CLEANED_UP: u32 = 10;
-    pub(super) const COUNT: usize = 11;
+/// The state of a `pipe`: the source and destination, and the listeners it adds.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct PipeState {
+    src: Heap<js::object::Object>,
+    dest: Heap<js::object::Object>,
+    ondata: Heap<js::object::Object>,
+    onend: Heap<js::object::Object>,
+    unpipe: Heap<js::object::Object>,
+    onunpipe: Heap<js::object::Object>,
+    onerror: Heap<js::object::Object>,
+    onclose: Heap<js::object::Object>,
+    onfinish: Heap<js::object::Object>,
+    /// The `drain` listener, which the first backpressure adds.
+    ondrain: Option<Heap<js::object::Object>>,
+    #[no_trace]
+    cleaned_up: bool,
 }
 
-/// Each `pipe` listener's captures are `[pipe]`, where `pipe` is the array [`pipe_captures`]
-/// describes.
-fn pipe_array<'s>(
-    scope: &'s Scope<'_>,
-    payload: HandleValue<'_>,
-) -> Result<Captures<'s>, ExnThrown> {
-    let outer = Captures::of(scope, payload)?;
-    let inner = outer.get(0)?;
-    Captures::of(scope, inner)
+#[core_runtime::jsmethods]
+impl PipeState {
+    fn new(&self, scope: &Scope<'_>, src: Object<'_>, dest: Object<'_>) -> Result<(), ExnThrown> {
+        let listener =
+            |body: Callback, nargs: u32| Function::new_callback(scope, c"", nargs, body, self);
+        let data = self.data();
+        data.src.set(src);
+        data.dest.set(dest);
+        data.ondata.set(*listener(pipe_ondata, 1)?);
+        data.onend.set(*listener(pipe_onend, 0)?);
+        data.unpipe.set(*listener(pipe_unpipe, 0)?);
+        data.onunpipe.set(*listener(pipe_onunpipe, 2)?);
+        data.onerror.set(*listener(pipe_onerror, 1)?);
+        data.onclose.set(*listener(pipe_onclose, 0)?);
+        data.onfinish.set(*listener(pipe_onfinish, 0)?);
+        Ok(())
+    }
 }
 
 /// `readable.pipe(dest, options)`.
@@ -1184,80 +1129,72 @@ pub(crate) fn pipe<'s>(
     dest: HandleValue<'s>,
     options: Option<HandleValue<'_>>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    use pipe_captures::*;
-    let state = readable_state(scope, src)?;
-    let dest_object = as_object(scope, dest)
-        .ok_or_else(|| js::error::TypeError("dest must be a stream".into()).throw(scope))?;
-    let pipes = required_obj(scope, state, c"pipes")?;
-    if pipes.num(scope, c"length")? == 1.0 && !state.flag(scope, c"multiAwaitDrain")? {
-        state.set_flag(scope, c"multiAwaitDrain", true)?;
-        let existing = state.val(scope, c"awaitDrainWriters")?;
+    let side = ReadableSide::of(scope, src)?;
+    let dest_object = Object::from_value(scope, dest)
+        .map_err(|_| js::error::TypeError("dest must be a stream".into()).throw(scope))?;
+    let pipes = side.pipes(scope);
+    if pipes.length(scope)? == 1 && !side.has(R::MULTI_AWAIT_DRAIN) {
+        side.set(R::MULTI_AWAIT_DRAIN, true);
+        let existing = side.await_drain_writers(scope);
         let set = js::Set::new(scope)?;
-        if truthy(scope, existing) {
+        if js::conversion::to_boolean(existing) {
             set.add(scope, existing)?;
         }
-        state.set_property(scope, c"awaitDrainWriters", set)?;
+        side.set_await_drain_writers(set.to_jsval_throwing(scope)?);
     }
-    array_push(scope, pipes, dest)?;
+    pipes.push(scope, dest)?;
 
-    let pipe = js::Array::with_contents(scope, &[js::value::undefined(); COUNT])?;
-    let pipe_value = scope.root_value((*pipe).to_jsval_raw_throwing(scope)?);
-    let captures = Captures::of(scope, (*pipe).to_jsval_throwing(scope)?)?;
-    captures.set(SRC, src)?;
-    captures.set(DEST, dest)?;
-    captures.set(CLEANED_UP, false)?;
-    let make = |body: Callback, nargs: u32| closure(scope, nargs, body, &[pipe_value.get()]);
-    let ondata = make(pipe_ondata, 1)?;
-    let onend = make(pipe_onend, 0)?;
-    let unpipe = make(pipe_unpipe, 0)?;
-    let onunpipe = make(pipe_onunpipe, 2)?;
-    let onerror = make(pipe_onerror, 1)?;
-    let onclose = make(pipe_onclose, 0)?;
-    let onfinish = make(pipe_onfinish, 0)?;
-    for (index, function) in [
-        (ONDATA, ondata),
-        (ONEND, onend),
-        (UNPIPE, unpipe),
-        (ONUNPIPE, onunpipe),
-        (ONERROR, onerror),
-        (ONCLOSE, onclose),
-        (ONFINISH, onfinish),
-    ] {
-        captures.set(index, function)?;
-    }
-
+    let state = PipeState::new(scope, src, dest_object)?;
     let end_option = options
-        .and_then(|options| as_object(scope, options))
+        .and_then(|options| Object::from_value(scope, options).ok())
         .map(|options| options.get_property(scope, c"end"))
         .transpose()?;
     let stdout_or_stderr = {
-        let process = scope.global().obj(scope, c"process")?;
+        let process = crate::process::process_value(scope)?;
         let mut matches = false;
-        if let Some(process) = process {
+        if let Ok(process) = Object::from_value(scope, process) {
             for name in [c"stdout", c"stderr"] {
-                matches |= same(scope, process.val(scope, name)?, dest)?;
+                let stdio = process.get_property(scope, name)?;
+                matches |= js::comparison::strictly_equal(scope, stdio, dest)?;
             }
         }
         matches
     };
     let do_end =
         !end_option.is_some_and(|end| end.is_boolean() && !end.to_boolean()) && !stdout_or_stderr;
+    let (ondata, onend, unpipe, onunpipe, onerror, onclose, onfinish) = {
+        let data = state.data();
+        (
+            data.ondata.get(scope),
+            data.onend.get(scope),
+            data.unpipe.get(scope),
+            data.onunpipe.get(scope),
+            data.onerror.get(scope),
+            data.onclose.get(scope),
+            data.onfinish.get(scope),
+        )
+    };
     let end_fn = if do_end { onend } else { unpipe };
-    if state.flag(scope, c"endEmitted")? {
-        super::util::next_tick_call(scope, end_fn.to_jsval_throwing(scope)?, &[])?;
+    if side.has(R::END_EMITTED) {
+        js::jobs::queue_tick(scope, end_fn.to_jsval_throwing(scope)?, &[])?;
     } else {
-        listen(scope, src, c"once", "end", end_fn)?;
+        listen(scope, src, c"once", c"end", end_fn)?;
     }
-    listen(scope, dest_object, c"on", "unpipe", onunpipe)?;
-    listen(scope, src, c"on", "data", ondata)?;
-    prepend_listener(scope, dest_object, "error", onerror)?;
-    listen(scope, dest_object, c"once", "close", onclose)?;
-    listen(scope, dest_object, c"once", "finish", onfinish)?;
-    emit(scope, dest_object, "pipe", &[src.to_jsval_throwing(scope)?])?;
+    listen(scope, dest_object, c"on", c"unpipe", onunpipe)?;
+    listen(scope, src, c"on", c"data", ondata)?;
+    prepend_listener(scope, dest_object, c"error", onerror)?;
+    listen(scope, dest_object, c"once", c"close", onclose)?;
+    listen(scope, dest_object, c"once", c"finish", onfinish)?;
+    crate::events::emit(
+        scope,
+        dest_object,
+        c"pipe",
+        &[src.to_jsval_throwing(scope)?],
+    )?;
     if is_true(dest_object.get_property(scope, c"writableNeedDrain")?) {
-        pipe_pause(scope, &captures)?;
-    } else if !flowing(scope, state)? {
-        call_method(scope, src, c"resume", &[])?;
+        pipe_pause(scope, state)?;
+    } else if !flowing(side) {
+        Function::call_by_name(scope, src.handle(), c"resume", js::function::EmptyArgs)?;
     }
     Ok(dest)
 }
@@ -1266,7 +1203,7 @@ pub(crate) fn pipe<'s>(
 pub(crate) fn prepend_listener(
     scope: &Scope<'_>,
     emitter: Object<'_>,
-    event: &str,
+    event: &'static CStr,
     listener: Object<'_>,
 ) -> Result<(), ExnThrown> {
     if has_method(scope, emitter, c"prependListener")? {
@@ -1281,18 +1218,17 @@ fn pipe_ondata(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use pipe_captures::*;
-    let captures = pipe_array(scope, payload)?;
-    let dest = captures.obj(DEST)?;
-    match call_method(scope, dest, c"write", &[args.get(0)]) {
+    let state = cast_payload::<PipeState>(scope, payload);
+    let dest = state.data().dest.get(scope);
+    match Function::call_by_name(scope, dest.handle(), c"write", &[args.get(0)]) {
         Ok(ret) => {
             if ret.is_boolean() && !ret.to_boolean() {
-                pipe_pause(scope, &captures)?;
+                pipe_pause(scope, state)?;
             }
         }
         Err(_) => {
-            let error = take_exception(scope);
-            call_method(scope, dest, c"destroy", &[error])?;
+            let error = js::exception::take_pending_or_undefined(scope);
+            Function::call_by_name(scope, dest.handle(), c"destroy", &[error])?;
         }
     }
     Ok(js::value::undefined())
@@ -1300,63 +1236,67 @@ fn pipe_ondata(
 
 /// Node's `pause` inside `pipe`: record `dest` as awaited, pause the source, and listen for
 /// `drain` on `dest`.
-fn pipe_pause(scope: &Scope<'_>, captures: &Captures<'_>) -> Result<(), ExnThrown> {
-    use pipe_captures::*;
-    let src = captures.obj(SRC)?;
-    let dest = captures.get(DEST)?;
-    let state = readable_state(scope, src)?;
-    if !captures.flag(CLEANED_UP)? {
-        let pipes = required_obj(scope, state, c"pipes")?;
-        let count = pipes.num(scope, c"length")?;
-        if count == 1.0 && same(scope, pipes.get_element(scope, 0)?, dest)? {
-            state.set_property(scope, c"awaitDrainWriters", dest)?;
-            state.set_flag(scope, c"multiAwaitDrain", false)?;
-        } else if count > 1.0 && truthy(scope, call_method(scope, pipes, c"includes", &[dest])?) {
-            if let Some(writers) = state.obj(scope, c"awaitDrainWriters")? {
-                call_method(scope, writers, c"add", &[dest])?;
+fn pipe_pause(scope: &Scope<'_>, state: PipeState<'_>) -> Result<(), ExnThrown> {
+    let (src, dest, cleaned_up) = {
+        let data = state.data();
+        (data.src.get(scope), data.dest.get(scope), data.cleaned_up)
+    };
+    let dest_value = dest.to_jsval_throwing(scope)?;
+    if !cleaned_up {
+        let side = ReadableSide::of(scope, src)?;
+        let pipes = side.pipes(scope);
+        let count = pipes.length(scope)?;
+        if count == 1
+            && js::comparison::strictly_equal(scope, pipes.get_element(scope, 0)?, dest_value)?
+        {
+            side.set_await_drain_writers(dest_value);
+            side.set(R::MULTI_AWAIT_DRAIN, false);
+        } else if count > 1 && pipes.index_of(scope, dest_value)?.is_some() {
+            if let Some(writers) = await_drain_set(scope, side) {
+                writers.add(scope, dest_value)?;
             }
         }
-        call_method(scope, src, c"pause", &[])?;
+        Function::call_by_name(scope, src.handle(), c"pause", js::function::EmptyArgs)?;
     }
-    if captures.get(ONDRAIN)?.is_undefined() {
-        let ondrain = closure(
-            scope,
-            0,
-            pipe_ondrain,
-            &[src.to_jsval_raw_throwing(scope)?, dest.get()],
-        )?;
-        captures.set(ONDRAIN, ondrain)?;
-        listen(scope, captures.obj(DEST)?, c"on", "drain", ondrain)?;
+    if state.data().ondrain.is_none() {
+        let ondrain = Function::new_callback(scope, c"", 0, pipe_ondrain, state)?;
+        state.data_mut().ondrain = Some(Heap::from(*ondrain));
+        listen(scope, dest, c"on", c"drain", *ondrain)?;
     }
     Ok(())
 }
 
-/// Node's `pipeOnDrain`, whose captures are `[src, dest]`.
+/// Node's `pipeOnDrain`.
 fn pipe_ondrain(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let src = captures.obj(0)?;
-    let dest = captures.get(1)?;
-    let state = readable_state(scope, src)?;
-    let writers = state.val(scope, c"awaitDrainWriters")?;
-    if same(scope, writers, dest)? {
-        state.set_property(scope, c"awaitDrainWriters", js::value::null())?;
-    } else if state.flag(scope, c"multiAwaitDrain")? {
-        if let Some(writers) = as_object(scope, writers) {
-            call_method(scope, writers, c"delete", &[dest])?;
+    let state = cast_payload::<PipeState>(scope, payload);
+    let (src, dest) = {
+        let data = state.data();
+        (data.src.get(scope), data.dest.get(scope))
+    };
+    let dest = dest.to_jsval_throwing(scope)?;
+    let side = ReadableSide::of(scope, src)?;
+    let writers = side.await_drain_writers(scope);
+    if js::comparison::strictly_equal(scope, writers, dest)? {
+        side.set_await_drain_writers(HandleValue::null());
+    } else if side.has(R::MULTI_AWAIT_DRAIN) {
+        if let Some(writers) = await_drain_set(scope, side) {
+            writers.delete(scope, dest)?;
         }
     }
-    let writers = state.val(scope, c"awaitDrainWriters")?;
-    let empty = match as_object(scope, writers) {
-        None => true,
-        Some(set) if state.flag(scope, c"multiAwaitDrain")? => set.num(scope, c"size")? == 0.0,
-        Some(_) => false,
+    let writers = side.await_drain_writers(scope);
+    let empty = if !writers.is_object() {
+        true
+    } else if side.has(R::MULTI_AWAIT_DRAIN) {
+        await_drain_set(scope, side).is_some_and(|set| set.size(scope) == 0)
+    } else {
+        false
     };
-    if empty && state.flag(scope, c"_dataListening")? {
-        call_method(scope, src, c"resume", &[])?;
+    if empty && side.has(R::DATA_LISTENING) {
+        Function::call_by_name(scope, src.handle(), c"resume", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
 }
@@ -1366,13 +1306,27 @@ fn pipe_onend(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    call_method(
-        scope,
-        pipe_array(scope, payload)?.obj(pipe_captures::DEST)?,
-        c"end",
-        &[],
-    )?;
+    let dest = cast_payload::<PipeState>(scope, payload)
+        .data()
+        .dest
+        .get(scope);
+    Function::call_by_name(scope, dest.handle(), c"end", js::function::EmptyArgs)?;
     Ok(js::value::undefined())
+}
+
+/// `src.unpipe(dest)`.
+fn pipe_unpipe_now(scope: &Scope<'_>, state: PipeState<'_>) -> Result<(), ExnThrown> {
+    let (src, dest) = {
+        let data = state.data();
+        (data.src.get(scope), data.dest.get(scope))
+    };
+    Function::call_by_name(
+        scope,
+        src.handle(),
+        c"unpipe",
+        &[dest.to_jsval_throwing(scope)?],
+    )?;
+    Ok(())
 }
 
 fn pipe_unpipe(
@@ -1380,13 +1334,7 @@ fn pipe_unpipe(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = pipe_array(scope, payload)?;
-    call_method(
-        scope,
-        captures.obj(pipe_captures::SRC)?,
-        c"unpipe",
-        &[captures.get(pipe_captures::DEST)?],
-    )?;
+    pipe_unpipe_now(scope, cast_payload::<PipeState>(scope, payload))?;
     Ok(js::value::undefined())
 }
 
@@ -1395,13 +1343,14 @@ fn pipe_onunpipe(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = pipe_array(scope, payload)?;
-    if same(scope, args.get(0), captures.get(pipe_captures::SRC)?)? {
-        if let Some(info) = as_object(scope, args.get(1)) {
+    let state = cast_payload::<PipeState>(scope, payload);
+    let src = state.data().src.get(scope);
+    if js::comparison::strictly_equal(scope, args.get(0), src.to_jsval_throwing(scope)?)? {
+        if let Ok(info) = Object::from_value(scope, args.get(1)) {
             let unpiped = info.get_property(scope, c"hasUnpiped")?;
             if unpiped.is_boolean() && !unpiped.to_boolean() {
                 info.set_property(scope, c"hasUnpiped", true)?;
-                pipe_cleanup(scope, &captures)?;
+                pipe_cleanup(scope, state)?;
             }
         }
     }
@@ -1409,34 +1358,52 @@ fn pipe_onunpipe(
 }
 
 /// Node's `cleanup` inside `pipe`.
-fn pipe_cleanup(scope: &Scope<'_>, captures: &Captures<'_>) -> Result<(), ExnThrown> {
-    use pipe_captures::*;
-    let src = captures.obj(SRC)?;
-    let dest = captures.obj(DEST)?;
-    let remove = |emitter: Object<'_>, event: &str, index: u32| -> Result<(), ExnThrown> {
-        if let Some(listener) = as_object(scope, captures.get(index)?) {
-            listen(scope, emitter, c"removeListener", event, listener)?;
-        }
-        Ok(())
+fn pipe_cleanup(scope: &Scope<'_>, state: PipeState<'_>) -> Result<(), ExnThrown> {
+    let (src, dest, ondata, onend, unpipe, onunpipe, onerror, onclose, onfinish, ondrain) = {
+        let data = state.data();
+        (
+            data.src.get(scope),
+            data.dest.get(scope),
+            data.ondata.get(scope),
+            data.onend.get(scope),
+            data.unpipe.get(scope),
+            data.onunpipe.get(scope),
+            data.onerror.get(scope),
+            data.onclose.get(scope),
+            data.onfinish.get(scope),
+            data.ondrain.get(scope),
+        )
     };
-    remove(dest, "close", ONCLOSE)?;
-    remove(dest, "finish", ONFINISH)?;
-    remove(dest, "drain", ONDRAIN)?;
-    remove(dest, "error", ONERROR)?;
-    remove(dest, "unpipe", ONUNPIPE)?;
-    remove(src, "end", ONEND)?;
-    remove(src, "end", UNPIPE)?;
-    remove(src, "data", ONDATA)?;
-    captures.set(CLEANED_UP, true)?;
-    let ondrain = captures.get(ONDRAIN)?;
-    let state = readable_state(scope, src)?;
-    if !ondrain.is_undefined() && truthy(scope, state.get_property(scope, c"awaitDrainWriters")?) {
-        let needs = match dest.obj(scope, c"_writableState")? {
+    let remove = |emitter: Object<'_>, event: &'static CStr, listener: Object<'_>| {
+        listen(scope, emitter, c"removeListener", event, listener)
+    };
+    remove(dest, c"close", onclose)?;
+    remove(dest, c"finish", onfinish)?;
+    if let Some(ondrain) = ondrain {
+        remove(dest, c"drain", ondrain)?;
+    }
+    remove(dest, c"error", onerror)?;
+    remove(dest, c"unpipe", onunpipe)?;
+    remove(src, c"end", onend)?;
+    remove(src, c"end", unpipe)?;
+    remove(src, c"data", ondata)?;
+    state.data_mut().cleaned_up = true;
+    let Some(ondrain) = ondrain else {
+        return Ok(());
+    };
+    let side = ReadableSide::of(scope, src)?;
+    if js::conversion::to_boolean(side.await_drain_writers(scope)) {
+        let needs = match super::util::sides(scope, dest)?.writable {
             None => true,
-            Some(w) => w.flag(scope, c"needDrain")?,
+            Some(writable) => writable.need_drain(scope)?,
         };
         if needs {
-            call(scope, HandleValue::undefined(), ondrain, &[])?;
+            Function::call(
+                scope,
+                HandleValue::undefined(),
+                ondrain.to_jsval_throwing(scope)?,
+                js::function::EmptyArgs,
+            )?;
         }
     }
     Ok(())
@@ -1447,23 +1414,23 @@ fn pipe_onerror(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use pipe_captures::*;
-    let captures = pipe_array(scope, payload)?;
-    let dest = captures.obj(DEST)?;
-    call_method(scope, captures.obj(SRC)?, c"unpipe", &[captures.get(DEST)?])?;
-    if let Some(onerror) = as_object(scope, captures.get(ONERROR)?) {
-        listen(scope, dest, c"removeListener", "error", onerror)?;
-    }
-    let error_event = string(scope, "error")?;
+    let state = cast_payload::<PipeState>(scope, payload);
+    pipe_unpipe_now(scope, state)?;
+    let (dest, onerror) = {
+        let data = state.data();
+        (data.dest.get(scope), data.onerror.get(scope))
+    };
+    listen(scope, dest, c"removeListener", c"error", onerror)?;
+    let error_event = js::class::get_or_init_atom(scope, c"error")?;
     if listener_count(scope, dest, error_event)? == 0.0 {
-        let (readable, writable) = states(scope, dest)?;
+        let sides = super::util::sides(scope, dest)?;
         let error = args.get(0);
-        match writable.or(readable) {
-            Some(state) if !state.flag(scope, c"errorEmitted")? => {
+        match sides.writable.or(sides.readable) {
+            Some(side) if !side.error_emitted(scope)? => {
                 error_or_destroy(scope, dest, error, false)?
             }
             _ => {
-                emit(scope, dest, "error", &[error])?;
+                crate::events::emit(scope, dest, c"error", &[error])?;
             }
         }
     }
@@ -1472,38 +1439,32 @@ fn pipe_onerror(
 
 fn pipe_onclose(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
+    _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = pipe_array(scope, payload)?;
-    if let Some(onfinish) = as_object(scope, captures.get(pipe_captures::ONFINISH)?) {
-        listen(
-            scope,
-            captures.obj(pipe_captures::DEST)?,
-            c"removeListener",
-            "finish",
-            onfinish,
-        )?;
-    }
-    pipe_unpipe(scope, args, payload)
+    let state = cast_payload::<PipeState>(scope, payload);
+    let (dest, onfinish) = {
+        let data = state.data();
+        (data.dest.get(scope), data.onfinish.get(scope))
+    };
+    listen(scope, dest, c"removeListener", c"finish", onfinish)?;
+    pipe_unpipe_now(scope, state)?;
+    Ok(js::value::undefined())
 }
 
 fn pipe_onfinish(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
+    _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = pipe_array(scope, payload)?;
-    if let Some(onclose) = as_object(scope, captures.get(pipe_captures::ONCLOSE)?) {
-        listen(
-            scope,
-            captures.obj(pipe_captures::DEST)?,
-            c"removeListener",
-            "close",
-            onclose,
-        )?;
-    }
-    pipe_unpipe(scope, args, payload)
+    let state = cast_payload::<PipeState>(scope, payload);
+    let (dest, onclose) = {
+        let data = state.data();
+        (data.dest.get(scope), data.onclose.get(scope))
+    };
+    listen(scope, dest, c"removeListener", c"close", onclose)?;
+    pipe_unpipe_now(scope, state)?;
+    Ok(js::value::undefined())
 }
 
 /// The `{ hasUnpiped: false }` argument of an `unpipe` event.
@@ -1519,97 +1480,142 @@ pub(crate) fn unpipe<'s>(
     stream: Object<'s>,
     dest: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, ExnThrown> {
-    let state = readable_state(scope, stream)?;
-    let pipes = required_obj(scope, state, c"pipes")?;
-    if pipes.num(scope, c"length")? == 0.0 {
+    let side = ReadableSide::of(scope, stream)?;
+    let pipes = side.pipes(scope);
+    if pipes.length(scope)? == 0 {
         return Ok(stream);
     }
     let stream_value = stream.to_jsval_throwing(scope)?;
-    let dest = dest.filter(|dest| truthy(scope, *dest));
+    let dest = dest.filter(|dest| js::conversion::to_boolean(*dest));
     let Some(dest) = dest else {
-        let length = pipes.num(scope, c"length")? as u32;
-        let dests: Vec<HandleValue<'_>> = (0..length)
-            .map(|index| pipes.get_element(scope, index))
-            .collect::<Result<_, _>>()?;
-        state.set_property(
-            scope,
-            c"pipes",
-            *js::Array::with_contents(scope, &[] as &[Value])?,
-        )?;
-        call_method(scope, stream, c"pause", &[] as &[HandleValue<'_>])?;
+        let dests = pipes.to_vec(scope)?;
+        side.get().pipes.set(js::Array::new(scope, 0)?);
+        Function::call_by_name(scope, stream.handle(), c"pause", js::function::EmptyArgs)?;
         for dest in dests {
-            if let Some(dest) = as_object(scope, dest) {
-                emit(scope, dest, "unpipe", &[stream_value, unpipe_info(scope)?])?;
+            if let Ok(dest) = Object::from_value(scope, dest) {
+                crate::events::emit(scope, dest, c"unpipe", &[stream_value, unpipe_info(scope)?])?;
             }
         }
         return Ok(stream);
     };
-    let index = call_method(scope, pipes, c"indexOf", &[dest])?.to_number();
-    if index < 0.0 {
+    let Some(index) = pipes.index_of(scope, dest)? else {
         return Ok(stream);
+    };
+    pipes.remove(scope, index, 1)?;
+    if pipes.length(scope)? == 0 {
+        Function::call_by_name(scope, stream.handle(), c"pause", js::function::EmptyArgs)?;
     }
-    let start = scope.root_value(js::value::from_f64(index));
-    let one = scope.root_value(js::value::from_f64(1.0));
-    call_method(scope, pipes, c"splice", &[start, one])?;
-    if pipes.num(scope, c"length")? == 0.0 {
-        call_method(scope, stream, c"pause", &[] as &[HandleValue<'_>])?;
-    }
-    if let Some(dest) = as_object(scope, dest) {
-        emit(scope, dest, "unpipe", &[stream_value, unpipe_info(scope)?])?;
+    if let Ok(dest) = Object::from_value(scope, dest) {
+        crate::events::emit(scope, dest, c"unpipe", &[stream_value, unpipe_info(scope)?])?;
     }
     Ok(stream)
 }
 
-/// The captures of the async iterator's functions: `[stream, error, callback, cleanup, readable
-/// listener, destroyOnReturn, done, pending, started]`. `error` is `undefined` while the stream
-/// hasn't finished, `null` once it ended, and the error otherwise. `pending` is the promise of the
-/// last `next()` call. `started` is set by the first `next()` call.
-mod iterator_captures {
-    pub(super) const STREAM: u32 = 0;
-    pub(super) const ERROR: u32 = 1;
-    pub(super) const CALLBACK: u32 = 2;
-    pub(super) const CLEANUP: u32 = 3;
-    pub(super) const LISTENER: u32 = 4;
-    pub(super) const DESTROY_ON_RETURN: u32 = 5;
-    pub(super) const DONE: u32 = 6;
-    pub(super) const PENDING: u32 = 7;
-    pub(super) const STARTED: u32 = 8;
-    pub(super) const COUNT: usize = 9;
+/// The state of an async iterator over a readable: Node's `createAsyncIterator` generator.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct IteratorState {
+    stream: Heap<js::object::Object>,
+    /// `undefined` while the stream hasn't finished, `null` once it ended, and the error
+    /// otherwise.
+    error: Heap<Value>,
+    /// The promise of a step that waits for the stream to signal more data or its end.
+    waiting: Option<Heap<js::promise::Promise>>,
+    /// The promise of the step that a signal resumed, which a microtask takes.
+    resuming: Option<Heap<js::promise::Promise>>,
+    /// The microtask that runs the resumed step.
+    resume_job: Option<Heap<js::function::Function>>,
+    /// The cleanup of the `finished` the generator runs.
+    cleanup: Option<Heap<EosStateImpl>>,
+    /// The `readable` listener.
+    listener: Option<Heap<js::object::Object>>,
+    /// The promise of the last `next()` call.
+    pending: Option<Heap<js::promise::Promise>>,
+    #[no_trace]
+    destroy_on_return: bool,
+    #[no_trace]
+    done: bool,
+    /// Set by the first `next()` call.
+    #[no_trace]
+    started: bool,
 }
 
-/// Node's `createAsyncIterator`, as an object with `next`, `return` and `throw`.
+#[core_runtime::jsmethods]
+impl IteratorState {}
+
+use super::eos::EosStateImpl;
+
+/// A step of an async iterator that runs once a promise settles: the state and the promise the
+/// step settles.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct IteratorStep {
+    state: Heap<IteratorStateImpl>,
+    promise: Heap<js::promise::Promise>,
+}
+
+#[core_runtime::jsmethods]
+impl IteratorStep {}
+
+/// A new [`IteratorStep`] that settles `promise`.
+fn iterator_step_of<'s>(
+    scope: &'s Scope<'_>,
+    state: IteratorState<'_>,
+    promise: js::Promise<'_>,
+) -> Result<IteratorStep<'s>, ExnThrown> {
+    js::class::create_instance_with::<IteratorStepImpl>(scope, |_| IteratorStepImpl {
+        state: Heap::from(state),
+        promise: Heap::from(promise),
+    })
+}
+
+/// Node's `streamToAsyncIterator`: `createAsyncIterator` of `stream`, as an object with `next`,
+/// `return` and `throw`. A stream without a `read` method is iterated through
+/// `Readable.wrap(stream, { objectMode: true })`.
 pub(crate) fn async_iterator<'s>(
     scope: &'s Scope<'_>,
     stream: Object<'_>,
     options: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, Thrown> {
-    use iterator_captures::*;
     let options = match options.filter(|options| !options.is_undefined()) {
-        Some(options) => Some(crate::errors::validate_object(scope, options, "options")?),
+        Some(options) => Some(crate::errors::validate_plain_object(
+            scope, options, "options", false,
+        )?),
         None => None,
     };
+    let stream = if has_method(scope, stream, c"read")? {
+        stream
+    } else {
+        let wrap_options = Object::new_plain(scope)?;
+        wrap_options.set_property(scope, c"objectMode", true)?;
+        let stream = stream.to_jsval_throwing(scope)?;
+        let wrap_options = wrap_options.to_jsval_throwing(scope)?;
+        wrap_static(scope, stream, Some(wrap_options))?
+    };
     let destroy_on_return = match options {
-        Some(options) => {
-            let value = options.get_property(scope, c"destroyOnReturn")?;
-            !(value.is_boolean() && !value.to_boolean())
-        }
+        Some(options) => not_false(options.get_property(scope, c"destroyOnReturn")?),
         None => true,
     };
-    let state_array = js::Array::with_contents(scope, &[js::value::undefined(); COUNT])?;
-    let captures = Captures::of(scope, (*state_array).to_jsval_throwing(scope)?)?;
-    captures.set(STREAM, stream)?;
-    captures.set(DESTROY_ON_RETURN, destroy_on_return)?;
-    captures.set(DONE, false)?;
-    captures.set(STARTED, false)?;
-
-    let iterator = Object::new_plain(scope)?;
-    iterator.set_prototype(scope, js::class::get_async_iterator_prototype(scope)?)?;
+    let state =
+        js::class::create_instance_with::<IteratorStateImpl>(scope, |_| IteratorStateImpl {
+            stream: Heap::from(stream),
+            error: Heap::default(),
+            waiting: None,
+            resuming: None,
+            resume_job: None,
+            cleanup: None,
+            listener: None,
+            pending: None,
+            destroy_on_return,
+            done: false,
+            started: false,
+        })?;
+    let iterator =
+        Object::new_plain_with_proto(scope, js::class::get_async_iterator_prototype(scope)?)?;
     for (name, body) in [
         (c"next", iterator_next as Callback),
         (c"return", iterator_return),
         (c"throw", iterator_throw),
     ] {
-        let function = Function::new_callback(scope, name, 0, body, *state_array)?;
+        let function = Function::new_callback(scope, name, 0, body, state)?;
         iterator.set_property(scope, name, *function)?;
     }
     iterator.set_property(scope, c"stream", stream)?;
@@ -1617,35 +1623,44 @@ pub(crate) fn async_iterator<'s>(
 }
 
 /// The start of Node's generator body: listen for `readable`, and record the end of the stream.
-fn iterator_start(scope: &Scope<'_>, captures: &Captures<'_>) -> Result<(), Thrown> {
-    use iterator_captures::*;
-    captures.set(STARTED, true)?;
-    let stream = captures.obj(STREAM)?;
-    let listener = closure(scope, 0, iterator_on_readable, &[captures.array_value()?])?;
-    captures.set(LISTENER, listener)?;
-    listen(scope, stream, c"on", "readable", listener)?;
-    let eos_callback = closure(scope, 1, iterator_on_end, &[captures.array_value()?])?;
-    let eos_options = Object::new_plain(scope)?;
-    eos_options.set_property(scope, c"writable", false)?;
-    let cleanup = super::eos::eos(
+fn iterator_start(scope: &Scope<'_>, state: IteratorState<'_>) -> Result<(), Thrown> {
+    state.data_mut().started = true;
+    let stream = state.data().stream.get(scope);
+    let listener = Function::new_callback(scope, c"", 0, iterator_on_readable, state)?;
+    state.data_mut().listener = Some(Heap::from(*listener));
+    listen(scope, stream, c"on", c"readable", *listener)?;
+    let options = EosOptions {
+        writable: Some(false),
+        ..EosOptions::default()
+    };
+    let payload = state.to_jsval_throwing(scope)?;
+    let cleanup = super::eos::eos_native(
         scope,
-        stream.to_jsval_throwing(scope)?,
-        Some(eos_options.to_jsval_throwing(scope)?),
-        eos_callback.to_jsval_throwing(scope)?,
+        stream,
+        options,
+        EosCallback::Native(iterator_on_end, payload),
     )?;
-    captures.set(CLEANUP, cleanup)?;
+    state.data_mut().cleanup = Some(Heap::from(cleanup));
     Ok(())
 }
 
-/// Call the iterator's pending callback, if any, and clear it.
-fn iterator_wake(scope: &Scope<'_>, captures: &Captures<'_>) -> Result<(), ExnThrown> {
-    use iterator_captures::*;
-    let callback = captures.get(CALLBACK)?;
-    captures.set(CALLBACK, js::value::undefined())?;
-    if is_function(scope, callback) {
-        call(scope, HandleValue::undefined(), callback, &[])?;
-    }
-    Ok(())
+/// Resume the step that waits for the stream, if any, one microtask later, when Node's generator
+/// resumes from awaiting the promise its callback resolves.
+fn iterator_wake(scope: &Scope<'_>, state: IteratorState<'_>) -> Result<(), ExnThrown> {
+    let Some(waiting) = state.data_mut().waiting.take_rooted(scope) else {
+        return Ok(());
+    };
+    state.data_mut().resuming = Some(Heap::from(waiting));
+    let job = state.data().resume_job.get(scope);
+    let job = match job {
+        Some(job) => job,
+        None => {
+            let job = Function::new_callback(scope, c"", 0, iterator_resumed, state)?;
+            state.data_mut().resume_job = Some(Heap::from(job));
+            job
+        }
+    };
+    js::jobs::queue_microtask(scope, &job)
 }
 
 fn iterator_on_readable(
@@ -1653,10 +1668,7 @@ fn iterator_on_readable(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    iterator_wake(
-        scope,
-        &Captures::of(scope, Captures::of(scope, payload)?.get(0)?)?,
-    )?;
+    iterator_wake(scope, cast_payload::<IteratorState>(scope, payload))?;
     Ok(js::value::undefined())
 }
 
@@ -1666,45 +1678,57 @@ fn iterator_on_end(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use iterator_captures::*;
-    let captures = Captures::of(scope, Captures::of(scope, payload)?.get(0)?)?;
+    let state = cast_payload::<IteratorState>(scope, payload);
     let error = args.get(0);
-    if truthy(scope, error) {
-        let combined = destroy::aggregate_two_errors(scope, captures.get(ERROR)?, error)?;
-        captures.set(ERROR, combined)?;
+    if js::conversion::to_boolean(error) {
+        let previous = state.data().error.get(scope);
+        let combined = destroy::aggregate_two_errors(scope, previous, error)?;
+        state.data().error.set(combined.get());
     } else {
-        captures.set(ERROR, js::value::null())?;
+        state.data().error.set(js::value::null());
     }
-    iterator_wake(scope, &captures)?;
+    iterator_wake(scope, state)?;
     Ok(js::value::undefined())
 }
 
 /// The `finally` block of Node's generator: destroy the stream, or stop listening to it.
-fn iterator_finish(scope: &Scope<'_>, captures: &Captures<'_>) -> Result<(), ExnThrown> {
-    use iterator_captures::*;
-    if captures.flag(DONE)? {
+fn iterator_finish(scope: &Scope<'_>, state: IteratorState<'_>) -> Result<(), ExnThrown> {
+    if state.data().done {
         return Ok(());
     }
-    captures.set(DONE, true)?;
-    let stream = captures.obj(STREAM)?;
-    let error = captures.get(ERROR)?;
+    state.data_mut().done = true;
+    let (stream, error, destroy_on_return) = {
+        let data = state.data();
+        (
+            data.stream.get(scope),
+            data.error.get(scope),
+            data.destroy_on_return,
+        )
+    };
     let preserve_half_open_duplex = error.is_null()
         && is_true(stream.get_property(scope, c"allowHalfOpen")?)
         && is_true(stream.get_property(scope, c"writable")?)
         && !is_true(stream.get_property(scope, c"writableEnded")?);
-    let auto_destroy = readable_state(scope, stream)?.flag(scope, c"autoDestroy")?;
-    if (truthy(scope, error) || captures.flag(DESTROY_ON_RETURN)?)
-        && (error.is_undefined() || auto_destroy)
+    // `autoDestroy` is read only for an error, as Node's condition reads it, and a stream without
+    // a readable state doesn't destroy itself.
+    let auto_destroy = |scope: &Scope<'_>| -> Result<bool, ExnThrown> {
+        Ok(super::readable_auto_destroy(scope, stream)?.unwrap_or(false))
+    };
+    if (js::conversion::to_boolean(error) || destroy_on_return)
+        && (error.is_undefined() || auto_destroy(scope)?)
         && !preserve_half_open_duplex
     {
         destroy::destroyer(scope, stream.to_jsval_throwing(scope)?, HandleValue::null())?;
     } else {
-        if let Some(listener) = as_object(scope, captures.get(LISTENER)?) {
-            listen(scope, stream, c"off", "readable", listener)?;
+        let (listener, cleanup) = {
+            let data = state.data();
+            (data.listener.get(scope), data.cleanup.get(scope))
+        };
+        if let Some(listener) = listener {
+            listen(scope, stream, c"off", c"readable", listener)?;
         }
-        let cleanup = captures.get(CLEANUP)?;
-        if is_function(scope, cleanup) {
-            call(scope, HandleValue::undefined(), cleanup, &[])?;
+        if let Some(cleanup) = cleanup {
+            super::eos::cleanup(scope, cleanup)?;
         }
     }
     Ok(())
@@ -1715,125 +1739,102 @@ fn iterator_finish(scope: &Scope<'_>, captures: &Captures<'_>) -> Result<(), Exn
 /// chunk is available yet, once the stream signals more data or its end.
 fn iterator_step(
     scope: &Scope<'_>,
-    state: HandleValue<'_>,
+    state: IteratorState<'_>,
     promise: js::Promise<'_>,
 ) -> Result<(), ExnThrown> {
-    use iterator_captures::*;
-    let captures = Captures::of(scope, state)?;
     let undefined_value = HandleValue::undefined();
-    if captures.flag(DONE)? {
+    if state.data().done {
         let result = js::iteration::create_iter_result(scope, undefined_value, true)?;
         return promise.resolve(scope, result);
     }
-    let stream = captures.obj(STREAM)?;
-    let chunk = if truthy(scope, stream.get_property(scope, c"destroyed")?) {
+    let stream = state.data().stream.get(scope);
+    let chunk = if js::conversion::to_boolean(stream.get_property(scope, c"destroyed")?) {
         HandleValue::null()
     } else {
-        call_method(scope, stream, c"read", &[] as &[HandleValue<'_>])?
+        Function::call_by_name(scope, stream.handle(), c"read", js::function::EmptyArgs)?
     };
     if !chunk.is_null() {
         let awaited = js::Promise::call_original_resolve(scope, chunk)?;
-        let fulfilled = closure(scope, 1, iterator_yield, &[promise])?;
-        let rejected = closure(scope, 1, iterator_reject, &[promise])?;
-        awaited.then(scope, Some(fulfilled), Some(rejected))?;
+        let fulfilled = Function::new_callback(scope, c"", 1, iterator_yield, promise)?;
+        let rejected = Function::new_callback(scope, c"", 1, iterator_reject, promise)?;
+        awaited.then(scope, Some(*fulfilled), Some(*rejected))?;
         return Ok(());
     }
-    let error = captures.get(ERROR)?;
-    if truthy(scope, error) {
-        iterator_finish(scope, &captures)?;
+    let error = state.data().error.get(scope);
+    if js::conversion::to_boolean(error) {
+        iterator_finish(scope, state)?;
         return promise.reject(scope, error);
     }
     if error.is_null() {
-        iterator_finish(scope, &captures)?;
+        iterator_finish(scope, state)?;
         let result = js::iteration::create_iter_result(scope, undefined_value, true)?;
         return promise.resolve(scope, result);
     }
-    let resume = closure(
-        scope,
-        0,
-        iterator_resume,
-        &[state.get(), promise.to_jsval_raw_throwing(scope)?],
-    )?;
-    captures.set(CALLBACK, resume)
+    state.data_mut().waiting = Some(Heap::from(promise));
+    Ok(())
 }
 
-/// Fulfill the captured promise with `{ value, done: false }`, whose captures are `[promise]`.
+/// Fulfill the promise that is the payload with `{ value, done: false }`.
 fn iterator_yield(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let promise = captured_promise(scope, &Captures::of(scope, payload)?, 0)?;
+    let promise = cast_payload::<js::Promise>(scope, payload);
     let result = js::iteration::create_iter_result(scope, args.get(0), false)?;
     promise.resolve(scope, result)?;
     Ok(js::value::undefined())
 }
 
-/// Reject the captured promise with the argument, whose captures are `[promise]`.
+/// Reject the promise that is the payload with the argument.
 fn iterator_reject(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let promise = captured_promise(scope, &Captures::of(scope, payload)?, 0)?;
-    promise.reject(scope, args.get(0))?;
+    cast_payload::<js::Promise>(scope, payload).reject(scope, args.get(0))?;
     Ok(js::value::undefined())
 }
 
-/// The captured promise at `index`.
-fn captured_promise<'s>(
-    scope: &'s Scope<'_>,
-    captures: &Captures<'s>,
-    index: u32,
-) -> Result<js::Promise<'s>, ExnThrown> {
-    captures
-        .obj(index)?
-        .cast::<js::Promise>()
-        .map_err(|_| type_error(scope, "not a promise"))
-}
-
-/// Run [`iterator_step`] for the captures `[state, promise]`, rejecting the promise with an
-/// exception it throws.
-fn iterator_step_captured(scope: &Scope<'_>, payload: HandleValue<'_>) -> Result<(), ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let promise = captured_promise(scope, &captures, 1)?;
-    if iterator_step(scope, captures.get(0)?, promise).is_err() {
-        let error = take_exception(scope);
+/// Run [`iterator_step`], rejecting `promise` with an exception it throws.
+fn iterator_step_or_reject(
+    scope: &Scope<'_>,
+    state: IteratorState<'_>,
+    promise: js::Promise<'_>,
+) -> Result<(), ExnThrown> {
+    if iterator_step(scope, state, promise).is_err() {
+        let error = js::exception::take_pending_or_undefined(scope);
         promise.reject(scope, error)?;
     }
     Ok(())
 }
 
-/// The function [`iterator_step`] stores in the `CALLBACK` capture when no chunk is available,
-/// whose captures are `[state, promise]`: take the next step one microtask later, when Node's
-/// generator resumes from awaiting the promise this callback resolves.
-fn iterator_resume(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let job = Function::new_callback(scope, c"", 0, iterator_resumed, payload)?;
-    js::jobs::queue_microtask(scope, &job)?;
-    Ok(js::value::undefined())
-}
-
-/// The microtask [`iterator_resume`] queues, whose captures are `[state, promise]`.
+/// The microtask [`iterator_wake`] queues: take the resumed step.
 fn iterator_resumed(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    iterator_step_captured(scope, payload)?;
+    let state = cast_payload::<IteratorState>(scope, payload);
+    let resuming = state.data_mut().resuming.take_rooted(scope);
+    if let Some(promise) = resuming {
+        iterator_step_or_reject(scope, state, promise)?;
+    }
     Ok(js::value::undefined())
 }
 
-/// Run the step after the previous `next()` settled, whose captures are `[state, promise]`.
+/// Run the step after the previous `next()` settled, whose payload is an [`IteratorStep`].
 fn iterator_chained_step(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    iterator_step_captured(scope, payload)?;
+    let step = cast_payload::<IteratorStep>(scope, payload);
+    let (state, promise) = {
+        let data = step.data();
+        (data.state.get(scope), data.promise.get(scope))
+    };
+    iterator_step_or_reject(scope, state, promise)?;
     Ok(js::value::undefined())
 }
 
@@ -1842,36 +1843,30 @@ fn iterator_next(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use iterator_captures::*;
-    let captures = Captures::of(scope, payload)?;
-    if !captures.flag(STARTED)? && !captures.flag(DONE)? {
-        if let Err(error) = iterator_start(scope, &captures) {
+    let state = cast_payload::<IteratorState>(scope, payload);
+    let (started, done) = {
+        let data = state.data();
+        (data.started, data.done)
+    };
+    if !started && !done {
+        if let Err(error) = iterator_start(scope, state) {
             error.throw(scope);
-            let error = take_exception(scope);
+            let error = js::exception::take_pending_or_undefined(scope);
             return js::Promise::new_rejected_with_error(scope, error)?
                 .to_jsval_raw_throwing(scope);
         }
     }
     let promise = js::Promise::new_pending(scope)?;
-    let pending = captures.get(PENDING)?;
-    match as_object(scope, pending).and_then(|pending| pending.cast::<js::Promise>().ok()) {
+    let previous = state.data().pending.get(scope);
+    match previous {
         Some(previous) if previous.is_pending() => {
-            let step = closure(
-                scope,
-                0,
-                iterator_chained_step,
-                &[payload.get(), promise.to_jsval_raw_throwing(scope)?],
-            )?;
-            previous.then(scope, Some(step), Some(step))?;
+            let step = iterator_step_of(scope, state, promise)?;
+            let reaction = Function::new_callback(scope, c"", 0, iterator_chained_step, step)?;
+            previous.then(scope, Some(*reaction), Some(*reaction))?;
         }
-        _ => {
-            if iterator_step(scope, payload, promise).is_err() {
-                let error = take_exception(scope);
-                promise.reject(scope, error)?;
-            }
-        }
+        _ => iterator_step_or_reject(scope, state, promise)?,
     }
-    captures.set(PENDING, *promise)?;
+    state.data_mut().pending = Some(Heap::from(promise));
     promise.to_jsval_raw_throwing(scope)
 }
 
@@ -1884,54 +1879,58 @@ fn iterator_return(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use iterator_captures::*;
-    let captures = Captures::of(scope, payload)?;
-    if !captures.flag(STARTED)? {
-        captures.set(DONE, true)?;
+    let state = cast_payload::<IteratorState>(scope, payload);
+    if !state.data().started {
+        state.data_mut().done = true;
     }
     let promise = js::Promise::new_pending(scope)?;
-    let shared = [payload, promise.to_jsval_throwing(scope)?];
-    let fulfilled = closure(scope, 1, iterator_returned, &shared)?;
-    let rejected = closure(scope, 1, iterator_return_rejected, &shared)?;
+    let step = iterator_step_of(scope, state, promise)?;
+    let fulfilled = Function::new_callback(scope, c"", 1, iterator_returned, step)?;
+    let rejected = Function::new_callback(scope, c"", 1, iterator_return_rejected, step)?;
     js::Promise::call_original_resolve(scope, args.get(0))?.then(
         scope,
-        Some(fulfilled),
-        Some(rejected),
+        Some(*fulfilled),
+        Some(*rejected),
     )?;
     promise.to_jsval_raw_throwing(scope)
 }
 
-/// The fulfillment of `return(value)`'s value, whose captures are `[state, promise]`.
+/// The fulfillment of `return(value)`'s value, whose payload is an [`IteratorStep`].
 fn iterator_returned(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let promise = captured_promise(scope, &captures, 1)?;
-    iterator_finish(scope, &Captures::of(scope, captures.get(0)?)?)?;
+    let step = cast_payload::<IteratorStep>(scope, payload);
+    let (state, promise) = {
+        let data = step.data();
+        (data.state.get(scope), data.promise.get(scope))
+    };
+    iterator_finish(scope, state)?;
     let result = js::iteration::create_iter_result(scope, args.get(0), true)?;
     promise.resolve(scope, result)?;
     Ok(js::value::undefined())
 }
 
-/// The rejection of `return(value)`'s value, whose captures are `[state, promise]`.
+/// The rejection of `return(value)`'s value, whose payload is an [`IteratorStep`].
 fn iterator_return_rejected(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use iterator_captures::*;
-    let captures = Captures::of(scope, payload)?;
-    let promise = captured_promise(scope, &captures, 1)?;
-    let state = Captures::of(scope, captures.get(0)?)?;
-    if state.flag(DONE)? {
+    let step = cast_payload::<IteratorStep>(scope, payload);
+    let (state, promise) = {
+        let data = step.data();
+        (data.state.get(scope), data.promise.get(scope))
+    };
+    if state.data().done {
         promise.reject(scope, args.get(0))?;
         return Ok(js::value::undefined());
     }
-    let combined = destroy::aggregate_two_errors(scope, state.get(ERROR)?, args.get(0))?;
-    state.set(ERROR, combined)?;
-    iterator_finish(scope, &state)?;
+    let previous = state.data().error.get(scope);
+    let combined = destroy::aggregate_two_errors(scope, previous, args.get(0))?;
+    state.data().error.set(combined.get());
+    iterator_finish(scope, state)?;
     promise.reject(scope, combined)?;
     Ok(js::value::undefined())
 }
@@ -1943,33 +1942,46 @@ fn iterator_throw(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use iterator_captures::*;
-    let captures = Captures::of(scope, payload)?;
-    if !captures.flag(STARTED)? {
-        captures.set(DONE, true)?;
+    let state = cast_payload::<IteratorState>(scope, payload);
+    if !state.data().started {
+        state.data_mut().done = true;
         return js::Promise::new_rejected_with_error(scope, args.get(0))?
             .to_jsval_raw_throwing(scope);
     }
-    let combined = destroy::aggregate_two_errors(scope, captures.get(ERROR)?, args.get(0))?;
-    captures.set(ERROR, combined)?;
-    iterator_finish(scope, &captures)?;
+    let previous = state.data().error.get(scope);
+    let combined = destroy::aggregate_two_errors(scope, previous, args.get(0))?;
+    state.data().error.set(combined.get());
+    iterator_finish(scope, state)?;
     js::Promise::new_rejected_with_error(scope, combined)?.to_jsval_raw_throwing(scope)
 }
 
-/// The listeners `wrap` adds to the wrapped stream, whose captures are `[readable, wrapped,
-/// paused]`.
+/// The state of `readable.wrap(stream)`: the readable, the wrapped old-style stream, and whether
+/// the wrap paused it.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct WrapState {
+    readable: Heap<js::object::Object>,
+    wrapped: Heap<js::object::Object>,
+    #[no_trace]
+    paused: bool,
+}
+
+#[core_runtime::jsmethods]
+impl WrapState {}
+
 fn wrap_ondata(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let readable = captures.obj(0)?;
-    let wrapped = captures.obj(1)?;
-    let pushed = call_method(scope, readable, c"push", &[args.get(0)])?;
-    if !truthy(scope, pushed) && has_method(scope, wrapped, c"pause")? {
-        captures.set(2, true)?;
-        call_method(scope, wrapped, c"pause", &[])?;
+    let state = cast_payload::<WrapState>(scope, payload);
+    let (readable, wrapped) = {
+        let data = state.data();
+        (data.readable.get(scope), data.wrapped.get(scope))
+    };
+    let pushed = Function::call_by_name(scope, readable.handle(), c"push", &[args.get(0)])?;
+    if !js::conversion::to_boolean(pushed) && has_method(scope, wrapped, c"pause")? {
+        state.data_mut().paused = true;
+        Function::call_by_name(scope, wrapped.handle(), c"pause", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
 }
@@ -1979,8 +1991,11 @@ fn wrap_onend(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let readable = Captures::of(scope, payload)?.obj(0)?;
-    call_method(scope, readable, c"push", &[HandleValue::null()])?;
+    let readable = cast_payload::<WrapState>(scope, payload)
+        .data()
+        .readable
+        .get(scope);
+    Function::call_by_name(scope, readable.handle(), c"push", &[HandleValue::null()])?;
     Ok(js::value::undefined())
 }
 
@@ -1989,7 +2004,10 @@ fn wrap_onerror(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let readable = Captures::of(scope, payload)?.obj(0)?;
+    let readable = cast_payload::<WrapState>(scope, payload)
+        .data()
+        .readable
+        .get(scope);
     error_or_destroy(scope, readable, args.get(0), false)?;
     Ok(js::value::undefined())
 }
@@ -1999,8 +2017,16 @@ fn wrap_onclose(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let readable = Captures::of(scope, payload)?.obj(0)?;
-    call_method(scope, readable, c"destroy", &[])?;
+    let readable = cast_payload::<WrapState>(scope, payload)
+        .data()
+        .readable
+        .get(scope);
+    Function::call_by_name(
+        scope,
+        readable.handle(),
+        c"destroy",
+        js::function::EmptyArgs,
+    )?;
     Ok(js::value::undefined())
 }
 
@@ -2009,32 +2035,13 @@ fn wrap_read(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let wrapped = captures.obj(1)?;
-    if captures.flag(2)? && has_method(scope, wrapped, c"resume")? {
-        captures.set(2, false)?;
-        call_method(scope, wrapped, c"resume", &[])?;
+    let state = cast_payload::<WrapState>(scope, payload);
+    let wrapped = state.data().wrapped.get(scope);
+    if state.data().paused && has_method(scope, wrapped, c"resume")? {
+        state.data_mut().paused = false;
+        Function::call_by_name(scope, wrapped.handle(), c"resume", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
-}
-
-/// `Object.keys(object)`: the own enumerable string keys of `object`.
-fn enumerable_keys<'s>(
-    scope: &'s Scope<'_>,
-    object: Object<'_>,
-) -> Result<Vec<HandleValue<'s>>, ExnThrown> {
-    let object_prototype = Object::new_plain(scope)?
-        .get_prototype(scope)?
-        .ok_or_else(|| type_error(scope, "Object.prototype is missing"))?;
-    let is_enumerable = object_prototype.val(scope, c"propertyIsEnumerable")?;
-    let this = object.to_jsval_throwing(scope)?;
-    let mut keys = Vec::new();
-    for key in object.own_keys(scope)? {
-        if key.is_string() && truthy(scope, call(scope, this, is_enumerable, &[key])?) {
-            keys.push(key);
-        }
-    }
-    Ok(keys)
 }
 
 /// `readable.wrap(stream)`: read from an old-style stream.
@@ -2043,29 +2050,30 @@ pub(crate) fn wrap<'s>(
     readable: Object<'s>,
     wrapped: HandleValue<'_>,
 ) -> Result<Object<'s>, ExnThrown> {
-    let wrapped_object = as_object(scope, wrapped)
-        .ok_or_else(|| js::error::TypeError("stream must be an object".into()).throw(scope))?;
-    let payload = js::Array::with_contents(
-        scope,
-        &[
-            readable.to_jsval_raw_throwing(scope)?,
-            wrapped.get(),
-            js::value::from_bool(false),
-        ],
-    )?;
+    let wrapped_object = Object::from_value(scope, wrapped)
+        .map_err(|_| js::error::TypeError("stream must be an object".into()).throw(scope))?;
+    let state = js::class::create_instance_with::<WrapStateImpl>(scope, |_| WrapStateImpl {
+        readable: Heap::from(readable),
+        wrapped: Heap::from(wrapped_object),
+        paused: false,
+    })?;
     for (event, body) in [
-        ("data", wrap_ondata as Callback),
-        ("end", wrap_onend),
-        ("error", wrap_onerror),
-        ("close", wrap_onclose),
-        ("destroy", wrap_onclose),
+        (c"data", wrap_ondata as Callback),
+        (c"end", wrap_onend),
+        (c"error", wrap_onerror),
+        (c"close", wrap_onclose),
+        (c"destroy", wrap_onclose),
     ] {
-        let listener = Function::new_callback(scope, c"", 1, body, *payload)?;
+        let listener = Function::new_callback(scope, c"", 1, body, state)?;
         listen(scope, wrapped_object, c"on", event, *listener)?;
     }
-    let read = Function::new_callback(scope, c"_read", 0, wrap_read, *payload)?;
+    let read = Function::new_callback(scope, c"_read", 0, wrap_read, state)?;
     readable.set_property(scope, c"_read", *read)?;
-    for key in enumerable_keys(scope, wrapped_object)?.into_iter().skip(1) {
+    for key in wrapped_object
+        .own_enumerable_keys(scope)?
+        .into_iter()
+        .skip(1)
+    {
         let Some(name) = rust_string(scope, key) else {
             continue;
         };
@@ -2074,25 +2082,24 @@ pub(crate) fn wrap<'s>(
         };
         let existing = readable.get_property_by_name(scope, &name)?;
         let method = wrapped_object.get_property_by_name(scope, &name)?;
-        if existing.is_undefined() && is_function(scope, method) {
-            let method_object = as_object(scope, method).expect("functions are objects");
-            let bound = call_method(scope, method_object, c"bind", &[wrapped])?;
+        if existing.is_undefined() && js::function::is_callable(method) {
+            let method_object = Object::from_value(scope, method).expect("functions are objects");
+            let bound = Function::call_by_name(scope, method_object.handle(), c"bind", &[wrapped])?;
             readable.set_property_by_name(scope, &name, bound)?;
         }
     }
     Ok(readable)
 }
 
-/// The `destroy` option of a `Readable.wrap` stream, whose captures are `[src]`: destroy `src`
-/// with the error, and call the callback with it.
+/// The `destroy` option of a `Readable.wrap` stream, whose payload is the wrapped stream: destroy
+/// it with the error, and call the callback with it.
 fn wrap_destroy(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let src = Captures::of(scope, payload)?.get(0)?;
-    destroy::destroyer(scope, src, args.get(0))?;
-    call(scope, HandleValue::undefined(), args.get(1), &[args.get(0)])?;
+    destroy::destroyer(scope, payload, args.get(0))?;
+    Function::call(scope, HandleValue::undefined(), args.get(1), &[args.get(0)])?;
     Ok(js::value::undefined())
 }
 
@@ -2103,23 +2110,20 @@ fn wrap_static<'s>(
     options: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, ExnThrown> {
     let src_object = Object::from_value_coerce(scope, src)?;
-    let mut object_mode = src_object.val(scope, c"readableObjectMode")?;
-    if object_mode.is_null() || object_mode.is_undefined() {
-        object_mode = src_object.val(scope, c"objectMode")?;
+    let mut object_mode = src_object.get_property(scope, c"readableObjectMode")?;
+    if object_mode.is_null_or_undefined() {
+        object_mode = src_object.get_property(scope, c"objectMode")?;
     }
-    if object_mode.is_null() || object_mode.is_undefined() {
+    if object_mode.is_null_or_undefined() {
         object_mode = scope.root_value(js::value::from_bool(true));
     }
     let merged = Object::new_plain(scope)?;
     merged.set_property(scope, c"objectMode", object_mode)?;
-    if let Some(options) = options.and_then(|options| as_object(scope, options)) {
+    if let Some(options) = options.and_then(|options| Object::from_value(scope, options).ok()) {
         merged.assign(scope, options)?;
     }
-    merged.set_property(
-        scope,
-        c"destroy",
-        closure(scope, 2, wrap_destroy, &[src.get()])?,
-    )?;
+    let destroy = Function::new_callback(scope, c"destroy", 2, wrap_destroy, src)?;
+    merged.set_property(scope, c"destroy", *destroy)?;
     let readable = Function::construct(scope, readable::class_constructor(scope)?, &[merged])?;
     wrap(scope, readable, src)
 }
@@ -2127,13 +2131,15 @@ fn wrap_static<'s>(
 #[core_runtime::jsfunction_class(
     name = "Readable",
     extends = "super::super::legacy::stream",
+    state = "super::super::state::StreamState",
+    invalid_this = "crate::errors::invalid_this",
     self_construct
 )]
 pub mod readable {
     use super::*;
 
     /// <https://nodejs.org/api/stream.html#new-streamreadableoptions>
-    #[constructor]
+    #[constructor(length = 1)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2145,6 +2151,7 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#readabledestroyerror>
+    #[method(length = 2)]
     pub fn destroy<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
@@ -2170,11 +2177,12 @@ pub mod readable {
         error: HandleValue<'_>,
         callback: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        call(scope, HandleValue::undefined(), callback, &[error])?;
+        Function::call(scope, HandleValue::undefined(), callback, &[error])?;
         Ok(())
     }
 
     /// <https://nodejs.org/api/stream.html#readablepushchunk-encoding>
+    #[method(length = 2)]
     pub fn push(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2185,6 +2193,7 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#readableunshiftchunk-encoding>
+    #[method(length = 2)]
     pub fn unshift(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2196,8 +2205,9 @@ pub mod readable {
 
     /// <https://nodejs.org/api/stream.html#readableispaused>
     pub fn is_paused(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
-        let state = readable_state(scope, this)?;
-        Ok(state.flag(scope, c"_paused")? || paused_flowing(scope, state)?)
+        let side = ReadableSide::of(scope, this)?;
+        let part = side.get();
+        Ok(part.paused == Some(true) || part.flowing == Some(false))
     }
 
     /// <https://nodejs.org/api/stream.html#readablesetencodingencoding>
@@ -2210,6 +2220,7 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#readablereadsize>
+    #[method(length = 1)]
     pub fn read<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -2220,12 +2231,13 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#readable_readsize>: subclasses implement it.
-    #[method(name = "_read")]
+    #[method(name = "_read", length = 1)]
     pub fn read_impl() -> Result<(), NodeError> {
         Err(NodeError::not_implemented("_read()"))
     }
 
     /// <https://nodejs.org/api/stream.html#readablepipedestination-options>
+    #[method(length = 2)]
     pub fn pipe<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -2236,6 +2248,7 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#readableunpipedestination>
+    #[method(length = 1)]
     pub fn unpipe<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
@@ -2288,23 +2301,16 @@ pub mod readable {
 
     /// <https://nodejs.org/api/events.html#emitterremovealllistenerseventname>: also updates the
     /// `readable` listening state.
+    #[method(length = 1)]
     pub fn remove_all_listeners<'s>(
         scope: &'s Scope<'_>,
         this: Object<'s>,
         event: Option<HandleValue<'_>>,
-    ) -> Result<Object<'s>, ExnThrown> {
-        let ctor = crate::events::emitter_constructor(scope)?;
-        let proto = required_obj(scope, ctor, c"prototype")?;
-        let method = proto.val(scope, c"removeAllListeners")?;
-        let args: Vec<HandleValue<'_>> = event.into_iter().collect();
-        call(scope, this.to_jsval_throwing(scope)?, method, &args)?;
+    ) -> Result<Object<'s>, Thrown> {
+        crate::events::event_emitter::remove_all_listeners(scope, this, event)?;
         let name = rust_string(scope, event.unwrap_or(HandleValue::undefined()));
         if event.is_none_or(|event| event.is_undefined()) || name.as_deref() == Some("readable") {
-            next_tick(
-                scope,
-                update_readable_listening,
-                &[this.to_jsval_raw_throwing(scope)?],
-            )?;
+            super::tick(scope, update_readable_listening, this)?;
         }
         Ok(this)
     }
@@ -2329,6 +2335,7 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#readableiteratoroptions>
+    #[method(length = 1)]
     pub fn iterator<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -2338,7 +2345,7 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#streamreadablefromiterable-options>
-    #[static_method]
+    #[static_method(length = 2)]
     pub fn from<'s>(
         scope: &'s Scope<'_>,
         iterable: HandleValue<'_>,
@@ -2348,7 +2355,7 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#streamreadablefromwebreadablestream-options>
-    #[static_method]
+    #[static_method(length = 2)]
     pub fn from_web<'s>(
         scope: &'s Scope<'_>,
         readable_stream: HandleValue<'_>,
@@ -2358,7 +2365,7 @@ pub mod readable {
     }
 
     /// <https://nodejs.org/api/stream.html#streamreadabletowebstreamreadable-options>
-    #[static_method]
+    #[static_method(length = 2)]
     pub fn to_web<'s>(
         scope: &'s Scope<'_>,
         stream_readable: HandleValue<'_>,
@@ -2370,7 +2377,7 @@ pub mod readable {
     /// Node's static `Readable.wrap(src, options)`: a `Readable` with `options` that wraps the
     /// old-style stream `src`, and destroys it when destroyed. Its `objectMode` defaults to
     /// `src.readableObjectMode`, then `src.objectMode`, then `true`.
-    #[static_method(name = "wrap")]
+    #[static_method(name = "wrap", length = 2)]
     pub fn wrap_stream<'s>(
         scope: &'s Scope<'_>,
         src: HandleValue<'_>,
@@ -2386,38 +2393,70 @@ pub mod readable {
     }
 }
 
-/// Create the `ReadableState` of `stream` and take the readable options: Node's
-/// `new ReadableState()` and the option handling of the `Readable` and `Duplex` constructors.
+/// Create the readable part of the state of `stream` and its `_readableState` view, and take the
+/// readable options: Node's `new ReadableState()` and the option handling of the `Readable` and
+/// `Duplex` constructors.
 pub(crate) fn init_readable(
     scope: &Scope<'_>,
     stream: Object<'_>,
     options: Option<HandleValue<'_>>,
     is_duplex: bool,
 ) -> Result<(), Thrown> {
-    let state_ctor = readable_state::class_constructor(scope)?;
-    let options_value = options.unwrap_or(HandleValue::undefined());
-    let stream_value = stream.to_jsval_throwing(scope)?;
-    let duplex_value = scope.root_value(js::value::from_bool(is_duplex));
-    let state = js::Function::construct(
-        scope,
-        state_ctor,
-        &[options_value, stream_value, duplex_value],
-    )?;
-    stream.set_property(scope, c"_readableState", state)?;
-    if let Some(options) = options.and_then(|options| as_object(scope, options)) {
+    init_readable_with(scope, stream, options, is_duplex, PropertyInit::Assign)
+}
+
+/// Initialize `stream`, which this crate created, as the `Readable` constructor does for
+/// `options`, or for `{ highWaterMark: high_water_mark }` if `high_water_mark` is a valid high
+/// water mark. It has no `_events` yet, so its emitter is initialized with
+/// [`crate::events::init_new_emitter`].
+pub(crate) fn init_new_readable(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    options: Option<HandleValue<'_>>,
+    high_water_mark: Option<f64>,
+) -> Result<(), Thrown> {
+    match high_water_mark {
+        Some(mark) => {
+            init_readable_with(scope, stream, None, false, PropertyInit::Define)?;
+            ReadableSide::of(scope, stream)?.get_mut().high_water_mark = mark;
+        }
+        None => init_readable_with(scope, stream, options, false, PropertyInit::Define)?,
+    }
+    crate::events::init_new_emitter(scope, stream)?;
+    finish_construction(scope, stream)
+}
+
+/// Run [`init_readable`], creating `_readableState` as `init` creates properties.
+fn init_readable_with(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    options: Option<HandleValue<'_>>,
+    is_duplex: bool,
+    init: PropertyInit,
+) -> Result<(), Thrown> {
+    let state = readable::state_of(scope, stream)?;
+    init_readable_part(scope, state, options, is_duplex)?;
+    let view = super::state::new_readable_view(scope, state)?;
+    match init {
+        PropertyInit::Define => {
+            stream.define_property(scope, c"_readableState", view, JSPROP_ENUMERATE as u32)?
+        }
+        PropertyInit::Assign => stream.set_property(scope, c"_readableState", view)?,
+    }
+    if let Some(options) = options.and_then(|options| Object::from_value(scope, options).ok()) {
         for (option, method) in [
             (c"read", c"_read"),
             (c"destroy", c"_destroy"),
             (c"construct", c"_construct"),
         ] {
-            let value = options.val(scope, option)?;
-            if is_function(scope, value) {
+            let value = options.get_property(scope, option)?;
+            if js::function::is_callable(value) {
                 stream.set_property(scope, method, value)?;
             }
         }
         if !is_duplex {
-            let signal = options.val(scope, c"signal")?;
-            if truthy(scope, signal) {
+            let signal = options.get_property(scope, c"signal")?;
+            if js::conversion::to_boolean(signal) {
                 super::add_abort_signal(scope, signal, stream.to_jsval_throwing(scope)?)?;
             }
         }
@@ -2429,35 +2468,32 @@ pub(crate) fn init_readable(
 /// end of the `Readable`, `Writable` and `Duplex` constructors.
 pub(crate) fn finish_construction(scope: &Scope<'_>, stream: Object<'_>) -> Result<(), Thrown> {
     let construct = stream.get_property(scope, c"_construct")?;
-    if construct.is_null() || construct.is_undefined() {
+    if construct.is_null_or_undefined() {
         return Ok(());
     }
-    let on_constructed = closure(
-        scope,
-        0,
-        on_constructed,
-        &[stream.to_jsval_raw_throwing(scope)?],
-    )?;
-    destroy::construct(scope, stream, on_constructed)?;
+    let on_constructed = Function::new_callback(scope, c"", 0, on_constructed, stream)?;
+    destroy::construct(scope, stream, *on_constructed)?;
     Ok(())
 }
 
-/// The `kOnConstructed` of both states: start reading ahead if the readable side needs data, and
-/// write what the writable side buffered.
+/// The `kOnConstructed` of both states, whose payload is the stream: start reading ahead if the
+/// readable side needs data, and write what the writable side buffered.
 fn on_constructed(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
-    let (readable, writable) = states(scope, stream)?;
-    if let Some(state) = readable {
-        if state.flag(scope, c"needReadable")? {
-            maybe_read_more(scope, stream, state)?;
+    let stream = cast_payload::<Object>(scope, payload);
+    let Some(state) = super::state::try_state(scope, stream)? else {
+        return Ok(js::value::undefined());
+    };
+    if let Some(side) = ReadableSide::of_state(state) {
+        if side.has(R::NEED_READABLE) {
+            maybe_read_more(scope, stream, side)?;
         }
     }
-    if let Some(state) = writable {
-        super::writable::on_constructed(scope, stream, state)?;
+    if let Some(side) = WritableSide::of_state(state) {
+        super::writable::on_constructed(scope, stream, side)?;
     }
     Ok(js::value::undefined())
 }
@@ -2481,78 +2517,172 @@ pub(crate) fn accessor(
     proto.define_accessor_by_name(scope, name, Some(*get), set.map(|set| *set), 0)
 }
 
-/// `this._readableState`, for the accessors.
-fn this_state<'s>(
+/// The readable part of the state of an accessor's `this`, if it has one.
+fn this_side<'s>(
     scope: &'s Scope<'_>,
     args: &CallbackArgs<'_>,
-) -> Result<Option<Object<'s>>, ExnThrown> {
-    match as_object(scope, scope.root_value(args.this())) {
-        Some(this) => this.obj(scope, c"_readableState"),
-        None => Ok(None),
+) -> Result<Option<ReadableSide<'s>>, ExnThrown> {
+    match Object::from_value(scope, args.this()) {
+        Ok(this) => ReadableSide::try_of(scope, this),
+        Err(_) => Ok(None),
     }
 }
 
-/// Define the accessor callback `$fn_name`, which returns `this._readableState[$field]`, or
-/// `$default` if `this` has no readable state.
-macro_rules! state_getter {
-    ($fn_name:ident, $field:expr, $default:expr) => {
-        fn $fn_name(
-            scope: &Scope<'_>,
-            args: CallbackArgs<'_>,
-            _payload: HandleValue,
-        ) -> Result<Value, ExnThrown> {
-            match this_state(scope, &args)? {
-                Some(state) => Ok(state.get_property(scope, $field)?.get()),
-                None => Ok($default),
-            }
-        }
-    };
+/// A getter of `Readable.prototype`: `body` of the readable part of `this`'s state, or `default`
+/// without one.
+fn readable_getter(
+    scope: &Scope<'_>,
+    args: &CallbackArgs<'_>,
+    default: impl FnOnce() -> Value,
+    body: impl FnOnce(&ReadablePart) -> Value,
+) -> Result<Value, ExnThrown> {
+    Ok(match this_side(scope, args)? {
+        Some(side) => body(&side.get()),
+        None => default(),
+    })
 }
 
-state_getter!(
-    get_readable_high_water_mark,
-    c"highWaterMark",
-    js::value::undefined()
-);
-state_getter!(get_readable_buffer, c"buffer", js::value::undefined());
-state_getter!(get_readable_flowing, c"flowing", js::value::undefined());
-state_getter!(get_readable_length, c"length", js::value::undefined());
-state_getter!(
-    get_readable_object_mode,
-    c"objectMode",
-    js::value::from_bool(false)
-);
-state_getter!(get_readable_encoding, c"encoding", js::value::null());
-state_getter!(get_errored, c"errored", js::value::null());
-state_getter!(get_closed, c"closed", js::value::from_bool(false));
-state_getter!(get_destroyed, c"destroyed", js::value::from_bool(false));
-state_getter!(
-    get_readable_ended,
-    c"endEmitted",
-    js::value::from_bool(false)
-);
-state_getter!(
-    get_readable_did_read,
-    c"dataEmitted",
-    js::value::from_bool(false)
-);
+fn get_readable_high_water_mark(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    readable_getter(scope, &args, js::value::undefined, |part| {
+        js::value::from_f64(part.high_water_mark)
+    })
+}
+
+fn get_readable_buffer(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    Ok(match this_side(scope, &args)? {
+        Some(side) => side.buffer(scope).as_value(),
+        None => js::value::undefined(),
+    })
+}
+
+fn get_readable_flowing(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    readable_getter(scope, &args, js::value::undefined, |part| {
+        match part.flowing {
+            Some(flowing) => js::value::from_bool(flowing),
+            None => js::value::null(),
+        }
+    })
+}
+
+fn get_readable_length(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    readable_getter(scope, &args, js::value::undefined, |part| {
+        js::value::from_f64(part.length)
+    })
+}
+
+fn get_readable_object_mode(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    readable_getter(
+        scope,
+        &args,
+        || js::value::from_bool(false),
+        |part| js::value::from_bool(part.flags.contains(R::OBJECT_MODE)),
+    )
+}
+
+fn get_readable_encoding(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    Ok(match this_side(scope, &args)? {
+        Some(side) => side.encoding(scope).map_or(js::value::null(), |e| e.get()),
+        None => js::value::null(),
+    })
+}
+
+fn get_errored(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    Ok(match this_side(scope, &args)? {
+        Some(side) => side.errored(scope).map_or(js::value::null(), |e| e.get()),
+        None => js::value::null(),
+    })
+}
+
+fn get_closed(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    readable_getter(
+        scope,
+        &args,
+        || js::value::from_bool(false),
+        |part| js::value::from_bool(part.flags.contains(R::CLOSED)),
+    )
+}
+
+fn get_destroyed(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    readable_getter(
+        scope,
+        &args,
+        || js::value::from_bool(false),
+        |part| js::value::from_bool(part.flags.contains(R::DESTROYED)),
+    )
+}
+
+fn get_readable_ended(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    readable_getter(
+        scope,
+        &args,
+        || js::value::from_bool(false),
+        |part| js::value::from_bool(part.flags.contains(R::END_EMITTED)),
+    )
+}
+
+fn get_readable_did_read(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    readable_getter(
+        scope,
+        &args,
+        || js::value::from_bool(false),
+        |part| js::value::from_bool(part.flags.contains(R::DATA_EMITTED)),
+    )
+}
 
 fn get_readable(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let Some(state) = this_state(scope, &args)? else {
+    let Some(side) = this_side(scope, &args)? else {
         return Ok(js::value::from_bool(false));
     };
-    let readable = state.get_property(scope, c"readable")?;
-    let disabled = readable.is_boolean() && !readable.to_boolean();
-    Ok(js::value::from_bool(
-        !disabled
-            && !state.flag(scope, c"destroyed")?
-            && !state.flag(scope, c"errorEmitted")?
-            && !state.flag(scope, c"endEmitted")?,
-    ))
+    let readable = side.get().is_readable();
+    Ok(js::value::from_bool(readable))
 }
 
 fn set_readable(
@@ -2560,8 +2690,9 @@ fn set_readable(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    if let Some(state) = this_state(scope, &args)? {
-        state.set_flag(scope, c"readable", truthy(scope, args.get(0)))?;
+    if let Some(side) = this_side(scope, &args)? {
+        let readable = js::conversion::to_boolean(args.get(0));
+        side.get().readable.set(js::value::from_bool(readable));
     }
     Ok(js::value::undefined())
 }
@@ -2571,8 +2702,10 @@ fn set_readable_flowing(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    if let Some(state) = this_state(scope, &args)? {
-        state.set_property(scope, c"flowing", args.get(0))?;
+    if let Some(side) = this_side(scope, &args)? {
+        let value = args.get(0);
+        side.get_mut().flowing =
+            (!value.is_null_or_undefined()).then(|| js::conversion::to_boolean(value));
     }
     Ok(js::value::undefined())
 }
@@ -2582,8 +2715,8 @@ fn set_destroyed(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    if let Some(state) = this_state(scope, &args)? {
-        state.set_property(scope, c"destroyed", args.get(0))?;
+    if let Some(side) = this_side(scope, &args)? {
+        side.set(R::DESTROYED, js::conversion::to_boolean(args.get(0)));
     }
     Ok(js::value::undefined())
 }
@@ -2593,15 +2726,12 @@ fn get_readable_aborted(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let Some(state) = this_state(scope, &args)? else {
+    let Some(side) = this_side(scope, &args)? else {
         return Ok(js::value::from_bool(false));
     };
-    let readable = state.get_property(scope, c"readable")?;
-    let disabled = readable.is_boolean() && !readable.to_boolean();
-    let failed =
-        state.flag(scope, c"destroyed")? || truthy(scope, state.get_property(scope, c"errored")?);
+    let failed = side.has(R::DESTROYED) || side.is_errored();
     Ok(js::value::from_bool(
-        !disabled && failed && !state.flag(scope, c"endEmitted")?,
+        !side.disabled() && failed && !side.has(R::END_EMITTED),
     ))
 }
 
@@ -2625,9 +2755,22 @@ pub(crate) fn capture_rejection(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let this = this_object(scope, &args)?;
-    call_method(scope, this, c"destroy", &[args.get(0)])?;
+    Function::call_by_name(scope, this.handle(), c"destroy", &[args.get(0)])?;
     Ok(js::value::undefined())
 }
+
+/// The state of a `Symbol.asyncDispose` call: the promise it returned, and the error it
+/// destroyed the stream with.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct DisposeState {
+    promise: Heap<js::promise::Promise>,
+    error: Heap<Value>,
+    #[no_trace]
+    writable: bool,
+}
+
+#[core_runtime::jsmethods]
+impl DisposeState {}
 
 /// `Readable.prototype[Symbol.asyncDispose]()`, or the `Writable` one if the payload is `true`:
 /// destroy the stream with an `AbortError` unless it ended (or finished), and return a promise that
@@ -2642,7 +2785,10 @@ pub(crate) fn async_dispose(
     let writable = is_true(payload);
     let promise = match async_dispose_start(scope, &args, writable) {
         Ok(promise) => promise,
-        Err(_) => js::Promise::new_rejected_with_error(scope, take_exception(scope))?,
+        Err(_) => js::Promise::new_rejected_with_error(
+            scope,
+            js::exception::take_pending_or_undefined(scope),
+        )?,
     };
     promise.to_jsval_raw_throwing(scope)
 }
@@ -2655,63 +2801,67 @@ fn async_dispose_start<'s>(
 ) -> Result<js::Promise<'s>, ExnThrown> {
     let this = this_object(scope, args)?;
     let mut error = HandleValue::undefined();
-    if !truthy(scope, this.get_property(scope, c"destroyed")?) {
+    if !js::conversion::to_boolean(this.get_property(scope, c"destroyed")?) {
         let done = if writable {
             c"writableFinished"
         } else {
             c"readableEnded"
         };
-        error = if truthy(scope, this.get_property(scope, done)?) {
+        error = if js::conversion::to_boolean(this.get_property(scope, done)?) {
             HandleValue::null()
         } else {
             crate::errors::abort_error(scope, None)?
         };
-        call_method(scope, this, c"destroy", &[error])?;
+        Function::call_by_name(scope, this.handle(), c"destroy", &[error])?;
     }
     let closed = js::Promise::new_pending(scope)?;
-    let callback = closure(
+    let state = js::class::create_instance_with::<DisposeStateImpl>(scope, |_| DisposeStateImpl {
+        promise: Heap::from(closed),
+        error: Heap::from(error.get()),
+        writable,
+    })?;
+    let payload = state.to_jsval_throwing(scope)?;
+    super::eos::eos_native(
         scope,
-        1,
-        async_dispose_settle,
-        &[
-            closed.to_jsval_raw_throwing(scope)?,
-            error.get(),
-            js::value::from_bool(writable),
-        ],
-    )?;
-    super::eos::eos(
-        scope,
-        this.to_jsval_throwing(scope)?,
-        None,
-        callback.to_jsval_throwing(scope)?,
+        this,
+        EosOptions::default(),
+        EosCallback::Native(async_dispose_settle, payload),
     )
     .map_err(|error| error.throw(scope))?;
-    let fulfilled = Function::new_callback(scope, c"", 0, return_undefined, ())?;
+    let fulfilled = js::class::get_or_init_shared_function(
+        scope,
+        return_undefined as *const () as usize,
+        |scope| Function::new_callback(scope, c"", 0, return_undefined, ()),
+    )?;
     closed.then(scope, Some(*fulfilled), None)
 }
 
-/// The `finished` callback of [`async_dispose`], whose captures are `[promise, error, writable]`.
+/// The `finished` callback of [`async_dispose`], whose payload is a [`DisposeState`].
 fn async_dispose_settle(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let promise = captures
-        .obj(0)?
-        .cast::<js::Promise>()
-        .map_err(|_| type_error(scope, "not a promise"))?;
+    let state = cast_payload::<DisposeState>(scope, payload);
+    let (promise, expected_error, writable) = {
+        let data = state.data();
+        (
+            data.promise.get(scope),
+            data.error.get(scope),
+            data.writable,
+        )
+    };
     let error = args.get(0);
-    let expected = if captures.flag(2)? {
-        let name = match as_object(scope, error) {
+    let expected = if writable {
+        let name = match Object::from_value(scope, error).ok() {
             Some(error) => rust_string(scope, error.get_property(scope, c"name")?),
             None => None,
         };
         name.as_deref() == Some("AbortError")
     } else {
-        same(scope, error, captures.get(1)?)?
+        js::comparison::strictly_equal(scope, error, expected_error)?
     };
-    if truthy(scope, error) && !expected {
+    if js::conversion::to_boolean(error) && !expected {
         promise.reject(scope, error)?;
     } else {
         promise.resolve(scope, HandleValue::null())?;
@@ -2815,14 +2965,14 @@ fn setup_readable(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Res
         scope.root_id(key),
         (*iterator).to_jsval_throwing(scope)?,
     )?;
-    let capture = crate::symbol(scope, "nodejs.rejection", true)?;
+    let capture = crate::events::REJECTION.value(scope)?;
     define_symbol_method(scope, proto, capture, c"", capture_rejection)?;
     define_async_dispose(scope, proto, false)?;
     super::operators::define_operators(scope, proto)?;
     ctor.set_property(
         scope,
         c"ReadableState",
-        readable_state::class_constructor(scope)?,
+        super::state::ReadableState::class_constructor(scope)?,
     )?;
     Ok(())
 }

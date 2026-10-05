@@ -4,15 +4,53 @@
 
 use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
-use js::function::{CallbackArgs, EmptyArgs};
+use js::function::{cast_payload, CallbackArgs, EmptyArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
-use js::native::{HandleId, Value};
+use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
-use super::{ops, run_callback, Variant};
+use super::promises::{FileHandle, FileHandleImpl};
+use super::{ops, run_callback, Prepared, Variant};
 use crate::errors::{validate_integer, NodeError, Thrown};
-use crate::stream::{call_method, closure, is_function, string, truthy, Captures, Props};
+use crate::stream::state::{StreamState, StreamStateImpl};
+use crate::support::Props;
+
+/// The payload of the `open` and `write` callbacks and of the `close` listener on a stream's
+/// `FileHandle`: the stream, and the callback of its `_construct` or `_write`, or its `close`
+/// method.
+#[core_runtime::jsclass(hidden)]
+pub(super) struct StreamRequest {
+    stream: Heap<js::object::Object>,
+    callback: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl StreamRequest {}
+
+/// A new [`StreamRequest`] of `stream` with `callback`.
+fn stream_request<'s>(
+    scope: &'s Scope<'_>,
+    stream: Object<'_>,
+    callback: HandleValue<'_>,
+) -> Result<StreamRequest<'s>, ExnThrown> {
+    js::class::create_instance_with::<StreamRequestImpl>(scope, |_| StreamRequestImpl {
+        stream: Heap::from(stream),
+        callback: Heap::from(callback.get()),
+    })
+}
+
+/// The payload of the `close` callback: the callback of `_destroy`, and the error the stream was
+/// destroyed with.
+#[core_runtime::jsclass(hidden)]
+pub(super) struct CloseRequest {
+    callback: Heap<Value>,
+    error: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl CloseRequest {}
 
 /// A copy of the stream options `options`, which may be an encoding name, for the stream base
 /// class: with `highWaterMark` defaulting to `high_water_mark`, and `autoDestroy` following
@@ -40,20 +78,47 @@ fn base_options<'s>(
     copy.set_property(
         scope,
         c"autoDestroy",
-        auto_close.is_undefined() || truthy(scope, auto_close),
+        auto_close.is_undefined() || js::conversion::to_boolean(auto_close),
     )?;
     Ok(copy)
 }
 
-/// The key of the `FileHandle` a stream reads or writes, which the stream closes.
-fn handle_key<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
-    let symbol = crate::symbol(scope, "nodejs.fs.stream.handle", true)?;
-    Ok(scope.root_id(js::id::value_to_id(scope, symbol)?))
+/// The state of an `fs.ReadStream` or an `fs.WriteStream`: the state of the stream, the
+/// `FileHandle` it reads or writes, which the stream closes, and whether a read or write is in
+/// progress.
+#[core_runtime::jsclass(hidden, extends = StreamState)]
+pub(crate) struct FileStreamState {
+    parent: StreamStateImpl,
+    handle: Option<Heap<FileHandleImpl>>,
+    #[no_trace]
+    performing_io: bool,
+    /// The `_destroy` that waits for the read or write in progress to finish.
+    pending_close: Option<Heap<CloseRequestImpl>>,
+}
+
+#[core_runtime::jsmethods]
+impl FileStreamState {}
+
+/// The `close` listener on a stream's `FileHandle`, whose payload is a [`StreamRequest`]: call the
+/// stream's `close` method.
+fn handle_closed(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let request = cast_payload::<StreamRequest>(scope, payload);
+    let (stream, close) = {
+        let data = request.data();
+        (data.stream.get(scope), data.callback.get(scope))
+    };
+    Function::call(scope, stream, close, EmptyArgs)?;
+    Ok(js::value::undefined())
 }
 
 /// Set the fields both stream classes share on `stream` from `path` and the `options` copy:
-/// `fd`, `path`, `flags`, `mode`, `start` and `pos`. A `FileHandle` as `options.fd` is kept
-/// under [`handle_key`].
+/// `fd`, `path`, `flags`, `mode`, `start` and `pos`. A `FileHandle` as `options.fd` is kept in
+/// the stream's [`FileStreamState`], and as in Node.js's `importFd`, the stream references the
+/// handle's descriptor and is closed when the handle emits `close`.
 fn init_fields(
     scope: &Scope<'_>,
     stream: Object<'_>,
@@ -69,7 +134,24 @@ fn init_fields(
     } else {
         let fd = match super::promises::file_handle_fd(scope, fd)? {
             Some(handle_fd) => {
-                stream.set_property_by_id(scope, handle_key(scope)?, fd)?;
+                let handle = Object::from_value(scope, *fd)
+                    .map_err(|e| e.throw(scope))?
+                    .cast::<FileHandle>()
+                    .map_err(|e| js::error::TypeError(e.to_string()).throw(scope))?;
+                read_stream_class::state_of(scope, stream)?
+                    .data_mut()
+                    .handle = Some(Heap::from(handle));
+                handle.retain();
+                let close = stream.get_property(scope, c"close")?;
+                let request = stream_request(scope, stream, close)?;
+                let listener = Function::new_callback(scope, c"", 0, handle_closed, request)?;
+                let close = js::class::get_or_init_atom(scope, c"close")?;
+                Function::call_by_name(
+                    scope,
+                    handle.handle(),
+                    c"on",
+                    &[close, (*listener).to_jsval_throwing(scope)?],
+                )?;
                 handle_fd
             }
             None => super::fd_arg(scope, fd)?,
@@ -91,23 +173,23 @@ fn init_fields(
     }
     let start = options.val(scope, c"start")?;
     if !start.is_undefined() {
-        validate_integer(scope, start, "start", 0.0, 9007199254740991.0)?;
+        validate_integer(scope, start, "start", 0.0, crate::errors::MAX_SAFE_INTEGER)?;
     }
     stream.set_property(scope, c"start", start)?;
     stream.set_property(scope, c"pos", start)?;
     Ok(())
 }
 
-/// The `open` callback of `_construct`, whose captures are `[stream, callback]`: record the
+/// The `open` callback of `_construct`, whose payload is a [`StreamRequest`]: record the
 /// descriptor, call the callback, and emit `open` and `ready`, or pass the error on.
 fn opened(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let stream = captures.obj(0)?;
-    let callback = captures.get(1)?;
+    let request = cast_payload::<StreamRequest>(scope, payload);
+    let stream = request.data().stream.get(scope);
+    let callback = request.data().callback.get(scope);
     let error = args.get(0);
     if !error.is_null() && !error.is_undefined() {
         Function::call(scope, HandleValue::undefined(), callback, &[error])?;
@@ -116,8 +198,8 @@ fn opened(
     let fd = args.get(1);
     stream.set_property(scope, c"fd", fd)?;
     Function::call(scope, HandleValue::undefined(), callback, EmptyArgs)?;
-    call_method(scope, stream, c"emit", &[string(scope, "open")?, fd])?;
-    call_method(scope, stream, c"emit", &[string(scope, "ready")?])?;
+    crate::events::emit(scope, stream, c"open", &[fd])?;
+    crate::events::emit(scope, stream, c"ready", &[])?;
     Ok(js::value::undefined())
 }
 
@@ -133,11 +215,12 @@ fn construct(scope: &Scope<'_>, this: Object<'_>, callback: HandleValue<'_>) -> 
         this.val(scope, c"mode")?,
     ];
     let prepared = (ops::OPS[ops::index_of("open")].parse)(scope, &args, Variant::Callback)?;
-    let done = closure(
+    let done = Function::new_callback(
         scope,
+        c"",
         2,
         opened,
-        &[this.to_jsval_raw_throwing(scope)?, callback.get()],
+        stream_request(scope, this, callback)?,
     )?;
     run_callback(
         scope,
@@ -148,27 +231,106 @@ fn construct(scope: &Scope<'_>, this: Object<'_>, callback: HandleValue<'_>) -> 
     )
 }
 
-/// The `close` callback of `_destroy`, whose captures are `[callback, error]`: call the callback
+/// The `close` callback of `_destroy`, whose payload is a [`CloseRequest`]: call the callback
 /// with the close error, or else the destroy error.
 fn closed(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
+    let request = cast_payload::<CloseRequest>(scope, payload);
     let close_error = args.get(0);
-    let error = if close_error.is_null() || close_error.is_undefined() {
-        captures.get(1)?
+    let error = if close_error.is_null_or_undefined() {
+        request.data().error.get(scope)
     } else {
         close_error
     };
-    Function::call(scope, HandleValue::undefined(), captures.get(0)?, &[error])?;
+    let callback = request.data().callback.get(scope);
+    Function::call(scope, HandleValue::undefined(), callback, &[error])?;
     Ok(js::value::undefined())
 }
 
-/// The `_destroy` of both stream classes: close the `FileHandle` or descriptor, if there is one,
-/// and call `callback` with the first error.
+/// The `_destroy` of both stream classes: once the read or write in progress, if there is one,
+/// finished, close the `FileHandle` or descriptor, if there is one, and call `callback` with the
+/// first error.
 fn destroy(
+    scope: &Scope<'_>,
+    this: Object<'_>,
+    error: HandleValue<'_>,
+    callback: HandleValue<'_>,
+) -> Result<(), Thrown> {
+    let state = read_stream_class::try_state_of(scope, this)?;
+    if let Some(state) = state.filter(|state| state.data().performing_io) {
+        let request =
+            js::class::create_instance_with::<CloseRequestImpl>(scope, |_| CloseRequestImpl {
+                callback: Heap::from(callback.get()),
+                error: Heap::from(error.get()),
+            })?;
+        state.data_mut().pending_close = Some(Heap::from(request));
+        return Ok(());
+    }
+    close(scope, this, error, callback)
+}
+
+/// Run the read or write `prepared` as `function` with the callback `done`, and record it as in
+/// progress on `stream` until `done` runs. One that fails to start isn't recorded.
+fn start_io(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    function: &str,
+    prepared: Prepared,
+    done: Function<'_>,
+) -> Result<(), Thrown> {
+    let state = read_stream_class::state_of(scope, stream)?;
+    state.data_mut().performing_io = true;
+    let started = run_callback(
+        scope,
+        function,
+        prepared,
+        done.to_jsval_throwing(scope)?,
+        true,
+    );
+    if started.is_err() {
+        state.data_mut().performing_io = false;
+    }
+    started
+}
+
+/// Record that the read or write in progress on `stream` finished. If the stream was destroyed,
+/// run the `_destroy` that waited for it, with its error, or else `io_error`, and return `true`.
+fn io_done(
+    scope: &Scope<'_>,
+    stream: Object<'_>,
+    io_error: HandleValue<'_>,
+) -> Result<bool, Thrown> {
+    let state = read_stream_class::state_of(scope, stream)?;
+    state.data_mut().performing_io = false;
+    if !stream.flag(scope, c"destroyed")? {
+        return Ok(false);
+    }
+    let pending = state
+        .data_mut()
+        .pending_close
+        .take()
+        .map(|request| request.take(scope));
+    if let Some(request) = pending {
+        let (error, callback) = {
+            let data = request.data();
+            (data.error.get(scope), data.callback.get(scope))
+        };
+        let error = if js::conversion::to_boolean(error) {
+            error
+        } else {
+            io_error
+        };
+        close(scope, stream, error, callback)?;
+    }
+    Ok(true)
+}
+
+/// Close the `FileHandle` or descriptor of `this`, if there is one, and call `callback` with the
+/// close error, or else `error`.
+fn close(
     scope: &Scope<'_>,
     this: Object<'_>,
     error: HandleValue<'_>,
@@ -179,14 +341,21 @@ fn destroy(
         Function::call(scope, js::value::undefined(), callback, &[error])?;
         return Ok(());
     }
-    let done = closure(scope, 1, closed, &[callback.get(), error.get()])?;
-    let handle = this.get_property_by_id(scope, handle_key(scope)?)?;
-    if let Ok(handle) = Object::from_value(scope, *handle) {
+    let request =
+        js::class::create_instance_with::<CloseRequestImpl>(scope, |_| CloseRequestImpl {
+            callback: Heap::from(callback.get()),
+            error: Heap::from(error.get()),
+        })?;
+    let done = Function::new_callback(scope, c"", 1, closed, request)?;
+    let handle = read_stream_class::try_state_of(scope, this)?
+        .and_then(|state| state.data().handle.get(scope));
+    if let Some(handle) = handle {
+        // As Node.js's `FileHandleOperations.close`: release the stream's reference, then close
+        // the handle.
         this.set_property(scope, c"fd", js::value::null())?;
-        let closing = call_method(scope, handle, c"close", &[])?;
-        let closing = Object::from_value(scope, *closing).map_err(|e| e.throw(scope))?;
-        let done = done.to_jsval_throwing(scope)?;
-        call_method(scope, closing, c"then", &[done, done])?;
+        handle.release(scope)?;
+        let closing = handle.close(scope)?;
+        closing.add_reactions(scope, Some(*done), Some(*done))?;
         return Ok(());
     }
     let prepared = (ops::OPS[ops::index_of("close")].parse)(scope, &[fd], Variant::Callback)?;
@@ -217,22 +386,26 @@ fn define_pending(scope: &Scope<'_>, prototype: Object<'_>) -> Result<(), ExnThr
     prototype.define_accessor(scope, c"pending", Some(*getter), None, 0)
 }
 
-/// The `read` callback of `_read`, whose captures are `[stream]`: push the bytes read, or `null`
-/// at the end of the file, or destroy the stream with the error.
+/// The `read` callback of `_read`, whose payload is the stream: push the bytes read, or `null` at
+/// the end of the file, or destroy the stream with the error. On a destroyed stream, run the
+/// `_destroy` that waited for the read instead.
 fn was_read(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = Captures::of(scope, payload)?.obj(0)?;
+    let stream = cast_payload::<Object>(scope, payload);
     let error = args.get(0);
+    if io_done(scope, stream, error).map_err(|thrown| thrown.throw(scope))? {
+        return Ok(js::value::undefined());
+    }
     if !error.is_null() && !error.is_undefined() {
-        call_method(scope, stream, c"destroy", &[error])?;
+        Function::call_by_name(scope, stream.handle(), c"destroy", &[error])?;
         return Ok(js::value::undefined());
     }
     let count = args.get(1).to_number();
     if count <= 0.0 {
-        call_method(scope, stream, c"push", &[HandleValue::null()])?;
+        Function::call_by_name(scope, stream.handle(), c"push", &[HandleValue::null()])?;
         return Ok(js::value::undefined());
     }
     let total = stream.num(scope, c"bytesRead")?;
@@ -240,14 +413,15 @@ fn was_read(
     let buffer = Object::from_value(scope, args.get(2)).map_err(|e| e.throw(scope))?;
     let zero = scope.root_value(js::value::from_f64(0.0));
     let end = scope.root_value(js::value::from_f64(count));
-    let chunk = call_method(scope, buffer, c"subarray", &[zero, end])?;
-    call_method(scope, stream, c"push", &[chunk])?;
+    let chunk = Function::call_by_name(scope, buffer.handle(), c"subarray", &[zero, end])?;
+    Function::call_by_name(scope, stream.handle(), c"push", &[chunk])?;
     Ok(js::value::undefined())
 }
 
 #[core_runtime::jsfunction_class(
     name = "ReadStream",
     extends = "crate::stream::readable_class",
+    state = "FileStreamState",
     self_construct
 )]
 pub mod read_stream_class {
@@ -303,7 +477,7 @@ pub mod read_stream_class {
             size.min(end - position.to_number() + 1.0)
         };
         if size <= 0.0 {
-            call_method(scope, this, c"push", &[HandleValue::null()])?;
+            Function::call_by_name(scope, this.handle(), c"push", &[HandleValue::null()])?;
             return Ok(());
         }
         let buffer =
@@ -323,14 +497,8 @@ pub mod read_stream_class {
         if position.is_number() {
             this.set_property(scope, c"pos", position.to_number() + size)?;
         }
-        let done = closure(scope, 3, was_read, &[this.to_jsval_raw_throwing(scope)?])?;
-        run_callback(
-            scope,
-            "read",
-            prepared,
-            done.to_jsval_throwing(scope)?,
-            true,
-        )
+        let done = Function::new_callback(scope, c"", 3, was_read, this)?;
+        super::start_io(scope, this, "read", prepared, done)
     }
 
     #[method(name = "_destroy")]
@@ -349,11 +517,11 @@ pub mod read_stream_class {
         this: Object<'_>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), ExnThrown> {
-        if let Some(callback) = callback.filter(|callback| is_function(scope, *callback)) {
+        if let Some(callback) = callback.filter(|callback| js::function::is_callable(*callback)) {
             crate::stream::end_of_stream(scope, this.to_jsval_throwing(scope)?, None, callback)
                 .map_err(|thrown| thrown.throw(scope))?;
         }
-        call_method(scope, this, c"destroy", &[])?;
+        Function::call_by_name(scope, this.handle(), c"destroy", js::function::EmptyArgs)?;
         Ok(())
     }
 
@@ -363,17 +531,31 @@ pub mod read_stream_class {
     }
 }
 
-/// The `write` callback of `_write`, whose captures are `[stream, callback]`: count the bytes
-/// written and call the callback, or call it with the error.
+/// The `write` callback of `_write`, whose payload is a [`StreamRequest`]: count the bytes
+/// written and call the callback, or call it with the error. On a destroyed stream, call the
+/// callback with the error or else `ERR_STREAM_DESTROYED`, and run the `_destroy` that waited for
+/// the write.
 fn written(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let stream = captures.obj(0)?;
-    let callback = captures.get(1)?;
-    let error = args.get(0);
+    let request = cast_payload::<StreamRequest>(scope, payload);
+    let stream = request.data().stream.get(scope);
+    let callback = request.data().callback.get(scope);
+    let mut error = args.get(0);
+    if stream.flag(scope, c"destroyed")? {
+        if error.is_null_or_undefined() {
+            error = crate::stream::stream_destroyed("write").to_value(scope)?;
+        }
+        Function::call(scope, HandleValue::undefined(), callback, &[error])?;
+        io_done(scope, stream, error).map_err(|thrown| thrown.throw(scope))?;
+        return Ok(js::value::undefined());
+    }
+    read_stream_class::state_of(scope, stream)
+        .map_err(|thrown| thrown.throw(scope))?
+        .data_mut()
+        .performing_io = false;
     if !error.is_null() && !error.is_undefined() {
         Function::call(scope, HandleValue::undefined(), callback, &[error])?;
         return Ok(js::value::undefined());
@@ -387,6 +569,7 @@ fn written(
 #[core_runtime::jsfunction_class(
     name = "WriteStream",
     extends = "crate::stream::writable_class",
+    state = "FileStreamState",
     self_construct
 )]
 pub mod write_stream_class {
@@ -445,19 +628,9 @@ pub mod write_stream_class {
                 .map_or(0, |view| view.byte_length());
             this.set_property(scope, c"pos", position.to_number() + length as f64)?;
         }
-        let done = closure(
-            scope,
-            2,
-            written,
-            &[this.to_jsval_raw_throwing(scope)?, callback.get()],
-        )?;
-        run_callback(
-            scope,
-            "write",
-            prepared,
-            done.to_jsval_throwing(scope)?,
-            true,
-        )
+        let request = stream_request(scope, this, callback)?;
+        let done = Function::new_callback(scope, c"", 2, written, request)?;
+        super::start_io(scope, this, "write", prepared, done)
     }
 
     #[method(name = "_destroy")]
@@ -477,29 +650,35 @@ pub mod write_stream_class {
         this: Object<'_>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), ExnThrown> {
-        if let Some(callback) = callback.filter(|callback| is_function(scope, *callback)) {
+        if let Some(callback) = callback.filter(|callback| js::function::is_callable(*callback)) {
             if this.flag(scope, c"closed")? {
-                crate::stream::next_tick_call(scope, callback, &[])?;
+                crate::support::next_tick_call(scope, callback, &[])?;
                 return Ok(());
             }
-            call_method(scope, this, c"on", &[string(scope, "close")?, callback])?;
+            Function::call_by_name(
+                scope,
+                this.handle(),
+                c"on",
+                &[js::class::get_or_init_atom(scope, c"close")?, callback],
+            )?;
         }
-        let state = this.obj(scope, c"_writableState")?;
-        let auto_close = match state {
-            Some(state) => state.flag(scope, c"autoDestroy")?,
-            None => true,
-        };
+        let auto_close = crate::stream::writable_auto_destroy(scope, this)?.unwrap_or(true);
         if !auto_close {
             let destroy = this.val(scope, c"destroy")?;
-            call_method(scope, this, c"on", &[string(scope, "finish")?, destroy])?;
+            Function::call_by_name(
+                scope,
+                this.handle(),
+                c"on",
+                &[js::class::get_or_init_atom(scope, c"finish")?, destroy],
+            )?;
         }
-        call_method(scope, this, c"end", &[])?;
+        Function::call_by_name(scope, this.handle(), c"end", js::function::EmptyArgs)?;
         Ok(())
     }
 
     /// <https://nodejs.org/api/fs.html#writestreamdestroysoon>
     pub fn destroy_soon(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        call_method(scope, this, c"end", &[])?;
+        Function::call_by_name(scope, this.handle(), c"end", js::function::EmptyArgs)?;
         Ok(())
     }
 

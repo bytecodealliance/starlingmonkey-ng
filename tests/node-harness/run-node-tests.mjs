@@ -17,12 +17,13 @@
 //   --target=TARGET         Execution target: native, wasm, or deno or bun for comparison runs
 //                           (default: native)
 //   --runtime=PATH          The starlingmonkey binary, starling.wasm for --target=wasm, or the
-//                           deno or bun binary (default: target/debug/starlingmonkey,
-//                           target/wasm32-wasip3/release/starling.wasm, deps/deno-bin/deno or
-//                           deps/bun-bin/bun)
+//                           deno or bun binary (default: debug/starlingmonkey or
+//                           wasm32-wasip3/release/starling.wasm in CARGO_TARGET_DIR or target/,
+//                           deps/deno-bin/deno or deps/bun-bin/bun)
 //   --timeout=MS            Per-test timeout (default: 30000)
 //   -j N                    Tests run at once (default: the number of CPUs)
 //   --update-expectations   Record the current results as the expectations
+//   --mark-flaky            Record the selected tests as FLAKY on the target, without running them
 //   --json=FILE             Write each test's status, skip reason, failure signature and output
 //                           excerpt to FILE, for tests/node-harness/report.mjs
 //   -v                      Print the output of failing tests
@@ -40,16 +41,22 @@
 //
 // expectations.json maps each test to `{ "status": "PASS" | "FAIL" | "SKIP" | "FLAKY" }`, with
 // `wasm_status` where the wasm target's result differs. `FLAKY` marks a test whose result varies
-// between runs: its result is neither compared nor recorded. The run exits with status 1 if a
-// test expected to pass fails or skips, and with status 2 if no test was selected.
+// between runs: its result is neither compared nor recorded. A native update keeps a test's previous
+// status as its `wasm_status` when the status changes, so the wasm expectation changes only with a
+// wasm update. The run exits with status 1 if a test's status changes to anything but `PASS`, and
+// with status 2 if no test was selected.
 
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { cpus } from "node:os";
 import path from "node:path";
 
 const HARNESS_DIR = path.dirname(new URL(import.meta.url).pathname);
 const REPO_ROOT = path.resolve(HARNESS_DIR, "../..");
+// The directory Cargo builds into: `CARGO_TARGET_DIR`, or the repository's `target`.
+const TARGET_DIR = process.env.CARGO_TARGET_DIR
+  ? path.resolve(process.env.CARGO_TARGET_DIR)
+  : path.join(REPO_ROOT, "target");
 const TESTS_FILE = path.join(HARNESS_DIR, "tests.txt");
 const EXPECTATIONS_FILE = path.join(HARNESS_DIR, "expectations.json");
 // The directory for each test's temporary directory. The wasm target preopens it under the same
@@ -125,6 +132,7 @@ function parseArgs(argv) {
     timeout: 30000,
     jobs: cpus().length,
     update: false,
+    markFlaky: false,
     json: null,
     verbose: false,
     patterns: [],
@@ -138,6 +146,7 @@ function parseArgs(argv) {
     else if (arg.startsWith("--timeout=")) config.timeout = Number(value("--timeout"));
     else if (arg === "-j") config.jobs = Number(argv[++index]);
     else if (arg === "--update-expectations") config.update = true;
+    else if (arg === "--mark-flaky") config.markFlaky = true;
     else if (arg.startsWith("--json=")) config.json = path.resolve(value("--json"));
     else if (arg === "-v") config.verbose = true;
     else if (arg === "--help") {
@@ -146,13 +155,15 @@ function parseArgs(argv) {
       process.exit(0);
     } else config.patterns.push(arg);
   }
-  config.runtime ??= path.join(
-    REPO_ROOT,
-    OTHER_RUNTIMES[config.target]?.runtime ??
-      (config.target === "wasm" ? "target/wasm32-wasip3/release/starling.wasm" : "target/debug/starlingmonkey"),
-  );
-  if (config.update && OTHER_RUNTIMES[config.target]) {
-    console.error(`--update-expectations can't be used with --target=${config.target}`);
+  config.runtime ??= OTHER_RUNTIMES[config.target]
+    ? path.join(REPO_ROOT, OTHER_RUNTIMES[config.target].runtime)
+    : path.join(TARGET_DIR, config.target === "wasm" ? "wasm32-wasip3/release/starling.wasm" : "debug/starlingmonkey");
+  if ((config.update || config.markFlaky) && OTHER_RUNTIMES[config.target]) {
+    console.error(`--update-expectations and --mark-flaky can't be used with --target=${config.target}`);
+    process.exit(2);
+  }
+  if (config.markFlaky && (config.update || config.patterns.length === 0)) {
+    console.error("--mark-flaky needs test patterns and can't be combined with --update-expectations");
     process.exit(2);
   }
   return config;
@@ -211,13 +222,19 @@ function command(config, file, env) {
     };
   }
   // wasmtime maps the repository to the guest's root and the temporary directory to itself, so
-  // guest paths are the repository-relative ones.
-  const guest = (host) => "/" + path.relative(REPO_ROOT, host);
+  // guest paths are the repository-relative ones. The Node.js clone is mapped to its guest path
+  // too, since WASI doesn't follow a symbolic link out of a preopened directory, and a clone
+  // outside the repository isn't under the root.
+  const guestNodeRoot = config.nodeRoot.startsWith(REPO_ROOT + path.sep)
+    ? "/" + path.relative(REPO_ROOT, config.nodeRoot)
+    : "/node";
+  const guest = (host) => path.posix.join(guestNodeRoot, path.relative(config.nodeRoot, host));
   return {
     command: "wasmtime",
     args: [
       "run",
       `--dir=${REPO_ROOT}::/`,
+      `--dir=${realpathSync(config.nodeRoot)}::${guestNodeRoot}`,
       `--dir=${TEMP_ROOT}`,
       "-Sinherit-network=y,tcp=y,udp=y,http=y,p3=y",
       "-Wcomponent-model-async=y",
@@ -250,8 +267,9 @@ function runTest(config, file) {
       child.kill("SIGKILL");
       output += `\n[timed out after ${config.timeout} ms]`;
     }, config.timeout);
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
+      if (signal && !output.includes("[timed out after")) output += `\n[killed by ${signal}]`;
       rmSync(testDir, { recursive: true, force: true });
       // A test that skips exits with status 0 after printing the skip line.
       const skipped = code === 0 && /^1\.\.0 # Skipped:/m.test(output);
@@ -271,7 +289,7 @@ function failureSignature(output) {
   const unimplemented = /The (\S+) method is not implemented/.exec(output);
   if (unimplemented) return `unimplemented:${unimplemented[1]}`;
   if (output.includes("ERR_SERVE_MODE_REQUIRED")) return "http-command-mode";
-  if (/panicked at|Segmentation fault|SIGSEGV|SIGABRT|Assertion failure:/.test(output)) return "crash";
+  if (/panicked at|Segmentation fault|SIGSEGV|SIGABRT|Assertion failure:|\[killed by SIG/.test(output)) return "crash";
   const notFunction = /(\S+) is not a function/.exec(output);
   if (notFunction) return `not-a-function:${notFunction[1]}`;
   if (/AssertionError|ERR_ASSERTION|Expected values to be|Mismatched .* function calls/.test(output)) return "assertion";
@@ -284,6 +302,27 @@ function failureSignature(output) {
 /** The skip message `common.skip()` printed in `output`, if any. */
 function skipMessage(output) {
   return /^1\.\.0 # Skipped: (.*)$/m.exec(output)?.[1];
+}
+
+/** Warn if `runtime` is older than the repository's last commit, for a binary built before it. */
+function warnIfStale(runtime) {
+  if (!existsSync(runtime) || !runtime.startsWith(REPO_ROOT)) return;
+  let committed;
+  try {
+    committed = Number(execFileSync("git", ["-C", REPO_ROOT, "log", "-1", "--format=%ct"], { encoding: "utf8" }));
+  } catch {
+    return;
+  }
+  if (statSync(runtime).mtimeMs / 1000 < committed) {
+    console.warn(`Warning: ${path.relative(REPO_ROOT, runtime)} is older than the last commit.`);
+  }
+}
+
+/** Write `expectations` to expectations.json, sorted by test name. */
+function writeExpectations(expectations) {
+  const sorted = Object.fromEntries(Object.entries(expectations).sort(([a], [b]) => a.localeCompare(b, 'en')));
+  writeFileSync(EXPECTATIONS_FILE, JSON.stringify(sorted, null, 2) + "\n");
+  console.log(`Updated ${EXPECTATIONS_FILE}`);
 }
 
 /** The expected status of `file` on the configured target, or `undefined` without one. */
@@ -300,9 +339,34 @@ async function main() {
     process.exit(2);
   }
   if (config.target === "wasm") execFileSync("wasmtime", ["--version"]);
+  warnIfStale(config.runtime);
   const compared = !OTHER_RUNTIMES[config.target];
   const expectations = compared && existsSync(EXPECTATIONS_FILE) ? JSON.parse(readFileSync(EXPECTATIONS_FILE, "utf8")) : {};
   const tests = selectTests(config);
+  if (config.markFlaky) {
+    if (tests.length === 0) {
+      console.error("No tests selected.");
+      process.exit(2);
+    }
+    for (const file of tests) {
+      const entry = { ...(expectations[file] ?? {}) };
+      if (config.target === "wasm") {
+        // The native status stays as it is. A test without one gets the wasm status as both.
+        entry.status ??= "FLAKY";
+        if (entry.status === "FLAKY") delete entry.wasm_status;
+        else entry.wasm_status = "FLAKY";
+      } else {
+        // The previous status stays the wasm expectation.
+        if (entry.status && entry.status !== "FLAKY" && !entry.wasm_status) entry.wasm_status = entry.status;
+        entry.status = "FLAKY";
+        if (entry.wasm_status === "FLAKY") delete entry.wasm_status;
+      }
+      expectations[file] = entry;
+      console.log(`FLAKY ${file}`);
+    }
+    writeExpectations(expectations);
+    return;
+  }
   const results = new Map();
   const queue = [...tests];
   const started = Date.now();
@@ -346,8 +410,8 @@ async function main() {
     const expected = expectedStatus(config, expectations, file);
     if (expected === "FLAKY") continue;
     if (expected === undefined) unexpected.push(`${file} (${status}, no expectation)`);
-    else if (expected === "PASS" && status !== "PASS") regressions.push(`${file} (${status})`);
     else if (expected !== "PASS" && status === "PASS") improvements.push(file);
+    else if (expected !== status) regressions.push(`${file} (${status}, expected ${expected})`);
   }
 
   if (config.update) {
@@ -361,15 +425,16 @@ async function main() {
         if (status === entry.status) delete entry.wasm_status;
         else entry.wasm_status = status;
       } else {
+        // The previous status stays the wasm expectation until a wasm update records it.
+        if (entry.status && entry.status !== status && !entry.wasm_status) entry.wasm_status = entry.status;
         entry.status = status;
+        if (entry.wasm_status === status) delete entry.wasm_status;
       }
       if (reason) entry.reason = reason;
       else delete entry.reason;
       expectations[file] = entry;
     }
-    const sorted = Object.fromEntries(Object.entries(expectations).sort(([a], [b]) => a.localeCompare(b)));
-    writeFileSync(EXPECTATIONS_FILE, JSON.stringify(sorted, null, 2) + "\n");
-    console.log(`Updated ${EXPECTATIONS_FILE}`);
+    writeExpectations(expectations);
   }
 
   if (config.json) {

@@ -63,14 +63,7 @@ fn string_units(
     if !value.is_string() {
         return Err(js::error::TypeError(format!("input.{method} is not a function")).throw(scope));
     }
-    let string = js::JSString::from_value(scope, value)?;
-    // SAFETY: the closure makes no call into SpiderMonkey.
-    unsafe {
-        string.with_chars(scope, |chars| match chars {
-            js::string::StrChars::Latin1(bytes) => bytes.iter().map(|b| u16::from(*b)).collect(),
-            js::string::StrChars::TwoByte(units) => units.to_vec(),
-        })
-    }
+    js::JSString::from_value(scope, value)?.to_utf16_vec(scope)
 }
 
 /// Punycode.js's `ucs2decode` of `units`: the code points, with each surrogate pair combined.

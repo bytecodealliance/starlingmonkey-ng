@@ -1,160 +1,66 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! `Readable.toWeb`, `Readable.fromWeb`, `Writable.toWeb`, `Writable.fromWeb`, `Duplex.toWeb` and
-//! `Duplex.fromWeb`: Node's `lib/internal/webstreams/adapters.js`. The web streams are the
-//! runtime's `ReadableStream` and `WritableStream` globals, used through their JS API.
+//! `Duplex.fromWeb`: Node's `lib/internal/webstreams/adapters.js`, on the runtime's
+//! `ReadableStream` and `WritableStream`.
 
 use std::ffi::CStr;
 
-use js::conversion::ToJSVal;
-use js::error::ExnThrown;
-use js::function::{Callback, CallbackArgs};
+use js::conversion::{FromJSVal, ToJSVal};
+use js::error::{ExnThrown, ThrowException};
+use js::function::{cast_payload, Callback, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
-
-use super::readable::{buffer_from, is_buffer, is_encoding};
-use super::util::{
-    as_object, call, call_method, closure, error_value, has_method, is_destroyed, is_readable,
-    is_writable, is_writable_ended, listen, next_tick, rust_string, take_exception, truthy,
-    type_error, Captures, Props,
+use web_streams::queuing::QueuingStrategy;
+use web_streams::readable::byte_stream_controller::ReadableByteStreamControllerImpl;
+use web_streams::readable::default_controller::ReadableStreamDefaultControllerImpl;
+use web_streams::readable::default_reader::DefaultReaderImpl;
+use web_streams::readable::{
+    DefaultReader, ReadableByteStreamController, ReadableStream, ReadableStreamDefaultController,
 };
-use crate::errors::{validate_object, NodeError, Thrown};
+use web_streams::writable::default_controller::WritableStreamDefaultControllerImpl;
+use web_streams::writable::default_writer::WritableStreamDefaultWriterImpl;
+use web_streams::writable::{
+    WritableStream, WritableStreamDefaultController, WritableStreamDefaultWriter,
+};
 
-/// The global constructor `name`.
-fn web_class<'s>(scope: &'s Scope<'_>, name: &'static CStr) -> Result<Object<'s>, ExnThrown> {
-    scope.global().obj(scope, name)?.ok_or_else(|| {
-        let name = name.to_str().unwrap_or_default();
-        type_error(scope, &format!("{name} is not defined"))
-    })
-}
-
-/// `new globalThis[name](...args)`.
-fn construct<'s>(
-    scope: &'s Scope<'_>,
-    name: &'static CStr,
-    args: &[HandleValue<'_>],
-) -> Result<Object<'s>, ExnThrown> {
-    let args: Vec<HandleValue<'s>> = args.iter().map(|arg| scope.root_value(arg.get())).collect();
-    Function::construct(scope, web_class(scope, name)?, &args)
-}
+use super::eos::{EosCallback, EosOptions, EosStateImpl};
+use super::readable::{buffer_from, is_buffer, is_encoding};
+use super::util::{is_destroyed, is_readable, is_writable, is_writable_ended, sides};
+use crate::errors::{validate_plain_object, NodeError, Thrown};
+use crate::support::{class_object, is_str, noop_function, rust_string};
 
 /// Whether `value` is a `ReadableStream`, by its brand.
 pub(crate) fn is_readable_stream(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-    as_object(scope, value).is_some_and(|object| {
-        object
-            .cast::<web_streams::readable::readable_stream::ReadableStream>()
-            .is_ok()
-    })
+    Object::from_value(scope, value).is_ok_and(|object| object.cast::<ReadableStream>().is_ok())
 }
 
 /// Whether `value` is a `WritableStream`, by its brand.
 pub(crate) fn is_writable_stream(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-    as_object(scope, value).is_some_and(|object| {
-        object
-            .cast::<web_streams::writable::writable_stream::WritableStream>()
-            .is_ok()
-    })
+    Object::from_value(scope, value).is_ok_and(|object| object.cast::<WritableStream>().is_ok())
 }
 
-/// Whether `value` is `null` or `undefined`.
-fn is_nullish(value: HandleValue<'_>) -> bool {
-    value.is_null() || value.is_undefined()
-}
-
-/// A plain object without a prototype, as Node's `{ __proto__: null }`.
-fn null_prototype_object<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let object = Object::new_plain(scope)?;
-    object.set_prototype(scope, js::prelude::HandleObject::null())?;
-    Ok(object)
-}
-
-/// A function that does nothing, shared by all callers in a global.
-fn noop_function<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let function =
-        js::class::get_or_init_shared_function(scope, noop as *const () as usize, |scope| {
-            Function::new_callback(scope, c"", 0, noop, ())
-        })?;
-    Ok(*function)
-}
-
-fn noop(
-    _scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    Ok(js::value::undefined())
-}
-
-/// A new state array of `count` `undefined` values, the captures of the functions an adapter
-/// creates.
-fn new_state<'s>(scope: &'s Scope<'_>, count: usize) -> Result<Captures<'s>, ExnThrown> {
-    let array = js::Array::new(scope, count)?;
-    for index in 0..count as u32 {
-        array.set_element(scope, index, HandleValue::undefined())?;
-    }
-    Captures::of(scope, (*array).to_jsval_throwing(scope)?)
-}
-
-/// The state of a function whose captures are `[state, ...]`.
-fn state_of<'s>(scope: &'s Scope<'_>, payload: HandleValue<'_>) -> Result<Captures<'s>, ExnThrown> {
-    Captures::of(scope, Captures::of(scope, payload)?.get(0)?)
-}
-
-/// A function running `body` with the captures `[state]`.
-fn method<'s>(
+/// `new Uint8Array(source)`: a copy of a `Buffer`, or a view of an `ArrayBuffer`.
+fn new_uint8_array<'s>(
     scope: &'s Scope<'_>,
-    state: &Captures<'_>,
-    name: &CStr,
-    nargs: u32,
-    body: Callback,
-) -> Result<Object<'s>, ExnThrown> {
-    Ok(*Function::new_callback(
-        scope,
-        name,
-        nargs,
-        body,
-        *js::Array::with_contents(scope, &[state.array_value()?])?,
-    )?)
+    source: HandleValue<'s>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let class = class_object(scope, js::class_spec::JSProtoKey::JSProto_Uint8Array)?;
+    Function::construct(scope, class, &[source])?.to_jsval_throwing(scope)
 }
 
-/// The promise at `index` of `state`, if it holds one.
-fn promise_at<'s>(
+/// `promise`, or a promise rejected with the pending exception if creating it threw.
+fn or_rejected<'s>(
     scope: &'s Scope<'_>,
-    state: &Captures<'s>,
-    index: u32,
-) -> Result<Option<js::Promise<'s>>, ExnThrown> {
-    Ok(as_object(scope, state.get(index)?).and_then(|object| object.cast::<js::Promise>().ok()))
-}
-
-/// Resolve or reject `promise` with `value` unless it settled, as the functions of
-/// `Promise.withResolvers()` do.
-fn settle(
-    scope: &Scope<'_>,
-    promise: js::Promise<'_>,
-    reject: bool,
-    value: HandleValue<'_>,
-) -> Result<(), ExnThrown> {
-    if !promise.is_pending() {
-        return Ok(());
-    }
-    if reject {
-        promise.reject(scope, value)
-    } else {
-        promise.resolve(scope, value)
-    }
-}
-
-/// `Promise.resolve(value).then(fulfilled, rejected)`.
-fn then<'s>(
-    scope: &'s Scope<'_>,
-    value: HandleValue<'_>,
-    fulfilled: Option<Object<'_>>,
-    rejected: Option<Object<'_>>,
+    promise: Result<js::Promise<'s>, ExnThrown>,
 ) -> Result<js::Promise<'s>, ExnThrown> {
-    js::Promise::call_original_resolve(scope, scope.root_value(value.get()))?
-        .then(scope, fulfilled, rejected)
+    match promise {
+        Ok(promise) => Ok(promise),
+        Err(ExnThrown) => js::Promise::new_rejected_with_pending_error(scope),
+    }
 }
 
 /// `ERR_INVALID_ARG_TYPE` for the argument `name`, which isn't `expected`.
@@ -170,17 +76,9 @@ fn options_object<'s>(
     name: &str,
 ) -> Result<Object<'s>, Thrown> {
     match options.filter(|options| !options.is_undefined()) {
-        Some(options) => Ok(validate_object(scope, options, name)?),
+        Some(options) => validate_plain_object(scope, options, name, false),
         None => Ok(Object::new_plain(scope)?),
     }
-}
-
-/// `validateBoolean(value, name)`.
-fn validate_boolean(scope: &Scope<'_>, value: HandleValue<'_>, name: &str) -> Result<bool, Thrown> {
-    if !value.is_boolean() {
-        return Err(invalid_type(scope, name, "of type boolean", value));
-    }
-    Ok(value.to_boolean())
 }
 
 /// `options[name]`, or `default` if it is `undefined`.
@@ -190,7 +88,7 @@ fn option_or<'s>(
     name: &'static CStr,
     default: bool,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let value = options.val(scope, name)?;
+    let value = options.get_property(scope, name)?;
     Ok(if value.is_undefined() {
         scope.root_value(js::value::from_bool(default))
     } else {
@@ -218,8 +116,8 @@ fn handle_known_internal_errors<'s>(
     scope: &'s Scope<'_>,
     cause: HandleValue<'s>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let code = match as_object(scope, cause) {
-        Some(object) => object.val(scope, c"code")?,
+    let code = match Object::from_value(scope, cause).ok() {
+        Some(object) => object.get_property(scope, c"code")?,
         None => return Ok(cause),
     };
     let Some(code_text) = rust_string(scope, code) else {
@@ -231,9 +129,10 @@ fn handle_known_internal_errors<'s>(
     if crate::zlib::is_failure_code(&code_text) || code_text.starts_with("ERR__ERROR_") {
         let options = Object::new_plain(scope)?;
         options.set_property(scope, c"cause", cause)?;
-        let error = construct(
+        let class = class_object(scope, js::class_spec::JSProtoKey::JSProto_TypeError)?;
+        let error = Function::construct(
             scope,
-            c"TypeError",
+            class,
             &[HandleValue::undefined(), options.to_jsval_throwing(scope)?],
         )?;
         error.define_property(
@@ -247,27 +146,83 @@ fn handle_known_internal_errors<'s>(
     Ok(cause)
 }
 
-/// Call `callback(error)`, or with no argument if `error` is `None`.
-fn call_back(
-    scope: &Scope<'_>,
-    callback: HandleValue<'_>,
-    error: Option<HandleValue<'_>>,
-) -> Result<(), ExnThrown> {
-    let args: Vec<HandleValue<'_>> = error.into_iter().collect();
-    call(scope, HandleValue::undefined(), callback, &args)?;
-    Ok(())
+/// The state of [`writable_to_web`]: the Node.js stream, the `WritableStream`'s controller, the
+/// pending backpressure and close promises, and the `finished` it waits on.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct WritableToWebState {
+    stream: Heap<js::object::Object>,
+    controller: Option<Heap<WritableStreamDefaultControllerImpl>>,
+    backpressure: Option<Heap<js::promise::Promise>>,
+    closed: Option<Heap<js::promise::Promise>>,
+    cleanup: Option<Heap<EosStateImpl>>,
 }
 
-/// The captures of the functions [`writable_to_web`] creates: `[stream, controller,
-/// backpressurePromise, closed, cleanup]`, where `backpressurePromise` and `closed` are pending
-/// promises or `undefined`.
-mod to_writable {
-    pub(super) const STREAM: u32 = 0;
-    pub(super) const CONTROLLER: u32 = 1;
-    pub(super) const BACKPRESSURE: u32 = 2;
-    pub(super) const CLOSED: u32 = 3;
-    pub(super) const CLEANUP: u32 = 4;
-    pub(super) const COUNT: usize = 5;
+#[core_runtime::jsmethods]
+impl WritableToWebState {}
+
+/// A new `WritableStream` that is closed.
+fn closed_writable_stream<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+    let writable = WritableStream::new(scope, None, None)?;
+    or_rejected(scope, writable.close(scope))?;
+    Ok(*writable)
+}
+
+/// The underlying source or sink of an adapter: `methods` as functions with `state` as their
+/// payload, on a null-prototype object.
+fn algorithms<'s>(
+    scope: &'s Scope<'_>,
+    state: impl ToJSVal<'s> + Copy,
+    methods: &[(&'static CStr, u32, Callback)],
+) -> Result<Object<'s>, ExnThrown> {
+    let object = Object::new_with_null_prototype(scope)?;
+    for &(name, nargs, body) in methods {
+        let function = Function::new_callback(scope, name, nargs, body, state)?;
+        object.set_property(scope, name, *function)?;
+    }
+    Ok(object)
+}
+
+/// The `size` of the strategy of a `WritableStream` writing to a writable that isn't in object
+/// mode: `chunk?.byteLength ?? chunk?.length ?? 1`.
+fn chunk_size(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let chunk = args.get(0);
+    if chunk.is_null_or_undefined() {
+        return Ok(js::value::from_i32(1));
+    }
+    let object = Object::from_value_coerce(scope, chunk)?;
+    for name in [c"byteLength", c"length"] {
+        let value = object.get_property(scope, name)?;
+        if !value.is_null_or_undefined() {
+            return Ok(value.get());
+        }
+    }
+    Ok(js::value::from_i32(1))
+}
+
+/// The `size` of a `ByteLengthQueuingStrategy`: `chunk.byteLength`.
+fn byte_length_size(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let chunk = Object::from_value_coerce(scope, args.get(0))?;
+    Ok(chunk.get_property(scope, c"byteLength")?.get())
+}
+
+/// The shared function running `body`.
+fn shared_function<'s>(
+    scope: &'s Scope<'_>,
+    name: &CStr,
+    body: Callback,
+) -> Result<js::Callable<'s>, ExnThrown> {
+    let function = js::class::get_or_init_shared_function(scope, body as usize, |scope| {
+        Function::new_callback(scope, name, 1, body, ())
+    })?;
+    Ok(function.as_callable())
 }
 
 /// Node's `newWritableStreamFromStreamWritable`: a `WritableStream` writing to the Node.js
@@ -276,11 +231,13 @@ pub(crate) fn writable_to_web<'s>(
     scope: &'s Scope<'_>,
     stream: HandleValue<'_>,
 ) -> Result<Object<'s>, Thrown> {
-    use to_writable::*;
-    let candidate = as_object(scope, stream).filter(|_| truthy(scope, stream));
+    let candidate = Object::from_value(scope, stream)
+        .ok()
+        .filter(|_| js::conversion::to_boolean(stream));
     let stream_object = match candidate {
         Some(object)
-            if has_method(scope, object, c"write")? && has_method(scope, object, c"on")? =>
+            if crate::support::has_method(scope, object, c"write")?
+                && crate::support::has_method(scope, object, c"on")? =>
         {
             object
         }
@@ -294,73 +251,54 @@ pub(crate) fn writable_to_web<'s>(
         }
     };
     if is_destroyed(scope, stream)? == Some(true) || is_writable(scope, stream)? != Some(true) {
-        let writable = construct(scope, c"WritableStream", &[])?;
-        call_method(scope, writable, c"close", &[])?;
-        return Ok(writable);
+        return Ok(closed_writable_stream(scope)?);
     }
-    let high_water_mark = stream_object.val(scope, c"writableHighWaterMark")?;
-    let strategy = if truthy(scope, stream_object.val(scope, c"writableObjectMode")?) {
-        let init = Object::new_plain(scope)?;
-        init.set_property(scope, c"highWaterMark", high_water_mark)?;
-        construct(
-            scope,
-            c"CountQueuingStrategy",
-            &[init.to_jsval_throwing(scope)?],
-        )?
-    } else {
-        let strategy = Object::new_plain(scope)?;
-        strategy.set_property(scope, c"highWaterMark", high_water_mark)?;
-        let size = Function::new_callback(scope, c"size", 1, chunk_size, ())?;
-        strategy.set_property(scope, c"size", *size)?;
-        strategy
+    let high_water_mark = stream_object.get_property(scope, c"writableHighWaterMark")?;
+    let high_water_mark = f64::from_jsval(scope, high_water_mark, ()).map_err(|_| ExnThrown)?;
+    let object_mode =
+        js::conversion::to_boolean(stream_object.get_property(scope, c"writableObjectMode")?);
+    let strategy = QueuingStrategy {
+        high_water_mark: Some(high_water_mark),
+        size: if object_mode {
+            None
+        } else {
+            Some(shared_function(scope, c"size", chunk_size)?)
+        },
     };
 
-    let state = new_state(scope, COUNT)?;
-    state.set(STREAM, stream_object)?;
-    let on_end = method(scope, &state, c"", 1, writable_to_web_finished)?;
-    let cleanup = super::eos::eos(scope, stream, None, on_end.to_jsval_throwing(scope)?)?;
-    state.set(CLEANUP, cleanup)?;
-    let on_drain = method(scope, &state, c"onDrain", 0, writable_to_web_drain)?;
-    listen(scope, stream_object, c"on", "drain", on_drain)?;
-
-    let sink = Object::new_plain(scope)?;
-    for (name, nargs, body) in [
-        (c"start", 1, writable_to_web_start as Callback),
-        (c"write", 1, writable_to_web_write),
-        (c"abort", 1, writable_to_web_abort),
-        (c"close", 0, writable_to_web_close),
-    ] {
-        sink.set_property(scope, name, method(scope, &state, name, nargs, body)?)?;
-    }
-    Ok(construct(
-        scope,
-        c"WritableStream",
-        &[
-            sink.to_jsval_throwing(scope)?,
-            strategy.to_jsval_throwing(scope)?,
-        ],
-    )?)
-}
-
-/// The `size` of the strategy of a `WritableStream` writing to a writable that isn't in object
-/// mode: `chunk?.byteLength ?? chunk?.length ?? 1`.
-fn chunk_size(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let chunk = args.get(0);
-    if is_nullish(chunk) {
-        return Ok(js::value::from_i32(1));
-    }
-    let object = Object::from_value_coerce(scope, chunk)?;
-    for name in [c"byteLength", c"length"] {
-        let value = object.val(scope, name)?;
-        if !is_nullish(value) {
-            return Ok(value.get());
+    let state = js::class::create_instance_with::<WritableToWebStateImpl>(scope, |_| {
+        WritableToWebStateImpl {
+            stream: Heap::from(stream_object),
+            controller: None,
+            backpressure: None,
+            closed: None,
+            cleanup: None,
         }
-    }
-    Ok(js::value::from_i32(1))
+    })?;
+    let payload = state.to_jsval_throwing(scope)?;
+    let cleanup = super::eos::eos_native(
+        scope,
+        stream_object,
+        EosOptions::default(),
+        EosCallback::Native(writable_to_web_finished, payload),
+    )?;
+    state.data_mut().cleanup = Some(Heap::from(cleanup));
+    let on_drain = Function::new_callback(scope, c"onDrain", 0, writable_to_web_drain, state)?;
+    crate::events::listen(scope, stream_object, c"on", c"drain", *on_drain)?;
+
+    let sink = algorithms(
+        scope,
+        state,
+        &[
+            (c"start", 1, writable_to_web_start),
+            (c"write", 1, writable_to_web_write),
+            (c"abort", 1, writable_to_web_abort),
+            (c"close", 0, writable_to_web_close),
+        ],
+    )?;
+    let writable =
+        WritableStream::new(scope, Some(sink.to_jsval_throwing(scope)?), Some(strategy))?;
+    Ok(*writable)
 }
 
 /// The `finished` callback of [`writable_to_web`]: error the `WritableStream` with the stream's
@@ -370,38 +308,49 @@ fn writable_to_web_finished(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use to_writable::*;
-    let state = state_of(scope, payload)?;
-    let error = handle_known_internal_errors(scope, args.get(0))?;
-    call(scope, HandleValue::undefined(), state.get(CLEANUP)?, &[])?;
-    let stream = state.obj(STREAM)?;
-    listen(scope, stream, c"on", "error", noop_function(scope)?)?;
-    let closed = promise_at(scope, &state, CLOSED)?;
-    let controller = as_object(scope, state.get(CONTROLLER)?);
-    if !is_nullish(error) {
-        if let Some(backpressure) = promise_at(scope, &state, BACKPRESSURE)? {
-            settle(scope, backpressure, true, error)?;
+    let state = cast_payload::<WritableToWebState>(scope, payload);
+    let error = if !args.is_empty() {
+        args.get(0)
+    } else {
+        HandleValue::undefined()
+    };
+    let error = handle_known_internal_errors(scope, error)?;
+    let (stream, cleanup) = {
+        let data = state.data();
+        (data.stream.get(scope), data.cleanup.get(scope))
+    };
+    if let Some(cleanup) = cleanup {
+        super::eos::cleanup(scope, cleanup)?;
+    }
+    crate::events::listen(scope, stream, c"on", c"error", noop_function(scope)?)?;
+    let (backpressure, closed) = {
+        let mut data = state.data_mut();
+        (data.backpressure.get(scope), data.closed.take_rooted(scope))
+    };
+    if !error.is_null_or_undefined() {
+        if let Some(backpressure) = backpressure.filter(|promise| promise.is_pending()) {
+            backpressure.reject(scope, error)?;
         }
-        if let Some(closed) = closed {
-            settle(scope, closed, true, error)?;
-            state.set(CLOSED, js::value::undefined())?;
+        if let Some(closed) = closed.filter(|promise| promise.is_pending()) {
+            closed.reject(scope, error)?;
         }
+        let controller = state.data_mut().controller.take_rooted(scope);
         if let Some(controller) = controller {
-            call_method(scope, controller, c"error", &[error])?;
+            controller.error(scope, Some(error))?;
         }
-        state.set(CONTROLLER, js::value::undefined())?;
         return Ok(js::value::undefined());
     }
     if let Some(closed) = closed {
-        settle(scope, closed, false, HandleValue::undefined())?;
-        state.set(CLOSED, js::value::undefined())?;
+        if closed.is_pending() {
+            closed.resolve(scope, HandleValue::undefined())?;
+        }
         return Ok(js::value::undefined());
     }
+    let controller = state.data_mut().controller.take_rooted(scope);
     if let Some(controller) = controller {
         let error = crate::errors::abort_error(scope, None)?;
-        call_method(scope, controller, c"error", &[error])?;
+        controller.error(scope, Some(error))?;
     }
-    state.set(CONTROLLER, js::value::undefined())?;
     Ok(js::value::undefined())
 }
 
@@ -410,9 +359,10 @@ fn writable_to_web_drain(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    if let Some(backpressure) = promise_at(scope, &state, to_writable::BACKPRESSURE)? {
-        settle(scope, backpressure, false, HandleValue::undefined())?;
+    let state = cast_payload::<WritableToWebState>(scope, payload);
+    let backpressure = state.data().backpressure.get(scope);
+    if let Some(backpressure) = backpressure.filter(|promise| promise.is_pending()) {
+        backpressure.resolve(scope, HandleValue::undefined())?;
     }
     Ok(js::value::undefined())
 }
@@ -422,7 +372,11 @@ fn writable_to_web_start(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    state_of(scope, payload)?.set(to_writable::CONTROLLER, args.get(0))?;
+    let state = cast_payload::<WritableToWebState>(scope, payload);
+    let controller = Object::from_value(scope, args.get(0))
+        .ok()
+        .and_then(|controller| controller.cast::<WritableStreamDefaultController>().ok());
+    state.data_mut().controller = controller.map(Heap::from);
     Ok(js::value::undefined())
 }
 
@@ -434,67 +388,65 @@ fn writable_to_web_write(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use to_writable::*;
-    let state = state_of(scope, payload)?;
-    let stream = state.obj(STREAM)?;
+    let state = cast_payload::<WritableToWebState>(scope, payload);
+    let stream = state.data().stream.get(scope);
     let mut chunk = args.get(0);
-    let object_mode = truthy(scope, stream.val(scope, c"writableObjectMode")?);
+    let object_mode =
+        js::conversion::to_boolean(stream.get_property(scope, c"writableObjectMode")?);
     if !object_mode {
-        if let Some(object) = as_object(scope, chunk) {
+        if let Ok(object) = Object::from_value(scope, chunk) {
             if crate::inspect::is_array_buffer(object)
                 || crate::inspect::is_shared_array_buffer(scope, object)?
             {
-                chunk = construct(scope, c"Uint8Array", &[chunk])?.to_jsval_throwing(scope)?;
+                chunk = new_uint8_array(scope, chunk)?;
             }
         }
     }
-    let need_drain = truthy(scope, stream.val(scope, c"writableNeedDrain")?);
-    if !need_drain && truthy(scope, call_method(scope, stream, c"write", &[chunk])?) {
+    let need_drain = js::conversion::to_boolean(stream.get_property(scope, c"writableNeedDrain")?);
+    if !need_drain
+        && js::conversion::to_boolean(Function::call_by_name(
+            scope,
+            stream.handle(),
+            c"write",
+            &[chunk],
+        )?)
+    {
         return Ok(js::value::undefined());
     }
     let backpressure = js::Promise::new_pending(scope)?;
-    state.set(BACKPRESSURE, *backpressure)?;
-    if !truthy(scope, stream.val(scope, c"writableNeedDrain")?) {
+    state.data_mut().backpressure = Some(Heap::from(backpressure));
+    if !js::conversion::to_boolean(stream.get_property(scope, c"writableNeedDrain")?) {
         backpressure.resolve(scope, HandleValue::undefined())?;
     }
-    let result = js::Promise::new_pending(scope)?;
-    let captures = [state.array, *result];
-    let fulfilled = closure(scope, 1, backpressure_settled, &captures)?;
-    let rejected = closure(scope, 1, backpressure_failed, &captures)?;
-    backpressure.then(scope, Some(fulfilled), Some(rejected))?;
+    let settled = Function::new_callback(scope, c"", 1, backpressure_settled, state)?;
+    let failed = Function::new_callback(scope, c"", 1, backpressure_failed, state)?;
+    let result = backpressure.then(scope, Some(*settled), Some(*failed))?;
     result.to_jsval_raw_throwing(scope)
 }
 
-/// The `finally` of the backpressure promise, whose captures are `[state, result]`: clear it, and
-/// fulfill `result`.
+/// The `finally` of the backpressure promise: clear it.
 fn backpressure_settled(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let state = Captures::of(scope, captures.get(0)?)?;
-    state.set(to_writable::BACKPRESSURE, js::value::undefined())?;
-    if let Some(result) = promise_at(scope, &captures, 1)? {
-        result.resolve(scope, HandleValue::undefined())?;
-    }
+    cast_payload::<WritableToWebState>(scope, payload)
+        .data_mut()
+        .backpressure = None;
     Ok(js::value::undefined())
 }
 
-/// The `finally` of the backpressure promise after a rejection, whose captures are `[state,
-/// result]`: clear it, and reject `result` with the reason.
+/// The `finally` of the backpressure promise after a rejection: clear it, and reject with the
+/// reason.
 fn backpressure_failed(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let state = Captures::of(scope, captures.get(0)?)?;
-    state.set(to_writable::BACKPRESSURE, js::value::undefined())?;
-    if let Some(result) = promise_at(scope, &captures, 1)? {
-        result.reject(scope, args.get(0))?;
-    }
-    Ok(js::value::undefined())
+    cast_payload::<WritableToWebState>(scope, payload)
+        .data_mut()
+        .backpressure = None;
+    Err(js::exception::throw_value(scope, args.get(0)))
 }
 
 fn writable_to_web_abort(
@@ -502,9 +454,11 @@ fn writable_to_web_abort(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let stream = state.get(to_writable::STREAM)?;
-    super::destroy::destroyer(scope, stream, args.get(0))?;
+    let stream = cast_payload::<WritableToWebState>(scope, payload)
+        .data()
+        .stream
+        .get(scope);
+    super::destroy::destroyer(scope, stream.to_jsval_throwing(scope)?, args.get(0))?;
     Ok(js::value::undefined())
 }
 
@@ -514,142 +468,67 @@ fn writable_to_web_close(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use to_writable::*;
-    let state = state_of(scope, payload)?;
-    let stream = state.get(STREAM)?;
-    if state.get(CLOSED)?.is_undefined() && is_writable_ended(scope, stream)? != Some(true) {
+    let state = cast_payload::<WritableToWebState>(scope, payload);
+    let (stream, closing) = {
+        let data = state.data();
+        (data.stream.get(scope), data.closed.is_some())
+    };
+    if !closing && is_writable_ended(scope, stream.to_jsval_throwing(scope)?)? != Some(true) {
         let closed = js::Promise::new_pending(scope)?;
-        state.set(CLOSED, *closed)?;
-        call_method(scope, state.obj(STREAM)?, c"end", &[])?;
+        state.data_mut().closed = Some(Heap::from(closed));
+        Function::call_by_name(scope, stream.handle(), c"end", js::function::EmptyArgs)?;
         return closed.to_jsval_raw_throwing(scope);
     }
-    state.set(CONTROLLER, js::value::undefined())?;
+    state.data_mut().controller = None;
     js::Promise::new_resolved_with_value(scope, HandleValue::undefined())?
         .to_jsval_raw_throwing(scope)
 }
 
-/// The captures of the functions [`readable_to_web`] creates: `[stream, controller, wasCanceled,
-/// cleanup, isBYOB, objectMode]`.
-mod to_readable {
-    pub(super) const STREAM: u32 = 0;
-    pub(super) const CONTROLLER: u32 = 1;
-    pub(super) const WAS_CANCELED: u32 = 2;
-    pub(super) const CLEANUP: u32 = 3;
-    pub(super) const IS_BYOB: u32 = 4;
-    pub(super) const OBJECT_MODE: u32 = 5;
-    pub(super) const COUNT: usize = 6;
+/// The controller of a `ReadableStream`: a default controller, or a byte stream controller.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+enum Controller {
+    Default(Heap<ReadableStreamDefaultControllerImpl>),
+    Bytes(Heap<ReadableByteStreamControllerImpl>),
 }
 
-/// The key of the property marking a stream that has the no-op `error` listener
-/// [`readable_to_web`] adds.
-fn error_sentinel_key<'s>(scope: &'s Scope<'_>) -> Result<js::native::HandleId<'s>, ExnThrown> {
-    let symbol = crate::symbol(scope, "nodejs.webstreams.kErrorSentinelAttached", true)?;
-    Ok(scope.root_id(js::id::value_to_id(scope, symbol)?))
+/// The rooted [`Controller`].
+#[derive(Clone, Copy)]
+enum RootedController<'s> {
+    Default(ReadableStreamDefaultController<'s>),
+    Bytes(ReadableByteStreamController<'s>),
 }
 
-/// Node's `newReadableStreamFromStreamReadable`: a `ReadableStream` reading from the Node.js
-/// readable `stream`, a byte stream if `options.type` is `'bytes'`. `options.strategy` is its
-/// queuing strategy, by default one with the stream's high water mark.
-pub(crate) fn readable_to_web<'s>(
+/// The state of [`readable_to_web`]: the Node.js stream, the `ReadableStream`'s controller,
+/// whether it was canceled, and the `finished` it waits on.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct ReadableToWebState {
+    stream: Heap<js::object::Object>,
+    controller: Option<Controller>,
+    cleanup: Option<Heap<EosStateImpl>>,
+    #[no_trace]
+    was_canceled: bool,
+    #[no_trace]
+    is_byob: bool,
+    #[no_trace]
+    object_mode: bool,
+}
+
+#[core_runtime::jsmethods]
+impl ReadableToWebState {}
+
+/// The controller of `state`'s `ReadableStream`.
+fn controller_of<'s>(
     scope: &'s Scope<'_>,
-    stream: HandleValue<'_>,
-    options: Option<HandleValue<'_>>,
-) -> Result<Object<'s>, Thrown> {
-    use to_readable::*;
-    let readable_state = match as_object(scope, stream) {
-        Some(object) => object.val(scope, c"_readableState")?,
-        None => HandleValue::undefined(),
-    };
-    if !readable_state.is_object() && !readable_state.is_null() {
-        return Err(invalid_type(
-            scope,
-            "streamReadable",
-            "an stream.Readable",
-            stream,
-        ));
+    state: ReadableToWebState<'_>,
+) -> Option<RootedController<'s>> {
+    match &state.data().controller {
+        Some(Controller::Default(controller)) => {
+            Some(RootedController::Default(controller.get(scope)))
+        }
+        Some(Controller::Bytes(controller)) => Some(RootedController::Bytes(controller.get(scope))),
+        None => None,
     }
-    let stream_object = as_object(scope, stream).expect("streams are objects");
-    let options = options_object(scope, options, "options")?;
-    let kind = options.val(scope, c"type")?;
-    let is_byob = validate_type(scope, kind)?;
-
-    let state = new_state(scope, COUNT)?;
-    state.set(STREAM, stream_object)?;
-    state.set(WAS_CANCELED, false)?;
-    state.set(CLEANUP, noop_function(scope)?)?;
-    state.set(IS_BYOB, is_byob)?;
-    let source = null_prototype_object(scope)?;
-    if is_byob {
-        source.set_property(scope, c"type", "bytes")?;
-    } else {
-        source.set_property(scope, c"type", HandleValue::undefined())?;
-    }
-    source.set_property(
-        scope,
-        c"start",
-        method(scope, &state, c"start", 1, readable_to_web_start)?,
-    )?;
-    source.set_property(
-        scope,
-        c"cancel",
-        method(scope, &state, c"cancel", 1, readable_to_web_cancel)?,
-    )?;
-
-    let readable = is_readable(scope, stream)? == Some(true);
-    let object_mode = stream_object.val(scope, c"readableObjectMode")?;
-    state.set(OBJECT_MODE, truthy(scope, object_mode))?;
-    let mut strategy = HandleValue::undefined();
-    if readable {
-        source.set_property(
-            scope,
-            c"pull",
-            method(scope, &state, c"pull", 0, readable_to_web_pull)?,
-        )?;
-        let high_water_mark = stream_object.val(scope, c"readableHighWaterMark")?;
-        let init = Object::new_plain(scope)?;
-        init.set_property(scope, c"highWaterMark", high_water_mark)?;
-        strategy = if is_byob {
-            init.to_jsval_throwing(scope)?
-        } else {
-            let given = options.val(scope, c"strategy")?;
-            if is_nullish(given) {
-                let class = if truthy(scope, object_mode) {
-                    c"CountQueuingStrategy"
-                } else {
-                    c"ByteLengthQueuingStrategy"
-                };
-                construct(scope, class, &[init.to_jsval_throwing(scope)?])?
-                    .to_jsval_throwing(scope)?
-            } else {
-                given
-            }
-        };
-    }
-    let readable_stream = construct(
-        scope,
-        c"ReadableStream",
-        &[source.to_jsval_throwing(scope)?, strategy],
-    )?;
-
-    let eos_options = null_prototype_object(scope)?;
-    eos_options.set_property(scope, c"writable", false)?;
-    let on_end = method(scope, &state, c"", 1, readable_to_web_finished)?;
-    let cleanup = super::eos::eos_synchronous(
-        scope,
-        stream,
-        Some(eos_options.to_jsval_throwing(scope)?),
-        on_end.to_jsval_throwing(scope)?,
-    )?;
-    state.set(CLEANUP, cleanup)?;
-
-    if state.flag(WAS_CANCELED)? {
-        call(scope, HandleValue::undefined(), cleanup, &[])?;
-    } else if readable {
-        call_method(scope, stream_object, c"pause", &[])?;
-        let on_data = method(scope, &state, c"onData", 1, readable_to_web_data)?;
-        listen(scope, stream_object, c"on", "data", on_data)?;
-    }
-    Ok(readable_stream)
 }
 
 /// `validateOneOf(type, 'options.type', ['bytes', undefined])`. Returns whether `type` is
@@ -658,7 +537,7 @@ fn validate_type(scope: &Scope<'_>, kind: HandleValue<'_>) -> Result<bool, Throw
     if kind.is_undefined() {
         return Ok(false);
     }
-    if super::util::is_str(scope, kind, c"bytes")? {
+    if is_str(scope, kind, c"bytes")? {
         return Ok(true);
     }
     Err(NodeError::invalid_arg_value(
@@ -670,12 +549,128 @@ fn validate_type(scope: &Scope<'_>, kind: HandleValue<'_>) -> Result<bool, Throw
     .into())
 }
 
+/// An underlying source `{ type }`, with `type` `'bytes'` for a byte stream.
+fn typed_source<'s>(scope: &'s Scope<'_>, kind: HandleValue<'_>) -> Result<Object<'s>, ExnThrown> {
+    let source = Object::new_plain(scope)?;
+    source.set_property(scope, c"type", kind)?;
+    Ok(source)
+}
+
+/// Node's `newReadableStreamFromStreamReadable`: a `ReadableStream` reading from the Node.js
+/// readable `stream`, a byte stream if `options.type` is `'bytes'`. `options.strategy` is its
+/// queuing strategy, by default one with the stream's high water mark.
+pub(crate) fn readable_to_web<'s>(
+    scope: &'s Scope<'_>,
+    stream: HandleValue<'_>,
+    options: Option<HandleValue<'_>>,
+) -> Result<Object<'s>, Thrown> {
+    let stream_object = Object::from_value(scope, stream).ok();
+    let has_state = match stream_object {
+        Some(object) => sides(scope, object)?.readable.is_some(),
+        None => false,
+    };
+    let Some(stream_object) = stream_object.filter(|_| has_state) else {
+        return Err(invalid_type(
+            scope,
+            "streamReadable",
+            "an stream.Readable",
+            stream,
+        ));
+    };
+    let options = options_object(scope, options, "options")?;
+    let kind = options.get_property(scope, c"type")?;
+    let is_byob = validate_type(scope, kind)?;
+
+    let readable = is_readable(scope, stream)? == Some(true);
+    let object_mode =
+        js::conversion::to_boolean(stream_object.get_property(scope, c"readableObjectMode")?);
+    let state = js::class::create_instance_with::<ReadableToWebStateImpl>(scope, |_| {
+        ReadableToWebStateImpl {
+            stream: Heap::from(stream_object),
+            controller: None,
+            cleanup: None,
+            was_canceled: false,
+            is_byob,
+            object_mode,
+        }
+    })?;
+    let mut methods: Vec<(&'static CStr, u32, Callback)> = vec![
+        (c"start", 1, readable_to_web_start),
+        (c"cancel", 1, readable_to_web_cancel),
+    ];
+    let mut strategy = None;
+    if readable {
+        methods.push((c"pull", 0, readable_to_web_pull));
+        let high_water_mark = stream_object.get_property(scope, c"readableHighWaterMark")?;
+        let high_water_mark = f64::from_jsval(scope, high_water_mark, ()).map_err(|_| ExnThrown)?;
+        let given = options.get_property(scope, c"strategy")?;
+        strategy = Some(if is_byob {
+            QueuingStrategy {
+                high_water_mark: Some(high_water_mark),
+                size: None,
+            }
+        } else if given.is_null_or_undefined() {
+            QueuingStrategy {
+                high_water_mark: Some(high_water_mark),
+                size: if object_mode {
+                    None
+                } else {
+                    Some(shared_function(scope, c"size", byte_length_size)?)
+                },
+            }
+        } else {
+            QueuingStrategy::from_jsval(scope, given, ()).map_err(|error| error.throw(scope))?
+        });
+    }
+    let source = algorithms(scope, state, &methods)?;
+    if is_byob {
+        source.set_property(scope, c"type", "bytes")?;
+    }
+    let readable_stream =
+        ReadableStream::new(scope, Some(source.to_jsval_throwing(scope)?), strategy)?;
+
+    let payload = state.to_jsval_throwing(scope)?;
+    let eos_options = EosOptions {
+        writable: Some(false),
+        synchronous: true,
+        ..EosOptions::default()
+    };
+    let cleanup = super::eos::eos_native(
+        scope,
+        stream_object,
+        eos_options,
+        EosCallback::Native(readable_to_web_finished, payload),
+    )?;
+    state.data_mut().cleanup = Some(Heap::from(cleanup));
+
+    if state.data().was_canceled {
+        super::eos::cleanup(scope, cleanup)?;
+    } else if readable {
+        Function::call_by_name(
+            scope,
+            stream_object.handle(),
+            c"pause",
+            js::function::EmptyArgs,
+        )?;
+        let on_data = Function::new_callback(scope, c"onData", 1, readable_to_web_data, state)?;
+        crate::events::listen(scope, stream_object, c"on", c"data", *on_data)?;
+    }
+    Ok(*readable_stream)
+}
+
 fn readable_to_web_start(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    state_of(scope, payload)?.set(to_readable::CONTROLLER, args.get(0))?;
+    let state = cast_payload::<ReadableToWebState>(scope, payload);
+    if let Ok(controller) = Object::from_value(scope, args.get(0)) {
+        if let Ok(controller) = controller.cast::<ReadableStreamDefaultController>() {
+            state.data_mut().controller = Some(Controller::Default(Heap::from(controller)));
+        } else if let Ok(controller) = controller.cast::<ReadableByteStreamController>() {
+            state.data_mut().controller = Some(Controller::Bytes(Heap::from(controller)));
+        }
+    }
     Ok(js::value::undefined())
 }
 
@@ -684,10 +679,10 @@ fn readable_to_web_cancel(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    state.set(to_readable::WAS_CANCELED, true)?;
-    let stream = state.get(to_readable::STREAM)?;
-    super::destroy::destroyer(scope, stream, args.get(0))?;
+    let state = cast_payload::<ReadableToWebState>(scope, payload);
+    state.data_mut().was_canceled = true;
+    let stream = state.data().stream.get(scope);
+    super::destroy::destroyer(scope, stream.to_jsval_throwing(scope)?, args.get(0))?;
     Ok(js::value::undefined())
 }
 
@@ -696,8 +691,11 @@ fn readable_to_web_pull(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = state_of(scope, payload)?.obj(to_readable::STREAM)?;
-    call_method(scope, stream, c"resume", &[])?;
+    let stream = cast_payload::<ReadableToWebState>(scope, payload)
+        .data()
+        .stream
+        .get(scope);
+    Function::call_by_name(scope, stream.handle(), c"resume", js::function::EmptyArgs)?;
     Ok(js::value::undefined())
 }
 
@@ -708,25 +706,38 @@ fn readable_to_web_data(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use to_readable::*;
-    let state = state_of(scope, payload)?;
+    let state = cast_payload::<ReadableToWebState>(scope, payload);
     let mut chunk = args.get(0);
-    if is_buffer(scope, chunk)? && !state.flag(OBJECT_MODE)? {
-        chunk = construct(scope, c"Uint8Array", &[chunk])?.to_jsval_throwing(scope)?;
+    if is_buffer(scope, chunk)? && !state.data().object_mode {
+        chunk = new_uint8_array(scope, chunk)?;
     }
-    let controller = state.obj(CONTROLLER)?;
-    call_method(scope, controller, c"enqueue", &[chunk])?;
-    let desired = controller.val(scope, c"desiredSize")?;
-    let full = if desired.is_number() {
-        desired.to_number() <= 0.0
-    } else {
-        desired.is_null()
+    let desired = match controller_of(scope, state) {
+        Some(RootedController::Default(controller)) => {
+            controller.enqueue(scope, chunk)?;
+            controller.desired_size(scope)
+        }
+        Some(RootedController::Bytes(controller)) => {
+            let view = js::ArrayBufferView::from_value(scope, chunk).ok_or_else(|| {
+                js::error::TypeError(String::from("chunk is not an ArrayBufferView")).throw(scope)
+            })?;
+            controller.enqueue(scope, view)?;
+            controller.desired_size(scope)
+        }
+        None => {
+            return Err(js::error::TypeError(String::from("controller is undefined")).throw(scope))
+        }
     };
-    if full {
-        call_method(scope, state.obj(STREAM)?, c"pause", &[])?;
+    if desired.is_none_or(|desired| desired <= 0.0) {
+        let stream = state.data().stream.get(scope);
+        Function::call_by_name(scope, stream.handle(), c"pause", js::function::EmptyArgs)?;
     }
     Ok(js::value::undefined())
 }
+
+/// The key of the property marking a stream that has the no-op `error` listener
+/// [`readable_to_web`] adds.
+static ERROR_SENTINEL_ATTACHED: js::symbol::CachedSymbol =
+    js::symbol::CachedSymbol::new(c"kErrorSentinelAttached");
 
 /// The `finished` callback of [`readable_to_web`]: error or close the `ReadableStream` unless it
 /// was canceled.
@@ -735,54 +746,114 @@ fn readable_to_web_finished(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use to_readable::*;
-    let state = state_of(scope, payload)?;
-    let error = handle_known_internal_errors(scope, args.get(0))?;
-    call(scope, HandleValue::undefined(), state.get(CLEANUP)?, &[])?;
-    let stream = state.obj(STREAM)?;
-    let key = error_sentinel_key(scope)?;
+    let state = cast_payload::<ReadableToWebState>(scope, payload);
+    let error = if !args.is_empty() {
+        args.get(0)
+    } else {
+        HandleValue::undefined()
+    };
+    let error = handle_known_internal_errors(scope, error)?;
+    let (stream, cleanup) = {
+        let data = state.data();
+        (data.stream.get(scope), data.cleanup.get(scope))
+    };
+    if let Some(cleanup) = cleanup {
+        super::eos::cleanup(scope, cleanup)?;
+    }
+    let key = ERROR_SENTINEL_ATTACHED.id(scope)?;
     if !stream.has_property_by_id(scope, key)? {
-        listen(scope, stream, c"on", "error", noop_function(scope)?)?;
+        crate::events::listen(scope, stream, c"on", c"error", noop_function(scope)?)?;
         stream.set_property_by_id(scope, key, true)?;
     }
-    if state.flag(WAS_CANCELED)? {
+    if state.data().was_canceled {
         return Ok(js::value::undefined());
     }
-    state.set(WAS_CANCELED, true)?;
-    let controller = state.obj(CONTROLLER)?;
-    if truthy(scope, error) {
-        call_method(scope, controller, c"error", &[error])?;
-        return Ok(js::value::undefined());
-    }
-    call_method(scope, controller, c"close", &[])?;
-    if state.flag(IS_BYOB)? {
-        if let Some(request) = controller.obj(scope, c"byobRequest")? {
-            let zero = scope.root_value(js::value::from_i32(0));
-            call_method(scope, request, c"respond", &[zero])?;
+    state.data_mut().was_canceled = true;
+    let controller = controller_of(scope, state);
+    match controller {
+        Some(RootedController::Default(controller)) => {
+            if js::conversion::to_boolean(error) {
+                controller.error(scope, Some(error))?;
+            } else {
+                controller.close(scope)?;
+            }
+        }
+        Some(RootedController::Bytes(controller)) => {
+            if js::conversion::to_boolean(error) {
+                controller.error(scope, Some(error))?;
+            } else {
+                controller.close(scope)?;
+                if state.data().is_byob {
+                    if let Some(request) = controller.byob_request(scope) {
+                        request.respond(scope, js::conversion::EnforceRange(0))?;
+                    }
+                }
+            }
+        }
+        None => {
+            return Err(js::error::TypeError(String::from("controller is undefined")).throw(scope))
         }
     }
     Ok(js::value::undefined())
 }
 
-/// The captures of the functions the `fromWeb` adapters create: `[stream, writer, reader,
-/// writableClosed, readableClosed, decodeStrings, objectMode]`, where `stream` is the Node.js
-/// stream the adapter returns.
-mod from_web {
-    pub(super) const STREAM: u32 = 0;
-    pub(super) const WRITER: u32 = 1;
-    pub(super) const READER: u32 = 2;
-    pub(super) const WRITABLE_CLOSED: u32 = 3;
-    pub(super) const READABLE_CLOSED: u32 = 4;
-    pub(super) const DECODE_STRINGS: u32 = 5;
-    pub(super) const OBJECT_MODE: u32 = 6;
-    pub(super) const COUNT: usize = 7;
+/// The state of the `fromWeb` adapters: the Node.js stream they return, the writer and the reader
+/// of the web streams, and whether those closed.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct FromWebState {
+    stream: Option<Heap<js::object::Object>>,
+    writer: Option<Heap<WritableStreamDefaultWriterImpl>>,
+    reader: Option<Heap<DefaultReaderImpl>>,
+    #[no_trace]
+    writable_closed: bool,
+    #[no_trace]
+    readable_closed: bool,
+    #[no_trace]
+    decode_strings: bool,
+    #[no_trace]
+    object_mode: bool,
+}
+
+#[core_runtime::jsmethods]
+impl FromWebState {}
+
+/// The writer of `state`.
+fn writer_of<'s>(
+    scope: &'s Scope<'_>,
+    state: FromWebState<'_>,
+) -> Result<WritableStreamDefaultWriter<'s>, ExnThrown> {
+    state
+        .data()
+        .writer
+        .get(scope)
+        .ok_or_else(|| js::error::TypeError(String::from("no writer")).throw(scope))
+}
+
+/// The reader of `state`.
+fn reader_of<'s>(
+    scope: &'s Scope<'_>,
+    state: FromWebState<'_>,
+) -> Result<DefaultReader<'s>, ExnThrown> {
+    state
+        .data()
+        .reader
+        .get(scope)
+        .ok_or_else(|| js::error::TypeError(String::from("no reader")).throw(scope))
+}
+
+/// The Node.js stream of `state`.
+fn stream_of<'s>(scope: &'s Scope<'_>, state: FromWebState<'_>) -> HandleValue<'s> {
+    match state.data().stream.get(scope) {
+        Some(stream) => scope.root_value(stream.as_value()),
+        None => HandleValue::undefined(),
+    }
 }
 
 /// The options of the Node.js stream a `fromWeb` adapter creates: the properties in `values`, and
-/// the functions in `methods` with the captures `[state]`.
+/// the functions in `methods` with `state` as their payload.
 fn stream_options<'s>(
     scope: &'s Scope<'_>,
-    state: &Captures<'_>,
+    state: FromWebState<'_>,
     values: &[(&'static CStr, HandleValue<'_>)],
     methods: &[(&'static CStr, u32, Callback)],
 ) -> Result<HandleValue<'s>, ExnThrown> {
@@ -791,9 +862,53 @@ fn stream_options<'s>(
         options.set_property(scope, name, value)?;
     }
     for &(name, nargs, body) in methods {
-        options.set_property(scope, name, method(scope, state, name, nargs, body)?)?;
+        let function = Function::new_callback(scope, name, nargs, body, state)?;
+        options.set_property(scope, name, *function)?;
     }
     options.to_jsval_throwing(scope)
+}
+
+/// A new [`FromWebState`].
+fn new_from_web_state<'s>(
+    scope: &'s Scope<'_>,
+    writer: Option<WritableStreamDefaultWriter<'_>>,
+    reader: Option<DefaultReader<'_>>,
+    decode_strings: bool,
+    object_mode: bool,
+) -> Result<FromWebState<'s>, ExnThrown> {
+    js::class::create_instance_with::<FromWebStateImpl>(scope, |_| FromWebStateImpl {
+        stream: None,
+        writer: writer.map(Heap::from),
+        reader: reader.map(Heap::from),
+        writable_closed: false,
+        readable_closed: false,
+        decode_strings,
+        object_mode,
+    })
+}
+
+/// The writer of `writable_stream`, which locks it: `writableStream.getWriter()`.
+fn get_writer<'s>(
+    scope: &'s Scope<'_>,
+    writable_stream: HandleValue<'_>,
+) -> Result<WritableStreamDefaultWriter<'s>, ExnThrown> {
+    let stream = Object::from_value(scope, writable_stream)
+        .expect("streams are objects")
+        .cast::<WritableStream>()
+        .expect("the stream is a WritableStream");
+    stream.get_writer(scope)
+}
+
+/// The reader of `readable_stream`, which locks it: `readableStream.getReader()`.
+fn get_reader<'s>(
+    scope: &'s Scope<'_>,
+    readable_stream: HandleValue<'_>,
+) -> Result<DefaultReader<'s>, ExnThrown> {
+    let stream = Object::from_value(scope, readable_stream)
+        .expect("streams are objects")
+        .cast::<ReadableStream>()
+        .expect("the stream is a ReadableStream");
+    web_streams::readable::native_read::acquire_native_reader(scope, &stream)
 }
 
 /// Node's `newStreamWritableFromWritableStream`: a Node.js `Writable` writing to the
@@ -803,7 +918,6 @@ pub(crate) fn writable_from_web<'s>(
     writable_stream: HandleValue<'_>,
     options: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, Thrown> {
-    use from_web::*;
     if !is_writable_stream(scope, writable_stream) {
         return Err(invalid_type(
             scope,
@@ -813,24 +927,26 @@ pub(crate) fn writable_from_web<'s>(
         ));
     }
     let options = options_object(scope, options, "options")?;
-    let high_water_mark = options.val(scope, c"highWaterMark")?;
+    let high_water_mark = options.get_property(scope, c"highWaterMark")?;
     let decode_strings = option_or(scope, options, c"decodeStrings", true)?;
     let object_mode = option_or(scope, options, c"objectMode", false)?;
-    let signal = options.val(scope, c"signal")?;
-    let object_mode_flag = validate_boolean(scope, object_mode, "options.objectMode")?;
-    let decode_strings_flag = validate_boolean(scope, decode_strings, "options.decodeStrings")?;
+    let signal = options.get_property(scope, c"signal")?;
+    let object_mode_flag =
+        crate::errors::validate_boolean(scope, object_mode, "options.objectMode")?;
+    let decode_strings_flag =
+        crate::errors::validate_boolean(scope, decode_strings, "options.decodeStrings")?;
 
-    let source = as_object(scope, writable_stream).expect("streams are objects");
-    let writer = call_method(scope, source, c"getWriter", &[])?;
-    let state = new_state(scope, COUNT)?;
-    state.set(WRITER, writer)?;
-    state.set(WRITABLE_CLOSED, false)?;
-    state.set(READABLE_CLOSED, false)?;
-    state.set(DECODE_STRINGS, decode_strings_flag)?;
-    state.set(OBJECT_MODE, object_mode_flag)?;
+    let writer = get_writer(scope, writable_stream)?;
+    let state = new_from_web_state(
+        scope,
+        Some(writer),
+        None,
+        decode_strings_flag,
+        object_mode_flag,
+    )?;
     let stream_options = stream_options(
         scope,
-        &state,
+        state,
         &[
             (c"highWaterMark", high_water_mark),
             (c"objectMode", object_mode),
@@ -846,8 +962,8 @@ pub(crate) fn writable_from_web<'s>(
     )?;
     let ctor = super::writable::writable::class_constructor(scope)?;
     let writable = Function::construct(scope, ctor, &[stream_options])?;
-    state.set(STREAM, writable)?;
-    watch_writer_closed(scope, &state)?;
+    state.data_mut().stream = Some(Heap::from(writable));
+    watch_writer_closed(scope, state)?;
     Ok(writable)
 }
 
@@ -858,7 +974,6 @@ pub(crate) fn readable_from_web<'s>(
     readable_stream: HandleValue<'_>,
     options: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, Thrown> {
-    use from_web::*;
     if !is_readable_stream(scope, readable_stream) {
         return Err(invalid_type(
             scope,
@@ -868,22 +983,18 @@ pub(crate) fn readable_from_web<'s>(
         ));
     }
     let options = options_object(scope, options, "options")?;
-    let high_water_mark = options.val(scope, c"highWaterMark")?;
-    let encoding = options.val(scope, c"encoding")?;
+    let high_water_mark = options.get_property(scope, c"highWaterMark")?;
+    let encoding = options.get_property(scope, c"encoding")?;
     let object_mode = option_or(scope, options, c"objectMode", false)?;
-    let signal = options.val(scope, c"signal")?;
+    let signal = options.get_property(scope, c"signal")?;
     validate_encoding(scope, encoding)?;
-    validate_boolean(scope, object_mode, "options.objectMode")?;
+    crate::errors::validate_boolean(scope, object_mode, "options.objectMode")?;
 
-    let source = as_object(scope, readable_stream).expect("streams are objects");
-    let reader = call_method(scope, source, c"getReader", &[])?;
-    let state = new_state(scope, COUNT)?;
-    state.set(READER, reader)?;
-    state.set(WRITABLE_CLOSED, false)?;
-    state.set(READABLE_CLOSED, false)?;
+    let reader = get_reader(scope, readable_stream)?;
+    let state = new_from_web_state(scope, None, Some(reader), false, false)?;
     let stream_options = stream_options(
         scope,
-        &state,
+        state,
         &[
             (c"objectMode", object_mode),
             (c"highWaterMark", high_water_mark),
@@ -897,8 +1008,8 @@ pub(crate) fn readable_from_web<'s>(
     )?;
     let ctor = super::readable::readable::class_constructor(scope)?;
     let readable = Function::construct(scope, ctor, &[stream_options])?;
-    state.set(STREAM, readable)?;
-    watch_reader_closed(scope, &state)?;
+    state.data_mut().stream = Some(Heap::from(readable));
+    watch_reader_closed(scope, state)?;
     Ok(readable)
 }
 
@@ -909,10 +1020,9 @@ pub(crate) fn duplex_from_web<'s>(
     pair: Option<HandleValue<'_>>,
     options: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, Thrown> {
-    use from_web::*;
     let pair = options_object(scope, pair, "pair")?;
-    let readable_stream = pair.val(scope, c"readable")?;
-    let writable_stream = pair.val(scope, c"writable")?;
+    let readable_stream = pair.get_property(scope, c"readable")?;
+    let writable_stream = pair.get_property(scope, c"writable")?;
     if !is_readable_stream(scope, readable_stream) {
         return Err(invalid_type(
             scope,
@@ -932,27 +1042,26 @@ pub(crate) fn duplex_from_web<'s>(
     let options = options_object(scope, options, "options")?;
     let allow_half_open = option_or(scope, options, c"allowHalfOpen", false)?;
     let object_mode = option_or(scope, options, c"objectMode", false)?;
-    let encoding = options.val(scope, c"encoding")?;
+    let encoding = options.get_property(scope, c"encoding")?;
     let decode_strings = option_or(scope, options, c"decodeStrings", true)?;
-    let high_water_mark = options.val(scope, c"highWaterMark")?;
-    let signal = options.val(scope, c"signal")?;
-    let object_mode_flag = validate_boolean(scope, object_mode, "options.objectMode")?;
+    let high_water_mark = options.get_property(scope, c"highWaterMark")?;
+    let signal = options.get_property(scope, c"signal")?;
+    let object_mode_flag =
+        crate::errors::validate_boolean(scope, object_mode, "options.objectMode")?;
     validate_encoding(scope, encoding)?;
 
-    let writable_object = as_object(scope, writable_stream).expect("streams are objects");
-    let readable_object = as_object(scope, readable_stream).expect("streams are objects");
-    let writer = call_method(scope, writable_object, c"getWriter", &[])?;
-    let reader = call_method(scope, readable_object, c"getReader", &[])?;
-    let state = new_state(scope, COUNT)?;
-    state.set(WRITER, writer)?;
-    state.set(READER, reader)?;
-    state.set(WRITABLE_CLOSED, false)?;
-    state.set(READABLE_CLOSED, false)?;
-    state.set(DECODE_STRINGS, truthy(scope, decode_strings))?;
-    state.set(OBJECT_MODE, object_mode_flag)?;
+    let writer = get_writer(scope, writable_stream)?;
+    let reader = get_reader(scope, readable_stream)?;
+    let state = new_from_web_state(
+        scope,
+        Some(writer),
+        Some(reader),
+        js::conversion::to_boolean(decode_strings),
+        object_mode_flag,
+    )?;
     let stream_options = stream_options(
         scope,
-        &state,
+        state,
         &[
             (c"allowHalfOpen", allow_half_open),
             (c"highWaterMark", high_water_mark),
@@ -971,32 +1080,38 @@ pub(crate) fn duplex_from_web<'s>(
     )?;
     let ctor = super::duplex::duplex::class_constructor(scope)?;
     let duplex = Function::construct(scope, ctor, &[stream_options])?;
-    state.set(STREAM, duplex)?;
-    watch_writer_closed(scope, &state)?;
-    watch_reader_closed(scope, &state)?;
+    state.data_mut().stream = Some(Heap::from(duplex));
+    watch_writer_closed(scope, state)?;
+    watch_reader_closed(scope, state)?;
     Ok(duplex)
+}
+
+/// `promise.then(fulfilled, rejected)`, with `state` as the reactions' payload.
+fn react<'s>(
+    scope: &'s Scope<'_>,
+    promise: js::Promise<'_>,
+    state: impl ToJSVal<'s> + Copy,
+    fulfilled: Callback,
+    rejected: Callback,
+) -> Result<(), ExnThrown> {
+    let fulfilled = Function::new_callback(scope, c"", 1, fulfilled, state)?;
+    let rejected = Function::new_callback(scope, c"", 1, rejected, state)?;
+    promise.then(scope, Some(*fulfilled), Some(*rejected))?;
+    Ok(())
 }
 
 /// `writer.closed.then(...)`: destroy the stream with `ERR_STREAM_PREMATURE_CLOSE` if the
 /// `WritableStream` closes before the stream ended, or with the error it errors with.
-fn watch_writer_closed(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    let writer = state.obj(from_web::WRITER)?;
-    let closed = writer.val(scope, c"closed")?;
-    let fulfilled = method(scope, state, c"", 0, writer_closed)?;
-    let rejected = method(scope, state, c"", 1, web_stream_failed)?;
-    then(scope, closed, Some(fulfilled), Some(rejected))?;
-    Ok(())
+fn watch_writer_closed(scope: &Scope<'_>, state: FromWebState<'_>) -> Result<(), ExnThrown> {
+    let closed = writer_of(scope, state)?.closed(scope);
+    react(scope, closed, state, writer_closed, web_stream_failed)
 }
 
 /// `reader.closed.then(...)`: destroy the stream with the error the `ReadableStream` errors
 /// with.
-fn watch_reader_closed(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    let reader = state.obj(from_web::READER)?;
-    let closed = reader.val(scope, c"closed")?;
-    let fulfilled = method(scope, state, c"", 0, reader_closed)?;
-    let rejected = method(scope, state, c"", 1, web_stream_failed)?;
-    then(scope, closed, Some(fulfilled), Some(rejected))?;
-    Ok(())
+fn watch_reader_closed(scope: &Scope<'_>, state: FromWebState<'_>) -> Result<(), ExnThrown> {
+    let closed = reader_of(scope, state)?.closed(scope);
+    react(scope, closed, state, reader_closed, web_stream_failed)
 }
 
 fn writer_closed(
@@ -1004,12 +1119,11 @@ fn writer_closed(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use from_web::*;
-    let state = state_of(scope, payload)?;
-    state.set(WRITABLE_CLOSED, true)?;
-    let stream = state.get(STREAM)?;
+    let state = cast_payload::<FromWebState>(scope, payload);
+    state.data_mut().writable_closed = true;
+    let stream = stream_of(scope, state);
     if is_writable_ended(scope, stream)? != Some(true) {
-        let error = error_value(scope, super::eos::premature_close())?;
+        let error = super::eos::premature_close().to_value(scope)?;
         super::destroy::destroyer(scope, stream, error)?;
     }
     Ok(js::value::undefined())
@@ -1020,7 +1134,9 @@ fn reader_closed(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    state_of(scope, payload)?.set(from_web::READABLE_CLOSED, true)?;
+    cast_payload::<FromWebState>(scope, payload)
+        .data_mut()
+        .readable_closed = true;
     Ok(js::value::undefined())
 }
 
@@ -1031,58 +1147,54 @@ fn web_stream_failed(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use from_web::*;
-    let state = state_of(scope, payload)?;
-    state.set(WRITABLE_CLOSED, true)?;
-    state.set(READABLE_CLOSED, true)?;
-    super::destroy::destroyer(scope, state.get(STREAM)?, args.get(0))?;
+    let state = cast_payload::<FromWebState>(scope, payload);
+    {
+        let mut data = state.data_mut();
+        data.writable_closed = true;
+        data.readable_closed = true;
+    }
+    super::destroy::destroyer(scope, stream_of(scope, state), args.get(0))?;
     Ok(js::value::undefined())
 }
 
 /// How [`done`] handles an exception the callback of a `fromWeb` stream's method throws.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 enum OnThrow {
     /// Destroy the stream with it.
+    #[default]
     Destroy,
     /// Destroy the stream with it in a tick.
     DestroyInTick,
-    /// Throw it in a tick.
-    ThrowInTick,
 }
 
-impl OnThrow {
-    fn code(self) -> i32 {
-        self as i32
-    }
-
-    fn of(value: HandleValue<'_>) -> Self {
-        match value.to_int32() {
-            0 => OnThrow::Destroy,
-            1 => OnThrow::DestroyInTick,
-            _ => OnThrow::ThrowInTick,
-        }
-    }
+/// A call of a `fromWeb` stream's `write`, `writev` or `final`: the adapter state, the chunk or
+/// chunks to write, the callback, and how an exception the callback throws is handled.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct WebWrite {
+    state: Heap<FromWebStateImpl>,
+    chunk: Heap<Value>,
+    callback: Heap<Value>,
+    #[no_trace]
+    on_throw: OnThrow,
 }
 
-/// Promise reactions that call `callback`: with no error once the promise fulfills, and with the
-/// reason once it rejects. An exception `callback` throws is handled according to `on_throw`.
-fn done_reactions<'s>(
+#[core_runtime::jsmethods]
+impl WebWrite {}
+
+/// A new [`WebWrite`].
+fn new_web_write<'s>(
     scope: &'s Scope<'_>,
-    state: &Captures<'_>,
+    state: FromWebState<'_>,
+    chunk: HandleValue<'_>,
     callback: HandleValue<'_>,
     on_throw: OnThrow,
-) -> Result<(Object<'s>, Object<'s>), ExnThrown> {
-    let captures = js::Array::with_contents(
-        scope,
-        &[
-            state.array_value()?,
-            callback.get(),
-            js::value::from_i32(on_throw.code()),
-        ],
-    )?;
-    let fulfilled = Function::new_callback(scope, c"", 1, done_fulfilled, *captures)?;
-    let rejected = Function::new_callback(scope, c"", 1, done_rejected, *captures)?;
-    Ok((*fulfilled, *rejected))
+) -> Result<WebWrite<'s>, ExnThrown> {
+    js::class::create_instance_with::<WebWriteImpl>(scope, |_| WebWriteImpl {
+        state: Heap::from(state),
+        chunk: Heap::from(chunk.get()),
+        callback: Heap::from(callback.get()),
+        on_throw,
+    })
 }
 
 fn done_fulfilled(
@@ -1090,7 +1202,7 @@ fn done_fulfilled(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    done(scope, payload, None)
+    done(scope, cast_payload::<WebWrite>(scope, payload), None)
 }
 
 fn done_rejected(
@@ -1098,78 +1210,60 @@ fn done_rejected(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    done(scope, payload, Some(args.get(0)))
+    done(
+        scope,
+        cast_payload::<WebWrite>(scope, payload),
+        Some(args.get(0)),
+    )
 }
 
-/// Node's `done(error)` of the `fromWeb` streams' methods, whose captures are `[state, callback,
-/// onThrow]`.
+/// Node's `done(error)` of the `fromWeb` streams' methods.
 fn done(
     scope: &Scope<'_>,
-    payload: HandleValue<'_>,
+    write: WebWrite<'_>,
     error: Option<HandleValue<'_>>,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let state = Captures::of(scope, captures.get(0)?)?;
-    if call_back(scope, captures.get(1)?, error).is_err() {
-        let thrown = take_exception(scope);
-        let stream = state.get(from_web::STREAM)?;
-        match OnThrow::of(captures.get(2)?) {
+    let (state, callback, on_throw) = {
+        let data = write.data();
+        (
+            data.state.get(scope),
+            data.callback.get(scope),
+            data.on_throw,
+        )
+    };
+    let args: Vec<HandleValue<'_>> = error.into_iter().collect();
+    if Function::call(scope, HandleValue::undefined(), callback, &args).is_err() {
+        let thrown = js::exception::take_pending_or_undefined(scope);
+        let stream = stream_of(scope, state);
+        match on_throw {
             OnThrow::Destroy => super::destroy::destroyer(scope, stream, thrown)?,
             OnThrow::DestroyInTick => {
-                next_tick(scope, destroy_in_tick, &[stream.get(), thrown.get()])?
+                js::jobs::queue_native_tick(scope, destroy_in_tick, stream, &[thrown])?
             }
-            OnThrow::ThrowInTick => next_tick(scope, throw_in_tick, &[thrown.get()])?,
         }
     }
     Ok(js::value::undefined())
 }
 
-/// `process.nextTick(() => destroy(stream, error))`, whose captures are `[stream, error]`.
+/// `process.nextTick(() => destroy(stream, error))`, whose payload is the stream and whose
+/// argument is the error.
 fn destroy_in_tick(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
+    args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    super::destroy::destroyer(scope, captures.get(0)?, captures.get(1)?)?;
+    super::destroy::destroyer(scope, payload, args.get(0))?;
     Ok(js::value::undefined())
 }
 
-/// `process.nextTick(() => { throw error; })`, whose captures are `[error]`.
-fn throw_in_tick(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let error = Captures::of(scope, payload)?.get(0)?;
-    Err(js::exception::set_pending(
-        scope,
-        error,
-        js::native::ExceptionStackBehavior::Capture,
-    ))
-}
-
-/// `writer.ready.then(after).then(done, done)`, with the captures `[state, value]` for `after`.
-fn after_ready(
-    scope: &Scope<'_>,
-    state: &Captures<'_>,
-    after: Callback,
-    value: HandleValue<'_>,
-    callback: HandleValue<'_>,
-    on_throw: OnThrow,
-) -> Result<(), ExnThrown> {
-    let writer = state.obj(from_web::WRITER)?;
-    let ready = writer.val(scope, c"ready")?;
-    let after = closure(
-        scope,
-        1,
-        after,
-        &[state.array.to_jsval_throwing(scope)?, value],
-    )?;
-    let written = then(scope, ready, Some(after), None)?;
-    let (fulfilled, rejected) = done_reactions(scope, state, callback, on_throw)?;
-    written.then(scope, Some(fulfilled), Some(rejected))?;
-    Ok(())
+/// `writer.ready.then(after).then(done, done)`, with `write` as the payload of `after` and of
+/// `done`.
+fn after_ready(scope: &Scope<'_>, write: WebWrite<'_>, after: Callback) -> Result<(), ExnThrown> {
+    let state = write.data().state.get(scope);
+    let ready = writer_of(scope, state)?.ready(scope);
+    let after = Function::new_callback(scope, c"", 1, after, write)?;
+    let written = ready.then(scope, Some(*after), None)?;
+    react(scope, written, write, done_fulfilled, done_rejected)
 }
 
 /// The `writev(chunks, callback)` of the `fromWeb` streams: write each chunk once the writer is
@@ -1179,40 +1273,44 @@ fn web_writev(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    after_ready(
+    let state = cast_payload::<FromWebState>(scope, payload);
+    let write = new_web_write(
         scope,
-        &state,
-        write_all,
+        state,
         args.get(0),
         args.get(1),
         OnThrow::DestroyInTick,
     )?;
+    after_ready(scope, write, write_all)?;
     Ok(js::value::undefined())
 }
 
-/// `SafePromiseAllReturnVoid(chunks, (data) => writer.write(data.chunk))`, whose captures are
-/// `[state, chunks]`.
+/// `SafePromiseAllReturnVoid(chunks, (data) => writer.write(data.chunk))`, whose payload is the
+/// [`WebWrite`].
 fn write_all(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let state = Captures::of(scope, captures.get(0)?)?;
-    let writer = state.obj(from_web::WRITER)?;
-    let chunks = captures.obj(1)?;
+    let write = cast_payload::<WebWrite>(scope, payload);
+    let (state, chunks) = {
+        let data = write.data();
+        (data.state.get(scope), data.chunk.get(scope))
+    };
+    let writer = writer_of(scope, state)?;
+    let chunks = Object::from_value_coerce(scope, chunks)?;
+    let length = chunks.get_property(scope, c"length")?;
+    let length = f64::from_jsval(scope, length, ()).map_err(|_| ExnThrown)? as u32;
     let mut writes = Vec::new();
-    for index in 0..chunks.num(scope, c"length")? as u32 {
+    for index in 0..length {
         let data = chunks.get_element(scope, index)?;
-        let chunk = Object::from_value_coerce(scope, data)?.val(scope, c"chunk")?;
-        let written = call_method(scope, writer, c"write", &[chunk])?;
-        writes.push(js::Promise::call_original_resolve(scope, written)?);
+        let chunk = Object::from_value_coerce(scope, data)?.get_property(scope, c"chunk")?;
+        writes.push(or_rejected(scope, writer.write(scope, Some(chunk)))?);
     }
     let handles: Vec<_> = writes.iter().map(|promise| promise.handle()).collect();
     let all = js::Promise::wait_for_all_from(scope, &handles)?;
-    let fulfilled = Function::new_callback(scope, c"", 0, noop, ())?;
-    all.then(scope, Some(*fulfilled), None)?
+    let fulfilled = noop_function(scope)?;
+    all.then(scope, Some(fulfilled), None)?
         .to_jsval_raw_throwing(scope)
 }
 
@@ -1223,44 +1321,41 @@ fn web_write(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use from_web::*;
-    let state = state_of(scope, payload)?;
+    let state = cast_payload::<FromWebState>(scope, payload);
     let mut chunk = args.get(0);
-    if chunk.is_string() && state.flag(DECODE_STRINGS)? && !state.flag(OBJECT_MODE)? {
+    let (decode_strings, object_mode) = {
+        let data = state.data();
+        (data.decode_strings, data.object_mode)
+    };
+    if chunk.is_string() && decode_strings && !object_mode {
         let buffer = buffer_from(scope, &[chunk, args.get(1)])?;
-        let buffer = as_object(scope, buffer).expect("buffers are objects");
-        let view = construct(
+        let buffer = js::ArrayBufferView::from_value(scope, buffer).expect("buffers are views");
+        let view = js::Uint8Array::with_buffer(
             scope,
-            c"Uint8Array",
-            &[
-                buffer.val(scope, c"buffer")?,
-                buffer.val(scope, c"byteOffset")?,
-                buffer.val(scope, c"byteLength")?,
-            ],
+            buffer.viewed_buffer(scope)?,
+            buffer.byte_offset(),
+            buffer.byte_length(),
         )?;
-        chunk = view.to_jsval_throwing(scope)?;
+        chunk = scope.root_value(view.as_value());
     }
-    after_ready(
-        scope,
-        &state,
-        write_one,
-        chunk,
-        args.get(2),
-        OnThrow::Destroy,
-    )?;
+    let write = new_web_write(scope, state, chunk, args.get(2), OnThrow::Destroy)?;
+    after_ready(scope, write, write_one)?;
     Ok(js::value::undefined())
 }
 
-/// `writer.write(chunk)`, whose captures are `[state, chunk]`.
+/// `writer.write(chunk)`, whose payload is the [`WebWrite`].
 fn write_one(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let state = Captures::of(scope, captures.get(0)?)?;
-    let writer = state.obj(from_web::WRITER)?;
-    Ok(call_method(scope, writer, c"write", &[captures.get(1)?])?.get())
+    let write = cast_payload::<WebWrite>(scope, payload);
+    let (state, chunk) = {
+        let data = write.data();
+        (data.state.get(scope), data.chunk.get(scope))
+    };
+    let writer = writer_of(scope, state)?;
+    or_rejected(scope, writer.write(scope, Some(chunk)))?.to_jsval_raw_throwing(scope)
 }
 
 /// The `final(callback)` of the `fromWeb` streams: close the writer unless the `WritableStream`
@@ -1270,13 +1365,17 @@ fn web_final(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use from_web::*;
-    let state = state_of(scope, payload)?;
-    if !state.flag(WRITABLE_CLOSED)? {
-        let closed = call_method(scope, state.obj(WRITER)?, c"close", &[])?;
-        let (fulfilled, rejected) =
-            done_reactions(scope, &state, args.get(0), OnThrow::DestroyInTick)?;
-        then(scope, closed, Some(fulfilled), Some(rejected))?;
+    let state = cast_payload::<FromWebState>(scope, payload);
+    if !state.data().writable_closed {
+        let closed = or_rejected(scope, writer_of(scope, state)?.close(scope))?;
+        let write = new_web_write(
+            scope,
+            state,
+            HandleValue::undefined(),
+            args.get(0),
+            OnThrow::DestroyInTick,
+        )?;
+        react(scope, closed, write, done_fulfilled, done_rejected)?;
     }
     Ok(js::value::undefined())
 }
@@ -1287,11 +1386,9 @@ fn web_read(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let read = call_method(scope, state.obj(from_web::READER)?, c"read", &[])?;
-    let fulfilled = method(scope, &state, c"", 1, web_read_result)?;
-    let rejected = method(scope, &state, c"", 1, web_read_failed)?;
-    then(scope, read, Some(fulfilled), Some(rejected))?;
+    let state = cast_payload::<FromWebState>(scope, payload);
+    let read = or_rejected(scope, reader_of(scope, state)?.read(scope))?;
+    react(scope, read, state, web_read_result, web_read_failed)?;
     Ok(js::value::undefined())
 }
 
@@ -1300,13 +1397,19 @@ fn web_read_result(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let stream = state.obj(from_web::STREAM)?;
+    let state = cast_payload::<FromWebState>(scope, payload);
+    let stream = Object::from_value(scope, stream_of(scope, state))
+        .map_err(|_| js::error::TypeError(String::from("no stream")).throw(scope))?;
     let result = Object::from_value_coerce(scope, args.get(0))?;
-    if truthy(scope, result.val(scope, c"done")?) {
-        call_method(scope, stream, c"push", &[HandleValue::null()])?;
+    if js::conversion::to_boolean(result.get_property(scope, c"done")?) {
+        Function::call_by_name(scope, stream.handle(), c"push", &[HandleValue::null()])?;
     } else {
-        call_method(scope, stream, c"push", &[result.val(scope, c"value")?])?;
+        Function::call_by_name(
+            scope,
+            stream.handle(),
+            c"push",
+            &[result.get_property(scope, c"value")?],
+        )?;
     }
     Ok(js::value::undefined())
 }
@@ -1316,34 +1419,63 @@ fn web_read_failed(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    super::destroy::destroyer(scope, state.get(from_web::STREAM)?, args.get(0))?;
+    let state = cast_payload::<FromWebState>(scope, payload);
+    super::destroy::destroyer(scope, stream_of(scope, state), args.get(0))?;
     Ok(js::value::undefined())
 }
 
-/// A function that calls the destroy callback with `error`, for the promise of
-/// `destroy(error, callback)`.
-fn destroy_done_reactions<'s>(
+/// The state of the `destroy(error, callback)` of the `fromWeb` streams: the callback and the
+/// error.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct DestroyDone {
+    callback: Heap<Value>,
+    error: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl DestroyDone {}
+
+/// The function calling `callback` with `error`, for the promise of `destroy(error, callback)`.
+fn destroy_done_function<'s>(
     scope: &'s Scope<'_>,
     callback: HandleValue<'_>,
     error: HandleValue<'_>,
 ) -> Result<Object<'s>, ExnThrown> {
-    closure(scope, 0, destroy_done, &[callback.get(), error.get()])
+    let state = js::class::create_instance_with::<DestroyDoneImpl>(scope, |_| DestroyDoneImpl {
+        callback: Heap::from(callback.get()),
+        error: Heap::from(error.get()),
+    })?;
+    Ok(*Function::new_callback(scope, c"", 0, destroy_done, state)?)
 }
 
-/// Node's `done()` of the `fromWeb` streams' `destroy`, whose captures are `[callback, error]`:
-/// call the callback with the error, and throw an exception it throws in a tick.
+/// Node's `done()` of the `fromWeb` streams' `destroy`, whose payload is a [`DestroyDone`]: call
+/// the callback with the error, and throw an exception it throws in a tick.
 fn destroy_done(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    if call_back(scope, captures.get(0)?, Some(captures.get(1)?)).is_err() {
-        let thrown = take_exception(scope);
-        next_tick(scope, throw_in_tick, &[thrown.get()])?;
+    let state = cast_payload::<DestroyDone>(scope, payload);
+    let (callback, error) = {
+        let data = state.data();
+        (data.callback.get(scope), data.error.get(scope))
+    };
+    if Function::call(scope, HandleValue::undefined(), callback, &[error]).is_err() {
+        let thrown = js::exception::take_pending_or_undefined(scope);
+        js::jobs::queue_native_tick(scope, crate::support::throw_in_tick, thrown, &[])?;
     }
     Ok(js::value::undefined())
+}
+
+/// Call `done` with no arguments.
+fn call_done(scope: &Scope<'_>, done: Object<'_>) -> Result<(), ExnThrown> {
+    Function::call(
+        scope,
+        HandleValue::undefined(),
+        done.to_jsval_throwing(scope)?,
+        js::function::EmptyArgs,
+    )?;
+    Ok(())
 }
 
 /// The `destroy(error, callback)` of [`writable_from_web`]: abort the writer with `error`, or
@@ -1353,26 +1485,20 @@ fn writable_from_web_destroy(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use from_web::*;
-    let state = state_of(scope, payload)?;
+    let state = cast_payload::<FromWebState>(scope, payload);
     let (error, callback) = (args.get(0), args.get(1));
-    let done = destroy_done_reactions(scope, callback, error)?;
-    if !state.flag(WRITABLE_CLOSED)? {
-        let writer = state.obj(WRITER)?;
-        let closed = if is_nullish(error) {
-            call_method(scope, writer, c"close", &[])?
+    let done = destroy_done_function(scope, callback, error)?;
+    if !state.data().writable_closed {
+        let writer = writer_of(scope, state)?;
+        let closed = if error.is_null_or_undefined() {
+            writer.close(scope)
         } else {
-            call_method(scope, writer, c"abort", &[error])?
+            writer.abort(scope, error)
         };
-        then(scope, closed, Some(done), Some(done))?;
+        or_rejected(scope, closed)?.then(scope, Some(done), Some(done))?;
         return Ok(js::value::undefined());
     }
-    call(
-        scope,
-        HandleValue::undefined(),
-        done.to_jsval_throwing(scope)?,
-        &[],
-    )?;
+    call_done(scope, done)?;
     Ok(js::value::undefined())
 }
 
@@ -1383,21 +1509,15 @@ fn readable_from_web_destroy(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use from_web::*;
-    let state = state_of(scope, payload)?;
+    let state = cast_payload::<FromWebState>(scope, payload);
     let (error, callback) = (args.get(0), args.get(1));
-    let done = destroy_done_reactions(scope, callback, error)?;
-    if !state.flag(READABLE_CLOSED)? {
-        let canceled = call_method(scope, state.obj(READER)?, c"cancel", &[error])?;
-        then(scope, canceled, Some(done), Some(done))?;
+    let done = destroy_done_function(scope, callback, error)?;
+    if !state.data().readable_closed {
+        let canceled = reader_of(scope, state)?.cancel(scope, Some(error));
+        or_rejected(scope, canceled)?.then(scope, Some(done), Some(done))?;
         return Ok(js::value::undefined());
     }
-    call(
-        scope,
-        HandleValue::undefined(),
-        done.to_jsval_throwing(scope)?,
-        &[],
-    )?;
+    call_done(scope, done)?;
     Ok(js::value::undefined())
 }
 
@@ -1408,31 +1528,29 @@ fn duplex_from_web_destroy(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use from_web::*;
-    let state = state_of(scope, payload)?;
+    let state = cast_payload::<FromWebState>(scope, payload);
     let (error, callback) = (args.get(0), args.get(1));
-    let done = destroy_done_reactions(scope, callback, error)?;
-    let writable_closed = state.flag(WRITABLE_CLOSED)?;
-    let readable_closed = state.flag(READABLE_CLOSED)?;
+    let done = destroy_done_function(scope, callback, error)?;
+    let (writable_closed, readable_closed) = {
+        let data = state.data();
+        (data.writable_closed, data.readable_closed)
+    };
     if writable_closed && readable_closed {
-        call(
-            scope,
-            HandleValue::undefined(),
-            done.to_jsval_throwing(scope)?,
-            &[],
-        )?;
+        call_done(scope, done)?;
         return Ok(js::value::undefined());
     }
-    let side =
-        |closed: bool, owner: u32, name: &'static CStr| -> Result<js::Promise<'_>, ExnThrown> {
-            if closed {
-                return js::Promise::new_resolved_with_value(scope, HandleValue::undefined());
-            }
-            let result = call_method(scope, state.obj(owner)?, name, &[error])?;
-            js::Promise::call_original_resolve(scope, result)
-        };
-    let writer = side(writable_closed, WRITER, c"abort")?;
-    let reader = side(readable_closed, READER, c"cancel")?;
+    let writer = if writable_closed {
+        js::Promise::new_resolved_with_value(scope, HandleValue::undefined())?
+    } else {
+        let aborted = or_rejected(scope, writer_of(scope, state)?.abort(scope, error))?;
+        js::Promise::call_original_resolve(scope, aborted)?
+    };
+    let reader = if readable_closed {
+        js::Promise::new_resolved_with_value(scope, HandleValue::undefined())?
+    } else {
+        let canceled = or_rejected(scope, reader_of(scope, state)?.cancel(scope, Some(error)))?;
+        js::Promise::call_original_resolve(scope, canceled)?
+    };
     let all = js::Promise::wait_for_all_from(scope, &[writer.handle(), reader.handle()])?;
     all.then(scope, Some(done), Some(done))?;
     Ok(js::value::undefined())
@@ -1447,36 +1565,35 @@ pub(crate) fn duplex_to_web<'s>(
     duplex: HandleValue<'_>,
     options: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, Thrown> {
-    let has_state = |name: &'static CStr| -> Result<bool, ExnThrown> {
-        let value = match as_object(scope, duplex) {
-            Some(object) => object.val(scope, name)?,
-            None => return Ok(false),
-        };
-        Ok(value.is_object() || value.is_null())
+    let has_states = match Object::from_value(scope, duplex) {
+        Ok(object) => {
+            let sides = sides(scope, object)?;
+            sides.readable.is_some() && sides.writable.is_some()
+        }
+        Err(_) => false,
     };
-    if !has_state(c"_writableState")? || !has_state(c"_readableState")? {
+    if !has_states {
         return Err(invalid_type(scope, "duplex", "an stream.Duplex", duplex));
     }
     let options = options_object(scope, options, "options")?;
-    let readable_options = null_prototype_object(scope)?;
-    let mut kind = options.val(scope, c"readableType")?;
-    if is_nullish(kind) {
-        kind = options.val(scope, c"type")?;
+    let mut kind = options.get_property(scope, c"readableType")?;
+    if kind.is_null_or_undefined() {
+        kind = options.get_property(scope, c"type")?;
     }
+    let readable_options = Object::new_with_null_prototype(scope)?;
     readable_options.set_property(scope, c"type", kind)?;
     let readable_options_value = readable_options.to_jsval_throwing(scope)?;
-    let empty_source = || -> Result<HandleValue<'_>, ExnThrown> {
-        let source = Object::new_plain(scope)?;
-        source.set_property(scope, c"type", kind)?;
-        source.to_jsval_throwing(scope)
+    let canceled_readable = || -> Result<Object<'_>, ExnThrown> {
+        let source = typed_source(scope, kind)?.to_jsval_throwing(scope)?;
+        let readable = ReadableStream::new(scope, Some(source), None)?;
+        or_rejected(scope, readable.cancel(scope, None))?;
+        Ok(*readable)
     };
 
     let pair = Object::new_plain(scope)?;
     if is_destroyed(scope, duplex)? == Some(true) {
-        let writable = construct(scope, c"WritableStream", &[])?;
-        let readable = construct(scope, c"ReadableStream", &[empty_source()?])?;
-        call_method(scope, writable, c"close", &[])?;
-        call_method(scope, readable, c"cancel", &[])?;
+        let writable = closed_writable_stream(scope)?;
+        let readable = canceled_readable()?;
         pair.set_property(scope, c"readable", readable)?;
         pair.set_property(scope, c"writable", writable)?;
         return Ok(pair);
@@ -1485,19 +1602,13 @@ pub(crate) fn duplex_to_web<'s>(
     let writable = if is_writable(scope, duplex)? == Some(true) {
         writable_to_web(scope, duplex)?
     } else {
-        construct(scope, c"WritableStream", &[])?
+        closed_writable_stream(scope)?
     };
-    if is_writable(scope, duplex)? != Some(true) {
-        call_method(scope, writable, c"close", &[])?;
-    }
     let readable = if is_readable(scope, duplex)? == Some(true) {
         readable_to_web(scope, duplex, Some(readable_options_value))?
     } else {
-        construct(scope, c"ReadableStream", &[empty_source()?])?
+        canceled_readable()?
     };
-    if is_readable(scope, duplex)? != Some(true) {
-        call_method(scope, readable, c"cancel", &[])?;
-    }
     pair.set_property(scope, c"writable", writable)?;
     pair.set_property(scope, c"readable", readable)?;
     Ok(pair)

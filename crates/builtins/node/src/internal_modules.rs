@@ -6,6 +6,7 @@
 //! `_http_outgoing` and `_http_server`, which hold `http` classes and helpers. Their other exports
 //! are stubs, as are the other internal modules' exports.
 
+use crate::support::Props;
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::ExnThrown;
 use js::function::CallbackArgs;
@@ -13,8 +14,6 @@ use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
-
-use crate::stream::{string, Props};
 
 /// The internal modules with implemented exports, and the module and export each one's value
 /// comes from, or `None` for the modules whose value is an object of `http` members.
@@ -112,11 +111,14 @@ fn check_invalid_header_char(
 
 /// A case-insensitive regular expression for `pattern`.
 fn regexp<'s>(scope: &'s Scope<'_>, pattern: &str) -> Result<Object<'s>, ExnThrown> {
-    let class = scope.global().obj(scope, c"RegExp")?.ok_or(ExnThrown)?;
+    let class = crate::support::class_object(scope, js::class_spec::JSProtoKey::JSProto_RegExp)?;
     Function::construct(
         scope,
         class,
-        &[string(scope, pattern)?, string(scope, "i")?],
+        &[
+            js::conversion::ToJSVal::to_jsval_throwing(pattern, scope)?,
+            js::class::get_or_init_atom(scope, c"i")?,
+        ],
     )
 }
 
@@ -137,8 +139,9 @@ fn module_value<'s>(scope: &'s Scope<'_>, name: &str) -> Result<Object<'s>, ExnT
         value.set_property(scope, target, http.val(scope, source)?)?;
     }
     if name == "node:_http_common" {
-        let methods = http.obj(scope, c"METHODS")?.ok_or(ExnThrown)?;
-        let methods = crate::stream::call_method(scope, methods, c"slice", &[])?;
+        let methods = crate::support::as_array(scope, http.val(scope, c"METHODS")?)
+            .ok_or_else(|| js::error::TypeError("http.METHODS is missing".into()).throw(scope))?;
+        let methods = js::Array::with_contents(scope, &methods.to_vec(scope)?)?;
         value.set_property(scope, c"methods", methods)?;
         value.set_property(scope, c"CRLF", "\r\n")?;
         value.set_property(
@@ -182,6 +185,8 @@ pub(crate) fn register(scope: &Scope<'_>, name: &'static str) -> bool {
             exports.push((export, member));
         }
         exports.push(("default", value.to_jsval_throwing(scope)?));
+        // SAFETY: the caller guarantees the module loader is initialized, and every value is
+        // rooted.
         core_runtime::module::register_synthetic_module(scope, name, &exports)
     };
     register().is_ok()

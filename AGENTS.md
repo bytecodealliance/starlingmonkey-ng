@@ -5,6 +5,8 @@ Read these before changing the runtime:
 - [docs/builtin-development.md](docs/builtin-development.md): the practices all builtins follow,
   how to verify changes, and how to work on this repository as an agent.
 - [docs/rooting.md](docs/rooting.md): GC rooting for any code that handles JS values.
+- [docs/node-compat.md](docs/node-compat.md#implementation-rules): the implementation rules for the
+  Node.js builtins in `crates/builtins/node`.
 
 The rules that past changes most often broke:
 

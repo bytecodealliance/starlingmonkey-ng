@@ -111,3 +111,19 @@ const refreshedUnref = setTimeout(() => {
 }, 60_000).unref();
 eq(refreshedUnref.refresh().hasRef(), false, "refresh keeps a timer unreferenced");
 setImmediate(() => {}).unref();
+
+// A fired immediate is unreferenced and drops its callback, and refreshing a fired timeout gives it
+// a new async ID.
+{
+  const fired = setImmediate(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  eq(fired.hasRef(), false, "a fired immediate is unreferenced");
+  eq(fired._onImmediate, undefined, "a fired immediate drops its callback");
+  const timeout = setTimeout(() => {}, 1);
+  const asyncId = Object.getOwnPropertySymbols(timeout).find((symbol) => String(symbol) === "Symbol(asyncId)");
+  const before = timeout[asyncId];
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  timeout.refresh();
+  eq(timeout[asyncId] !== before, true, "refreshing a fired timeout gives it a new async ID");
+  clearTimeout(timeout);
+}

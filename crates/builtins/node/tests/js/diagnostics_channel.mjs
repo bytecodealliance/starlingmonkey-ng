@@ -111,3 +111,23 @@ const falsyTrace = tracingChannel("falsy");
 falsyTrace.subscribe({ start: null, asyncStart: (context) => falsy.push(["asyncStart", context.result]), error: () => falsy.push(["error"]) });
 falsyTrace.traceCallback((callback) => callback(0, "zero"), -1, {}, null, () => {});
 deepEq(falsy, [["asyncStart", "zero"]], "a falsy callback error is success");
+eq(falsyTrace.traceCallback((callback) => callback(null, 1), -1, {}, null, () => "returned"), undefined, "the substituted callback returns undefined");
+
+// A subscriber's exception is rethrown in the tick queue, before the microtasks queued earlier.
+{
+  const order = [];
+  const listener = (error) => order.push(`uncaught ${error.message}`);
+  process.on("uncaughtException", listener);
+  const thrower = channel("throwing in a tick");
+  const subscriber = () => { throw new Error("boom"); };
+  thrower.subscribe(subscriber);
+  await new Promise((resolve) => setTimeout(() => {
+    Promise.resolve().then(() => order.push("microtask"));
+    process.nextTick(() => order.push("nextTick"));
+    thrower.publish(1);
+    setTimeout(resolve, 1);
+  }, 1));
+  process.off("uncaughtException", listener);
+  thrower.unsubscribe(subscriber);
+  deepEq(order, ["nextTick", "uncaught boom", "microtask"], "a subscriber's exception is reported in the tick queue");
+}

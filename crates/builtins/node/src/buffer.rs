@@ -47,16 +47,24 @@ pub enum Encoding {
 impl Encoding {
     /// The encoding `name` names, case-insensitively, as Node accepts it.
     pub fn parse(name: &str) -> Option<Self> {
-        Some(match name.to_ascii_lowercase().as_str() {
-            "utf8" | "utf-8" => Encoding::Utf8,
-            "ucs2" | "ucs-2" | "utf16le" | "utf-16le" => Encoding::Utf16le,
-            "latin1" | "binary" => Encoding::Latin1,
-            "ascii" => Encoding::Ascii,
-            "base64" => Encoding::Base64,
-            "base64url" => Encoding::Base64Url,
-            "hex" => Encoding::Hex,
-            _ => return None,
-        })
+        const NAMES: [(&str, Encoding); 12] = [
+            ("utf8", Encoding::Utf8),
+            ("utf-8", Encoding::Utf8),
+            ("ucs2", Encoding::Utf16le),
+            ("ucs-2", Encoding::Utf16le),
+            ("utf16le", Encoding::Utf16le),
+            ("utf-16le", Encoding::Utf16le),
+            ("latin1", Encoding::Latin1),
+            ("binary", Encoding::Latin1),
+            ("ascii", Encoding::Ascii),
+            ("base64", Encoding::Base64),
+            ("base64url", Encoding::Base64Url),
+            ("hex", Encoding::Hex),
+        ];
+        NAMES
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|(_, encoding)| *encoding)
     }
 }
 
@@ -177,26 +185,18 @@ pub fn encode_string(
     Ok(bytes)
 }
 
-/// `bytes` as base64 in the standard alphabet with padding, or the URL-safe one without.
-pub(crate) fn encode_base64(bytes: &[u8], url: bool) -> String {
-    const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let alphabet = if url { URL } else { STANDARD };
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for index in 0..=chunk.len() {
-            out.push(alphabet[(n >> (18 - 6 * index)) as usize & 63] as char);
-        }
-        if !url {
-            for _ in chunk.len()..3 {
-                out.push('=');
-            }
-        }
-    }
-    out
+/// The lowercase hexadecimal digits of `bytes`, two per byte.
+pub(crate) fn hex_digits(bytes: &[u8]) -> Vec<u8> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                DIGITS[usize::from(byte >> 4)],
+                DIGITS[usize::from(byte & 0xf)],
+            ]
+        })
+        .collect()
 }
 
 /// `bytes` decoded as `encoding` into a JS string.
@@ -223,7 +223,7 @@ pub fn decode_bytes<'s>(
         .throw(scope));
     }
     match encoding {
-        Encoding::Utf8 => js::JSString::from_str(scope, &String::from_utf8_lossy(bytes)),
+        Encoding::Utf8 => js::JSString::from_utf8_lossy(scope, bytes),
         Encoding::Latin1 => js::JSString::from_latin1(scope, bytes),
         Encoding::Ascii => {
             let ascii: Vec<u8> = bytes.iter().map(|byte| byte & 0x7f).collect();
@@ -238,21 +238,15 @@ pub fn decode_bytes<'s>(
                 .collect();
             js::JSString::from_utf16(scope, &units)
         }
-        Encoding::Base64 => js::JSString::from_str(scope, &encode_base64(bytes, false)),
-        Encoding::Base64Url => js::JSString::from_str(scope, &encode_base64(bytes, true)),
-        Encoding::Hex => {
-            const DIGITS: &[u8; 16] = b"0123456789abcdef";
-            let hex: Vec<u8> = bytes
-                .iter()
-                .flat_map(|byte| {
-                    [
-                        DIGITS[usize::from(byte >> 4)],
-                        DIGITS[usize::from(byte & 15)],
-                    ]
-                })
-                .collect();
-            js::JSString::from_latin1(scope, &hex)
+        Encoding::Base64 | Encoding::Base64Url => {
+            let url = encoding == Encoding::Base64Url;
+            let Some(text) = web_globals::base64::encode(bytes, url) else {
+                js::exception::report_out_of_memory(scope);
+                return Err(ExnThrown);
+            };
+            js::JSString::from_str(scope, &text)
         }
+        Encoding::Hex => js::JSString::from_latin1(scope, &hex_digits(bytes)),
     }
 }
 
@@ -260,11 +254,9 @@ pub fn decode_bytes<'s>(
 // Buffer objects
 // ============================================================================
 
-/// `Buffer.prototype` in the current realm.
+/// `Buffer.prototype` in the current realm, as `Buffer` was created with it.
 fn buffer_prototype<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let ctor = buffer::class_constructor(scope)?;
-    let proto = ctor.get_property(scope, c"prototype")?;
-    Object::from_value(scope, proto).map_err(|e| e.throw(scope))
+    buffer::prototype_object(scope)
 }
 
 /// A new `Buffer` holding a copy of `bytes`.
@@ -273,6 +265,38 @@ pub fn new_buffer<'s>(scope: &'s Scope<'_>, bytes: &[u8]) -> Result<Object<'s>, 
     let array: Object<'s> = *array.as_array_buffer_view();
     array.set_prototype(scope, buffer_prototype(scope)?.handle())?;
     Ok(array)
+}
+
+/// A new zero-filled `Buffer` of `length` bytes.
+fn new_zeroed_buffer<'s>(scope: &'s Scope<'_>, length: usize) -> Result<Object<'s>, ExnThrown> {
+    let array = js::Uint8Array::new(scope, length)?;
+    let array: Object<'s> = *array.as_array_buffer_view();
+    array.set_prototype(scope, buffer_prototype(scope)?.handle())?;
+    Ok(array)
+}
+
+/// A new `Buffer` of `length` bytes that `fill` writes. `fill` must not call into SpiderMonkey.
+pub(crate) fn new_buffer_with<'s>(
+    scope: &'s Scope<'_>,
+    length: usize,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), ExnThrown> + Send,
+) -> Result<Object<'s>, ExnThrown> {
+    let buffer = new_zeroed_buffer(scope, length)?;
+    let view = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
+    view.with_bytes_mut(fill)?;
+    Ok(buffer)
+}
+
+/// A new `Buffer` of the UTF-8 encoding of `string`.
+fn utf8_buffer<'s>(
+    scope: &'s Scope<'_>,
+    string: js::JSString<'_>,
+) -> Result<Object<'s>, ExnThrown> {
+    let length = string.utf8_length(scope)?;
+    let buffer = new_zeroed_buffer(scope, length)?;
+    let view = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
+    string.write_utf8(scope, view, 0..length)?;
+    Ok(buffer)
 }
 
 /// A new `Buffer` viewing `length` bytes of `buffer` from `offset`.
@@ -324,18 +348,13 @@ fn adjust_offset(
     })
 }
 
-/// Whether `value` is truthy, as JS's `ToBoolean` converts it.
-fn truthy(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-    bool::from_jsval(scope, value, ()).unwrap_or(false)
-}
-
 /// `value`, unless it is missing or `undefined`.
 fn defined(value: Option<HandleValue<'_>>) -> Option<HandleValue<'_>> {
     value.filter(|value| !value.is_undefined())
 }
 
 /// The largest offset Node.js's `validateOffset` accepts by default, `Number.MAX_SAFE_INTEGER`.
-const MAX_OFFSET: f64 = 9007199254740991.0;
+const MAX_OFFSET: f64 = crate::errors::MAX_SAFE_INTEGER;
 
 /// `value` converted to a number, as JS's unary `+` converts it.
 fn to_number(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<f64, ExnThrown> {
@@ -374,7 +393,7 @@ fn lookup_encoding(
 }
 
 /// `ERR_UNKNOWN_ENCODING` for the encoding argument `value`.
-fn unknown_encoding(scope: &Scope<'_>, value: HandleValue<'_>) -> Thrown {
+pub(crate) fn unknown_encoding(scope: &Scope<'_>, value: HandleValue<'_>) -> Thrown {
     let name = js::JSString::from_value(scope, value)
         .and_then(|name| name.to_utf8(scope))
         .unwrap_or_default();
@@ -389,7 +408,7 @@ fn unknown_encoding(scope: &Scope<'_>, value: HandleValue<'_>) -> Thrown {
 /// The encoding a falsy or `"utf8"` `value` selects, UTF-8, or the one [`lookup_encoding`] finds,
 /// or `ERR_UNKNOWN_ENCODING`.
 fn encoding_or_utf8(scope: &Scope<'_>, value: Option<HandleValue<'_>>) -> Result<Encoding, Thrown> {
-    match value.filter(|value| truthy(scope, *value)) {
+    match value.filter(|value| js::conversion::to_boolean(*value)) {
         None => Ok(Encoding::Utf8),
         Some(value) => lookup_encoding(scope, value)?.ok_or_else(|| unknown_encoding(scope, value)),
     }
@@ -706,15 +725,13 @@ impl NumberFormat {
     }
 }
 
-/// `bytes` in `endian` order as a little-endian integer of 8 bytes, sign-extended if `signed`.
+/// `bytes` in `endian` order as an integer, sign-extended if `signed`.
 fn read_integer(bytes: &[u8], endian: Endian, signed: bool) -> i128 {
     let mut value: i128 = 0;
-    let ordered: Vec<u8> = match endian {
-        Endian::Little => bytes.iter().rev().copied().collect(),
-        Endian::Big => bytes.to_vec(),
-    };
-    for byte in &ordered {
-        value = (value << 8) | i128::from(*byte);
+    let mut push = |byte: &u8| value = (value << 8) | i128::from(*byte);
+    match endian {
+        Endian::Little => bytes.iter().rev().for_each(&mut push),
+        Endian::Big => bytes.iter().for_each(&mut push),
     }
     if signed && !bytes.is_empty() {
         let bits = bytes.len() * 8;
@@ -725,15 +742,17 @@ fn read_integer(bytes: &[u8], endian: Endian, signed: bool) -> i128 {
     value
 }
 
-/// The low `width` bytes of `value` in `endian` order.
-fn integer_bytes(value: i128, width: usize, endian: Endian) -> Vec<u8> {
-    let little: Vec<u8> = (0..width)
-        .map(|index| (value >> (8 * index)) as u8)
-        .collect();
-    match endian {
-        Endian::Little => little,
-        Endian::Big => little.into_iter().rev().collect(),
+/// The low `width` bytes of `value` in `endian` order, at the start of the array.
+fn integer_bytes(value: i128, width: usize, endian: Endian) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    for (index, byte) in bytes[..width].iter_mut().enumerate() {
+        let shift = match endian {
+            Endian::Little => index,
+            Endian::Big => width - 1 - index,
+        };
+        *byte = (value >> (8 * shift)) as u8;
     }
+    bytes
 }
 
 /// One `read*` or `write*` method.
@@ -741,6 +760,23 @@ struct NumberMethod {
     name: &'static CStr,
     format: NumberFormat,
     write: bool,
+}
+
+impl NumberMethod {
+    fn length(&self) -> u32 {
+        match (self.write, self.format) {
+            (false, NumberFormat::UVar(_) | NumberFormat::IVar(_)) => 2,
+            (true, NumberFormat::UVar(_) | NumberFormat::IVar(_)) => 3,
+            (
+                false,
+                NumberFormat::F32(_)
+                | NumberFormat::F64(_)
+                | NumberFormat::BigU64(_)
+                | NumberFormat::BigI64(_),
+            ) => 0,
+            _ => 1,
+        }
+    }
 }
 
 macro_rules! number_methods {
@@ -878,8 +914,9 @@ fn read_number(
             offset
         };
         let offset = number_offset(scope, offset, width, view.byte_length())?;
-        let bytes = view.with_bytes(|bytes| bytes[offset..offset + width].to_vec());
-        let bytes = bytes.as_slice();
+        let mut copy = [0; 8];
+        view.with_bytes(|bytes| copy[..width].copy_from_slice(&bytes[offset..offset + width]));
+        let bytes = &copy[..width];
         let endian = method.format.endian();
         Ok(match method.format {
             NumberFormat::U8
@@ -966,12 +1003,17 @@ fn write_number(
             NumberFormat::F32(_) | NumberFormat::F64(_) => {
                 let float = to_number(scope, value)?;
                 let offset = number_offset(scope, offset, width, length)?;
-                let bytes = match (method.format, endian) {
-                    (NumberFormat::F32(_), Endian::Little) => (float as f32).to_le_bytes().to_vec(),
-                    (NumberFormat::F32(_), Endian::Big) => (float as f32).to_be_bytes().to_vec(),
-                    (_, Endian::Little) => float.to_le_bytes().to_vec(),
-                    (_, Endian::Big) => float.to_be_bytes().to_vec(),
-                };
+                let mut bytes = [0; 8];
+                match (method.format, endian) {
+                    (NumberFormat::F32(_), Endian::Little) => {
+                        bytes[..4].copy_from_slice(&(float as f32).to_le_bytes())
+                    }
+                    (NumberFormat::F32(_), Endian::Big) => {
+                        bytes[..4].copy_from_slice(&(float as f32).to_be_bytes())
+                    }
+                    (_, Endian::Little) => bytes = float.to_le_bytes(),
+                    (_, Endian::Big) => bytes = float.to_be_bytes(),
+                }
                 (offset, bytes)
             }
             NumberFormat::BigU64(_) | NumberFormat::BigI64(_) => {
@@ -1066,7 +1108,9 @@ fn write_number(
         if offset + width > view.byte_length() {
             return Err(out_of_bounds(None));
         }
-        view.with_bytes_mut(|target| target[offset..offset + width].copy_from_slice(&bytes));
+        view.with_bytes_mut(|target| {
+            target[offset..offset + width].copy_from_slice(&bytes[..width])
+        });
         Ok(js::value::from_f64((offset + width) as f64))
     };
     run().map_err(|error| error.throw(scope))
@@ -1151,12 +1195,15 @@ fn from_array_like<'s>(scope: &'s Scope<'_>, array_like: Object<'_>) -> Result<O
         return Err(Thrown::Pending);
     }
     let count = count as u32;
-    let mut bytes = Vec::with_capacity(count as usize);
+    let buffer = new_zeroed_buffer(scope, count as usize)?;
+    let view = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
     for index in 0..count {
         let element = array_like.get_element(scope, index)?;
-        bytes.push(to_uint8(to_number(scope, element)?));
+        let byte = to_uint8(to_number(scope, element)?);
+        // Content code has no reference to the new buffer, so it keeps its length.
+        view.with_bytes_mut(|target| target[index as usize] = byte);
     }
-    Ok(new_buffer(scope, &bytes)?)
+    Ok(buffer)
 }
 
 /// Node.js's `Buffer.from(value, encodingOrOffset, length)`.
@@ -1172,6 +1219,9 @@ fn buffer_from<'s>(
             None => Encoding::Utf8,
         };
         let string = js::JSString::from_value(scope, value)?;
+        if encoding == Encoding::Utf8 {
+            return Ok(utf8_buffer(scope, string)?);
+        }
         return Ok(new_buffer(scope, &encode_string(scope, string, encoding)?)?);
     }
     let invalid = || {
@@ -1242,6 +1292,16 @@ fn size_arg(scope: &Scope<'_>, size: HandleValue<'_>) -> Result<usize, Thrown> {
     Ok(size as usize)
 }
 
+/// `ERR_INVALID_ARG_TYPE` unless `value` is a string, with the message of Node.js's C++
+/// `THROW_AND_RETURN_IF_NOT_STRING`.
+fn require_string(value: HandleValue<'_>) -> Result<(), Thrown> {
+    if value.is_string() {
+        return Ok(());
+    }
+    let message = "argument must be a string";
+    Err(NodeError::new(ErrorKind::TypeError, "ERR_INVALID_ARG_TYPE", message).into())
+}
+
 /// Node.js's `StringBytes::Write`: write the bytes the string `string` encodes to in `encoding`
 /// into `view` from `offset`, at most `max_length` of them and only whole characters. Returns how
 /// many bytes were written.
@@ -1253,23 +1313,25 @@ fn write_string(
     max_length: usize,
     encoding: Encoding,
 ) -> Result<usize, Thrown> {
-    if !string.is_string() {
-        return Err(
-            NodeError::invalid_arg_type(scope, "argument", "of type string", string).into(),
-        );
+    require_string(string)?;
+    let string = js::JSString::from_value(scope, *string)?;
+    if encoding == Encoding::Utf8 {
+        // Flattening a rope allocates, so it happens before the bytes are borrowed.
+        string.ensure_linear(scope)?;
+        // Converting the arguments can run JS that shrinks or detaches the buffer.
+        let available = view.byte_length().checked_sub(offset);
+        let Some(available) = available else {
+            return Err(out_of_bounds(Some("offset")));
+        };
+        let end = offset + max_length.min(available);
+        return Ok(string.write_utf8(scope, view, offset..end)?);
     }
-    let mut bytes = encode_string(scope, js::JSString::from_value(scope, *string)?, encoding)?;
+    let mut bytes = encode_string(scope, string, encoding)?;
     if bytes.len() > max_length {
         bytes.truncate(match encoding {
             Encoding::Utf16le => max_length & !1,
             _ => max_length,
         });
-        // A partial UTF-8 sequence at the end isn't written.
-        if encoding == Encoding::Utf8 {
-            while std::str::from_utf8(&bytes).is_err() {
-                bytes.pop();
-            }
-        }
     }
     // Converting the arguments can run JS that shrinks or detaches the buffer.
     if offset + bytes.len() > view.byte_length() {
@@ -1316,10 +1378,16 @@ fn array_index(
     value: Option<HandleValue<'_>>,
     default: usize,
 ) -> Result<usize, Thrown> {
-    let Some(value) = defined(value) else {
-        return Ok(default);
-    };
-    let number = to_number(scope, value)?.trunc();
+    match defined(value) {
+        Some(value) => integer_index(to_number(scope, value)?),
+        None => Ok(default),
+    }
+}
+
+/// [`array_index`] of the number `number`: truncated, with `NaN` as 0, and `ERR_OUT_OF_RANGE` if
+/// it is negative.
+fn integer_index(number: f64) -> Result<usize, Thrown> {
+    let number = number.trunc();
     let number = if number.is_nan() { 0.0 } else { number };
     if number < 0.0 {
         return Err(NodeError::new(
@@ -1362,8 +1430,17 @@ fn slice_as<'s>(
     Ok(decode_bytes(scope, &bytes, encoding)?)
 }
 
-/// Node.js's `StringWrite` for the `*Write` methods: write `string` in `encoding` into `this` from
-/// `offset`, at most `length` bytes. Both are converted to integers, and must fit in the buffer.
+/// The `*Write` methods: write `string` in `encoding` into `this` from `offset`, at most `length`
+/// bytes, and return the count written.
+///
+/// For UTF-8, Latin-1 and ASCII, Node.js's JS wrappers check the numbers `offset` and `length`
+/// before they are truncated: `offset` defaults to 0, `length` to the bytes after `offset`, and
+/// `ERR_BUFFER_OUT_OF_BOUNDS` is thrown unless `0 <= offset <= byteLength` and
+/// `0 <= length <= byteLength - offset`. `NaN` passes these checks.
+///
+/// Then, as Node.js's C++ `StringWrite` for every encoding, `string` must be a string, and `offset`
+/// and `length` are integers as [`array_index`] converts them: an `offset` past the end throws
+/// `ERR_BUFFER_OUT_OF_BOUNDS`, and `length` is clamped to the bytes after `offset`.
 fn write_as(
     scope: &Scope<'_>,
     this: Object<'_>,
@@ -1373,30 +1450,43 @@ fn write_as(
     encoding: Encoding,
 ) -> Result<f64, Thrown> {
     let view = this_view(this)?;
-    if !string.is_string() {
-        return Err(
-            NodeError::invalid_arg_type(scope, "argument", "of type string", string).into(),
-        );
-    }
-    let capacity = view.byte_length() as f64;
-    let integer = |value: Option<HandleValue<'_>>, default: f64| -> Result<f64, Thrown> {
-        match defined(value) {
-            None => Ok(default),
-            Some(value) => {
-                let number = to_number(scope, value)?.trunc();
-                Ok(if number.is_nan() { 0.0 } else { number })
-            }
+    let capacity = view.byte_length();
+    let checked = if matches!(
+        encoding,
+        Encoding::Utf8 | Encoding::Latin1 | Encoding::Ascii
+    ) {
+        let available = capacity as f64;
+        let offset = match defined(offset) {
+            None => 0.0,
+            Some(offset) => to_number(scope, offset)?,
+        };
+        if offset < 0.0 || offset > available {
+            return Err(out_of_bounds(Some("offset")));
         }
+        let length = match defined(length) {
+            None => available - offset,
+            Some(length) => to_number(scope, length)?,
+        };
+        if length < 0.0 || length > available - offset {
+            return Err(out_of_bounds(Some("length")));
+        }
+        Some((offset, length))
+    } else {
+        None
     };
-    let offset = integer(offset, 0.0)?;
-    if !(0.0..=capacity).contains(&offset) {
+    require_string(string)?;
+    let offset = match checked {
+        Some((offset, _)) => integer_index(offset)?,
+        None => array_index(scope, offset, 0)?,
+    };
+    if offset > capacity {
         return Err(out_of_bounds(Some("offset")));
     }
-    let max_length = integer(length, capacity - offset)?;
-    if !(0.0..=capacity - offset).contains(&max_length) {
-        return Err(out_of_bounds(Some("length")));
-    }
-    let (offset, max_length) = (offset as usize, max_length as usize);
+    let max_length = match checked {
+        Some((_, length)) => integer_index(length)?,
+        None => array_index(scope, length, capacity - offset)?,
+    };
+    let max_length = max_length.min(capacity - offset);
     if max_length == 0 {
         return Ok(0.0);
     }
@@ -1535,7 +1625,7 @@ fn construct<'s>(
             );
         }
         let size = size_arg(scope, value)?;
-        return Ok(new_buffer(scope, &vec![0; size])?);
+        return Ok(new_zeroed_buffer(scope, size)?);
     }
     buffer_from(scope, value, encoding_or_offset, length)
 }
@@ -1543,12 +1633,24 @@ fn construct<'s>(
 js::instance_local! {
     /// Set once DEP0005 was emitted.
     static CONSTRUCTOR_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many calls of the `Buffer` constructor checked whether to emit DEP0005.
+    static CONSTRUCTOR_CHECKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Emit DEP0005 for a call of the `Buffer` constructor, once per instance. Without
-/// `--pending-deprecation`, a call from a module in `node_modules` emits nothing.
+/// The number of `Buffer` constructor calls after which DEP0005 is no longer emitted, Node.js's
+/// limit of `nodeModulesCheckCounter`.
+const MAX_CONSTRUCTOR_CHECKS: u32 = 10000;
+
+/// Emit DEP0005 for a call of the `Buffer` constructor, once per instance, and not after
+/// [`MAX_CONSTRUCTOR_CHECKS`] calls. Without `--pending-deprecation`, a call from a module in
+/// `node_modules` emits nothing.
 fn warn_buffer_constructor(scope: &Scope<'_>) -> Result<(), ExnThrown> {
-    if CONSTRUCTOR_WARNED.get()
+    if CONSTRUCTOR_WARNED.get() {
+        return Ok(());
+    }
+    let checks = CONSTRUCTOR_CHECKS.get().saturating_add(1);
+    CONSTRUCTOR_CHECKS.set(checks);
+    if checks > MAX_CONSTRUCTOR_CHECKS
         || (!crate::runtime_flags::get().pending_deprecation
             && crate::process::called_from_node_modules(scope)?)
     {
@@ -1597,24 +1699,11 @@ pub(crate) fn define_species(scope: &Scope<'_>, ctor: Object<'_>) -> Result<(), 
         0,
     )?;
     let getter = Function::new_callback(scope, c"get [Symbol.species]", 0, get_species, *species)?;
-    let descriptor = Object::new_plain(scope)?;
-    descriptor.set_property(scope, c"get", *getter)?;
-    descriptor.set_property(scope, c"configurable", true)?;
-    let key = js::symbol::get_well_known(scope, js::native::SymbolCode::species);
-    let key = scope.root_value(js::value::from_symbol(key));
-    let object = scope.global().get_property(scope, c"Object")?;
-    let object = Object::from_value(scope, object).map_err(|e| e.throw(scope))?;
-    Function::call_by_name(
+    let key = scope.root_id(js::symbol::get_well_known_key(
         scope,
-        object.handle(),
-        c"defineProperty",
-        &[
-            ctor.to_jsval_throwing(scope)?,
-            key,
-            descriptor.to_jsval_throwing(scope)?,
-        ],
-    )?;
-    Ok(())
+        js::native::SymbolCode::species,
+    ));
+    ctor.define_accessor_by_id(scope, key, Some(*getter), None, 0)
 }
 
 #[core_runtime::jsfunction_class(name = "Buffer")]
@@ -1623,7 +1712,7 @@ pub mod buffer {
 
     /// <https://nodejs.org/api/buffer.html#new-bufferarray>: the deprecated `Buffer(value)` and
     /// `new Buffer(value)`, which are `Buffer.alloc(value)` for a number and `Buffer.from` otherwise.
-    #[constructor]
+    #[constructor(length = 3)]
     pub fn create<'s>(
         scope: &'s Scope<'_>,
         value: HandleValue<'_>,
@@ -1635,7 +1724,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#static-method-bufferfromarray>
-    #[static_method]
+    #[static_method(length = 3)]
     pub fn from<'s>(
         scope: &'s Scope<'_>,
         value: HandleValue<'_>,
@@ -1646,7 +1735,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#static-method-bufferallocsize-fill-encoding>
-    #[static_method]
+    #[static_method(length = 3)]
     pub fn alloc<'s>(
         scope: &'s Scope<'_>,
         size: HandleValue<'_>,
@@ -1654,19 +1743,21 @@ pub mod buffer {
         encoding: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
         let size = size_arg(scope, size)?;
-        let mut bytes = vec![0; size];
         let fill = fill.filter(|fill| !fill.is_undefined());
+        let mut plan = None;
         if let Some(fill) = fill.filter(|fill| !(fill.is_number() && fill.to_number() == 0.0)) {
             if size > 0 {
                 let start = scope.root_value(js::value::from_f64(0.0));
                 let end = scope.root_value(js::value::from_f64(size as f64));
-                if let Some(plan) = fill_plan(scope, size, fill, Some(start), Some(end), encoding)?
-                {
-                    plan.apply(&mut bytes);
-                }
+                plan = fill_plan(scope, size, fill, Some(start), Some(end), encoding)?;
             }
         }
-        Ok(new_buffer(scope, &bytes)?)
+        Ok(new_buffer_with(scope, size, |bytes| {
+            if let Some(plan) = plan {
+                plan.apply(bytes);
+            }
+            Ok(())
+        })?)
     }
 
     /// <https://nodejs.org/api/buffer.html#static-method-bufferallocunsafesize>: zero-filled.
@@ -1676,7 +1767,7 @@ pub mod buffer {
         size: HandleValue<'_>,
     ) -> Result<Object<'s>, Thrown> {
         let size = size_arg(scope, size)?;
-        Ok(new_buffer(scope, &vec![0; size])?)
+        Ok(new_zeroed_buffer(scope, size)?)
     }
 
     /// <https://nodejs.org/api/buffer.html#static-method-bufferallocunsafeslowsize>: zero-filled.
@@ -1686,13 +1777,13 @@ pub mod buffer {
         size: HandleValue<'_>,
     ) -> Result<Object<'s>, Thrown> {
         let size = size_arg(scope, size)?;
-        Ok(new_buffer(scope, &vec![0; size])?)
+        Ok(new_zeroed_buffer(scope, size)?)
     }
 
     /// <https://nodejs.org/api/buffer.html#static-method-bufferbytelengthstring-encoding>: for a
     /// string, the length its encoding computes without decoding it, and the UTF-8 length for an
     /// unknown encoding.
-    #[static_method]
+    #[static_method(length = 2)]
     pub fn byte_length(
         scope: &Scope<'_>,
         value: HandleValue<'_>,
@@ -1704,12 +1795,12 @@ pub mod buffer {
             if length == 0 {
                 return Ok(0.0);
             }
-            let encoding = match encoding.filter(|encoding| truthy(scope, *encoding)) {
+            let encoding = match encoding.filter(|encoding| js::conversion::to_boolean(*encoding)) {
                 None => Encoding::Utf8,
                 Some(encoding) => lookup_encoding(scope, encoding)?.unwrap_or(Encoding::Utf8),
             };
             return Ok(match encoding {
-                Encoding::Utf8 => string.to_utf8(scope)?.len(),
+                Encoding::Utf8 => string.utf8_length(scope)?,
                 Encoding::Utf16le => length * 2,
                 Encoding::Latin1 | Encoding::Ascii => length,
                 Encoding::Hex => length / 2,
@@ -1756,7 +1847,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#static-method-bufferconcatlist-totallength>
-    #[static_method]
+    #[static_method(length = 2)]
     pub fn concat<'s>(
         scope: &'s Scope<'_>,
         list: HandleValue<'_>,
@@ -1778,16 +1869,32 @@ pub mod buffer {
                 scope, total, "length", 0.0, MAX_LENGTH,
             )? as usize),
         };
-        let mut bytes = Vec::new();
+        let mut views = Vec::new();
         for index in 0..count {
             let item = array.get_element(scope, index)?;
-            let view = uint8_array_arg(scope, item, &format!("list[{index}]"))?;
-            view.with_bytes(|view| bytes.extend_from_slice(view));
+            let view = as_view(scope, item)
+                .filter(|view| view.view_kind() == js::typedarray::ViewKind::Uint8)
+                .ok_or_else(|| {
+                    let name = format!("list[{index}]");
+                    let expected = "an instance of Buffer or Uint8Array";
+                    NodeError::invalid_arg_type(scope, &name, expected, item)
+                })?;
+            views.push(view);
         }
-        if let Some(total) = total {
-            bytes.resize(total, 0);
+        let length =
+            total.unwrap_or_else(|| views.iter().map(|view| view.byte_length()).sum::<usize>());
+        let buffer = new_zeroed_buffer(scope, length)?;
+        let target = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
+        let mut position = 0;
+        for view in views {
+            if position == length {
+                break;
+            }
+            let count = view.byte_length().min(length - position);
+            target.copy_region_from(position, view, 0, count);
+            position += count;
         }
-        Ok(new_buffer(scope, &bytes)?)
+        Ok(buffer)
     }
 
     /// <https://nodejs.org/api/buffer.html#static-method-bufferisbufferobj>
@@ -1810,6 +1917,7 @@ pub mod buffer {
     /// <https://nodejs.org/api/buffer.html#buftostringencoding-start-end>: `start` and `end` are
     /// converted to numbers and clamped to the buffer, and a range that ends before it starts is
     /// empty.
+    #[method(length = 3)]
     pub fn to_string<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -1858,6 +1966,7 @@ pub mod buffer {
 
     /// <https://nodejs.org/api/buffer.html#bufwritestring-offset-length-encoding>: `offset` or
     /// `length` may be the encoding instead. Only whole characters are written.
+    #[method(length = 4)]
     pub fn write(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -1899,7 +2008,7 @@ pub mod buffer {
     /// <https://nodejs.org/api/buffer.html#static-method-buffercopybytesfromview-offset-length>:
     /// a copy of the elements of the typed array `view` from `offset`, `length` of them or to its
     /// end.
-    #[static_method]
+    #[static_method(length = 3)]
     pub fn copy_bytes_from<'s>(
         scope: &'s Scope<'_>,
         view: HandleValue<'_>,
@@ -1938,6 +2047,7 @@ pub mod buffer {
     }
 
     /// Node.js's `utf8Slice(start, end)`.
+    #[method(length = 2)]
     pub fn utf8_slice<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -1948,6 +2058,7 @@ pub mod buffer {
     }
 
     /// Node.js's `ucs2Slice(start, end)`.
+    #[method(length = 2)]
     pub fn ucs2_slice<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -1958,6 +2069,7 @@ pub mod buffer {
     }
 
     /// Node.js's `latin1Slice(start, end)`.
+    #[method(length = 2)]
     pub fn latin1_slice<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -1968,6 +2080,7 @@ pub mod buffer {
     }
 
     /// Node.js's `asciiSlice(start, end)`.
+    #[method(length = 2)]
     pub fn ascii_slice<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -1978,6 +2091,7 @@ pub mod buffer {
     }
 
     /// Node.js's `base64Slice(start, end)`.
+    #[method(length = 2)]
     pub fn base64_slice<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -1988,6 +2102,7 @@ pub mod buffer {
     }
 
     /// Node.js's `base64urlSlice(start, end)`.
+    #[method(length = 2)]
     pub fn base64url_slice<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -1998,6 +2113,7 @@ pub mod buffer {
     }
 
     /// Node.js's `hexSlice(start, end)`.
+    #[method(length = 2)]
     pub fn hex_slice<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -2008,6 +2124,7 @@ pub mod buffer {
     }
 
     /// Node.js's `utf8Write(string, offset, length)`.
+    #[method(length = 3)]
     pub fn utf8_write(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2019,6 +2136,7 @@ pub mod buffer {
     }
 
     /// Node.js's `ucs2Write(string, offset, length)`.
+    #[method(length = 3)]
     pub fn ucs2_write(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2030,6 +2148,7 @@ pub mod buffer {
     }
 
     /// Node.js's `latin1Write(string, offset, length)`.
+    #[method(length = 3)]
     pub fn latin1_write(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2041,6 +2160,7 @@ pub mod buffer {
     }
 
     /// Node.js's `asciiWrite(string, offset, length)`.
+    #[method(length = 3)]
     pub fn ascii_write(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2052,6 +2172,7 @@ pub mod buffer {
     }
 
     /// Node.js's `base64Write(string, offset, length)`.
+    #[method(length = 3)]
     pub fn base64_write(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2063,6 +2184,7 @@ pub mod buffer {
     }
 
     /// Node.js's `base64urlWrite(string, offset, length)`.
+    #[method(length = 3)]
     pub fn base64url_write(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2074,6 +2196,7 @@ pub mod buffer {
     }
 
     /// Node.js's `hexWrite(string, offset, length)`.
+    #[method(length = 3)]
     pub fn hex_write(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2107,6 +2230,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#bufcomparetarget-targetstart-targetend-sourcestart-sourceend>
+    #[method(length = 5)]
     pub fn compare(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2145,6 +2269,7 @@ pub mod buffer {
 
     /// <https://nodejs.org/api/buffer.html#bufcopytarget-targetstart-sourcestart-sourceend>: the
     /// positions are converted to integers, and the copy stops at the end of either buffer.
+    #[method(length = 4)]
     pub fn copy(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2216,6 +2341,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#bufsubarraystart-end>
+    #[method(length = 2)]
     pub fn subarray<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -2242,6 +2368,7 @@ pub mod buffer {
 
     /// <https://nodejs.org/api/buffer.html#bufslicestart-end>: the same as `subarray`, a view of
     /// the same memory.
+    #[method(length = 2)]
     pub fn slice<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -2252,6 +2379,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#buffillvalue-offset-end-encoding>
+    #[method(length = 4)]
     pub fn fill<'s>(
         scope: &'s Scope<'_>,
         this: Object<'s>,
@@ -2274,6 +2402,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#bufindexofvalue-byteoffset-encoding>
+    #[method(length = 4)]
     pub fn index_of(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2286,6 +2415,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#buflastindexofvalue-byteoffset-encoding>
+    #[method(length = 4)]
     pub fn last_index_of(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2298,6 +2428,7 @@ pub mod buffer {
     }
 
     /// <https://nodejs.org/api/buffer.html#bufincludesvalue-byteoffset-encoding>
+    #[method(length = 4)]
     pub fn includes(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -2328,8 +2459,9 @@ pub mod buffer {
     /// `Buffer` inherit from `Uint8Array`.
     #[setup]
     pub fn setup(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let uint8_array = scope.global().get_property(scope, c"Uint8Array")?;
-        let uint8_array = Object::from_value(scope, uint8_array).map_err(|e| e.throw(scope))?;
+        let uint8_array =
+            js::class::get_class_object(scope, js::class_spec::JSProtoKey::JSProto_Uint8Array)?;
+        let uint8_array = Object::from_handle(uint8_array).ok_or(ExnThrown)?;
         let uint8_proto = uint8_array.get_property(scope, c"prototype")?;
         let uint8_proto = Object::from_value(scope, uint8_proto).map_err(|e| e.throw(scope))?;
         ctor.set_prototype(scope, uint8_array.handle())?;
@@ -2351,8 +2483,8 @@ pub mod buffer {
             } else {
                 read_number
             };
-            let nargs = if method.write { 2 } else { 1 };
-            let function = Function::new_callback(scope, method.name, nargs, body, index as i32)?;
+            let function =
+                Function::new_callback(scope, method.name, method.length(), body, index as i32)?;
             proto.define_property(scope, method.name, *function, enumerable)?;
         }
         for (name, body) in [
@@ -2366,8 +2498,7 @@ pub mod buffer {
         proto.define_property(scope, c"toLocaleString", to_string, enumerable)?;
         let inspect = Function::new_callback(scope, c"inspect", 2, inspect_buffer, ())?;
         proto.define_property(scope, c"inspect", *inspect, enumerable)?;
-        let custom = crate::symbol(scope, crate::inspect::INSPECT_CUSTOM, true)?;
-        let custom = scope.root_id(js::id::value_to_id(scope, custom)?);
+        let custom = crate::inspect::INSPECT_CUSTOM.id(scope)?;
         proto.set_property_by_id(scope, custom, *inspect)?;
         let of = Function::new_callback(scope, c"of", 0, buffer_of, ())?;
         ctor.define_property(scope, c"of", *of, enumerable)?;
@@ -2609,11 +2740,29 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         constants.set_property(scope, c"MAX_LENGTH", MAX_LENGTH)?;
         constants.set_property(scope, c"MAX_STRING_LENGTH", MAX_STRING_LENGTH)?;
         Ok(vec![
-            ("Blob", scope.global().get_property(scope, c"Blob")?),
-            ("File", scope.global().get_property(scope, c"File")?),
+            (
+                "Blob",
+                js::class::class_constructor::<web_files::blob::BlobImpl>(scope)?
+                    .to_jsval_throwing(scope)?,
+            ),
+            (
+                "File",
+                js::class::class_constructor::<web_files::file::FileImpl>(scope)?
+                    .to_jsval_throwing(scope)?,
+            ),
             ("SlowBuffer", slow_buffer_function(scope)?),
-            ("atob", scope.global().get_property(scope, c"atob")?),
-            ("btoa", scope.global().get_property(scope, c"btoa")?),
+            (
+                "atob",
+                web_globals::base64::atob_function(scope)
+                    .ok_or(ExnThrown)?
+                    .to_jsval_throwing(scope)?,
+            ),
+            (
+                "btoa",
+                web_globals::base64::btoa_function(scope)
+                    .ok_or(ExnThrown)?
+                    .to_jsval_throwing(scope)?,
+            ),
             ("constants", constants.to_jsval_throwing(scope)?),
         ])
     };
@@ -2638,7 +2787,7 @@ fn slow_buffer(
         HandleValue::undefined()
     };
     let size = size_arg(scope, size).map_err(|error| error.throw(scope))?;
-    new_buffer(scope, &vec![0; size])?.to_jsval_raw_throwing(scope)
+    new_zeroed_buffer(scope, size)?.to_jsval_raw_throwing(scope)
 }
 
 /// `buffer.SlowBuffer`: [`slow_buffer`] deprecated with DEP0030, as `util.deprecate` wraps it.
@@ -2651,11 +2800,11 @@ fn slow_buffer_function<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, Exn
         c"deprecate",
         &[
             function.to_jsval_throwing(scope)?,
-            crate::stream::string(
+            js::class::get_or_init_atom(
                 scope,
-                "SlowBuffer() is deprecated. Please use Buffer.allocUnsafeSlow()",
+                c"SlowBuffer() is deprecated. Please use Buffer.allocUnsafeSlow()",
             )?,
-            crate::stream::string(scope, "DEP0030")?,
+            js::class::get_or_init_atom(scope, c"DEP0030")?,
         ],
     )?;
     Ok(scope.root_value(wrapper.get()))
@@ -2702,25 +2851,8 @@ fn set_inspect_max_bytes(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let value = args.get(0);
-    if !value.is_number() {
-        return Err(NodeError::invalid_arg_type(
-            scope,
-            "INSPECT_MAX_BYTES",
-            "of type number",
-            value,
-        )
-        .throw(scope));
-    }
-    let number = value.to_number();
-    if number.is_nan() || number < 0.0 {
-        return Err(NodeError::out_of_range(
-            "INSPECT_MAX_BYTES",
-            ">= 0",
-            &crate::errors::out_of_range_received(number),
-        )
-        .throw(scope));
-    }
+    let number = crate::errors::validate_number(scope, args.get(0), "INSPECT_MAX_BYTES", 0.0)
+        .map_err(|error| error.throw(scope))?;
     INSPECT_MAX.set(number);
     Ok(js::value::undefined())
 }

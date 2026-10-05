@@ -9,17 +9,15 @@
 //! `stack` reads during the call get SpiderMonkey's string.
 
 use std::cell::Cell;
-use std::ffi::CStr;
 
+use crate::support::Props;
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::{Callback, CallbackArgs};
+use js::function::CallbackArgs;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
-
-use crate::stream::{as_object, call_method, is_function, string, Captures, Props};
 
 js::instance_local! {
     /// Set while `Error.prepareStackTrace` runs.
@@ -264,7 +262,7 @@ fn prepare_function<'s>(
         return Ok(None);
     }
     let prepare = error_ctor.val(scope, c"prepareStackTrace")?;
-    Ok(is_function(scope, prepare).then_some(prepare))
+    Ok(js::function::is_callable(prepare).then_some(prepare))
 }
 
 /// The result of `prepare` for `error` and the frames of SpiderMonkey's stack string `stack`.
@@ -305,29 +303,27 @@ fn define_stack(
     object.define_property(scope, c"stack", value, 0)
 }
 
-/// The global `Error` constructor.
-fn error_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    scope
-        .global()
-        .obj(scope, c"Error")?
-        .ok_or_else(|| js::error::TypeError("Error is not an object".into()).throw(scope))
+/// The realm's `Error` constructor.
+pub(crate) fn error_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+    let error = js::class::get_class_object(scope, js::class_spec::JSProtoKey::JSProto_Error)?;
+    Object::from_handle(error).ok_or(ExnThrown)
 }
 
-/// `Error.captureStackTrace(object[, constructorOpt])`, whose captures are `[original]`: call
+/// `Error.captureStackTrace(object[, constructorOpt])`, whose payload is `original`: call
 /// SpiderMonkey's `original`, then replace the `stack` it defined with `Error.prepareStackTrace`'s
 /// result if that is a function.
 fn capture_stack_trace(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
-    payload: HandleValue,
+    original: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let original = Captures::of(scope, payload)?.get(0)?;
     let args = crate::callback_args(&args);
     Function::call(scope, js::value::undefined(), original, &args)?;
     let error_ctor = error_constructor(scope)?;
     let (Some(prepare), Some(object)) = (
         prepare_function(scope, error_ctor)?,
-        args.first().and_then(|target| as_object(scope, *target)),
+        args.first()
+            .and_then(|target| Object::from_value(scope, *target).ok()),
     ) else {
         return Ok(js::value::undefined());
     };
@@ -341,21 +337,20 @@ fn capture_stack_trace(
     Ok(js::value::undefined())
 }
 
-/// The `Error.prototype.stack` getter, whose captures are `[original]`: SpiderMonkey's `original`
+/// The `Error.prototype.stack` getter, whose payload is `original`: SpiderMonkey's `original`
 /// getter's string, or, if `Error.prepareStackTrace` is a function, its result, which then
 /// replaces the error's `stack`.
 fn stack_getter(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
-    payload: HandleValue,
+    original: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let original = Captures::of(scope, payload)?.get(0)?;
     let this = scope.root_value(args.this());
     let stack = Function::call(scope, this, original, js::function::EmptyArgs)?;
     let error_ctor = error_constructor(scope)?;
     let (Some(prepare), Some(error), true) = (
         prepare_function(scope, error_ctor)?,
-        as_object(scope, this),
+        Object::from_value(scope, this).ok(),
         stack.is_string(),
     ) else {
         return Ok(stack.get());
@@ -366,54 +361,28 @@ fn stack_getter(
     Ok(result.get())
 }
 
-/// A function named `name` running `body` with `captures` as its payload.
-fn named_closure<'s>(
-    scope: &'s Scope<'_>,
-    name: &CStr,
-    nargs: u32,
-    body: Callback,
-    captures: &[HandleValue<'s>],
-) -> Result<Object<'s>, ExnThrown> {
-    let payload = js::Array::with_contents(scope, captures)?;
-    Ok(*Function::new_callback(scope, name, nargs, body, *payload)?)
-}
-
 /// Wrap `Error.captureStackTrace` and the `Error.prototype.stack` getter of `global`'s realm so
 /// they call `Error.prepareStackTrace`.
 pub(crate) fn install(scope: &Scope<'_>) -> Result<(), ExnThrown> {
     let error_ctor = error_constructor(scope)?;
     let capture = error_ctor.val(scope, c"captureStackTrace")?;
-    if is_function(scope, capture) {
-        let wrapper = named_closure(
-            scope,
-            c"captureStackTrace",
-            2,
-            capture_stack_trace,
-            &[capture],
-        )?;
-        error_ctor.define_property(scope, c"captureStackTrace", wrapper, 0)?;
+    if js::function::is_callable(capture) {
+        let wrapper =
+            Function::new_callback(scope, c"captureStackTrace", 2, capture_stack_trace, capture)?;
+        error_ctor.define_property(scope, c"captureStackTrace", *wrapper, 0)?;
     }
-    let Some(prototype) = error_ctor.obj(scope, c"prototype")? else {
+    let prototype =
+        js::class::get_class_prototype(scope, js::class_spec::JSProtoKey::JSProto_Error)?;
+    let Some(prototype) = Object::from_handle(prototype) else {
         return Ok(());
     };
-    let object_ctor = scope
-        .global()
-        .obj(scope, c"Object")?
-        .ok_or_else(|| js::error::TypeError("Object is not an object".into()).throw(scope))?;
-    let descriptor = call_method(
-        scope,
-        object_ctor,
-        c"getOwnPropertyDescriptor",
-        &[prototype.to_jsval_throwing(scope)?, string(scope, "stack")?],
-    )?;
-    let Some(descriptor) = as_object(scope, descriptor) else {
+    let stack = js::class::get_or_init_property_id(scope, c"stack")?;
+    let Some(property) = prototype.own_property_descriptor(scope, stack)? else {
         return Ok(());
     };
-    let getter = descriptor.val(scope, c"get")?;
-    if !is_function(scope, getter) {
+    let Some(getter) = property.getter.filter(|getter| getter.is_callable()) else {
         return Ok(());
-    }
-    let setter = descriptor.obj(scope, c"set")?;
-    let wrapper = named_closure(scope, c"stack", 0, stack_getter, &[getter])?;
-    prototype.define_accessor(scope, c"stack", Some(wrapper), setter, 0)
+    };
+    let wrapper = Function::new_callback(scope, c"stack", 0, stack_getter, getter)?;
+    prototype.define_accessor(scope, c"stack", Some(*wrapper), property.setter, 0)
 }

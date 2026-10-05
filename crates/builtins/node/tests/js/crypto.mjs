@@ -138,6 +138,24 @@ eq(scryptSync("pw", "salt", 0).length, 0, "scrypt with an empty key");
 throws(() => scryptSync("pw", "salt", 16, { N: 3 }), "ERR_CRYPTO_INVALID_SCRYPT_PARAMS", "scrypt needs a power of two");
 throws(() => scryptSync("pw", "salt", 16, { N: 2 ** 20 }), "ERR_CRYPTO_INVALID_SCRYPT_PARAMS", "scrypt checks maxmem");
 throws(() => scryptSync("pw", "salt", 16, { N: 16, cost: 16 }), "ERR_INCOMPATIBLE_OPTION_PAIR", "scrypt option pairs");
+const memoryLimit = "Invalid scrypt params: error:030000AC:digital envelope routines::memory limit exceeded";
+const scryptMessage = (options) => {
+  try {
+    scryptSync("pw", "salt", 16, options);
+    return "derived";
+  } catch (error) {
+    return error.message;
+  }
+};
+eq(scryptMessage({ N: 2, r: 8, p: 2 ** 27 - 1, maxmem: 2 ** 50 }), memoryLimit, "scrypt's blocks exceed 2^31 - 1 bytes");
+eq(scryptMessage({ N: 2 ** 16, r: 1, maxmem: 2 ** 40 }), memoryLimit, "scrypt's cost must be below 2^(16 * r)");
+eq(scryptMessage({ N: 16, r: 8, maxmem: 19455 }), memoryLimit, "scrypt's memory one byte above maxmem");
+eq(scryptMessage({ N: 16, r: 8, maxmem: 19456 }), "derived", "scrypt's memory at maxmem");
+eq(
+  scryptMessage({ N: 2 ** 31, r: 2 ** 14, maxmem: 2 ** 53 - 1 }),
+  "error:078C0100:common libcrypto routines::malloc failure",
+  "scrypt memory that can't be allocated",
+);
 const scryptResult = await new Promise((resolve) => scrypt("pw", "salt", 16, { N: 16 }, (error, key) => resolve([error, key.toString("hex")])));
 deepEq(scryptResult, [null, "c5d06c368e4a07b8a98e9a06773fcf4a"], "scrypt with a callback");
 

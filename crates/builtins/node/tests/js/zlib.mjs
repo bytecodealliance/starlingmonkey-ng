@@ -211,3 +211,42 @@ eq(constants.Z_BEST_COMPRESSION, 9, "constants");
   await new Promise((resolve) => closed.close(resolve));
   eq(closed.destroyed, true, "close destroys the stream");
 }
+
+// Output limits apply while the output is produced.
+{
+  const zeros = Buffer.alloc(1 << 20);
+  const bombs = {
+    gunzipSync: gzipSync(zeros),
+    inflateSync: deflateSync(zeros),
+    brotliDecompressSync: zlib.brotliCompressSync(zeros),
+    zstdDecompressSync: zlib.zstdCompressSync(zeros),
+  };
+  for (const [name, bomb] of Object.entries(bombs)) {
+    const error = throws(() => zlib[name](bomb, { maxOutputLength: 1024 }), "ERR_BUFFER_TOO_LARGE", `${name} with maxOutputLength`);
+    eq(error.message, "Cannot create a Buffer larger than 1024 bytes", `${name}'s message`);
+    eq(zlib[name](bomb, { maxOutputLength: 1 << 20 }).length, 1 << 20, `${name} at maxOutputLength`);
+  }
+  const truncated = gzipSync(zeros).subarray(0, 500);
+  throws(() => gunzipSync(truncated, { maxOutputLength: 1024 }), "ERR_BUFFER_TOO_LARGE", "the limit is reached before the end");
+
+  for (const [create, bomb] of [
+    [createGunzip, bombs.gunzipSync],
+    [zlib.createBrotliDecompress, bombs.brotliDecompressSync],
+    [zlib.createZstdDecompress, bombs.zstdDecompressSync],
+  ]) {
+    const sizes = new Set();
+    const stream = create({ chunkSize: 4096 });
+    stream.on("data", (chunk) => sizes.add(chunk.length));
+    await new Promise((resolve) => stream.on("end", resolve).end(bomb));
+    eq([...sizes].join(), "4096", `${create.name} pushes chunkSize buffers`);
+
+    const paused = create();
+    paused.write(bomb);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    eq(paused.readableLength <= 64 * 1024, true, `${create.name} waits while the readable side is full`);
+    let total = 0;
+    paused.on("data", (chunk) => { total += chunk.length; });
+    await new Promise((resolve) => paused.on("end", resolve).end());
+    eq(total, 1 << 20, `${create.name} continues once read`);
+  }
+}

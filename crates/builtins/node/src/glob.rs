@@ -8,10 +8,9 @@
 //! globstar or a regular expression. The regular expressions are minimatch's, and run on the JS
 //! engine's `RegExp`. Matching follows minimatch's POSIX rules on every platform.
 
-use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
+use js::gc::handle::RootedHeap;
 use js::gc::scope::Scope;
-use js::{Function, Object};
 
 /// The options of a [`Glob`] that differ between Node's uses of minimatch.
 #[derive(Clone, Copy, Debug)]
@@ -43,7 +42,6 @@ pub(crate) struct Glob {
 }
 
 /// The matcher of one path segment.
-#[derive(Debug)]
 enum Part {
     /// `**`, which matches any number of segments.
     Globstar,
@@ -55,15 +53,15 @@ enum Part {
 
 /// A regular expression matching a segment, with the faster test minimatch uses in its place for
 /// some patterns.
-#[derive(Debug)]
 struct Regex {
     source: String,
     flags: String,
     fast: Option<FastTest>,
+    /// The `RegExp` of `source` and `flags`, once [`Glob::new`] compiled it.
+    compiled: Option<RootedHeap<js::regexp::RegExp>>,
 }
 
 /// The tests minimatch substitutes for the regular expressions of common segment patterns.
-#[derive(Debug)]
 enum FastTest {
     /// `*`: a non-empty name not starting with `.`.
     Star,
@@ -137,7 +135,8 @@ fn is_dotted(segment: &str) -> bool {
 }
 
 impl Glob {
-    /// Compile `pattern`. A pattern longer than minimatch accepts throws a `TypeError`.
+    /// Compile `pattern`. A pattern longer than minimatch accepts throws a `TypeError`, and one
+    /// nested too deeply for the native stack throws a `RangeError`.
     pub(crate) fn new(
         scope: &Scope<'_>,
         pattern: &str,
@@ -154,23 +153,26 @@ impl Glob {
                 options,
             });
         }
-        let mut glob_set: Vec<String> = Vec::new();
-        for expanded in brace_expand(&pattern) {
-            if !glob_set.contains(&expanded) {
-                glob_set.push(expanded);
-            }
-        }
-        let glob_parts = glob_set.iter().map(|glob| slash_split(glob)).collect();
+        let expanded = brace_expand(scope, &pattern)?;
+        let mut seen = std::collections::HashSet::with_capacity(expanded.len());
+        let glob_set = expanded.iter().filter(|glob| seen.insert(glob.as_str()));
+        let glob_parts = glob_set.map(|glob| slash_split(glob)).collect();
         let glob_parts = second_phase(first_phase(glob_parts));
-        let set: Vec<Vec<Part>> = glob_parts
+        let mut set: Vec<Vec<Part>> = glob_parts
             .iter()
-            .map(|parts| parts.iter().map(|part| parse_part(part, options)).collect())
-            .collect();
+            .map(|parts| {
+                parts
+                    .iter()
+                    .map(|part| parse_part(scope, part, options))
+                    .collect()
+            })
+            .collect::<Result<_, _>>()?;
         // We compile every regular expression here so that an invalid one throws a `SyntaxError`
         // whatever the path, as in Node.js.
-        for part in set.iter().flatten() {
+        for part in set.iter_mut().flatten() {
             if let Part::Regex(regex) = part {
-                compile_regex(scope, &regex.source, &regex.flags)?;
+                let compiled = compile_regex(scope, &regex.source, &regex.flags)?;
+                regex.compiled = Some(RootedHeap::new(compiled));
             }
         }
         Ok(Glob {
@@ -224,9 +226,10 @@ impl Glob {
         match part {
             Part::Globstar => Ok(false),
             Part::Literal(literal) => Ok(literal == segment),
-            Part::Regex(regex) => match &regex.fast {
-                Some(fast) => Ok(fast.test(segment, self.options.nocase)),
-                None => regex_test(scope, &regex.source, &regex.flags, segment),
+            Part::Regex(regex) => match (&regex.fast, &regex.compiled) {
+                (Some(fast), _) => Ok(fast.test(segment, self.options.nocase)),
+                (None, Some(compiled)) => regex_test(scope, compiled.get(scope), segment),
+                (None, None) => Ok(false),
             },
         }
     }
@@ -400,24 +403,22 @@ impl Glob {
     }
 }
 
-/// `new RegExp(source, flags)`.
+/// `new RegExp(source, flags)`, which throws a `SyntaxError` for an invalid `source`.
 fn compile_regex<'s>(
     scope: &'s Scope<'_>,
     source: &str,
     flags: &str,
-) -> Result<Object<'s>, ExnThrown> {
-    let class = js::class::get_class_object(scope, js::class_spec::JSProtoKey::JSProto_RegExp)?;
-    let class = Object::from_handle(class).ok_or(ExnThrown)?;
-    let source = js::JSString::from_str(scope, source)?.to_jsval_throwing(scope)?;
-    let flags = js::JSString::from_str(scope, flags)?.to_jsval_throwing(scope)?;
-    Function::construct(scope, class, &[source, flags])
+) -> Result<js::RegExp<'s>, ExnThrown> {
+    let source: Vec<u16> = source.encode_utf16().collect();
+    js::RegExp::from_utf16(scope, &source, js::regexp::flags_from_str(flags))
 }
 
-/// `new RegExp(source, flags).test(text)`.
-fn regex_test(scope: &Scope<'_>, source: &str, flags: &str, text: &str) -> Result<bool, ExnThrown> {
-    let regex = compile_regex(scope, source, flags)?;
-    let text = js::JSString::from_str(scope, text)?.to_jsval_throwing(scope)?;
-    let result = Function::call_by_name(scope, regex.handle(), c"test", &[text])?;
+/// `regex.test(text)`, without updating the `RegExp` statics.
+fn regex_test(scope: &Scope<'_>, regex: js::RegExp<'_>, text: &str) -> Result<bool, ExnThrown> {
+    let text: Vec<u16> = text.encode_utf16().collect();
+    let mut index = 0;
+    // SAFETY: `text` stays alive and unchanged for the call.
+    let result = unsafe { regex.execute_no_statics(scope, &text, &mut index, true)? };
     Ok(result.is_boolean() && result.to_boolean())
 }
 
@@ -663,18 +664,18 @@ fn is_line_terminator(c: char) -> bool {
 }
 
 /// The brace expansions of `pattern`, as minimatch's `braceExpand` produces them.
-fn brace_expand(pattern: &str) -> Vec<String> {
+fn brace_expand(scope: &Scope<'_>, pattern: &str) -> Result<Vec<String>, ExnThrown> {
     if !has_brace_pair(pattern) {
-        return vec![pattern.to_string()];
+        return Ok(vec![pattern.to_string()]);
     }
     let text = match pattern.strip_prefix("{}") {
         Some(rest) => format!("{ESC_OPEN}{ESC_CLOSE}{rest}"),
         None => pattern.to_string(),
     };
-    expand(&text, true)
+    Ok(expand(scope, &text, true)?
         .into_iter()
         .map(|expanded| expanded.replace(ESC_OPEN, "{").replace(ESC_CLOSE, "}"))
-        .collect()
+        .collect())
 }
 
 /// The first balanced `{…}` of `text`, as `pre`, `body` and `post`, following the
@@ -849,21 +850,25 @@ fn expand_sequence(body: &str, alpha: bool) -> Vec<String> {
 
 /// The comma-separated parts of `text`, keeping nested `{…}` together.
 fn parse_comma_parts(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let Some((pre, body, post)) = balanced(text) else {
-        return text.split(',').map(String::from).collect();
+    // The text after each `{…}` is split the same way, and its first part is appended to the last
+    // part before it.
+    let mut parts = vec![String::new()];
+    let append = |parts: &mut Vec<String>, text: &str| {
+        let mut split = text.split(',');
+        if let (Some(first), Some(last)) = (split.next(), parts.last_mut()) {
+            last.push_str(first);
+        }
+        parts.extend(split.map(String::from));
     };
-    let mut parts: Vec<String> = pre.split(',').map(String::from).collect();
-    let last = parts.len() - 1;
-    parts[last].push_str(&format!("{{{body}}}"));
-    let mut post_parts = parse_comma_parts(post);
-    if !post.is_empty() {
-        let first = post_parts.remove(0);
-        parts[last].push_str(&first);
-        parts.extend(post_parts);
+    let mut text = text;
+    while let Some((pre, body, post)) = balanced(text) {
+        append(&mut parts, pre);
+        if let Some(last) = parts.last_mut() {
+            last.push_str(&format!("{{{body}}}"));
+        }
+        text = post;
     }
+    append(&mut parts, text);
     parts
 }
 
@@ -882,14 +887,15 @@ fn has_later_option(text: &str) -> bool {
 }
 
 /// `brace-expansion`'s `expand_`.
-fn expand(input: &str, mut is_top: bool) -> Vec<String> {
+fn expand(scope: &Scope<'_>, input: &str, mut is_top: bool) -> Result<Vec<String>, ExnThrown> {
+    let _guard = crate::errors::check_stack(scope)?;
     let mut acc = vec![String::new()];
     let mut drop_empties = false;
     let mut first_group = true;
     let mut text = input.to_string();
     loop {
         let Some((pre, body, post)) = balanced(&text) else {
-            return combine(&acc, &text, &[String::new()], drop_empties);
+            return Ok(combine(&acc, &text, &[String::new()], drop_empties));
         };
         let (pre, body, post) = (pre.to_string(), body.to_string(), post.to_string());
         if pre.ends_with('$') {
@@ -914,12 +920,12 @@ fn expand(input: &str, mut is_top: bool) -> Vec<String> {
                 is_top = true;
                 continue;
             }
-            return combine(
+            return Ok(combine(
                 &acc,
                 &format!("{pre}{{{body}}}{post}"),
                 &[String::new()],
                 drop_empties,
-            );
+            ));
         }
         if first_group {
             drop_empties = is_top && !sequence;
@@ -930,7 +936,7 @@ fn expand(input: &str, mut is_top: bool) -> Vec<String> {
         } else {
             let mut n = parse_comma_parts(&body);
             if n.len() == 1 {
-                n = expand(&n[0], false)
+                n = expand(scope, &n[0], false)?
                     .into_iter()
                     .map(|expanded| format!("{{{expanded}}}"))
                     .collect();
@@ -955,7 +961,7 @@ fn expand(input: &str, mut is_top: bool) -> Vec<String> {
             let mut values = Vec::new();
             let mut length = 0;
             'outer: for part in &n {
-                for value in expand(part, false) {
+                for value in expand(scope, part, false)? {
                     if drops_empties && value.is_empty() {
                         continue;
                     }
@@ -975,7 +981,7 @@ fn expand(input: &str, mut is_top: bool) -> Vec<String> {
         }
         text = post;
     }
-    acc
+    Ok(acc)
 }
 
 // ============================================================================
@@ -994,22 +1000,23 @@ const START_NO_TRAVERSAL: &str = "(?!(?:^|/)\\.\\.?(?:$|/))";
 const START_NO_DOT: &str = "(?!\\.)";
 
 /// The matcher of the segment pattern `pattern`, as minimatch's `parse` compiles it.
-fn parse_part(pattern: &str, options: GlobOptions) -> Part {
+fn parse_part(scope: &Scope<'_>, pattern: &str, options: GlobOptions) -> Result<Part, ExnThrown> {
     if pattern == "**" {
-        return Part::Globstar;
+        return Ok(Part::Globstar);
     }
     if pattern.is_empty() {
-        return Part::Literal(String::new());
+        return Ok(Part::Literal(String::new()));
     }
-    let mut ast = Ast::new(pattern, options);
-    match ast.mm_pattern() {
+    let mut ast = Ast::new(scope, pattern, options)?;
+    Ok(match ast.mm_pattern(scope)? {
         MmPattern::Literal(literal) => Part::Literal(literal),
         MmPattern::Regex(source, flags) => Part::Regex(Regex {
             source,
             flags,
             fast: FastTest::of(pattern),
+            compiled: None,
         }),
-    }
+    })
 }
 
 /// `c` escaped for a regular expression, as minimatch's `regExpEscape` escapes it.
@@ -1347,7 +1354,7 @@ struct Ast {
 
 impl Ast {
     /// The AST of `pattern`, as `AST.fromGlob` parses it.
-    fn new(pattern: &str, options: GlobOptions) -> Ast {
+    fn new(scope: &Scope<'_>, pattern: &str, options: GlobOptions) -> Result<Ast, ExnThrown> {
         let mut ast = Ast {
             nodes: Vec::new(),
             negs: Vec::new(),
@@ -1356,8 +1363,8 @@ impl Ast {
         };
         ast.add_node(None, None);
         let chars: Vec<char> = pattern.chars().collect();
-        ast.parse(&chars, 0, 0, 0);
-        ast
+        ast.parse(scope, &chars, 0, 0, 0)?;
+        Ok(ast)
     }
 
     fn add_node(&mut self, kind: Option<char>, parent: Option<usize>) -> usize {
@@ -1392,30 +1399,39 @@ impl Ast {
     }
 
     /// The pattern text of `node`.
-    fn pattern_text(&mut self, node: usize) -> String {
+    fn pattern_text(&mut self, scope: &Scope<'_>, node: usize) -> Result<String, ExnThrown> {
         if let Some(string) = &self.nodes[node].string {
-            return string.clone();
+            return Ok(string.clone());
         }
+        let _guard = crate::errors::check_stack(scope)?;
         let items = self.nodes[node].items.clone();
-        let texts: Vec<String> = items
+        let texts = items
             .iter()
             .map(|item| match item {
-                Item::Text(text) => text.clone(),
-                Item::Node(child) => self.pattern_text(*child),
+                Item::Text(text) => Ok(text.clone()),
+                Item::Node(child) => self.pattern_text(scope, *child),
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         let string = match self.nodes[node].kind {
             None => texts.concat(),
             Some(kind) => format!("{kind}({})", texts.join("|")),
         };
         self.nodes[node].string = Some(string.clone());
-        string
+        Ok(string)
     }
 
     /// minimatch's `#parseAST`: parse `text` from `pos` into `node`, and return the index after
     /// what was parsed.
-    fn parse(&mut self, text: &[char], node: usize, pos: usize, ext_depth: usize) -> usize {
+    fn parse(
+        &mut self,
+        scope: &Scope<'_>,
+        text: &[char],
+        node: usize,
+        pos: usize,
+        ext_depth: usize,
+    ) -> Result<usize, ExnThrown> {
         const MAX_DEPTH: usize = 2;
+        let _guard = crate::errors::check_stack(scope)?;
         let mut in_brace = false;
         let mut brace_start = 0;
         let mut brace_neg = false;
@@ -1445,14 +1461,14 @@ impl Ast {
                 if is_extglob_kind(c) && text.get(i) == Some(&'(') && ext_depth <= MAX_DEPTH {
                     self.push(node, Item::Text(std::mem::take(&mut acc)));
                     let ext = self.add_node(Some(c), Some(node));
-                    i = self.parse(text, ext, i, ext_depth + 1);
+                    i = self.parse(scope, text, ext, i, ext_depth + 1)?;
                     self.push(node, Item::Node(ext));
                     continue;
                 }
                 acc.push(c);
             }
             self.push(node, Item::Text(acc));
-            return i;
+            return Ok(i);
         }
         let mut i = pos + 1;
         let mut part = self.add_node(None, Some(node));
@@ -1488,7 +1504,7 @@ impl Ast {
                 self.push(part, Item::Text(std::mem::take(&mut acc)));
                 let ext = self.add_node(Some(c), Some(part));
                 self.push(part, Item::Node(ext));
-                i = self.parse(text, ext, i, ext_depth + depth_add);
+                i = self.parse(scope, text, ext, i, ext_depth + depth_add)?;
                 continue;
             }
             if c == '|' {
@@ -1506,7 +1522,7 @@ impl Ast {
                 for part in parts {
                     self.push(node, Item::Node(part));
                 }
-                return i;
+                return Ok(i);
             }
             acc.push(c);
         }
@@ -1515,52 +1531,56 @@ impl Ast {
         node.kind = None;
         node.has_magic = None;
         node.items = vec![Item::Text(rest)];
-        i
+        Ok(i)
     }
 
-    fn is_start(&self, node: usize) -> bool {
-        if node == 0 {
-            return true;
+    /// minimatch's `isStart`: whether `node` and each of its ancestors only follow `!` extglobs
+    /// in their parents.
+    fn is_start(&self, mut node: usize) -> bool {
+        while node != 0 {
+            let Some(parent) = self.nodes[node].parent else {
+                return false;
+            };
+            let parent_index = self.nodes[node].parent_index;
+            let after_negations = (0..parent_index).all(|i| {
+                matches!(self.nodes[parent].items.get(i),
+                    Some(Item::Node(sibling)) if self.nodes[*sibling].kind == Some('!'))
+            });
+            if !after_negations {
+                return false;
+            }
+            node = parent;
         }
-        let Some(parent) = self.nodes[node].parent else {
-            return false;
-        };
-        if !self.is_start(parent) {
-            return false;
-        }
-        let parent_index = self.nodes[node].parent_index;
-        (0..parent_index).all(|i| {
-            matches!(self.nodes[parent].items.get(i),
-                Some(Item::Node(sibling)) if self.nodes[*sibling].kind == Some('!'))
-        })
+        true
     }
 
-    fn is_end(&self, node: usize) -> bool {
-        if node == 0 {
-            return true;
+    /// minimatch's `isEnd`: whether `node` and each of its ancestors up to the first `!` extglob
+    /// are alternatives or the last items of their parents.
+    fn is_end(&self, mut node: usize) -> bool {
+        while node != 0 {
+            let Some(parent) = self.nodes[node].parent else {
+                return false;
+            };
+            if self.nodes[parent].kind == Some('!') {
+                return true;
+            }
+            let last = self.nodes[node].parent_index as isize
+                == self.nodes[parent].items.len() as isize - 1;
+            if self.nodes[node].kind.is_some() && !last {
+                return false;
+            }
+            node = parent;
         }
-        let Some(parent) = self.nodes[node].parent else {
-            return false;
-        };
-        if self.nodes[parent].kind == Some('!') {
-            return true;
-        }
-        if !self.is_end(parent) {
-            return false;
-        }
-        if self.nodes[node].kind.is_none() {
-            return true;
-        }
-        self.nodes[node].parent_index as isize == self.nodes[parent].items.len() as isize - 1
+        true
     }
 
     /// minimatch's `#fillNegs`: append the items after each `!` extglob, at every level, to its
     /// alternatives.
-    fn fill_negs(&mut self) {
+    fn fill_negs(&mut self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
         if self.filled_negs {
-            return;
+            return Ok(());
         }
-        self.pattern_text(0);
+        self.pattern_text(scope, 0)?;
         self.filled_negs = true;
         while let Some(neg) = self.negs.pop() {
             if self.nodes[neg].kind != Some('!') {
@@ -1573,7 +1593,7 @@ impl Ast {
                     let sibling = self.nodes[pp].items[i].clone();
                     for item in self.nodes[neg].items.clone() {
                         if let Item::Node(alternative) = item {
-                            self.copy_in(alternative, &sibling);
+                            self.copy_in(scope, alternative, &sibling)?;
                         }
                     }
                     i += 1;
@@ -1581,24 +1601,32 @@ impl Ast {
                 p = pp;
             }
         }
+        Ok(())
     }
 
-    fn copy_in(&mut self, node: usize, item: &Item) {
+    fn copy_in(&mut self, scope: &Scope<'_>, node: usize, item: &Item) -> Result<(), ExnThrown> {
         match item {
             Item::Text(text) => self.push(node, Item::Text(text.clone())),
             Item::Node(child) => {
-                let clone = self.clone_node(*child, node);
+                let clone = self.clone_node(scope, *child, node)?;
                 self.push(node, Item::Node(clone));
             }
         }
+        Ok(())
     }
 
-    fn clone_node(&mut self, node: usize, parent: usize) -> usize {
+    fn clone_node(
+        &mut self,
+        scope: &Scope<'_>,
+        node: usize,
+        parent: usize,
+    ) -> Result<usize, ExnThrown> {
+        let _guard = crate::errors::check_stack(scope)?;
         let clone = self.add_node(self.nodes[node].kind, Some(parent));
         for item in self.nodes[node].items.clone() {
-            self.copy_in(clone, &item);
+            self.copy_in(scope, clone, &item)?;
         }
-        clone
+        Ok(clone)
     }
 
     /// The only item of `child` as an extglob, if `node` is an extglob and `child` is a sequence
@@ -1688,11 +1716,12 @@ impl Ast {
 
     /// minimatch's `#flatten`: merge nested extglobs that [`Ast::can_adopt`] and
     /// [`Ast::can_usurp`] allow.
-    fn flatten(&mut self, node: usize) {
+    fn flatten(&mut self, scope: &Scope<'_>, node: usize) -> Result<(), ExnThrown> {
+        let _guard = crate::errors::check_stack(scope)?;
         if !self.is_extglob(node) {
             for item in self.nodes[node].items.clone() {
                 if let Item::Node(child) = item {
-                    self.flatten(child);
+                    self.flatten(scope, child)?;
                 }
             }
         } else {
@@ -1702,7 +1731,7 @@ impl Ast {
                 let mut i = 0;
                 while i < self.nodes[node].items.len() {
                     if let Item::Node(child) = self.nodes[node].items[i] {
-                        self.flatten(child);
+                        self.flatten(scope, child)?;
                         if self.can_adopt(node, child, adoption) {
                             done = false;
                             self.adopt(node, child, i);
@@ -1723,16 +1752,22 @@ impl Ast {
             }
         }
         self.nodes[node].string = None;
+        Ok(())
     }
 
     /// minimatch's `#partsToRegExp`: the alternatives of the extglob `node`, joined with `|`.
-    fn parts_to_regexp(&mut self, node: usize, dot: bool) -> String {
+    fn parts_to_regexp(
+        &mut self,
+        scope: &Scope<'_>,
+        node: usize,
+        dot: bool,
+    ) -> Result<String, ExnThrown> {
         let items = self.nodes[node].items.clone();
         let mut sources = Vec::new();
         for item in items {
             let source = match item {
                 Item::Node(child) => {
-                    let (source, _, _, uflag) = self.regexp_source(child, Some(dot));
+                    let (source, _, _, uflag) = self.regexp_source(scope, child, Some(dot))?;
                     self.nodes[node].uflag = self.nodes[node].uflag || uflag;
                     source
                 }
@@ -1746,21 +1781,23 @@ impl Ast {
         }
         let whole = self.is_start(node) && self.is_end(node);
         sources.retain(|source| !whole || !source.is_empty());
-        sources.join("|")
+        Ok(sources.join("|"))
     }
 
     /// minimatch's `toRegExpSource`: the regular expression of `node`, the literal it stands
     /// for, whether it has magic, and whether it needs the `u` flag.
     fn regexp_source(
         &mut self,
+        scope: &Scope<'_>,
         node: usize,
         allow_dot: Option<bool>,
-    ) -> (String, String, bool, bool) {
+    ) -> Result<(String, String, bool, bool), ExnThrown> {
+        let _guard = crate::errors::check_stack(scope)?;
         let dot = allow_dot.unwrap_or(false);
         let allows_dot = allow_dot == Some(true);
         if node == 0 {
-            self.flatten(0);
-            self.fill_negs();
+            self.flatten(scope, 0)?;
+            self.fill_negs(scope)?;
         }
         let Some(kind) = self.nodes[node].kind else {
             let no_empty = self.is_start(node)
@@ -1776,7 +1813,8 @@ impl Ast {
                         parse_glob(&text, self.nodes[node].has_magic == Some(true), no_empty)
                     }
                     Item::Node(child) => {
-                        let (re, _, has_magic, uflag) = self.regexp_source(child, allow_dot);
+                        let (re, _, has_magic, uflag) =
+                            self.regexp_source(scope, child, allow_dot)?;
                         (re, has_magic, uflag)
                     }
                 };
@@ -1816,28 +1854,28 @@ impl Ast {
             };
             let has_magic = self.nodes[node].has_magic == Some(true);
             self.nodes[node].has_magic = Some(has_magic);
-            return (
+            return Ok((
                 format!("{start}{src}{end}"),
                 unescape(&src),
                 has_magic,
                 self.nodes[node].uflag,
-            );
+            ));
         };
         let repeated = kind == '*' || kind == '+';
         let open = if kind == '!' { "(?:(?!(?:" } else { "(?:" };
-        let mut body = self.parts_to_regexp(node, dot);
+        let mut body = self.parts_to_regexp(scope, node, dot)?;
         if self.is_start(node) && self.is_end(node) && body.is_empty() && kind != '!' {
-            let string = self.pattern_text(node);
+            let string = self.pattern_text(scope, node)?;
             let state = &mut self.nodes[node];
             state.items = vec![Item::Text(string.clone())];
             state.kind = None;
             state.has_magic = None;
-            return (string.clone(), unescape(&string), false, false);
+            return Ok((string.clone(), unescape(&string), false, false));
         }
         let mut body_dot_allowed = if !repeated || allows_dot || dot {
             String::new()
         } else {
-            self.parts_to_regexp(node, true)
+            self.parts_to_regexp(scope, node, true)?
         };
         if body_dot_allowed == body {
             body_dot_allowed.clear();
@@ -1872,19 +1910,19 @@ impl Ast {
         };
         let has_magic = self.nodes[node].has_magic == Some(true);
         self.nodes[node].has_magic = Some(has_magic);
-        (
+        Ok((
             final_source,
             unescape(&body),
             has_magic,
             self.nodes[node].uflag,
-        )
+        ))
     }
 
     /// minimatch's `toMMPattern`: the literal the segment pattern stands for, or its regular
     /// expression if it has magic.
-    fn mm_pattern(&mut self) -> MmPattern {
-        let glob = self.pattern_text(0);
-        let (re, body, has_magic, uflag) = self.regexp_source(0, None);
+    fn mm_pattern(&mut self, scope: &Scope<'_>) -> Result<MmPattern, ExnThrown> {
+        let glob = self.pattern_text(scope, 0)?;
+        let (re, body, has_magic, uflag) = self.regexp_source(scope, 0, None)?;
         let options = self.options;
         let any_magic = has_magic
             || self.nodes[0].has_magic == Some(true)
@@ -1892,7 +1930,7 @@ impl Ast {
                 && !options.nocase_magic_only
                 && glob.to_uppercase() != glob.to_lowercase());
         if !any_magic {
-            return MmPattern::Literal(body);
+            return Ok(MmPattern::Literal(body));
         }
         let mut flags = String::new();
         if options.nocase {
@@ -1901,6 +1939,6 @@ impl Ast {
         if uflag {
             flags.push('u');
         }
-        MmPattern::Regex(format!("^{re}$"), flags)
+        Ok(MmPattern::Regex(format!("^{re}$"), flags))
     }
 }

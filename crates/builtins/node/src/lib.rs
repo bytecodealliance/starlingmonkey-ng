@@ -37,6 +37,7 @@ mod stack_trace;
 pub mod stream;
 pub mod string_decoder;
 mod stub;
+mod support;
 pub mod test_runner;
 pub mod timers;
 pub mod tty;
@@ -134,43 +135,53 @@ pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
     }
 }
 
+/// Intern the keys of the property templates that the builtins create objects with.
+fn register_templates(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    events::EMITTER_PROPERTIES.register(scope)?;
+    http::register_templates(scope)?;
+    url::URL_PROPERTIES.register(scope)
+}
+
 /// Register the classes of the Node.js modules on `global`, without defining their constructors
 /// on it.
 fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
+    register_templates(scope)?;
     events::event_emitter::register(scope)?;
-    stream::register_classes(scope)?;
-    assert::assertion_error::register(scope)?;
-    assert::call_tracker::register(scope)?;
-    async_hooks::async_local_storage::register(scope)?;
-    async_hooks::async_resource::register(scope)?;
-    buffer::buffer::register(scope)?;
-    commonjs::module_class::register(scope)?;
-    crypto::KeyObjectHandle::add_to_global(scope, global);
-    crypto::NativeHash::add_to_global(scope, global);
-    crypto::NativeHmac::add_to_global(scope, global);
-    crypto::hash_class::register(scope)?;
-    crypto::hmac_class::register(scope)?;
-    crypto::key_object_class::register(scope)?;
-    crypto::secret_key_object_class::register(scope)?;
-    diagnostics_channel::channel::register(scope)?;
-    diagnostics_channel::tracing_channel::register(scope)?;
-    errors::abort_error_class::register(scope)?;
+    stream::register_classes(scope, global)?;
+    dns::LookupRequest::add_to_global(scope, global);
+    events::OnceState::add_to_global(scope, global);
+    events::RejectionState::add_to_global(scope, global);
+    events_async::OnIteration::add_to_global(scope, global);
+    events_async::OnceWait::add_to_global(scope, global);
     fs::register_classes(scope, global)?;
     http::register_classes(scope, global)?;
     net::register_classes(scope, global)?;
-    readline::interface_class::register(scope)?;
-    readline::promises_interface_class::register(scope)?;
+    readline::InterfaceState::add_to_global(scope, global);
+    readline::QuestionAbort::add_to_global(scope, global);
+    readline::QuestionAnswer::add_to_global(scope, global);
     stack_trace::CallSite::add_to_global(scope, global);
     string_decoder::NativeDecoder::add_to_global(scope, global);
+    support::PendingOp::add_to_global(scope, global);
+    zlib::ParamsRequest::add_to_global(scope, global);
+    zlib::ZlibState::add_to_global(scope, global);
+    assert::register_classes(scope, global)?;
+    async_hooks::register_classes(scope, global)?;
+    buffer::buffer::register(scope)?;
+    commonjs::module_class::register(scope)?;
+    crypto::register_classes(scope, global)?;
+    inspect::register_classes(scope, global)?;
+    util::register_classes(scope, global);
+    diagnostics_channel::register_classes(scope, global)?;
+    errors::abort_error_class::register(scope)?;
+    readline::interface_class::register(scope)?;
+    readline::promises_interface_class::register(scope)?;
     string_decoder::string_decoder_class::register(scope)?;
-    test_runner::register_classes(scope)?;
-    timers::timeout::register(scope)?;
-    timers::immediate::register(scope)?;
-    tty::StdinHandle::add_to_global(scope, global);
+    test_runner::register_classes(scope, global)?;
+    timers::register_classes(scope, global)?;
     tty::read_stream_class::register(scope)?;
     url::url_class::register(scope)?;
-    zlib::ZlibHandle::add_to_global(scope, global);
-    zlib::register_classes(scope)
+    zlib::register_classes(scope)?;
+    Ok(())
 }
 
 /// `gc(options)`, which `--expose-gc` installs: run a full garbage collection. Returns a promise
@@ -249,20 +260,4 @@ pub(crate) fn builtin_module_names() -> impl Iterator<Item = &'static str> {
     exports_table::BUILTIN_EXPORTS
         .iter()
         .map(|&(name, aliases, _)| aliases.first().copied().unwrap_or(name))
-}
-
-/// A new symbol with `description`, registered under that key in the global symbol registry
-/// (`Symbol.for`) if `registered`.
-pub(crate) fn symbol<'s>(
-    scope: &'s Scope<'_>,
-    description: &str,
-    registered: bool,
-) -> Result<HandleValue<'s>, ExnThrown> {
-    let description = js::JSString::from_str(scope, description)?;
-    let symbol = if registered {
-        js::symbol::get_symbol_for(scope, description.handle())?
-    } else {
-        js::symbol::new_symbol(scope, description.handle())?
-    };
-    Ok(scope.root_value(js::value::from_symbol(symbol)))
 }

@@ -5,29 +5,26 @@
 //! results and the errors of the failed tests. See Node.js's
 //! `lib/internal/test_runner/reporter/spec.js`.
 
-use std::ffi::CStr;
-
 use js::conversion::FromJSVal;
 use js::error::ExnThrown;
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::Object;
 
-use super::{elements, harness, kind_of, objects, parent_of, push, ROOT, SUITE};
-use crate::stream::{as_object, call_method, rust_string, string, Props};
+use super::{harness, parent_of, Harness, TestRecord, ROOT, SUITE};
+use crate::support::rust_string;
 
-/// The harness's counters of finished tests, in the order the summary lists them.
-pub(super) const COUNTERS: [&CStr; 7] = [
-    c"tests",
-    c"suites",
-    c"passed",
-    c"failed",
-    c"cancelled",
-    c"skipped",
-    c"todo",
-];
+/// The indices of the harness's counters of finished tests.
+const TESTS: usize = 0;
+const SUITES: usize = 1;
+const PASSED: usize = 2;
+const FAILED: usize = 3;
+const CANCELLED: usize = 4;
+const SKIPPED: usize = 5;
+const TODO: usize = 6;
 
-/// The labels the summary gives [`COUNTERS`].
+/// The labels the summary gives the harness's counters, in their order.
 const COUNTER_LABELS: [&str; 7] = [
     "tests",
     "suites",
@@ -41,14 +38,14 @@ const COUNTER_LABELS: [&str; 7] = [
 /// Write `text` with `process.stdout.write`, or to the standard output if there is no
 /// `process.stdout`.
 fn write(scope: &Scope<'_>, text: &str) -> Result<(), ExnThrown> {
-    let process = scope.global().get_property(scope, c"process")?;
-    let stdout = match as_object(scope, process) {
-        Some(process) => process.obj(scope, c"stdout")?,
+    let process = crate::process::process_value(scope)?;
+    let stdout = match Object::from_value(scope, process).ok() {
+        Some(process) => Object::from_value(scope, process.get_property(scope, c"stdout")?).ok(),
         None => None,
     };
     match stdout {
         Some(stdout) => {
-            call_method(scope, stdout, c"write", &[string(scope, text)?])?;
+            js::Function::call_by_name(scope, stdout.handle(), c"write", &[text])?;
         }
         None => print!("{text}"),
     }
@@ -56,8 +53,8 @@ fn write(scope: &Scope<'_>, text: &str) -> Result<(), ExnThrown> {
 }
 
 /// Two spaces per level of `nesting`.
-fn indent(nesting: f64) -> String {
-    "  ".repeat(nesting.max(0.0) as usize)
+fn indent(nesting: u32) -> String {
+    "  ".repeat(nesting as usize)
 }
 
 /// `value` converted to a string, as a template literal converts it, or as `util.inspect` shows
@@ -90,106 +87,116 @@ fn inspect(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
     })
 }
 
+/// The duration between `start` and `end` in milliseconds, as the reporter shows it.
+fn duration(start: Option<f64>, end: Option<f64>) -> f64 {
+    let duration = end.unwrap_or(0.0) - start.unwrap_or(0.0);
+    (duration * 1e6).round() / 1e6
+}
+
 /// The line of the finished `record`, without indentation: its symbol, name, duration, and its
 /// `SKIP`, `TODO` or `EXPECTED FAILURE` directive.
-fn title(scope: &Scope<'_>, record: Object<'_>) -> Result<String, ExnThrown> {
-    let passed = record.flag(scope, c"passed")?;
-    let mut symbol = if passed { "\u{2714} " } else { "\u{2716} " };
-    let name = display(scope, record.get_property(scope, c"name")?);
-    let duration = record.num(scope, c"endTime")? - record.num(scope, c"startTime")?;
-    let mut title = name;
+fn title(scope: &Scope<'_>, record: TestRecord<'_>) -> String {
+    let data = record.data();
+    let mut symbol = if data.passed {
+        "\u{2714} "
+    } else {
+        "\u{2716} "
+    };
+    let mut title = data.name.clone();
+    let duration = duration(data.start_time, data.end_time);
     if duration != 0.0 {
-        let rounded = (duration * 1e6).round() / 1e6;
         title.push_str(&format!(
             " ({}ms)",
-            crate::errors::number_to_string(rounded)
+            crate::errors::number_to_string(duration)
         ));
     }
-    let message = rust_string(scope, record.get_property(scope, c"message")?)
-        .filter(|message| !message.is_empty());
-    if record.flag(scope, c"skipped")? {
+    let message = rust_string(scope, data.message.get(scope)).filter(|message| !message.is_empty());
+    if data.skipped {
         title.push_str(&format!(" # {}", message.as_deref().unwrap_or("SKIP")));
         symbol = "\u{fe63} ";
-    } else if record.flag(scope, c"todo")? {
+    } else if data.todo {
         title.push_str(&format!(" # {}", message.as_deref().unwrap_or("TODO")));
-        if !passed {
+        if !data.passed {
             symbol = "\u{26a0} ";
         }
-    } else if record.flag(scope, c"expectFailure")? {
+    } else if data.expect_failure {
         title.push_str(" # EXPECTED FAILURE");
     }
-    Ok(format!("{symbol}{title}"))
+    format!("{symbol}{title}")
 }
 
 /// The error of the failed `record`, as the lines below its title show it.
-fn error_lines(scope: &Scope<'_>, record: Object<'_>, nesting: f64) -> Result<String, ExnThrown> {
+fn error_lines(scope: &Scope<'_>, record: TestRecord<'_>, nesting: u32) -> String {
     let indentation = indent(nesting);
-    let error = record.get_property(scope, c"error")?;
+    let error = record.data().error.get(scope);
     let text = inspect(scope, error).replace("\r\n", "\n");
     let joined = text
         .split('\n')
         .collect::<Vec<_>>()
         .join(&format!("\n{indentation}  "));
-    Ok(format!("\n{indentation}  {joined}\n"))
+    format!("\n{indentation}  {joined}\n")
 }
 
 /// Add the finished `record` to the harness's counters, as Node.js's `countCompletedTest` does.
-fn count(scope: &Scope<'_>, harness: Object<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    let increment = |name: &'static CStr| -> Result<(), ExnThrown> {
-        let value = harness.num(scope, name)?;
-        harness.set_property(scope, name, value + 1.0)
-    };
-    let passed = record.flag(scope, c"passed")?;
-    let todo = record.flag(scope, c"todo")?;
-    if kind_of(scope, record)? == SUITE {
-        increment(c"suites")?;
-        if !passed && !todo {
-            harness.set_property(scope, c"success", false)?;
+fn count(harness: Harness<'_>, record: TestRecord<'_>) {
+    let record = record.data();
+    let mut harness = harness.data_mut();
+    if record.kind == SUITE {
+        harness.counters[SUITES] += 1;
+        if !record.passed && !record.todo {
+            harness.success = false;
         }
-        return Ok(());
+        return;
     }
-    if record.flag(scope, c"skipped")? {
-        increment(c"skipped")?;
-    } else if todo {
-        increment(c"todo")?;
-    } else if record.flag(scope, c"cancelled")? {
-        increment(c"cancelled")?;
-        harness.set_property(scope, c"success", false)?;
-    } else if !passed {
-        increment(c"failed")?;
-        harness.set_property(scope, c"success", false)?;
+    if record.skipped {
+        harness.counters[SKIPPED] += 1;
+    } else if record.todo {
+        harness.counters[TODO] += 1;
+    } else if record.cancelled {
+        harness.counters[CANCELLED] += 1;
+        harness.success = false;
+    } else if !record.passed {
+        harness.counters[FAILED] += 1;
+        harness.success = false;
     } else {
-        increment(c"passed")?;
+        harness.counters[PASSED] += 1;
     }
-    increment(c"tests")
+    harness.counters[TESTS] += 1;
 }
 
 /// Report the finished test or suite `record`: count it, and write its line, after a line for
 /// each of its ancestors that has none yet, and its diagnostics. A failed record is kept for the
 /// summary's list of failures, unless it failed because its subtests did.
-pub(super) fn report_test(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    if record.flag(scope, c"filtered")? || kind_of(scope, record)? == ROOT {
+pub(super) fn report_test(scope: &Scope<'_>, record: TestRecord<'_>) -> Result<(), ExnThrown> {
+    if record.data().filtered || record.data().kind == ROOT {
         return Ok(());
     }
     let harness = harness(scope)?;
-    count(scope, harness, record)?;
+    count(harness, record);
     let mut headers = Vec::new();
-    let mut current = parent_of(scope, record)?;
+    let mut current = parent_of(scope, record);
     while let Some(ancestor) = current {
-        if kind_of(scope, ancestor)? == ROOT || ancestor.flag(scope, c"announced")? {
-            break;
+        {
+            let mut data = ancestor.data_mut();
+            if data.kind == ROOT || data.announced {
+                break;
+            }
+            data.announced = true;
+            headers.push(format!("{}\u{25b6} {}\n", indent(data.nesting), data.name));
         }
-        ancestor.set_property(scope, c"announced", true)?;
-        let name = display(scope, ancestor.get_property(scope, c"name")?);
-        let nesting = ancestor.num(scope, c"nesting")?;
-        headers.push(format!("{}\u{25b6} {name}\n", indent(nesting)));
-        current = parent_of(scope, ancestor)?;
+        current = parent_of(scope, ancestor);
     }
     headers.reverse();
-    let nesting = record.num(scope, c"nesting")?;
+    let nesting = record.data().nesting;
     let mut text = headers.concat();
-    text.push_str(&format!("{}{}\n", indent(nesting), title(scope, record)?));
-    for message in elements(scope, record, c"diagnostics")? {
+    text.push_str(&format!("{}{}\n", indent(nesting), title(scope, record)));
+    let diagnostics: Vec<HandleValue<'_>> = record
+        .data()
+        .diagnostics
+        .iter()
+        .map(|message| message.get(scope))
+        .collect();
+    for message in diagnostics {
         text.push_str(&format!(
             "{}\u{2139} {}\n",
             indent(nesting),
@@ -197,12 +204,12 @@ pub(super) fn report_test(scope: &Scope<'_>, record: Object<'_>) -> Result<(), E
         ));
     }
     write(scope, &text)?;
-    let failure_type = record.get_property(scope, c"failureType")?;
-    if !record.flag(scope, c"passed")?
-        && !crate::stream::is_str(scope, failure_type, c"subtestsFailed")?
-    {
-        let failures = harness.obj(scope, c"failures")?.ok_or(ExnThrown)?;
-        push(scope, failures, record)?;
+    let listed = {
+        let data = record.data();
+        !data.passed && data.failure_type != "subtestsFailed"
+    };
+    if listed {
+        harness.data_mut().failures.push(Heap::from(record));
     }
     Ok(())
 }
@@ -213,8 +220,7 @@ pub(super) fn report_root_hook_failure(
     scope: &Scope<'_>,
     error: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let harness = harness(scope)?;
-    harness.set_property(scope, c"success", false)?;
+    harness(scope)?.data_mut().success = false;
     let file = super::entry_file(scope)?;
     let name = display(scope, file);
     let text = format!(
@@ -228,38 +234,47 @@ pub(super) fn report_root_hook_failure(
 /// tests with their errors.
 pub(super) fn summary(
     scope: &Scope<'_>,
-    harness: Object<'_>,
-    root: Object<'_>,
+    harness: Harness<'_>,
+    root: TestRecord<'_>,
 ) -> Result<(), ExnThrown> {
     let mut text = String::new();
-    for message in elements(scope, root, c"diagnostics")? {
+    let diagnostics: Vec<HandleValue<'_>> = root
+        .data()
+        .diagnostics
+        .iter()
+        .map(|message| message.get(scope))
+        .collect();
+    for message in diagnostics {
         text.push_str(&format!("\u{2139} {}\n", display(scope, message)));
     }
-    for (counter, label) in COUNTERS.iter().zip(COUNTER_LABELS) {
-        let value = harness.num(scope, counter)?;
-        text.push_str(&format!(
-            "\u{2139} {label} {}\n",
-            crate::errors::number_to_string(value)
-        ));
+    let counters = harness.data().counters;
+    for (value, label) in counters.iter().zip(COUNTER_LABELS) {
+        text.push_str(&format!("\u{2139} {label} {value}\n"));
     }
-    let duration = root.num(scope, c"endTime")? - root.num(scope, c"startTime")?;
-    let rounded = (duration * 1e6).round() / 1e6;
+    let (start, end) = {
+        let data = root.data();
+        (data.start_time, data.end_time)
+    };
     text.push_str(&format!(
         "\u{2139} duration_ms {}\n",
-        crate::errors::number_to_string(rounded)
+        crate::errors::number_to_string(duration(start, end))
     ));
-    let failures = objects(scope, harness, c"failures")?;
+    let failures: Vec<TestRecord<'_>> = harness
+        .data()
+        .failures
+        .iter()
+        .map(|record| record.get(scope))
+        .collect();
     if !failures.is_empty() {
         let mut parts = vec!["\n\u{2716} failing tests:\n".to_string()];
         for record in failures {
             parts.push(format!(
                 "{}{}",
-                title(scope, record)?,
-                error_lines(scope, record, 0.0)?
+                title(scope, record),
+                error_lines(scope, record, 0)
             ));
         }
         text.push_str(&parts.join("\n"));
     }
-    write(scope, &text)?;
-    Ok(())
+    write(scope, &text)
 }

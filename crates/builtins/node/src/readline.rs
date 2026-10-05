@@ -11,14 +11,16 @@
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{ErrorKind, NodeError, Thrown};
-use crate::stream::{call_method, closure, is_function, next_tick_call, string, Captures, Props};
+use crate::support::{next_tick_call, Props};
 
 /// The key of the shared object `readline.promises` is.
 static PROMISES_KEY: u8 = 0;
@@ -32,133 +34,175 @@ fn use_after_close() -> NodeError {
     )
 }
 
+/// The state of an `Interface`.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct InterfaceState {
+    /// The callback of the pending question, or `undefined`.
+    question: Heap<Value>,
+    #[no_trace]
+    prompt: String,
+    /// The UTF-8 decoder of `Buffer` input chunks, which holds an incomplete character until the
+    /// next chunk.
+    #[no_trace]
+    decoder: crate::string_decoder::NativeDecoderImpl,
+    /// Whether the last input ended with `\r`, so that a `\n` starting the next one ends no line.
+    #[no_trace]
+    saw_return: bool,
+    /// The input of the line being read.
+    #[no_trace]
+    partial: String,
+    #[no_trace]
+    closed: bool,
+    #[no_trace]
+    paused: bool,
+    /// The listeners on the input's `data`, `end` and `error` events.
+    on_data: Option<Heap<js::object::Object>>,
+    on_end: Option<Heap<js::object::Object>>,
+    on_error: Option<Heap<js::object::Object>>,
+    /// The `signal` option and the abort listener on it, which `close` removes.
+    signal: Option<Heap<js::object::Object>>,
+    on_abort: Option<Heap<js::object::Object>>,
+    /// The iterator `[Symbol.asyncIterator]()` returns, once created.
+    line_iterator: Option<Heap<js::object::Object>>,
+}
+
+#[core_runtime::jsmethods]
+impl InterfaceState {}
+
+/// The state of the interface `interface`.
+fn state_of<'s>(
+    scope: &'s Scope<'_>,
+    interface: Object<'s>,
+) -> Result<InterfaceState<'s>, ExnThrown> {
+    interface_class::state_of(scope, interface)
+}
+
 /// The text of the input chunk `chunk`: a string, or a `Buffer` decoded by the interface's UTF-8
-/// `StringDecoder` in `_starlingDecoder`, which buffers an incomplete character until the next
-/// chunk.
+/// decoder.
 fn decode(
     scope: &Scope<'_>,
-    interface: Object<'_>,
+    state: InterfaceState<'_>,
     chunk: HandleValue<'_>,
 ) -> Result<String, ExnThrown> {
     if chunk.is_string() {
         return Ok(String::from_jsval(scope, chunk, ()).unwrap_or_default());
     }
-    let decoder = match interface.obj(scope, c"_starlingDecoder")? {
-        Some(decoder) => decoder,
-        None => {
-            let class = crate::string_decoder::string_decoder_class::class_constructor(scope)?;
-            let decoder = Function::construct(scope, class, &[string(scope, "utf8")?])?;
-            interface.define_property(scope, c"_starlingDecoder", decoder, 0)?;
-            decoder
-        }
+    let Some(view) = js::ArrayBufferView::from_value(scope, chunk) else {
+        return Ok(String::new());
     };
-    let text = call_method(scope, decoder, c"write", &[chunk])?;
-    Ok(String::from_jsval(scope, text, ()).unwrap_or_default())
+    let bytes = view.copy_bytes(scope)?;
+    let units = state.data_mut().decoder.decode(&bytes);
+    Ok(String::from_utf16_lossy(&units))
 }
 
 /// Handle the line `line`: answer the pending question with it, or emit it as a `line` event.
 fn on_line(scope: &Scope<'_>, interface: Object<'_>, line: &str) -> Result<(), ExnThrown> {
+    let state = state_of(scope, interface)?;
     let line = js::JSString::from_str(scope, line)?.to_jsval_throwing(scope)?;
-    let question = interface.val(scope, c"_starlingQuestion")?;
-    if is_function(scope, question) {
-        interface.set_property(scope, c"_starlingQuestion", js::value::undefined())?;
+    let question = state.data().question.get(scope);
+    if js::function::is_callable(question) {
+        state.data_mut().question.set(js::value::undefined());
         Function::call(scope, js::value::undefined(), question, &[line])?;
         return Ok(());
     }
-    call_method(scope, interface, c"emit", &[string(scope, "line")?, line])?;
+    crate::events::emit(scope, interface, c"line", &[line])?;
     Ok(())
 }
 
 /// Add `text` to the line being read, and handle each line it completes. A `\r` that ends one
 /// piece of text and a `\n` that starts the next end a single line.
 fn feed(scope: &Scope<'_>, interface: Object<'_>, text: &str) -> Result<(), ExnThrown> {
-    let mut buffer =
-        String::from_jsval(scope, interface.val(scope, c"line")?, ()).unwrap_or_default();
-    let mut text = text;
-    if interface.flag(scope, c"_starlingCarriage")? {
-        text = text.strip_prefix('\n').unwrap_or(text);
-        interface.set_property(scope, c"_starlingCarriage", false)?;
-    }
-    buffer.push_str(text);
+    let state = state_of(scope, interface)?;
     let mut lines = Vec::new();
-    let mut rest = buffer.as_str();
-    while let Some(end) = rest.find(['\r', '\n']) {
-        lines.push(&rest[..end]);
-        let after = &rest[end..];
-        rest = if let Some(after_crlf) = after.strip_prefix("\r\n") {
-            after_crlf
-        } else {
-            if after == "\r" {
-                interface.set_property(scope, c"_starlingCarriage", true)?;
-            }
-            &after[1..]
-        };
+    {
+        let mut data = state.data_mut();
+        let mut text = text;
+        if data.saw_return {
+            text = text.strip_prefix('\n').unwrap_or(text);
+            data.saw_return = false;
+        }
+        let mut buffer = std::mem::take(&mut data.partial);
+        buffer.push_str(text);
+        let mut rest = buffer.as_str();
+        while let Some(end) = rest.find(['\r', '\n']) {
+            lines.push(rest[..end].to_string());
+            let after = &rest[end..];
+            rest = if let Some(after_crlf) = after.strip_prefix("\r\n") {
+                after_crlf
+            } else {
+                if after == "\r" {
+                    data.saw_return = true;
+                }
+                &after[1..]
+            };
+        }
+        data.partial = rest.to_string();
     }
-    interface.set_property(scope, c"line", rest)?;
     for line in lines {
-        on_line(scope, interface, line)?;
-        if interface.flag(scope, c"closed")? {
+        on_line(scope, interface, &line)?;
+        if state.data().closed {
             return Ok(());
         }
     }
     Ok(())
 }
 
-/// The `data` listener of an interface's input, whose captures are `[interface]`.
+/// The `data` listener of an interface's input, whose payload is the interface.
 fn on_data(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let interface = Captures::of(scope, payload)?.obj(0)?;
-    if !interface.flag(scope, c"closed")? {
-        let text = decode(scope, interface, args.get(0))?;
+    let interface = cast_payload::<Object>(scope, payload);
+    let state = state_of(scope, interface)?;
+    if !state.data().closed {
+        let text = decode(scope, state, args.get(0))?;
         feed(scope, interface, &text)?;
     }
     Ok(js::value::undefined())
 }
 
-/// The `end` listener of an interface's input, whose captures are `[interface]`: handle the last
+/// The `end` listener of an interface's input, whose payload is the interface: handle the last
 /// line, if it has no line ending, and close the interface.
 fn on_end(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let interface = Captures::of(scope, payload)?.obj(0)?;
-    if interface.flag(scope, c"closed")? {
+    let interface = cast_payload::<Object>(scope, payload);
+    let state = state_of(scope, interface)?;
+    if state.data().closed {
         return Ok(js::value::undefined());
     }
-    let line = String::from_jsval(scope, interface.val(scope, c"line")?, ()).unwrap_or_default();
+    let line = std::mem::take(&mut state.data_mut().partial);
     if !line.is_empty() {
-        interface.set_property(scope, c"line", "")?;
         on_line(scope, interface, &line)?;
     }
-    interface_class::close(scope, interface)?;
+    Function::call_by_name(scope, interface.handle(), c"close", js::function::EmptyArgs)?;
     Ok(js::value::undefined())
 }
 
-/// The `error` listener of an interface's input, whose captures are `[interface]`: emit the
+/// The `error` listener of an interface's input, whose payload is the interface: emit the
 /// error as the interface's `error` event.
 fn on_error(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let interface = Captures::of(scope, payload)?.obj(0)?;
-    call_method(
-        scope,
-        interface,
-        c"emit",
-        &[string(scope, "error")?, args.get(0)],
-    )?;
+    let interface = cast_payload::<Object>(scope, payload);
+    crate::events::emit(scope, interface, c"error", &[args.get(0)])?;
     Ok(js::value::undefined())
 }
 
 /// Write `text` to the interface's output, if it has one.
 fn write_output(scope: &Scope<'_>, interface: Object<'_>, text: &str) -> Result<(), ExnThrown> {
     if let Some(output) = interface.obj(scope, c"output")? {
-        call_method(scope, output, c"write", &[string(scope, text)?])?;
+        Function::call_by_name(
+            scope,
+            output.handle(),
+            c"write",
+            &[js::conversion::ToJSVal::to_jsval_throwing(text, scope)?],
+        )?;
     }
     Ok(())
 }
@@ -170,14 +214,15 @@ fn ask(
     query: HandleValue<'_>,
     callback: HandleValue<'_>,
 ) -> Result<(), Thrown> {
-    if interface.flag(scope, c"closed")? {
+    let state = state_of(scope, interface)?;
+    if state.data().closed {
         return Err(use_after_close().into());
     }
-    if is_function(scope, interface.val(scope, c"_starlingQuestion")?) {
+    if js::function::is_callable(state.data().question.get(scope)) {
         interface_class::prompt(scope, interface)?;
         return Ok(());
     }
-    interface.set_property(scope, c"_starlingQuestion", callback)?;
+    state.data_mut().question.set(callback.get());
     let query = js::JSString::from_value(scope, query)?.to_utf8(scope)?;
     write_output(scope, interface, &query)?;
     interface_class::resume(scope, interface)?;
@@ -193,281 +238,144 @@ fn init_interface(
     output: Option<HandleValue<'_>>,
 ) -> Result<(), Thrown> {
     crate::events::event_emitter::init(scope, this, None)?;
-    let (input, output, prompt) = match Object::from_value(scope, *input) {
+    let (input, output, signal, prompt) = match Object::from_value(scope, *input) {
         Ok(options) if !options.val(scope, c"input")?.is_undefined() => (
             options.val(scope, c"input")?,
             options.val(scope, c"output")?,
+            options.val(scope, c"signal")?,
             options.val(scope, c"prompt")?,
         ),
         _ => (
-            scope.root_value(input.get()),
-            output.map_or_else(
-                || scope.root_value(js::value::undefined()),
-                |output| scope.root_value(output.get()),
-            ),
-            scope.root_value(js::value::undefined()),
+            input,
+            output.unwrap_or(HandleValue::undefined()),
+            HandleValue::undefined(),
+            HandleValue::undefined(),
         ),
+    };
+    // As in Node.js, a falsy `signal` is ignored.
+    let signal = if js::conversion::to_boolean(signal) {
+        crate::errors::validate_abort_signal(scope, signal, "options.signal")?;
+        Some(Object::from_value(scope, *signal)?)
+    } else {
+        None
     };
     let input_object = Object::from_value(scope, *input)
         .map_err(|_| NodeError::invalid_arg_type(scope, "input", "an instance of Stream", input))?;
-    this.set_property(scope, c"input", input)?;
-    this.set_property(scope, c"output", output)?;
-    this.set_property(scope, c"terminal", false)?;
-    this.set_property(scope, c"line", "")?;
-    this.set_property(scope, c"cursor", 0)?;
+    let prompt = match crate::support::rust_string(scope, prompt) {
+        Some(prompt) => prompt,
+        None => "> ".to_string(),
+    };
+    let data = Function::new_callback(scope, c"", 1, on_data, this)?;
+    let end = Function::new_callback(scope, c"", 0, on_end, this)?;
+    let error = Function::new_callback(scope, c"", 1, on_error, this)?;
+    *interface_class::state_of(scope, this)?.data_mut() = InterfaceStateImpl {
+        question: Heap::from(js::value::undefined()),
+        prompt,
+        decoder: crate::string_decoder::NativeDecoderImpl::default(),
+        saw_return: false,
+        partial: String::new(),
+        closed: false,
+        paused: false,
+        on_data: Some(Heap::from(*data)),
+        on_end: Some(Heap::from(*end)),
+        on_error: Some(Heap::from(*error)),
+        signal: None,
+        on_abort: None,
+        line_iterator: None,
+    };
+    this.set_property(scope, c"completer", js::value::undefined())?;
+    this.set_property(scope, c"crlfDelay", 100)?;
+    this.set_property(scope, c"escapeCodeTimeout", 500)?;
     this.set_property(scope, c"history", *js::Array::new(scope, 0)?)?;
-    this.set_property(scope, c"closed", false)?;
-    this.set_property(scope, c"paused", false)?;
-    if prompt.is_string() {
-        this.set_property(scope, c"_starlingPrompt", prompt)?;
-    } else {
-        this.set_property(scope, c"_starlingPrompt", "> ")?;
+    this.set_property(scope, c"historyIndex", -1)?;
+    this.set_property(scope, c"historySize", 30)?;
+    this.set_property(scope, c"input", input)?;
+    this.set_property(scope, c"isCompletionEnabled", true)?;
+    this.set_property(scope, c"isFlushing", false)?;
+    this.set_property(scope, c"line", "")?;
+    this.set_property(scope, c"output", output)?;
+    this.set_property(scope, c"tabSize", 8)?;
+    this.set_property(scope, c"terminal", false)?;
+    for (event, listener) in [(c"error", error), (c"data", data), (c"end", end)] {
+        crate::events::listen(scope, input_object, c"on", event, *listener)?;
     }
-    let data = closure(scope, 1, on_data, &[this.to_jsval_raw_throwing(scope)?])?;
-    let end = closure(scope, 0, on_end, &[this.to_jsval_raw_throwing(scope)?])?;
-    let error = closure(scope, 1, on_error, &[this.to_jsval_raw_throwing(scope)?])?;
-    this.define_property(scope, c"_starlingOnData", data, 0)?;
-    this.define_property(scope, c"_starlingOnEnd", end, 0)?;
-    this.define_property(scope, c"_starlingOnError", error, 0)?;
-    call_method(
-        scope,
-        input_object,
-        c"on",
-        &[string(scope, "error")?, error.to_jsval_throwing(scope)?],
-    )?;
-    call_method(
-        scope,
-        input_object,
-        c"on",
-        &[string(scope, "data")?, data.to_jsval_throwing(scope)?],
-    )?;
-    call_method(
-        scope,
-        input_object,
-        c"on",
-        &[string(scope, "end")?, end.to_jsval_throwing(scope)?],
-    )?;
-    if crate::stream::has_method(scope, input_object, c"resume")? {
-        call_method(scope, input_object, c"resume", &[])?;
+    if crate::support::has_method(scope, input_object, c"resume")? {
+        Function::call_by_name(
+            scope,
+            input_object.handle(),
+            c"resume",
+            js::function::EmptyArgs,
+        )?;
+    }
+    if let Some(signal) = signal {
+        // An aborted signal closes the interface in a tick, and any other signal closes it when
+        // it aborts.
+        if signal.flag(scope, c"aborted")? {
+            js::jobs::queue_native_tick(scope, close_on_abort, this, &[])?;
+        } else {
+            let listener = Function::new_callback(scope, c"", 0, close_on_abort, this)?;
+            crate::events::listen(scope, signal, c"addEventListener", c"abort", *listener)?;
+            let state = state_of(scope, this)?;
+            let mut data = state.data_mut();
+            data.signal = Some(Heap::from(signal));
+            data.on_abort = Some(Heap::from(*listener));
+        }
     }
     Ok(())
 }
 
-/// The `line` listener of an async iterator, whose captures are `[state]`: fulfill the oldest
-/// pending `next()` with the line, or queue it.
-fn iterator_line(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    let waiting = state.obj(scope, c"waiting")?.ok_or(ExnThrown)?;
-    if waiting.num(scope, c"length")? > 0.0 {
-        let promise = call_method(scope, waiting, c"shift", &[])?;
-        let promise = Object::from_value(scope, *promise)
-            .map_err(|e| e.throw(scope))?
-            .cast::<js::Promise>()
-            .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
-        let result = js::iteration::create_iter_result(scope, args.get(0), false)?;
-        promise.resolve(scope, result.to_jsval_throwing(scope)?)?;
-    } else {
-        call_method(
-            scope,
-            state.obj(scope, c"queue")?.ok_or(ExnThrown)?,
-            c"push",
-            &[args.get(0)],
-        )?;
-    }
-    Ok(js::value::undefined())
-}
-
-/// The `close` listener of an async iterator, whose captures are `[state]`: fulfill every pending
-/// `next()` as done.
-fn iterator_close(
+/// The abort listener of an interface's `signal`, whose payload is the interface: close it.
+fn close_on_abort(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    state.set_property(scope, c"done", true)?;
-    let waiting = state.obj(scope, c"waiting")?.ok_or(ExnThrown)?;
-    while waiting.num(scope, c"length")? > 0.0 {
-        let promise = call_method(scope, waiting, c"shift", &[])?;
-        let promise = Object::from_value(scope, *promise)
-            .map_err(|e| e.throw(scope))?
-            .cast::<js::Promise>()
-            .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
-        let result = js::iteration::create_iter_result(scope, js::value::undefined(), true)?;
-        promise.resolve(scope, result.to_jsval_throwing(scope)?)?;
-    }
+    let interface = cast_payload::<Object>(scope, payload);
+    Function::call_by_name(scope, interface.handle(), c"close", js::function::EmptyArgs)?;
     Ok(js::value::undefined())
 }
 
-/// The `error` listener of an async iterator, whose captures are `[state]`: reject the oldest
-/// pending `next()` with the error, or the next call of `next()` if none is pending, and end the
-/// iteration.
-fn iterator_error(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    state.set_property(scope, c"done", true)?;
-    let waiting = state.obj(scope, c"waiting")?.ok_or(ExnThrown)?;
-    if waiting.num(scope, c"length")? > 0.0 {
-        let promise = call_method(scope, waiting, c"shift", &[])?;
-        let promise = Object::from_value(scope, *promise)
-            .map_err(|e| e.throw(scope))?
-            .cast::<js::Promise>()
-            .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
-        promise.reject(scope, args.get(0))?;
-    } else {
-        state.set_property(scope, c"error", args.get(0))?;
-    }
-    Ok(js::value::undefined())
-}
-
-/// `next()` of an async iterator, whose captures are `[state]`: a promise for the next line.
-fn iterator_next(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    let queue = state.obj(scope, c"queue")?.ok_or(ExnThrown)?;
-    if queue.num(scope, c"length")? > 0.0 {
-        let line = call_method(scope, queue, c"shift", &[])?;
-        let result = js::iteration::create_iter_result(scope, line, false)?;
-        return js::Promise::new_resolved_with_value(scope, result)?.to_jsval_raw_throwing(scope);
-    }
-    let error = state.val(scope, c"error")?;
-    if !error.is_undefined() {
-        state.set_property(scope, c"error", js::value::undefined())?;
-        return js::Promise::new_rejected_with_error(scope, error)?.to_jsval_raw_throwing(scope);
-    }
-    if state.flag(scope, c"done")? {
-        let result = js::iteration::create_iter_result(scope, js::value::undefined(), true)?;
-        return js::Promise::new_resolved_with_value(scope, result)?.to_jsval_raw_throwing(scope);
-    }
-    let promise = js::Promise::new_pending(scope)?;
-    call_method(
-        scope,
-        state.obj(scope, c"waiting")?.ok_or(ExnThrown)?,
-        c"push",
-        &[promise.to_jsval_throwing(scope)?],
-    )?;
-    promise.to_jsval_raw_throwing(scope)
-}
-
-/// `return()` of an async iterator, whose captures are `[state, interface]`: close the interface,
-/// and return a promise for a done result.
-fn iterator_return(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    interface_class::close(scope, captures.obj(1)?)?;
-    let result = js::iteration::create_iter_result(scope, js::value::undefined(), true)?;
-    js::Promise::new_resolved_with_value(scope, result)?.to_jsval_raw_throwing(scope)
-}
-
-/// `[Symbol.asyncIterator]()` of an async iterator: the iterator itself.
-fn iterator_self(
-    _scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    Ok(args.this())
-}
-
-/// `[Symbol.asyncIterator]()` of an interface: an async iterator over its lines, which ends once
-/// it closes.
+/// `[Symbol.asyncIterator]()` of an interface: Node.js's `events.on` iterator over its `line`
+/// events, which yields each line, pauses the interface while more than 1024 lines are queued, and
+/// ends when the interface closes. Every call returns the iterator the first call created.
 fn async_iterator(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let interface =
-        Object::from_value(scope, scope.root_value(args.this())).map_err(|e| e.throw(scope))?;
-    let state = Object::new_plain(scope)?;
-    state.set_property(scope, c"queue", *js::Array::new(scope, 0)?)?;
-    state.set_property(scope, c"waiting", *js::Array::new(scope, 0)?)?;
-    state.set_property(scope, c"done", interface.flag(scope, c"closed")?)?;
-    let line = closure(
-        scope,
-        1,
-        iterator_line,
-        &[state.to_jsval_raw_throwing(scope)?],
-    )?;
-    call_method(
-        scope,
-        interface,
-        c"on",
-        &[string(scope, "line")?, line.to_jsval_throwing(scope)?],
-    )?;
-    let close = closure(
-        scope,
-        0,
-        iterator_close,
-        &[state.to_jsval_raw_throwing(scope)?],
-    )?;
-    call_method(
-        scope,
-        interface,
-        c"once",
-        &[string(scope, "close")?, close.to_jsval_throwing(scope)?],
-    )?;
-    let error = closure(
-        scope,
-        1,
-        iterator_error,
-        &[state.to_jsval_raw_throwing(scope)?],
-    )?;
-    call_method(
-        scope,
-        interface,
-        c"once",
-        &[string(scope, "error")?, error.to_jsval_throwing(scope)?],
-    )?;
-    let iterator = Object::new_plain(scope)?;
-    let next = closure(
-        scope,
-        0,
-        iterator_next,
-        &[state.to_jsval_raw_throwing(scope)?],
-    )?;
-    iterator.set_property(scope, c"next", next)?;
-    let finish = closure(
-        scope,
-        0,
-        iterator_return,
-        &[
-            state.to_jsval_raw_throwing(scope)?,
-            interface.to_jsval_raw_throwing(scope)?,
-        ],
-    )?;
-    iterator.set_property(scope, c"return", finish)?;
-    let itself = Function::new_callback(scope, c"[Symbol.asyncIterator]", 0, iterator_self, ())?;
-    js::class::define_well_known_symbol_property(
-        scope,
-        iterator,
-        js::native::SymbolCode::asyncIterator,
-        *itself,
-    )?;
+    let interface = crate::support::this_object(scope, &args)?;
+    let state = state_of(scope, interface)?;
+    let cached = state.data().line_iterator.get(scope);
+    if let Some(iterator) = cached {
+        return iterator.to_jsval_raw_throwing(scope);
+    }
+    let settings = crate::events_async::OnSettings {
+        high_water_mark: 1024.0,
+        low_water_mark: 1.0,
+        signal: None,
+        first_event_param: true,
+    };
+    let line = js::class::get_or_init_atom(scope, c"line")?;
+    let iterator = crate::events_async::on_iterator(scope, interface, line, settings, |scope| {
+        Ok(vec![js::class::get_or_init_atom(scope, c"close")?])
+    })
+    .map_err(|thrown| thrown.throw(scope))?;
+    state.data_mut().line_iterator = Some(Heap::from(iterator));
     iterator.to_jsval_raw_throwing(scope)
 }
 
 #[core_runtime::jsfunction_class(
     name = "Interface",
     extends = "crate::events::event_emitter",
-    self_construct
+    self_construct,
+    state = "InterfaceState",
+    invalid_this = "crate::errors::invalid_this"
 )]
 pub mod interface_class {
     use super::*;
 
     /// <https://nodejs.org/api/readline.html#class-interfaceconstructor>
-    #[constructor]
+    #[constructor(length = 4)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -480,56 +388,76 @@ pub mod interface_class {
     /// <https://nodejs.org/api/readline.html#rlclose>: stop reading the input, pause, and emit
     /// `close`.
     pub fn close(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        if this.flag(scope, c"closed")? {
+        let state = state_of(scope, this)?;
+        if state.data().closed {
             return Ok(());
         }
+        let listeners = {
+            let data = state.data();
+            [
+                (c"data", data.on_data.get(scope)),
+                (c"end", data.on_end.get(scope)),
+                (c"error", data.on_error.get(scope)),
+            ]
+        };
         if let Some(input) = this.obj(scope, c"input")? {
-            let listeners = [
-                ("data", c"_starlingOnData"),
-                ("end", c"_starlingOnEnd"),
-                ("error", c"_starlingOnError"),
-            ];
             for (event, listener) in listeners {
-                let listener = this.val(scope, listener)?;
-                call_method(
-                    scope,
-                    input,
-                    c"removeListener",
-                    &[string(scope, event)?, listener],
-                )?;
+                if let Some(listener) = listener {
+                    crate::events::listen(scope, input, c"removeListener", event, listener)?;
+                }
             }
         }
         interface_class::pause(scope, this)?;
+        state.data_mut().closed = true;
         this.set_property(scope, c"closed", true)?;
-        call_method(scope, this, c"emit", &[string(scope, "close")?])?;
+        let (signal, on_abort) = {
+            let mut data = state.data_mut();
+            (
+                data.signal.take_rooted(scope),
+                data.on_abort.take_rooted(scope),
+            )
+        };
+        if let (Some(signal), Some(on_abort)) = (signal, on_abort) {
+            crate::events::listen(scope, signal, c"removeEventListener", c"abort", on_abort)?;
+        }
+        crate::events::emit(scope, this, c"close", &[])?;
         Ok(())
     }
 
     /// <https://nodejs.org/api/readline.html#rlpause>
     pub fn pause<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
-        if !this.flag(scope, c"paused")? {
+        let state = state_of(scope, this)?;
+        if !state.data().paused {
             if let Some(input) = this.obj(scope, c"input")? {
-                call_method(scope, input, c"pause", &[])?;
+                Function::call_by_name(scope, input.handle(), c"pause", js::function::EmptyArgs)?;
             }
+            state.data_mut().paused = true;
             this.set_property(scope, c"paused", true)?;
-            call_method(scope, this, c"emit", &[string(scope, "pause")?])?;
+            crate::events::emit(scope, this, c"pause", &[])?;
         }
         Ok(this)
     }
 
     /// <https://nodejs.org/api/readline.html#rlresume>
     pub fn resume<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
-        if this.flag(scope, c"paused")? && !this.flag(scope, c"closed")? {
+        let state = state_of(scope, this)?;
+        let (paused, closed) = {
+            let data = state.data();
+            (data.paused, data.closed)
+        };
+        if paused && !closed {
             if let Some(input) = this.obj(scope, c"input")? {
-                call_method(scope, input, c"resume", &[])?;
+                Function::call_by_name(scope, input.handle(), c"resume", js::function::EmptyArgs)?;
             }
+            state.data_mut().paused = false;
             this.set_property(scope, c"paused", false)?;
-            call_method(scope, this, c"emit", &[string(scope, "resume")?])?;
+            crate::events::emit(scope, this, c"resume", &[])?;
         }
         Ok(this)
     }
 
     /// <https://nodejs.org/api/readline.html#rlquestionquery-options-callback>
+    #[method(length = 3)]
     pub fn question(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -537,7 +465,7 @@ pub mod interface_class {
         options: HandleValue<'_>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let callback = if is_function(scope, options) {
+        let callback = if js::function::is_callable(options) {
             options
         } else {
             callback.unwrap_or_else(|| scope.root_value(js::value::undefined()))
@@ -555,7 +483,7 @@ pub mod interface_class {
         } else {
             callback
         };
-        if is_function(scope, callback) {
+        if js::function::is_callable(callback) {
             super::ask(scope, this, query, callback)?;
         }
         Ok(())
@@ -567,32 +495,30 @@ pub mod interface_class {
         this: Object<'_>,
         prompt: String,
     ) -> Result<(), ExnThrown> {
-        this.set_property(scope, c"_starlingPrompt", prompt.as_str())
+        state_of(scope, this)?.data_mut().prompt = prompt;
+        Ok(())
     }
 
     /// <https://nodejs.org/api/readline.html#rlgetprompt>
-    pub fn get_prompt<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
-    ) -> Result<HandleValue<'s>, ExnThrown> {
-        this.val(scope, c"_starlingPrompt")
+    pub fn get_prompt(scope: &Scope<'_>, this: Object<'_>) -> Result<String, ExnThrown> {
+        Ok(state_of(scope, this)?.data().prompt.clone())
     }
 
     /// <https://nodejs.org/api/readline.html#rlpromptpreservecursor>
     pub fn prompt(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
-        if this.flag(scope, c"closed")? {
+        let state = state_of(scope, this)?;
+        if state.data().closed {
             return Err(use_after_close().into());
         }
         interface_class::resume(scope, this)?;
-        let prompt =
-            String::from_jsval(scope, this.val(scope, c"_starlingPrompt")?, ()).unwrap_or_default();
+        let prompt = state.data().prompt.clone();
         super::write_output(scope, this, &prompt)?;
         Ok(())
     }
 
     /// <https://nodejs.org/api/readline.html#rlwritedata-key>: handle `data` as input.
     pub fn write(scope: &Scope<'_>, this: Object<'_>, data: HandleValue<'_>) -> Result<(), Thrown> {
-        if this.flag(scope, c"closed")? {
+        if state_of(scope, this)?.data().closed {
             return Err(use_after_close().into());
         }
         if data.is_string() {
@@ -602,14 +528,15 @@ pub mod interface_class {
         Ok(())
     }
 
-    /// <https://nodejs.org/api/readline.html#rlgetcursorpos>
+    /// <https://nodejs.org/api/readline.html#rlgetcursorpos>: the column after the prompt.
     pub fn get_cursor_pos<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
     ) -> Result<Object<'s>, ExnThrown> {
+        let columns = crate::inspect::columns(&state_of(scope, this)?.data().prompt);
         let position = Object::new_plain(scope)?;
+        position.set_property(scope, c"cols", columns as f64)?;
         position.set_property(scope, c"rows", 0)?;
-        position.set_property(scope, c"cols", this.val(scope, c"cursor")?)?;
         Ok(position)
     }
 
@@ -632,27 +559,29 @@ pub mod interface_class {
     }
 }
 
-/// The answer callback of a promise question, whose captures are `[promise]`: fulfill the
-/// promise with the answer.
+/// The answer callback of a promise question, whose payload is the promise: fulfill the promise
+/// with the answer.
 fn resolve_answer(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let promise = Captures::of(scope, payload)?
-        .obj(0)?
-        .cast::<js::Promise>()
-        .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
+    let promise = cast_payload::<js::Promise>(scope, payload);
     promise.resolve(scope, args.get(0))?;
     Ok(js::value::undefined())
 }
 
-#[core_runtime::jsfunction_class(name = "Interface", extends = "super::interface_class")]
+#[core_runtime::jsfunction_class(
+    name = "Interface",
+    extends = "super::interface_class",
+    state = "InterfaceState",
+    invalid_this = "crate::errors::invalid_this"
+)]
 pub mod promises_interface_class {
     use super::*;
 
     /// <https://nodejs.org/api/readline.html#class-readlinepromisesinterface>
-    #[constructor]
+    #[constructor(length = 0)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -670,12 +599,7 @@ pub mod promises_interface_class {
         options: Option<HandleValue<'_>>,
     ) -> Result<js::Promise<'s>, ExnThrown> {
         let promise = js::Promise::new_pending(scope)?;
-        let answer = closure(
-            scope,
-            1,
-            super::resolve_answer,
-            &[promise.to_jsval_raw_throwing(scope)?],
-        )?;
+        let answer = Function::new_callback(scope, c"", 1, super::resolve_answer, promise)?;
         let mut answer = answer.to_jsval_throwing(scope)?;
         let signal = match options.and_then(|options| Object::from_value(scope, *options).ok()) {
             Some(options) => options.val(scope, c"signal")?,
@@ -716,85 +640,104 @@ fn watch_signal<'s>(
     callback: HandleValue<'_>,
     promise: Option<&js::Promise<'_>>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let promise = match promise {
-        Some(promise) => promise.to_jsval_throwing(scope)?,
-        None => scope.root_value(js::value::undefined()),
-    };
-    let on_abort = closure(
-        scope,
-        0,
-        question_aborted,
-        &[
-            interface.to_jsval_raw_throwing(scope)?,
-            signal.get(),
-            promise.get(),
-        ],
-    )?;
     let signal_object = Object::from_value(scope, *signal).map_err(|e| e.throw(scope))?;
+    let abort =
+        js::class::create_instance_with::<QuestionAbortImpl>(scope, |_| QuestionAbortImpl {
+            interface: Heap::from(interface),
+            signal: Heap::from(signal_object),
+            promise: promise.map(|promise| Heap::from(**promise)),
+        })?;
+    let on_abort = Function::new_callback(scope, c"", 0, question_aborted, abort)?;
     let once = Object::new_plain(scope)?;
     once.set_property(scope, c"once", true)?;
-    call_method(
+    Function::call_by_name(
         scope,
-        signal_object,
+        signal_object.handle(),
         c"addEventListener",
         &[
-            string(scope, "abort")?,
+            js::class::get_or_init_atom(scope, c"abort")?,
             on_abort.to_jsval_throwing(scope)?,
             once.to_jsval_throwing(scope)?,
         ],
     )?;
-    let answered = closure(
-        scope,
-        1,
-        question_answered,
-        &[
-            signal.get(),
-            on_abort.to_jsval_raw_throwing(scope)?,
-            callback.get(),
-        ],
-    )?;
+    let answer =
+        js::class::create_instance_with::<QuestionAnswerImpl>(scope, |_| QuestionAnswerImpl {
+            signal: Heap::from(signal_object),
+            on_abort: Heap::from(*on_abort),
+            callback: Heap::from(callback.get()),
+        })?;
+    let answered = Function::new_callback(scope, c"", 1, question_answered, answer)?;
     answered.to_jsval_throwing(scope)
 }
 
-/// The abort listener of a question, whose captures are `[interface, signal, promise]`: cancel
-/// the question, and reject the promise, if there is one, with an `AbortError`.
+/// The payload of [`question_aborted`]: the interface asking a question with a signal, the
+/// signal, and the promise of a promise question.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct QuestionAbort {
+    interface: Heap<js::object::Object>,
+    signal: Heap<js::object::Object>,
+    promise: Option<Heap<js::object::Object>>,
+}
+
+#[core_runtime::jsmethods]
+impl QuestionAbort {}
+
+/// The payload of [`question_answered`]: the signal of a question, its abort listener, and the
+/// answer callback.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct QuestionAnswer {
+    signal: Heap<js::object::Object>,
+    on_abort: Heap<js::object::Object>,
+    callback: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl QuestionAnswer {}
+
+/// The abort listener of a question, whose payload is a [`QuestionAbort`]: cancel the question,
+/// and reject the promise, if there is one, with an `AbortError`.
 fn question_aborted(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let interface = captures.obj(0)?;
-    interface.set_property(scope, c"_starlingQuestion", js::value::undefined())?;
-    let promise = captures.get(2)?;
-    if let Ok(promise) = Object::from_value(scope, *promise) {
+    let abort = cast_payload::<QuestionAbort>(scope, payload);
+    let interface = abort.data().interface.get(scope);
+    let signal = abort.data().signal.get(scope);
+    let promise = abort.data().promise.get(scope);
+    state_of(scope, interface)?
+        .data_mut()
+        .question
+        .set(js::value::undefined());
+    if let Some(promise) = promise {
         let promise = promise
             .cast::<js::Promise>()
             .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
-        let reason = captures.obj(1)?.val(scope, c"reason")?;
+        let reason = signal.val(scope, c"reason")?;
         let error = crate::errors::abort_error(scope, Some(reason))?;
         promise.reject(scope, error)?;
     }
     Ok(js::value::undefined())
 }
 
-/// The answer callback of a question with a signal, whose captures are `[signal, onAbort,
-/// callback]`: remove the abort listener, then call the callback with the answer.
+/// The answer callback of a question with a signal, whose payload is a [`QuestionAnswer`]:
+/// remove the abort listener, then call the callback with the answer.
 fn question_answered(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let on_abort = captures.get(1)?;
-    call_method(
+    let answer = cast_payload::<QuestionAnswer>(scope, payload);
+    let signal = answer.data().signal.get(scope);
+    let on_abort = answer.data().on_abort.get(scope).to_jsval_throwing(scope)?;
+    let callback = answer.data().callback.get(scope);
+    Function::call_by_name(
         scope,
-        captures.obj(0)?,
+        signal.handle(),
         c"removeEventListener",
-        &[string(scope, "abort")?, on_abort],
+        &[js::class::get_or_init_atom(scope, c"abort")?, on_abort],
     )?;
-    let callback = captures.get(2)?;
-    if is_function(scope, callback) {
+    if js::function::is_callable(callback) {
         Function::call(scope, js::value::undefined(), callback, &[args.get(0)])?;
     }
     Ok(js::value::undefined())
@@ -812,7 +755,7 @@ fn js_number(number: f64) -> String {
 /// Call `callback` with `null` in a tick, if it is a function, and return `true`, as Node.js's
 /// cursor functions do without a stream to write to.
 fn without_stream(scope: &Scope<'_>, callback: Option<HandleValue<'_>>) -> Result<bool, ExnThrown> {
-    if let Some(callback) = callback.filter(|callback| is_function(scope, *callback)) {
+    if let Some(callback) = callback.filter(|callback| js::function::is_callable(*callback)) {
         next_tick_call(scope, callback, &[scope.root_value(js::value::null())])?;
     }
     Ok(true)
@@ -826,15 +769,17 @@ fn write_escape(
     code: &str,
     callback: Option<HandleValue<'_>>,
 ) -> Result<bool, ExnThrown> {
-    let callback = callback.filter(|callback| is_function(scope, *callback));
+    let callback = callback.filter(|callback| js::function::is_callable(*callback));
     if stream.is_null_or_undefined() {
         return without_stream(scope, callback);
     }
     let stream = Object::from_value(scope, *stream).map_err(|e| e.throw(scope))?;
-    let code = string(scope, code)?;
+    let code = js::conversion::ToJSVal::to_jsval_throwing(code, scope)?;
     let written = match callback {
-        Some(callback) => call_method(scope, stream, c"write", &[code, callback])?,
-        None => call_method(scope, stream, c"write", &[code])?,
+        Some(callback) => {
+            Function::call_by_name(scope, stream.handle(), c"write", &[code, callback])?
+        }
+        None => Function::call_by_name(scope, stream.handle(), c"write", &[code])?,
     };
     Ok(!written.is_boolean() || written.to_boolean())
 }
@@ -878,7 +823,7 @@ fn promises_object<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrow
                     "createInterface" => Function::new_callback(
                         scope,
                         c"createInterface",
-                        1,
+                        4,
                         create_promises_interface,
                         (),
                     )?
@@ -900,6 +845,7 @@ pub mod module {
     pub use super::interface_class as Interface;
 
     /// <https://nodejs.org/api/readline.html#readlinecreateinterfaceoptions>
+    #[function(length = 4)]
     pub fn create_interface<'s>(
         scope: &'s Scope<'_>,
         args: RestArgs<HandleValue<'_>>,
@@ -909,6 +855,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/readline.html#readlineclearlinestream-dir-callback>
+    #[function(length = 3)]
     pub fn clear_line(
         scope: &Scope<'_>,
         stream: HandleValue<'_>,
@@ -931,6 +878,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/readline.html#readlineclearscreendownstream-callback>
+    #[function(length = 2)]
     pub fn clear_screen_down(
         scope: &Scope<'_>,
         stream: HandleValue<'_>,
@@ -941,6 +889,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/readline.html#readlinecursortostream-x-y-callback>
+    #[function(length = 4)]
     pub fn cursor_to(
         scope: &Scope<'_>,
         stream: HandleValue<'_>,
@@ -951,7 +900,7 @@ pub mod module {
         validate_callback(scope, callback)?;
         let undefined = scope.root_value(js::value::undefined());
         let (x, mut y, mut callback) = (x.unwrap_or(undefined), y.unwrap_or(undefined), callback);
-        if is_function(scope, y) {
+        if js::function::is_callable(y) {
             callback = Some(y);
             y = undefined;
         }
@@ -979,6 +928,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/readline.html#readlinemovecursorstream-dx-dy-callback>
+    #[function(length = 4)]
     pub fn move_cursor(
         scope: &Scope<'_>,
         stream: HandleValue<'_>,
@@ -1025,6 +975,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/readline.html#readlineemitkeypresseventsstream-interface>: has no
     /// effect, since keypresses aren't supported.
+    #[function(length = 1)]
     pub fn emit_keypress_events() -> Result<(), ExnThrown> {
         Ok(())
     }

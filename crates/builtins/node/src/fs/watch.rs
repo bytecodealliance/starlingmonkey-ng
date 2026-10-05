@@ -14,12 +14,14 @@
 //! `FSWatcher` of `internal/fs/watchers`.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
@@ -33,9 +35,7 @@ use crate::errors::{
     ErrorKind, NodeError, Thrown,
 };
 use crate::glob::{platform_nocase, Glob, GlobOptions};
-use crate::stream::{
-    call_method, closure, is_function, next_tick_call, string, truthy, Captures, Props,
-};
+use crate::support::{next_tick_call, Props};
 
 /// The time between the polls of an `fs.watch` or `fsPromises.watch` watcher. A file created and
 /// removed between two polls is only reported by the event without a filename.
@@ -308,10 +308,11 @@ fn same_stat(a: &Stat, b: &Stat) -> bool {
         && a.dev == b.dev
 }
 
-/// The poll state of a watcher. Its `onchange` property is the function that polls report
-/// changes to.
+/// The poll state of a watcher.
 #[core_runtime::jsclass(hidden)]
 pub struct FSEvent {
+    /// The function that polls report changes to, which the `onchange` property mirrors.
+    onchange: Heap<Value>,
     /// What the handle polls, once started.
     #[no_trace]
     poll: Option<Poll>,
@@ -332,26 +333,32 @@ pub struct FSEvent {
     /// The `StatWatcher`'s `kOldStatus`.
     #[no_trace]
     old_status: i32,
+    /// The callback of the poll timers, created for the first poll.
+    poll_callback: Option<Heap<js::object::Object>>,
 }
 
 #[core_runtime::jsmethods]
-impl FSEvent {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
-    }
+impl FSEvent {}
+
+/// The state of an `FSWatcher` or a `StatWatcher`.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct WatcherState {
+    /// The handle, which `_handle` mirrors, until the watcher is closed or stopped.
+    handle: Option<Heap<FSEventImpl>>,
+    /// The ignore matcher of an `FSWatcher`, which `_ignoreMatcher` mirrors.
+    ignore_matcher: Option<Heap<Value>>,
 }
 
-/// A new handle that polls nothing yet, with `onchange` as its `onchange` property.
+#[core_runtime::jsmethods]
+impl WatcherState {}
+
+/// A new handle that polls nothing yet and reports changes to `onchange`.
 fn new_handle<'s>(
     scope: &'s Scope<'_>,
     onchange: HandleValue<'_>,
 ) -> Result<FSEvent<'s>, ExnThrown> {
     let handle = js::class::create_instance_with::<FSEventImpl>(scope, |_| FSEventImpl {
+        onchange: Heap::from(onchange.get()),
         poll: None,
         timer: None,
         referenced: true,
@@ -359,6 +366,7 @@ fn new_handle<'s>(
         ref_count: 1,
         max_ref_count: 1,
         old_status: -1,
+        poll_callback: None,
     })?;
     handle.set_property(scope, c"onchange", onchange)?;
     Ok(handle)
@@ -371,12 +379,28 @@ fn as_handle<'s>(scope: &'s Scope<'_>, value: HandleValue<'_>) -> Option<FSEvent
         .and_then(|object| object.cast::<FSEvent>().ok())
 }
 
-/// The handle in `object._handle`, if it has one.
+/// The handle of the watcher `watcher`, if it has one.
 fn handle_of<'s>(
     scope: &'s Scope<'_>,
-    object: Object<'_>,
+    watcher: Object<'s>,
 ) -> Result<Option<FSEvent<'s>>, ExnThrown> {
-    Ok(as_handle(scope, object.val(scope, c"_handle")?))
+    Ok(fs_watcher_class::try_state_of(scope, watcher)?
+        .and_then(|state| state.data().handle.get(scope)))
+}
+
+/// Set the handle of the watcher `watcher`, and its `_handle` mirror.
+fn set_handle(
+    scope: &Scope<'_>,
+    watcher: Object<'_>,
+    handle: Option<FSEvent<'_>>,
+) -> Result<(), ExnThrown> {
+    fs_watcher_class::state_of(scope, watcher)?
+        .data_mut()
+        .handle = handle.map(Heap::from);
+    match handle {
+        Some(handle) => watcher.set_property(scope, c"_handle", handle),
+        None => watcher.set_property(scope, c"_handle", js::value::null()),
+    }
 }
 
 /// Set whether `handle` keeps the event loop running.
@@ -422,7 +446,15 @@ fn arm(scope: &Scope<'_>, handle: &FSEvent<'_>, delay: Duration) -> Result<(), E
             matches!(data.poll, Some(Poll::Stat { .. })),
         )
     };
-    let callback = closure(scope, 0, poll, &[handle.to_jsval_raw_throwing(scope)?])?;
+    let cached = handle.data().poll_callback.get(scope);
+    let callback = match cached {
+        Some(callback) => callback,
+        None => {
+            let callback = *Function::new_callback(scope, c"", 0, poll, *handle)?;
+            handle.data_mut().poll_callback = Some(Heap::from(callback));
+            callback
+        }
+    };
     let callback = js::Callable::from_jsval(scope, callback.to_jsval_throwing(scope)?, ())
         .map_err(|e| e.throw(scope))?;
     let undefined = HandleValue::undefined();
@@ -452,15 +484,14 @@ enum Found {
     Stat(Option<(i32, Stat, Stat)>),
 }
 
-/// The body of a poll timer, whose captures are `[handle]`: poll, queue the next poll, and pass
+/// The body of a poll timer, whose payload is the handle: poll, queue the next poll, and pass
 /// what changed to the handle's `onchange`, until it is closed.
 fn poll(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let handle_value = Captures::of(scope, payload)?.get(0)?;
-    let Some(handle) = as_handle(scope, handle_value) else {
+    let Some(handle) = as_handle(scope, payload) else {
         return Ok(js::value::undefined());
     };
     {
@@ -519,7 +550,7 @@ fn poll(
         }
     };
     arm(scope, &handle, interval)?;
-    let onchange = handle.get_property(scope, c"onchange")?;
+    let onchange = handle.data().onchange.get(scope);
     let this = handle.to_jsval_throwing(scope)?;
     match found {
         None => {}
@@ -537,7 +568,11 @@ fn poll(
                     scope,
                     this,
                     onchange,
-                    &[status, string(scope, change.event)?, filename],
+                    &[
+                        status,
+                        js::conversion::ToJSVal::to_jsval_throwing(change.event, scope)?,
+                        filename,
+                    ],
                 )?;
             }
         }
@@ -598,11 +633,7 @@ fn watch_error(scope: &Scope<'_>, error: std::io::Error, path: &str) -> Thrown {
         if let Ok(object) = Object::from_value(scope, error) {
             let _ = object.set_property(scope, c"filename", path);
         }
-        js::exception::set_pending(
-            scope,
-            error,
-            js::native::ExceptionStackBehavior::DoNotCapture,
-        );
+        js::exception::throw_value(scope, error);
     }
     thrown.into()
 }
@@ -615,30 +646,13 @@ fn pending_code(scope: &Scope<'_>) -> Option<String> {
         .and_then(|object| object.get_property(scope, c"code").ok())
         .filter(|code| code.is_string())
         .and_then(|code| String::from_jsval(scope, code, ()).ok());
-    js::exception::set_pending(
-        scope,
-        error,
-        js::native::ExceptionStackBehavior::DoNotCapture,
-    );
+    js::exception::throw_value(scope, error);
     code
 }
 
 // ============================================================================
 // Options
 // ============================================================================
-
-/// `value` as a boolean, or `ERR_INVALID_ARG_TYPE` naming `name`.
-fn validate_boolean(scope: &Scope<'_>, value: HandleValue<'_>, name: &str) -> Result<bool, Thrown> {
-    if !value.is_boolean() {
-        return Err(NodeError::invalid_arg_type(scope, name, "of type boolean", value).into());
-    }
-    Ok(value.to_boolean())
-}
-
-/// Whether `value` is `true`.
-fn is_true(value: HandleValue<'_>) -> bool {
-    value.is_boolean() && value.to_boolean()
-}
 
 /// Node.js's `validateIgnoreOption`: `value` is `undefined`, `null`, a non-empty string, a
 /// `RegExp`, a function, or an array of those.
@@ -716,23 +730,17 @@ fn create_ignore_matcher<'s>(
         }
         _ => matchers.set_element(scope, 0, ignore)?,
     }
-    closure(
-        scope,
-        1,
-        ignore_matches,
-        &[matchers.to_jsval_raw_throwing(scope)?],
-    )?
-    .to_jsval_throwing(scope)
+    Function::new_callback(scope, c"", 1, ignore_matches, *matchers)?.to_jsval_throwing(scope)
 }
 
-/// The body of an ignore matcher, whose captures are `[patterns]`: whether the filename argument
+/// The body of an ignore matcher, whose payload is the array of patterns: whether the filename argument
 /// matches a pattern.
 fn ignore_matches(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let matchers = Captures::of(scope, payload)?.obj(0)?;
+    let matchers = cast_payload::<Object>(scope, payload);
     let filename = args.get(0);
     let length = matchers.num(scope, c"length")? as u32;
     for index in 0..length {
@@ -749,12 +757,14 @@ fn ignore_matches(
         } else {
             let object = Object::from_value(scope, *matcher).map_err(|e| e.throw(scope))?;
             if object.is_callable() {
-                truthy(
+                js::conversion::to_boolean(Function::call(
                     scope,
-                    crate::stream::call(scope, HandleValue::undefined(), matcher, &[filename])?,
-                )
+                    HandleValue::undefined(),
+                    matcher,
+                    &[filename],
+                )?)
             } else {
-                !call_method(scope, object, c"exec", &[filename])?.is_null()
+                !Function::call_by_name(scope, object.handle(), c"exec", &[filename])?.is_null()
             }
         };
         if hit {
@@ -772,36 +782,53 @@ fn linux_recursive_platform() -> bool {
 /// Emit `event` on `emitter` in the tick queue.
 fn emit_in_tick(scope: &Scope<'_>, emitter: Object<'_>, event: &str) -> Result<(), ExnThrown> {
     let emit = emitter.obj(scope, c"emit")?.ok_or(ExnThrown)?;
-    let bound = call_method(scope, emit, c"bind", &[emitter.to_jsval_throwing(scope)?])?;
-    next_tick_call(scope, bound, &[string(scope, event)?])
+    let bound = Function::call_by_name(
+        scope,
+        emit.handle(),
+        c"bind",
+        &[emitter.to_jsval_throwing(scope)?],
+    )?;
+    next_tick_call(
+        scope,
+        bound,
+        &[js::conversion::ToJSVal::to_jsval_throwing(event, scope)?],
+    )
 }
 
 // ============================================================================
 // FSWatcher
 // ============================================================================
 
-/// The `onchange` of an `FSWatcher`'s handle, whose captures are `[watcher]`: emit `change` with
+/// The `onchange` of an `FSWatcher`'s handle, whose payload is the watcher: emit `change` with
 /// the event type and filename, unless the watcher's `_ignoreMatcher` matches the filename.
 fn watcher_onchange(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let watcher = Captures::of(scope, payload)?.obj(0)?;
+    let watcher = cast_payload::<Object>(scope, payload);
     let filename = args.get(2);
-    let matcher = watcher.val(scope, c"_ignoreMatcher")?;
-    if !filename.is_null_or_undefined() && is_function(scope, matcher) {
-        let ignored = crate::stream::call(
+    let matcher = fs_watcher_class::try_state_of(scope, watcher)?.and_then(|state| {
+        state
+            .data()
+            .ignore_matcher
+            .as_ref()
+            .map(|matcher| matcher.get(scope))
+    });
+    if let Some(matcher) = matcher
+        .filter(|matcher| !filename.is_null_or_undefined() && js::function::is_callable(*matcher))
+    {
+        let ignored = Function::call(
             scope,
             watcher.to_jsval_throwing(scope)?,
             matcher,
             &[filename],
         )?;
-        if truthy(scope, ignored) {
+        if js::conversion::to_boolean(ignored) {
             return Ok(js::value::undefined());
         }
     }
-    crate::stream::emit(scope, watcher, "change", &[args.get(1), filename])?;
+    crate::events::emit(scope, watcher, c"change", &[args.get(1), filename])?;
     Ok(js::value::undefined())
 }
 
@@ -828,14 +855,17 @@ fn start_watcher(
     let path = path_arg(scope, filename, "filename")?;
     validate_ignore_option(scope, ignore, "options.ignore")?;
     let matcher = create_ignore_matcher(scope, ignore)?;
+    fs_watcher_class::state_of(scope, watcher)?
+        .data_mut()
+        .ignore_matcher = Some(Heap::from(matcher.get()));
     watcher.set_property(scope, c"_ignoreMatcher", matcher)?;
     let started = start_tree(
         scope,
         &handle,
         &path,
         &path,
-        is_true(persistent),
-        is_true(recursive),
+        crate::support::is_true(persistent),
+        crate::support::is_true(recursive),
         false,
         encoding,
     );
@@ -850,7 +880,11 @@ fn start_watcher(
     }
 }
 
-#[core_runtime::jsfunction_class(name = "FSWatcher", extends = "crate::events::event_emitter")]
+#[core_runtime::jsfunction_class(
+    name = "FSWatcher",
+    extends = "crate::events::event_emitter",
+    state = "WatcherState"
+)]
 pub mod fs_watcher_class {
     use super::*;
 
@@ -858,14 +892,9 @@ pub mod fs_watcher_class {
     #[constructor]
     pub fn init(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
         crate::events::event_emitter::init(scope, this, None)?;
-        let onchange = closure(
-            scope,
-            3,
-            watcher_onchange,
-            &[this.to_jsval_raw_throwing(scope)?],
-        )?;
+        let onchange = Function::new_callback(scope, c"", 3, watcher_onchange, this)?;
         let handle = new_handle(scope, onchange.to_jsval_throwing(scope)?)?;
-        this.set_property(scope, c"_handle", handle)?;
+        set_handle(scope, this, Some(handle))?;
         this.set_property(scope, c"_ignoreMatcher", js::value::null())?;
         Ok(())
     }
@@ -883,7 +912,7 @@ pub mod fs_watcher_class {
             return Ok(());
         }
         close_handle(&handle);
-        this.set_property(scope, c"_handle", js::value::null())?;
+        set_handle(scope, this, None)?;
         emit_in_tick(scope, this, "close")
     }
 
@@ -909,17 +938,17 @@ pub mod fs_watcher_class {
 // The recursive watcher of Node.js on Linux
 // ============================================================================
 
-/// The `onchange` of a recursive watcher's handle, whose captures are `[watcher]`: emit `change`,
+/// The `onchange` of a recursive watcher's handle, whose payload is the watcher: emit `change`,
 /// unless the watcher's ignore matcher matches the filename or a directory above it.
 fn recursive_onchange(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let watcher = Captures::of(scope, payload)?.obj(0)?;
+    let watcher = cast_payload::<RecursiveWatcher>(scope, payload);
     let filename = args.get(2);
-    let matcher = watcher.val(scope, c"_starlingIgnore")?;
-    if filename.is_string() && is_function(scope, matcher) {
+    let matcher = watcher.data().ignore.get(scope);
+    if filename.is_string() && js::function::is_callable(matcher) {
         let name = String::from_jsval(scope, filename, ()).map_err(|e| e.throw(scope))?;
         let separator = std::path::MAIN_SEPARATOR;
         let mut prefixes: Vec<&str> = name
@@ -929,15 +958,20 @@ fn recursive_onchange(
         if !name.is_empty() {
             prefixes.push(&name);
         }
-        let this = watcher.to_jsval_throwing(scope)?;
+        let this = watcher.as_object().to_jsval_throwing(scope)?;
         for prefix in prefixes {
-            let prefix = string(scope, prefix)?;
-            if truthy(scope, crate::stream::call(scope, this, matcher, &[prefix])?) {
+            let prefix = js::conversion::ToJSVal::to_jsval_throwing(prefix, scope)?;
+            if js::conversion::to_boolean(Function::call(scope, this, matcher, &[prefix])?) {
                 return Ok(js::value::undefined());
             }
         }
     }
-    crate::stream::emit(scope, watcher, "change", &[args.get(1), filename])?;
+    crate::events::emit(
+        scope,
+        watcher.as_object(),
+        c"change",
+        &[args.get(1), filename],
+    )?;
     Ok(js::value::undefined())
 }
 
@@ -946,25 +980,25 @@ fn recursive_onchange(
 /// as Node.js's implementation does.
 fn start_recursive(
     scope: &Scope<'_>,
-    watcher: Object<'_>,
+    watcher: RecursiveWatcher<'_>,
     filename: HandleValue<'_>,
 ) -> Result<(), Thrown> {
     let path = crate::path::resolve_paths(&[path_arg(scope, filename, "path")?]);
-    let Some(handle) = watcher
-        .val(scope, c"_starlingHandle")
-        .map(|value| as_handle(scope, value))?
-    else {
-        return Ok(());
+    let (handle, persistent, throw_if_no_entry) = {
+        let mut data = watcher.data_mut();
+        data.closed = false;
+        (
+            data.handle.get(scope),
+            data.persistent,
+            data.throw_if_no_entry,
+        )
     };
-    watcher.define_property(scope, c"_starlingClosed", false, 0)?;
-    let persistent = watcher.val(scope, c"_starlingPersistent")?;
-    let throw_if_no_entry = watcher.flag(scope, c"_starlingThrowIfNoEntry")?;
     match start_tree(
         scope,
         &handle,
         &path,
         &path,
-        is_true(persistent),
+        persistent,
         true,
         true,
         Some(Encoding::Utf8),
@@ -980,25 +1014,54 @@ fn start_recursive(
     }
 }
 
+/// The payload of the `change` and `abort` listeners of a pending `next()` of a recursive
+/// watcher's async iterator: the promise `next()` returned, the watcher, and the watcher's signal
+/// and the `abort` listener, if it has a signal.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct RecursiveNext {
+    promise: Heap<js::object::Object>,
+    watcher: Heap<RecursiveWatcherImpl>,
+    signal: Option<Heap<js::object::Object>>,
+    on_abort: Option<Heap<js::object::Object>>,
+}
+
+#[core_runtime::jsmethods]
+impl RecursiveNext {}
+
+/// The promise of `next`.
+fn next_promise<'s>(
+    scope: &'s Scope<'_>,
+    next: RecursiveNext<'_>,
+) -> Result<js::Promise<'s>, ExnThrown> {
+    let promise = next.data().promise.get(scope);
+    promise
+        .cast::<js::Promise>()
+        .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))
+}
+
 /// The `change` listener of a pending `next()` of a recursive watcher's async iterator, whose
-/// captures are `[promise, signal, onAbort]`: fulfill the promise with the change.
+/// payload is a [`RecursiveNext`]: fulfill the promise with the change.
 fn recursive_next_change(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let promise = captures
-        .obj(0)?
-        .cast::<js::Promise>()
-        .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
-    if let Ok(signal) = Object::from_value(scope, *captures.get(1)?) {
-        let on_abort = captures.get(2)?;
-        call_method(
+    let next = cast_payload::<RecursiveNext>(scope, payload);
+    let promise = next_promise(scope, next)?;
+    let (signal, on_abort) = {
+        let data = next.data();
+        (data.signal.get(scope), data.on_abort.get(scope))
+    };
+    if let Some(signal) = signal {
+        let on_abort = match on_abort {
+            Some(on_abort) => on_abort.to_jsval_throwing(scope)?,
+            None => scope.root_value(js::value::undefined()),
+        };
+        Function::call_by_name(
             scope,
-            signal,
+            signal.handle(),
             c"removeEventListener",
-            &[string(scope, "abort")?, on_abort],
+            &[js::class::get_or_init_atom(scope, c"abort")?, on_abort],
         )?;
     }
     let value = Object::new_plain(scope)?;
@@ -1012,21 +1075,21 @@ fn recursive_next_change(
 }
 
 /// The `abort` listener of a pending `next()` of a recursive watcher's async iterator, whose
-/// captures are `[promise, watcher, signal]`: close the watcher, and reject the promise with an
+/// payload is a [`RecursiveNext`]: close the watcher, and reject the promise with an
 /// `AbortError`.
 fn recursive_next_abort(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let promise = captures
-        .obj(0)?
-        .cast::<js::Promise>()
-        .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
-    let watcher = captures.obj(1)?;
-    let signal = captures.obj(2)?;
-    recursive_watcher_class::close(scope, watcher)?;
+    let next = cast_payload::<RecursiveNext>(scope, payload);
+    let promise = next_promise(scope, next)?;
+    let (watcher, signal) = {
+        let data = next.data();
+        (data.watcher.get(scope), data.signal.get(scope))
+    };
+    let signal = signal.ok_or_else(|| js::error::TypeError("no signal".into()).throw(scope))?;
+    watcher.close(scope)?;
     let reason = signal.val(scope, c"reason")?;
     let error = abort_error(scope, Some(reason))?;
     promise.reject(scope, error)?;
@@ -1041,32 +1104,29 @@ fn done_result(scope: &Scope<'_>) -> Result<Value, ExnThrown> {
     result.to_jsval_raw_throwing(scope)
 }
 
-/// `next()` of a recursive watcher's async iterator, whose captures are `[watcher]`: a done result
+/// `next()` of a recursive watcher's async iterator, whose payload is the watcher: a done result
 /// once the watcher is closed, and otherwise a promise for the next change.
 fn recursive_next(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let watcher = Captures::of(scope, payload)?.obj(0)?;
-    if watcher.flag(scope, c"_starlingClosed")? {
+    let watcher = cast_payload::<RecursiveWatcher>(scope, payload);
+    if watcher.data().closed {
         return done_result(scope);
     }
     let promise = js::Promise::new_pending(scope)?;
-    let promise_value = promise.to_jsval_throwing(scope)?;
-    let signal = watcher.val(scope, c"_starlingSignal")?;
-    let mut on_abort = HandleValue::undefined();
-    if let Ok(signal_object) = Object::from_value(scope, *signal) {
-        let abort = closure(
-            scope,
-            0,
-            recursive_next_abort,
-            &[
-                *promise_value,
-                watcher.to_jsval_raw_throwing(scope)?,
-                *signal,
-            ],
-        )?;
+    let signal = watcher.data().signal.get(scope);
+    let signal_object = Object::from_value(scope, *signal).ok();
+    let next =
+        js::class::create_instance_with::<RecursiveNextImpl>(scope, |_| RecursiveNextImpl {
+            promise: Heap::from(*promise),
+            watcher: Heap::from(watcher),
+            signal: signal_object.map(Heap::from),
+            on_abort: None,
+        })?;
+    if let Some(signal_object) = signal_object {
+        let abort = Function::new_callback(scope, c"", 0, recursive_next_abort, next)?;
         if signal_object.flag(scope, c"aborted")? {
             Function::call(
                 scope,
@@ -1076,39 +1136,34 @@ fn recursive_next(
             )?;
             return promise.to_jsval_raw_throwing(scope);
         }
-        on_abort = abort.to_jsval_throwing(scope)?;
+        next.data_mut().on_abort.set(*abort);
         let options = Object::new_plain(scope)?;
         options.set_property(scope, c"once", true)?;
-        call_method(
+        Function::call_by_name(
             scope,
-            signal_object,
+            signal_object.handle(),
             c"addEventListener",
             &[
-                string(scope, "abort")?,
-                on_abort,
+                js::class::get_or_init_atom(scope, c"abort")?,
+                abort.to_jsval_throwing(scope)?,
                 options.to_jsval_throwing(scope)?,
             ],
         )?;
     }
-    let listener = closure(
-        scope,
-        2,
-        recursive_next_change,
-        &[*promise_value, *signal, *on_abort],
-    )?;
-    crate::stream::listen(scope, watcher, c"once", "change", listener)?;
+    let listener = Function::new_callback(scope, c"", 2, recursive_next_change, next)?;
+    crate::events::listen(scope, watcher.as_object(), c"once", c"change", *listener)?;
     promise.to_jsval_raw_throwing(scope)
 }
 
-/// `return()` of a recursive watcher's async iterator, whose captures are `[watcher]`: close the
+/// `return()` of a recursive watcher's async iterator, whose payload is the watcher: close the
 /// watcher, and return a done result.
 fn recursive_return(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let watcher = Captures::of(scope, payload)?.obj(0)?;
-    recursive_watcher_class::close(scope, watcher)?;
+    let watcher = cast_payload::<RecursiveWatcher>(scope, payload);
+    watcher.close(scope)?;
     done_result(scope)
 }
 
@@ -1128,19 +1183,15 @@ fn recursive_async_iterator(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let watcher = crate::stream::this_object(scope, &args)?;
-    let watcher_value = watcher.to_jsval_throwing(scope)?;
+    let this = crate::support::this_object(scope, &args)?;
+    let watcher = this
+        .cast::<RecursiveWatcher>()
+        .map_err(|_| NodeError::invalid_this("FSWatcher").throw(scope))?;
     let iterator = Object::new_plain(scope)?;
-    iterator.set_property(
-        scope,
-        c"next",
-        closure(scope, 0, recursive_next, &[watcher_value])?,
-    )?;
-    iterator.set_property(
-        scope,
-        c"return",
-        closure(scope, 0, recursive_return, &[watcher_value])?,
-    )?;
+    let next = Function::new_callback(scope, c"", 0, recursive_next, watcher)?;
+    iterator.set_property(scope, c"next", *next)?;
+    let finish = Function::new_callback(scope, c"", 0, recursive_return, watcher)?;
+    iterator.set_property(scope, c"return", *finish)?;
     let itself = Function::new_callback(scope, c"[Symbol.asyncIterator]", 0, iterator_self, ())?;
     js::class::define_well_known_symbol_property(
         scope,
@@ -1151,39 +1202,49 @@ fn recursive_async_iterator(
     iterator.to_jsval_raw_throwing(scope)
 }
 
-#[core_runtime::jsfunction_class(
+/// Node's `FSWatcher` of `internal/fs/recursive_watch`: an `EventEmitter` with the poll handle,
+/// the options and whether it is closed.
+#[core_runtime::jsclass(
     name = "FSWatcher",
-    extends = "crate::events::event_emitter",
-    class_syntax
+    hidden,
+    proto_parent = "crate::events::event_emitter"
 )]
-pub mod recursive_watcher_class {
-    use super::*;
+pub struct RecursiveWatcher {
+    handle: Heap<FSEventImpl>,
+    /// The `ignore` matcher.
+    ignore: Heap<Value>,
+    signal: Heap<Value>,
+    #[no_trace]
+    persistent: bool,
+    #[no_trace]
+    throw_if_no_entry: bool,
+    #[no_trace]
+    closed: bool,
+}
 
-    /// Node's `FSWatcher` of `internal/fs/recursive_watch`, with `options` validated as Node
-    /// validates them.
+#[core_runtime::jsmethods(node_args)]
+impl RecursiveWatcher {
+    /// A watcher with `options` validated as Node validates them.
     #[constructor]
-    pub fn init(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        options: Option<HandleValue<'_>>,
-    ) -> Result<(), Thrown> {
+    pub fn new(&self, scope: &Scope<'_>, options: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+        let this = self.as_object();
         crate::events::event_emitter::init(scope, this, None)?;
         let options = options.filter(|options| !options.is_undefined());
         let get =
             |name| option(scope, options, name).map(|value| value.filter(|value| !value.is_null()));
         if let Some(recursive) = get(c"recursive")? {
-            validate_boolean(scope, recursive, "options.recursive")?;
+            crate::errors::validate_boolean(scope, recursive, "options.recursive")?;
         }
-        let persistent = get(c"persistent")?;
-        if let Some(persistent) = persistent {
-            validate_boolean(scope, persistent, "options.persistent")?;
-        }
+        let persistent = match get(c"persistent")? {
+            Some(value) => crate::errors::validate_boolean(scope, value, "options.persistent")?,
+            None => false,
+        };
         let signal = get(c"signal")?;
         if let Some(signal) = signal {
             validate_abort_signal(scope, signal, "options.signal")?;
         }
         let throw_if_no_entry = match get(c"throwIfNoEntry")? {
-            Some(value) => validate_boolean(scope, value, "options.throwIfNoEntry")?,
+            Some(value) => crate::errors::validate_boolean(scope, value, "options.throwIfNoEntry")?,
             None => true,
         };
         if let Some(encoding) = get(c"encoding")? {
@@ -1200,98 +1261,112 @@ pub mod recursive_watcher_class {
         let ignore = option(scope, options, c"ignore")?.unwrap_or(HandleValue::undefined());
         validate_ignore_option(scope, ignore, "options.ignore")?;
         let matcher = create_ignore_matcher(scope, ignore)?;
-        let onchange = closure(
-            scope,
-            3,
-            recursive_onchange,
-            &[this.to_jsval_raw_throwing(scope)?],
-        )?;
+        let onchange = Function::new_callback(scope, c"", 3, recursive_onchange, *self)?;
         let handle = new_handle(scope, onchange.to_jsval_throwing(scope)?)?;
-        let undefined = HandleValue::undefined();
-        this.define_property(scope, c"_starlingHandle", handle, 0)?;
-        this.define_property(scope, c"_starlingIgnore", matcher, 0)?;
-        this.define_property(
-            scope,
-            c"_starlingPersistent",
-            persistent.unwrap_or(undefined),
-            0,
-        )?;
-        this.define_property(scope, c"_starlingSignal", signal.unwrap_or(undefined), 0)?;
-        this.define_property(scope, c"_starlingThrowIfNoEntry", throw_if_no_entry, 0)?;
-        this.define_property(scope, c"_starlingClosed", false, 0)?;
+        let mut data = self.data_mut();
+        data.handle.set(handle);
+        data.ignore.set(matcher.get());
+        data.signal
+            .set(signal.map_or(js::value::undefined(), |signal| signal.get()));
+        data.persistent = persistent;
+        data.throw_if_no_entry = throw_if_no_entry;
         Ok(())
     }
 
     /// <https://nodejs.org/api/fs.html#watcherclose>: stop watching, and emit `close`. Closing a
     /// closed watcher does nothing.
-    pub fn close(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        if this.flag(scope, c"_starlingClosed")? {
-            return Ok(());
-        }
-        this.define_property(scope, c"_starlingClosed", true, 0)?;
-        if let Some(handle) = as_handle(scope, this.val(scope, c"_starlingHandle")?) {
-            close_handle(&handle);
-        }
-        crate::stream::emit(scope, this, "close", &[])?;
+    #[method]
+    pub fn close(&self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
+        let handle = {
+            let mut data = self.data_mut();
+            if data.closed {
+                return Ok(());
+            }
+            data.closed = true;
+            data.handle.get(scope)
+        };
+        close_handle(&handle);
+        crate::events::emit(scope, self.as_object(), c"close", &[])?;
         Ok(())
     }
 
     /// Does nothing, as on Linux in Node.js.
     #[method(name = "ref")]
-    pub fn ref_impl() {}
+    pub fn ref_impl(&self) {}
 
     /// Does nothing, as on Linux in Node.js.
-    pub fn unref() {}
+    #[method]
+    pub fn unref(&self) {}
+}
 
-    /// Define `[Symbol.asyncIterator]`.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let iterator = Function::new_callback(
-            scope,
-            c"[Symbol.asyncIterator]",
-            0,
-            recursive_async_iterator,
-            (),
-        )?;
-        js::class::define_well_known_symbol_property(
-            scope,
-            proto,
-            js::native::SymbolCode::asyncIterator,
-            *iterator,
-        )
-    }
+/// Register the recursive `FSWatcher`, and define its `[Symbol.asyncIterator]`.
+pub(super) fn register_recursive_watcher(
+    scope: &Scope<'_>,
+    global: Object<'_>,
+) -> Result<(), ExnThrown> {
+    RecursiveWatcher::add_to_global(scope, global);
+    let proto = js::class::get_prototype_object_for::<RecursiveWatcherImpl>(scope)
+        .expect("FSWatcher was registered above");
+    let iterator = Function::new_callback(
+        scope,
+        c"[Symbol.asyncIterator]",
+        0,
+        recursive_async_iterator,
+        (),
+    )?;
+    js::class::define_well_known_symbol_property(
+        scope,
+        proto,
+        js::native::SymbolCode::asyncIterator,
+        *iterator,
+    )
 }
 
 // ============================================================================
 // fs.watch
 // ============================================================================
 
-/// The body of an `abort` listener or tick callback, whose captures are `[watcher]`: close the
+/// The body of an `abort` listener or tick callback, whose payload is the watcher: close the
 /// watcher.
 fn close_watcher(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let watcher = Captures::of(scope, payload)?.obj(0)?;
-    call_method(scope, watcher, c"close", &[])?;
+    let watcher = cast_payload::<Object>(scope, payload);
+    Function::call_by_name(scope, watcher.handle(), c"close", js::function::EmptyArgs)?;
     Ok(js::value::undefined())
 }
 
-/// The `close` listener of a watcher with a signal, whose captures are `[signal, listener]`:
-/// remove the `abort` listener.
+/// The payload of [`remove_abort_listener`]: the signal of a watcher, and the `abort` listener
+/// added to it.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct AbortListener {
+    signal: Heap<js::object::Object>,
+    listener: Heap<js::object::Object>,
+}
+
+#[core_runtime::jsmethods]
+impl AbortListener {}
+
+/// The `close` listener of a watcher with a signal, whose payload is an [`AbortListener`]: remove
+/// the `abort` listener.
 fn remove_abort_listener(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let signal = captures.obj(0)?;
-    call_method(
+    let abort = cast_payload::<AbortListener>(scope, payload);
+    let signal = abort.data().signal.get(scope);
+    let listener = abort.data().listener.get(scope);
+    Function::call_by_name(
         scope,
-        signal,
+        signal.handle(),
         c"removeEventListener",
-        &[string(scope, "abort")?, captures.get(1)?],
+        &[
+            js::class::get_or_init_atom(scope, c"abort")?,
+            listener.to_jsval_throwing(scope)?,
+        ],
     )?;
     Ok(js::value::undefined())
 }
@@ -1303,7 +1378,7 @@ pub(crate) fn watch<'s>(
     options: HandleValue<'_>,
     listener: HandleValue<'_>,
 ) -> Result<Object<'s>, Thrown> {
-    let (options, listener) = if is_function(scope, options) {
+    let (options, listener) = if js::function::is_callable(options) {
         (HandleValue::undefined(), options)
     } else {
         (options, listener)
@@ -1332,8 +1407,8 @@ pub(crate) fn watch<'s>(
     let ignore = get(c"ignore", js::value::undefined())?;
     let path = path_arg(scope, filename, "path")?;
     let path_value = js::JSString::from_str(scope, &path)?.to_jsval_throwing(scope)?;
-    let watcher = if truthy(scope, recursive) && linux_recursive_platform() {
-        let class = recursive_watcher_class::class_constructor(scope)?;
+    let watcher = if js::conversion::to_boolean(recursive) && linux_recursive_platform() {
+        let class = js::class::class_constructor::<RecursiveWatcherImpl>(scope)?;
         let copy = Object::new_plain(scope)?;
         for (name, value) in [
             (c"persistent", persistent),
@@ -1350,7 +1425,10 @@ pub(crate) fn watch<'s>(
             copy.set_property(scope, c"encoding", encoding)?;
         }
         let watcher = Function::construct(scope, class, &[copy.to_jsval_throwing(scope)?])?;
-        start_recursive(scope, watcher, path_value)?;
+        let recursive = watcher
+            .cast::<RecursiveWatcher>()
+            .map_err(|_| js::error::TypeError("not an FSWatcher".into()).throw(scope))?;
+        start_recursive(scope, recursive, path_value)?;
         watcher
     } else {
         let class = fs_watcher_class::class_constructor(scope)?;
@@ -1363,35 +1441,32 @@ pub(crate) fn watch<'s>(
             recursive,
             encoding,
             ignore,
-            truthy(scope, throw_if_no_entry),
+            js::conversion::to_boolean(throw_if_no_entry),
         )?;
         watcher
     };
-    if truthy(scope, listener) {
-        call_method(
+    if js::conversion::to_boolean(listener) {
+        Function::call_by_name(
             scope,
-            watcher,
+            watcher.handle(),
             c"addListener",
-            &[string(scope, "change")?, listener],
+            &[js::class::get_or_init_atom(scope, c"change")?, listener],
         )?;
     }
     if let Some(signal) = signal.and_then(|signal| Object::from_value(scope, *signal).ok()) {
-        let watcher_value = watcher.to_jsval_throwing(scope)?;
         if signal.flag(scope, c"aborted")? {
-            crate::stream::next_tick(scope, close_watcher, &[watcher_value.get()])?;
+            js::jobs::queue_native_tick(scope, close_watcher, watcher, &[])?;
         } else {
-            let abort = closure(scope, 0, close_watcher, &[watcher_value])?;
-            crate::stream::listen(scope, signal, c"addEventListener", "abort", abort)?;
-            let remove = closure(
-                scope,
-                0,
-                remove_abort_listener,
-                &[
-                    signal.to_jsval_raw_throwing(scope)?,
-                    abort.to_jsval_raw_throwing(scope)?,
-                ],
-            )?;
-            crate::stream::listen(scope, watcher, c"once", "close", remove)?;
+            let abort = Function::new_callback(scope, c"", 0, close_watcher, watcher)?;
+            crate::events::listen(scope, signal, c"addEventListener", c"abort", *abort)?;
+            let listener = js::class::create_instance_with::<AbortListenerImpl>(scope, |_| {
+                AbortListenerImpl {
+                    signal: Heap::from(signal),
+                    listener: Heap::from(*abort),
+                }
+            })?;
+            let remove = Function::new_callback(scope, c"", 0, remove_abort_listener, listener)?;
+            crate::events::listen(scope, watcher, c"once", c"close", *remove)?;
         }
     }
     Ok(watcher)
@@ -1401,18 +1476,26 @@ pub(crate) fn watch<'s>(
 // StatWatcher, fs.watchFile and fs.unwatchFile
 // ============================================================================
 
-/// The `onchange` of a `StatWatcher`'s handle, whose captures are `[watcher, handle]`: emit
-/// `change` with the current and previous stats, as Node's `onchange` does.
+/// The payload of [`stat_onchange`]: a `StatWatcher` and its handle.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct StatChange {
+    watcher: Heap<js::object::Object>,
+    handle: Heap<FSEventImpl>,
+}
+
+#[core_runtime::jsmethods]
+impl StatChange {}
+
+/// The `onchange` of a `StatWatcher`'s handle, whose payload is a [`StatChange`]: emit `change`
+/// with the current and previous stats, as Node's `onchange` does.
 fn stat_onchange(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let watcher = captures.obj(0)?;
-    let Some(handle) = as_handle(scope, captures.get(1)?) else {
-        return Ok(js::value::undefined());
-    };
+    let change = cast_payload::<StatChange>(scope, payload);
+    let watcher = change.data().watcher.get(scope);
+    let handle = change.data().handle.get(scope);
     let status = args.get(0).to_number() as i32;
     let current = args.get(1);
     let previous = args.get(2);
@@ -1425,7 +1508,7 @@ fn stat_onchange(
         return Ok(js::value::undefined());
     }
     handle.data_mut().old_status = status;
-    crate::stream::emit(scope, watcher, "change", &[current, previous])?;
+    crate::events::emit(scope, watcher, c"change", &[current, previous])?;
     Ok(js::value::undefined())
 }
 
@@ -1442,16 +1525,18 @@ fn start_stat_watcher(
         return Ok(());
     }
     let handle = new_handle(scope, HandleValue::undefined())?;
-    let handle_value = handle.to_jsval_throwing(scope)?;
-    let onchange = closure(
-        scope,
-        3,
-        stat_onchange,
-        &[watcher.to_jsval_raw_throwing(scope)?, *handle_value],
-    )?;
-    handle.set_property(scope, c"onchange", onchange)?;
-    watcher.set_property(scope, c"_handle", handle_value)?;
-    if !truthy(scope, persistent) {
+    let change = js::class::create_instance_with::<StatChangeImpl>(scope, |_| StatChangeImpl {
+        watcher: Heap::from(watcher),
+        handle: Heap::from(handle),
+    })?;
+    let onchange = Function::new_callback(scope, c"", 3, stat_onchange, change)?;
+    handle
+        .data_mut()
+        .onchange
+        .set(onchange.to_jsval_throwing(scope)?.get());
+    handle.set_property(scope, c"onchange", *onchange)?;
+    set_handle(scope, watcher, Some(handle))?;
+    if !js::conversion::to_boolean(persistent) {
         stat_watcher_class::unref(scope, watcher)?;
     }
     let path = path_arg(scope, filename, "filename")?;
@@ -1500,7 +1585,11 @@ fn add_or_clean_ref(
     Ok(())
 }
 
-#[core_runtime::jsfunction_class(name = "StatWatcher", extends = "crate::events::event_emitter")]
+#[core_runtime::jsfunction_class(
+    name = "StatWatcher",
+    extends = "crate::events::event_emitter",
+    state = "WatcherState"
+)]
 pub mod stat_watcher_class {
     use super::*;
 
@@ -1523,7 +1612,7 @@ pub mod stat_watcher_class {
         };
         emit_in_tick(scope, this, "stop")?;
         close_handle(&handle);
-        this.set_property(scope, c"_handle", js::value::null())
+        set_handle(scope, this, None)
     }
 
     /// <https://nodejs.org/api/fs.html#statwatcherref>: count a reference, and reference the
@@ -1620,11 +1709,11 @@ pub(crate) fn watch_file<'s>(
             watcher
         }
     };
-    call_method(
+    Function::call_by_name(
         scope,
-        watcher,
+        watcher.handle(),
         c"addListener",
-        &[string(scope, "change")?, listener],
+        &[js::class::get_or_init_atom(scope, c"change")?, listener],
     )?;
     Ok(watcher)
 }
@@ -1641,18 +1730,23 @@ pub(crate) fn unwatch_file(
     let Ok(watcher) = Object::from_value(scope, *map.lookup(scope, key)?) else {
         return Ok(());
     };
-    let change = string(scope, "change")?;
-    if is_function(scope, listener) {
-        let before = crate::stream::listener_count(scope, watcher, change)?;
-        call_method(scope, watcher, c"removeListener", &[change, listener])?;
-        if crate::stream::listener_count(scope, watcher, change)? < before {
+    let change = js::class::get_or_init_atom(scope, c"change")?;
+    if js::function::is_callable(listener) {
+        let before = crate::events::listener_count(scope, watcher, change)?;
+        Function::call_by_name(
+            scope,
+            watcher.handle(),
+            c"removeListener",
+            &[change, listener],
+        )?;
+        if crate::events::listener_count(scope, watcher, change)? < before {
             add_or_clean_ref(scope, watcher, "clean")?;
         }
     } else {
-        call_method(scope, watcher, c"removeAllListeners", &[change])?;
+        Function::call_by_name(scope, watcher.handle(), c"removeAllListeners", &[change])?;
         add_or_clean_ref(scope, watcher, "cleanAll")?;
     }
-    if crate::stream::listener_count(scope, watcher, change)? == 0.0 {
+    if crate::events::listener_count(scope, watcher, change)? == 0.0 {
         stat_watcher_class::stop(scope, watcher)?;
         map.delete(scope, key)?;
     }
@@ -1675,55 +1769,100 @@ fn queue_overflow(max: f64) -> NodeError {
     )
 }
 
-/// The `onchange` of the handle of an `fsPromises.watch` iterator, whose captures are `[state]`:
-/// queue the change, or pass it to a waiting `next()`, unless the ignore matcher matches the
-/// filename. Changes beyond `maxQueue` queued ones are dropped with a warning, or replace the
-/// queue with an `ERR_FS_WATCH_QUEUE_OVERFLOW` error if `overflow` is `'error'`.
+/// A change an `fsPromises.watch` iterator queued.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+struct QueuedChange {
+    event_type: Heap<Value>,
+    filename: Heap<Value>,
+}
+
+/// The state of an `fsPromises.watch` iterator.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct WatchIterator {
+    filename: Heap<Value>,
+    options: Heap<Value>,
+    /// The changes no `next()` received yet.
+    queue: VecDeque<QueuedChange>,
+    /// The promises of the `next()` calls that wait for a change.
+    waiting: VecDeque<Heap<js::promise::Promise>>,
+    /// The poll handle, once watching started.
+    handle: Option<Heap<FSEventImpl>>,
+    #[no_trace]
+    max_queue: f64,
+    /// Whether a change beyond `max_queue` queued ones fails the iteration.
+    #[no_trace]
+    overflow_error: bool,
+    signal: Heap<Value>,
+    /// The `ignore` matcher.
+    ignore: Heap<Value>,
+    /// The `abort` listener added to `signal`.
+    oncancel: Option<Heap<js::object::Object>>,
+    /// The error that ends the iteration once the queued changes were received.
+    error: Heap<Value>,
+    #[no_trace]
+    started: bool,
+    #[no_trace]
+    done: bool,
+}
+
+#[core_runtime::jsmethods]
+impl WatchIterator {}
+
+/// The `onchange` of the handle of an `fsPromises.watch` iterator, whose payload is its
+/// [`WatchIterator`]: queue the change, or pass it to a waiting `next()`, unless the ignore
+/// matcher matches the filename. Changes beyond `maxQueue` queued ones are dropped with a
+/// warning, or replace the queue with an `ERR_FS_WATCH_QUEUE_OVERFLOW` error if `overflow` is
+/// `'error'`.
 fn iterator_onchange(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
+    let state = cast_payload::<WatchIterator>(scope, payload);
     let filename = args.get(2);
-    let matcher = state.val(scope, c"ignore")?;
-    if !filename.is_null_or_undefined() && is_function(scope, matcher) {
-        let ignored = crate::stream::call(scope, HandleValue::undefined(), matcher, &[filename])?;
-        if truthy(scope, ignored) {
+    let matcher = state.data().ignore.get(scope);
+    if !filename.is_null_or_undefined() && js::function::is_callable(matcher) {
+        let ignored = Function::call(scope, HandleValue::undefined(), matcher, &[filename])?;
+        if js::conversion::to_boolean(ignored) {
             return Ok(js::value::undefined());
         }
     }
-    let queue = state.obj(scope, c"queue")?.ok_or(ExnThrown)?;
-    let max = state.num(scope, c"maxQueue")?;
-    if queue.num(scope, c"length")? < max {
-        let item = Object::new_plain(scope)?;
-        item.set_prototype(scope, js::native::HandleObject::null())?;
-        item.set_property(scope, c"eventType", args.get(1))?;
-        item.set_property(scope, c"filename", filename)?;
-        call_method(scope, queue, c"push", &[item.to_jsval_throwing(scope)?])?;
-    } else if state.flag(scope, c"overflowError")? {
-        queue.set_property(scope, c"length", 0)?;
-        let error = crate::stream::error_value(scope, queue_overflow(max))?;
-        state.set_property(scope, c"error", error)?;
+    let (length, max, overflow_error) = {
+        let data = state.data();
+        (data.queue.len() as f64, data.max_queue, data.overflow_error)
+    };
+    if length < max {
+        state.data_mut().queue.push_back(QueuedChange {
+            event_type: Heap::from(args.get(1).get()),
+            filename: Heap::from(filename.get()),
+        });
+    } else if overflow_error {
+        let error = queue_overflow(max).to_value(scope)?;
+        let mut data = state.data_mut();
+        data.queue.clear();
+        data.error.set(error.get());
     } else {
         crate::process::emit_warning(scope, "fs.watch maxQueue exceeded", "Warning")?;
     }
     settle_waiting(scope, state)
 }
 
-/// Settle the waiting `next()` promises of an `fsPromises.watch` iterator's `state` with what
-/// is queued: changes first, then the error or the abort, which ends the iteration.
-fn settle_waiting(scope: &Scope<'_>, state: Object<'_>) -> Result<Value, ExnThrown> {
-    let waiting = state.obj(scope, c"waiting")?.ok_or(ExnThrown)?;
-    while waiting.num(scope, c"length")? > 0.0 {
+/// Settle the waiting `next()` promises of the iterator `state` with what is queued: changes
+/// first, then the error or the abort, which ends the iteration.
+fn settle_waiting(scope: &Scope<'_>, state: WatchIterator<'_>) -> Result<Value, ExnThrown> {
+    while !state.data().waiting.is_empty() {
         let Some(outcome) = next_outcome(scope, state)? else {
             break;
         };
-        let promise = call_method(scope, waiting, c"shift", &[])?;
-        let promise = Object::from_value(scope, *promise)
-            .map_err(|e| e.throw(scope))?
-            .cast::<js::Promise>()
-            .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
+        let promise = state
+            .data_mut()
+            .waiting
+            .pop_front()
+            .map(|promise| promise.get(scope));
+        let Some(promise) = promise else {
+            break;
+        };
         match outcome {
             Ok(value) => promise.resolve(scope, value)?,
             Err(error) => promise.reject(scope, error)?,
@@ -1732,29 +1871,36 @@ fn settle_waiting(scope: &Scope<'_>, state: Object<'_>) -> Result<Value, ExnThro
     Ok(js::value::undefined())
 }
 
-/// What the next `next()` of an `fsPromises.watch` iterator's `state` settles with, if it is
-/// known: a queued change, a done result once the iteration ended, or the error or abort that
-/// ends it. Ending the iteration closes the handle.
+/// What the next `next()` of the iterator `state` settles with, if it is known: a queued change,
+/// a done result once the iteration ended, or the error or abort that ends it. Ending the
+/// iteration closes the handle.
 fn next_outcome<'s>(
     scope: &'s Scope<'_>,
-    state: Object<'_>,
+    state: WatchIterator<'_>,
 ) -> Result<Option<Result<HandleValue<'s>, HandleValue<'s>>>, ExnThrown> {
-    if state.flag(scope, c"done")? {
+    if state.data().done {
         let result = js::iteration::create_iter_result(scope, js::value::undefined(), true)?;
         return Ok(Some(Ok(result.to_jsval_throwing(scope)?)));
     }
-    let queue = state.obj(scope, c"queue")?.ok_or(ExnThrown)?;
-    if queue.num(scope, c"length")? > 0.0 {
-        let item = call_method(scope, queue, c"shift", &[])?;
+    let change = state
+        .data_mut()
+        .queue
+        .pop_front()
+        .map(|change| (change.event_type.get(scope), change.filename.get(scope)));
+    if let Some((event_type, filename)) = change {
+        let item = Object::new_plain(scope)?;
+        item.set_prototype(scope, js::native::HandleObject::null())?;
+        item.set_property(scope, c"eventType", event_type)?;
+        item.set_property(scope, c"filename", filename)?;
         let result = js::iteration::create_iter_result(scope, item, false)?;
         return Ok(Some(Ok(result.to_jsval_throwing(scope)?)));
     }
-    let error = state.val(scope, c"error")?;
+    let error = state.data().error.get(scope);
     if !error.is_undefined() {
         finish_iterator(scope, state)?;
         return Ok(Some(Err(error)));
     }
-    let signal = state.val(scope, c"signal")?;
+    let signal = state.data().signal.get(scope);
     if let Ok(signal) = Object::from_value(scope, *signal) {
         if signal.flag(scope, c"aborted")? {
             let reason = signal.val(scope, c"reason")?;
@@ -1765,35 +1911,43 @@ fn next_outcome<'s>(
     Ok(None)
 }
 
-/// End the iteration of an `fsPromises.watch` iterator's `state`: close its handle, and remove
-/// its `abort` listener, as the generator's `finally` block does.
-fn finish_iterator(scope: &Scope<'_>, state: Object<'_>) -> Result<(), ExnThrown> {
-    state.set_property(scope, c"done", true)?;
-    if let Some(handle) = as_handle(scope, state.val(scope, c"handle")?) {
+/// End the iteration of the iterator `state`: close its handle, and remove its `abort` listener,
+/// as the generator's `finally` block does.
+fn finish_iterator(scope: &Scope<'_>, state: WatchIterator<'_>) -> Result<(), ExnThrown> {
+    let (handle, signal, oncancel) = {
+        let mut data = state.data_mut();
+        data.done = true;
+        let handle = data.handle.as_ref().map(|handle| handle.get(scope));
+        let oncancel = data.oncancel.as_ref().map(|oncancel| oncancel.get(scope));
+        (handle, data.signal.get(scope), oncancel)
+    };
+    if let Some(handle) = handle {
         close_handle(&handle);
     }
-    let signal = state.val(scope, c"signal")?;
-    let oncancel = state.val(scope, c"oncancel")?;
-    if let (Ok(signal), false) = (Object::from_value(scope, *signal), oncancel.is_undefined()) {
-        call_method(
+    if let (Ok(signal), Some(oncancel)) = (Object::from_value(scope, *signal), oncancel) {
+        Function::call_by_name(
             scope,
-            signal,
+            signal.handle(),
             c"removeEventListener",
-            &[string(scope, "abort")?, oncancel],
+            &[
+                js::class::get_or_init_atom(scope, c"abort")?,
+                oncancel.to_jsval_throwing(scope)?,
+            ],
         )?;
     }
     Ok(())
 }
 
-/// The `abort` listener of an `fsPromises.watch` iterator, whose captures are `[state]`: stop
-/// watching, and settle the waiting `next()` promises.
+/// The `abort` listener of an `fsPromises.watch` iterator, whose payload is its
+/// [`WatchIterator`]: stop watching, and settle the waiting `next()` promises.
 fn iterator_cancel(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    if let Some(handle) = as_handle(scope, state.val(scope, c"handle")?) {
+    let state = cast_payload::<WatchIterator>(scope, payload);
+    let handle = state.data().handle.as_ref().map(|handle| handle.get(scope));
+    if let Some(handle) = handle {
         close_handle(&handle);
     }
     settle_waiting(scope, state)
@@ -1801,10 +1955,10 @@ fn iterator_cancel(
 
 /// The body of `fsPromises.watch` up to its first `yield`: validate the arguments and start the
 /// handle, as Node's async generator does on the first `next()`.
-fn start_iterator(scope: &Scope<'_>, state: Object<'_>) -> Result<(), Thrown> {
-    let filename = state.val(scope, c"filename")?;
+fn start_iterator(scope: &Scope<'_>, state: WatchIterator<'_>) -> Result<(), Thrown> {
+    let filename = state.data().filename.get(scope);
     let path = path_arg(scope, filename, "path")?;
-    let options = state.val(scope, c"options")?;
+    let options = state.data().options.get(scope);
     let options = if options.is_undefined() {
         None
     } else {
@@ -1820,11 +1974,13 @@ fn start_iterator(scope: &Scope<'_>, state: Object<'_>) -> Result<(), Thrown> {
         }
     };
     let persistent = match value(c"persistent")? {
-        Some(persistent) => validate_boolean(scope, persistent, "options.persistent")?,
+        Some(persistent) => {
+            crate::errors::validate_boolean(scope, persistent, "options.persistent")?
+        }
         None => true,
     };
     let recursive = match value(c"recursive")? {
-        Some(recursive) => validate_boolean(scope, recursive, "options.recursive")?,
+        Some(recursive) => crate::errors::validate_boolean(scope, recursive, "options.recursive")?,
         None => false,
     };
     let max_queue = match value(c"maxQueue")? {
@@ -1832,8 +1988,8 @@ fn start_iterator(scope: &Scope<'_>, state: Object<'_>) -> Result<(), Thrown> {
             scope,
             max_queue,
             "options.maxQueue",
-            -9007199254740991.0,
-            9007199254740991.0,
+            -crate::errors::MAX_SAFE_INTEGER,
+            crate::errors::MAX_SAFE_INTEGER,
         )?,
         None => 2048.0,
     };
@@ -1865,7 +2021,7 @@ fn start_iterator(scope: &Scope<'_>, state: Object<'_>) -> Result<(), Thrown> {
     validate_ignore_option(scope, ignore, "options.ignore")?;
     let encoding = match value(c"encoding")? {
         None => Some(Encoding::Utf8),
-        Some(encoding) if !truthy(scope, encoding) => Some(Encoding::Utf8),
+        Some(encoding) if !js::conversion::to_boolean(encoding) => Some(Encoding::Utf8),
         Some(encoding) => {
             let parsed = encoding
                 .is_string()
@@ -1890,33 +2046,32 @@ fn start_iterator(scope: &Scope<'_>, state: Object<'_>) -> Result<(), Thrown> {
         if signal.flag(scope, c"aborted")? {
             let reason = signal.val(scope, c"reason")?;
             let error = abort_error(scope, Some(reason))?;
-            js::exception::set_pending(
-                scope,
-                error,
-                js::native::ExceptionStackBehavior::DoNotCapture,
-            );
+            js::exception::throw_value(scope, error);
             return Err(Thrown::Pending);
         }
     }
-    let state_value = state.to_jsval_throwing(scope)?;
-    let onchange = closure(scope, 3, iterator_onchange, &[state_value])?;
+    let onchange = Function::new_callback(scope, c"", 3, iterator_onchange, state)?;
     let handle = new_handle(scope, onchange.to_jsval_throwing(scope)?)?;
-    state.set_property(scope, c"handle", handle)?;
-    state.set_property(scope, c"maxQueue", max_queue)?;
-    state.set_property(scope, c"overflowError", overflow_error)?;
-    state.set_property(scope, c"signal", signal)?;
-    state.set_property(scope, c"ignore", create_ignore_matcher(scope, ignore)?)?;
+    let matcher = create_ignore_matcher(scope, ignore)?;
+    {
+        let mut data = state.data_mut();
+        data.handle = Some(Heap::from(handle));
+        data.max_queue = max_queue;
+        data.overflow_error = overflow_error;
+        data.signal.set(signal.get());
+        data.ignore.set(matcher.get());
+    }
     if let Ok(signal) = Object::from_value(scope, *signal) {
-        let oncancel = closure(scope, 0, iterator_cancel, &[state_value])?;
-        state.set_property(scope, c"oncancel", oncancel)?;
+        let oncancel = Function::new_callback(scope, c"", 0, iterator_cancel, state)?;
+        state.data_mut().oncancel = Some(Heap::from(*oncancel));
         let options = Object::new_plain(scope)?;
         options.set_property(scope, c"once", true)?;
-        call_method(
+        Function::call_by_name(
             scope,
-            signal,
+            signal.handle(),
             c"addEventListener",
             &[
-                string(scope, "abort")?,
+                js::class::get_or_init_atom(scope, c"abort")?,
                 oncancel.to_jsval_throwing(scope)?,
                 options.to_jsval_throwing(scope)?,
             ],
@@ -1932,11 +2087,7 @@ fn start_iterator(scope: &Scope<'_>, state: Object<'_>) -> Result<(), Thrown> {
                 if let Ok(object) = Object::from_value(scope, error) {
                     object.set_property(scope, c"filename", filename)?;
                 }
-                js::exception::set_pending(
-                    scope,
-                    error,
-                    js::native::ExceptionStackBehavior::DoNotCapture,
-                );
+                js::exception::throw_value(scope, error);
             }
         }
         return Err(thrown);
@@ -1944,26 +2095,30 @@ fn start_iterator(scope: &Scope<'_>, state: Object<'_>) -> Result<(), Thrown> {
     Ok(())
 }
 
-/// `next()` of an `fsPromises.watch` iterator, whose captures are `[state]`: a promise for the
-/// next change.
+/// `next()` of an `fsPromises.watch` iterator, whose payload is its [`WatchIterator`]: a promise
+/// for the next change.
 fn iterator_next(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
-    if !state.flag(scope, c"started")? && !state.flag(scope, c"done")? {
-        state.set_property(scope, c"started", true)?;
+    let state = cast_payload::<WatchIterator>(scope, payload);
+    let start = {
+        let mut data = state.data_mut();
+        let start = !data.started && !data.done;
+        data.started = true;
+        start
+    };
+    if start {
         if let Err(thrown) = start_iterator(scope, state) {
             thrown.throw(scope);
-            let error = crate::stream::take_exception(scope);
+            let error = js::exception::take_pending_or_undefined(scope);
             finish_iterator(scope, state)?;
             return js::Promise::new_rejected_with_error(scope, error)?
                 .to_jsval_raw_throwing(scope);
         }
     }
-    let waiting = state.obj(scope, c"waiting")?.ok_or(ExnThrown)?;
-    if waiting.num(scope, c"length")? == 0.0 {
+    if state.data().waiting.is_empty() {
         match next_outcome(scope, state)? {
             Some(Ok(value)) => {
                 return js::Promise::new_resolved_with_value(scope, value)?
@@ -1977,37 +2132,32 @@ fn iterator_next(
         }
     }
     let promise = js::Promise::new_pending(scope)?;
-    call_method(
-        scope,
-        waiting,
-        c"push",
-        &[promise.to_jsval_throwing(scope)?],
-    )?;
+    state.data_mut().waiting.push_back(Heap::from(promise));
     promise.to_jsval_raw_throwing(scope)
 }
 
-/// `return(value)` of an `fsPromises.watch` iterator, whose captures are `[state]`: end the
-/// iteration, and return a promise for a done result with `value`.
+/// `return(value)` of an `fsPromises.watch` iterator, whose payload is its [`WatchIterator`]:
+/// end the iteration, and return a promise for a done result with `value`.
 fn iterator_return(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
+    let state = cast_payload::<WatchIterator>(scope, payload);
     finish_iterator(scope, state)?;
     settle_waiting(scope, state)?;
     let result = js::iteration::create_iter_result(scope, args.get(0), true)?;
     js::Promise::new_resolved_with_value(scope, result)?.to_jsval_raw_throwing(scope)
 }
 
-/// `throw(error)` of an `fsPromises.watch` iterator, whose captures are `[state]`: end the
-/// iteration, and return a promise rejected with `error`.
+/// `throw(error)` of an `fsPromises.watch` iterator, whose payload is its [`WatchIterator`]: end
+/// the iteration, and return a promise rejected with `error`.
 fn iterator_throw(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Captures::of(scope, payload)?.obj(0)?;
+    let state = cast_payload::<WatchIterator>(scope, payload);
     finish_iterator(scope, state)?;
     settle_waiting(scope, state)?;
     js::Promise::new_rejected_with_error(scope, args.get(0))?.to_jsval_raw_throwing(scope)
@@ -2020,28 +2170,20 @@ pub(super) fn promises_watch(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = Object::new_plain(scope)?;
-    state.set_property(scope, c"filename", args.get(0))?;
-    state.set_property(scope, c"options", args.get(1))?;
-    state.set_property(scope, c"queue", js::Array::new(scope, 0)?)?;
-    state.set_property(scope, c"waiting", js::Array::new(scope, 0)?)?;
-    let state_value = state.to_jsval_throwing(scope)?;
+    let state =
+        js::class::create_instance_with::<WatchIteratorImpl>(scope, |_| WatchIteratorImpl {
+            filename: Heap::from(args.get(0).get()),
+            options: Heap::from(args.get(1).get()),
+            max_queue: 2048.0,
+            ..Default::default()
+        })?;
     let iterator = Object::new_plain(scope)?;
-    iterator.set_property(
-        scope,
-        c"next",
-        closure(scope, 0, iterator_next, &[state_value])?,
-    )?;
-    iterator.set_property(
-        scope,
-        c"return",
-        closure(scope, 1, iterator_return, &[state_value])?,
-    )?;
-    iterator.set_property(
-        scope,
-        c"throw",
-        closure(scope, 1, iterator_throw, &[state_value])?,
-    )?;
+    let next = Function::new_callback(scope, c"", 0, iterator_next, state)?;
+    iterator.set_property(scope, c"next", *next)?;
+    let finish = Function::new_callback(scope, c"", 1, iterator_return, state)?;
+    iterator.set_property(scope, c"return", *finish)?;
+    let throw = Function::new_callback(scope, c"", 1, iterator_throw, state)?;
+    iterator.set_property(scope, c"throw", *throw)?;
     let itself = Function::new_callback(scope, c"[Symbol.asyncIterator]", 0, iterator_self, ())?;
     js::class::define_well_known_symbol_property(
         scope,
@@ -2049,7 +2191,7 @@ pub(super) fn promises_watch(
         js::native::SymbolCode::asyncIterator,
         *itself,
     )?;
-    let tag = string(scope, "AsyncGenerator")?;
+    let tag = js::class::get_or_init_atom(scope, c"AsyncGenerator")?;
     js::class::define_well_known_symbol_property(
         scope,
         iterator,

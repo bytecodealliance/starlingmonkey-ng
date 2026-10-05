@@ -4,351 +4,335 @@
 //! <https://nodejs.org/api/async_hooks.html>.
 //!
 //! `AsyncLocalStorage` and `AsyncResource` keep their stores in the async context
-//! ([`js::async_context`]) as Node's `AsyncContextFrame`s do: the context is a `Map` from each
-//! `AsyncLocalStorage` to its store, and setting a store replaces the context with a copy that
-//! holds it. Promise reactions, timers and other event-loop tasks run with the context that was
-//! current when they were created.
+//! ([`js::async_context`]) as Node's `AsyncContextFrame`s do: the context is an
+//! [`AsyncContextFrame`] holding each `AsyncLocalStorage`'s store, and setting a store replaces
+//! the context with a copy that holds it. Promise reactions, timers and other event-loop tasks run
+//! with the context that was current when they were created.
 //!
 //! `executionAsyncId()` returns 1 and `triggerAsyncId()` returns 0, Node's values at the top level
 //! of a script. `AsyncResource` IDs count up from 2. `createHook` returns a hook whose callbacks
 //! are never called.
 
 use js::async_context::Snapshot;
-use js::conversion::{FromJSVal, ToJSVal};
+use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
+use js::symbol::CachedSymbol;
 use js::{Function, Object};
 
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
 
-/// The `Map` the current async context is, if there is one.
-pub(crate) fn current_frame<'s>(scope: &'s Scope<'_>) -> Option<js::Map<'s>> {
-    js::async_context::current(scope).and_then(|context| context.cast::<js::Map>().ok())
+/// The store of one `AsyncLocalStorage` in an [`AsyncContextFrame`].
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+struct FrameEntry {
+    storage: Heap<js::object::Object>,
+    store: Heap<Value>,
 }
 
-/// The body of the callback [`derived_frame`] copies entries with, whose payload is the new frame.
-fn copy_entry(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let frame = Object::from_value(scope, payload)
-        .map_err(|e| e.throw(scope))?
-        .cast::<js::Map>()
-        .map_err(|_| js::error::TypeError("not a Map".into()).throw(scope))?;
-    frame.insert(scope, args.get(1), args.get(0))?;
-    Ok(js::value::undefined())
+/// An async context frame, as Node's `AsyncContextFrame`: the stores of the `AsyncLocalStorage`s
+/// that have one in an async context. Setting a store makes a new frame, and only
+/// `asyncLocalStorage.disable()` changes a frame.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct AsyncContextFrame {
+    entries: Vec<FrameEntry>,
 }
 
-/// A copy of the current async context's frame in which `storage` maps to `store`, or doesn't
-/// appear if `store` is `None`.
+#[core_runtime::jsmethods]
+impl AsyncContextFrame {}
+
+/// The frame the current async context is, if there is one.
+fn current_frame<'s>(scope: &'s Scope<'_>) -> Option<AsyncContextFrame<'s>> {
+    js::async_context::current(scope).and_then(|context| context.cast::<AsyncContextFrame>().ok())
+}
+
+/// The store `key` has in the current async context, if it has one.
+pub(crate) fn current_store<'s>(scope: &'s Scope<'_>, key: Object<'_>) -> Option<HandleValue<'s>> {
+    let frame = current_frame(scope)?;
+    let data = frame.data();
+    data.entries
+        .iter()
+        .find(|entry| entry.storage.get(scope).as_raw() == key.as_raw())
+        .map(|entry| entry.store.get(scope))
+}
+
+/// A copy of the current async context's frame in which `key` has `store`, or no store if `store`
+/// is `None`.
 pub(crate) fn derived_frame<'s>(
     scope: &'s Scope<'_>,
-    storage: Object<'_>,
+    key: Object<'_>,
     store: Option<HandleValue<'_>>,
-) -> Result<js::Map<'s>, ExnThrown> {
-    let frame = js::Map::new(scope)?;
+) -> Result<AsyncContextFrame<'s>, ExnThrown> {
+    let mut kept: Vec<(Object<'s>, HandleValue<'s>)> = Vec::new();
     if let Some(current) = current_frame(scope) {
-        let copy = Function::new_callback(scope, c"", 2, copy_entry, *frame)?;
-        let copy = (*copy).to_jsval_throwing(scope)?;
-        current.for_each(scope, copy, scope.root_value(js::value::undefined()))?;
-    }
-    let key = storage.to_jsval_throwing(scope)?;
-    match store {
-        Some(store) => frame.insert(scope, key, store)?,
-        None => {
-            frame.delete(scope, key)?;
+        for entry in &current.data().entries {
+            let storage = entry.storage.get(scope);
+            if storage.as_raw() != key.as_raw() {
+                kept.push((storage, entry.store.get(scope)));
+            }
         }
     }
-    Ok(frame)
+    let added = store.map(|store| (key, store));
+    js::class::create_instance_with::<AsyncContextFrameImpl>(scope, |_| AsyncContextFrameImpl {
+        entries: kept
+            .iter()
+            .copied()
+            .chain(added)
+            .map(|(storage, store)| FrameEntry {
+                storage: Heap::from(storage),
+                store: Heap::from(store.get()),
+            })
+            .collect(),
+    })
 }
 
 /// Call `callback` with `this` and `args` while `context` is current, then restore the context
 /// that was current before, whether or not `callback` throws.
-pub(crate) fn call_in(
-    scope: &Scope<'_>,
+pub(crate) fn call_in<'s>(
+    scope: &'s Scope<'_>,
     context: Snapshot,
     callback: HandleValue<'_>,
     this: HandleValue<'_>,
     args: &[HandleValue<'_>],
-) -> Result<Value, ExnThrown> {
+) -> Result<HandleValue<'s>, ExnThrown> {
     let previous = context.enter();
-    let result = Function::call(scope, this, callback, args);
+    let result =
+        Function::call(scope, this, callback, args).map(|result| scope.root_value(result.get()));
     previous.enter();
-    result.map(|value| value.get())
+    result
 }
 
-/// A snapshot of `frame`, a frame object or `undefined`.
-fn snapshot_of(scope: &Scope<'_>, frame: HandleValue<'_>) -> Snapshot {
-    Snapshot::of(Object::from_value(scope, frame).ok())
+/// The arguments of a native call from index `start` on.
+fn args_from<'a>(args: &'a CallbackArgs<'_>, start: u32) -> Vec<HandleValue<'a>> {
+    (start..args.len()).map(|index| args.get(index)).collect()
 }
 
-/// The body of a function [`bind_to_current`] returns, whose payload is `[frame, fn, thisArg]`:
-/// call `fn` with the frame as the async context, and with `thisArg`, or the call's `this` if
-/// `thisArg` is `undefined`.
-fn call_bound(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
-    let frame = state.get_element(scope, 0)?;
-    let callback = state.get_element(scope, 1)?;
-    let mut this = state.get_element(scope, 2)?;
-    if this.is_undefined() {
-        this = scope.root_value(args.this());
-    }
-    let call_args: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
-    call_in(scope, snapshot_of(scope, frame), callback, this, &call_args)
+/// An `AsyncLocalStorage`. See <https://nodejs.org/api/async_context.html#class-asynclocalstorage>.
+#[core_runtime::jsclass(name = "AsyncLocalStorage", hidden)]
+pub struct AsyncLocalStorage {
+    default_value: Heap<Value>,
+    name: Heap<Value>,
 }
 
-/// A function calling `callback` with the current async context, and with `this_arg`, or the
-/// call's `this` if `this_arg` is `undefined`. Its `length` is `callback`'s.
-fn bind_to_current<'s>(
-    scope: &'s Scope<'_>,
-    callback: Object<'_>,
-    this_arg: HandleValue<'_>,
-) -> Result<Object<'s>, ExnThrown> {
-    let frame = match js::async_context::current(scope) {
-        Some(frame) => frame.to_jsval_throwing(scope)?,
-        None => scope.root_value(js::value::undefined()),
-    };
-    let state = js::Array::with_contents(
-        scope,
-        &[
-            frame.get(),
-            callback.to_jsval_raw_throwing(scope)?,
-            this_arg.get(),
-        ],
-    )?;
-    let length = callback.get_property(scope, c"length")?;
-    let length = if length.is_number() {
-        length.to_number() as u32
-    } else {
-        0
-    };
-    let name = if this_arg.is_undefined() {
-        c"bound"
-    } else {
-        c"bound runInAsyncScope"
-    };
-    let bound = Function::new_callback(scope, name, length, call_bound, *state)?;
-    Ok(*bound)
-}
-
-/// The key of the realm's `WeakMap` from each `AsyncLocalStorage` and `AsyncResource` to the
-/// object holding its state.
-struct States;
-
-/// The object holding the state of `this`, an `AsyncLocalStorage` or `AsyncResource`, created if
-/// `create` is set. Without `create`, a `TypeError` is thrown if `this` has no state.
-fn state_of<'s>(
-    scope: &'s Scope<'_>,
-    this: Object<'_>,
-    create: bool,
-) -> Result<Object<'s>, ExnThrown> {
-    let states = match js::class::realm_object::<States>(scope) {
-        Some(states) => states
-            .cast::<js::WeakMap>()
-            .map_err(|_| js::error::TypeError("not a WeakMap".into()).throw(scope))?,
-        None => {
-            let states = js::WeakMap::new(scope)?;
-            js::class::register_realm_object::<States>(scope, *states);
-            states
-        }
-    };
-    let key = scope.root_value(this.to_jsval_raw_throwing(scope)?);
-    if create {
-        let state = Object::new_plain(scope)?;
-        states.insert(scope, key, state.to_jsval_throwing(scope)?)?;
-        return Ok(state);
-    }
-    Object::from_value(scope, states.lookup(scope, key)?)
-        .map_err(|_| js::error::TypeError("Illegal invocation".into()).throw(scope))
-}
-
-/// The body of the function `AsyncLocalStorage.snapshot()` returns, whose payload is the frame
-/// current when it was created: call `args[0]` with the remaining arguments and that frame as the
-/// async context.
-fn call_in_snapshot(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let call_args: Vec<HandleValue<'_>> = (1..args.len()).map(|index| args.get(index)).collect();
-    let undefined = scope.root_value(js::value::undefined());
-    call_in(
-        scope,
-        snapshot_of(scope, payload),
-        args.get(0),
-        undefined,
-        &call_args,
-    )
-}
-
-#[core_runtime::jsfunction_class(name = "AsyncLocalStorage", class_syntax)]
-pub mod async_local_storage {
-    use super::*;
-
+#[core_runtime::jsmethods(node_args)]
+impl AsyncLocalStorage {
     /// <https://nodejs.org/api/async_context.html#new-asynclocalstorageoptions>
     #[constructor]
-    pub fn init(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        options: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        let options = options.and_then(|options| Object::from_value(scope, options).ok());
-        let (default_value, name) = match options {
-            Some(options) => (
-                options.get_property(scope, c"defaultValue")?,
-                options.get_property(scope, c"name")?,
-            ),
-            None => (
-                scope.root_value(js::value::undefined()),
-                scope.root_value(js::value::undefined()),
-            ),
+    pub fn new(&self, scope: &Scope<'_>, options: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+        let (default_value, name) = match options.filter(|options| !options.is_undefined()) {
+            Some(options) => {
+                let options = Object::from_value(scope, options).map_err(|_| {
+                    NodeError::invalid_arg_type(scope, "options", "of type object", options)
+                })?;
+                (
+                    options.get_property(scope, c"defaultValue")?,
+                    options.get_property(scope, c"name")?,
+                )
+            }
+            None => (HandleValue::undefined(), HandleValue::undefined()),
         };
         let name = if name.is_undefined() {
-            js::JSString::from_str(scope, "")?.to_jsval_throwing(scope)?
+            js::JSString::empty(scope)
         } else {
-            name
+            js::JSString::from_value(scope, name)?
         };
-        let state = state_of(scope, this, true)?;
-        state.set_property(scope, c"defaultValue", default_value)?;
-        state.set_property(scope, c"name", name)
+        let data = self.data();
+        data.default_value.set(default_value.get());
+        data.name.set(name.as_value());
+        Ok(())
     }
 
-    /// <https://nodejs.org/api/async_context.html#asynclocalstoragerunstore-callback-args>
-    pub fn run<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
-        store: HandleValue<'_>,
-        callback: HandleValue<'_>,
-        args: RestArgs<HandleValue<'_>>,
-    ) -> Result<HandleValue<'s>, ExnThrown> {
-        let frame = derived_frame(scope, this, Some(store))?;
-        let undefined = scope.root_value(js::value::undefined());
-        Ok(scope.root_value(call_in(
-            scope,
-            Snapshot::of(Some(*frame)),
-            callback,
-            undefined,
-            &args,
-        )?))
+    /// <https://nodejs.org/api/async_context.html#asynclocalstoragename>
+    #[getter]
+    pub fn name<'r>(&self, scope: &'r Scope<'_>) -> HandleValue<'r> {
+        self.data().name.get(scope)
     }
 
-    /// <https://nodejs.org/api/async_context.html#asynclocalstorageexitcallback-args>
-    pub fn exit<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
-        callback: HandleValue<'_>,
-        args: RestArgs<HandleValue<'_>>,
-    ) -> Result<HandleValue<'s>, ExnThrown> {
-        let undefined = scope.root_value(js::value::undefined());
-        let frame = derived_frame(scope, this, Some(undefined))?;
-        Ok(scope.root_value(call_in(
-            scope,
-            Snapshot::of(Some(*frame)),
-            callback,
-            undefined,
-            &args,
-        )?))
-    }
-
-    /// <https://nodejs.org/api/async_context.html#asynclocalstoragegetstore>: the store, or the
-    /// `defaultValue` option if no store was set.
-    pub fn get_store<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
-    ) -> Result<HandleValue<'s>, ExnThrown> {
-        let key = scope.root_value(this.to_jsval_raw_throwing(scope)?);
-        match current_frame(scope) {
-            Some(frame) if frame.has(scope, key)? => frame.lookup(scope, key),
-            _ => state_of(scope, this, false)?.get_property(scope, c"defaultValue"),
+    /// <https://nodejs.org/api/async_context.html#asynclocalstoragedisable>: removes the store
+    /// from the current context, including from the work that captured it.
+    #[method]
+    pub fn disable(&self, scope: &Scope<'_>) {
+        if let Some(frame) = current_frame(scope) {
+            let key = self.as_object();
+            frame
+                .data_mut()
+                .entries
+                .retain(|entry| entry.storage.get(scope).as_raw() != key.as_raw());
         }
     }
 
     /// <https://nodejs.org/api/async_context.html#asynclocalstorageenterwithstore>: the store
     /// stays set for the rest of the current task or job, and for the work it creates.
-    pub fn enter_with(
-        scope: &Scope<'_>,
-        this: Object<'_>,
+    #[method]
+    pub fn enter_with(&self, scope: &Scope<'_>, store: HandleValue<'_>) -> Result<(), ExnThrown> {
+        let frame = derived_frame(scope, self.as_object(), Some(store))?;
+        Snapshot::of(Some(frame.as_object())).enter();
+        Ok(())
+    }
+
+    /// <https://nodejs.org/api/async_context.html#asynclocalstoragerunstore-callback-args>
+    #[method]
+    pub fn run<'r>(
+        &self,
+        scope: &'r Scope<'_>,
         store: HandleValue<'_>,
-    ) -> Result<(), ExnThrown> {
-        let frame = derived_frame(scope, this, Some(store))?;
-        Snapshot::of(Some(*frame)).enter();
-        Ok(())
+        callback: HandleValue<'_>,
+        args: RestArgs<HandleValue<'_>>,
+    ) -> Result<HandleValue<'r>, ExnThrown> {
+        let frame = derived_frame(scope, self.as_object(), Some(store))?;
+        let context = Snapshot::of(Some(frame.as_object()));
+        call_in(scope, context, callback, HandleValue::undefined(), &args)
     }
 
-    /// <https://nodejs.org/api/async_context.html#asynclocalstoragedisable>: removes the store
-    /// from the current context, including from the work that captured it.
-    pub fn disable(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        if let Some(frame) = current_frame(scope) {
-            frame.delete(scope, this.to_jsval_throwing(scope)?)?;
-        }
-        Ok(())
+    /// <https://nodejs.org/api/async_context.html#asynclocalstorageexitcallback-args>: runs
+    /// `callback` with the store set to `undefined`.
+    #[method]
+    pub fn exit<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+        callback: HandleValue<'_>,
+        args: RestArgs<HandleValue<'_>>,
+    ) -> Result<HandleValue<'r>, ExnThrown> {
+        let undefined = HandleValue::undefined();
+        let frame = derived_frame(scope, self.as_object(), Some(undefined))?;
+        let context = Snapshot::of(Some(frame.as_object()));
+        call_in(scope, context, callback, HandleValue::undefined(), &args)
     }
 
-    /// <https://nodejs.org/api/async_context.html#static-method-asynclocalstoragebindfn>
+    /// <https://nodejs.org/api/async_context.html#asynclocalstoragegetstore>: the store, or the
+    /// `defaultValue` option if no store was set.
+    #[method]
+    pub fn get_store<'r>(&self, scope: &'r Scope<'_>) -> HandleValue<'r> {
+        current_store(scope, self.as_object())
+            .unwrap_or_else(|| self.data().default_value.get(scope))
+    }
+
+    /// `asyncLocalStorage.withScope(store)`: a `RunScope` that sets the store until it is
+    /// disposed, which restores the store it replaced.
+    #[method]
+    pub fn with_scope<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+        store: HandleValue<'_>,
+    ) -> Result<RunScope<'r>, ExnThrown> {
+        let previous = self.get_store(scope);
+        self.enter_with(scope, store)?;
+        js::class::create_instance_with::<RunScopeImpl>(scope, |_| RunScopeImpl {
+            storage: Some(Heap::from(self.as_object())),
+            previous: Heap::from(previous.get()),
+        })
+    }
+
+    /// <https://nodejs.org/api/async_context.html#static-method-asynclocalstoragebindfn>: an
+    /// `AsyncResource` binds `fn`, as in Node.js.
     #[static_method]
-    pub fn bind<'s>(scope: &'s Scope<'_>, callback: HandleValue<'_>) -> Result<Object<'s>, Thrown> {
-        let callback = validate_function(scope, callback, "fn")?;
-        let undefined = scope.root_value(js::value::undefined());
-        Ok(bind_to_current(scope, callback, undefined)?)
-    }
-
-    /// <https://nodejs.org/api/async_context.html#static-method-asynclocalstoragesnapshot>
-    #[static_method]
-    pub fn snapshot<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-        let frame = match js::async_context::current(scope) {
-            Some(frame) => frame.to_jsval_throwing(scope)?,
-            None => scope.root_value(js::value::undefined()),
-        };
-        Ok(*Function::new_callback(
+    pub fn bind<'r>(scope: &'r Scope<'_>, callback: HandleValue<'_>) -> Result<Object<'r>, Thrown> {
+        bind_new_resource(
             scope,
-            c"runInAsyncScope",
-            1,
-            call_in_snapshot,
-            frame,
-        )?)
+            callback,
+            HandleValue::undefined(),
+            HandleValue::undefined(),
+        )
     }
 
-    /// Define the `name` accessor.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let getter = Function::new_callback(scope, c"get name", 0, storage_name, ())?;
-        proto.define_accessor(scope, c"name", Some(*getter), None, 0)
+    /// <https://nodejs.org/api/async_context.html#static-method-asynclocalstoragesnapshot>: a
+    /// function that calls its first argument with the others in the current async context,
+    /// bound by an `AsyncResource` as in Node.js.
+    #[static_method]
+    pub fn snapshot<'r>(scope: &'r Scope<'_>) -> Result<Object<'r>, Thrown> {
+        let run = Function::new_callback(scope, c"", 1, call_first_argument, ())?;
+        bind_new_resource(
+            scope,
+            run.to_jsval_throwing(scope)?,
+            HandleValue::undefined(),
+            HandleValue::undefined(),
+        )
     }
 }
 
-/// `asyncLocalStorage.name`: the `name` option, or the empty string.
-fn storage_name(
+/// The function `AsyncLocalStorage.snapshot()` binds: call `args[0]` with the remaining arguments.
+fn call_first_argument(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
-    Ok(state_of(scope, this, false)?
-        .get_property(scope, c"name")?
-        .get())
+    let rest = args_from(&args, 1);
+    Ok(Function::call(scope, HandleValue::undefined(), args.get(0), &rest)?.get())
 }
+
+/// The scope `asyncLocalStorage.withScope(store)` returns.
+#[core_runtime::jsclass(name = "RunScope", hidden)]
+pub struct RunScope {
+    /// The `AsyncLocalStorage` whose store the scope set, until it is disposed.
+    storage: Option<Heap<js::object::Object>>,
+    /// The store the scope replaced.
+    previous: Heap<Value>,
+}
+
+#[core_runtime::jsmethods(node_args)]
+impl RunScope {
+    /// Restore the store the scope replaced. Does nothing once the scope is disposed.
+    #[method]
+    pub fn dispose(&self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
+        let (storage, previous) = {
+            let mut data = self.data_mut();
+            let Some(storage) = data.storage.take_rooted(scope) else {
+                return Ok(());
+            };
+            (storage, data.previous.get(scope))
+        };
+        let storage = storage
+            .cast::<AsyncLocalStorage>()
+            .map_err(|_| js::error::TypeError("not an AsyncLocalStorage".into()).throw(scope))?;
+        storage.enter_with(scope, previous)
+    }
+}
+
+/// `runScope[Symbol.dispose]()`: `runScope.dispose()`.
+fn dispose_run_scope(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = crate::support::this_object(scope, &args)?;
+    Function::call_by_name(scope, this.handle(), c"dispose", js::function::EmptyArgs)?;
+    Ok(js::value::undefined())
+}
+
+/// Node's `Symbol('context_frame')`, under which an `AsyncResource` holds its async context.
+static CONTEXT_FRAME: CachedSymbol = CachedSymbol::new(c"context_frame");
+/// Node's `Symbol('async_id_symbol')`, under which an `AsyncResource` holds its ID.
+static ASYNC_ID: CachedSymbol = CachedSymbol::new(c"async_id_symbol");
+/// Node's `Symbol('trigger_async_id_symbol')`, under which an `AsyncResource` holds the ID of the
+/// resource that created it.
+static TRIGGER_ASYNC_ID: CachedSymbol = CachedSymbol::new(c"trigger_async_id_symbol");
 
 /// The key the per-realm counter of async resource IDs is kept under.
 static ASYNC_ID_KEY: u8 = 0;
 
-#[core_runtime::jsfunction_class(name = "AsyncResource", class_syntax)]
-pub mod async_resource {
-    use super::*;
+/// An `AsyncResource`. See <https://nodejs.org/api/async_context.html#class-asyncresource>.
+#[core_runtime::jsclass(name = "AsyncResource", hidden)]
+pub struct AsyncResource {
+    /// The async context current when the resource was created.
+    frame: Option<Heap<js::object::Object>>,
+    #[no_trace]
+    async_id: f64,
+    #[no_trace]
+    trigger_async_id: f64,
+}
 
+#[core_runtime::jsmethods(node_args)]
+impl AsyncResource {
     /// <https://nodejs.org/api/async_context.html#new-asyncresourcetype-options>: the
     /// `requireManualDestroy` option has no effect.
     #[constructor]
-    pub fn init(
+    pub fn new(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
         r#type: HandleValue<'_>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
@@ -363,24 +347,21 @@ pub mod async_resource {
                 let options = Object::from_value(scope, options).map_err(|e| e.throw(scope))?;
                 options.get_property(scope, c"triggerAsyncId")?
             }
-            _ => scope.root_value(js::value::undefined()),
+            _ => HandleValue::undefined(),
         };
         let trigger = if trigger.is_undefined() {
             1.0
         } else {
-            const MAX_SAFE_INTEGER: f64 = 9007199254740991.0;
             let number = trigger.is_number().then(|| trigger.to_number());
             match number {
                 Some(number)
-                    if number.fract() == 0.0 && (-1.0..=MAX_SAFE_INTEGER).contains(&number) =>
+                    if number.fract() == 0.0
+                        && (-1.0..=crate::errors::MAX_SAFE_INTEGER).contains(&number) =>
                 {
                     number
                 }
                 _ => {
-                    let string = scope.global().get_property(scope, c"String")?;
-                    let undefined = scope.root_value(js::value::undefined());
-                    let shown = Function::call(scope, undefined, string, &[trigger])?;
-                    let shown = js::JSString::from_value(scope, shown)?.to_utf8(scope)?;
+                    let shown = crate::errors::js_string(scope, trigger)?;
                     return Err(NodeError::new(
                         ErrorKind::RangeError,
                         "ERR_INVALID_ASYNC_ID",
@@ -390,98 +371,266 @@ pub mod async_resource {
                 }
             }
         };
-        let frame = match js::async_context::current(scope) {
-            Some(frame) => frame.to_jsval_throwing(scope)?,
-            None => scope.root_value(js::value::undefined()),
-        };
+        let frame = js::async_context::current(scope);
         // IDs start at 2, after `executionAsyncId()`.
         let id = js::class::next_global_counter(scope, &ASYNC_ID_KEY as *const u8 as usize) + 2;
-        let state = state_of(scope, this, true)?;
-        state.set_property(scope, c"frame", frame)?;
-        state.set_property(scope, c"asyncId", id as f64)?;
-        state.set_property(scope, c"triggerAsyncId", trigger)?;
+        {
+            let mut data = self.data_mut();
+            data.frame = frame.map(Heap::from);
+            data.async_id = id as f64;
+            data.trigger_async_id = trigger;
+        }
+        let this = self.as_object();
+        let frame = match frame {
+            Some(frame) => frame.to_jsval_throwing(scope)?,
+            None => HandleValue::undefined(),
+        };
+        this.set_property_by_id(scope, CONTEXT_FRAME.id(scope)?, frame)?;
+        this.set_property_by_id(scope, ASYNC_ID.id(scope)?, id as f64)?;
+        this.set_property_by_id(scope, TRIGGER_ASYNC_ID.id(scope)?, trigger)?;
         Ok(())
     }
 
     /// <https://nodejs.org/api/async_context.html#asyncresourceruninasyncscopefn-thisarg-args>
-    pub fn run_in_async_scope<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
+    #[method(length = 2)]
+    pub fn run_in_async_scope<'r>(
+        &self,
+        scope: &'r Scope<'_>,
         callback: HandleValue<'_>,
         this_arg: Option<HandleValue<'_>>,
         args: RestArgs<HandleValue<'_>>,
-    ) -> Result<HandleValue<'s>, ExnThrown> {
-        let frame = state_of(scope, this, false)?.get_property(scope, c"frame")?;
-        let this_arg = this_arg.unwrap_or_else(|| scope.root_value(js::value::undefined()));
-        Ok(scope.root_value(call_in(
-            scope,
-            snapshot_of(scope, frame),
-            callback,
-            this_arg,
-            &args,
-        )?))
+    ) -> Result<HandleValue<'r>, ExnThrown> {
+        let context = self.context(scope);
+        let this_arg = this_arg.unwrap_or(HandleValue::undefined());
+        call_in(scope, context, callback, this_arg, &args)
     }
 
     /// <https://nodejs.org/api/async_context.html#asyncresourceemitdestroy>
-    pub fn emit_destroy<'s>(this: Object<'s>) -> Object<'s> {
-        this
+    #[method]
+    pub fn emit_destroy(&self) -> Object<'s> {
+        self.as_object()
     }
 
     /// <https://nodejs.org/api/async_context.html#asyncresourceasyncid>
-    pub fn async_id(scope: &Scope<'_>, this: Object<'_>) -> Result<f64, ExnThrown> {
-        let id = state_of(scope, this, false)?.get_property(scope, c"asyncId")?;
-        Ok(f64::from_jsval(scope, id, ()).unwrap_or(0.0))
+    #[method]
+    pub fn async_id(&self) -> f64 {
+        self.data().async_id
     }
 
     /// <https://nodejs.org/api/async_context.html#asyncresourcetriggerasyncid>
-    pub fn trigger_async_id(scope: &Scope<'_>, this: Object<'_>) -> Result<f64, ExnThrown> {
-        let id = state_of(scope, this, false)?.get_property(scope, c"triggerAsyncId")?;
-        Ok(f64::from_jsval(scope, id, ()).unwrap_or(0.0))
+    #[method]
+    pub fn trigger_async_id(&self) -> f64 {
+        self.data().trigger_async_id
     }
 
     /// <https://nodejs.org/api/async_context.html#asyncresourcebindfn-thisarg>
-    pub fn bind<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
+    #[method(length = 2)]
+    pub fn bind<'r>(
+        &self,
+        scope: &'r Scope<'_>,
         callback: HandleValue<'_>,
         this_arg: Option<HandleValue<'_>>,
-    ) -> Result<Object<'s>, Thrown> {
+    ) -> Result<Object<'r>, Thrown> {
         let callback = validate_function(scope, callback, "fn")?;
-        let frame = state_of(scope, this, false)?.get_property(scope, c"frame")?;
-        let this_arg = this_arg.unwrap_or_else(|| scope.root_value(js::value::undefined()));
-        let previous = snapshot_of(scope, frame).enter();
-        let bound = bind_to_current(scope, callback, this_arg);
-        previous.enter();
-        let bound = bound?;
-        bound.define_property(scope, c"asyncResource", this, 0)?;
-        Ok(bound)
+        bind_resource(
+            scope,
+            self.as_object(),
+            callback,
+            this_arg.unwrap_or(HandleValue::undefined()),
+        )
     }
 
     /// <https://nodejs.org/api/async_context.html#static-method-asyncresourcebindfn-type-thisarg>
-    #[static_method(name = "bind")]
-    pub fn bind_static<'s>(
-        scope: &'s Scope<'_>,
+    #[static_method(name = "bind", length = 3)]
+    pub fn bind_static<'r>(
+        scope: &'r Scope<'_>,
         callback: HandleValue<'_>,
         r#type: Option<HandleValue<'_>>,
         this_arg: Option<HandleValue<'_>>,
-    ) -> Result<Object<'s>, Thrown> {
-        let callback = validate_function(scope, callback, "fn")?;
-        let ctor = class_constructor(scope)?;
-        let r#type = match r#type.filter(|value| value.is_string()) {
-            Some(r#type) => r#type,
-            None => {
-                js::JSString::from_str(scope, "bound-anonymous-fn")?.to_jsval_throwing(scope)?
-            }
-        };
-        let resource = Function::construct(scope, ctor, &[r#type])?;
-        let resource = Object::from_value(scope, resource)?;
-        bind(
+    ) -> Result<Object<'r>, Thrown> {
+        bind_new_resource(
             scope,
-            resource,
-            callback.to_jsval_throwing(scope)?,
-            this_arg,
+            callback,
+            r#type.unwrap_or(HandleValue::undefined()),
+            this_arg.unwrap_or(HandleValue::undefined()),
         )
     }
+
+    /// A snapshot of the async context the resource was created in.
+    fn context(&self, scope: &Scope<'_>) -> Snapshot {
+        Snapshot::of(self.data().frame.as_ref().map(|frame| frame.get(scope)))
+    }
+}
+
+/// Node's static `AsyncResource.bind(fn, type, thisArg)`: a new `AsyncResource` of the type
+/// `type`, or of `fn`'s name, or `bound-anonymous-fn`, binds `fn`.
+fn bind_new_resource<'s>(
+    scope: &'s Scope<'_>,
+    callback: HandleValue<'_>,
+    r#type: HandleValue<'_>,
+    this_arg: HandleValue<'_>,
+) -> Result<Object<'s>, Thrown> {
+    let callback = validate_function(scope, callback, "fn")?;
+    let r#type = if js::conversion::to_boolean(r#type) {
+        r#type
+    } else {
+        let name = callback.get_property(scope, c"name")?;
+        if js::conversion::to_boolean(name) {
+            name
+        } else {
+            js::JSString::from_str(scope, "bound-anonymous-fn")?.to_jsval_throwing(scope)?
+        }
+    };
+    let resource = AsyncResource::new(scope, r#type, None)?;
+    bind_resource(scope, resource.as_object(), callback, this_arg)
+}
+
+/// The state of a function `asyncResource.bind(fn, thisArg)` returns.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct Bound {
+    resource: Heap<js::object::Object>,
+    callback: Heap<js::object::Object>,
+    this_arg: Heap<Value>,
+    /// The `runInAsyncScope` method of the resource when a `thisArg` was given, which the function
+    /// calls instead of looking the method up.
+    run: Option<Heap<js::object::Object>>,
+    /// The value of the function's `asyncResource` property.
+    exposed: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl Bound {}
+
+/// Node's `asyncResource.bind(fn, thisArg)`: a function that calls `resource.runInAsyncScope` with
+/// `fn`, `thisArg` or the call's `this` if `thisArg` is `undefined`, and its arguments. Its
+/// `length` is `fn`'s, and its deprecated `asyncResource` property is `resource`.
+fn bind_resource<'s>(
+    scope: &'s Scope<'_>,
+    resource: Object<'_>,
+    callback: Object<'_>,
+    this_arg: HandleValue<'_>,
+) -> Result<Object<'s>, Thrown> {
+    let run = if this_arg.is_undefined() {
+        None
+    } else {
+        let run = resource.get_property(scope, c"runInAsyncScope")?;
+        Some(Object::from_value(scope, run).map_err(|_| {
+            js::error::TypeError("runInAsyncScope is not a function".into()).throw(scope)
+        })?)
+    };
+    let state = js::class::create_instance_with::<BoundImpl>(scope, |_| BoundImpl {
+        resource: Heap::from(resource),
+        callback: Heap::from(callback),
+        this_arg: Heap::from(this_arg.get()),
+        run: run.map(Heap::from),
+        exposed: Heap::from(resource.to_jsval_raw_throwing(scope).unwrap_or_default()),
+    })?;
+    let name = if this_arg.is_undefined() {
+        c"bound"
+    } else {
+        c"bound runInAsyncScope"
+    };
+    let bound = Function::new_callback(scope, name, 0, call_bound, state)?;
+    let length = callback.get_property(scope, c"length")?;
+    let readonly = js::class_spec::JSPROP_READONLY as u32;
+    bound.define_property(scope, c"length", length, readonly)?;
+    let getter = Function::new_callback(scope, c"deprecated", 0, get_async_resource, state)?;
+    let setter = Function::new_callback(scope, c"deprecated", 1, set_async_resource, state)?;
+    let enumerable = js::class_spec::JSPROP_ENUMERATE as u32;
+    bound.define_accessor(
+        scope,
+        c"asyncResource",
+        Some(*getter),
+        Some(*setter),
+        enumerable,
+    )?;
+    Ok(*bound)
+}
+
+/// The body of a function [`bind_resource`] returns, whose payload is its [`Bound`] state.
+fn call_bound(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let state = cast_payload::<Bound>(scope, payload);
+    let (resource, callback, this_arg, run) = {
+        let data = state.data();
+        (
+            data.resource.get(scope),
+            data.callback.get(scope),
+            data.this_arg.get(scope),
+            data.run.as_ref().map(|run| run.get(scope)),
+        )
+    };
+    let this_arg = if run.is_some() {
+        this_arg
+    } else {
+        scope.root_value(args.this())
+    };
+    let mut call_args = vec![callback.to_jsval_throwing(scope)?, this_arg];
+    call_args.extend(args_from(&args, 0));
+    let result = match run {
+        Some(run) => Function::call(scope, resource, run, &call_args)?,
+        None => Function::call_by_name(scope, resource.handle(), c"runInAsyncScope", &call_args)?,
+    };
+    Ok(result.get())
+}
+
+/// The getter of a bound function's `asyncResource`, whose payload is its [`Bound`] state: emit
+/// `DEP0172`, and return the value.
+fn get_async_resource(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    crate::process::deprecate_once(
+        scope,
+        "The asyncResource property on bound functions is deprecated",
+        "DEP0172",
+    )?;
+    Ok(cast_payload::<Bound>(scope, payload)
+        .data()
+        .exposed
+        .get(scope)
+        .get())
+}
+
+/// The setter of a bound function's `asyncResource`, whose payload is its [`Bound`] state: emit
+/// `DEP0172`, and replace the value the getter returns.
+fn set_async_resource(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    crate::process::deprecate_once(
+        scope,
+        "The asyncResource property on bound functions is deprecated",
+        "DEP0172",
+    )?;
+    cast_payload::<Bound>(scope, payload)
+        .data()
+        .exposed
+        .set(args.get(0).get());
+    Ok(js::value::undefined())
+}
+
+/// Register the classes of `node:async_hooks` on `global`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
+    AsyncContextFrame::add_to_global(scope, global);
+    AsyncLocalStorage::add_to_global(scope, global);
+    RunScope::add_to_global(scope, global);
+    AsyncResource::add_to_global(scope, global);
+    Bound::add_to_global(scope, global);
+    let proto = js::class::get_prototype_object_for::<RunScopeImpl>(scope)
+        .expect("RunScope was registered above");
+    let dispose = Function::new_callback(scope, c"[Symbol.dispose]", 0, dispose_run_scope, ())?;
+    js::class::define_well_known_symbol_property(
+        scope,
+        proto,
+        js::native::SymbolCode::dispose,
+        *dispose,
+    )
 }
 
 /// The `enable()` and `disable()` of a hook `createHook` returns: return `this`.
@@ -500,8 +649,8 @@ struct ExecutionAsyncResource;
 pub mod module {
     use super::*;
 
-    pub use super::async_local_storage as AsyncLocalStorage;
-    pub use super::async_resource as AsyncResource;
+    pub use super::AsyncLocalStorage;
+    pub use super::AsyncResource;
 
     /// <https://nodejs.org/api/async_hooks.html#async_hooksexecutionasyncid>: always 1.
     pub fn execution_async_id() -> f64 {
@@ -529,9 +678,7 @@ pub mod module {
             (c"promiseResolve", "hook.promiseResolve"),
         ] {
             let callback = callbacks.get_property(scope, name)?;
-            if !callback.is_undefined()
-                && !Object::from_value(scope, callback).is_ok_and(|callback| callback.is_callable())
-            {
+            if !callback.is_undefined() && !js::function::is_callable(callback) {
                 return Err(NodeError::new(
                     ErrorKind::TypeError,
                     "ERR_ASYNC_CALLBACK",

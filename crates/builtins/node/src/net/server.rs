@@ -2,7 +2,8 @@
 
 //! `net.Server`, which accepts TCP connections through `platform::net`.
 //!
-//! The listening socket is in a `ListenerHandle` under `_starlingListener`. Each accepted
+//! A server's state is a [`ServerState`]: its listening socket while it listens, the
+//! cancellation of the accept in progress, and the number of open connections. Each accepted
 //! connection becomes a connected `Socket`, emitted as a `connection` event.
 
 use std::cell::RefCell;
@@ -15,61 +16,34 @@ use js::function::CallbackArgs;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
-use js::promise::{PromiseFuture, PromiseOutcome};
 use js::{Function, Object};
 use platform::net::StreamListener;
 
-use super::socket::{attach, read_zero, release, socket_class, throw_net_error};
+use super::socket::{address_object, attach, read_zero, release, socket_class};
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
-use crate::stream::{
-    call_method, closure, is_function, next_tick_call, string, truthy, Captures, Props,
-};
+use crate::fs::UvError;
+use crate::support::{emit_later, next_tick_call, spawn_cancellable, until_cancelled, Canceller};
 
-/// The listening socket of a server, shared with the accept in progress, which polls it.
+/// The state of a `net.Server`.
 #[core_runtime::jsclass(hidden)]
-pub struct ListenerHandle {
-    /// The listening socket, which `close` takes and drops, so it stops accepting at once.
+pub(crate) struct ServerState {
+    /// The listening socket, which the accept in progress polls too.
     #[no_trace]
-    listener: Rc<RefCell<Option<StreamListener>>>,
-    /// Cancels the accept in progress.
+    listener: Option<Rc<RefCell<StreamListener>>>,
     #[no_trace]
-    cancel: Option<futures_channel::oneshot::Sender<()>>,
+    cancel_accept: Option<Canceller>,
     #[no_trace]
     local_addr: Option<SocketAddr>,
+    /// The number of open connections, which `_connections` mirrors.
+    #[no_trace]
+    connections: f64,
+    /// Whether the server listens, which `listening` returns.
+    #[no_trace]
+    pub(crate) listening: bool,
 }
 
 #[core_runtime::jsmethods]
-impl ListenerHandle {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
-    }
-}
-
-/// The listener handle of `server`, if it is listening.
-fn handle_of<'s>(
-    scope: &'s Scope<'_>,
-    server: Object<'_>,
-) -> Result<Option<ListenerHandle<'s>>, ExnThrown> {
-    Ok(server
-        .obj(scope, c"_starlingListener")?
-        .and_then(|handle| handle.cast::<ListenerHandle>().ok()))
-}
-
-/// Emit the event and arguments `args` on `emitter` in the tick queue.
-fn emit_later(
-    scope: &Scope<'_>,
-    emitter: Object<'_>,
-    args: &[HandleValue<'_>],
-) -> Result<(), ExnThrown> {
-    let emit = emitter.obj(scope, c"emit")?.ok_or(ExnThrown)?;
-    let bound = call_method(scope, emit, c"bind", &[emitter.to_jsval_throwing(scope)?])?;
-    next_tick_call(scope, bound, args)
-}
+impl ServerState {}
 
 /// Emit `drop` on `server` with the addresses of the connection of `socket`, and drop the
 /// connection.
@@ -77,6 +51,7 @@ fn drop_connection(
     scope: &Scope<'_>,
     server: Object<'_>,
     socket: Object<'_>,
+    state: super::socket::SocketState<'_>,
 ) -> Result<(), ExnThrown> {
     let data = Object::new_plain(scope)?;
     for name in [
@@ -87,168 +62,136 @@ fn drop_connection(
         c"remotePort",
         c"remoteFamily",
     ] {
-        data.set_property(scope, name, socket.val(scope, name)?)?;
+        data.set_property(scope, name, socket.get_property(scope, name)?)?;
     }
-    release(scope, socket)?;
-    call_method(
-        scope,
-        server,
-        c"emit",
-        &[string(scope, "drop")?, data.to_jsval_throwing(scope)?],
-    )?;
+    release(scope, socket, state)?;
+    crate::events::emit(scope, server, c"drop", &[data.to_jsval_throwing(scope)?])?;
     Ok(())
 }
 
-/// Whether the `check` method of the `blockList` of `server` returns a truthy value for the peer
-/// address of `socket`.
-fn blocked(scope: &Scope<'_>, server: Object<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
-    let Some(block_list) = server.obj(scope, c"blockList")? else {
-        return Ok(false);
-    };
-    let address = socket.val(scope, c"remoteAddress")?;
-    let text = match address.is_string() {
-        true => String::from_jsval_throwing(scope, address, ())?,
-        false => return Ok(false),
-    };
-    let family = if super::is_ipv4(&text) {
-        "ipv4"
-    } else if super::is_ipv6(&text) {
-        "ipv6"
-    } else {
-        return Ok(false);
-    };
-    let blocked = call_method(
-        scope,
-        block_list,
-        c"check",
-        &[address, string(scope, family)?],
-    )?;
-    Ok(truthy(scope, blocked))
-}
-
-/// The fulfillment reaction of an accept, whose captures are `[server]`: emit `connection` with
-/// the connected socket, or `drop` once `maxConnections` connections are open, and accept the
-/// next connection. A connection whose peer `blockList` blocks is closed without an event. A
-/// cancelled accept is fulfilled with `undefined`.
-fn on_accept(
+/// The completion of an accept: emit `connection` with the connected socket, or `drop` once
+/// `maxConnections` connections are open, and accept the next connection. A connection whose peer
+/// `blockList` blocks is closed without an event. After an error, `error` is emitted, and the next
+/// connection is accepted if the error belongs to the connection that failed, such as one the
+/// peer reset before it was accepted.
+fn accept_done(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let server = Captures::of(scope, payload)?.obj(0)?;
-    let Ok(socket) = Object::from_value(scope, args.get(0)) else {
-        return Ok(js::value::undefined());
+    server: Object<'_>,
+    result: Result<HandleValue<'_>, HandleValue<'_>>,
+) -> Result<(), ExnThrown> {
+    let state = server_class::state_of(scope, server)?;
+    state.data_mut().cancel_accept = None;
+    let socket = match result {
+        Ok(socket) => Object::from_value(scope, socket).map_err(|e| e.throw(scope))?,
+        Err(error) => {
+            let code = match Object::from_value(scope, error) {
+                Ok(error) => {
+                    crate::support::rust_string(scope, error.get_property(scope, c"code")?)
+                }
+                Err(_) => None,
+            };
+            crate::events::emit(scope, server, c"error", &[error])?;
+            if matches!(
+                code.as_deref(),
+                Some("ECONNABORTED" | "ECONNRESET" | "ENOTCONN")
+            ) {
+                accept(scope, server)?;
+            }
+            return Ok(());
+        }
     };
-    let connections = server.num(scope, c"_connections")?;
-    let max = server.val(scope, c"maxConnections")?;
+    let socket_state = socket_class::state_of(scope, socket)?;
+    let connections = state.data().connections;
+    let max = server.get_property(scope, c"maxConnections")?;
     if max.is_number() && connections >= max.to_number() {
-        drop_connection(scope, server, socket)?;
+        drop_connection(scope, server, socket, socket_state)?;
         return accept(scope, server);
     }
-    if blocked(scope, server, socket)? {
-        release(scope, socket)?;
-        return accept(scope, server);
+    let peer = socket_state.data().peer_ip();
+    let block_list = server.get_property(scope, c"blockList")?;
+    if let Some(ip) = peer {
+        if super::blocklist::blocks(scope, block_list, ip) {
+            release(scope, socket, socket_state)?;
+            return accept(scope, server);
+        }
     }
-    if server.flag(scope, c"pauseOnConnect")? {
-        call_method(scope, socket, c"pause", &[])?;
+    if js::conversion::to_boolean(server.get_property(scope, c"pauseOnConnect")?) {
+        Function::call_by_name(scope, socket.handle(), c"pause", js::function::EmptyArgs)?;
     } else {
         read_zero(scope, socket)?;
     }
+    state.data_mut().connections = connections + 1.0;
     server.set_property(scope, c"_connections", connections + 1.0)?;
+    socket_state.data_mut().server = Some(js::gc::handle::Heap::from(server));
     socket.set_property(scope, c"server", server)?;
-    socket.define_property(scope, c"_server", server, 0)?;
-    call_method(
+    socket.set_property(scope, c"_server", server)?;
+    crate::events::emit(
         scope,
         server,
-        c"emit",
-        &[string(scope, "connection")?, args.get(0)],
+        c"connection",
+        &[socket.to_jsval_throwing(scope)?],
     )?;
     accept(scope, server)
 }
 
-/// The rejection reaction of an accept, whose captures are `[server]`: emit `error`. The server
-/// accepts the next connection if the error belongs to the connection that failed, such as one
-/// the peer reset before it was accepted.
-fn on_accept_error(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let server = Captures::of(scope, payload)?.obj(0)?;
-    let code = match Object::from_value(scope, args.get(0)) {
-        Ok(error) => {
-            let code = error.val(scope, c"code")?;
-            code.is_string()
-                .then(|| String::from_jsval_throwing(scope, code, ()))
-                .transpose()?
-        }
-        Err(_) => None,
+/// Accept the next connection of `server`, unless it stopped listening.
+fn accept(scope: &Scope<'_>, server: Object<'_>) -> Result<(), ExnThrown> {
+    let state = server_class::state_of(scope, server)?;
+    let Some(listener) = state.data().listener.clone() else {
+        return Ok(());
     };
-    call_method(
+    let canceller = spawn_cancellable(
         scope,
         server,
-        c"emit",
-        &[string(scope, "error")?, args.get(0)],
+        |cancelled| {
+            let accepted = std::future::poll_fn(move |cx| listener.borrow_mut().poll_accept(cx));
+            until_cancelled(cancelled, accepted)
+        },
+        |scope, server, result| {
+            let connection = result.map_err(|error| UvError::net(&error, "accept").throw(scope))?;
+            let options = Object::new_plain(scope)?;
+            let allow_half_open =
+                js::conversion::to_boolean(server.get_property(scope, c"allowHalfOpen")?);
+            options.set_property(scope, c"allowHalfOpen", allow_half_open)?;
+            let socket = socket_class::new_instance(scope)?;
+            socket_class::init(scope, socket, Some(options.to_jsval_throwing(scope)?))
+                .map_err(|thrown| thrown.throw(scope))?;
+            let state = socket_class::state_of(scope, socket)?;
+            attach(scope, socket, state, connection)?;
+            socket.to_jsval_throwing(scope)
+        },
+        accept_done,
     )?;
-    if matches!(
-        code.as_deref(),
-        Some("ECONNABORTED" | "ECONNRESET" | "ENOTCONN")
-    ) {
-        accept(scope, server)?;
-    }
-    Ok(js::value::undefined())
+    state.data_mut().cancel_accept = Some(canceller);
+    Ok(())
 }
 
-/// Accept the next connection of `server`, unless it stopped listening.
-fn accept(scope: &Scope<'_>, server: Object<'_>) -> Result<Value, ExnThrown> {
-    let Some(handle) = handle_of(scope, server)? else {
-        return Ok(js::value::undefined());
+/// Count one connection of `server` less, after the socket it accepted was destroyed, and emit
+/// `close` if it was the last and the server stopped listening.
+pub(crate) fn connection_closed(scope: &Scope<'_>, server: Object<'_>) -> Result<(), ExnThrown> {
+    let Some(state) = server_class::try_state_of(scope, server)? else {
+        return Ok(());
     };
-    let (sender, cancelled) = futures_channel::oneshot::channel();
-    let listener = {
-        let mut state = handle.data_mut();
-        if state.listener.borrow().is_none() {
-            return Ok(js::value::undefined());
-        }
-        state.cancel = Some(sender);
-        state.listener.clone()
+    let connections = {
+        let mut data = state.data_mut();
+        data.connections -= 1.0;
+        data.connections
     };
-    let allow_half_open = server.flag(scope, c"allowHalfOpen")?;
-    let future = async move {
-        let accepted = std::future::poll_fn(|cx| match listener.borrow_mut().as_mut() {
-            Some(listener) => listener.poll_accept(cx).map(Some),
-            None => std::task::Poll::Ready(None),
-        });
-        let cancel = async {
-            let _ = cancelled.await;
-            None
-        };
-        let result = futures_lite::future::or(accepted, cancel).await;
-        PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
-            let Some(result) = result else {
-                return Ok(scope.root_value(js::value::undefined()));
-            };
-            let connection =
-                result.map_err(|error| throw_net_error(scope, &error, "accept", None, &[]))?;
-            let class = socket_class::class_constructor(scope)?;
-            let options = Object::new_plain(scope)?;
-            options.set_property(scope, c"allowHalfOpen", allow_half_open)?;
-            let socket = Function::construct(scope, class, &[options.to_jsval_throwing(scope)?])?;
-            attach(scope, socket, connection)?;
-            socket.to_jsval_throwing(scope)
-        }))
+    server.set_property(scope, c"_connections", connections)?;
+    emit_close_if_drained(scope, server)
+}
+
+/// Emit `close` on `server` in the tick queue if it doesn't listen and has no open connection.
+fn emit_close_if_drained(scope: &Scope<'_>, server: Object<'_>) -> Result<(), ExnThrown> {
+    let drained = {
+        let state = server_class::state_of(scope, server)?;
+        let data = state.data();
+        data.listener.is_none() && data.connections <= 0.0
     };
-    let promise = js::Promise::new_pending(scope)?;
-    promise.spawn(PromiseFuture::new(future));
-    let on_accept = closure(scope, 1, on_accept, &[server.to_jsval_raw_throwing(scope)?])?;
-    let on_error = closure(
-        scope,
-        1,
-        on_accept_error,
-        &[server.to_jsval_raw_throwing(scope)?],
-    )?;
-    promise.then(scope, Some(on_accept), Some(on_error))?;
-    Ok(js::value::undefined())
+    if drained {
+        emit_later(scope, server, c"close", &[])?;
+    }
+    Ok(())
 }
 
 /// The port, host and callback `listen`'s arguments give, as Node.js's `Server.listen`
@@ -261,10 +204,10 @@ pub(crate) fn listen_args<'s>(
     let callback = args
         .last()
         .copied()
-        .filter(|last| is_function(scope, *last));
+        .filter(|last| js::function::is_callable(*last));
     let first = args.first().copied();
     let options = match first {
-        Some(first) if first.is_object() && !is_function(scope, first) => {
+        Some(first) if first.is_object() && !js::function::is_callable(first) => {
             Object::from_value(scope, *first).map_err(|e| Thrown::from(e.throw(scope)))?
         }
         Some(first) if super::is_pipe_name(scope, first)? => {
@@ -280,12 +223,12 @@ pub(crate) fn listen_args<'s>(
         }
         None => Object::new_plain(scope)?,
     };
-    let port = options.val(scope, c"port")?;
-    let free_port = first.is_none_or(|first| is_function(scope, first))
+    let port = options.get_property(scope, c"port")?;
+    let free_port = first.is_none_or(|first| js::function::is_callable(first))
         || (port.is_undefined() && options.has_property(scope, c"port")?)
         || port.is_null();
-    let host = options.val(scope, c"host")?;
-    let host = if host.is_string() && truthy(scope, host) {
+    let host = options.get_property(scope, c"host")?;
+    let host = if host.is_string() && js::conversion::to_boolean(host) {
         Some(String::from_jsval(scope, host, ())?)
     } else {
         None
@@ -297,8 +240,8 @@ pub(crate) fn listen_args<'s>(
         let port = super::validate_port(scope, port, "options.port")?;
         return Ok((port, host, callback));
     }
-    let path = options.val(scope, c"path")?;
-    if truthy(scope, path) && super::is_pipe_name(scope, path)? {
+    let path = options.get_property(scope, c"path")?;
+    if js::conversion::to_boolean(path) && super::is_pipe_name(scope, path)? {
         return Err(NodeError::not_implemented("listen() on an IPC path").into());
     }
     let options_value = options.to_jsval_throwing(scope)?;
@@ -314,23 +257,20 @@ pub(crate) fn listen_args<'s>(
     Err(NodeError::invalid_arg_value(scope, "options", options_value, "is invalid").into())
 }
 
-/// The `close` listener `close` adds for a server that was not listening, whose captures are
-/// `[callback]`: call the callback with `ERR_SERVER_NOT_RUNNING`.
-pub(crate) fn call_not_running(
+/// The `close` listener `close` adds for a server that was not listening, whose payload is the
+/// callback: call the callback with `ERR_SERVER_NOT_RUNNING`.
+fn call_not_running(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let callback = Captures::of(scope, payload)?.get(0)?;
-    let error = crate::stream::error_value(
-        scope,
-        NodeError::new(
-            ErrorKind::Error,
-            "ERR_SERVER_NOT_RUNNING",
-            "Server is not running.",
-        ),
-    )?;
-    Function::call(scope, js::value::undefined(), callback, &[error])?;
+    let error = NodeError::new(
+        ErrorKind::Error,
+        "ERR_SERVER_NOT_RUNNING",
+        "Server is not running.",
+    )
+    .to_value(scope)?;
+    Function::call(scope, HandleValue::undefined(), payload, &[error])?;
     Ok(js::value::undefined())
 }
 
@@ -342,21 +282,44 @@ pub(crate) fn on_close(
     callback: Option<HandleValue<'_>>,
     listening: bool,
 ) -> Result<(), ExnThrown> {
-    let Some(callback) = callback.filter(|callback| is_function(scope, *callback)) else {
+    let Some(callback) = callback.filter(|callback| js::function::is_callable(*callback)) else {
         return Ok(());
     };
     let listener = if listening {
-        scope.root_value(callback.get())
+        callback
     } else {
-        closure(scope, 0, call_not_running, &[callback.get()])?.to_jsval_throwing(scope)?
+        let close = Function::new_callback(scope, c"close", 0, call_not_running, callback)?;
+        (*close).to_jsval_throwing(scope)?
     };
-    call_method(scope, server, c"once", &[string(scope, "close")?, listener])?;
+    Function::call_by_name(
+        scope,
+        server.handle(),
+        c"once",
+        &[js::class::get_or_init_atom(scope, c"close")?, listener],
+    )?;
     Ok(())
+}
+
+/// The getter of `listening`.
+fn get_listening(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let listening = match Object::from_value(scope, args.this()) {
+        Ok(server) => {
+            server_class::try_state_of(scope, server)?.is_some_and(|state| state.data().listening)
+        }
+        Err(_) => false,
+    };
+    Ok(js::value::from_bool(listening))
 }
 
 #[core_runtime::jsfunction_class(
     name = "Server",
     extends = "crate::events::event_emitter",
+    state = "ServerState",
+    invalid_this = "crate::errors::invalid_this",
     self_construct
 )]
 pub mod server_class {
@@ -364,9 +327,9 @@ pub mod server_class {
 
     /// <https://nodejs.org/api/net.html#class-netserver>: a server whose `connection` events go
     /// to `listener`. Of the options, `allowHalfOpen` and `pauseOnConnect` apply to the accepted
-    /// sockets, `blockList` closes connections from the peers it blocks, and `noDelay` and
-    /// `keepAlive` have no effect.
-    #[constructor]
+    /// sockets, `blockList` closes connections from the peers it blocks, and `noDelay`,
+    /// `keepAlive`, `keepAliveInitialDelay` and `highWaterMark` have no effect.
+    #[constructor(length = 2)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -375,7 +338,7 @@ pub mod server_class {
     ) -> Result<(), Thrown> {
         crate::events::event_emitter::init(scope, this, None)?;
         let (options, listener) = match options {
-            Some(options) if is_function(scope, options) => (None, Some(options)),
+            Some(options) if js::function::is_callable(options) => (None, Some(options)),
             Some(options) if options.is_null() || options.is_undefined() => (None, listener),
             Some(options) if options.is_object() => (
                 Some(
@@ -395,38 +358,53 @@ pub mod server_class {
             }
             None => (None, listener),
         };
-        if let Some(listener) = listener.filter(|listener| is_function(scope, *listener)) {
-            call_method(
+        if let Some(listener) = listener.filter(|listener| js::function::is_callable(*listener)) {
+            Function::call_by_name(
                 scope,
-                this,
+                this.handle(),
                 c"on",
-                &[string(scope, "connection")?, listener],
+                &[js::class::get_or_init_atom(scope, c"connection")?, listener],
             )?;
         }
-        this.set_property(scope, c"listening", false)?;
         this.set_property(scope, c"_connections", 0)?;
+        this.set_property(scope, c"_handle", js::value::null())?;
+        this.set_property(scope, c"_usingWorkers", false)?;
+        this.set_property(scope, c"_workers", *js::Array::new(scope, 0)?)?;
+        this.set_property(scope, c"_unref", false)?;
+        this.set_property(scope, c"_listeningId", 1)?;
+        let option = |name| -> Result<HandleValue<'_>, ExnThrown> {
+            match options {
+                Some(options) => options.get_property(scope, name),
+                None => Ok(HandleValue::undefined()),
+            }
+        };
         for name in [
             c"allowHalfOpen",
             c"pauseOnConnect",
             c"noDelay",
             c"keepAlive",
         ] {
-            let value = match options {
-                Some(options) => truthy(scope, options.val(scope, name)?),
-                None => false,
-            };
+            let value = js::conversion::to_boolean(option(name)?);
             this.set_property(scope, name, value)?;
         }
-        if let Some(options) = options {
-            let block_list = options.val(scope, c"blockList")?;
-            if truthy(scope, block_list) {
-                super::super::blocklist::validate_block_list(
-                    scope,
-                    block_list,
-                    "options.blockList",
-                )?;
-                this.set_property(scope, c"blockList", block_list)?;
-            }
+        let delay = option(c"keepAliveInitialDelay")?;
+        let delay = if delay.is_number() {
+            (delay.to_number() / 1000.0).trunc()
+        } else {
+            0.0
+        };
+        this.set_property(scope, c"keepAliveInitialDelay", delay)?;
+        let high_water_mark = option(c"highWaterMark")?;
+        if high_water_mark.is_null_or_undefined() {
+            let mark = crate::stream::state::default_high_water_mark(false);
+            this.set_property(scope, c"highWaterMark", mark)?;
+        } else {
+            this.set_property(scope, c"highWaterMark", high_water_mark)?;
+        }
+        let block_list = option(c"blockList")?;
+        if js::conversion::to_boolean(block_list) {
+            super::super::blocklist::validate_block_list(scope, block_list, "options.blockList")?;
+            this.set_property(scope, c"blockList", block_list)?;
         }
         Ok(())
     }
@@ -440,7 +418,8 @@ pub mod server_class {
     ) -> Result<Object<'s>, Thrown> {
         let args: Vec<HandleValue<'_>> =
             args.iter().map(|arg| scope.root_value(arg.get())).collect();
-        if this.flag(scope, c"listening")? {
+        let state = state_of(scope, this)?;
+        if state.data().listening {
             return Err(NodeError::new(
                 ErrorKind::Error,
                 "ERR_SERVER_ALREADY_LISTEN",
@@ -457,51 +436,33 @@ pub mod server_class {
             })?,
         };
         if let Some(callback) = callback {
-            call_method(
+            Function::call_by_name(
                 scope,
-                this,
+                this.handle(),
                 c"once",
-                &[string(scope, "listening")?, callback],
+                &[js::class::get_or_init_atom(scope, c"listening")?, callback],
             )?;
         }
         let addr = SocketAddr::new(ip, port);
         match platform::net::listen_stream(addr) {
             Ok(listener) => {
-                let local_addr = listener.local_addr;
-                let handle = js::class::create_instance_with::<ListenerHandleImpl>(scope, |_| {
-                    ListenerHandleImpl {
-                        listener: Rc::new(RefCell::new(Some(listener))),
-                        cancel: None,
-                        local_addr: Some(local_addr),
-                    }
-                })?;
-                this.define_property(
-                    scope,
-                    c"_starlingListener",
-                    handle.to_jsval_throwing(scope)?,
-                    0,
-                )?;
-                this.set_property(scope, c"listening", true)?;
-                emit_later(scope, this, &[string(scope, "listening")?])?;
+                {
+                    let mut data = state.data_mut();
+                    data.local_addr = Some(listener.local_addr);
+                    data.listener = Some(Rc::new(RefCell::new(listener)));
+                    data.listening = true;
+                }
+                this.set_property(scope, c"_handle", Object::new_plain(scope)?)?;
+                emit_later(scope, this, c"listening", &[])?;
                 accept(scope, this)?;
             }
             Err(error) => {
-                let address =
-                    js::JSString::from_str(scope, &ip.to_string())?.to_jsval_throwing(scope)?;
-                let port_value = scope.root_value(js::value::from_f64(f64::from(port)));
-                let detail = format!(
-                    "{}: {addr}",
-                    platform::fs::FsError::from_code(error.code()).description
-                );
-                throw_net_error(
-                    scope,
-                    &error,
-                    "listen",
-                    Some(&detail),
-                    &[(c"address", address), (c"port", port_value)],
-                );
-                let error = crate::stream::take_exception(scope);
-                emit_later(scope, this, &[string(scope, "error")?, error])?;
+                let description = platform::fs::FsError::from_code(error.code()).description;
+                let error = UvError::net(&error, "listen")
+                    .suffix(format!(": {description} {addr}"))
+                    .addr(addr)
+                    .into_value(scope)?;
+                emit_later(scope, this, c"error", &[error])?;
             }
         }
         Ok(this)
@@ -510,34 +471,34 @@ pub mod server_class {
     /// <https://nodejs.org/api/net.html#serverclosecallback>: stop accepting connections, and
     /// emit `close` once the connections already accepted have closed. `callback` is called on
     /// `close`, with `ERR_SERVER_NOT_RUNNING` if the server was not listening.
+    #[method(length = 1)]
     pub fn close<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, ExnThrown> {
-        let handle = handle_of(scope, this)?;
-        super::on_close(scope, this, callback, handle.is_some())?;
-        if let Some(handle) = handle {
-            let mut state = handle.data_mut();
-            state.listener.borrow_mut().take();
-            if let Some(cancel) = state.cancel.take() {
-                let _ = cancel.send(());
-            }
-        }
-        this.set_property(scope, c"_starlingListener", js::value::undefined())?;
-        this.set_property(scope, c"listening", false)?;
-        server_class::emit_close_if_drained(scope, this)?;
+        let state = state_of(scope, this)?;
+        let (listener, cancel) = {
+            let mut data = state.data_mut();
+            data.listening = false;
+            (data.listener.take(), data.cancel_accept.take())
+        };
+        on_close(scope, this, callback, listener.is_some())?;
+        drop(cancel);
+        drop(listener);
+        this.set_property(scope, c"_handle", js::value::null())?;
+        emit_close_if_drained(scope, this)?;
         Ok(this)
     }
 
     /// Emit `close` in the tick queue if the server is not listening and has no open
     /// connection.
     #[method(name = "_emitCloseIfDrained")]
-    pub fn emit_close_if_drained(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        if handle_of(scope, this)?.is_some() || this.num(scope, c"_connections")? > 0.0 {
-            return Ok(());
-        }
-        emit_later(scope, this, &[string(scope, "close")?])
+    pub fn emit_close_if_drained_impl(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+    ) -> Result<(), ExnThrown> {
+        emit_close_if_drained(scope, this)
     }
 
     /// <https://nodejs.org/api/net.html#serveraddress>: the bound address, family and port, or
@@ -546,18 +507,15 @@ pub mod server_class {
         scope: &'s Scope<'_>,
         this: Object<'_>,
     ) -> Result<HandleValue<'s>, ExnThrown> {
-        let Some(addr) = handle_of(scope, this)?.and_then(|handle| handle.data().local_addr) else {
-            return Ok(scope.root_value(js::value::null()));
+        let addr = {
+            let state = state_of(scope, this)?;
+            let data = state.data();
+            data.local_addr.filter(|_| data.listener.is_some())
         };
-        let address = Object::new_plain(scope)?;
-        address.set_property(scope, c"address", addr.ip().to_string().as_str())?;
-        address.set_property(
-            scope,
-            c"family",
-            if addr.is_ipv4() { "IPv4" } else { "IPv6" },
-        )?;
-        address.set_property(scope, c"port", f64::from(addr.port()))?;
-        address.to_jsval_throwing(scope)
+        match addr {
+            Some(addr) => address_object(scope, addr)?.to_jsval_throwing(scope),
+            None => Ok(HandleValue::null()),
+        }
     }
 
     /// <https://nodejs.org/api/net.html#servergetconnectionscallback>: the number of open
@@ -568,9 +526,9 @@ pub mod server_class {
         callback: HandleValue<'_>,
     ) -> Result<Object<'s>, Thrown> {
         validate_function(scope, callback, "callback")?;
-        let null = scope.root_value(js::value::null());
-        let count = this.val(scope, c"_connections")?;
-        next_tick_call(scope, callback, &[null, count])?;
+        let count = state_of(scope, this)?.data().connections;
+        let count = scope.root_value(js::value::from_f64(count));
+        next_tick_call(scope, callback, &[HandleValue::null(), count])?;
         Ok(this)
     }
 
@@ -584,5 +542,18 @@ pub mod server_class {
     /// keeps the event loop alive.
     pub fn unref<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
         Ok(this)
+    }
+
+    /// Define `listening`.
+    #[setup]
+    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
+        let getter = Function::new_callback(scope, c"listening", 0, get_listening, ())?;
+        proto.define_accessor(
+            scope,
+            c"listening",
+            Some(*getter),
+            None,
+            js::class_spec::JSPROP_ENUMERATE as u32,
+        )
     }
 }

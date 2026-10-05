@@ -2,28 +2,33 @@
 
 //! `ClientRequest`, which sends a request through `platform::http`, and `Agent`.
 //!
-//! The request body is collected until `end()` and then sent with the request. The host handles
-//! connections, so agents only hold their options.
+//! The request body is collected in the request's state until `end()` and then sent with the
+//! request. The host handles connections, so an agent only keeps its options, and the sockets of
+//! a `keepAlive` agent's finished requests in its `freeSockets`.
+
+use std::time::Duration;
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
+use js::object::{PropertyInit, PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
-use js::promise::{PromiseFuture, PromiseOutcome};
 use js::{Function, Object};
 use platform::http::{OutgoingBody, Request};
 
-use super::incoming::{incoming_message_class, set_headers, set_response_body};
-use super::outgoing::{as_array, elements, header_pairs, object_keys, outgoing_message_class};
-use super::server::emit_later;
+use super::incoming::{new_message, set_host_source, MessageHead};
+use super::outgoing::{
+    header_args, header_pairs, outgoing_message_class, ClientPart, OutgoingState, Transport,
+};
 use super::status_text;
 use crate::errors::{ErrorKind, NodeError, Thrown};
-use crate::stream::{call_method, closure, is_function, string, truthy, Captures, Props};
+use crate::support::{emit_later, spawn_cancellable, until_cancelled};
 
-/// The headers the client leaves out besides [`super::outgoing::HOST_HEADERS`]: none natively,
-/// and on wasm the ones the host refuses.
+/// The headers the client leaves out besides those that frame the request, which the host sets:
+/// none natively, and on wasm the ones the host refuses.
 #[cfg(not(target_arch = "wasm32"))]
 const REFUSED_HEADERS: [&str; 0] = [];
 #[cfg(target_arch = "wasm32")]
@@ -33,6 +38,14 @@ const REFUSED_HEADERS: [&str; 5] = [
     "proxy-connection",
     "proxy-authorization",
     "http2-settings",
+];
+
+/// The headers that framing and connection management own, which the host sets itself.
+const HOST_HEADERS: [&str; 4] = [
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "content-length",
 ];
 
 /// Throw the error for the transport failure `message` of a request to `url`, with the `code`
@@ -69,22 +82,6 @@ pub(super) fn transport_error(scope: &Scope<'_>, message: &str, url: Option<&str
     }
 }
 
-/// `text` decoded as `decodeURIComponent` does, or `None` if it has a malformed escape.
-fn decode_uri_component(text: &str) -> Option<String> {
-    let mut bytes = Vec::with_capacity(text.len());
-    let mut input = text.bytes();
-    while let Some(byte) = input.next() {
-        if byte != b'%' {
-            bytes.push(byte);
-            continue;
-        }
-        let high = (input.next()? as char).to_digit(16)?;
-        let low = (input.next()? as char).to_digit(16)?;
-        bytes.push((high * 16 + low) as u8);
-    }
-    String::from_utf8(bytes).ok()
-}
-
 /// The options a URL gives a request: `protocol`, `hostname`, `port`, `path` and `auth`.
 fn url_options<'s>(scope: &'s Scope<'_>, href: &str) -> Result<Object<'s>, Thrown> {
     let url = url::Url::parse(href)
@@ -108,8 +105,8 @@ fn url_options<'s>(scope: &'s Scope<'_>, href: &str) -> Result<Object<'s>, Throw
     let password = url.password().unwrap_or_default();
     if !url.username().is_empty() || !password.is_empty() {
         let (Some(user), Some(password)) = (
-            decode_uri_component(url.username()),
-            decode_uri_component(password),
+            crate::url::decode_uri_component(url.username()),
+            crate::url::decode_uri_component(password),
         ) else {
             return Err(Thrown::from(js::error::throw_uri_error(
                 scope,
@@ -132,8 +129,8 @@ pub(super) fn url_of(
     let Ok(object) = Object::from_value(scope, *value) else {
         return Ok(None);
     };
-    let href = object.val(scope, c"href")?;
-    if href.is_string() && object.val(scope, c"searchParams")?.is_object() {
+    let href = object.get_property(scope, c"href")?;
+    if href.is_string() && object.get_property(scope, c"searchParams")?.is_object() {
         return Ok(Some(String::from_jsval_throwing(scope, href, ())?));
     }
     Ok(None)
@@ -145,8 +142,8 @@ fn string_option(
     options: Object<'_>,
     name: &'static std::ffi::CStr,
 ) -> Result<Option<String>, ExnThrown> {
-    let value = options.val(scope, name)?;
-    if value.is_null() || value.is_undefined() {
+    let value = options.get_property(scope, name)?;
+    if value.is_null_or_undefined() {
         return Ok(None);
     }
     Ok(Some(String::from_jsval_throwing(scope, value, ())?))
@@ -160,8 +157,8 @@ fn host_option(
     name: &'static std::ffi::CStr,
     label: &str,
 ) -> Result<Option<String>, Thrown> {
-    let value = options.val(scope, name)?;
-    if value.is_null() || value.is_undefined() {
+    let value = options.get_property(scope, name)?;
+    if value.is_null_or_undefined() {
         return Ok(None);
     }
     if !value.is_string() {
@@ -170,310 +167,284 @@ fn host_option(
     Ok(Some(String::from_jsval(scope, value, ())?).filter(|host| !host.is_empty()))
 }
 
-/// The fulfillment reaction of a request's send, whose captures are `[request]`: emit
-/// `response` with the response the promise was fulfilled with, consuming it if nothing listens.
-fn on_response(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let request = Captures::of(scope, payload)?.obj(0)?;
-    let Ok(response) = Object::from_value(scope, args.get(0)) else {
-        // The send was cancelled.
-        return Ok(js::value::undefined());
-    };
-    clear_timer(scope, request)?;
-    if request.flag(scope, c"destroyed")? {
-        call_method(scope, response, c"destroy", &[])?;
-        return Ok(js::value::undefined());
+/// Run `f` on the client part of the state of a request, if it is a client request.
+fn with_client<R>(state: &OutgoingState<'_>, f: impl FnOnce(&mut ClientPart) -> R) -> Option<R> {
+    match &mut state.data_mut().transport {
+        Transport::Client(client) => Some(f(client)),
+        _ => None,
     }
-    request.set_property(scope, c"res", response)?;
-    if let Some(socket) = request.obj(scope, c"socket")? {
-        response.set_property(scope, c"socket", socket)?;
-        response.set_property(scope, c"client", socket)?;
-    }
-    response.set_property(scope, c"req", request)?;
-    let emit_close = closure(
-        scope,
-        0,
-        emit_request_close,
-        &[request.to_jsval_raw_throwing(scope)?],
-    )?;
-    call_method(
-        scope,
-        response,
-        c"once",
-        &[string(scope, "end")?, emit_close.to_jsval_throwing(scope)?],
-    )?;
-    let response_value = response.to_jsval_throwing(scope)?;
-    let listened = call_method(
-        scope,
-        request,
-        c"emit",
-        &[string(scope, "response")?, response_value],
-    )?;
-    if request.flag(scope, c"aborted")? || !truthy(scope, listened) {
-        call_method(scope, response, c"resume", &[])?;
-    }
-    Ok(js::value::undefined())
 }
 
-/// The `end` listener of a response, whose captures are `[request]`: return the request's socket
+/// The completion of a request's send: emit `response` with the response, consuming it if
+/// nothing listens, or emit `error` and `close` after a failure, unless the request was
+/// destroyed.
+fn send_done(
+    scope: &Scope<'_>,
+    request: Object<'_>,
+    result: Result<HandleValue<'_>, HandleValue<'_>>,
+) -> Result<(), ExnThrown> {
+    let state = super::outgoing::state_of(scope, request)?;
+    clear_timer(&state);
+    with_client(&state, |client| client.cancel = None);
+    let destroyed = state.data().destroyed;
+    let response = match result {
+        Ok(response) => Object::from_value(scope, response).map_err(|e| e.throw(scope))?,
+        Err(error) => {
+            if destroyed {
+                return Ok(());
+            }
+            state.data_mut().destroyed = true;
+            request.set_property(scope, c"destroyed", true)?;
+            crate::events::emit(scope, request, c"error", &[error])?;
+            crate::events::emit(scope, request, c"close", &[])?;
+            return Ok(());
+        }
+    };
+    if destroyed {
+        Function::call_by_name(
+            scope,
+            response.handle(),
+            c"destroy",
+            js::function::EmptyArgs,
+        )?;
+        return Ok(());
+    }
+    with_client(&state, |client| {
+        client.response = Some(Heap::from(response))
+    });
+    request.set_property(scope, c"res", response)?;
+    response.set_property(scope, c"req", request)?;
+    let close = Function::new_callback(scope, c"", 0, emit_request_close, request)?;
+    crate::events::listen(scope, response, c"once", c"end", *close)?;
+    let listened = crate::events::emit(
+        scope,
+        request,
+        c"response",
+        &[response.to_jsval_throwing(scope)?],
+    )?;
+    if js::conversion::to_boolean(request.get_property(scope, c"aborted")?) || !listened {
+        Function::call_by_name(scope, response.handle(), c"resume", js::function::EmptyArgs)?;
+    }
+    Ok(())
+}
+
+/// The `end` listener of a response, whose payload is its request: return the request's socket
 /// to its agent, and emit `close` on the request.
 fn emit_request_close(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let request = Captures::of(scope, payload)?.obj(0)?;
+    let request = js::function::cast_payload::<js::Object>(scope, payload);
     release_socket(scope, request)?;
-    emit_later(scope, request, &[string(scope, "close")?])?;
+    emit_later(scope, request, c"close", &[])?;
     Ok(js::value::undefined())
 }
 
-/// The rejection reaction of a request's send, whose captures are `[request]`: emit `error` and
-/// `close`, unless the request was destroyed.
-fn on_send_error(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let request = Captures::of(scope, payload)?.obj(0)?;
-    clear_timer(scope, request)?;
-    if request.flag(scope, c"destroyed")? {
-        return Ok(js::value::undefined());
-    }
-    request.set_property(scope, c"destroyed", true)?;
-    call_method(
-        scope,
-        request,
-        c"emit",
-        &[string(scope, "error")?, args.get(0)],
-    )?;
-    call_method(scope, request, c"emit", &[string(scope, "close")?])?;
-    Ok(js::value::undefined())
-}
-
-/// The timer callback of `setTimeout`, whose captures are `[request]`: emit `timeout`.
+/// The timer callback of `setTimeout`, whose `this` is the request: emit `timeout`.
 fn on_timeout(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let request = Captures::of(scope, payload)?.obj(0)?;
-    request.set_property(scope, c"_starlingTimer", js::value::undefined())?;
-    call_method(scope, request, c"emit", &[string(scope, "timeout")?])?;
+    let request = crate::support::this_object(scope, &args)?;
+    let state = super::outgoing::state_of(scope, request)?;
+    with_client(&state, |client| client.timer = None);
+    crate::events::emit(scope, request, c"timeout", &[])?;
     Ok(js::value::undefined())
 }
 
-/// Clear the timer `setTimeout` started for `request`, if it is pending.
-fn clear_timer(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrown> {
-    let timer = request.val(scope, c"_starlingTimer")?;
-    if !timer.is_undefined() {
-        let clear = scope.global().val(scope, c"clearTimeout")?;
-        Function::call(scope, js::value::undefined(), clear, &[timer])?;
-        request.set_property(scope, c"_starlingTimer", js::value::undefined())?;
-    }
-    Ok(())
-}
-
-/// The cancellation of a request's send, which `destroy` triggers.
-#[core_runtime::jsclass(hidden)]
-pub struct SendCancel {
-    #[no_trace]
-    sender: Option<futures_channel::oneshot::Sender<()>>,
-}
-
-#[core_runtime::jsmethods]
-impl SendCancel {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
+/// Cancel the timer `setTimeout` started for the request of `state`, if it is pending.
+fn clear_timer(state: &OutgoingState<'_>) {
+    if let Some(Some(id)) = with_client(state, |client| client.timer.take()) {
+        core_runtime::event_loop::with_active_event_loop(|el| el.clear_js_timer(id));
     }
 }
 
-/// Cancel the send of `request`, if it is in progress.
-fn cancel_send(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrown> {
-    let Some(handle) = request.obj(scope, c"_starlingCancel")? else {
-        return Ok(());
-    };
-    if let Ok(handle) = handle.cast::<SendCancel>() {
-        if let Some(sender) = handle.data_mut().sender.take() {
-            let _ = sender.send(());
-        }
-    }
-    Ok(())
-}
-
-/// Attach the reactions of a request's send to `promise`.
-fn react(
+/// Send `request` with the bytes written to it as its body. `destroy` cancels the send. A request
+/// whose host name can't be in a URL fails with `ENOTFOUND`.
+fn start(
     scope: &Scope<'_>,
     request: Object<'_>,
-    promise: js::Promise<'_>,
+    state: &OutgoingState<'_>,
 ) -> Result<(), ExnThrown> {
-    let on_response = closure(
-        scope,
-        1,
-        on_response,
-        &[request.to_jsval_raw_throwing(scope)?],
-    )?;
-    let on_error = closure(
-        scope,
-        1,
-        on_send_error,
-        &[request.to_jsval_raw_throwing(scope)?],
-    )?;
-    promise.then(scope, Some(on_response), Some(on_error))?;
-    Ok(())
-}
-
-/// Send `request` with the chunks written to it as its body. `destroy` cancels the send, which
-/// fulfills the promise with `undefined`. A request whose host name can't be in a URL fails
-/// with `ENOTFOUND`.
-fn start(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrown> {
-    let url = String::from_jsval_throwing(scope, request.val(scope, c"_starlingUrl")?, ())?;
+    let (url, body) = with_client(state, |client| {
+        (client.url.clone(), std::mem::take(&mut client.body))
+    })
+    .unwrap_or_default();
     if url.is_empty() {
-        let host = request.val(scope, c"host")?;
+        let host = request.get_property(scope, c"host")?;
         let name = String::from_jsval_throwing(scope, host, ())?;
-        crate::net::throw_net_error(
-            scope,
+        let error = crate::fs::UvError::net(
             &platform::net::NetError::NoAddress(name.clone()),
             "getaddrinfo",
-            Some(&name),
-            &[(c"hostname", host)],
-        );
-        let error = crate::stream::take_exception(scope);
-        let promise = js::Promise::new_pending(scope)?;
-        promise.reject(scope, error)?;
-        return react(scope, request, promise);
+        )
+        .suffix(format!(" {name}"))
+        .hostname(&name)
+        .into_value(scope)?;
+        return send_done(scope, request, Err(error));
     }
-    let mut body = Vec::new();
-    if let Some(chunks) = request.obj(scope, c"_starlingChunks")? {
-        for chunk in elements(scope, chunks)? {
-            if let Some(view) = Object::from_value(scope, chunk)
-                .ok()
-                .and_then(js::ArrayBufferView::from_object)
-            {
-                view.with_bytes(|bytes| body.extend_from_slice(bytes));
-            }
-        }
-    }
-    let headers = header_pairs(scope, request)?
+    let headers = header_pairs(scope, state)?
         .into_iter()
         .filter(|(name, _)| {
             let name = name.to_ascii_lowercase();
-            !super::outgoing::HOST_HEADERS.contains(&name.as_str())
-                && !REFUSED_HEADERS.contains(&name.as_str())
+            !HOST_HEADERS.contains(&name.as_str()) && !REFUSED_HEADERS.contains(&name.as_str())
         })
         .collect();
+    let method = request.get_property(scope, c"method")?;
     let outgoing = Request {
-        method: String::from_jsval(scope, request.val(scope, c"method")?, ())
-            .unwrap_or_else(|_| "GET".into()),
+        method: String::from_jsval(scope, method, ()).unwrap_or_else(|_| "GET".into()),
         url: url.clone(),
         headers,
         body: OutgoingBody::Bytes(body.into()),
     };
-    let (sender, cancelled) = futures_channel::oneshot::channel();
-    let cancel = js::class::create_instance_with::<SendCancelImpl>(scope, |_| SendCancelImpl {
-        sender: Some(sender),
-    })?;
-    request.define_property(
+    let canceller = spawn_cancellable(
         scope,
-        c"_starlingCancel",
-        cancel.to_jsval_throwing(scope)?,
-        0,
-    )?;
-    let future = async move {
-        let send = async { Some(platform::http::send(outgoing).await) };
-        let cancel = async {
-            let _ = cancelled.await;
-            None
-        };
-        let result = futures_lite::future::or(send, cancel).await;
-        PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
-            let Some(result) = result else {
-                return Ok(scope.root_value(js::value::undefined()));
-            };
+        request,
+        |cancelled| until_cancelled(cancelled, platform::http::send(outgoing)),
+        move |scope, request, result| {
             let response = result.map_err(|error| transport_error(scope, &error.0, Some(&url)))?;
-            let class = incoming_message_class::class_constructor(scope)?;
-            let message = Function::construct(scope, class, js::function::EmptyArgs)?;
-            message.set_property(scope, c"statusCode", f64::from(response.status))?;
-            message.set_property(
-                scope,
-                c"statusMessage",
-                status_text(response.status).unwrap_or(""),
-            )?;
-            set_headers(scope, message, &response.headers)?;
-            set_response_body(scope, message, response.body)?;
+            let state = super::outgoing::state_of(scope, request)?;
+            let socket = state.data().socket.get(scope);
+            let socket = match socket {
+                Some(socket) => scope.root_value(socket.as_value()),
+                None => HandleValue::undefined(),
+            };
+            let head = MessageHead {
+                version: Some((1, 1)),
+                status: Some((response.status, status_text(response.status).unwrap_or(""))),
+                headers: Some(response.headers),
+                ..MessageHead::default()
+            };
+            let message = new_message(scope, socket, head)?;
+            set_host_source(scope, message, response.body, Some(url))?;
             message.to_jsval_throwing(scope)
-        }))
-    };
-    let promise = js::Promise::new_pending(scope)?;
-    promise.spawn(PromiseFuture::new(future));
-    react(scope, request, promise)
+        },
+        send_done,
+    )?;
+    with_client(state, |client| client.cancel = Some(canceller));
+    Ok(())
 }
 
-/// The free sockets of `agent` for connections named `name`, an array the agent keeps under the
-/// connection's name.
+/// Keep `bytes` of the body of the request `request`, and send the request with the body kept if
+/// `last` and it wasn't destroyed.
+pub(super) fn send(
+    scope: &Scope<'_>,
+    request: Object<'_>,
+    state: &OutgoingState<'_>,
+    bytes: Vec<u8>,
+    last: bool,
+) -> Result<bool, ExnThrown> {
+    with_client(state, |client| client.body.extend_from_slice(&bytes));
+    if last && !state.data().destroyed {
+        start(scope, request, state)?;
+    }
+    Ok(true)
+}
+
+/// Cancel the send of the request `request`, destroy the response if it arrived, and emit
+/// `error` and `close`. The error is `error`, or, if none is given and neither a response
+/// arrived nor the request was aborted, an `ECONNRESET` "socket hang up" error.
+pub(super) fn destroy(
+    scope: &Scope<'_>,
+    request: Object<'_>,
+    state: &OutgoingState<'_>,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    clear_timer(state);
+    let response = with_client(state, |client| {
+        client.cancel = None;
+        client.response.as_ref().map(|response| response.get(scope))
+    })
+    .flatten();
+    if let Some(response) = response {
+        Function::call_by_name(scope, response.handle(), c"destroy", &[error])?;
+    }
+    let aborted = js::conversion::to_boolean(request.get_property(scope, c"aborted")?);
+    let error = if !error.is_null_or_undefined() {
+        Some(error)
+    } else if response.is_none() && !aborted {
+        Some(NodeError::new(ErrorKind::Error, "ECONNRESET", "socket hang up").to_value(scope)?)
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        emit_later(scope, request, c"error", &[error])?;
+    }
+    emit_later(scope, request, c"close", &[])
+}
+
+/// The free sockets of `agent` for connections named `name`: the array its `freeSockets` holds
+/// under the name, created if `create`.
 fn free_sockets<'s>(
     scope: &'s Scope<'_>,
     agent: Object<'_>,
     name: &str,
-) -> Result<Object<'s>, ExnThrown> {
-    let pool = match agent.obj(scope, c"_starlingFreeSockets")? {
-        Some(pool) => pool,
-        None => {
-            let pool = super::outgoing::null_object(scope)?;
-            agent.define_property(scope, c"_starlingFreeSockets", pool, 0)?;
-            pool
-        }
+    create: bool,
+) -> Result<Option<js::Array<'s>>, ExnThrown> {
+    let Ok(pool) = Object::from_value(scope, *agent.get_property(scope, c"freeSockets")?) else {
+        return Ok(None);
     };
-    let key = string(scope, name)?;
+    let key = name.to_jsval_throwing(scope)?;
     let sockets = crate::http::get_by_key(scope, pool, key)?;
-    if let Ok(sockets) = Object::from_value(scope, *sockets) {
-        return Ok(sockets);
+    if let Some(sockets) = super::outgoing::as_array(scope, sockets)? {
+        return Ok(Some(sockets));
     }
-    let sockets = *js::Array::new(scope, 0)?;
+    if !create {
+        return Ok(None);
+    }
+    let sockets = js::Array::new(scope, 0)?;
     crate::http::set_by_key(scope, pool, key, sockets.to_jsval_throwing(scope)?)?;
-    Ok(sockets)
+    Ok(Some(sockets))
+}
+
+/// Whether `agent` keeps connections alive.
+fn keeps_alive(scope: &Scope<'_>, agent: Object<'_>) -> Result<bool, ExnThrown> {
+    Ok(js::conversion::to_boolean(
+        agent.get_property(scope, c"keepAlive")?,
+    ))
 }
 
 /// Assign `request` a socket for a connection to `host` and `port` in the tick queue, as Node.js's
 /// agent does once it has one: `socket` and `connection` become the socket, and `socket` is
 /// emitted. A request destroyed before then gets no socket. A `keepAlive` agent reuses a socket
-/// a response of the same host and port returned to it, and sets `reusedSocket`. The socket's
-/// remote address is `host` if it is an IP address.
+/// a response of the same host and port returned to its `freeSockets`, and sets `reusedSocket`.
+/// The socket's remote address is `host` if it is an IP address.
 fn assign_socket_later(
     scope: &Scope<'_>,
     request: Object<'_>,
+    state: &OutgoingState<'_>,
     agent: Option<Object<'_>>,
     host: &str,
-    port: f64,
+    port: u16,
     encrypted: bool,
 ) -> Result<(), ExnThrown> {
     let name = format!("{host}:{port}:");
-    request.define_property(scope, c"_starlingSocketName", name.as_str(), 0)?;
     let mut reused = None;
-    if let Some(agent) = agent.filter(|agent| agent.flag(scope, c"keepAlive").unwrap_or(false)) {
-        let free = free_sockets(scope, agent, &name)?;
-        let socket = call_method(scope, free, c"pop", &[])?;
-        if let Ok(socket) = Object::from_value(scope, *socket) {
-            socket.define_property(scope, c"_starlingOwner", request, 0)?;
-            request.set_property(scope, c"reusedSocket", true)?;
-            reused = Some(socket);
+    if let Some(agent) = agent {
+        if keeps_alive(scope, agent)? {
+            if let Some(free) = free_sockets(scope, agent, &name, false)? {
+                let length = free.length(scope)?;
+                if length > 0 {
+                    let socket = free.get_element(scope, length - 1)?;
+                    free.set_length(scope, length - 1)?;
+                    if let Ok(socket) = Object::from_value(scope, socket) {
+                        super::host_socket::set_owner(scope, socket, Some(request))?;
+                        request.set_property(scope, c"reusedSocket", true)?;
+                        reused = Some(socket);
+                    }
+                }
+            }
         }
     }
+    with_client(state, |client| client.socket_name = name);
     let socket = match reused {
         Some(socket) => socket,
         None => {
-            let remote = host.parse::<std::net::IpAddr>().ok().map(|ip| {
-                let family = if ip.is_ipv4() { "IPv4" } else { "IPv6" };
-                (ip.to_string(), port as u16, family)
-            });
+            let remote = host
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| std::net::SocketAddr::new(ip, port));
             let connection = super::host_socket::HostConnection {
                 remote,
                 local_port: None,
@@ -483,90 +454,82 @@ fn assign_socket_later(
             super::host_socket::new_host_socket(scope, connection)?
         }
     };
-    crate::stream::next_tick(
+    js::jobs::queue_native_tick(
         scope,
         assign_socket,
-        &[
-            request.to_jsval_raw_throwing(scope)?,
-            socket.to_jsval_raw_throwing(scope)?,
-        ],
+        request,
+        &[socket.to_jsval_throwing(scope)?],
     )
 }
 
-/// The tick of [`assign_socket_later`], whose captures are `[request, socket]`.
+/// The tick of [`assign_socket_later`], whose payload is the request and whose argument is the
+/// socket.
 fn assign_socket(
     scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
+    args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let request = captures.obj(0)?;
-    if request.flag(scope, c"destroyed")? {
+    let request = js::function::cast_payload::<js::Object>(scope, payload);
+    let state = super::outgoing::state_of(scope, request)?;
+    if state.data().destroyed {
         return Ok(js::value::undefined());
     }
-    let socket = captures.obj(1)?;
-    request.set_property(scope, c"socket", socket)?;
-    request.set_property(scope, c"connection", socket)?;
-    let socket = socket.to_jsval_throwing(scope)?;
-    call_method(scope, request, c"emit", &[string(scope, "socket")?, socket])?;
+    let socket = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
+    state.data_mut().socket = Some(Heap::from(socket));
+    crate::events::emit(
+        scope,
+        request,
+        c"socket",
+        &[socket.to_jsval_throwing(scope)?],
+    )?;
     Ok(js::value::undefined())
 }
 
-/// Return the socket of `request` to its agent's free sockets, if the agent is a `keepAlive` one
-/// and the socket isn't destroyed.
+/// Return the socket of `request` to its agent's `freeSockets`, if the agent keeps connections
+/// alive and the socket isn't destroyed.
 fn release_socket(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrown> {
-    let Some(agent) = request.obj(scope, c"agent")? else {
+    let state = super::outgoing::state_of(scope, request)?;
+    let (agent, name) = with_client(&state, |client| {
+        (
+            client.agent.as_ref().map(|agent| agent.get(scope)),
+            client.socket_name.clone(),
+        )
+    })
+    .unwrap_or_default();
+    let Some(agent) = agent else {
         return Ok(());
     };
-    let Some(socket) = request.obj(scope, c"socket")? else {
+    let Some(socket) = state.data().socket.get(scope) else {
         return Ok(());
     };
-    if !agent.flag(scope, c"keepAlive")? || socket.flag(scope, c"destroyed")? {
+    if !keeps_alive(scope, agent)? || super::host_socket::is_destroyed(socket) {
         return Ok(());
     }
-    let name = String::from_jsval_throwing(scope, request.val(scope, c"_starlingSocketName")?, ())?;
-    socket.define_property(scope, c"_starlingOwner", js::value::undefined(), 0)?;
-    let free = free_sockets(scope, agent, &name)?;
-    call_method(scope, free, c"push", &[socket.to_jsval_throwing(scope)?])?;
+    super::host_socket::set_owner(scope, socket, None)?;
+    if let Some(free) = free_sockets(scope, agent, &name, true)? {
+        free.push(scope, socket)?;
+    }
     Ok(())
 }
 
 /// Add the headers `headers` gives to `request`: from an object, a flat array of names and
 /// values, or an array of `[name, value]` pairs.
 fn add_headers(scope: &Scope<'_>, request: Object<'_>, headers: Object<'_>) -> Result<(), Thrown> {
-    let Some(array) = as_array(scope, headers.to_jsval_throwing(scope)?)? else {
-        for key in object_keys(scope, headers)? {
-            let value = crate::http::get_by_key(scope, headers, key)?;
-            outgoing_message_class::set_header(scope, request, key, value)?;
+    let value = headers.to_jsval_throwing(scope)?;
+    let is_array = super::outgoing::as_array(scope, value)?.is_some();
+    for (name, value) in header_args(scope, value, false)? {
+        if is_array {
+            outgoing_message_class::append_header(scope, request, name, value)?;
+        } else {
+            outgoing_message_class::set_header(scope, request, name, value)?;
         }
-        return Ok(());
-    };
-    let items = elements(scope, array)?;
-    if let Some(first) = items.first() {
-        if as_array(scope, *first)?.is_some() {
-            for item in &items {
-                let pair =
-                    Object::from_value(scope, **item).map_err(|e| Thrown::from(e.throw(scope)))?;
-                let name = pair.get_element(scope, 0)?;
-                let value = pair.get_element(scope, 1)?;
-                outgoing_message_class::append_header(scope, request, name, value)?;
-            }
-            return Ok(());
-        }
-    }
-    if items.len() % 2 != 0 {
-        let headers = headers.to_jsval_throwing(scope)?;
-        return Err(NodeError::invalid_arg_value(scope, "headers", headers, "is invalid").into());
-    }
-    for pair in items.chunks(2) {
-        outgoing_message_class::append_header(scope, request, pair[0], pair[1])?;
     }
     Ok(())
 }
 
 /// The URL of a request to `host` and `port` with `path`, whose request target always starts
 /// with `/`, or an empty string if `host` can't be in a URL.
-fn request_url(protocol: &str, host: &str, port: f64, default_port: f64, path: &str) -> String {
+fn request_url(protocol: &str, host: &str, port: u16, default_port: f64, path: &str) -> String {
     let bracketed = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
     } else {
@@ -576,12 +539,55 @@ fn request_url(protocol: &str, host: &str, port: f64, default_port: f64, path: &
         return String::new();
     };
     let slash = if path.starts_with('/') { "" } else { "/" };
-    if port == default_port {
+    if f64::from(port) == default_port {
         format!("{protocol}//{host}{slash}{path}")
     } else {
         format!("{protocol}//{host}:{port}{slash}{path}")
     }
 }
+
+/// The getter of `path`.
+fn get_path(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
+    let Some(state) = super::outgoing::try_state_of(scope, this)? else {
+        return Ok(js::value::undefined());
+    };
+    let path = with_client(&state, |client| {
+        client.path.as_ref().map(|path| path.get(scope))
+    })
+    .flatten();
+    Ok(path.map_or_else(js::value::undefined, |path| path.get()))
+}
+
+/// The setter of `path`.
+fn set_path(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
+    if let Some(state) = super::outgoing::try_state_of(scope, this)? {
+        let value = args.get(0);
+        with_client(&state, |client| client.path = Some(Heap::from(value.get())));
+    }
+    Ok(js::value::undefined())
+}
+
+/// The own properties the `ClientRequest` constructor creates after those of `OutgoingMessage`, in
+/// Node's order.
+pub(crate) static REQUEST_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"agent"),
+    TemplateKey::Name(c"method"),
+    TemplateKey::Name(c"res"),
+    TemplateKey::Name(c"aborted"),
+    TemplateKey::Name(c"reusedSocket"),
+    TemplateKey::Name(c"host"),
+    TemplateKey::Name(c"protocol"),
+]);
 
 #[core_runtime::jsfunction_class(name = "ClientRequest", extends = "super::outgoing_message_class")]
 pub mod client_request_class {
@@ -591,7 +597,7 @@ pub mod client_request_class {
     /// or with the options `input`, with `options` added, whose response goes to `callback`. Of
     /// the options, `signal` destroys the request when aborted, and the TLS options and
     /// `createConnection` are ignored.
-    #[constructor]
+    #[constructor(length = 3)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -599,42 +605,36 @@ pub mod client_request_class {
         options: Option<HandleValue<'_>>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        super::outgoing_message_class::init(scope, this)?;
-        this.set_property(scope, c"_starlingWire", false)?;
+        super::outgoing_message_class::init(scope, this, None)?;
+        let state = super::super::outgoing::state_of(scope, this)?;
+        state.data_mut().transport = Transport::Client(ClientPart::default());
         let merged = Object::new_plain(scope)?;
-        let assign = scope.global().obj(scope, c"Object")?.ok_or(ExnThrown)?;
         let (options, callback) = match options {
-            Some(options) if is_function(scope, options) => (None, Some(options)),
+            Some(options) if js::function::is_callable(options) => (None, Some(options)),
             options => (options, callback),
         };
-        let (input_options, options) = match url_of(scope, input)? {
-            Some(href) => (
-                Some(url_options(scope, &href)?.to_jsval_throwing(scope)?),
-                options,
-            ),
-            None if input.is_object() => (Some(scope.root_value(input.get())), options),
-            None => (None, options),
+        let input_options = match url_of(scope, input)? {
+            Some(href) => Some(url_options(scope, &href)?),
+            None => Object::from_value(scope, *input).ok(),
         };
+        let options = options.and_then(|options| Object::from_value(scope, *options).ok());
         for source in [input_options, options].into_iter().flatten() {
-            if source.is_object() {
-                call_method(
-                    scope,
-                    assign,
-                    c"assign",
-                    &[merged.to_jsval_throwing(scope)?, source],
-                )?;
-            }
+            merged.assign(scope, source)?;
         }
-        let default_agent = match merged.obj(scope, c"_defaultAgent")? {
-            Some(agent) => agent,
-            None => crate::http::global_agent(scope, false)?,
-        };
-        let agent = merged.val(scope, c"agent")?;
+        let default_agent =
+            match Object::from_value(scope, *merged.get_property(scope, c"_defaultAgent")?) {
+                Ok(agent) => agent,
+                Err(_) => crate::http::global_agent(scope, false)?,
+            };
+        let agent = merged.get_property(scope, c"agent")?;
         let agent = if agent.is_boolean() && !agent.to_boolean() {
-            let ctor = default_agent.obj(scope, c"constructor")?.ok_or(ExnThrown)?;
+            let ctor = default_agent.get_property(scope, c"constructor")?;
+            let ctor =
+                Object::from_value(scope, *ctor).map_err(|e| Thrown::from(e.throw(scope)))?;
             Some(Function::construct(scope, ctor, js::function::EmptyArgs)?)
-        } else if agent.is_null() || agent.is_undefined() {
-            (!is_function(scope, merged.val(scope, c"createConnection")?)).then_some(default_agent)
+        } else if agent.is_null_or_undefined() {
+            (!js::function::is_callable(merged.get_property(scope, c"createConnection")?))
+                .then_some(default_agent)
         } else {
             Object::from_value(scope, *agent).ok()
         };
@@ -650,8 +650,8 @@ pub mod client_request_class {
                 .unwrap_or(default_protocol),
             None => default_protocol,
         };
-        let path = merged.val(scope, c"path")?;
-        let path = if truthy(scope, path) {
+        let path = merged.get_property(scope, c"path")?;
+        let path = if js::conversion::to_boolean(path) {
             let path = String::from_jsval(scope, path, ())?;
             if path.chars().any(|c| !('\u{21}'..='\u{ff}').contains(&c)) {
                 return Err(NodeError::new(
@@ -673,16 +673,16 @@ pub mod client_request_class {
             )
             .into());
         }
-        let default_port = match merged.val(scope, c"defaultPort")? {
-            port if truthy(scope, port) => port,
+        let default_port = match merged.get_property(scope, c"defaultPort")? {
+            port if js::conversion::to_boolean(port) => port,
             _ => match agent {
-                Some(agent) => agent.val(scope, c"defaultPort")?,
-                None => scope.root_value(js::value::undefined()),
+                Some(agent) => agent.get_property(scope, c"defaultPort")?,
+                None => HandleValue::undefined(),
             },
         };
-        let port = match merged.val(scope, c"port")? {
-            port if truthy(scope, port) => port,
-            _ if truthy(scope, default_port) => default_port,
+        let port = match merged.get_property(scope, c"port")? {
+            port if js::conversion::to_boolean(port) => port,
+            _ if js::conversion::to_boolean(default_port) => default_port,
             _ => scope.root_value(js::value::from_f64(80.0)),
         };
         f64::from_jsval(scope, port, ())?;
@@ -695,7 +695,7 @@ pub mod client_request_class {
             )
             .into());
         }
-        let port = f64::from(crate::net::validate_port(scope, port, "Port")?);
+        let port = crate::net::validate_port(scope, port, "Port")?;
         let default_port = if default_port.is_number() {
             default_port.to_number()
         } else if protocol == "https:" {
@@ -710,171 +710,161 @@ pub mod client_request_class {
             .unwrap_or_else(|| "GET".into())
             .to_ascii_uppercase();
         let url = request_url(&protocol, &host, port, default_port, &path);
-        this.set_property(scope, c"method", method.as_str())?;
-        this.set_property(scope, c"path", path.as_str())?;
-        this.set_property(scope, c"host", host.as_str())?;
-        this.set_property(scope, c"protocol", protocol.as_str())?;
-        this.set_property(scope, c"aborted", false)?;
-        this.set_property(scope, c"reusedSocket", false)?;
-        this.set_property(scope, c"res", js::value::null())?;
-        this.define_property(scope, c"_starlingUrl", url.as_str(), 0)?;
+        // SAFETY: `Assign` has no requirements.
+        let mut properties =
+            unsafe { this.property_writer(scope, &REQUEST_PROPERTIES, PropertyInit::Assign) }?;
         match agent {
-            Some(agent) => this.set_property(scope, c"agent", agent)?,
-            None => this.set_property(scope, c"agent", js::value::undefined())?,
+            Some(agent) => properties.write(scope, c"agent", agent)?,
+            None => properties.write(scope, c"agent", HandleValue::undefined())?,
         }
-        if let Some(headers) = merged.obj(scope, c"headers")? {
+        properties.write(scope, c"method", method.as_str())?;
+        properties.write(scope, c"res", HandleValue::null())?;
+        properties.write(scope, c"aborted", false)?;
+        properties.write(scope, c"reusedSocket", false)?;
+        properties.write(scope, c"host", host.as_str())?;
+        properties.write(scope, c"protocol", protocol.as_str())?;
+        properties.finish(scope)?;
+        let path_value = path.as_str().to_jsval_throwing(scope)?;
+        with_client(&state, |client| {
+            client.url = url;
+            client.agent = agent.map(Heap::from);
+            client.path = Some(Heap::from(path_value.get()));
+        });
+        if let Ok(headers) = Object::from_value(scope, *merged.get_property(scope, c"headers")?) {
             super::add_headers(scope, this, headers)?;
         }
         if let Some(auth) = string_option(scope, merged, c"auth")? {
-            if super::outgoing_message_class::get_header(
-                scope,
-                this,
-                string(scope, "authorization")?,
-            )?
-            .is_undefined()
-            {
-                let encoded = crate::buffer::decode_bytes(
-                    scope,
-                    auth.as_bytes(),
-                    crate::buffer::Encoding::Base64,
-                )?
-                .to_utf8(scope)?;
-                let name = string(scope, "Authorization")?;
-                let value = string(scope, &format!("Basic {encoded}"))?;
+            if super::super::outgoing::header_value(scope, &state, "authorization").is_none() {
+                let Some(encoded) = web_globals::base64::encode(auth.as_bytes(), false) else {
+                    js::exception::report_out_of_memory(scope);
+                    return Err(ExnThrown.into());
+                };
+                let name = js::class::get_or_init_atom(scope, c"Authorization")?;
+                let value = format!("Basic {encoded}")
+                    .as_str()
+                    .to_jsval_throwing(scope)?;
                 super::outgoing_message_class::set_header(scope, this, name, value)?;
             }
         }
-        if let Some(callback) = callback.filter(|callback| is_function(scope, *callback)) {
-            call_method(
-                scope,
-                this,
-                c"once",
-                &[string(scope, "response")?, callback],
-            )?;
+        if let Some(callback) =
+            callback.and_then(|callback| Object::from_value(scope, *callback).ok())
+        {
+            if callback.is_callable() {
+                crate::events::listen(scope, this, c"once", c"response", callback)?;
+            }
         }
-        let timeout = merged.val(scope, c"timeout")?;
+        let timeout = merged.get_property(scope, c"timeout")?;
         if timeout.is_number() {
             client_request_class::set_timeout(scope, this, timeout.to_number(), None)?;
         }
-        let signal = merged.val(scope, c"signal")?;
-        if truthy(scope, signal) {
+        let signal = merged.get_property(scope, c"signal")?;
+        if js::conversion::to_boolean(signal) {
             crate::stream::add_abort_signal(scope, signal, this.to_jsval_throwing(scope)?)?;
         }
-        super::assign_socket_later(scope, this, agent, &host, port, protocol == "https:")?;
+        super::assign_socket_later(
+            scope,
+            this,
+            &state,
+            agent,
+            &host,
+            port,
+            protocol == "https:",
+        )?;
         Ok(())
     }
 
-    /// Has no effect, since the runtime's HTTP client writes the request head.
+    /// Mark the headers sent, which `headersSent` returns. The runtime's HTTP client writes the
+    /// request head.
     #[method(name = "_implicitHeader")]
-    pub fn implicit_header_impl() -> Result<(), ExnThrown> {
+    pub fn implicit_header_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        super::super::outgoing::state_of(scope, this)?
+            .data_mut()
+            .header_stored = true;
         Ok(())
-    }
-
-    /// Collect `chunk`, and send the request with the collected chunks if `last`.
-    #[method(name = "_starlingSend")]
-    pub fn send_impl(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        chunk: HandleValue<'_>,
-        last: bool,
-    ) -> Result<bool, ExnThrown> {
-        let chunks = match this.obj(scope, c"_starlingChunks")? {
-            Some(chunks) => chunks,
-            None => {
-                let chunks = js::Array::new(scope, 0)?;
-                this.define_property(scope, c"_starlingChunks", *chunks, 0)?;
-                *chunks
-            }
-        };
-        call_method(scope, chunks, c"push", &[chunk])?;
-        if last && !this.flag(scope, c"destroyed")? {
-            start(scope, this)?;
-        }
-        Ok(true)
-    }
-
-    /// Cancel the send, destroy the response if it arrived, and emit `error` and `close`. The
-    /// error is `error`, or, if none is given and neither a response arrived nor the request
-    /// was aborted, an `ECONNRESET` "socket hang up" error.
-    #[method(name = "_starlingDestroy")]
-    pub fn destroy_impl(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        error: HandleValue<'_>,
-    ) -> Result<(), ExnThrown> {
-        clear_timer(scope, this)?;
-        cancel_send(scope, this)?;
-        let response = this.obj(scope, c"res")?;
-        if let Some(response) = response {
-            call_method(scope, response, c"destroy", &[error])?;
-        }
-        let error = if !error.is_undefined() && !error.is_null() {
-            Some(scope.root_value(error.get()))
-        } else if response.is_none() && !this.flag(scope, c"aborted")? {
-            Some(crate::stream::error_value(
-                scope,
-                NodeError::new(ErrorKind::Error, "ECONNRESET", "socket hang up"),
-            )?)
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            emit_later(scope, this, &[string(scope, "error")?, error])?;
-        }
-        emit_later(scope, this, &[string(scope, "close")?])
     }
 
     /// <https://nodejs.org/api/http.html#requestabort>
     pub fn abort(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        if truthy(scope, this.val(scope, c"aborted")?) {
+        if js::conversion::to_boolean(this.get_property(scope, c"aborted")?) {
             return Ok(());
         }
         this.set_property(scope, c"aborted", true)?;
-        emit_later(scope, this, &[string(scope, "abort")?])?;
+        emit_later(scope, this, c"abort", &[])?;
         super::outgoing_message_class::destroy(scope, this, None)?;
         Ok(())
     }
 
     /// <https://nodejs.org/api/http.html#requestsettimeouttimeout-callback>: emit `timeout` if
     /// no response arrived within `timeout` milliseconds.
+    #[method(length = 2)]
     pub fn set_timeout<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
         timeout: f64,
         callback: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, ExnThrown> {
-        clear_timer(scope, this)?;
-        if let Some(callback) = callback.filter(|callback| is_function(scope, *callback)) {
-            call_method(scope, this, c"once", &[string(scope, "timeout")?, callback])?;
+        let state = super::super::outgoing::state_of(scope, this)?;
+        clear_timer(&state);
+        if let Some(callback) =
+            callback.and_then(|callback| Object::from_value(scope, *callback).ok())
+        {
+            if callback.is_callable() {
+                crate::events::listen(scope, this, c"once", c"timeout", callback)?;
+            }
         }
         if timeout > 0.0 {
-            let fire = closure(scope, 0, on_timeout, &[this.to_jsval_raw_throwing(scope)?])?;
-            let set = scope.global().val(scope, c"setTimeout")?;
-            let delay = scope.root_value(js::value::from_f64(timeout));
-            let timer = Function::call(
+            let timeout = scope.root_value(js::value::from_f64(timeout));
+            let timeout = crate::timers::timer_delay(scope, timeout)?;
+            let fire = crate::support::shared_function(scope, on_timeout, 0)?;
+            let fire = js::Callable::from_jsval(scope, fire.to_jsval_throwing(scope)?, ())
+                .map_err(|e| e.throw(scope))?;
+            let id = core_runtime::event_loop::timer::start_timer(
                 scope,
-                js::value::undefined(),
-                set,
-                &[fire.to_jsval_throwing(scope)?, delay],
-            )?;
-            this.define_property(scope, c"_starlingTimer", timer, 0)?;
+                fire,
+                this.to_jsval_throwing(scope)?,
+                &[],
+                Duration::from_millis(timeout as u64),
+                false,
+                None,
+            )
+            .ok_or_else(|| {
+                core_runtime::event_loop::throw_no_event_loop(scope, "request.setTimeout")
+            })?;
+            with_client(&state, |client| client.timer = Some(id));
         }
         Ok(this)
     }
 
     /// <https://nodejs.org/api/http.html#requestsetnodelaynodelay>: has no effect.
+    #[method(length = 1)]
     pub fn set_no_delay() -> Result<(), ExnThrown> {
         Ok(())
     }
 
     /// <https://nodejs.org/api/http.html#requestsetsocketkeepaliveenable-initialdelay>: has no
     /// effect.
+    #[method(length = 2)]
     pub fn set_socket_keep_alive() -> Result<(), ExnThrown> {
         Ok(())
     }
+
+    /// Define `path`.
+    #[setup]
+    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
+        let getter = Function::new_callback(scope, c"path", 0, get_path, ())?;
+        let setter = Function::new_callback(scope, c"path", 1, set_path, ())?;
+        proto.define_accessor(
+            scope,
+            c"path",
+            Some(*getter),
+            Some(*setter),
+            js::class_spec::JSPROP_ENUMERATE as u32,
+        )
+    }
 }
 
-/// Initialize the agent `this` with `options` and the default port and protocol.
+/// Initialize the agent `this` with `options` and the default port and protocol, with Node.js's
+/// own data properties.
 fn init_agent(
     scope: &Scope<'_>,
     this: Object<'_>,
@@ -883,27 +873,25 @@ fn init_agent(
     protocol: &str,
 ) -> Result<(), ExnThrown> {
     crate::events::event_emitter::init(scope, this, None).map_err(|thrown| thrown.throw(scope))?;
-    let options = match options.filter(|options| options.is_object()) {
-        Some(options) => scope.root_value(options.get()),
-        None => Object::new_plain(scope)?.to_jsval_throwing(scope)?,
+    let options = match options.and_then(|options| Object::from_value(scope, *options).ok()) {
+        Some(options) => options,
+        None => Object::new_plain(scope)?,
     };
-    let options_object = Object::from_value(scope, *options).map_err(|e| e.throw(scope))?;
     this.set_property(scope, c"options", options)?;
     this.set_property(scope, c"defaultPort", default_port)?;
     this.set_property(scope, c"protocol", protocol)?;
-    this.set_property(
-        scope,
-        c"keepAlive",
-        truthy(scope, options_object.val(scope, c"keepAlive")?),
-    )?;
+    for name in [c"requests", c"sockets", c"freeSockets"] {
+        this.set_property(scope, name, Object::new_with_null_prototype(scope)?)?;
+    }
     this.set_property(scope, c"keepAliveMsecs", 1000)?;
+    let keep_alive = js::conversion::to_boolean(options.get_property(scope, c"keepAlive")?);
+    this.set_property(scope, c"keepAlive", keep_alive)?;
     this.set_property(scope, c"maxSockets", f64::INFINITY)?;
     this.set_property(scope, c"maxFreeSockets", 256)?;
+    this.set_property(scope, c"scheduling", "lifo")?;
     this.set_property(scope, c"maxTotalSockets", f64::INFINITY)?;
     this.set_property(scope, c"totalSocketCount", 0)?;
-    for name in [c"sockets", c"freeSockets", c"requests"] {
-        this.set_property(scope, name, super::outgoing::null_object(scope)?)?;
-    }
+    this.set_property(scope, c"agentKeepAliveTimeoutBuffer", 1000)?;
     Ok(())
 }
 
@@ -916,8 +904,9 @@ pub mod agent_class {
     use super::*;
 
     /// <https://nodejs.org/api/http.html#class-httpagent>: the options are kept, and have no
-    /// effect.
-    #[constructor]
+    /// effect besides `keepAlive`, which keeps the sockets of finished requests in
+    /// `freeSockets`.
+    #[constructor(length = 1)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -952,8 +941,8 @@ pub mod https_agent_class {
     use super::*;
 
     /// <https://nodejs.org/api/https.html#class-httpsagent>: the options are kept, and have no
-    /// effect.
-    #[constructor]
+    /// effect besides `keepAlive`.
+    #[constructor(length = 1)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,

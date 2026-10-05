@@ -430,6 +430,7 @@ pub mod path {
     }
 
     /// <https://nodejs.org/api/path.html#pathbasenamepath-suffix>
+    #[function(length = 2)]
     pub fn basename(
         scope: &Scope<'_>,
         path: HandleValue<'_>,

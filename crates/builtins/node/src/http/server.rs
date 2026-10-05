@@ -9,24 +9,51 @@
 //!
 //! Otherwise `listen()` adds a `fetch` event listener, and records the server with its port. Each
 //! `fetch` event goes to the listening server whose port is the request URL's, or else to the
-//! server that listened first, as a `request` event with an `IncomingMessage` for the web
-//! `Request` and a `ServerResponse` whose web `Response` is the event's response. When the
-//! runtime runs a script as a command without `--node-http-listen`, nothing serves requests, so
-//! `listen()` emits an `ERR_SERVE_MODE_REQUIRED` error. In a component without a
-//! `wasi:http/handler` export, `listen()` throws that error.
+//! server that listened first, as a `request` event with an `IncomingMessage` that reads the
+//! event's request and a `ServerResponse` that responds to the event with a web `Response` it
+//! builds natively. When the runtime runs a script as a command without `--node-http-listen`,
+//! nothing serves requests, so `listen()` emits an `ERR_SERVE_MODE_REQUIRED` error. In a
+//! component without a `wasi:http/handler` export, `listen()` throws that error.
 
-use js::conversion::{FromJSVal, ToJSVal};
+use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
-use super::incoming::{incoming_message_class, set_headers};
-use super::outgoing::server_response_class;
+use super::incoming::{new_message, MessageHead};
+use super::outgoing::{Served, Transport};
 use crate::errors::{validate_integer, validate_plain_object, ErrorKind, NodeError, Thrown};
-use crate::stream::{call_method, is_function, next_tick_call, string, Props};
+use crate::net::server::{ServerState, ServerStateImpl};
+use crate::support::emit_later;
+
+/// The state of an `http.Server`: the state of the `net.Server`, and the connections, timer and
+/// options of the server.
+#[core_runtime::jsclass(hidden, extends = ServerState)]
+pub(crate) struct HttpServerState {
+    parent: ServerStateImpl,
+    /// The connections of a server that accepts them itself, as `ConnectionState`s.
+    pub(super) connections: Vec<Heap<js::object::Object>>,
+    /// The ID of the timer that checks the connections for timed-out requests.
+    #[no_trace]
+    pub(super) check_timer: Option<u64>,
+    /// Whether `close` was called on a server that accepts connections itself.
+    #[no_trace]
+    pub(super) closing: bool,
+    /// The port a server that serves the runtime's requests listens on.
+    #[no_trace]
+    port: Option<u16>,
+    /// The class of the requests, from the `IncomingMessage` option.
+    pub(super) incoming_class: Option<Heap<js::object::Object>>,
+    /// The class of the responses, from the `ServerResponse` option.
+    pub(super) response_class: Option<Heap<js::object::Object>>,
+}
+
+#[core_runtime::jsmethods]
+impl HttpServerState {}
 
 /// The key of the shared array of listening servers.
 static SERVERS_KEY: u8 = 0;
@@ -38,10 +65,14 @@ pub(super) fn listens_itself() -> bool {
 }
 
 /// The listening servers of the current global, in the order they started listening.
-fn servers<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    js::class::get_or_init_shared_object(scope, &SERVERS_KEY as *const u8 as usize, |scope| {
-        Ok(*js::Array::new(scope, 0)?)
-    })
+fn servers<'s>(scope: &'s Scope<'_>) -> Result<js::Array<'s>, ExnThrown> {
+    let servers =
+        js::class::get_or_init_shared_object(scope, &SERVERS_KEY as *const u8 as usize, |scope| {
+            Ok(*js::Array::new(scope, 0)?)
+        })?;
+    servers
+        .cast::<js::Array>()
+        .map_err(|_| js::error::TypeError("unexpected object".into()).throw(scope))
 }
 
 /// The listening server that serves a request to `port`.
@@ -49,52 +80,21 @@ fn server_for<'s>(
     scope: &'s Scope<'_>,
     port: Option<u16>,
 ) -> Result<Option<Object<'s>>, ExnThrown> {
-    let servers = servers(scope)?;
-    let length = servers
-        .cast::<js::Array>()
-        .map_err(|_| js::error::TypeError("unexpected object".into()).throw(scope))?
-        .length(scope)?;
     let mut first = None;
-    for index in 0..length {
-        let server = servers.get_element(scope, index)?;
+    for server in servers(scope)?.to_vec(scope)? {
         let Ok(server) = Object::from_value(scope, server) else {
             continue;
         };
         if first.is_none() {
             first = Some(server);
         }
-        let listened = server.num(scope, c"_starlingPort")?;
-        if port.is_some_and(|port| f64::from(port) == listened) {
+        let listened =
+            server_class::try_state_of(scope, server)?.and_then(|state| state.data().port);
+        if port.is_some() && listened == port {
             return Ok(Some(server));
         }
     }
     Ok(first)
-}
-
-/// The socket a served request reports, with the request's local port, whether it was encrypted,
-/// and the client's address, port and family where the transport reports them, which `wasi:http`
-/// doesn't.
-fn socket<'s>(
-    scope: &'s Scope<'_>,
-    event: Object<'_>,
-    port: Option<u16>,
-    encrypted: bool,
-) -> Result<HandleValue<'s>, ExnThrown> {
-    let client_address = event
-        .cast::<fetch_event::fetch_event::FetchEvent>()
-        .ok()
-        .and_then(|event| event.client_address());
-    let remote = client_address.map(|client| {
-        let family = if client.is_ipv4() { "IPv4" } else { "IPv6" };
-        (client.ip().to_string(), client.port(), family)
-    });
-    let connection = super::host_socket::HostConnection {
-        remote,
-        local_port: port,
-        encrypted,
-        owner: None,
-    };
-    super::host_socket::new_host_socket(scope, connection)?.to_jsval_throwing(scope)
 }
 
 /// The authority of `url`: its host, followed by its port if it has one.
@@ -106,26 +106,38 @@ fn authority(url: &url::Url) -> Option<String> {
     })
 }
 
-/// The event `server` would emit with the request's socket for `request`, if it has listeners
-/// for it: `connect` for a `CONNECT` request, and `upgrade` for a request with an `Upgrade`
-/// header.
+/// The event `server` would emit with the request's socket for a request with `method` and the
+/// header list `headers`, if it has listeners for it: `connect` for a `CONNECT` request, and
+/// `upgrade` for a request with an `Upgrade` header.
 fn socket_event(
     scope: &Scope<'_>,
     server: Object<'_>,
-    request: Object<'_>,
-) -> Result<Option<&'static str>, ExnThrown> {
-    let method = String::from_jsval(scope, request.val(scope, c"method")?, ()).unwrap_or_default();
-    let headers = request.obj(scope, c"headers")?.ok_or(ExnThrown)?;
-    let upgrade = call_method(scope, headers, c"has", &[string(scope, "upgrade")?])?;
+    method: &str,
+    headers: &[(String, String)],
+) -> Result<Option<&'static std::ffi::CStr>, ExnThrown> {
     let name = if method.eq_ignore_ascii_case("CONNECT") {
-        "connect"
-    } else if upgrade.is_boolean() && upgrade.to_boolean() {
-        "upgrade"
+        c"connect"
+    } else if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("upgrade"))
+    {
+        c"upgrade"
     } else {
         return Ok(None);
     };
-    let count = call_method(scope, server, c"listenerCount", &[string(scope, name)?])?;
-    Ok((count.is_number() && count.to_number() > 0.0).then_some(name))
+    let count =
+        crate::events::listener_count(scope, server, js::class::get_or_init_atom(scope, name)?)?;
+    Ok((count > 0.0).then_some(name))
+}
+
+/// Respond to `event` with `response`.
+fn respond_with(
+    scope: &Scope<'_>,
+    event: Object<'_>,
+    response: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    Function::call_by_name(scope, event.handle(), c"respondWith", &[response])?;
+    Ok(())
 }
 
 /// Respond to `event` with a 501, since served requests have no socket to emit `event_name`
@@ -133,24 +145,34 @@ fn socket_event(
 fn respond_not_implemented(
     scope: &Scope<'_>,
     event: Object<'_>,
-    event_name: &str,
-) -> Result<Value, ExnThrown> {
-    let class = scope.global().obj(scope, c"Response")?.ok_or(ExnThrown)?;
-    let init = Object::new_plain(scope)?;
-    init.set_property(scope, c"status", 501)?;
-    let body = format!("Served requests have no socket for a '{event_name}' listener");
-    let response = Function::construct(
+    event_name: &std::ffi::CStr,
+) -> Result<(), ExnThrown> {
+    let body = format!(
+        "Served requests have no socket for a '{}' listener",
+        event_name.to_string_lossy()
+    );
+    let length = body.len() as u64;
+    let record = web_fetch::response::ResponseRecord {
+        status: 501,
+        ..Default::default()
+    };
+    let body = web_fetch::algorithms::Body {
+        source: web_fetch::algorithms::BodySource::Bytes(bytes::Bytes::from(body.into_bytes())),
+        length: Some(length),
+        source_disturbed: false,
+    };
+    let response = web_fetch::algorithms::create_a_response_object(
         scope,
-        class,
-        &[string(scope, &body)?, init.to_jsval_throwing(scope)?],
+        record,
+        vec![(
+            "content-type".to_string(),
+            "text/plain;charset=UTF-8".to_string(),
+        )],
+        web_fetch::headers::Guard::Immutable,
+        Some(body),
+        None,
     )?;
-    call_method(
-        scope,
-        event,
-        c"respondWith",
-        &[response.to_jsval_throwing(scope)?],
-    )?;
-    Ok(js::value::undefined())
+    respond_with(scope, event, response.to_jsval_throwing(scope)?)
 }
 
 /// The `fetch` event listener: respond to the event through the listening server for its request.
@@ -160,91 +182,84 @@ fn on_fetch(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let event = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
-    let request = event.obj(scope, c"request")?.ok_or(ExnThrown)?;
-    let href = String::from_jsval(scope, request.val(scope, c"url")?, ()).unwrap_or_default();
-    let url = url::Url::parse(&href).ok();
-    let port = url.as_ref().and_then(|url| url.port_or_known_default());
+    let fetch_event = event
+        .cast::<fetch_event::fetch_event::FetchEvent>()
+        .map_err(|_| js::error::TypeError("not a FetchEvent".into()).throw(scope))?;
+    let request = fetch_event.request(scope);
+    let url = request.current_url();
+    let method = request.method().to_string();
+    let port = url.port_or_known_default();
     let Some(server) = server_for(scope, port)? else {
         return Ok(js::value::undefined());
     };
-
-    if let Some(event_name) = socket_event(scope, server, request)? {
-        return respond_not_implemented(scope, event, event_name);
+    let mut headers = request.headers(scope).list();
+    if let Some(name) = socket_event(scope, server, &method, &headers)? {
+        respond_not_implemented(scope, event, name)?;
+        return Ok(js::value::undefined());
     }
 
-    let encrypted = url.as_ref().is_some_and(|url| url.scheme() == "https");
-    let req = Function::construct(
-        scope,
-        incoming_message_class::class_constructor(scope)?,
-        &[socket(scope, event, port, encrypted)?],
-    )?;
-    req.set_property(scope, c"method", request.val(scope, c"method")?)?;
-    let path = url.as_ref().map_or_else(
-        || "/".to_string(),
-        |url| match url.query() {
-            Some(query) => format!("{}?{query}", url.path()),
-            None => url.path().to_string(),
-        },
-    );
-    req.set_property(scope, c"url", path.as_str())?;
-    let headers = request.obj(scope, c"headers")?.ok_or(ExnThrown)?;
-    let mut list = headers
-        .cast::<web_fetch::headers::Headers>()
-        .map(|headers| headers.list())
-        .unwrap_or_default();
+    let connection = super::host_socket::HostConnection {
+        remote: fetch_event.client_address(),
+        local_port: port,
+        encrypted: url.scheme() == "https",
+        owner: None,
+    };
+    let socket = super::host_socket::new_host_socket(scope, connection)?;
+    let path = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
     // A `wasi:http` host passes the host as the request's authority rather than as a header.
-    if !list
+    if !headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("host"))
     {
-        if let Some(authority) = url.as_ref().and_then(authority) {
-            list.insert(0, ("host".to_string(), authority));
+        if let Some(authority) = authority(&url) {
+            headers.insert(0, ("host".to_string(), authority));
         }
     }
-    set_headers(scope, req, &list)?;
-    if let Some(body) = request.obj(scope, c"body")? {
-        let reader = call_method(scope, body, c"getReader", &[])?;
-        req.define_property(scope, c"_starlingReader", reader, 0)?;
+    let head = MessageHead {
+        version: Some((1, 1)),
+        method: Some(&method),
+        url: Some(&path),
+        headers: Some(headers),
+        ..MessageHead::default()
+    };
+    let req = new_message(scope, socket.to_jsval_throwing(scope)?, head)?;
+    if let Some(body) = request.take_incoming_body() {
+        super::incoming::set_host_source(scope, req, body, None)?;
+    } else if let Some(stream) = request.body(scope)? {
+        super::incoming::set_web_source(scope, req, stream)?;
     }
 
+    let res = super::outgoing::new_response(
+        scope,
+        req,
+        None,
+        crate::stream::state::default_high_water_mark(false),
+        false,
+    )?;
     let req_value = req.to_jsval_throwing(scope)?;
-    let res = Function::construct(
-        scope,
-        server_response_class::class_constructor(scope)?,
-        &[req_value],
-    )?;
-    res.set_property(scope, c"_starlingWire", false)?;
-    let req_socket = req.val(scope, c"socket")?;
-    res.set_property(scope, c"socket", req_socket)?;
-    res.set_property(scope, c"connection", req_socket)?;
     let promise = js::Promise::new_pending(scope)?;
-    res.define_property(scope, c"_starlingRespond", *promise, 0)?;
-    call_method(
-        scope,
-        event,
-        c"respondWith",
-        &[promise.to_jsval_throwing(scope)?],
-    )?;
-    let emitted = call_method(
+    {
+        let state = super::outgoing::state_of(scope, res)?;
+        let mut data = state.data_mut();
+        data.socket = Some(Heap::from(socket));
+        data.transport = Transport::Served(Served::new(promise));
+    }
+    super::host_socket::set_owner(scope, socket, Some(res))?;
+    respond_with(scope, event, promise.to_jsval_throwing(scope)?)?;
+    let emitted = crate::events::emit(
         scope,
         server,
-        c"emit",
-        &[
-            string(scope, "request")?,
-            req_value,
-            res.to_jsval_throwing(scope)?,
-        ],
+        c"request",
+        &[req_value, res.to_jsval_throwing(scope)?],
     );
     if emitted.is_err() {
         // We reject the response so the request doesn't wait for a response forever, and leave
         // the listener's exception pending.
-        let error = crate::stream::take_exception(scope);
-        if let Some(respond) = res.obj(scope, c"_starlingRespond")? {
-            if let Ok(respond) = respond.cast::<js::Promise>() {
-                res.set_property(scope, c"_starlingRespond", true)?;
-                respond.reject(scope, error)?;
-            }
-        }
+        let error = js::exception::take_pending_or_undefined(scope);
+        super::outgoing::reject_served(scope, res, error)?;
         js::exception::set_pending(
             scope,
             error,
@@ -253,38 +268,6 @@ fn on_fetch(
         return Err(ExnThrown);
     }
     Ok(js::value::undefined())
-}
-
-/// Emit the event and arguments `args` on `emitter` in a microtask.
-pub(super) fn emit_later(
-    scope: &Scope<'_>,
-    emitter: Object<'_>,
-    args: &[HandleValue<'_>],
-) -> Result<(), ExnThrown> {
-    let emit = emitter.obj(scope, c"emit")?.ok_or(ExnThrown)?;
-    let bound = call_method(scope, emit, c"bind", &[emitter.to_jsval_throwing(scope)?])?;
-    next_tick_call(scope, bound, args)
-}
-
-/// Call the `net.Server` method `name` on `server` with `args`.
-fn call_net<'s>(
-    scope: &'s Scope<'_>,
-    server: Object<'_>,
-    name: &'static std::ffi::CStr,
-    args: &[HandleValue<'_>],
-) -> Result<HandleValue<'s>, ExnThrown> {
-    let class = crate::net::server::server_class::class_constructor(scope)?;
-    let proto = class.obj(scope, c"prototype")?.ok_or(ExnThrown)?;
-    let method = proto.val(scope, name)?;
-    crate::stream::call(scope, server.to_jsval_throwing(scope)?, method, args)
-}
-
-/// `validateBoolean(value, name)`.
-fn validate_boolean(scope: &Scope<'_>, value: HandleValue<'_>, name: &str) -> Result<(), Thrown> {
-    if !value.is_boolean() {
-        return Err(NodeError::invalid_arg_type(scope, name, "of type boolean", value).into());
-    }
-    Ok(())
 }
 
 /// `Number.MAX_SAFE_INTEGER`.
@@ -312,26 +295,33 @@ fn option<'s>(
     name: &'static std::ffi::CStr,
 ) -> Result<HandleValue<'s>, ExnThrown> {
     match options {
-        Some(options) => options.val(scope, name),
-        None => Ok(scope.root_value(js::value::undefined())),
+        Some(options) => options.get_property(scope, name),
+        None => Ok(HandleValue::undefined()),
     }
 }
 
 /// Validate the HTTP options `options` and store them on `server`, as Node.js's
-/// `storeHTTPOptions` does.
+/// `storeHTTPOptions` does. The `IncomingMessage` and `ServerResponse` classes are kept in the
+/// server's state.
 fn store_options(
     scope: &Scope<'_>,
     server: Object<'_>,
     options: Option<Object<'_>>,
 ) -> Result<(), Thrown> {
-    for (name, hidden) in [
-        (c"IncomingMessage", c"_starlingIncomingMessage"),
-        (c"ServerResponse", c"_starlingServerResponse"),
-    ] {
-        let class = option(scope, options, name)?;
-        if crate::stream::truthy(scope, class) {
-            server.define_property(scope, hidden, class, 0)?;
-        }
+    let classes = [c"IncomingMessage", c"ServerResponse"].map(|name| {
+        option(scope, options, name).map(|class| {
+            Object::from_value(scope, *class)
+                .ok()
+                .filter(|_| js::conversion::to_boolean(class))
+        })
+    });
+    let [incoming_class, response_class] = classes;
+    let (incoming_class, response_class) = (incoming_class?, response_class?);
+    {
+        let state = server_class::state_of(scope, server)?;
+        let mut data = state.data_mut();
+        data.incoming_class = incoming_class.map(Heap::from);
+        data.response_class = response_class.map(Heap::from);
     }
     let max_header_size = option(scope, options, c"maxHeaderSize")?;
     if !max_header_size.is_undefined() {
@@ -346,16 +336,16 @@ fn store_options(
     server.set_property(scope, c"maxHeaderSize", max_header_size)?;
     let optimize = option(scope, options, c"optimizeEmptyRequests")?;
     if !optimize.is_undefined() {
-        validate_boolean(scope, optimize, "options.optimizeEmptyRequests")?;
+        crate::errors::validate_boolean(scope, optimize, "options.optimizeEmptyRequests")?;
     }
     let insecure = option(scope, options, c"insecureHTTPParser")?;
     if !insecure.is_undefined() {
-        validate_boolean(scope, insecure, "options.insecureHTTPParser")?;
+        crate::errors::validate_boolean(scope, insecure, "options.insecureHTTPParser")?;
     }
     server.set_property(scope, c"insecureHTTPParser", insecure)?;
     let validation = option(scope, options, c"httpValidation")?;
     if !validation.is_undefined() {
-        let text = crate::stream::rust_string(scope, validation);
+        let text = crate::support::rust_string(scope, validation);
         if !matches!(text.as_deref(), Some("strict" | "relaxed" | "insecure")) {
             return Err(NodeError::invalid_arg_value(
                 scope,
@@ -423,12 +413,12 @@ fn store_options(
     ] {
         let value = option(scope, options, name)?;
         if !value.is_undefined() {
-            validate_boolean(scope, value, label)?;
+            crate::errors::validate_boolean(scope, value, label)?;
             server.set_property(scope, name, value)?;
         } else {
             match default {
                 Some(default) => server.set_property(scope, name, default)?,
-                None => server.set_property(scope, name, js::value::undefined())?,
+                None => server.set_property(scope, name, HandleValue::undefined())?,
             }
         }
     }
@@ -437,28 +427,18 @@ fn store_options(
         crate::errors::validate_function(scope, callback, "options.shouldUpgradeCallback")?;
         server.set_property(scope, c"shouldUpgradeCallback", callback)?;
     } else {
-        let default = shared_function(scope, super::connection::default_should_upgrade, 1)?;
+        let default =
+            crate::support::shared_function(scope, super::connection::default_should_upgrade, 1)?;
         server.set_property(scope, c"shouldUpgradeCallback", default)?;
     }
     Ok(())
 }
 
-/// The shared function of the current global for `body`.
-fn shared_function<'s>(
-    scope: &'s Scope<'_>,
-    body: js::function::Callback,
-    nargs: u32,
-) -> Result<Object<'s>, ExnThrown> {
-    let function =
-        js::class::get_or_init_shared_function(scope, body as *const () as usize, |scope| {
-            Function::new_callback(scope, c"", nargs, body, ())
-        })?;
-    Ok(*function)
-}
-
 #[core_runtime::jsfunction_class(
     name = "Server",
     extends = "crate::net::server::server_class",
+    state = "HttpServerState",
+    invalid_this = "crate::errors::invalid_this",
     self_construct
 )]
 pub mod server_class {
@@ -471,7 +451,7 @@ pub mod server_class {
     /// `requireHostHeader`, `joinDuplicateHeaders`, `rejectNonStandardBodyWrites` and
     /// `shouldUpgradeCallback` apply to the connections a server accepts itself, and the others
     /// have no effect.
-    #[constructor]
+    #[constructor(length = 2)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -479,8 +459,8 @@ pub mod server_class {
         listener: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
         let (options, listener) = match options {
-            Some(options) if is_function(scope, options) => (None, Some(options)),
-            Some(options) if options.is_null() || options.is_undefined() => (None, listener),
+            Some(options) if js::function::is_callable(options) => (None, Some(options)),
+            Some(options) if options.is_null_or_undefined() => (None, listener),
             Some(options) => (
                 Some(validate_plain_object(scope, options, "options", false)?),
                 listener,
@@ -491,7 +471,7 @@ pub mod server_class {
         let net_options = Object::new_plain(scope)?;
         net_options.set_property(scope, c"allowHalfOpen", true)?;
         let no_delay = option(scope, options, c"noDelay")?;
-        if no_delay.is_null() || no_delay.is_undefined() {
+        if no_delay.is_null_or_undefined() {
             net_options.set_property(scope, c"noDelay", true)?;
         } else {
             net_options.set_property(scope, c"noDelay", no_delay)?;
@@ -505,30 +485,18 @@ pub mod server_class {
             Some(net_options.to_jsval_throwing(scope)?),
             None,
         )?;
-        if let Some(listener) = listener.filter(|listener| is_function(scope, *listener)) {
-            call_method(scope, this, c"on", &[string(scope, "request")?, listener])?;
+        if let Some(listener) = listener.filter(|listener| js::function::is_callable(*listener)) {
+            let listener =
+                Object::from_value(scope, *listener).map_err(|e| Thrown::from(e.throw(scope)))?;
+            crate::events::listen(scope, this, c"on", c"request", listener)?;
         }
         this.set_property(scope, c"httpAllowHalfOpen", false)?;
-        let on_connection = shared_function(scope, super::super::connection::on_connection, 1)?;
-        call_method(
-            scope,
-            this,
-            c"on",
-            &[
-                string(scope, "connection")?,
-                on_connection.to_jsval_throwing(scope)?,
-            ],
-        )?;
-        let on_listening = shared_function(scope, super::super::connection::on_listening, 0)?;
-        call_method(
-            scope,
-            this,
-            c"on",
-            &[
-                string(scope, "listening")?,
-                on_listening.to_jsval_throwing(scope)?,
-            ],
-        )?;
+        let on_connection =
+            crate::support::shared_function(scope, super::super::connection::on_connection, 1)?;
+        crate::events::listen(scope, this, c"on", c"connection", on_connection)?;
+        let on_listening =
+            crate::support::shared_function(scope, super::super::connection::on_listening, 0)?;
+        crate::events::listen(scope, this, c"on", c"listening", on_listening)?;
         this.set_property(scope, c"timeout", 0)?;
         this.set_property(scope, c"maxHeadersCount", js::value::null())?;
         this.set_property(scope, c"maxRequestsPerSocket", 0)?;
@@ -543,13 +511,12 @@ pub mod server_class {
         this: Object<'s>,
         args: RestArgs<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
-        let args: Vec<HandleValue<'_>> =
-            args.iter().map(|arg| scope.root_value(arg.get())).collect();
+        let state = state_of(scope, this)?;
         if super::listens_itself() {
-            this.set_property(scope, c"_starlingClosing", false)?;
-            call_net(scope, this, c"listen", &args)?;
-            return Ok(this);
+            state.data_mut().closing = false;
+            return crate::net::server::server_class::listen(scope, this, args);
         }
+        let args: Vec<HandleValue<'_>> = args.iter().copied().collect();
         let (port, _, callback) = crate::net::listen_args(scope, &args)?;
         if core_runtime::event_loop::without_request_handler() {
             return Err(NodeError::new(
@@ -560,48 +527,40 @@ pub mod server_class {
             .into());
         }
         if core_runtime::event_loop::running_as_command() {
-            let error = crate::stream::error_value(
-                scope,
-                NodeError::new(
+            let error = NodeError::new(
                     ErrorKind::Error,
                     "ERR_SERVE_MODE_REQUIRED",
                     "Serving HTTP requests needs serve mode: run the script with --serve <port>, or serve the component with a wasi:http host, or pass --node-http-listen",
-                ),
-            )?;
-            emit_later(scope, this, &[string(scope, "error")?, error])?;
+                ).to_value(scope)?;
+            emit_later(scope, this, c"error", &[error])?;
             return Ok(this);
         }
-        this.set_property(scope, c"_starlingPort", f64::from(port))?;
-        if !this.flag(scope, c"listening")? {
-            call_method(
-                scope,
-                servers(scope)?,
-                c"push",
-                &[this.to_jsval_throwing(scope)?],
-            )?;
+        let listening = {
+            let mut data = state.data_mut();
+            data.port = Some(port);
+            std::mem::replace(&mut data.parent.listening, true)
+        };
+        if !listening {
+            servers(scope)?.push(scope, this)?;
         }
-        this.set_property(scope, c"listening", true)?;
-        let listener = js::class::get_or_init_shared_function(
-            scope,
-            on_fetch as *const () as usize,
-            |scope| Function::new_callback(scope, c"", 1, on_fetch, ()),
-        )?;
-        let add = scope.global().val(scope, c"addEventListener")?;
-        js::Function::call(
-            scope,
-            js::value::undefined(),
-            add,
-            &[string(scope, "fetch")?, listener.to_jsval_throwing(scope)?],
-        )?;
+        this.set_property(scope, c"_handle", Object::new_plain(scope)?)?;
+        let listener = crate::support::shared_function(scope, on_fetch, 1)?;
+        scope
+            .global()
+            .cast::<web_globals::events::EventTarget>()
+            .expect("the global is an event target")
+            .add_event_listener(
+                scope,
+                "fetch".to_string(),
+                listener.to_jsval_throwing(scope)?,
+                None,
+            )?;
         if let Some(callback) = callback {
-            call_method(
-                scope,
-                this,
-                c"once",
-                &[string(scope, "listening")?, callback],
-            )?;
+            let callback =
+                Object::from_value(scope, *callback).map_err(|e| Thrown::from(e.throw(scope)))?;
+            crate::events::listen(scope, this, c"once", c"listening", callback)?;
         }
-        emit_later(scope, this, &[string(scope, "listening")?])?;
+        emit_later(scope, this, c"listening", &[])?;
         Ok(this)
     }
 
@@ -615,35 +574,22 @@ pub mod server_class {
         this: Object<'s>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, ExnThrown> {
+        let state = state_of(scope, this)?;
         if super::listens_itself() {
             super::super::connection::close_connections(scope, this, true)?;
             super::super::connection::stop_checking(scope, this)?;
-            this.set_property(scope, c"_starlingClosing", true)?;
-            let callback = callback.unwrap_or_else(|| scope.root_value(js::value::undefined()));
-            call_net(scope, this, c"close", &[callback])?;
-            return Ok(this);
+            state.data_mut().closing = true;
+            return crate::net::server::server_class::close(scope, this, callback);
         }
         let servers = servers(scope)?;
-        let index = call_method(
-            scope,
-            servers,
-            c"indexOf",
-            &[this.to_jsval_throwing(scope)?],
-        )?
-        .to_number();
-        if index >= 0.0 {
-            let one = scope.root_value(js::value::from_f64(1.0));
-            call_method(
-                scope,
-                servers,
-                c"splice",
-                &[scope.root_value(js::value::from_f64(index)), one],
-            )?;
+        let index = servers.index_of(scope, this.to_jsval_throwing(scope)?)?;
+        if let Some(index) = index {
+            servers.remove(scope, index, 1)?;
         }
-        let was_listening = this.flag(scope, c"listening")?;
-        this.set_property(scope, c"listening", false)?;
+        let was_listening = std::mem::replace(&mut state.data_mut().parent.listening, false);
+        this.set_property(scope, c"_handle", js::value::null())?;
         crate::net::on_close(scope, this, callback, was_listening)?;
-        emit_later(scope, this, &[string(scope, "close")?])?;
+        emit_later(scope, this, c"close", &[])?;
         Ok(this)
     }
 
@@ -652,34 +598,40 @@ pub mod server_class {
     /// before `listen`.
     pub fn address<'s>(
         scope: &'s Scope<'_>,
-        this: Object<'_>,
+        this: Object<'s>,
     ) -> Result<HandleValue<'s>, ExnThrown> {
         if super::listens_itself() {
-            return call_net(scope, this, c"address", &[]);
+            return crate::net::server::server_class::address(scope, this);
         }
-        if !this.flag(scope, c"listening")? {
-            return Ok(scope.root_value(js::value::null()));
-        }
+        let port = {
+            let state = state_of(scope, this)?;
+            let data = state.data();
+            data.port.filter(|_| data.parent.listening)
+        };
+        let Some(port) = port else {
+            return Ok(HandleValue::null());
+        };
         let address = Object::new_plain(scope)?;
         address.set_property(scope, c"address", "::")?;
         address.set_property(scope, c"family", "IPv6")?;
-        address.set_property(scope, c"port", this.val(scope, c"_starlingPort")?)?;
+        address.set_property(scope, c"port", f64::from(port))?;
         address.to_jsval_throwing(scope)
     }
 
     /// <https://nodejs.org/api/http.html#serversettimeoutmsecs-callback>: the idle timeout of
     /// the connections the server accepts from now on. `callback` becomes a `timeout` listener.
+    #[method(length = 2)]
     pub fn set_timeout<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
         msecs: Option<HandleValue<'_>>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, ExnThrown> {
-        let msecs = msecs.unwrap_or_else(|| scope.root_value(js::value::undefined()));
+        let msecs = msecs.unwrap_or(HandleValue::undefined());
         this.set_property(scope, c"timeout", msecs)?;
-        if let Some(callback) = callback.filter(|callback| crate::stream::truthy(scope, *callback))
-        {
-            call_method(scope, this, c"on", &[string(scope, "timeout")?, callback])?;
+        if let Some(callback) = callback.filter(|callback| js::conversion::to_boolean(*callback)) {
+            let callback = Object::from_value(scope, *callback).map_err(|e| e.throw(scope))?;
+            crate::events::listen(scope, this, c"on", c"timeout", callback)?;
         }
         Ok(this)
     }

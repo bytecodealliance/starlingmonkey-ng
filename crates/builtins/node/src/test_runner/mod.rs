@@ -2,8 +2,9 @@
 
 //! `node:test`: <https://nodejs.org/api/test.html>.
 //!
-//! Tests, suites and hooks are records: plain objects holding their state. Tests run one at a time
-//! in the order they were started, whatever their `concurrency` option. Tests registered at the top
+//! Tests, suites and hooks are [`TestRecord`]s holding their state in Rust, and the realm's
+//! [`Harness`] holds the root record and the counts of the run. Tests run one at a time in the
+//! order they were started, whatever their `concurrency` option. Tests registered at the top
 //! level start in a later job than the one that registered them, once the functions of the suites
 //! registered by then have finished. The functions of tests, suites and hooks run with their record
 //! in the async context, so a test registered while one of them runs, including after an `await`,
@@ -17,19 +18,23 @@
 mod mock;
 mod report;
 
+use std::collections::VecDeque;
+
 use js::async_context::Snapshot;
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
+use web_globals::events::algorithms::ScriptStackState;
+use web_globals::signals::abort_controller::{AbortController, AbortControllerImpl};
+
 use crate::errors::{ErrorKind, NodeError, Thrown};
-use crate::stream::{as_object, call_method, closure, is_function, is_str, rust_string, string};
-use crate::stream::{take_exception, truthy};
-use crate::stream::{Captures, Props};
+use crate::support::rust_string;
 
 /// The record kinds.
 const ROOT: u8 = 0;
@@ -42,7 +47,7 @@ const HOOK: u8 = 3;
 mod phase {
     /// A test or suite starts.
     pub const START: u8 = 0;
-    /// The next hook in the record's `hookQueue` runs. Once there are none left, the record's
+    /// The next hook in the record's hook queue runs. Once there are none left, the record's
     /// `next` phase follows.
     pub const HOOKS: u8 = 1;
     /// The function of a test or hook is called.
@@ -61,6 +66,8 @@ mod phase {
     pub const POST: u8 = 8;
     /// The root's `after` hooks finished.
     pub const ROOT_DONE: u8 = 9;
+    /// The hooks of a test or suite its parent cancelled finished.
+    pub const CANCELLED: u8 = 10;
 }
 
 /// The longest timeout, in milliseconds.
@@ -97,54 +104,258 @@ enum Outcome<'s> {
     Timeout,
 }
 
-/// The key of the realm's harness object.
-static HARNESS_KEY: u8 = 0;
+/// The types of hooks.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum HookType {
+    #[default]
+    Before,
+    After,
+    BeforeEach,
+    AfterEach,
+}
 
-/// The realm's harness: the object holding the root record, under `root` once a test or hook was
-/// registered, the counts of finished tests, and the runner's other per-realm state.
-fn harness<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    js::class::get_or_init_shared_object(scope, &HARNESS_KEY as *const u8 as usize, |scope| {
-        let harness = Object::new_plain(scope)?;
-        harness.set_property(scope, c"frameKey", Object::new_plain(scope)?)?;
-        harness.set_property(scope, c"contexts", *js::WeakMap::new(scope)?)?;
-        harness.set_property(scope, c"builds", *js::Array::new(scope, 0)?)?;
-        harness.set_property(scope, c"failures", *js::Array::new(scope, 0)?)?;
-        for counter in report::COUNTERS {
-            harness.set_property(scope, counter, 0)?;
+impl HookType {
+    /// The hook type a hook function of `node:test` registers, by its name.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "before" => Some(HookType::Before),
+            "after" => Some(HookType::After),
+            "beforeEach" => Some(HookType::BeforeEach),
+            "afterEach" => Some(HookType::AfterEach),
+            _ => None,
         }
-        harness.set_property(scope, c"success", true)?;
-        harness.set_property(scope, c"building", true)?;
-        Ok(harness)
-    })
+    }
+
+    /// The name of the hook type.
+    fn name(self) -> &'static str {
+        match self {
+            HookType::Before => "before",
+            HookType::After => "after",
+            HookType::BeforeEach => "beforeEach",
+            HookType::AfterEach => "afterEach",
+        }
+    }
+}
+
+/// A hook a record runs, with the context it receives.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+struct QueuedHook {
+    hook: Heap<TestRecordImpl>,
+    ctx: Heap<Value>,
+}
+
+/// A test, a suite, a hook, or the root of the realm's tests.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct TestRecord {
+    #[no_trace]
+    kind: u8,
+    #[no_trace]
+    name: String,
+    /// The depth below the root, which indents the record's report.
+    #[no_trace]
+    nesting: u32,
+    parent: Option<Heap<TestRecordImpl>>,
+    subtests: Vec<Heap<TestRecordImpl>>,
+    /// The started subtests waiting to run.
+    queue: VecDeque<Heap<TestRecordImpl>>,
+    /// The subtest running.
+    running: Option<Heap<TestRecordImpl>>,
+    diagnostics: Vec<Heap<Value>>,
+    before: Vec<Heap<TestRecordImpl>>,
+    after: Vec<Heap<TestRecordImpl>>,
+    before_each: Vec<Heap<TestRecordImpl>>,
+    after_each: Vec<Heap<TestRecordImpl>>,
+    /// The number of started subtests that haven't finished.
+    #[no_trace]
+    pending: u32,
+    #[no_trace]
+    phase: u8,
+    /// The number of the current await. Settlements of earlier awaits are ignored.
+    #[no_trace]
+    token: u64,
+    #[no_trace]
+    timeout: f64,
+    #[no_trace]
+    deadline: Option<f64>,
+    /// The event loop timer of the deadline.
+    #[no_trace]
+    timer: Option<u64>,
+    /// The promise that settles once the record finished.
+    done: Option<Heap<js::promise::Promise>>,
+    /// The promise that settles once the record's subtests finished.
+    waiting: Option<Heap<js::promise::Promise>>,
+    /// The promise of a suite's function that is building it.
+    build_promise: Option<Heap<js::object::Object>>,
+    callee: Heap<Value>,
+    /// The message of `skip` or `todo`.
+    message: Heap<Value>,
+    error: Heap<Value>,
+    /// The `failureType` of Node.js's `ERR_TEST_FAILURE`.
+    #[no_trace]
+    failure_type: &'static str,
+    /// The `only` option, if it is a boolean.
+    #[no_trace]
+    only: Option<bool>,
+    #[no_trace]
+    plan_option: Option<f64>,
+    #[no_trace]
+    plan: Option<f64>,
+    #[no_trace]
+    plan_actual: f64,
+    ctx: Option<Heap<TestContextImpl>>,
+    suite_ctx: Option<Heap<SuiteContextImpl>>,
+    controller: Option<Heap<AbortControllerImpl>>,
+    mock: Option<Heap<mock::MockTrackerImpl>>,
+    assert: Option<Heap<js::object::Object>>,
+    #[no_trace]
+    start_time: Option<f64>,
+    #[no_trace]
+    end_time: Option<f64>,
+    /// The test or suite a hook belongs to.
+    owner: Option<Heap<TestRecordImpl>>,
+    #[no_trace]
+    hook_type: HookType,
+    /// Whether a hook didn't run (0), runs (1) or ran (2).
+    #[no_trace]
+    hook_state: u8,
+    /// The context a hook's function receives.
+    hook_ctx: Heap<Value>,
+    hook_queue: Vec<QueuedHook>,
+    #[no_trace]
+    hook_index: usize,
+    /// The phase that follows the hook queue.
+    #[no_trace]
+    next: u8,
+    current_hook: Option<Heap<TestRecordImpl>>,
+    #[no_trace]
+    started: bool,
+    #[no_trace]
+    finished: bool,
+    #[no_trace]
+    failed: bool,
+    #[no_trace]
+    cancelled: bool,
+    #[no_trace]
+    skipped: bool,
+    #[no_trace]
+    todo: bool,
+    #[no_trace]
+    expect_failure: bool,
+    #[no_trace]
+    built: bool,
+    #[no_trace]
+    building: bool,
+    #[no_trace]
+    queued: bool,
+    /// Whether the `only` options left the record out.
+    #[no_trace]
+    filtered: bool,
+    #[no_trace]
+    passed: bool,
+    /// Whether the test was skipped before it ran.
+    #[no_trace]
+    was_skipped: bool,
+    /// Whether the record runs its hooks after a failure.
+    #[no_trace]
+    cleanup: bool,
+    #[no_trace]
+    skip_after_each: bool,
+    /// Whether no subtest was pending for the first time.
+    #[no_trace]
+    subtests_settled: bool,
+    #[no_trace]
+    run_only_subtests: bool,
+    #[no_trace]
+    has_only_tests: bool,
+    #[no_trace]
+    after_started: bool,
+    #[no_trace]
+    after_done: bool,
+    /// Whether the line of a test with subtests was written.
+    #[no_trace]
+    announced: bool,
+}
+
+#[core_runtime::jsmethods]
+impl TestRecord {}
+
+/// The realm's state of the test runner.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct Harness {
+    /// The root record, once a test or hook was registered.
+    root: Option<Heap<TestRecordImpl>>,
+    /// The promises of the suites that build.
+    builds: Vec<Heap<js::object::Object>>,
+    /// The failed records the summary lists.
+    failures: Vec<Heap<TestRecordImpl>>,
+    /// The counts of finished tests, in the order of [`report::COUNTER_LABELS`].
+    #[no_trace]
+    counters: [u32; 7],
+    #[no_trace]
+    success: bool,
+    /// Whether the root's subtests haven't started.
+    #[no_trace]
+    building: bool,
+    #[no_trace]
+    begun: bool,
+    #[no_trace]
+    reported: bool,
+    #[no_trace]
+    exiting: bool,
+    /// The number of `beforeExit` events.
+    #[no_trace]
+    exits: u32,
+    /// The functions `t.assert` wraps, by name.
+    assertions: Option<Heap<js::object::Object>>,
+}
+
+#[core_runtime::jsmethods]
+impl Harness {}
+
+/// The marker keying the realm's [`Harness`].
+struct HarnessObject;
+
+/// The realm's harness.
+fn harness<'s>(scope: &'s Scope<'_>) -> Result<Harness<'s>, ExnThrown> {
+    js::class::realm_object::<HarnessObject>(scope)
+        .and_then(|harness| harness.cast::<Harness>().ok())
+        .ok_or_else(|| js::error::TypeError("node:test is not registered".into()).throw(scope))
 }
 
 /// The root record, created on first use with the `process` listeners that write the summary and
 /// handle the uncaught errors of tests.
-fn root<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+fn root<'s>(scope: &'s Scope<'_>) -> Result<TestRecord<'s>, ExnThrown> {
     let harness = harness(scope)?;
-    if let Some(root) = harness.obj(scope, c"root")? {
+    if let Some(root) = harness.data().root.as_ref().map(|root| root.get(scope)) {
         return Ok(root);
     }
-    let root = new_record(scope, ROOT, "<root>", None)?;
-    root.set_property(scope, c"started", true)?;
-    root.set_property(scope, c"startTime", now_ms())?;
-    harness.set_property(scope, c"root", root)?;
-    let process = scope.global().get_property(scope, c"process")?;
-    if let Some(process) = as_object(scope, process) {
+    let root = new_record(scope, ROOT, "<root>".into(), None)?;
+    {
+        let mut data = root.data_mut();
+        data.started = true;
+        data.start_time = Some(now_ms());
+    }
+    harness.data_mut().root = Some(Heap::from(root));
+    let process = crate::process::process_value(scope)?;
+    if let Ok(process) = Object::from_value(scope, process) {
         let listener = Function::new_callback(scope, c"", 0, on_before_exit, ())?;
-        let event = string(scope, "beforeExit")?;
-        call_method(
+        let event = js::class::get_or_init_atom(scope, c"beforeExit")?;
+        Function::call_by_name(
             scope,
-            process,
+            process.handle(),
             c"on",
             &[event, (*listener).to_jsval_throwing(scope)?],
         )?;
-        for name in ["uncaughtException", "unhandledRejection"] {
+        for (name, event) in [
+            ("uncaughtException", c"uncaughtException"),
+            ("unhandledRejection", c"unhandledRejection"),
+        ] {
             let listener = Function::new_callback(scope, c"", 1, on_uncaught, name)?;
-            let event = string(scope, name)?;
-            call_method(
+            let event = js::class::get_or_init_atom(scope, event)?;
+            Function::call_by_name(
                 scope,
-                process,
+                process.handle(),
                 c"on",
                 &[event, (*listener).to_jsval_throwing(scope)?],
             )?;
@@ -163,25 +374,25 @@ fn on_uncaught(
 ) -> Result<Value, ExnThrown> {
     let error = args.get(0);
     let event = String::from_jsval(scope, payload, ()).map_err(|e| e.throw(scope))?;
-    let record = match crate::async_hooks::current_frame(scope) {
-        Some(frame) => {
-            let key = frame_key(scope)?.to_jsval_throwing(scope)?;
-            as_object(scope, frame.lookup(scope, key)?)
-        }
-        None => None,
-    };
+    let record = frame_record(scope)?;
     if let Some(record) = record {
-        let kind = kind_of(scope, record)?;
-        if kind != HOOK && kind != ROOT && !record.flag(scope, c"finished")? {
-            fail(scope, record, error, &event)?;
-            if let Some(controller) = record.obj(scope, c"controller")? {
-                call_method(scope, controller, c"abort", &[] as &[HandleValue])?;
+        let (kind, finished, current) = {
+            let data = record.data();
+            (data.kind, data.finished, data.phase)
+        };
+        if kind != HOOK && kind != ROOT && !finished {
+            fail(scope, record, error, failure_type(&event))?;
+            let controller = record
+                .data()
+                .controller
+                .as_ref()
+                .map(|controller| controller.get(scope));
+            if let Some(controller) = controller {
+                controller.abort(scope, HandleValue::undefined(), ScriptStackState::NonEmpty)?;
             }
-            let current = record.num(scope, c"phase")? as u8;
             if current == phase::SETTLED || current == phase::SUBTESTS {
-                let token = record.num(scope, c"token")?;
-                record.set_property(scope, c"token", token + 1.0)?;
-                clear_timer(scope, record)?;
+                record.data_mut().token += 1;
+                clear_timer(record);
                 advance(scope, record, Outcome::Error(error))?;
             }
             return Ok(js::value::undefined());
@@ -189,13 +400,14 @@ fn on_uncaught(
     }
     let shown = report::display(scope, error);
     let message = match record {
-        Some(record) if kind_of(scope, record)? != ROOT => {
-            let subject = if kind_of(scope, record)? == HOOK {
-                let hook_type = record.get_property(scope, c"hookType")?;
-                format!("Test hook \"{}\"", report::display(scope, hook_type))
-            } else {
-                let name = record.get_property(scope, c"name")?;
-                format!("Test \"{}\"", report::display(scope, name))
+        Some(record) if record.data().kind != ROOT => {
+            let subject = {
+                let data = record.data();
+                if data.kind == HOOK {
+                    format!("Test hook \"{}\"", data.hook_type.name())
+                } else {
+                    format!("Test \"{}\"", data.name)
+                }
             };
             format!(
                 "Error: {subject} generated asynchronous activity after the test ended. This \
@@ -210,73 +422,35 @@ fn on_uncaught(
         ),
     };
     let root = root(scope)?;
-    push(
-        scope,
-        objects_array(scope, root, c"diagnostics")?,
-        message.as_str(),
-    )?;
-    harness(scope)?.set_property(scope, c"success", false)?;
-    let process = scope.global().get_property(scope, c"process")?;
-    if let Some(process) = as_object(scope, process) {
+    let message = js::JSString::from_str(scope, &message)?;
+    root.data_mut()
+        .diagnostics
+        .push(Heap::from(message.as_value()));
+    harness(scope)?.data_mut().success = false;
+    set_failed_exit_code(scope)
+}
+
+/// The failure type of an error the uncaught event `event` reported.
+fn failure_type(event: &str) -> &'static str {
+    if event == "unhandledRejection" {
+        "unhandledRejection"
+    } else {
+        "uncaughtException"
+    }
+}
+
+/// Set `process.exitCode` to 1.
+fn set_failed_exit_code(scope: &Scope<'_>) -> Result<Value, ExnThrown> {
+    let process = crate::process::process_value(scope)?;
+    if let Ok(process) = Object::from_value(scope, process) {
         process.set_property(scope, c"exitCode", 1)?;
     }
     Ok(js::value::undefined())
 }
 
 /// The monotonic clock, in milliseconds.
-fn now_ms() -> f64 {
+pub(crate) fn now_ms() -> f64 {
     platform::clock::monotonic_ns() as f64 / 1e6
-}
-
-/// The `length` of the array `array`.
-fn length(scope: &Scope<'_>, array: Object<'_>) -> Result<u32, ExnThrown> {
-    Ok(array.num(scope, c"length")? as u32)
-}
-
-/// Append `value` to the array `array`.
-fn push<'s>(
-    scope: &'s Scope<'_>,
-    array: Object<'_>,
-    value: impl ToJSVal<'s>,
-) -> Result<(), ExnThrown> {
-    let index = length(scope, array)?;
-    array.set_element(scope, index, value)
-}
-
-/// The elements of the array `object[name]`.
-fn elements<'s>(
-    scope: &'s Scope<'_>,
-    object: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<Vec<HandleValue<'s>>, ExnThrown> {
-    let Some(array) = object.obj(scope, name)? else {
-        return Ok(Vec::new());
-    };
-    (0..length(scope, array)?)
-        .map(|index| array.get_element(scope, index))
-        .collect()
-}
-
-/// The objects in the array `object[name]`.
-fn objects<'s>(
-    scope: &'s Scope<'_>,
-    object: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<Vec<Object<'s>>, ExnThrown> {
-    Ok(elements(scope, object, name)?
-        .into_iter()
-        .filter_map(|value| as_object(scope, value))
-        .collect())
-}
-
-/// Whether `a` and `b` are the same object.
-fn same_object(a: Object<'_>, b: Object<'_>) -> bool {
-    a.as_raw() == b.as_raw()
-}
-
-/// A record's kind.
-fn kind_of(scope: &Scope<'_>, record: Object<'_>) -> Result<u8, ExnThrown> {
-    Ok(record.num(scope, c"kind")? as u8)
 }
 
 /// A new record of `kind` named `name`, the child of `parent`. It is not added to `parent`'s
@@ -284,68 +458,68 @@ fn kind_of(scope: &Scope<'_>, record: Object<'_>) -> Result<u8, ExnThrown> {
 fn new_record<'s>(
     scope: &'s Scope<'_>,
     kind: u8,
-    name: &str,
-    parent: Option<Object<'_>>,
-) -> Result<Object<'s>, ExnThrown> {
-    let record = Object::new_plain(scope)?;
-    record.set_property(scope, c"kind", f64::from(kind))?;
-    record.set_property(scope, c"name", name)?;
+    name: String,
+    parent: Option<TestRecord<'_>>,
+) -> Result<TestRecord<'s>, ExnThrown> {
     let nesting = match parent {
-        Some(parent) if kind_of(scope, parent)? != ROOT => parent.num(scope, c"nesting")? + 1.0,
-        _ => 0.0,
+        Some(parent) => {
+            let data = parent.data();
+            if data.kind == ROOT {
+                0
+            } else {
+                data.nesting + 1
+            }
+        }
+        None => 0,
     };
-    record.set_property(scope, c"nesting", nesting)?;
-    if let Some(parent) = parent {
-        record.set_property(scope, c"parent", parent)?;
-    }
-    record.set_property(scope, c"subtests", *js::Array::new(scope, 0)?)?;
-    record.set_property(scope, c"queue", *js::Array::new(scope, 0)?)?;
-    record.set_property(scope, c"diagnostics", *js::Array::new(scope, 0)?)?;
-    let hooks = Object::new_plain(scope)?;
-    for name in [c"before", c"after", c"beforeEach", c"afterEach"] {
-        hooks.set_property(scope, name, *js::Array::new(scope, 0)?)?;
-    }
-    record.set_property(scope, c"hooks", hooks)?;
-    record.set_property(scope, c"pending", 0)?;
-    record.set_property(scope, c"phase", f64::from(phase::START))?;
-    record.set_property(scope, c"token", 0)?;
-    record.set_property(scope, c"timeout", f64::INFINITY)?;
-    record.set_property(scope, c"done", *js::Promise::new_pending(scope)?)?;
-    Ok(record)
+    let done = js::Promise::new_pending(scope)?;
+    js::class::create_instance_with::<TestRecordImpl>(scope, |_| TestRecordImpl {
+        kind,
+        name,
+        nesting,
+        parent: parent.map(Heap::from),
+        phase: phase::START,
+        timeout: f64::INFINITY,
+        done: Some(Heap::from(done)),
+        ..Default::default()
+    })
 }
 
 /// The parent of `record`, if it has one.
-fn parent_of<'s>(
-    scope: &'s Scope<'_>,
-    record: Object<'_>,
-) -> Result<Option<Object<'s>>, ExnThrown> {
-    record.obj(scope, c"parent")
+fn parent_of<'s>(scope: &'s Scope<'_>, record: TestRecord<'_>) -> Option<TestRecord<'s>> {
+    record
+        .data()
+        .parent
+        .as_ref()
+        .map(|parent| parent.get(scope))
 }
 
 /// Mark `record` failed with `error`, the value the reporter shows, unless it failed already.
 /// `failure_type` is the `failureType` of Node.js's `ERR_TEST_FAILURE`.
 fn fail(
-    scope: &Scope<'_>,
-    record: Object<'_>,
+    _scope: &Scope<'_>,
+    record: TestRecord<'_>,
     error: HandleValue<'_>,
-    failure_type: &str,
+    failure_type: &'static str,
 ) -> Result<(), ExnThrown> {
-    if record.flag(scope, c"failed")? {
+    let mut data = record.data_mut();
+    if data.failed {
         return Ok(());
     }
-    record.set_property(scope, c"failed", true)?;
-    record.set_property(scope, c"error", error)?;
-    record.set_property(scope, c"failureType", failure_type)
+    data.failed = true;
+    data.error.set(error.get());
+    data.failure_type = failure_type;
+    Ok(())
 }
 
 /// [`fail`] with the message `message` as the error.
 fn fail_with(
     scope: &Scope<'_>,
-    record: Object<'_>,
+    record: TestRecord<'_>,
     message: &str,
-    failure_type: &str,
+    failure_type: &'static str,
 ) -> Result<(), ExnThrown> {
-    let message = string(scope, message)?;
+    let message = js::conversion::ToJSVal::to_jsval_throwing(message, scope)?;
     fail(scope, record, message, failure_type)
 }
 
@@ -353,23 +527,23 @@ fn fail_with(
 /// already.
 fn cancel(
     scope: &Scope<'_>,
-    record: Object<'_>,
+    record: TestRecord<'_>,
     message: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    if record.flag(scope, c"failed")? {
+    if record.data().failed {
         return Ok(());
     }
     fail(scope, record, message, "cancelledByParent")?;
-    record.set_property(scope, c"cancelled", true)
+    record.data_mut().cancelled = true;
+    Ok(())
 }
 
 /// The message of a test that ran out of time.
-fn timeout_message(scope: &Scope<'_>, record: Object<'_>) -> Result<String, ExnThrown> {
-    let timeout = record.num(scope, c"timeout")?;
-    Ok(format!(
+fn timeout_message(record: TestRecord<'_>) -> String {
+    format!(
         "test timed out after {}ms",
-        crate::errors::number_to_string(timeout)
-    ))
+        crate::errors::number_to_string(record.data().timeout)
+    )
 }
 
 /// The `ERR_TEST_FAILURE` error with `message`.
@@ -381,25 +555,22 @@ fn test_failure(message: &str) -> NodeError {
 // The async context
 // ---------------------------------------------------------------------------
 
-/// The key of the current record in the async context's frame.
-fn frame_key<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    harness(scope)?
-        .obj(scope, c"frameKey")?
-        .ok_or_else(|| js::error::TypeError("no frame key".into()).throw(scope))
+/// The record of the current async context, if it has one. The harness keys it in the frame.
+fn frame_record<'s>(scope: &'s Scope<'_>) -> Result<Option<TestRecord<'s>>, ExnThrown> {
+    let key = harness(scope)?.as_object();
+    Ok(crate::async_hooks::current_store(scope, key)
+        .and_then(|record| Object::from_value(scope, record).ok())
+        .and_then(|record| record.cast::<TestRecord>().ok()))
 }
 
 /// The test or suite whose function, or whose hook's function, is running in the current async
 /// context.
-fn current_record<'s>(scope: &'s Scope<'_>) -> Result<Option<Object<'s>>, ExnThrown> {
-    let Some(frame) = crate::async_hooks::current_frame(scope) else {
+fn current_record<'s>(scope: &'s Scope<'_>) -> Result<Option<TestRecord<'s>>, ExnThrown> {
+    let Some(record) = frame_record(scope)? else {
         return Ok(None);
     };
-    let key = frame_key(scope)?.to_jsval_throwing(scope)?;
-    let Some(record) = as_object(scope, frame.lookup(scope, key)?) else {
-        return Ok(None);
-    };
-    if kind_of(scope, record)? == HOOK {
-        return record.obj(scope, c"owner");
+    if record.data().kind == HOOK {
+        return Ok(record.data().owner.as_ref().map(|owner| owner.get(scope)));
     }
     Ok(Some(record))
 }
@@ -407,18 +578,16 @@ fn current_record<'s>(scope: &'s Scope<'_>) -> Result<Option<Object<'s>>, ExnThr
 /// Call `callee` with `this` and `args`, with `record` as the current record of the async context.
 fn call_with_record<'s>(
     scope: &'s Scope<'_>,
-    record: Object<'_>,
+    record: TestRecord<'_>,
     callee: HandleValue<'_>,
     this: HandleValue<'_>,
     args: &[HandleValue<'_>],
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let key = frame_key(scope)?;
+    let key = harness(scope)?.as_object();
     let value = record.to_jsval_throwing(scope)?;
     let frame = crate::async_hooks::derived_frame(scope, key, Some(value))?;
-    let snapshot = Snapshot::of(Some(*frame));
-    Ok(scope.root_value(crate::async_hooks::call_in(
-        scope, snapshot, callee, this, args,
-    )?))
+    let snapshot = Snapshot::of(Some(frame.as_object()));
+    crate::async_hooks::call_in(scope, snapshot, callee, this, args)
 }
 
 // ---------------------------------------------------------------------------
@@ -426,118 +595,106 @@ fn call_with_record<'s>(
 // ---------------------------------------------------------------------------
 
 /// The `TestContext` of `record`, created on first use.
-fn context_of<'s>(scope: &'s Scope<'_>, record: Object<'_>) -> Result<Object<'s>, ExnThrown> {
-    if let Some(ctx) = record.obj(scope, c"ctx")? {
+fn context_of<'s>(
+    scope: &'s Scope<'_>,
+    record: TestRecord<'_>,
+) -> Result<TestContext<'s>, ExnThrown> {
+    if let Some(ctx) = record.data().ctx.as_ref().map(|ctx| ctx.get(scope)) {
         return Ok(ctx);
     }
-    let ctor = test_context::class_constructor(scope)?;
-    let ctx = Function::construct(scope, ctor, &[] as &[Value])?;
-    register_context(scope, ctx, record)?;
-    record.set_property(scope, c"ctx", ctx)?;
+    let ctx = js::class::create_instance_with::<TestContextImpl>(scope, |_| TestContextImpl {
+        record: Some(Heap::from(record)),
+    })?;
+    record.data_mut().ctx = Some(Heap::from(ctx));
     Ok(ctx)
 }
 
 /// The context the hooks of `record` receive: a `SuiteContext` for a suite, and its `TestContext`
 /// otherwise.
-fn hook_context<'s>(scope: &'s Scope<'_>, record: Object<'_>) -> Result<Object<'s>, ExnThrown> {
-    if kind_of(scope, record)? != SUITE {
-        return context_of(scope, record);
+fn hook_context<'s>(
+    scope: &'s Scope<'_>,
+    record: TestRecord<'_>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    if record.data().kind != SUITE {
+        return context_of(scope, record)?.to_jsval_throwing(scope);
     }
-    if let Some(ctx) = record.obj(scope, c"suiteCtx")? {
-        return Ok(ctx);
+    if let Some(ctx) = record.data().suite_ctx.as_ref().map(|ctx| ctx.get(scope)) {
+        return ctx.to_jsval_throwing(scope);
     }
-    let ctor = suite_context::class_constructor(scope)?;
-    let ctx = Function::construct(scope, ctor, &[] as &[Value])?;
-    register_context(scope, ctx, record)?;
-    record.set_property(scope, c"suiteCtx", ctx)?;
-    Ok(ctx)
-}
-
-/// Record that the context `ctx` belongs to `record`.
-fn register_context(
-    scope: &Scope<'_>,
-    ctx: Object<'_>,
-    record: Object<'_>,
-) -> Result<(), ExnThrown> {
-    let contexts = contexts(scope)?;
-    contexts.insert(
-        scope,
-        ctx.to_jsval_throwing(scope)?,
-        record.to_jsval_throwing(scope)?,
-    )
-}
-
-/// The realm's `WeakMap` from each context to its record.
-fn contexts<'s>(scope: &'s Scope<'_>) -> Result<js::WeakMap<'s>, ExnThrown> {
-    harness(scope)?
-        .obj(scope, c"contexts")?
-        .and_then(|contexts| contexts.cast::<js::WeakMap>().ok())
-        .ok_or_else(|| js::error::TypeError("no contexts".into()).throw(scope))
-}
-
-/// The record of the context `this`, or a `TypeError` if it isn't one.
-fn record_of<'s>(scope: &'s Scope<'_>, this: HandleValue<'_>) -> Result<Object<'s>, ExnThrown> {
-    let illegal = || js::error::TypeError("Illegal invocation".into()).throw(scope);
-    if !this.is_object() {
-        return Err(illegal());
-    }
-    let key = scope.root_value(this.get());
-    as_object(scope, contexts(scope)?.lookup(scope, key)?).ok_or_else(illegal)
+    let ctx = js::class::create_instance_with::<SuiteContextImpl>(scope, |_| SuiteContextImpl {
+        record: Some(Heap::from(record)),
+    })?;
+    record.data_mut().suite_ctx = Some(Heap::from(ctx));
+    ctx.to_jsval_throwing(scope)
 }
 
 /// The names of `record` and its ancestors below the root, joined with ` > `.
-fn full_name(scope: &Scope<'_>, record: Object<'_>) -> Result<String, ExnThrown> {
+fn full_name(scope: &Scope<'_>, record: TestRecord<'_>) -> String {
     let mut names = Vec::new();
     let mut current = Some(record);
-    while let Some(object) = current {
-        if kind_of(scope, object)? == ROOT {
+    while let Some(record) = current {
+        if record.data().kind == ROOT {
             break;
         }
-        let name = object.get_property(scope, c"name")?;
-        names.push(String::from_jsval(scope, name, ()).unwrap_or_default());
-        current = parent_of(scope, object)?;
+        names.push(record.data().name.clone());
+        current = parent_of(scope, record);
     }
     names.reverse();
-    Ok(names.join(" > "))
+    names.join(" > ")
 }
 
 /// `process.argv[1]`, the entry module's path, or `undefined`.
 fn entry_file<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
-    let process = scope.global().get_property(scope, c"process")?;
-    let Some(argv) = as_object(scope, process)
-        .map(|process| process.obj(scope, c"argv"))
-        .transpose()?
-        .flatten()
-    else {
-        return Ok(scope.root_value(js::value::undefined()));
+    let process = crate::process::process_value(scope)?;
+    let Ok(process) = Object::from_value(scope, process) else {
+        return Ok(HandleValue::undefined());
     };
-    argv.get_element(scope, 1)
+    let argv = process.get_property(scope, c"argv")?;
+    match Object::from_value(scope, argv) {
+        Ok(argv) => argv.get_element(scope, 1),
+        Err(_) => Ok(HandleValue::undefined()),
+    }
 }
 
 /// The `AbortSignal` of `record`, created on first use, and aborted once `record` finished.
-fn signal_of<'s>(scope: &'s Scope<'_>, record: Object<'_>) -> Result<HandleValue<'s>, ExnThrown> {
-    let controller = match record.obj(scope, c"controller")? {
+fn signal_of<'s>(
+    scope: &'s Scope<'_>,
+    record: TestRecord<'_>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let existing = record
+        .data()
+        .controller
+        .as_ref()
+        .map(|controller| controller.get(scope));
+    let controller = match existing {
         Some(controller) => controller,
         None => {
-            let ctor = scope.global().get_property(scope, c"AbortController")?;
-            let controller = Function::construct(scope, ctor, &[] as &[Value])?;
-            record.set_property(scope, c"controller", controller)?;
-            if record.flag(scope, c"finished")? {
-                call_method(scope, controller, c"abort", &[] as &[HandleValue])?;
+            let controller = AbortController::new(scope)?;
+            record.data_mut().controller = Some(Heap::from(controller));
+            if record.data().finished {
+                controller.abort(scope, HandleValue::undefined(), ScriptStackState::NonEmpty)?;
             }
             controller
         }
     };
-    controller.get_property(scope, c"signal")
+    controller.signal(scope).to_jsval_throwing(scope)
 }
 
 /// The `MockTracker` of `record`, created on first use, and reset once `record` finished.
-fn mock_of<'s>(scope: &'s Scope<'_>, record: Object<'_>) -> Result<Object<'s>, ExnThrown> {
-    if let Some(tracker) = record.obj(scope, c"mock")? {
+fn mock_of<'s>(
+    scope: &'s Scope<'_>,
+    record: TestRecord<'_>,
+) -> Result<mock::MockTracker<'s>, ExnThrown> {
+    if let Some(tracker) = record
+        .data()
+        .mock
+        .as_ref()
+        .map(|tracker| tracker.get(scope))
+    {
         return Ok(tracker);
     }
     let tracker = mock::new_tracker(scope)?;
-    record.set_property(scope, c"mock", tracker)?;
+    record.data_mut().mock = Some(Heap::from(tracker));
     Ok(tracker)
 }
 
@@ -545,60 +702,77 @@ fn mock_of<'s>(scope: &'s Scope<'_>, record: Object<'_>) -> Result<Object<'s>, E
 /// [`ASSERT_METHODS`] of `node:assert` and the functions `assert.register` added.
 fn assertions<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
     let harness = harness(scope)?;
-    if let Some(map) = harness.obj(scope, c"assertions")? {
+    if let Some(map) = harness.data().assertions.as_ref().map(|map| map.get(scope)) {
         return Ok(map);
     }
-    let map = Object::new_plain(scope)?;
+    let map = Object::new_with_null_prototype(scope)?;
     if let Some(assert) = core_runtime::module::builtin_namespace(scope, "node:assert")? {
         for &name in ASSERT_METHODS {
             let c_name = std::ffi::CString::new(name).map_err(|_| ExnThrown)?;
             map.set_property_by_name(scope, &c_name, assert.get_property_by_name(scope, &c_name)?)?;
         }
     }
-    harness.set_property(scope, c"assertions", map)?;
+    harness.data_mut().assertions = Some(Heap::from(map));
     Ok(map)
 }
 
-/// The body of a `t.assert` function, whose payload captures the record and the assertion
-/// function: count the assertion for the record's plan, then call the function.
+/// The payload of [`counted_assertion`]: the test record and the assertion function.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct CountedAssertion {
+    record: Heap<TestRecordImpl>,
+    callee: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl CountedAssertion {}
+
+/// The body of a `t.assert` function, whose payload is a [`CountedAssertion`]: count the
+/// assertion for the record's plan, then call the function.
 fn counted_assertion(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let record = captures.obj(0)?;
-    count_for_plan(scope, record)?;
+    let assertion = cast_payload::<CountedAssertion>(scope, payload);
+    let (record, callee) = {
+        let data = assertion.data();
+        (data.record.get(scope), data.callee.get(scope))
+    };
+    count_for_plan(record);
     let ctx = context_of(scope, record)?.to_jsval_throwing(scope)?;
-    let callee = captures.get(1)?;
-    Ok(Function::call(scope, ctx, callee, &crate::callback_args(&args))?.get())
+    let call_args: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+    Ok(Function::call(scope, ctx, callee, &call_args)?.get())
 }
 
 /// Count an assertion or a subtest of `record` for its plan, if it has one.
-fn count_for_plan(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    if record.get_property(scope, c"plan")?.is_number() {
-        let actual = record.num(scope, c"planActual")?;
-        record.set_property(scope, c"planActual", actual + 1.0)?;
+fn count_for_plan(record: TestRecord<'_>) {
+    let mut data = record.data_mut();
+    if data.plan.is_some() {
+        data.plan_actual += 1.0;
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Registering tests and hooks
 // ---------------------------------------------------------------------------
 
+/// Whether an option value turns its option on: anything but `undefined` and `false`.
+fn option_set(value: HandleValue<'_>) -> bool {
+    !value.is_undefined() && !(value.is_boolean() && !value.to_boolean())
+}
+
 /// Create the test or suite of `kind` from the arguments `name`, `options` and `callee` of
 /// `test()`, `t.test()` or `describe()`, as a subtest of `parent`. `modifier` is the option
 /// `test.skip`, `test.todo`, `test.only` or `test.expectFailure` sets, if any.
 fn create_test<'s>(
     scope: &'s Scope<'_>,
-    parent: Object<'_>,
+    parent: TestRecord<'_>,
     kind: u8,
     args: [HandleValue<'_>; 3],
     modifier: Option<&str>,
-) -> Result<Object<'s>, Thrown> {
+) -> Result<TestRecord<'s>, Thrown> {
     let [mut name, mut options, mut callee] = args;
-    if is_function(scope, name) {
+    if js::function::is_callable(name) {
         callee = name;
         name = HandleValue::undefined();
         options = HandleValue::undefined();
@@ -606,16 +780,18 @@ fn create_test<'s>(
         callee = options;
         options = name;
         name = HandleValue::undefined();
-    } else if is_function(scope, options) {
+    } else if js::function::is_callable(options) {
         callee = options;
         options = HandleValue::undefined();
     }
-    let options = if options.is_object() {
-        as_object(scope, options).ok_or(ExnThrown)?
-    } else {
-        Object::new_plain(scope)?
+    let options = Object::from_value(scope, options).ok();
+    let option = |name: &'static std::ffi::CStr| -> Result<HandleValue<'_>, ExnThrown> {
+        match options {
+            Some(options) => options.get_property(scope, name),
+            None => Ok(HandleValue::undefined()),
+        }
     };
-    let callee = if is_function(scope, callee) {
+    let callee = if js::function::is_callable(callee) {
         callee
     } else {
         HandleValue::undefined()
@@ -623,7 +799,7 @@ fn create_test<'s>(
     let name = match rust_string(scope, name) {
         Some(name) if !name.is_empty() => name,
         _ => {
-            let fn_name = match as_object(scope, callee) {
+            let fn_name = match Object::from_value(scope, callee).ok() {
                 Some(callee) => callee.get_property(scope, c"name")?,
                 None => HandleValue::undefined(),
             };
@@ -634,7 +810,7 @@ fn create_test<'s>(
         }
     };
 
-    let concurrency = options.get_property(scope, c"concurrency")?;
+    let concurrency = option(c"concurrency")?;
     if concurrency.is_number() {
         let value = concurrency.to_number();
         if value.fract() != 0.0 || !(1.0..=4294967295.0).contains(&value) {
@@ -654,7 +830,7 @@ fn create_test<'s>(
         )
         .into());
     }
-    let timeout = options.get_property(scope, c"timeout")?;
+    let timeout = option(c"timeout")?;
     let timeout = if timeout.is_null() || timeout.is_undefined() {
         None
     } else if timeout.is_number() && timeout.to_number() == f64::INFINITY {
@@ -680,77 +856,81 @@ fn create_test<'s>(
         }
         Some(value)
     };
-    let signal = options.get_property(scope, c"signal")?;
+    let signal = option(c"signal")?;
     crate::errors::validate_abort_signal(scope, signal, "options.signal")?;
 
-    let finished = parent.flag(scope, c"finished")?
-        || (kind_of(scope, parent)? == SUITE && parent.flag(scope, c"built")?);
+    let finished = {
+        let data = parent.data();
+        data.finished || (data.kind == SUITE && data.built)
+    };
     let parent = if finished { root(scope)? } else { parent };
-    let record = new_record(scope, kind, &name, Some(parent))?;
-    record.set_property(scope, c"fn", callee)?;
+    let record = new_record(scope, kind, name, Some(parent))?;
 
     let skip = match modifier {
         Some("skip") => scope.root_value(js::value::from_bool(true)),
-        _ => options.get_property(scope, c"skip")?,
+        _ => option(c"skip")?,
     };
     let todo = match modifier {
         Some("todo") => scope.root_value(js::value::from_bool(true)),
-        _ => options.get_property(scope, c"todo")?,
+        _ => option(c"todo")?,
     };
-    let skipped = !skip.is_undefined() && !(skip.is_boolean() && !skip.to_boolean());
-    let todo_set = !todo.is_undefined() && !(todo.is_boolean() && !todo.to_boolean());
-    record.set_property(scope, c"skipped", skipped)?;
-    record.set_property(scope, c"todo", todo_set || parent.flag(scope, c"todo")?)?;
-    if skip.is_string() {
-        record.set_property(scope, c"message", skip)?;
-    } else if todo.is_string() {
-        record.set_property(scope, c"message", todo)?;
-    }
     let expect_failure = match modifier {
         Some("expectFailure") => true,
-        _ => {
-            let value = options.get_property(scope, c"expectFailure")?;
-            !value.is_undefined() && !(value.is_boolean() && !value.to_boolean())
-        }
+        _ => option_set(option(c"expectFailure")?),
     };
-    record.set_property(
-        scope,
-        c"expectFailure",
-        expect_failure || parent.flag(scope, c"expectFailure")?,
-    )?;
     let only = match modifier {
         Some("only") => scope.root_value(js::value::from_bool(true)),
-        _ => options.get_property(scope, c"only")?,
+        _ => option(c"only")?,
     };
-    record.set_property(scope, c"only", only)?;
-    if only.is_boolean() && only.to_boolean() {
-        parent.set_property(scope, c"runOnlySubtests", true)?;
-        if kind_of(scope, parent)? == ROOT || !parent.flag(scope, c"started")? {
+    let only = only.is_boolean().then(|| only.to_boolean());
+    let skipped = option_set(skip);
+    let plan = option(c"plan")?;
+    let (parent_todo, parent_expect_failure, parent_kind, parent_timeout, parent_started) = {
+        let data = parent.data();
+        (
+            data.todo,
+            data.expect_failure,
+            data.kind,
+            data.timeout,
+            data.started,
+        )
+    };
+    {
+        let mut data = record.data_mut();
+        if !skipped && only != Some(false) {
+            data.callee.set(callee.get());
+        }
+        data.skipped = skipped;
+        data.todo = option_set(todo) || parent_todo;
+        if skip.is_string() {
+            data.message.set(skip.get());
+        } else if todo.is_string() {
+            data.message.set(todo.get());
+        }
+        data.expect_failure = expect_failure || parent_expect_failure;
+        data.only = only;
+        let inherited = if kind == SUITE {
+            f64::INFINITY
+        } else {
+            parent_timeout
+        };
+        data.timeout = timeout.unwrap_or(inherited);
+        data.plan_option = plan.is_number().then(|| plan.to_number());
+    }
+    if only == Some(true) {
+        parent.data_mut().run_only_subtests = true;
+        if parent_kind == ROOT || !parent_started {
             let mut current = Some(parent);
             while let Some(ancestor) = current {
-                if ancestor.flag(scope, c"hasOnlyTests")? {
+                if ancestor.data().has_only_tests {
                     break;
                 }
-                ancestor.set_property(scope, c"hasOnlyTests", true)?;
-                current = parent_of(scope, ancestor)?;
+                ancestor.data_mut().has_only_tests = true;
+                current = parent_of(scope, ancestor);
             }
         }
     }
-    if skipped || (only.is_boolean() && !only.to_boolean()) {
-        record.set_property(scope, c"fn", js::value::undefined())?;
-    }
-    let inherited = if kind == SUITE {
-        f64::INFINITY
-    } else {
-        parent.num(scope, c"timeout")?
-    };
-    record.set_property(scope, c"timeout", timeout.unwrap_or(inherited))?;
-    let plan = options.get_property(scope, c"plan")?;
-    if plan.is_number() {
-        record.set_property(scope, c"planOption", plan)?;
-    }
-
-    push(scope, objects_array(scope, parent, c"subtests")?, record)?;
+    parent.data_mut().subtests.push(Heap::from(record));
     if finished {
         fail_with(
             scope,
@@ -765,75 +945,87 @@ fn create_test<'s>(
     Ok(record)
 }
 
-/// The array `object[name]`.
-fn objects_array<'s>(
-    scope: &'s Scope<'_>,
-    object: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<Object<'s>, ExnThrown> {
-    object
-        .obj(scope, name)?
-        .ok_or_else(|| js::error::TypeError("not an array".into()).throw(scope))
-}
-
 /// Call the function of the suite `record` with its `SuiteContext`. If it returns a promise, the
 /// suite is building until the promise settles. A function that throws or rejects fails the suite.
-fn build_suite(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    let callee = record.get_property(scope, c"fn")?;
-    if !is_function(scope, callee) {
-        return record.set_property(scope, c"built", true);
+fn build_suite(scope: &Scope<'_>, record: TestRecord<'_>) -> Result<(), ExnThrown> {
+    let callee = record.data().callee.get(scope);
+    if !js::function::is_callable(callee) {
+        record.data_mut().built = true;
+        return Ok(());
     }
-    let ctx = hook_context(scope, record)?.to_jsval_throwing(scope)?;
+    let ctx = hook_context(scope, record)?;
     match call_with_record(scope, record, callee, ctx, &[ctx]) {
         Err(ExnThrown) => {
-            let error = take_exception(scope);
+            let error = js::exception::take_pending_or_undefined(scope);
             fail(scope, record, error, "testCodeFailure")?;
-            record.set_property(scope, c"built", true)
+            record.data_mut().built = true;
+            Ok(())
         }
         Ok(result) if is_thenable(scope, result)? => {
-            record.set_property(scope, c"building", true)?;
+            record.data_mut().building = true;
             let promise = js::Promise::call_original_resolve(scope, result)?;
-            let record_value = record.to_jsval_throwing(scope)?;
-            let fulfilled = scope.root_value(js::value::from_bool(false));
-            let rejected = scope.root_value(js::value::from_bool(true));
-            let on_built = closure(scope, 1, suite_built, &[record_value, fulfilled])?;
-            let on_failed = closure(scope, 1, suite_built, &[record_value, rejected])?;
-            let built = promise.then(scope, Some(on_built), Some(on_failed))?;
-            record.set_property(scope, c"buildPromise", *built)?;
-            push(
-                scope,
-                objects_array(scope, harness(scope)?, c"builds")?,
-                *built,
-            )
+            let on_built = Function::new_callback(scope, c"", 1, suite_built, record)?;
+            let on_failed = Function::new_callback(scope, c"", 1, suite_build_failed, record)?;
+            let built = promise.then(scope, Some(*on_built), Some(*on_failed))?;
+            record.data_mut().build_promise = Some(Heap::from(*built));
+            harness(scope)?.data_mut().builds.push(Heap::from(*built));
+            Ok(())
         }
-        Ok(_) => record.set_property(scope, c"built", true),
+        Ok(_) => {
+            record.data_mut().built = true;
+            Ok(())
+        }
     }
 }
 
 /// Whether `value` is an object with a `then` method.
 fn is_thenable(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
-    match as_object(scope, value) {
-        Some(object) => Ok(is_function(scope, object.get_property(scope, c"then")?)),
+    match Object::from_value(scope, value).ok() {
+        Some(object) => Ok(js::function::is_callable(
+            object.get_property(scope, c"then")?,
+        )),
         None => Ok(false),
     }
 }
 
-/// The reaction to the promise a suite's function returned, whose payload captures the suite and
-/// whether this is the rejection reaction: finish its building, and fail it with the reason of a
-/// rejection.
+/// The fulfillment reaction to the promise a suite's function returned, whose payload is the
+/// suite: finish its building.
 fn suite_built(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    finish_build(cast_payload::<TestRecord>(scope, payload));
+    Ok(js::value::undefined())
+}
+
+/// Mark the suite `record` built.
+fn finish_build(record: TestRecord<'_>) {
+    let mut data = record.data_mut();
+    data.building = false;
+    data.built = true;
+}
+
+/// The rejection reaction to the promise a suite's function returned, whose payload is the suite:
+/// finish its building, and fail it with the reason.
+fn suite_build_failed(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let record = captures.obj(0)?;
-    record.set_property(scope, c"building", false)?;
-    record.set_property(scope, c"built", true)?;
-    if captures.flag(1)? {
-        fail(scope, record, args.get(0), "testCodeFailure")?;
-    }
+    let record = cast_payload::<TestRecord>(scope, payload);
+    finish_build(record);
+    fail(scope, record, args.get(0), "testCodeFailure")?;
     Ok(js::value::undefined())
+}
+
+/// The promise that settles once `record` finished.
+fn done_of<'s>(scope: &'s Scope<'_>, record: TestRecord<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+    let done = record.data().done.as_ref().map(|done| done.get(scope));
+    match done {
+        Some(done) => done.to_jsval_throwing(scope),
+        None => Ok(HandleValue::undefined()),
+    }
 }
 
 /// Register the test or suite of `kind` that `test()` or `describe()` was called with, as a
@@ -850,15 +1042,16 @@ fn register<'s>(
         None => root(scope)?,
     };
     let record = create_test(scope, parent, kind, args, modifier)?;
-    let parent = parent_of(scope, record)?.ok_or(ExnThrown)?;
-    match kind_of(scope, parent)? {
+    let parent = parent_of(scope, record).ok_or(ExnThrown)?;
+    let parent_kind = parent.data().kind;
+    match parent_kind {
         SUITE => Ok(
             js::Promise::call_original_resolve(scope, HandleValue::undefined())?
                 .to_jsval_throwing(scope)?,
         ),
-        ROOT if harness(scope)?.flag(scope, c"building")? => {
+        ROOT if harness(scope)?.data().building => {
             begin(scope)?;
-            Ok(record.get_property(scope, c"done")?)
+            Ok(done_of(scope, record)?)
         }
         _ => Ok(start_subtest(scope, record)?),
     }
@@ -868,25 +1061,25 @@ fn register<'s>(
 /// built. Does nothing after the first call.
 fn begin(scope: &Scope<'_>) -> Result<(), ExnThrown> {
     let harness = harness(scope)?;
-    if harness.flag(scope, c"begun")? {
+    if std::mem::replace(&mut harness.data_mut().begun, true) {
         return Ok(());
     }
-    harness.set_property(scope, c"begun", true)?;
     let ready = js::Promise::call_original_resolve(scope, HandleValue::undefined())?;
-    let on_ready = closure(scope, 0, wait_for_builds, &[] as &[HandleValue])?;
-    ready.add_reactions(scope, Some(on_ready), None)
+    let on_ready = Function::new_callback(scope, c"", 0, wait_for_builds, ())?;
+    ready.add_reactions(scope, Some(*on_ready), None)
 }
 
-/// Wait for the suites the harness's `builds` holds to be built, then start the root's subtests.
+/// Wait for the suites the harness's builds hold to be built, then start the root's subtests.
 fn wait_for_builds(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let harness = harness(scope)?;
-    let builds = objects(scope, harness, c"builds")?;
-    harness.set_property(scope, c"builds", *js::Array::new(scope, 0)?)?;
-    let on_built = closure(scope, 0, start_root_tests, &[] as &[HandleValue])?;
+    let builds: Vec<Object<'_>> = std::mem::take(&mut harness(scope)?.data_mut().builds)
+        .iter()
+        .map(|build| build.get(scope))
+        .collect();
+    let on_built = *Function::new_callback(scope, c"", 0, start_root_tests, ())?;
     if builds.is_empty() {
         let ready = js::Promise::call_original_resolve(scope, HandleValue::undefined())?;
         ready.add_reactions(scope, Some(on_built), None)?;
@@ -898,6 +1091,16 @@ fn wait_for_builds(
     Ok(js::value::undefined())
 }
 
+/// The subtests of `record`.
+fn subtests_of<'s>(scope: &'s Scope<'_>, record: TestRecord<'_>) -> Vec<TestRecord<'s>> {
+    record
+        .data()
+        .subtests
+        .iter()
+        .map(|subtest| subtest.get(scope))
+        .collect()
+}
+
 /// End the harness's building phase, and start the root's subtests that haven't started.
 fn start_root_tests(
     scope: &Scope<'_>,
@@ -905,13 +1108,16 @@ fn start_root_tests(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let harness = harness(scope)?;
-    if !harness.flag(scope, c"building")? {
+    if !std::mem::replace(&mut harness.data_mut().building, false) {
         return Ok(js::value::undefined());
     }
-    harness.set_property(scope, c"building", false)?;
     let root = root(scope)?;
-    for record in objects(scope, root, c"subtests")? {
-        if !record.flag(scope, c"queued")? && !record.flag(scope, c"finished")? {
+    for record in subtests_of(scope, root) {
+        let (queued, finished) = {
+            let data = record.data();
+            (data.queued, data.finished)
+        };
+        if !queued && !finished {
             start_subtest(scope, record)?;
         }
     }
@@ -920,23 +1126,16 @@ fn start_root_tests(
 }
 
 /// Whether the `only` options of `record` and its siblings leave it out.
-fn filtered_out(
-    scope: &Scope<'_>,
-    record: Object<'_>,
-    parent: Object<'_>,
-) -> Result<bool, ExnThrown> {
-    if record.flag(scope, c"failed")? {
-        return Ok(false);
+fn filtered_out(record: TestRecord<'_>, parent: TestRecord<'_>) -> bool {
+    let data = record.data();
+    if data.failed {
+        return false;
     }
-    let only = record.get_property(scope, c"only")?;
-    let only_true = only.is_boolean() && only.to_boolean();
-    let only_false = only.is_boolean() && !only.to_boolean();
-    if only_true || record.flag(scope, c"hasOnlyTests")? {
-        return Ok(false);
+    if data.only == Some(true) || data.has_only_tests {
+        return false;
     }
-    Ok(parent.flag(scope, c"runOnlySubtests")?
-        || parent.flag(scope, c"hasOnlyTests")?
-        || only_false)
+    let parent = parent.data();
+    parent.run_only_subtests || parent.has_only_tests || data.only == Some(false)
 }
 
 /// Start `record`: queue it to run once its parent runs no other subtest. Returns the promise that
@@ -944,52 +1143,58 @@ fn filtered_out(
 /// without being reported.
 fn start_subtest<'s>(
     scope: &'s Scope<'_>,
-    record: Object<'_>,
+    record: TestRecord<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let done = record.get_property(scope, c"done")?;
-    let parent = parent_of(scope, record)?.ok_or(ExnThrown)?;
-    if filtered_out(scope, record, parent)? {
-        record.set_property(scope, c"filtered", true)?;
-        record.set_property(scope, c"finished", true)?;
-        record.set_property(scope, c"passed", true)?;
+    let done = done_of(scope, record)?;
+    let parent = parent_of(scope, record).ok_or(ExnThrown)?;
+    if filtered_out(record, parent) {
+        {
+            let mut data = record.data_mut();
+            data.filtered = true;
+            data.finished = true;
+            data.passed = true;
+        }
         resolve_done(scope, record)?;
         return Ok(done);
     }
-    record.set_property(scope, c"queued", true)?;
-    let pending = parent.num(scope, c"pending")?;
-    parent.set_property(scope, c"pending", pending + 1.0)?;
-    push(scope, objects_array(scope, parent, c"queue")?, record)?;
+    record.data_mut().queued = true;
+    {
+        let mut data = parent.data_mut();
+        data.pending += 1;
+        data.queue.push_back(Heap::from(record));
+    }
     process_queue(scope, parent)?;
     Ok(done)
 }
 
 /// Run the next subtest in the queue of `parent`, if it runs none.
-fn process_queue(scope: &Scope<'_>, parent: Object<'_>) -> Result<(), ExnThrown> {
-    while parent.obj(scope, c"running")?.is_none() {
-        let queue = objects_array(scope, parent, c"queue")?;
-        if length(scope, queue)? == 0 {
-            break;
-        }
-        let shifted = call_method(scope, queue, c"shift", &[] as &[HandleValue])?;
-        let Some(record) = as_object(scope, shifted) else {
-            continue;
+fn process_queue(scope: &Scope<'_>, parent: TestRecord<'_>) -> Result<(), ExnThrown> {
+    loop {
+        let next = {
+            let mut data = parent.data_mut();
+            if data.running.is_some() {
+                break;
+            }
+            match pop_front_rooted(scope, &mut data.queue) {
+                Some(next) => next,
+                None => break,
+            }
         };
-        if record.flag(scope, c"finished")? {
+        if next.data().finished {
             continue;
         }
-        parent.set_property(scope, c"running", record)?;
-        record.set_property(scope, c"phase", f64::from(phase::START))?;
-        advance(scope, record, Outcome::Value)?;
+        parent.data_mut().running = Some(Heap::from(next));
+        next.data_mut().phase = phase::START;
+        advance(scope, next, Outcome::Value)?;
     }
     Ok(())
 }
 
 /// Resolve the promise that settles once `record` finished.
-fn resolve_done(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    if let Some(done) = record.obj(scope, c"done")? {
-        if let Ok(done) = done.cast::<js::Promise>() {
-            done.resolve(scope, HandleValue::undefined())?;
-        }
+fn resolve_done(scope: &Scope<'_>, record: TestRecord<'_>) -> Result<(), ExnThrown> {
+    let done = record.data().done.as_ref().map(|done| done.get(scope));
+    if let Some(done) = done {
+        done.resolve(scope, HandleValue::undefined())?;
     }
     Ok(())
 }
@@ -999,74 +1204,105 @@ fn resolve_done(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> 
 /// test if it fails.
 fn create_hook(
     scope: &Scope<'_>,
-    owner: Object<'_>,
-    hook_type: &str,
+    owner: TestRecord<'_>,
+    hook_type: HookType,
     callee: HandleValue<'_>,
     options: HandleValue<'_>,
 ) -> Result<(), Thrown> {
-    let hook = new_record(scope, HOOK, "<anonymous>", None)?;
-    hook.set_property(scope, c"owner", owner)?;
-    hook.set_property(scope, c"hookType", hook_type)?;
-    hook.set_property(scope, c"state", 0)?;
-    if is_function(scope, callee) {
-        hook.set_property(scope, c"fn", callee)?;
-    }
-    if let Some(options) = as_object(scope, options) {
-        let timeout = options.get_property(scope, c"timeout")?;
-        if timeout.is_number() {
-            let value = timeout.to_number();
-            if value != f64::INFINITY && !(0.0..=TIMEOUT_MAX).contains(&value) {
+    let mut timeout = None;
+    if let Ok(options) = Object::from_value(scope, options) {
+        let value = options.get_property(scope, c"timeout")?;
+        if value.is_number() {
+            let number = value.to_number();
+            if number != f64::INFINITY && !(0.0..=TIMEOUT_MAX).contains(&number) {
                 return Err(NodeError::out_of_range(
                     "options.timeout",
                     ">= 0 && <= 2147483647",
-                    &crate::errors::number_to_string(value),
+                    &crate::errors::number_to_string(number),
                 )
                 .into());
             }
-            hook.set_property(scope, c"timeout", value)?;
-        } else if !timeout.is_null() && !timeout.is_undefined() {
+            timeout = Some(number);
+        } else if !value.is_null() && !value.is_undefined() {
             return Err(NodeError::invalid_arg_type(
                 scope,
                 "options.timeout",
                 "of type number",
-                timeout,
+                value,
             )
             .into());
         }
     }
-    let hooks = owner.obj(scope, c"hooks")?.ok_or(ExnThrown)?;
-    let c_type = std::ffi::CString::new(hook_type).map_err(|_| ExnThrown)?;
-    let array = hooks.get_property_by_name(scope, &c_type)?;
-    let array = Object::from_value(scope, array)
-        .map_err(|_| js::error::TypeError("not an array".into()).throw(scope))?;
-    push(scope, array, hook)?;
-    if hook_type == "before" && owner.flag(scope, c"started")? {
-        let ctx = hook_context(scope, owner)?.to_jsval_throwing(scope)?;
+    let hook = new_record(scope, HOOK, "<anonymous>".into(), None)?;
+    {
+        let mut data = hook.data_mut();
+        data.owner = Some(Heap::from(owner));
+        data.hook_type = hook_type;
+        if js::function::is_callable(callee) {
+            data.callee.set(callee.get());
+        }
+        if let Some(timeout) = timeout {
+            data.timeout = timeout;
+        }
+    }
+    {
+        let mut data = owner.data_mut();
+        let hooks = match hook_type {
+            HookType::Before => &mut data.before,
+            HookType::After => &mut data.after,
+            HookType::BeforeEach => &mut data.before_each,
+            HookType::AfterEach => &mut data.after_each,
+        };
+        hooks.push(Heap::from(hook));
+    }
+    let (started, kind) = {
+        let data = owner.data();
+        (data.started, data.kind)
+    };
+    if hook_type == HookType::Before && started {
+        let ctx = hook_context(scope, owner)?;
         let done = start_hook(scope, hook, ctx)?;
-        if kind_of(scope, owner)? != ROOT {
-            let values = [
-                owner.to_jsval_throwing(scope)?,
-                hook.to_jsval_throwing(scope)?,
-            ];
-            let on_done = closure(scope, 0, early_hook_done, &values)?;
-            done.add_reactions(scope, Some(on_done), None)?;
+        if kind != ROOT {
+            let early =
+                js::class::create_instance_with::<EarlyHookImpl>(scope, |_| EarlyHookImpl {
+                    owner: Heap::from(owner),
+                    hook: Heap::from(hook),
+                })?;
+            let on_done = Function::new_callback(scope, c"", 0, early_hook_done, early)?;
+            done.add_reactions(scope, Some(*on_done), None)?;
         }
     }
     Ok(())
 }
 
-/// The reaction to a `before` hook that ran as it was registered, whose payload captures its owner
-/// and the hook: fail the owner if the hook failed.
+/// The payload of [`early_hook_done`]: a `before` hook that ran as it was registered, and its
+/// owner.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct EarlyHook {
+    owner: Heap<TestRecordImpl>,
+    hook: Heap<TestRecordImpl>,
+}
+
+#[core_runtime::jsmethods]
+impl EarlyHook {}
+
+/// The reaction to a `before` hook that ran as it was registered, whose payload is an
+/// [`EarlyHook`]: fail the owner if the hook failed.
 fn early_hook_done(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let owner = captures.obj(0)?;
-    let hook = captures.obj(1)?;
-    if hook.flag(scope, c"failed")? {
-        let error = hook.get_property(scope, c"error")?;
+    let early = cast_payload::<EarlyHook>(scope, payload);
+    let (owner, hook) = {
+        let data = early.data();
+        (data.owner.get(scope), data.hook.get(scope))
+    };
+    let error = {
+        let data = hook.data();
+        data.failed.then(|| data.error.get(scope))
+    };
+    if let Some(error) = error {
         fail(scope, owner, error, "hookFailed")?;
     }
     Ok(js::value::undefined())
@@ -1081,231 +1317,245 @@ fn early_hook_done(
 /// or the record's end superseded are ignored.
 fn await_value(
     scope: &Scope<'_>,
-    record: Object<'_>,
+    record: TestRecord<'_>,
     value: HandleValue<'_>,
     next: u8,
     timed: bool,
 ) -> Result<(), ExnThrown> {
-    let token = record.num(scope, c"token")? + 1.0;
-    record.set_property(scope, c"token", token)?;
-    record.set_property(scope, c"phase", f64::from(next))?;
+    let (token, deadline) = {
+        let mut data = record.data_mut();
+        data.token += 1;
+        data.phase = next;
+        (data.token, data.deadline)
+    };
     let promise = js::Promise::call_original_resolve(scope, value)?;
-    let record_value = record.to_jsval_throwing(scope)?;
-    let token_value = scope.root_value(js::value::from_f64(token));
-    let fulfilled = scope.root_value(js::value::from_bool(false));
-    let rejected = scope.root_value(js::value::from_bool(true));
-    let on_fulfilled = closure(scope, 1, resume, &[record_value, token_value, fulfilled])?;
-    let on_rejected = closure(scope, 1, resume, &[record_value, token_value, rejected])?;
-    promise.add_reactions(scope, Some(on_fulfilled), Some(on_rejected))?;
-    let deadline = record.get_property(scope, c"deadline")?;
-    if timed && deadline.is_number() && deadline.to_number().is_finite() {
-        let delay = (deadline.to_number() - now_ms()).max(0.0);
-        let on_timeout = closure(scope, 0, resume_timeout, &[record_value, token_value])?;
-        let callback = js::Callable::from_jsval(scope, on_timeout.to_jsval_throwing(scope)?, ())
-            .map_err(|e| e.throw(scope))?;
+    let awaited = js::class::create_instance_with::<AwaitImpl>(scope, |_| AwaitImpl {
+        record: Heap::from(record),
+        token,
+    })?;
+    let on_fulfilled = Function::new_callback(scope, c"", 1, resume_fulfilled, awaited)?;
+    let on_rejected = Function::new_callback(scope, c"", 1, resume_rejected, awaited)?;
+    promise.add_reactions(scope, Some(*on_fulfilled), Some(*on_rejected))?;
+    if let Some(deadline) = deadline.filter(|deadline| timed && deadline.is_finite()) {
+        let delay = (deadline - now_ms()).max(0.0);
+        let on_timeout = Function::new_callback(scope, c"", 0, resume_timeout, awaited)?;
         let id = core_runtime::event_loop::timer::start_timer(
             scope,
-            callback,
+            on_timeout.as_callable(),
             HandleValue::undefined(),
             &[],
             std::time::Duration::from_micros((delay * 1000.0) as u64),
             false,
             None,
         );
-        if let Some(id) = id {
-            record.set_property(scope, c"timer", id as f64)?;
-        }
+        record.data_mut().timer = id;
     }
     Ok(())
 }
 
 /// Cancel the timer of `record`'s deadline, if it has one.
-fn clear_timer(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    let timer = record.get_property(scope, c"timer")?;
-    if timer.is_number() {
-        let id = timer.to_number() as u64;
+fn clear_timer(record: TestRecord<'_>) {
+    if let Some(id) = record.data_mut().timer.take() {
         core_runtime::event_loop::with_active_event_loop(|event_loop| {
             event_loop.clear_js_timer(id)
         });
-        record.set_property(scope, c"timer", js::value::undefined())?;
     }
-    Ok(())
 }
 
-/// Whether the await `captures` was created for, which hold its record and token, is the record's
-/// current await. If it is, it is consumed and its timer cancelled.
-fn take_await(scope: &Scope<'_>, captures: &Captures<'_>) -> Result<bool, ExnThrown> {
-    let record = captures.obj(0)?;
-    let token = record.num(scope, c"token")?;
-    let awaited = captures.get(1)?;
-    if !awaited.is_number() || awaited.to_number() != token {
-        return Ok(false);
-    }
-    record.set_property(scope, c"token", token + 1.0)?;
-    clear_timer(scope, record)?;
-    Ok(true)
+/// The payload of the reactions and the timer callback of an await: the record, and the await's
+/// token.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct Await {
+    record: Heap<TestRecordImpl>,
+    #[no_trace]
+    token: u64,
 }
 
-/// The reaction to an awaited value, whose payload captures the record, the await's token, and
-/// whether this is the rejection reaction.
+#[core_runtime::jsmethods]
+impl Await {}
+
+/// If the await whose payload is `payload` is its record's current await, consume it, cancel its
+/// timer, and [`advance`] the record with `outcome`. Otherwise, do nothing.
 fn resume(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
+    payload: HandleValue<'_>,
+    outcome: Outcome<'_>,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    if !take_await(scope, &captures)? {
-        return Ok(js::value::undefined());
-    }
-    let record = captures.obj(0)?;
-    let outcome = if captures.flag(2)? {
-        Outcome::Error(args.get(0))
-    } else {
-        Outcome::Value
+    let awaited = cast_payload::<Await>(scope, payload);
+    let (record, token) = {
+        let data = awaited.data();
+        (data.record.get(scope), data.token)
     };
+    {
+        let mut data = record.data_mut();
+        if data.token != token {
+            return Ok(js::value::undefined());
+        }
+        data.token += 1;
+    }
+    clear_timer(record);
     if advance(scope, record, outcome).is_err() {
         core_runtime::event_loop::handle_and_clear_exception(scope);
     }
     Ok(js::value::undefined())
 }
 
-/// The timer callback of a record's deadline, whose payload captures the record and the await's
-/// token.
+/// The fulfillment reaction to an awaited value, whose payload is an [`Await`].
+fn resume_fulfilled(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    resume(scope, payload, Outcome::Value)
+}
+
+/// The rejection reaction to an awaited value, whose payload is an [`Await`].
+fn resume_rejected(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    resume(scope, payload, Outcome::Error(args.get(0)))
+}
+
+/// The timer callback of a record's deadline, whose payload is an [`Await`].
 fn resume_timeout(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    if !take_await(scope, &captures)? {
-        return Ok(js::value::undefined());
-    }
-    let record = captures.obj(0)?;
-    if advance(scope, record, Outcome::Timeout).is_err() {
-        core_runtime::event_loop::handle_and_clear_exception(scope);
-    }
-    Ok(js::value::undefined())
+    resume(scope, payload, Outcome::Timeout)
 }
 
 /// Set the deadline of `record` from its timeout.
-fn set_deadline(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    let timeout = record.num(scope, c"timeout")?;
-    if timeout.is_finite() {
-        record.set_property(scope, c"deadline", now_ms() + timeout)?;
+fn set_deadline(record: TestRecord<'_>) {
+    let mut data = record.data_mut();
+    if data.timeout.is_finite() {
+        data.deadline = Some(now_ms() + data.timeout);
     }
-    Ok(())
 }
 
 /// Mark `record` started.
-fn mark_started(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    record.set_property(scope, c"started", true)?;
-    record.set_property(scope, c"startTime", now_ms())
+fn mark_started(record: TestRecord<'_>) {
+    let mut data = record.data_mut();
+    data.started = true;
+    data.start_time = Some(now_ms());
 }
 
 /// The hooks to run in turn, with the context each receives.
-type HookList<'s> = Vec<(Object<'s>, HandleValue<'s>)>;
+type HookList<'s> = Vec<(TestRecord<'s>, HandleValue<'s>)>;
 
 /// Append the hooks of `hook_type` of `owner` to `list`, each receiving `ctx`.
 fn add_hooks<'s>(
     scope: &'s Scope<'_>,
     list: &mut HookList<'s>,
-    owner: Object<'_>,
-    hook_type: &'static std::ffi::CStr,
+    owner: TestRecord<'_>,
+    hook_type: HookType,
     ctx: HandleValue<'s>,
-) -> Result<(), ExnThrown> {
-    let hooks = owner.obj(scope, c"hooks")?.ok_or(ExnThrown)?;
-    for hook in objects(scope, hooks, hook_type)? {
-        list.push((hook, ctx));
-    }
-    Ok(())
+) {
+    let data = owner.data();
+    let hooks = match hook_type {
+        HookType::Before => &data.before,
+        HookType::After => &data.after,
+        HookType::BeforeEach => &data.before_each,
+        HookType::AfterEach => &data.after_each,
+    };
+    list.extend(hooks.iter().map(|hook| (hook.get(scope), ctx)));
 }
 
 /// The ancestors of `record`, starting with its parent.
-fn ancestors<'s>(scope: &'s Scope<'_>, record: Object<'_>) -> Result<Vec<Object<'s>>, ExnThrown> {
+fn ancestors<'s>(scope: &'s Scope<'_>, record: TestRecord<'_>) -> Vec<TestRecord<'s>> {
     let mut list = Vec::new();
-    let mut current = parent_of(scope, record)?;
+    let mut current = parent_of(scope, record);
     while let Some(ancestor) = current {
-        current = parent_of(scope, ancestor)?;
+        current = parent_of(scope, ancestor);
         list.push(ancestor);
     }
-    Ok(list)
+    list
 }
 
 /// The hooks that run after the function of the test `record`, or after it failed: the
 /// `afterEach` hooks of its ancestors, innermost first, unless it was skipped before it ran, then
 /// its own `after` hooks.
-fn after_hooks<'s>(scope: &'s Scope<'_>, record: Object<'_>) -> Result<HookList<'s>, ExnThrown> {
+fn after_hooks<'s>(
+    scope: &'s Scope<'_>,
+    record: TestRecord<'_>,
+) -> Result<HookList<'s>, ExnThrown> {
     let mut list = Vec::new();
     let ctx = context_of(scope, record)?.to_jsval_throwing(scope)?;
-    if !record.flag(scope, c"wasSkipped")? {
-        for ancestor in ancestors(scope, record)? {
-            add_hooks(scope, &mut list, ancestor, c"afterEach", ctx)?;
+    if !record.data().was_skipped {
+        for ancestor in ancestors(scope, record) {
+            add_hooks(scope, &mut list, ancestor, HookType::AfterEach, ctx);
         }
     }
-    add_hooks(scope, &mut list, record, c"after", ctx)?;
+    add_hooks(scope, &mut list, record, HookType::After, ctx);
     Ok(list)
 }
 
 /// The `after` hooks of the suite or root `record`.
 fn own_after_hooks<'s>(
     scope: &'s Scope<'_>,
-    record: Object<'_>,
+    record: TestRecord<'_>,
 ) -> Result<HookList<'s>, ExnThrown> {
     let mut list = Vec::new();
-    let ctx = hook_context(scope, record)?.to_jsval_throwing(scope)?;
-    add_hooks(scope, &mut list, record, c"after", ctx)?;
+    let ctx = hook_context(scope, record)?;
+    add_hooks(scope, &mut list, record, HookType::After, ctx);
     Ok(list)
 }
 
 /// Make `list` the hooks `record` runs next, followed by the phase `next`.
-fn queue_hooks(
-    scope: &Scope<'_>,
-    record: Object<'_>,
-    list: HookList<'_>,
-    next: u8,
-) -> Result<(), ExnThrown> {
-    let queue = js::Array::new(scope, 0)?;
-    for (index, (hook, ctx)) in list.into_iter().enumerate() {
-        queue.set_element(scope, 2 * index as u32, hook)?;
-        queue.set_element(scope, 2 * index as u32 + 1, ctx)?;
-    }
-    record.set_property(scope, c"hookQueue", *queue)?;
-    record.set_property(scope, c"hookIndex", 0)?;
-    record.set_property(scope, c"next", f64::from(next))?;
-    record.set_property(scope, c"phase", f64::from(phase::HOOKS))
+fn queue_hooks(record: TestRecord<'_>, list: HookList<'_>, next: u8) {
+    let mut data = record.data_mut();
+    data.hook_queue = list
+        .into_iter()
+        .map(|(hook, ctx)| QueuedHook {
+            hook: Heap::from(hook),
+            ctx: Heap::from(ctx.get()),
+        })
+        .collect();
+    data.hook_index = 0;
+    data.next = next;
+    data.phase = phase::HOOKS;
 }
 
 /// Run the hooks that follow the failure of the test `record`, ignoring their failures, then
 /// finish it.
-fn clean_up(scope: &Scope<'_>, record: Object<'_>) -> Result<(), ExnThrown> {
-    record.set_property(scope, c"cleanup", true)?;
+fn clean_up(scope: &Scope<'_>, record: TestRecord<'_>) -> Result<(), ExnThrown> {
+    record.data_mut().cleanup = true;
     let list = after_hooks(scope, record)?;
-    queue_hooks(scope, record, list, phase::POST)
+    queue_hooks(record, list, phase::POST);
+    Ok(())
 }
 
 /// Run `hook` with `ctx`, unless it is a `before` or `after` hook that ran or runs already.
 /// Returns the promise that resolves once it finished.
 fn start_hook<'s>(
     scope: &'s Scope<'_>,
-    hook: Object<'_>,
+    hook: TestRecord<'_>,
     ctx: HandleValue<'_>,
 ) -> Result<js::Promise<'s>, ExnThrown> {
-    let hook_type = hook.get_property(scope, c"hookType")?;
-    let once = is_str(scope, hook_type, c"before")? || is_str(scope, hook_type, c"after")?;
-    if once && hook.num(scope, c"state")? != 0.0 {
-        if let Some(done) = hook.obj(scope, c"done")? {
-            if let Ok(done) = done.cast::<js::Promise>() {
-                return Ok(done);
-            }
+    let existing = {
+        let data = hook.data();
+        let once = matches!(data.hook_type, HookType::Before | HookType::After);
+        if once && data.hook_state != 0 {
+            data.done.as_ref().map(|done| done.get(scope))
+        } else {
+            None
         }
+    };
+    if let Some(done) = existing {
+        return Ok(done);
     }
     let done = js::Promise::new_pending(scope)?;
-    hook.set_property(scope, c"state", 1)?;
-    hook.set_property(scope, c"failed", false)?;
-    hook.set_property(scope, c"error", js::value::undefined())?;
-    hook.set_property(scope, c"ctx", ctx)?;
-    hook.set_property(scope, c"done", *done)?;
-    hook.set_property(scope, c"phase", f64::from(phase::CALL))?;
+    {
+        let mut data = hook.data_mut();
+        data.hook_state = 1;
+        data.failed = false;
+        data.error.set(js::value::undefined());
+        data.hook_ctx.set(ctx.get());
+        data.done = Some(Heap::from(done));
+        data.phase = phase::CALL;
+    }
     advance(scope, hook, Outcome::Value)?;
     Ok(done)
 }
@@ -1314,25 +1564,32 @@ fn start_hook<'s>(
 /// record, whose function doesn't run. After it, it fails the record, and its remaining
 /// `afterEach` hooks don't run. Hooks that fail while the record cleans up after a failure are
 /// ignored.
-fn hook_failed(scope: &Scope<'_>, record: Object<'_>, hook: Object<'_>) -> Result<(), ExnThrown> {
-    let error = hook.get_property(scope, c"error")?;
-    if kind_of(scope, record)? == ROOT {
+fn hook_failed(
+    scope: &Scope<'_>,
+    record: TestRecord<'_>,
+    hook: TestRecord<'_>,
+) -> Result<(), ExnThrown> {
+    let error = hook.data().error.get(scope);
+    let (kind, cleanup, next) = {
+        let data = record.data();
+        (data.kind, data.cleanup, data.next)
+    };
+    if kind == ROOT {
         return report::report_root_hook_failure(scope, error);
     }
-    if record.flag(scope, c"cleanup")? {
+    if cleanup {
         return Ok(());
     }
     fail(scope, record, error, "hookFailed")?;
-    record.set_property(scope, c"cleanup", true)?;
-    let next = record.num(scope, c"next")? as u8;
+    record.data_mut().cleanup = true;
     if next == phase::CALL {
         let list = after_hooks(scope, record)?;
-        queue_hooks(scope, record, list, phase::POST)?;
+        queue_hooks(record, list, phase::POST);
     } else if next == phase::SUITE_RUN {
         let list = own_after_hooks(scope, record)?;
-        queue_hooks(scope, record, list, phase::POST)?;
+        queue_hooks(record, list, phase::POST);
     } else {
-        record.set_property(scope, c"skipAfterEach", true)?;
+        record.data_mut().skip_after_each = true;
     }
     Ok(())
 }
@@ -1343,25 +1600,31 @@ fn hook_failed(scope: &Scope<'_>, record: Object<'_>, hook: Object<'_>) -> Resul
 /// function threw.
 fn call_body<'s>(
     scope: &'s Scope<'_>,
-    record: Object<'_>,
+    record: TestRecord<'_>,
     ctx: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let callee = record.get_property(scope, c"fn")?;
-    let Some(function) = as_object(scope, callee).filter(|callee| callee.is_callable()) else {
-        return Ok(scope.root_value(js::value::undefined()));
+    let callee = record.data().callee.get(scope);
+    let Some(function) = Object::from_value(scope, callee)
+        .ok()
+        .filter(|callee| callee.is_callable())
+    else {
+        return Ok(HandleValue::undefined());
     };
-    let declared = function.num(scope, c"length")?;
-    if declared == 2.0 {
+    let declared = function.get_property(scope, c"length")?;
+    if declared.is_number() && declared.to_number() == 2.0 {
         let settled = js::Promise::new_pending(scope)?;
-        let called = scope.root_value(js::value::from_bool(false));
-        let values = [(*settled).to_jsval_throwing(scope)?, called];
-        let done = closure(scope, 1, callback_done, &values)?;
+        let callback =
+            js::class::create_instance_with::<DoneCallbackImpl>(scope, |_| DoneCallbackImpl {
+                promise: Heap::from(settled),
+                called: false,
+            })?;
+        let done = Function::new_callback(scope, c"", 1, callback_done, callback)?;
         let done = done.to_jsval_throwing(scope)?;
         return match call_with_record(scope, record, callee, ctx, &[ctx, done]) {
             Err(ExnThrown) => rejected_with_exception(scope),
             Ok(result) => {
-                let is_promise = as_object(scope, result)
-                    .is_some_and(|object| js::Promise::is_promise(object.handle()));
+                let is_promise = Object::from_value(scope, result)
+                    .is_ok_and(|object| js::Promise::is_promise(object.handle()));
                 if is_promise {
                     fail_with(
                         scope,
@@ -1371,7 +1634,7 @@ fn call_body<'s>(
                     )?;
                     Ok(result)
                 } else {
-                    (*settled).to_jsval_throwing(scope)
+                    settled.to_jsval_throwing(scope)
                 }
             }
         };
@@ -1384,29 +1647,35 @@ fn call_body<'s>(
 
 /// A promise rejected with the pending exception.
 fn rejected_with_exception<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
-    let error = take_exception(scope);
+    let error = js::exception::take_pending_or_undefined(scope);
     js::Promise::call_original_reject(scope, error)?.to_jsval_throwing(scope)
 }
 
-/// The callback a test function that declares two parameters receives, whose payload captures the
-/// promise it settles and whether it was called: reject the promise with a truthy first argument,
-/// and resolve it otherwise.
+/// The payload of [`callback_done`]: the promise it settles, and whether it was called.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct DoneCallback {
+    promise: Heap<js::promise::Promise>,
+    #[no_trace]
+    called: bool,
+}
+
+#[core_runtime::jsmethods]
+impl DoneCallback {}
+
+/// The callback a test function that declares two parameters receives, whose payload is a
+/// [`DoneCallback`]: reject the promise with a truthy first argument, and resolve it otherwise.
 fn callback_done(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    if captures.flag(1)? {
+    let callback = cast_payload::<DoneCallback>(scope, payload);
+    if std::mem::replace(&mut callback.data_mut().called, true) {
         return Err(test_failure("callback invoked multiple times").throw(scope));
     }
-    captures.set(1, true)?;
-    let promise = captures
-        .obj(0)?
-        .cast::<js::Promise>()
-        .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
+    let promise = callback.data().promise.get(scope);
     let error = args.get(0);
-    if truthy(scope, error) {
+    if js::conversion::to_boolean(error) {
         promise.reject(scope, error)?;
     } else {
         promise.resolve(scope, HandleValue::undefined())?;
@@ -1416,82 +1685,108 @@ fn callback_done(
 
 /// Take the steps of running `record` from its `phase`, until it awaits a value or finishes.
 /// `outcome` describes how the value the record awaited settled.
-fn advance(scope: &Scope<'_>, record: Object<'_>, outcome: Outcome<'_>) -> Result<(), ExnThrown> {
+fn advance(
+    scope: &Scope<'_>,
+    record: TestRecord<'_>,
+    outcome: Outcome<'_>,
+) -> Result<(), ExnThrown> {
     let mut outcome = Some(outcome);
-    let kind = kind_of(scope, record)?;
+    let kind = record.data().kind;
     loop {
         let outcome = outcome.take().unwrap_or(Outcome::Value);
-        let current = record.num(scope, c"phase")? as u8;
+        let current = record.data().phase;
         match current {
             phase::START if kind == SUITE => {
-                mark_started(scope, record)?;
-                if record.flag(scope, c"building")? {
-                    let build = record.get_property(scope, c"buildPromise")?;
+                mark_started(record);
+                let build = {
+                    let data = record.data();
+                    if data.building {
+                        data.build_promise.as_ref().map(|build| build.get(scope))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(build) = build {
+                    let build = build.to_jsval_throwing(scope)?;
                     return await_value(scope, record, build, phase::BUILT, false);
                 }
-                record.set_property(scope, c"phase", f64::from(phase::BUILT))?;
+                record.data_mut().phase = phase::BUILT;
             }
             phase::START if kind == TEST => {
-                mark_started(scope, record)?;
-                let plan = record.get_property(scope, c"planOption")?;
-                if plan.is_number() && !record.get_property(scope, c"plan")?.is_number() {
-                    record.set_property(scope, c"plan", plan)?;
-                    record.set_property(scope, c"planActual", 0)?;
-                }
-                let skipped = record.flag(scope, c"skipped")?;
-                record.set_property(scope, c"wasSkipped", skipped)?;
+                mark_started(record);
+                let skipped = {
+                    let mut data = record.data_mut();
+                    if data.plan.is_none() {
+                        if let Some(plan) = data.plan_option {
+                            data.plan = Some(plan);
+                            data.plan_actual = 0.0;
+                        }
+                    }
+                    data.was_skipped = data.skipped;
+                    data.skipped
+                };
                 let mut list = Vec::new();
-                if let Some(parent) = parent_of(scope, record)? {
-                    let parent_ctx = hook_context(scope, parent)?.to_jsval_throwing(scope)?;
-                    add_hooks(scope, &mut list, parent, c"before", parent_ctx)?;
+                if let Some(parent) = parent_of(scope, record) {
+                    let parent_ctx = hook_context(scope, parent)?;
+                    add_hooks(scope, &mut list, parent, HookType::Before, parent_ctx);
                     if !skipped {
                         let ctx = context_of(scope, record)?.to_jsval_throwing(scope)?;
-                        let mut chain = ancestors(scope, record)?;
+                        let mut chain = ancestors(scope, record);
                         chain.reverse();
                         for ancestor in chain {
-                            add_hooks(scope, &mut list, ancestor, c"beforeEach", ctx)?;
+                            add_hooks(scope, &mut list, ancestor, HookType::BeforeEach, ctx);
                         }
                     }
                 }
-                queue_hooks(scope, record, list, phase::CALL)?;
+                queue_hooks(record, list, phase::CALL);
             }
             phase::HOOKS => {
-                if let Some(hook) = record.obj(scope, c"currentHook")? {
-                    record.set_property(scope, c"currentHook", js::value::undefined())?;
-                    if hook.flag(scope, c"failed")? {
+                let finished_hook = record
+                    .data_mut()
+                    .current_hook
+                    .take()
+                    .map(|hook| hook.get(scope));
+                if let Some(hook) = finished_hook {
+                    if hook.data().failed {
                         hook_failed(scope, record, hook)?;
                         continue;
                     }
                 }
-                let queue = objects_array(scope, record, c"hookQueue")?;
-                let index = record.num(scope, c"hookIndex")? as u32;
-                if 2 * index >= length(scope, queue)? {
-                    let next = record.num(scope, c"next")? as u8;
-                    record.set_property(scope, c"phase", f64::from(next))?;
+                let queued = {
+                    let mut data = record.data_mut();
+                    match data.hook_queue.get(data.hook_index) {
+                        Some(queued) => {
+                            let entry = (queued.hook.get(scope), queued.ctx.get(scope));
+                            data.hook_index += 1;
+                            Some(entry)
+                        }
+                        None => {
+                            data.phase = data.next;
+                            None
+                        }
+                    }
+                };
+                let Some((hook, ctx)) = queued else {
                     continue;
-                }
-                record.set_property(scope, c"hookIndex", index + 1)?;
-                let hook =
-                    as_object(scope, queue.get_element(scope, 2 * index)?).ok_or(ExnThrown)?;
-                let ctx = queue.get_element(scope, 2 * index + 1)?;
-                if record.flag(scope, c"skipAfterEach")?
-                    && is_str(scope, hook.get_property(scope, c"hookType")?, c"afterEach")?
-                {
+                };
+                let skip =
+                    record.data().skip_after_each && hook.data().hook_type == HookType::AfterEach;
+                if skip {
                     continue;
                 }
                 let done = start_hook(scope, hook, ctx)?;
-                record.set_property(scope, c"currentHook", hook)?;
+                record.data_mut().current_hook = Some(Heap::from(hook));
                 return await_value(
                     scope,
                     record,
-                    (*done).to_jsval_throwing(scope)?,
+                    done.to_jsval_throwing(scope)?,
                     phase::HOOKS,
                     false,
                 );
             }
             phase::CALL => {
-                set_deadline(scope, record)?;
-                if kind == TEST && record.flag(scope, c"skipped")? {
+                set_deadline(record);
+                if kind == TEST && record.data().skipped {
                     return await_value(
                         scope,
                         record,
@@ -1501,7 +1796,7 @@ fn advance(scope: &Scope<'_>, record: Object<'_>, outcome: Outcome<'_>) -> Resul
                     );
                 }
                 let ctx = if kind == HOOK {
-                    record.get_property(scope, c"ctx")?
+                    record.data().hook_ctx.get(scope)
                 } else {
                     context_of(scope, record)?.to_jsval_throwing(scope)?
                 };
@@ -1511,17 +1806,20 @@ fn advance(scope: &Scope<'_>, record: Object<'_>, outcome: Outcome<'_>) -> Resul
             phase::SETTLED if kind == HOOK => {
                 match outcome {
                     Outcome::Error(error) => {
-                        record.set_property(scope, c"failed", true)?;
-                        record.set_property(scope, c"error", error)?;
+                        let mut data = record.data_mut();
+                        data.failed = true;
+                        data.error.set(error.get());
                     }
                     Outcome::Timeout => {
-                        let message = timeout_message(scope, record)?;
-                        record.set_property(scope, c"failed", true)?;
-                        record.set_property(scope, c"error", message.as_str())?;
+                        let message = timeout_message(record);
+                        let message = js::JSString::from_str(scope, &message)?;
+                        let mut data = record.data_mut();
+                        data.failed = true;
+                        data.error.set(message.as_value());
                     }
                     Outcome::Value => {}
                 }
-                record.set_property(scope, c"state", 2)?;
+                record.data_mut().hook_state = 2;
                 return resolve_done(scope, record);
             }
             phase::SETTLED => match outcome {
@@ -1530,7 +1828,10 @@ fn advance(scope: &Scope<'_>, record: Object<'_>, outcome: Outcome<'_>) -> Resul
                     clean_up(scope, record)?;
                 }
                 Outcome::Timeout => {
-                    let message = string(scope, &timeout_message(scope, record)?)?;
+                    let message = js::conversion::ToJSVal::to_jsval_throwing(
+                        &timeout_message(record),
+                        scope,
+                    )?;
                     cancel(scope, record, message)?;
                     clean_up(scope, record)?;
                 }
@@ -1538,18 +1839,23 @@ fn advance(scope: &Scope<'_>, record: Object<'_>, outcome: Outcome<'_>) -> Resul
                     // As in Node.js, a test waits for its subtests only until none of them is
                     // pending for the first time. Subtests started after that are cancelled if
                     // they haven't finished when the test does.
-                    if record.num(scope, c"pending")? > 0.0
-                        && !record.flag(scope, c"subtestsSettled")?
-                    {
+                    let wait = {
+                        let data = record.data();
+                        data.pending > 0 && !data.subtests_settled
+                    };
+                    if wait {
                         return wait_for_subtests(scope, record, phase::SUBTESTS);
                     }
-                    record.set_property(scope, c"phase", f64::from(phase::SUBTESTS))?;
+                    record.data_mut().phase = phase::SUBTESTS;
                 }
             },
             phase::SUBTESTS => {
                 match outcome {
                     Outcome::Timeout => {
-                        let message = string(scope, &timeout_message(scope, record)?)?;
+                        let message = js::conversion::ToJSVal::to_jsval_throwing(
+                            &timeout_message(record),
+                            scope,
+                        )?;
                         cancel(scope, record, message)?;
                         clean_up(scope, record)?;
                         continue;
@@ -1561,12 +1867,14 @@ fn advance(scope: &Scope<'_>, record: Object<'_>, outcome: Outcome<'_>) -> Resul
                     }
                     Outcome::Value => {}
                 }
-                let plan = record.get_property(scope, c"plan")?;
-                let actual = record.num(scope, c"planActual")?;
-                if plan.is_number() && plan.to_number() != actual {
+                let (plan, actual) = {
+                    let data = record.data();
+                    (data.plan, data.plan_actual)
+                };
+                if let Some(plan) = plan.filter(|plan| *plan != actual) {
                     let message = format!(
                         "plan expected {} assertions but received {}",
-                        crate::errors::number_to_string(plan.to_number()),
+                        crate::errors::number_to_string(plan),
                         crate::errors::number_to_string(actual)
                     );
                     fail_with(scope, record, &message, "testCodeFailure")?;
@@ -1574,46 +1882,59 @@ fn advance(scope: &Scope<'_>, record: Object<'_>, outcome: Outcome<'_>) -> Resul
                     continue;
                 }
                 let list = after_hooks(scope, record)?;
-                queue_hooks(scope, record, list, phase::POST)?;
+                queue_hooks(record, list, phase::POST);
             }
             phase::BUILT => {
                 let mut list = Vec::new();
-                if let Some(parent) = parent_of(scope, record)? {
-                    let parent_ctx = hook_context(scope, parent)?.to_jsval_throwing(scope)?;
-                    add_hooks(scope, &mut list, parent, c"before", parent_ctx)?;
+                if let Some(parent) = parent_of(scope, record) {
+                    let parent_ctx = hook_context(scope, parent)?;
+                    add_hooks(scope, &mut list, parent, HookType::Before, parent_ctx);
                 }
-                let ctx = hook_context(scope, record)?.to_jsval_throwing(scope)?;
-                add_hooks(scope, &mut list, record, c"before", ctx)?;
-                queue_hooks(scope, record, list, phase::SUITE_RUN)?;
+                let ctx = hook_context(scope, record)?;
+                add_hooks(scope, &mut list, record, HookType::Before, ctx);
+                queue_hooks(record, list, phase::SUITE_RUN);
             }
             phase::SUITE_RUN => {
-                set_deadline(scope, record)?;
-                if !record.flag(scope, c"skipped")? && !record.flag(scope, c"failed")? {
-                    for subtest in objects(scope, record, c"subtests")? {
-                        if !subtest.flag(scope, c"queued")? && !subtest.flag(scope, c"finished")? {
+                set_deadline(record);
+                let (skipped, failed) = {
+                    let data = record.data();
+                    (data.skipped, data.failed)
+                };
+                if !skipped && !failed {
+                    for subtest in subtests_of(scope, record) {
+                        let (queued, finished) = {
+                            let data = subtest.data();
+                            (data.queued, data.finished)
+                        };
+                        if !queued && !finished {
                             start_subtest(scope, subtest)?;
                         }
                     }
                 }
-                if record.num(scope, c"pending")? > 0.0 {
+                if record.data().pending > 0 {
                     return wait_for_subtests(scope, record, phase::SUITE_DONE);
                 }
-                record.set_property(scope, c"phase", f64::from(phase::SUITE_DONE))?;
+                record.data_mut().phase = phase::SUITE_DONE;
             }
             phase::SUITE_DONE => {
                 if let Outcome::Timeout = outcome {
-                    let message = string(scope, &timeout_message(scope, record)?)?;
+                    let message = js::conversion::ToJSVal::to_jsval_throwing(
+                        &timeout_message(record),
+                        scope,
+                    )?;
                     cancel(scope, record, message)?;
                 }
-                let failed = record.flag(scope, c"failed")?;
-                record.set_property(scope, c"cleanup", failed)?;
+                {
+                    let mut data = record.data_mut();
+                    data.cleanup = data.failed;
+                }
                 let list = own_after_hooks(scope, record)?;
-                queue_hooks(scope, record, list, phase::POST)?;
+                queue_hooks(record, list, phase::POST);
             }
             phase::POST => return post_run(scope, record, None),
             phase::ROOT_DONE => {
-                record.set_property(scope, c"afterDone", true)?;
-                if harness(scope)?.flag(scope, c"exiting")? {
+                record.data_mut().after_done = true;
+                if harness(scope)?.data().exiting {
                     return summarize(scope);
                 }
                 return Ok(());
@@ -1623,17 +1944,47 @@ fn advance(scope: &Scope<'_>, record: Object<'_>, outcome: Outcome<'_>) -> Resul
     }
 }
 
+/// Run the hooks that follow the test or suite `record` after its parent cancelled and finished
+/// it while it ran, as `clean_up` runs them after a failure, in a later job. A record that was
+/// running these hooks already runs the rest of them. `record` isn't finished or reported again.
+fn run_hooks_after_cancel(scope: &Scope<'_>, record: TestRecord<'_>) -> Result<(), ExnThrown> {
+    let (kind, current, next) = {
+        let data = record.data();
+        (data.kind, data.phase, data.next)
+    };
+    if kind != TEST && kind != SUITE {
+        return Ok(());
+    }
+    record.data_mut().cleanup = true;
+    if current == phase::HOOKS && next == phase::POST {
+        record.data_mut().next = phase::CANCELLED;
+        let running = record.data().current_hook.as_ref().and_then(|hook| {
+            hook.get(scope)
+                .data()
+                .done
+                .as_ref()
+                .map(|done| done.get(scope))
+        });
+        let running = match running {
+            Some(done) => done.to_jsval_throwing(scope)?,
+            None => HandleValue::undefined(),
+        };
+        return await_value(scope, record, running, phase::HOOKS, false);
+    }
+    let list = if kind == TEST {
+        after_hooks(scope, record)?
+    } else {
+        own_after_hooks(scope, record)?
+    };
+    queue_hooks(record, list, phase::CANCELLED);
+    await_value(scope, record, HandleValue::undefined(), phase::HOOKS, false)
+}
+
 /// Await the end of the subtests of `record`, then advance it from the phase `next`.
-fn wait_for_subtests(scope: &Scope<'_>, record: Object<'_>, next: u8) -> Result<(), ExnThrown> {
+fn wait_for_subtests(scope: &Scope<'_>, record: TestRecord<'_>, next: u8) -> Result<(), ExnThrown> {
     let waiting = js::Promise::new_pending(scope)?;
-    record.set_property(scope, c"waiting", *waiting)?;
-    await_value(
-        scope,
-        record,
-        (*waiting).to_jsval_throwing(scope)?,
-        next,
-        true,
-    )
+    record.data_mut().waiting = Some(Heap::from(waiting));
+    await_value(scope, record, waiting.to_jsval_throwing(scope)?, next, true)
 }
 
 /// Finish `record`: cancel its subtests that haven't finished, with `cancel_error` or the message
@@ -1641,34 +1992,37 @@ fn wait_for_subtests(scope: &Scope<'_>, record: Object<'_>, next: u8) -> Result<
 /// the next subtest of its parent.
 fn post_run(
     scope: &Scope<'_>,
-    record: Object<'_>,
+    record: TestRecord<'_>,
     cancel_error: Option<HandleValue<'_>>,
 ) -> Result<(), ExnThrown> {
-    let token = record.num(scope, c"token")?;
-    record.set_property(scope, c"token", token + 1.0)?;
-    clear_timer(scope, record)?;
-    let now = now_ms();
-    if !record.get_property(scope, c"endTime")?.is_number() {
-        record.set_property(scope, c"endTime", now)?;
+    record.data_mut().token += 1;
+    clear_timer(record);
+    {
+        let now = now_ms();
+        let mut data = record.data_mut();
+        data.end_time.get_or_insert(now);
+        data.start_time.get_or_insert(now);
+        data.queue.clear();
     }
-    if !record.get_property(scope, c"startTime")?.is_number() {
-        record.set_property(scope, c"startTime", now)?;
-    }
-    record.set_property(scope, c"queue", *js::Array::new(scope, 0)?)?;
     let message = match cancel_error {
         Some(error) => error,
-        None => string(
+        None => js::class::get_or_init_atom(
             scope,
-            "test did not finish before its parent and was cancelled",
+            c"test did not finish before its parent and was cancelled",
         )?,
     };
     let mut failed = 0;
-    for subtest in objects(scope, record, c"subtests")? {
-        if !subtest.flag(scope, c"finished")? {
+    for subtest in subtests_of(scope, record) {
+        if !subtest.data().finished {
             cancel(scope, subtest, message)?;
+            let started = subtest.data().started;
             post_run(scope, subtest, cancel_error)?;
+            if started {
+                run_hooks_after_cancel(scope, subtest)?;
+            }
         }
-        if !subtest.flag(scope, c"passed")? && !subtest.flag(scope, c"todo")? {
+        let data = subtest.data();
+        if !data.passed && !data.todo {
             failed += 1;
         }
     }
@@ -1681,53 +2035,70 @@ fn post_run(
             "subtestsFailed",
         )?;
     }
-    let expect_failure = record.flag(scope, c"expectFailure")?;
-    if !record.flag(scope, c"failed")? && expect_failure && !record.flag(scope, c"skipped")? {
+    let (expect_failure, failed, skipped) = {
+        let data = record.data();
+        (data.expect_failure, data.failed, data.skipped)
+    };
+    if !failed && expect_failure && !skipped {
         fail_with(
             scope,
             record,
             "test was expected to fail but passed",
             "expectedFailure",
         )?;
-        record.set_property(scope, c"passed", false)?;
+        record.data_mut().passed = false;
     } else {
-        let passed = !record.flag(scope, c"failed")? || expect_failure;
-        record.set_property(scope, c"passed", passed)?;
+        record.data_mut().passed = !failed || expect_failure;
     }
-    if let Some(tracker) = record.obj(scope, c"mock")? {
-        mock::reset_tracker(scope, tracker)?;
+    let tracker = record
+        .data()
+        .mock
+        .as_ref()
+        .map(|tracker| tracker.get(scope));
+    if let Some(tracker) = tracker {
+        tracker.reset(scope)?;
     }
-    record.set_property(scope, c"finished", true)?;
-    if let Some(controller) = record.obj(scope, c"controller")? {
-        call_method(scope, controller, c"abort", &[] as &[HandleValue])?;
+    record.data_mut().finished = true;
+    let controller = record
+        .data()
+        .controller
+        .as_ref()
+        .map(|controller| controller.get(scope));
+    if let Some(controller) = controller {
+        controller.abort(scope, HandleValue::undefined(), ScriptStackState::NonEmpty)?;
     }
     report::report_test(scope, record)?;
     resolve_done(scope, record)?;
 
-    let Some(parent) = parent_of(scope, record)? else {
+    let Some(parent) = parent_of(scope, record) else {
         return Ok(());
     };
-    if record.flag(scope, c"queued")? {
-        let pending = parent.num(scope, c"pending")? - 1.0;
-        parent.set_property(scope, c"pending", pending)?;
-        if pending <= 0.0 {
-            parent.set_property(scope, c"subtestsSettled", true)?;
-            if let Some(waiting) = parent.obj(scope, c"waiting")? {
-                parent.set_property(scope, c"waiting", js::value::undefined())?;
-                if let Ok(waiting) = waiting.cast::<js::Promise>() {
-                    waiting.resolve(scope, HandleValue::undefined())?;
-                }
+    if record.data().queued {
+        let waiting = {
+            let mut data = parent.data_mut();
+            data.pending = data.pending.saturating_sub(1);
+            if data.pending == 0 {
+                data.subtests_settled = true;
+                data.waiting.take_rooted(scope)
+            } else {
+                None
             }
+        };
+        if let Some(waiting) = waiting {
+            waiting.resolve(scope, HandleValue::undefined())?;
         }
     }
-    if parent
-        .obj(scope, c"running")?
-        .is_some_and(|running| same_object(running, record))
     {
-        parent.set_property(scope, c"running", js::value::undefined())?;
+        let mut data = parent.data_mut();
+        let running = data.running.as_ref().is_some_and(|running| {
+            running.get(scope).as_object().as_raw() == record.as_object().as_raw()
+        });
+        if running {
+            data.running = None;
+        }
     }
     process_queue(scope, parent)?;
-    if kind_of(scope, parent)? == ROOT {
+    if parent.data().kind == ROOT {
         root_check(scope)?;
     }
     Ok(())
@@ -1735,17 +2106,17 @@ fn post_run(
 
 /// Run the root's `after` hooks once its subtests all finished, unless they ran already.
 fn root_check(scope: &Scope<'_>) -> Result<(), ExnThrown> {
-    let harness = harness(scope)?;
+    let building = harness(scope)?.data().building;
     let root = root(scope)?;
-    if harness.flag(scope, c"building")?
-        || root.flag(scope, c"afterStarted")?
-        || root.num(scope, c"pending")? > 0.0
     {
-        return Ok(());
+        let mut data = root.data_mut();
+        if building || data.after_started || data.pending > 0 {
+            return Ok(());
+        }
+        data.after_started = true;
     }
-    root.set_property(scope, c"afterStarted", true)?;
     let list = own_after_hooks(scope, root)?;
-    queue_hooks(scope, root, list, phase::ROOT_DONE)?;
+    queue_hooks(root, list, phase::ROOT_DONE);
     advance(scope, root, Outcome::Value)
 }
 
@@ -1758,29 +2129,32 @@ fn on_before_exit(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let harness = harness(scope)?;
-    if harness.flag(scope, c"reported")? {
-        return Ok(js::value::undefined());
-    }
-    let exits = harness.num(scope, c"exits")? + 1.0;
-    harness.set_property(scope, c"exits", exits)?;
+    let exits = {
+        let mut data = harness.data_mut();
+        if data.reported {
+            return Ok(js::value::undefined());
+        }
+        data.exits += 1;
+        data.building = false;
+        data.exits
+    };
     let root = root(scope)?;
-    harness.set_property(scope, c"building", false)?;
-    root.set_property(scope, c"queue", *js::Array::new(scope, 0)?)?;
-    let message = string(
+    root.data_mut().queue.clear();
+    let message = js::class::get_or_init_atom(
         scope,
-        "Promise resolution is still pending but the event loop has already resolved",
+        c"Promise resolution is still pending but the event loop has already resolved",
     )?;
-    for record in objects(scope, root, c"subtests")? {
-        if !record.flag(scope, c"finished")? {
+    for record in subtests_of(scope, root) {
+        if !record.data().finished {
             cancel(scope, record, message)?;
             post_run(scope, record, Some(message))?;
         }
     }
     root_check(scope)?;
-    if root.flag(scope, c"afterDone")? || exits > 1.0 {
+    if root.data().after_done || exits > 1 {
         summarize(scope)?;
     } else {
-        harness.set_property(scope, c"exiting", true)?;
+        harness.data_mut().exiting = true;
     }
     Ok(js::value::undefined())
 }
@@ -1788,18 +2162,14 @@ fn on_before_exit(
 /// Write the summary, once, and set `process.exitCode` to 1 if a test failed.
 fn summarize(scope: &Scope<'_>) -> Result<(), ExnThrown> {
     let harness = harness(scope)?;
-    if harness.flag(scope, c"reported")? {
+    if std::mem::replace(&mut harness.data_mut().reported, true) {
         return Ok(());
     }
-    harness.set_property(scope, c"reported", true)?;
     let root = root(scope)?;
-    root.set_property(scope, c"endTime", now_ms())?;
+    root.data_mut().end_time = Some(now_ms());
     report::summary(scope, harness, root)?;
-    if !harness.flag(scope, c"success")? {
-        let process = scope.global().get_property(scope, c"process")?;
-        if let Some(process) = as_object(scope, process) {
-            process.set_property(scope, c"exitCode", 1)?;
-        }
+    if !harness.data().success {
+        set_failed_exit_code(scope)?;
     }
     Ok(())
 }
@@ -1808,39 +2178,54 @@ fn summarize(scope: &Scope<'_>) -> Result<(), ExnThrown> {
 // The module
 // ---------------------------------------------------------------------------
 
+/// The payload of [`register_entry`]: the kind of record, and the variant's name, if any.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct EntryVariant {
+    #[no_trace]
+    kind: u8,
+    #[no_trace]
+    modifier: Option<&'static str>,
+}
+
+#[core_runtime::jsmethods]
+impl EntryVariant {}
+
 /// The body of `test()`, `describe()` and their `skip`, `todo`, `only` and `expectFailure`
-/// variants, whose payload captures the kind of record and the variant's name, if any.
+/// variants, whose payload is an [`EntryVariant`].
 fn register_entry(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let kind = captures.get(0)?.to_number() as u8;
-    let modifier = rust_string(scope, captures.get(1)?);
+    let variant = cast_payload::<EntryVariant>(scope, payload);
+    let (kind, modifier) = {
+        let data = variant.data();
+        (data.kind, data.modifier)
+    };
     let result = register(
         scope,
         kind,
         [args.get(0), args.get(1), args.get(2)],
-        modifier.as_deref(),
+        modifier,
     )
     .map_err(|error| error.throw(scope))?;
     Ok(result.get())
 }
 
 /// The body of `before()`, `after()`, `beforeEach()` and `afterEach()`, whose payload is the hook
-/// type.
+/// type's name.
 fn register_hook(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let hook_type = String::from_jsval(scope, payload, ()).map_err(|e| e.throw(scope))?;
+    let hook_type = HookType::from_name(&hook_type).ok_or(ExnThrown)?;
     let owner = match current_record(scope)? {
         Some(owner) => owner,
         None => root(scope)?,
     };
-    create_hook(scope, owner, &hook_type, args.get(0), args.get(1))
+    create_hook(scope, owner, hook_type, args.get(0), args.get(1))
         .map_err(|error| error.throw(scope))?;
     Ok(js::value::undefined())
 }
@@ -1853,7 +2238,7 @@ fn get_test_context(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     match current_record(scope)? {
-        Some(record) if kind_of(scope, record)? != ROOT => {
+        Some(record) if record.data().kind != ROOT => {
             Ok(context_of(scope, record)?.to_jsval_raw_throwing(scope)?)
         }
         _ => Ok(js::value::undefined()),
@@ -1885,20 +2270,22 @@ fn entry_function<'s>(
     name: &std::ffi::CStr,
     kind: u8,
 ) -> Result<Object<'s>, ExnThrown> {
-    let kind_value = scope.root_value(js::value::from_f64(f64::from(kind)));
-    let undefined = scope.root_value(js::value::undefined());
-    let payload = js::Array::with_contents(scope, &[kind_value, undefined])?;
-    let function = *Function::new_callback(scope, name, 3, register_entry, *payload)?;
+    let entry_variant = |modifier| {
+        js::class::create_instance_with::<EntryVariantImpl>(scope, |_| EntryVariantImpl {
+            kind,
+            modifier,
+        })
+    };
+    let function = *Function::new_callback(scope, name, 3, register_entry, entry_variant(None)?)?;
     for (variant, c_variant) in [
         ("skip", c"skip"),
         ("todo", c"todo"),
         ("only", c"only"),
         ("expectFailure", c"expectFailure"),
     ] {
-        let variant_value = string(scope, variant)?;
-        let payload = js::Array::with_contents(scope, &[kind_value, variant_value])?;
+        let payload = entry_variant(Some(variant))?;
         let variant_function =
-            Function::new_callback(scope, c_variant, 3, register_entry, *payload)?;
+            Function::new_callback(scope, c_variant, 3, register_entry, payload)?;
         function.set_property(scope, c_variant, *variant_function)?;
     }
     Ok(function)
@@ -1947,7 +2334,7 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
             ("setResolveSnapshotPath", c"setResolveSnapshotPath"),
         ] {
             let qualified = format!("snapshot.{function}");
-            let kind = crate::stub::ExportKind::Function;
+            let kind = crate::stub::ExportKind::Function(1);
             let stub = crate::stub::stub_value(scope, name, &qualified, kind)?;
             snapshot.set_property(scope, c_function, stub)?;
         }
@@ -1978,124 +2365,253 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
 // TestContext and SuiteContext
 // ---------------------------------------------------------------------------
 
-/// The getters of `TestContext.prototype`. `SuiteContext.prototype` has the first
-/// [`SUITE_GETTERS`] of them.
-const GETTERS: &[&std::ffi::CStr] = &[
-    c"name",
-    c"fullName",
-    c"filePath",
-    c"signal",
-    c"passed",
-    c"attempt",
-    c"error",
-    c"assert",
-    c"mock",
-    c"workerId",
-];
-
-/// The number of [`GETTERS`] `SuiteContext.prototype` has.
-const SUITE_GETTERS: usize = 6;
-
-/// The body of a context getter, whose payload is its index in [`GETTERS`].
-fn context_getter(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let record = record_of(scope, scope.root_value(args.this()))?;
-    match payload.to_number() as usize {
-        0 => Ok(record.get_property(scope, c"name")?.get()),
-        1 => full_name(scope, record)?
-            .as_str()
-            .to_jsval_raw_throwing(scope),
-        2 => Ok(entry_file(scope)?.get()),
-        3 => Ok(signal_of(scope, record)?.get()),
-        4 => Ok(js::value::from_bool(record.flag(scope, c"passed")?)),
-        5 => Ok(js::value::from_f64(0.0)),
-        6 if record.flag(scope, c"failed")? => Ok(record.get_property(scope, c"error")?.get()),
-        6 => Ok(js::value::null()),
-        7 => assert_of(scope, record)?.to_jsval_raw_throwing(scope),
-        8 => mock_of(scope, record)?.to_jsval_raw_throwing(scope),
-        _ => Ok(js::value::undefined()),
-    }
+/// The record of a context, or the `TypeError` of a context created with `new`, which has none.
+fn record_of<'s>(
+    scope: &'s Scope<'_>,
+    record: &Option<Heap<TestRecordImpl>>,
+) -> Result<TestRecord<'s>, ExnThrown> {
+    record
+        .as_ref()
+        .map(|record| record.get(scope))
+        .ok_or_else(|| {
+            js::error::TypeError("Cannot read properties of undefined".into()).throw(scope)
+        })
 }
 
-/// Define the first `count` [`GETTERS`] on `proto`.
-fn define_getters(scope: &Scope<'_>, proto: Object<'_>, count: usize) -> Result<(), ExnThrown> {
-    for (index, name) in GETTERS.iter().enumerate().take(count) {
-        let getter = Function::new_callback(scope, name, 0, context_getter, index as f64)?;
-        proto.define_accessor(scope, name, Some(*getter), None, 0)?;
-    }
-    Ok(())
+/// A [`counted_assertion`] function of `record` that calls `callee`.
+fn counted_assertion_function<'s>(
+    scope: &'s Scope<'_>,
+    record: TestRecord<'_>,
+    callee: HandleValue<'_>,
+) -> Result<Function<'s>, ExnThrown> {
+    let assertion =
+        js::class::create_instance_with::<CountedAssertionImpl>(scope, |_| CountedAssertionImpl {
+            record: Heap::from(record),
+            callee: Heap::from(callee.get()),
+        })?;
+    Function::new_callback(scope, c"", 0, counted_assertion, assertion)
 }
 
 /// `t.assert` of the test `record`, created on first use: the functions [`assertions`] holds, and
 /// `node:assert`'s `ok` unless it holds one, each counting towards the plan.
-fn assert_of<'s>(scope: &'s Scope<'_>, record: Object<'_>) -> Result<Object<'s>, ExnThrown> {
-    if let Some(assert) = record.obj(scope, c"assert")? {
+fn assert_of<'s>(scope: &'s Scope<'_>, record: TestRecord<'_>) -> Result<Object<'s>, ExnThrown> {
+    if let Some(assert) = record
+        .data()
+        .assert
+        .as_ref()
+        .map(|assert| assert.get(scope))
+    {
         return Ok(assert);
     }
-    let assert = Object::new_plain(scope)?;
-    assert.set_prototype(scope, js::native::HandleObject::null())?;
+    let assert = Object::new_with_null_prototype(scope)?;
     let map = assertions(scope)?;
-    let record_value = record.to_jsval_throwing(scope)?;
     let mut has_ok = false;
     for key in map.own_keys(scope)? {
         let id = scope.root_id(js::id::value_to_id(scope, key)?);
         let callee = map.get_property_by_id(scope, id)?;
-        let wrapper = closure(scope, 0, counted_assertion, &[record_value, callee])?;
-        assert.set_property_by_id(scope, id, wrapper)?;
-        has_ok |= is_str(scope, key, c"ok")?;
+        let wrapper = counted_assertion_function(scope, record, callee)?;
+        assert.set_property_by_id(scope, id, *wrapper)?;
+        has_ok |= crate::support::is_str(scope, key, c"ok")?;
     }
     if !has_ok {
         if let Some(node_assert) = core_runtime::module::builtin_namespace(scope, "node:assert")? {
             let ok = node_assert.get_property(scope, c"ok")?;
-            let wrapper = closure(scope, 0, counted_assertion, &[record_value, ok])?;
-            assert.set_property(scope, c"ok", wrapper)?;
+            let wrapper = counted_assertion_function(scope, record, ok)?;
+            assert.set_property(scope, c"ok", *wrapper)?;
         }
     }
-    record.set_property(scope, c"assert", assert)?;
+    record.data_mut().assert = Some(Heap::from(assert));
     Ok(assert)
 }
 
-/// Add `message` to the diagnostics of the context `this`'s record.
-fn add_diagnostic(
-    scope: &Scope<'_>,
-    this: Object<'_>,
-    message: HandleValue<'_>,
-) -> Result<(), ExnThrown> {
-    let record = record_of(scope, this.to_jsval_throwing(scope)?)?;
-    push(
-        scope,
-        objects_array(scope, record, c"diagnostics")?,
-        message,
-    )
+/// Add `message` to the diagnostics of `record`.
+fn add_diagnostic(record: TestRecord<'_>, message: Option<HandleValue<'_>>) {
+    let message = message.unwrap_or(HandleValue::undefined());
+    record
+        .data_mut()
+        .diagnostics
+        .push(Heap::from(message.get()));
+}
+
+/// The rooted front element of `queue`, which is removed from it.
+#[js::allow_unrooted]
+fn pop_front_rooted<'s>(
+    scope: &'s Scope<'_>,
+    queue: &mut VecDeque<Heap<TestRecordImpl>>,
+) -> Option<TestRecord<'s>> {
+    queue.pop_front().map(|record| record.get(scope))
 }
 
 /// The context of a test, its function's first argument:
 /// <https://nodejs.org/api/test.html#class-testcontext>.
-#[core_runtime::jsfunction_class(name = "TestContext", class_syntax)]
-pub mod test_context {
-    use super::*;
+#[core_runtime::jsclass(name = "TestContext", hidden)]
+pub struct TestContext {
+    record: Option<Heap<TestRecordImpl>>,
+}
 
-    /// Contexts are created for records, by [`context_of`].
+#[core_runtime::jsmethods(node_args)]
+impl TestContext {
+    /// A context without a test, whose members throw, as `new TestContext()` creates it in
+    /// Node.js.
     #[constructor]
-    pub fn init(this: Object<'_>) -> Result<(), ExnThrown> {
-        let _ = this;
+    pub fn create() -> Self {
+        TestContextImpl { record: None }
+    }
+
+    /// <https://nodejs.org/api/test.html#contextsignal>
+    #[getter]
+    pub fn signal<'r>(&self, scope: &'r Scope<'_>) -> Result<HandleValue<'r>, ExnThrown> {
+        signal_of(scope, record_of(scope, &self.data().record)?)
+    }
+
+    /// <https://nodejs.org/api/test.html#contextname>
+    #[getter]
+    pub fn name(&self, scope: &Scope<'_>) -> Result<String, ExnThrown> {
+        Ok(record_of(scope, &self.data().record)?.data().name.clone())
+    }
+
+    /// <https://nodejs.org/api/test.html#contextfilepath>
+    #[getter]
+    pub fn file_path<'r>(&self, scope: &'r Scope<'_>) -> Result<HandleValue<'r>, ExnThrown> {
+        record_of(scope, &self.data().record)?;
+        entry_file(scope)
+    }
+
+    /// <https://nodejs.org/api/test.html#contextfullname>
+    #[getter]
+    pub fn full_name(&self, scope: &Scope<'_>) -> Result<String, ExnThrown> {
+        Ok(full_name(scope, record_of(scope, &self.data().record)?))
+    }
+
+    /// <https://nodejs.org/api/test.html#contexterror>: the error the test failed with, or `null`.
+    #[getter]
+    pub fn error<'r>(&self, scope: &'r Scope<'_>) -> Result<HandleValue<'r>, ExnThrown> {
+        let record = record_of(scope, &self.data().record)?;
+        let data = record.data();
+        Ok(if data.failed {
+            data.error.get(scope)
+        } else {
+            HandleValue::null()
+        })
+    }
+
+    /// <https://nodejs.org/api/test.html#contextpassed>
+    #[getter]
+    pub fn passed(&self, scope: &Scope<'_>) -> Result<bool, ExnThrown> {
+        Ok(record_of(scope, &self.data().record)?.data().passed)
+    }
+
+    /// <https://nodejs.org/api/test.html#contextattempt>: always 0.
+    #[getter]
+    pub fn attempt(&self, scope: &Scope<'_>) -> Result<f64, ExnThrown> {
+        record_of(scope, &self.data().record)?;
+        Ok(0.0)
+    }
+
+    /// <https://nodejs.org/api/test.html#contextworkerid>: tests don't run in workers.
+    #[getter]
+    pub fn worker_id<'r>(&self, scope: &'r Scope<'_>) -> Result<HandleValue<'r>, ExnThrown> {
+        record_of(scope, &self.data().record)?;
+        Ok(HandleValue::undefined())
+    }
+
+    /// <https://nodejs.org/api/test.html#contextassert>
+    #[getter]
+    pub fn assert<'r>(&self, scope: &'r Scope<'_>) -> Result<Object<'r>, ExnThrown> {
+        assert_of(scope, record_of(scope, &self.data().record)?)
+    }
+
+    /// <https://nodejs.org/api/test.html#contextmock>
+    #[getter]
+    pub fn mock<'r>(&self, scope: &'r Scope<'_>) -> Result<mock::MockTracker<'r>, ExnThrown> {
+        mock_of(scope, record_of(scope, &self.data().record)?)
+    }
+
+    /// <https://nodejs.org/api/test.html#contextdiagnosticmessage>
+    #[method]
+    pub fn diagnostic(
+        &self,
+        scope: &Scope<'_>,
+        message: Option<HandleValue<'_>>,
+    ) -> Result<(), ExnThrown> {
+        add_diagnostic(record_of(scope, &self.data().record)?, message);
+        Ok(())
+    }
+
+    /// `t.log()`: not implemented.
+    #[method]
+    pub fn log(&self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
+        Err(NodeError::not_implemented("t.log").throw(scope))
+    }
+
+    /// <https://nodejs.org/api/test.html#contextplancount-options>: the `wait` option is ignored.
+    #[method]
+    pub fn plan(&self, scope: &Scope<'_>, count: HandleValue<'_>) -> Result<(), Thrown> {
+        let record = record_of(scope, &self.data().record)?;
+        if record.data().plan.is_some() {
+            return Err(test_failure("cannot set plan more than once").into());
+        }
+        let count = crate::errors::validate_integer(scope, count, "count", 0.0, 4294967295.0)?;
+        let mut data = record.data_mut();
+        data.plan = Some(count);
+        data.plan_actual = 0.0;
+        Ok(())
+    }
+
+    /// <https://nodejs.org/api/test.html#contextrunonlyshouldrunonlytests>
+    #[method]
+    pub fn run_only(
+        &self,
+        scope: &Scope<'_>,
+        value: Option<HandleValue<'_>>,
+    ) -> Result<(), ExnThrown> {
+        let record = record_of(scope, &self.data().record)?;
+        record.data_mut().run_only_subtests = value.is_some_and(js::conversion::to_boolean);
+        Ok(())
+    }
+
+    /// <https://nodejs.org/api/test.html#contextskipmessage>
+    #[method]
+    pub fn skip(
+        &self,
+        scope: &Scope<'_>,
+        message: Option<HandleValue<'_>>,
+    ) -> Result<(), ExnThrown> {
+        let record = record_of(scope, &self.data().record)?;
+        let mut data = record.data_mut();
+        data.skipped = true;
+        data.message
+            .set(message.map_or(js::value::undefined(), |message| message.get()));
+        Ok(())
+    }
+
+    /// <https://nodejs.org/api/test.html#contexttodomessage>
+    #[method]
+    pub fn todo(
+        &self,
+        scope: &Scope<'_>,
+        message: Option<HandleValue<'_>>,
+    ) -> Result<(), ExnThrown> {
+        let record = record_of(scope, &self.data().record)?;
+        let mut data = record.data_mut();
+        data.todo = true;
+        data.message
+            .set(message.map_or(js::value::undefined(), |message| message.get()));
         Ok(())
     }
 
     /// <https://nodejs.org/api/test.html#contexttestname-options-fn>: start a subtest, which
     /// counts towards the plan.
-    pub fn test<'s>(
-        scope: &'s Scope<'_>,
-        this: Object<'_>,
+    #[method]
+    pub fn test<'r>(
+        &self,
+        scope: &'r Scope<'_>,
         name: Option<HandleValue<'_>>,
         options: Option<HandleValue<'_>>,
         callee: Option<HandleValue<'_>>,
-    ) -> Result<HandleValue<'s>, Thrown> {
-        let record = record_of(scope, this.to_jsval_throwing(scope)?)?;
-        count_for_plan(scope, record)?;
+    ) -> Result<HandleValue<'r>, Thrown> {
+        let record = record_of(scope, &self.data().record)?;
+        count_for_plan(record);
         let undefined = HandleValue::undefined();
         let args = [
             name.unwrap_or(undefined),
@@ -2106,177 +2622,166 @@ pub mod test_context {
         Ok(start_subtest(scope, subtest)?)
     }
 
-    /// <https://nodejs.org/api/test.html#contextskipmessage>
-    pub fn skip(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        message: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        let record = record_of(scope, this.to_jsval_throwing(scope)?)?;
-        record.set_property(scope, c"skipped", true)?;
-        record.set_property(
-            scope,
-            c"message",
-            message.unwrap_or(HandleValue::undefined()),
-        )
-    }
-
-    /// <https://nodejs.org/api/test.html#contexttodomessage>
-    pub fn todo(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        message: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        let record = record_of(scope, this.to_jsval_throwing(scope)?)?;
-        record.set_property(scope, c"todo", true)?;
-        record.set_property(
-            scope,
-            c"message",
-            message.unwrap_or(HandleValue::undefined()),
-        )
-    }
-
-    /// <https://nodejs.org/api/test.html#contextdiagnosticmessage>
-    pub fn diagnostic(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        message: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        add_diagnostic(scope, this, message.unwrap_or(HandleValue::undefined()))
-    }
-
-    /// <https://nodejs.org/api/test.html#contextplancount-options>: the `wait` option is ignored.
-    pub fn plan(scope: &Scope<'_>, this: Object<'_>, count: HandleValue<'_>) -> Result<(), Thrown> {
-        let record = record_of(scope, this.to_jsval_throwing(scope)?)?;
-        if record.get_property(scope, c"plan")?.is_number() {
-            return Err(test_failure("cannot set plan more than once").into());
-        }
-        crate::errors::validate_integer(scope, count, "count", 0.0, 4294967295.0)?;
-        record.set_property(scope, c"plan", count)?;
-        record.set_property(scope, c"planActual", 0)?;
-        Ok(())
-    }
-
-    /// <https://nodejs.org/api/test.html#contextrunonlyshouldrunonlytests>
-    pub fn run_only(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        value: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        let record = record_of(scope, this.to_jsval_throwing(scope)?)?;
-        let value = value.is_some_and(|value| truthy(scope, value));
-        record.set_property(scope, c"runOnlySubtests", value)
-    }
-
     /// <https://nodejs.org/api/test.html#contextbeforefn-options>
+    #[method]
     pub fn before(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
         callee: Option<HandleValue<'_>>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        add_hook(scope, this, "before", callee, options)
+        self.add_hook(scope, HookType::Before, callee, options)
     }
 
     /// <https://nodejs.org/api/test.html#contextafterfn-options>
+    #[method]
     pub fn after(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
         callee: Option<HandleValue<'_>>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        add_hook(scope, this, "after", callee, options)
+        self.add_hook(scope, HookType::After, callee, options)
     }
 
     /// <https://nodejs.org/api/test.html#contextbeforeeachfn-options>
+    #[method]
     pub fn before_each(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
         callee: Option<HandleValue<'_>>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        add_hook(scope, this, "beforeEach", callee, options)
+        self.add_hook(scope, HookType::BeforeEach, callee, options)
     }
 
     /// <https://nodejs.org/api/test.html#contextaftereachfn-options>
+    #[method]
     pub fn after_each(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
         callee: Option<HandleValue<'_>>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        add_hook(scope, this, "afterEach", callee, options)
+        self.add_hook(scope, HookType::AfterEach, callee, options)
     }
 
     /// <https://nodejs.org/api/test.html#contextwaitforcondition-options>: not implemented.
-    pub fn wait_for(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    #[method]
+    pub fn wait_for(&self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
         Err(NodeError::not_implemented("t.waitFor").throw(scope))
-    }
-
-    /// `t.log()`: not implemented.
-    pub fn log(scope: &Scope<'_>) -> Result<(), ExnThrown> {
-        Err(NodeError::not_implemented("t.log").throw(scope))
-    }
-
-    /// Define the getters.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        define_getters(scope, proto, GETTERS.len())
     }
 }
 
-/// Register the hook of `hook_type` of the context `this`'s record.
-fn add_hook(
-    scope: &Scope<'_>,
-    this: Object<'_>,
-    hook_type: &str,
-    callee: Option<HandleValue<'_>>,
-    options: Option<HandleValue<'_>>,
-) -> Result<(), Thrown> {
-    let record = record_of(scope, this.to_jsval_throwing(scope)?)?;
-    create_hook(
-        scope,
-        record,
-        hook_type,
-        callee.unwrap_or(HandleValue::undefined()),
-        options.unwrap_or(HandleValue::undefined()),
-    )
+impl<'s> TestContext<'s> {
+    /// Register the hook of `hook_type` of the context's record.
+    fn add_hook(
+        &self,
+        scope: &Scope<'_>,
+        hook_type: HookType,
+        callee: Option<HandleValue<'_>>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        let record = record_of(scope, &self.data().record)?;
+        create_hook(
+            scope,
+            record,
+            hook_type,
+            callee.unwrap_or(HandleValue::undefined()),
+            options.unwrap_or(HandleValue::undefined()),
+        )
+    }
 }
 
 /// The context of a suite, its function's argument:
 /// <https://nodejs.org/api/test.html#class-suitecontext>.
-#[core_runtime::jsfunction_class(name = "SuiteContext", class_syntax)]
-pub mod suite_context {
-    use super::*;
+#[core_runtime::jsclass(name = "SuiteContext", hidden)]
+pub struct SuiteContext {
+    record: Option<Heap<TestRecordImpl>>,
+}
 
-    /// Contexts are created for records, by [`hook_context`].
+#[core_runtime::jsmethods(node_args)]
+impl SuiteContext {
+    /// A context without a suite, whose members throw, as `new SuiteContext()` creates it in
+    /// Node.js.
     #[constructor]
-    pub fn init(this: Object<'_>) -> Result<(), ExnThrown> {
-        let _ = this;
-        Ok(())
+    pub fn create() -> Self {
+        SuiteContextImpl { record: None }
+    }
+
+    /// <https://nodejs.org/api/test.html#contextsignal-1>
+    #[getter]
+    pub fn signal<'r>(&self, scope: &'r Scope<'_>) -> Result<HandleValue<'r>, ExnThrown> {
+        signal_of(scope, record_of(scope, &self.data().record)?)
+    }
+
+    /// <https://nodejs.org/api/test.html#contextname-1>
+    #[getter]
+    pub fn name(&self, scope: &Scope<'_>) -> Result<String, ExnThrown> {
+        Ok(record_of(scope, &self.data().record)?.data().name.clone())
+    }
+
+    /// <https://nodejs.org/api/test.html#contextfilepath-1>
+    #[getter]
+    pub fn file_path<'r>(&self, scope: &'r Scope<'_>) -> Result<HandleValue<'r>, ExnThrown> {
+        record_of(scope, &self.data().record)?;
+        entry_file(scope)
+    }
+
+    /// <https://nodejs.org/api/test.html#contextfullname-1>
+    #[getter]
+    pub fn full_name(&self, scope: &Scope<'_>) -> Result<String, ExnThrown> {
+        Ok(full_name(scope, record_of(scope, &self.data().record)?))
+    }
+
+    /// Whether the suite passed.
+    #[getter]
+    pub fn passed(&self, scope: &Scope<'_>) -> Result<bool, ExnThrown> {
+        Ok(record_of(scope, &self.data().record)?.data().passed)
+    }
+
+    /// Always 0.
+    #[getter]
+    pub fn attempt(&self, scope: &Scope<'_>) -> Result<f64, ExnThrown> {
+        record_of(scope, &self.data().record)?;
+        Ok(0.0)
     }
 
     /// <https://nodejs.org/api/test.html#contextdiagnosticmessage-1>
+    #[method]
     pub fn diagnostic(
+        &self,
         scope: &Scope<'_>,
-        this: Object<'_>,
         message: Option<HandleValue<'_>>,
     ) -> Result<(), ExnThrown> {
-        add_diagnostic(scope, this, message.unwrap_or(HandleValue::undefined()))
+        add_diagnostic(record_of(scope, &self.data().record)?, message);
+        Ok(())
     }
 
-    /// Define the getters.
-    #[setup]
-    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        define_getters(scope, proto, SUITE_GETTERS)
+    /// `s.log()`: not implemented.
+    #[method]
+    pub fn log(&self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
+        Err(NodeError::not_implemented("s.log").throw(scope))
     }
 }
 
-/// Register the classes of `node:test`.
-pub(crate) fn register_classes(scope: &Scope<'_>) -> Result<(), ExnThrown> {
-    mock::mock_tracker::register(scope)?;
-    mock::mock_function_context::register(scope)?;
-    test_context::register(scope)?;
-    suite_context::register(scope)?;
+/// Register the test runner's classes on `global`, and create the realm's [`Harness`].
+pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
+    TestRecord::add_to_global(scope, global);
+    Harness::add_to_global(scope, global);
+    TestContext::add_to_global(scope, global);
+    SuiteContext::add_to_global(scope, global);
+    CountedAssertion::add_to_global(scope, global);
+    EarlyHook::add_to_global(scope, global);
+    Await::add_to_global(scope, global);
+    DoneCallback::add_to_global(scope, global);
+    EntryVariant::add_to_global(scope, global);
+    mock::register_classes(scope, global)?;
+    let harness = js::class::create_instance_with::<HarnessImpl>(scope, |_| HarnessImpl {
+        success: true,
+        building: true,
+        ..Default::default()
+    })?;
+    js::class::register_realm_object::<HarnessObject>(scope, harness.as_object());
     Ok(())
 }

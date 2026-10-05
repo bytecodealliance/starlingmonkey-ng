@@ -12,15 +12,6 @@ use js::{Function, Object};
 
 use crate::errors::{number_to_string, out_of_range_received, NodeError, Thrown};
 
-/// The argument at `index`, or `undefined`.
-fn arg<'a>(args: &'a CallbackArgs<'_>, index: u32) -> HandleValue<'a> {
-    if index < args.len() {
-        args.get(index)
-    } else {
-        HandleValue::undefined()
-    }
-}
-
 /// The value of the `O_*` constant `name` on this host, or 0 if it lacks it.
 fn open_flag(name: &str) -> i32 {
     platform::fs::open_flags()
@@ -36,7 +27,7 @@ pub(super) fn string_to_flags(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let flags = arg(&args, 0);
+    let flags = args.get(0);
     if flags.is_number() {
         return Ok(flags.get());
     }
@@ -98,19 +89,18 @@ pub(super) fn validate_offset_length_read(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let (offset, length) = (arg(&args, 0), arg(&args, 1));
-    let buffer_length = arg(&args, 2).to_number();
-    if offset.to_number() < 0.0 {
+    let (offset, length) = (args.get(0), args.get(1));
+    let offset_number = f64::from_jsval_throwing(scope, offset, ())?;
+    let length_number = f64::from_jsval_throwing(scope, length, ())?;
+    let buffer_length = f64::from_jsval_throwing(scope, args.get(2), ())?;
+    if offset_number < 0.0 {
         return Err(out_of_range(scope, "offset", ">= 0", offset));
     }
-    if length.to_number() < 0.0 {
+    if length_number < 0.0 {
         return Err(out_of_range(scope, "length", ">= 0", length));
     }
-    if offset.to_number() + length.to_number() > buffer_length {
-        let range = format!(
-            "<= {}",
-            number_to_string(buffer_length - offset.to_number())
-        );
+    if offset_number + length_number > buffer_length {
+        let range = format!("<= {}", number_to_string(buffer_length - offset_number));
         return Err(out_of_range(scope, "length", &range, length));
     }
     Ok(js::value::undefined())
@@ -123,17 +113,19 @@ pub(super) fn validate_offset_length_write(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let (offset, length) = (arg(&args, 0), arg(&args, 1));
-    let byte_length = arg(&args, 2).to_number();
-    if offset.to_number() > byte_length {
+    let (offset, length) = (args.get(0), args.get(1));
+    let offset_number = f64::from_jsval_throwing(scope, offset, ())?;
+    let length_number = f64::from_jsval_throwing(scope, length, ())?;
+    let byte_length = f64::from_jsval_throwing(scope, args.get(2), ())?;
+    if offset_number > byte_length {
         let range = format!("<= {}", number_to_string(byte_length));
         return Err(out_of_range(scope, "offset", &range, offset));
     }
-    if length.to_number() > byte_length - offset.to_number() {
-        let range = format!("<= {}", number_to_string(byte_length - offset.to_number()));
+    if length_number > byte_length - offset_number {
+        let range = format!("<= {}", number_to_string(byte_length - offset_number));
         return Err(out_of_range(scope, "length", &range, length));
     }
-    if length.to_number() < 0.0 {
+    if length_number < 0.0 {
         return Err(out_of_range(scope, "length", ">= 0", length));
     }
     crate::errors::validate_integer(scope, length, "length", 0.0, 2147483647.0)
@@ -151,7 +143,12 @@ fn join(scope: &Scope<'_>, path: HandleValue<'_>, name: HandleValue<'_>) -> Resu
         let view = Object::from_value(scope, value)
             .ok()
             .and_then(js::ArrayBufferView::from_object);
-        Ok(view.map(|view| view.with_bytes(|bytes| String::from_utf8_lossy(bytes).into_owned())))
+        let Some(view) = view else {
+            return Ok(None);
+        };
+        Ok(Some(
+            String::from_utf8_lossy(&view.copy_bytes(scope)?).into_owned(),
+        ))
     };
     let invalid = || {
         NodeError::invalid_arg_type(
@@ -177,7 +174,8 @@ fn dirent<'s>(
     kind: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, Thrown> {
     let file = join(scope, path, name)?;
-    crate::fs::new_dirent(scope, name, path, kind.to_number(), &file)
+    let kind = f64::from_jsval_throwing(scope, kind, ())?;
+    crate::fs::new_dirent(scope, name, path, kind, &file)
 }
 
 /// Call `callback` with `result`: the error, or `null` and the value.
@@ -205,9 +203,9 @@ pub(super) fn get_dirent(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let result = dirent(scope, arg(&args, 0), arg(&args, 1), arg(&args, 2));
-    let callback = arg(&args, 3);
-    if crate::stream::is_function(scope, callback) {
+    let result = dirent(scope, args.get(0), args.get(1), args.get(2));
+    let callback = args.get(3);
+    if js::function::is_callable(callback) {
         call_back(scope, callback, result)?;
         return Ok(js::value::undefined());
     }
@@ -223,12 +221,13 @@ pub(super) fn get_dirents(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let path = arg(&args, 0);
+    let path = args.get(0);
     let result = (|| -> Result<HandleValue<'_>, Thrown> {
-        let entries = Object::from_value(scope, arg(&args, 1))?;
+        let entries = Object::from_value(scope, args.get(1))?;
         let names = Object::from_value(scope, entries.get_element(scope, 0)?)?;
         let types = Object::from_value(scope, entries.get_element(scope, 1)?)?;
-        let length = names.get_property(scope, c"length")?.to_number() as u32;
+        let length =
+            f64::from_jsval_throwing(scope, names.get_property(scope, c"length")?, ())? as u32;
         for index in 0..length {
             let name = names.get_element(scope, index)?;
             let kind = types.get_element(scope, index)?;
@@ -237,8 +236,8 @@ pub(super) fn get_dirents(
         }
         Ok(names.to_jsval_throwing(scope)?)
     })();
-    let callback = arg(&args, 2);
-    if crate::stream::is_function(scope, callback) {
+    let callback = args.get(2);
+    if js::function::is_callable(callback) {
         call_back(scope, callback, result)?;
         return Ok(js::value::undefined());
     }

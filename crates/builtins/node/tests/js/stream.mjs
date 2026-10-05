@@ -212,6 +212,15 @@ eq({} instanceof Writable, false, "plain objects aren't Writables");
   done.push(null);
   eq(await result, undefined, "finished calls back once the stream ended");
 
+  let lengthReads = 0;
+  const foreign = {
+    pipe() {},
+    on() {},
+    _readableState: { endEmitted: false, ended: true, get length() { return lengthReads++ === 0 ? 0 : "x"; } },
+  };
+  finished(foreign, () => {});
+  eq(lengthReads, 1, "finished reads the length of a foreign readable state once");
+
   const premature = new Readable({ read() {} });
   const prematureResult = new Promise((resolve) => finished(premature, resolve));
   premature.destroy();
@@ -251,6 +260,45 @@ eq({} instanceof Writable, false, "plain objects aren't Writables");
   }
   await tick();
   eq(early.destroyed, true, "breaking out of for await destroys the stream");
+}
+
+// Async iteration of streams without `read` goes through `Readable.wrap`, and of foreign
+// readables through their own `read` and `_readableState`.
+{
+  const legacy = new stream.Stream();
+  legacy.readable = true;
+  const received = [];
+  const sink = new Writable({
+    objectMode: true,
+    write(chunk, encoding, callback) {
+      received.push(chunk);
+      callback();
+    },
+  });
+  const piped = new Promise((resolve) => {
+    pipeline(legacy, async function* (source) {
+      for await (const chunk of source) yield chunk;
+    }, sink, resolve);
+  });
+  legacy.emit("data", "a");
+  legacy.emit("data", "b");
+  legacy.emit("end");
+  deepEq([await piped, received], [undefined, ["a", "b"]], "pipeline iterates a legacy stream");
+  const wrapped = Readable.prototype[Symbol.asyncIterator].call(new stream.Stream());
+  eq(wrapped.stream instanceof Readable, true, "the iterator's stream is the wrapper");
+  const chunks = ["p"];
+  const foreign = Object.assign(new EventEmitter(), {
+    readable: true,
+    read: () => chunks.shift() ?? null,
+    _readableState: { autoDestroy: true },
+    destroy() {
+      this.destroyed = true;
+    },
+  });
+  const iterator = Readable.prototype[Symbol.asyncIterator].call(foreign);
+  deepEq(await iterator.next(), { value: "p", done: false }, "a foreign readable's chunks");
+  deepEq(await iterator.return(), { value: undefined, done: true }, "return() of a foreign readable's iterator");
+  eq(foreign.destroyed, true, "return() destroys a foreign readable");
 }
 
 // Readable.from with async iterables and promise values.
@@ -402,12 +450,14 @@ eq({} instanceof Writable, false, "plain objects aren't Writables");
   const unbuffered = new Readable({ read() {} });
   unbuffered._readableState.buffer = null;
   unbuffered._readableState.length = 1;
-  throws(() => unbuffered.read(), TypeError, "a broken buffer throws a catchable TypeError");
+  eq(unbuffered._readableState.buffer instanceof Array, true, "a non-array buffer is ignored");
+  unbuffered.read();
   const corked = new Writable({ write(c, e, cb) { cb(); } });
   corked.cork();
   corked.write("a");
   corked._writableState.bufferedIndex = 5;
-  throws(() => corked.uncork(), TypeError, "a broken buffered index throws a catchable TypeError");
+  corked.uncork();
+  eq(corked.writableLength, 0, "an assigned buffered index is ignored");
   eq(Duplex.from === Readable.from, false, "Duplex.from isn't Readable.from");
   eq(Object.keys(new PassThrough()).includes("_transformCallback"), false, "the transform callback isn't an enumerable key");
   eq(typeof Writable.prototype[Symbol.asyncDispose], "function", "Writable[Symbol.asyncDispose]");
@@ -660,4 +710,12 @@ eq({} instanceof Writable, false, "plain objects aren't Writables");
   eq((await from([1]).forEach(1).catch((error) => error)).code, "ERR_INVALID_ARG_TYPE", "forEach rejects an invalid fn");
   const error = throws(() => from([1]).take(1, 1), "ERR_INVALID_ARG_TYPE", "take validates options");
   eq(String(error).startsWith("TypeError [ERR_INVALID_ARG_TYPE]: "), true, "Node.js errors' toString has the code");
+}
+
+// Options that are arrays or functions are rejected, as Node.js's `validateObject` rejects them.
+{
+  throws(() => finished(new PassThrough(), [], () => {}), "ERR_INVALID_ARG_TYPE", "finished rejects array options");
+  throws(() => new Readable({ read() {} }).iterator([]), "ERR_INVALID_ARG_TYPE", "iterator rejects array options");
+  throws(() => new Readable({ read() {} }).map((x) => x, () => {}), "ERR_INVALID_ARG_TYPE", "map rejects function options");
+  throws(() => Readable.fromWeb(new ReadableStream(), []), "ERR_INVALID_ARG_TYPE", "fromWeb rejects array options");
 }

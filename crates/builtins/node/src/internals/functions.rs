@@ -14,22 +14,12 @@ use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{validate_function, validate_integer, NodeError, Thrown};
-use crate::stream::{call_method, string};
 
 /// The value `result` holds, or its error thrown.
 fn finish(scope: &Scope<'_>, result: Result<HandleValue<'_>, Thrown>) -> Result<Value, ExnThrown> {
     match result {
         Ok(value) => Ok(value.get()),
         Err(error) => Err(error.throw(scope)),
-    }
-}
-
-/// The argument at `index`, or `undefined`.
-fn arg<'a>(args: &'a CallbackArgs<'_>, index: u32) -> HandleValue<'a> {
-    if index < args.len() {
-        args.get(index)
-    } else {
-        HandleValue::undefined()
     }
 }
 
@@ -40,7 +30,7 @@ pub(super) fn sleep(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let msec = validate_integer(scope, arg(&args, 0), "msec", 0.0, 4294967295.0)
+    let msec = validate_integer(scope, args.get(0), "msec", 0.0, 4294967295.0)
         .map_err(|error| error.throw(scope))?;
     std::thread::sleep(std::time::Duration::from_millis(msec as u64));
     Ok(js::value::undefined())
@@ -58,7 +48,7 @@ pub(super) fn emit_experimental_warning(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let feature = js::JSString::from_value(scope, arg(&args, 0))?.to_utf8(scope)?;
+    let feature = js::JSString::from_value(scope, args.get(0))?.to_utf8(scope)?;
     if EXPERIMENTAL_WARNED.with(|warned| warned.borrow_mut().insert(feature.clone())) {
         let message = format!("{feature} is an experimental feature and might change at any time");
         crate::process::emit_warning(scope, &message, "ExperimentalWarning")?;
@@ -74,18 +64,25 @@ pub(super) fn pending_deprecate(
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
     if !crate::runtime_flags::get().pending_deprecation {
-        return Ok(arg(&args, 0).get());
+        return Ok(args.get(0).get());
     }
-    let util = crate::internal_modules::module_default(scope, "node:util")?;
-    let call_args = crate::callback_args(&args);
-    Ok(call_method(scope, util, c"deprecate", &call_args)?.get())
+    let deprecated = crate::util::module::deprecate(
+        scope,
+        args.get(0),
+        Some(args.get(1)),
+        Some(args.get(2)),
+        None,
+    )
+    .map_err(|error| error.throw(scope))?;
+    deprecated.to_jsval_raw_throwing(scope)
 }
 
 /// `internal/readline/utils`'s `CSI`: a template tag that prefixes its string with the control
 /// sequence introducer `ESC [`.
 fn csi(scope: &Scope<'_>, args: CallbackArgs<'_>, _: HandleValue) -> Result<Value, ExnThrown> {
-    let strings = Object::from_value(scope, arg(&args, 0)).map_err(|e| e.throw(scope))?;
-    let length = strings.get_property(scope, c"length")?.to_number() as u32;
+    let strings = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
+    let length =
+        f64::from_jsval_throwing(scope, strings.get_property(scope, c"length")?, ())? as u32;
     let mut text = String::from("\x1b[");
     for index in 0..length {
         let part = strings.get_element(scope, index)?;
@@ -140,7 +137,7 @@ pub(super) fn list_init(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let list = arg(&args, 0);
+    let list = args.get(0);
     set(scope, list, c"_idleNext", list)?;
     set(scope, list, c"_idlePrev", list)?;
     Ok(list.get())
@@ -152,7 +149,7 @@ pub(super) fn list_peek(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let list = arg(&args, 0);
+    let list = args.get(0);
     let last = property(scope, list, c"_idlePrev")?;
     if js::comparison::strictly_equal(scope, last, list)? {
         return Ok(js::value::null());
@@ -181,7 +178,7 @@ pub(super) fn list_remove(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    unlink(scope, arg(&args, 0))?;
+    unlink(scope, args.get(0))?;
     Ok(js::value::undefined())
 }
 
@@ -191,8 +188,8 @@ pub(super) fn list_append(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let list = arg(&args, 0);
-    let item = arg(&args, 1);
+    let list = args.get(0);
+    let item = args.get(1);
     let linked = |name| -> Result<bool, ExnThrown> {
         Ok(bool::from_jsval(scope, property(scope, item, name)?, ()).unwrap_or(false))
     };
@@ -213,7 +210,7 @@ pub(super) fn list_is_empty(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let list = arg(&args, 0);
+    let list = args.get(0);
     let first = property(scope, list, c"_idleNext")?;
     Ok(js::value::from_bool(js::comparison::strictly_equal(
         scope, first, list,
@@ -227,17 +224,10 @@ pub(super) fn is_url(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let Ok(value) = Object::from_value(scope, arg(&args, 0)) else {
-        return Ok(js::value::from_bool(false));
-    };
-    let truthy = |name| -> Result<bool, ExnThrown> {
-        Ok(bool::from_jsval(scope, value.get_property(scope, name)?, ()).unwrap_or(false))
-    };
-    let url = truthy(c"href")?
-        && truthy(c"protocol")?
-        && value.get_property(scope, c"auth")?.is_undefined()
-        && value.get_property(scope, c"path")?.is_undefined();
-    Ok(js::value::from_bool(url))
+    Ok(js::value::from_bool(crate::url::is_url(
+        scope,
+        args.get(0),
+    )?))
 }
 
 /// `internal/options`' `getOptionValue(name)`: the value of the runtime option `name`, for the
@@ -248,7 +238,7 @@ pub(super) fn get_option_value(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let name = String::from_jsval(scope, arg(&args, 0), ()).unwrap_or_default();
+    let name = String::from_jsval_throwing(scope, args.get(0), ())?;
     let flags = crate::runtime_flags::get();
     Ok(match name.as_str() {
         "--expose-internals" => flags.expose_internals.to_jsval_raw_throwing(scope)?,
@@ -287,11 +277,10 @@ pub(super) fn set_unref_timeout(
 ) -> Result<Value, ExnThrown> {
     let call_args = crate::callback_args(&args);
     let result = (|| -> Result<HandleValue<'_>, Thrown> {
-        validate_function(scope, arg(&args, 0), "callback")?;
-        let set_timeout = scope.global().get_property(scope, c"setTimeout")?;
-        let timer = Function::call(scope, HandleValue::undefined(), set_timeout, &call_args)?;
-        let timer = Object::from_value(scope, timer)?;
-        call_method(scope, timer, c"unref", &[])?;
+        validate_function(scope, args.get(0), "callback")?;
+        let rest = call_args.get(2..).unwrap_or_default();
+        let timer =
+            crate::timers::create_timeout(scope, args.get(0), args.get(1), rest, false, false)?;
         Ok(timer.to_jsval_throwing(scope)?)
     })();
     finish(scope, result)
@@ -305,8 +294,8 @@ pub(super) fn add_abort_signal_no_validate(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let signal = arg(&args, 0);
-    let stream = arg(&args, 1);
+    let signal = args.get(0);
+    let stream = args.get(1);
     let is_signal = match Object::from_value(scope, signal) {
         Ok(signal) => signal.has_property(scope, c"aborted")?,
         Err(_) => false,
@@ -315,7 +304,7 @@ pub(super) fn add_abort_signal_no_validate(
         return Ok(stream.get());
     }
     let module = crate::internal_modules::module_default(scope, "node:stream")?;
-    Ok(call_method(scope, module, c"addAbortSignal", &[signal, stream])?.get())
+    Ok(Function::call_by_name(scope, module.handle(), c"addAbortSignal", &[signal, stream])?.get())
 }
 
 /// `internal/assert/myers_diff`'s `myersDiff(actual, expected, checkCommaDisparity)`: the diff of
@@ -328,11 +317,13 @@ pub(super) fn myers_diff(
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let result = (|| -> Result<HandleValue<'_>, Thrown> {
-        let actual = Object::from_value(scope, arg(&args, 0))?;
-        let expected = Object::from_value(scope, arg(&args, 1))?;
-        let comma = bool::from_jsval(scope, arg(&args, 2), ()).unwrap_or(false);
-        let actual_length = actual.get_property(scope, c"length")?.to_number();
-        let expected_length = expected.get_property(scope, c"length")?.to_number();
+        let actual = Object::from_value(scope, args.get(0))?;
+        let expected = Object::from_value(scope, args.get(1))?;
+        let comma = bool::from_jsval(scope, args.get(2), ()).unwrap_or(false);
+        let actual_length =
+            f64::from_jsval_throwing(scope, actual.get_property(scope, c"length")?, ())?;
+        let expected_length =
+            f64::from_jsval_throwing(scope, expected.get_property(scope, c"length")?, ())?;
         let max = actual_length + expected_length;
         if max >= 2f64.powi(31) {
             return Err(NodeError::out_of_range(
@@ -358,7 +349,13 @@ pub(super) fn myers_diff(
         let mut pairs = Vec::with_capacity(diff.len());
         for (operation, value) in diff {
             let operation = scope.root_value(js::value::from_i32(operation.sign()));
-            let pair = js::Array::with_contents(scope, &[operation, string(scope, &value)?])?;
+            let pair = js::Array::with_contents(
+                scope,
+                &[
+                    operation,
+                    js::conversion::ToJSVal::to_jsval_throwing(&value, scope)?,
+                ],
+            )?;
             pairs.push(pair.to_jsval_throwing(scope)?);
         }
         Ok(js::Array::with_contents(scope, &pairs)?.to_jsval_throwing(scope)?)
@@ -374,7 +371,7 @@ pub(super) fn get_string_width(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let text = js::JSString::from_value(scope, arg(&args, 0))?.to_utf8(scope)?;
+    let text = js::JSString::from_value(scope, args.get(0))?.to_utf8(scope)?;
     let strip = !(args.len() > 1 && args.get(1).is_boolean() && !args.get(1).to_boolean());
     let width = if strip {
         crate::inspect::string_width(&text)

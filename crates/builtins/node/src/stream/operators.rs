@@ -4,139 +4,54 @@
 //! which return a `Readable.from` stream, and `every`, `forEach`, `reduce`, `toArray`, `some` and
 //! `find`, which return a promise. Node's `lib/internal/streams/operators.js`.
 //!
-//! Node writes these as async generators and async functions. Here a generator is an object with
-//! `next`, `return` and `throw` whose body is a state machine of promise reactions (see
-//! [`new_generator`]), and a `for await` loop is a [`loop_open`] loop that calls back for each
-//! value and at the end.
+//! Node writes these as async generators and async functions. Here a generator is a [`Generator`]
+//! whose body is a state machine of promise reactions on a body state, and a `for await` loop is
+//! a [`LoopState`] that calls back for each value and at the end.
 
+use std::collections::VecDeque;
 use std::ffi::CStr;
 
-use js::conversion::ToJSVal;
+use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::{Callback, CallbackArgs};
+use js::function::{cast_payload, Callback, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
+use js::iteration::{AsyncIteratorRecord, AsyncIteratorRecordImpl};
 use js::native::Value;
 use js::prelude::HandleValue;
+use js::symbol::CachedSymbol;
 use js::{Function, Object};
+use web_globals::signals::abort_controller::{AbortController, AbortControllerImpl};
+use web_globals::signals::{AbortSignal, AbortSignalImpl};
 
-use super::readable::array_push;
-use super::util::{
-    as_object, call, call_method, closure, error_value, is_function, listen, same, take_exception,
-    truthy, type_error, Captures, Props,
-};
 use crate::errors::{
     out_of_range_received, validate_abort_signal, validate_function, validate_integer,
-    validate_object, ErrorKind, NodeError, Thrown,
+    validate_plain_object, ErrorKind, NodeError, Thrown,
 };
 
 /// `Number.MAX_SAFE_INTEGER`, the default maximum of `validateInteger`.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
-/// A new state array of `count` `undefined` values.
-fn new_state<'s>(scope: &'s Scope<'_>, count: usize) -> Result<Captures<'s>, ExnThrown> {
-    let array = js::Array::new(scope, count)?;
-    for index in 0..count as u32 {
-        array.set_element(scope, index, HandleValue::undefined())?;
-    }
-    Captures::of(scope, (*array).to_jsval_throwing(scope)?)
-}
+/// Node's `kEmpty`, the result of `filter`'s function for a value it skips.
+static K_EMPTY: CachedSymbol = CachedSymbol::new(c"kEmpty");
 
-/// The state of a function whose captures are `[state]`.
-fn state_of<'s>(scope: &'s Scope<'_>, payload: HandleValue<'_>) -> Result<Captures<'s>, ExnThrown> {
-    Captures::of(scope, Captures::of(scope, payload)?.get(0)?)
-}
-
-/// A function running `body` with the captures `[state]`.
-fn bind<'s>(
+/// `options.signal`, if `options` is an object with an `AbortSignal` there.
+fn signal_of<'s>(
     scope: &'s Scope<'_>,
-    state: &Captures<'_>,
-    nargs: u32,
-    body: Callback,
-) -> Result<Object<'s>, ExnThrown> {
-    closure(scope, nargs, body, &[state.array_value()?])
-}
-
-/// The length of the array `array`.
-fn array_len(scope: &Scope<'_>, array: Object<'_>) -> Result<u32, ExnThrown> {
-    Ok(array.num(scope, c"length")? as u32)
-}
-
-/// Remove the first element of the array `array`.
-fn array_shift(scope: &Scope<'_>, array: Object<'_>) -> Result<(), ExnThrown> {
-    let length = array_len(scope, array)?;
-    if length == 0 {
-        return Ok(());
-    }
-    for index in 1..length {
-        let value = array.get_element(scope, index)?;
-        array.set_element(scope, index - 1, value)?;
-    }
-    array.set_property(scope, c"length", length - 1)
-}
-
-/// Run `fulfilled` or `rejected` once `Promise.resolve(value)` settles.
-fn await_value(
-    scope: &Scope<'_>,
-    value: HandleValue<'_>,
-    fulfilled: Object<'_>,
-    rejected: Object<'_>,
-) -> Result<(), ExnThrown> {
-    let value = scope.root_value(value.get());
-    js::Promise::call_original_resolve(scope, value)?.then(
-        scope,
-        Some(fulfilled),
-        Some(rejected),
-    )?;
-    Ok(())
-}
-
-/// The promise at `index` of `captures`.
-fn promise_at<'s>(
-    scope: &'s Scope<'_>,
-    captures: &Captures<'s>,
-    index: u32,
-) -> Result<js::Promise<'s>, ExnThrown> {
-    captures
-        .obj(index)?
-        .cast::<js::Promise>()
-        .map_err(|_| type_error(scope, "not a promise"))
-}
-
-/// Resolve or reject `promise` unless it settled.
-fn settle(
-    scope: &Scope<'_>,
-    promise: js::Promise<'_>,
-    reject: bool,
-    value: HandleValue<'_>,
-) -> Result<(), ExnThrown> {
-    if !promise.is_pending() {
-        return Ok(());
-    }
-    if reject {
-        promise.reject(scope, value)
-    } else {
-        promise.resolve(scope, value)
-    }
-}
-
-/// A new `AbortError`, with `cause` if given.
-fn abort_error<'s>(
-    scope: &'s Scope<'_>,
-    cause: Option<HandleValue<'_>>,
-) -> Result<HandleValue<'s>, ExnThrown> {
-    crate::errors::abort_error(scope, cause)
+    options: HandleValue<'_>,
+) -> Result<Option<AbortSignal<'s>>, ExnThrown> {
+    let Ok(options) = Object::from_value(scope, options) else {
+        return Ok(None);
+    };
+    let signal = options.get_property(scope, c"signal")?;
+    Ok(Object::from_value(scope, signal)
+        .ok()
+        .and_then(|signal| signal.cast::<AbortSignal>().ok()))
 }
 
 /// `options?.signal?.aborted`, for `options` an object or `undefined`.
 fn signal_aborted(scope: &Scope<'_>, options: HandleValue<'_>) -> Result<bool, ExnThrown> {
-    let Some(options) = as_object(scope, options) else {
-        return Ok(false);
-    };
-    let signal = options.val(scope, c"signal")?;
-    match as_object(scope, signal) {
-        Some(signal) => Ok(truthy(scope, signal.val(scope, c"aborted")?)),
-        None => Ok(false),
-    }
+    Ok(signal_of(scope, options)?.is_some_and(|signal| signal.aborted()))
 }
 
 /// `options?.signal?.reason`.
@@ -144,14 +59,10 @@ fn signal_reason<'s>(
     scope: &'s Scope<'_>,
     options: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let signal = match as_object(scope, options) {
-        Some(options) => options.val(scope, c"signal")?,
-        None => return Ok(HandleValue::undefined()),
-    };
-    match as_object(scope, signal) {
-        Some(signal) => signal.val(scope, c"reason"),
-        None => Ok(HandleValue::undefined()),
-    }
+    Ok(match signal_of(scope, options)? {
+        Some(signal) => signal.reason(scope),
+        None => HandleValue::undefined(),
+    })
 }
 
 /// The validation the operators share: `options` must be `null`, `undefined` or an object, and
@@ -161,84 +72,123 @@ fn validate_options<'s>(
     scope: &'s Scope<'_>,
     options: HandleValue<'s>,
 ) -> Result<HandleValue<'s>, Thrown> {
-    if options.is_null() || options.is_undefined() {
+    if options.is_null_or_undefined() {
         return Ok(HandleValue::undefined());
     }
-    let object = validate_object(scope, options, "options")?;
-    let signal = object.val(scope, c"signal")?;
-    if !signal.is_null() && !signal.is_undefined() {
-        validate_abort_signal(scope, object.val(scope, c"signal")?, "options.signal")?;
+    let object = validate_plain_object(scope, options, "options", false)?;
+    let signal = object.get_property(scope, c"signal")?;
+    if !signal.is_null_or_undefined() {
+        validate_abort_signal(scope, signal, "options.signal")?;
     }
     Ok(options)
 }
 
+/// Run `fulfilled` or `rejected` once `Promise.resolve(value)` settles, as `await value` does.
+fn await_value(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    fulfilled: Object<'_>,
+    rejected: Object<'_>,
+) -> Result<(), ExnThrown> {
+    js::Promise::call_original_resolve(scope, value)?.add_reactions(
+        scope,
+        Some(fulfilled),
+        Some(rejected),
+    )
+}
+
+/// A reaction function running `body` with `payload`.
+fn reaction<'s>(
+    scope: &'s Scope<'_>,
+    body: Callback,
+    payload: impl ToJSVal<'s>,
+) -> Result<Object<'s>, ExnThrown> {
+    Ok(*Function::new_callback(scope, c"", 1, body, payload)?)
+}
+
 /// The kinds of request a generator takes.
-mod request {
-    pub(super) const NEXT: i32 = 0;
-    pub(super) const RETURN: i32 = 1;
-    pub(super) const THROW: i32 = 2;
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Request {
+    #[default]
+    Next,
+    Return,
+    Throw,
 }
 
 /// The phases of a generator: before its first `next()`, suspended at a `yield`, and completed.
-mod phase {
-    pub(super) const START: i32 = 0;
-    pub(super) const YIELDED: i32 = 1;
-    pub(super) const DONE: i32 = 2;
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Phase {
+    #[default]
+    Start,
+    Yielded,
+    Done,
 }
 
-/// The captures of a generator's methods: `[body, requests, running, phase, start, resume]`.
-/// `requests` is the queue of `[kind, value, promise]` its `next`, `return` and `throw` calls
-/// add. `body` is the state of the body, whose element 0 is this array.
-mod generator {
-    pub(super) const BODY: u32 = 0;
-    pub(super) const REQUESTS: u32 = 1;
-    pub(super) const RUNNING: u32 = 2;
-    pub(super) const PHASE: u32 = 3;
-    pub(super) const START: u32 = 4;
-    pub(super) const RESUME: u32 = 5;
-    pub(super) const COUNT: usize = 6;
+/// A queued `next`, `return` or `throw` call of a generator, with its argument and promise.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+struct GenRequest {
+    #[no_trace]
+    kind: Request,
+    value: Heap<Value>,
+    promise: Heap<js::promise::Promise>,
 }
 
-/// The element of a body state that holds its generator's captures.
-const GEN: u32 = 0;
+/// The start of a generator's body, which gets the body state.
+type BodyStart = fn(&Scope<'_>, Object<'_>) -> Result<(), ExnThrown>;
 
-/// A new async generator object. Its first `next()` runs `start` with the captures `[body]`. A
-/// request after the body yielded runs `resume` with those captures and the arguments `(kind,
-/// value)`, the kind of [`request`] and its argument. Each step of the body ends with
-/// [`gen_yield`], [`gen_return`] or [`gen_throw`], and an exception `start` or `resume` throws
-/// ends it as [`gen_throw`] does. The requests are queued and run one at a time, as an async
-/// generator's are.
+/// The continuation of a generator's body after it yielded, which gets the body state and the
+/// request.
+type BodyResume = fn(&Scope<'_>, Object<'_>, Request, HandleValue<'_>) -> Result<(), ExnThrown>;
+
+/// An async generator: the body state, the queued requests, and the body's functions. The
+/// requests are queued and run one at a time, as an async generator's are.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct Generator {
+    body: Option<Heap<js::object::Object>>,
+    requests: VecDeque<GenRequest>,
+    #[no_trace]
+    running: bool,
+    #[no_trace]
+    phase: Phase,
+    #[no_trace]
+    start: Option<BodyStart>,
+    #[no_trace]
+    resume: Option<BodyResume>,
+}
+
+#[core_runtime::jsmethods]
+impl Generator {}
+
+/// A new async generator object over the body state `body`. Its first `next()` runs `start`. A
+/// request after the body yielded runs `resume`. Each step of the body ends with [`gen_yield`],
+/// [`gen_return`] or [`gen_throw`], and an exception `start` or `resume` throws ends it as
+/// [`gen_throw`] does.
 fn new_generator<'s>(
     scope: &'s Scope<'_>,
-    body: &Captures<'_>,
-    start: Callback,
-    resume: Callback,
-) -> Result<Object<'s>, ExnThrown> {
-    use generator::*;
-    let gen = new_state(scope, COUNT)?;
-    gen.set(BODY, body.array)?;
-    gen.set(REQUESTS, *js::Array::with_contents(scope, &[] as &[Value])?)?;
-    gen.set(RUNNING, false)?;
-    gen.set(PHASE, phase::START)?;
-    gen.set(START, bind(scope, body, 0, start)?)?;
-    gen.set(RESUME, bind(scope, body, 2, resume)?)?;
-    body.set(GEN, gen.array)?;
-    let object = Object::new_plain(scope)?;
-    object.set_prototype(scope, js::class::get_async_iterator_prototype(scope)?)?;
+    body: Object<'_>,
+    start: BodyStart,
+    resume: BodyResume,
+) -> Result<(Generator<'s>, Object<'s>), ExnThrown> {
+    let gen = js::class::create_instance_with::<GeneratorImpl>(scope, |_| GeneratorImpl {
+        body: Some(Heap::from(body)),
+        requests: VecDeque::new(),
+        running: false,
+        phase: Phase::Start,
+        start: Some(start),
+        resume: Some(resume),
+    })?;
+    let proto = js::class::get_async_iterator_prototype(scope)?;
+    let object = Object::new_plain_with_proto(scope, proto)?;
     for (name, method) in [
         (c"next", gen_next as Callback),
         (c"return", gen_return_method),
         (c"throw", gen_throw_method),
     ] {
-        let function = Function::new_callback(scope, name, 1, method, gen.array)?;
+        let function = Function::new_callback(scope, name, 1, method, gen)?;
         object.set_property(scope, name, *function)?;
     }
-    Ok(object)
-}
-
-/// The generator captures of the body state `body`.
-fn gen_of<'s>(scope: &'s Scope<'_>, body: &Captures<'s>) -> Result<Captures<'s>, ExnThrown> {
-    Captures::of(scope, body.get(GEN)?)
+    Ok((gen, object))
 }
 
 fn gen_next(
@@ -246,7 +196,7 @@ fn gen_next(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    gen_request(scope, payload, request::NEXT, args.get(0))
+    gen_request(scope, payload, Request::Next, args.get(0))
 }
 
 fn gen_return_method(
@@ -254,7 +204,7 @@ fn gen_return_method(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    gen_request(scope, payload, request::RETURN, args.get(0))
+    gen_request(scope, payload, Request::Return, args.get(0))
 }
 
 fn gen_throw_method(
@@ -262,65 +212,51 @@ fn gen_throw_method(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    gen_request(scope, payload, request::THROW, args.get(0))
+    gen_request(scope, payload, Request::Throw, args.get(0))
 }
 
 /// Queue a request, run it if the generator isn't running, and return its promise.
 fn gen_request(
     scope: &Scope<'_>,
     payload: HandleValue<'_>,
-    kind: i32,
+    kind: Request,
     value: HandleValue<'_>,
 ) -> Result<Value, ExnThrown> {
-    let gen = Captures::of(scope, payload)?;
+    let gen = cast_payload::<Generator>(scope, payload);
     let promise = js::Promise::new_pending(scope)?;
-    let entry = js::Array::with_contents(
-        scope,
-        &[
-            js::value::from_i32(kind),
-            value.get(),
-            promise.to_jsval_raw_throwing(scope)?,
-        ],
-    )?;
-    array_push(
-        scope,
-        gen.obj(generator::REQUESTS)?,
-        (*entry).to_jsval_throwing(scope)?,
-    )?;
-    gen_drain(scope, &gen)?;
+    gen.data_mut().requests.push_back(GenRequest {
+        kind,
+        value: Heap::from(value.get()),
+        promise: Heap::from(promise),
+    });
+    gen_drain(scope, gen)?;
     promise.to_jsval_raw_throwing(scope)
 }
 
-/// The first queued request, as `(kind, value, promise)`.
-fn gen_front<'s>(
-    scope: &'s Scope<'_>,
-    gen: &Captures<'s>,
-) -> Result<Option<(i32, HandleValue<'s>, js::Promise<'s>)>, ExnThrown> {
-    let requests = gen.obj(generator::REQUESTS)?;
-    if array_len(scope, requests)? == 0 {
-        return Ok(None);
-    }
-    let entry = Captures::of(scope, requests.get_element(scope, 0)?)?;
-    Ok(Some((
-        entry.get(0)?.to_int32(),
-        entry.get(1)?,
-        promise_at(scope, &entry, 2)?,
-    )))
+/// The first queued request, as `(kind, value)`.
+fn gen_front<'s>(scope: &'s Scope<'_>, gen: Generator<'_>) -> Option<(Request, HandleValue<'s>)> {
+    let data = gen.data();
+    let request = data.requests.front()?;
+    Some((request.kind, request.value.get(scope)))
 }
 
 /// Settle the first queued request with `value`, as a rejection or as `{ value, done }`, and
 /// remove it.
 fn gen_complete(
     scope: &Scope<'_>,
-    gen: &Captures<'_>,
+    gen: Generator<'_>,
     reject: bool,
     value: HandleValue<'_>,
     done: bool,
 ) -> Result<(), ExnThrown> {
-    let Some((_, _, promise)) = gen_front(scope, gen)? else {
-        return Ok(());
+    let promise = {
+        let data = gen.data();
+        let Some(request) = data.requests.front() else {
+            return Ok(());
+        };
+        request.promise.get(scope)
     };
-    array_shift(scope, gen.obj(generator::REQUESTS)?)?;
+    drop(gen.data_mut().requests.pop_front());
     if reject {
         promise.reject(scope, value)
     } else {
@@ -329,32 +265,36 @@ fn gen_complete(
     }
 }
 
+/// The body state of `gen`.
+fn gen_body<'s>(scope: &'s Scope<'_>, gen: Generator<'_>) -> Result<Object<'s>, ExnThrown> {
+    gen.data().body.get(scope).ok_or(ExnThrown)
+}
+
 /// Run the queued requests until one leaves the generator running or none is left.
-fn gen_drain(scope: &Scope<'_>, gen: &Captures<'_>) -> Result<(), ExnThrown> {
-    use generator::*;
+fn gen_drain(scope: &Scope<'_>, gen: Generator<'_>) -> Result<(), ExnThrown> {
     loop {
-        if gen.flag(RUNNING)? {
+        if gen.data().running {
             return Ok(());
         }
-        let Some((kind, value, _)) = gen_front(scope, gen)? else {
+        let Some((kind, value)) = gen_front(scope, gen) else {
             return Ok(());
         };
-        let current = gen.get(PHASE)?.to_int32();
-        if current == phase::START && kind != request::NEXT {
-            gen.set(PHASE, phase::DONE)?;
+        let phase = gen.data().phase;
+        if phase == Phase::Start && kind != Request::Next {
+            gen.data_mut().phase = Phase::Done;
             continue;
         }
-        if current == phase::DONE {
+        if phase == Phase::Done {
             match kind {
-                request::NEXT => gen_complete(scope, gen, false, HandleValue::undefined(), true)?,
-                request::THROW => gen_complete(scope, gen, true, value, true)?,
-                _ => {
-                    gen.set(RUNNING, true)?;
-                    let fulfilled = closure(scope, 1, gen_returned, &[gen.array_value()?])?;
-                    let rejected = closure(scope, 1, gen_return_failed, &[gen.array_value()?])?;
+                Request::Next => gen_complete(scope, gen, false, HandleValue::undefined(), true)?,
+                Request::Throw => gen_complete(scope, gen, true, value, true)?,
+                Request::Return => {
+                    gen.data_mut().running = true;
+                    let fulfilled = reaction(scope, gen_returned, gen)?;
+                    let rejected = reaction(scope, gen_return_failed, gen)?;
                     if await_value(scope, value, fulfilled, rejected).is_err() {
-                        gen.set(RUNNING, false)?;
-                        let error = take_exception(scope);
+                        gen.data_mut().running = false;
+                        let error = js::exception::take_pending_or_undefined(scope);
                         gen_complete(scope, gen, true, error, true)?;
                         continue;
                     }
@@ -363,37 +303,35 @@ fn gen_drain(scope: &Scope<'_>, gen: &Captures<'_>) -> Result<(), ExnThrown> {
             }
             continue;
         }
-        gen.set(RUNNING, true)?;
-        let stepped = if current == phase::START {
-            call(scope, HandleValue::undefined(), gen.get(START)?, &[])
-        } else {
-            let kind = scope.root_value(js::value::from_i32(kind));
-            call(
-                scope,
-                HandleValue::undefined(),
-                gen.get(RESUME)?,
-                &[kind, value],
-            )
+        gen.data_mut().running = true;
+        let body = gen_body(scope, gen)?;
+        let (start, resume) = {
+            let data = gen.data();
+            (data.start, data.resume)
+        };
+        let stepped = match (phase, start, resume) {
+            (Phase::Start, Some(start), _) => start(scope, body),
+            (_, _, Some(resume)) => resume(scope, body, kind, value),
+            _ => Ok(()),
         };
         if stepped.is_err() {
-            let error = take_exception(scope);
+            let error = js::exception::take_pending_or_undefined(scope);
             gen_end(scope, gen, true, error)?;
         }
         return Ok(());
     }
 }
 
-/// The value of a `return(value)` request to a completed generator settled, whose captures are
-/// `[generator]`.
+/// The value of a `return(value)` request to a completed generator settled.
 fn gen_returned(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let gen = Captures::of(scope, Captures::of(scope, payload)?.get(0)?)?;
-    gen.set(generator::RUNNING, false)?;
-    gen_complete(scope, &gen, false, args.get(0), true)?;
-    gen_drain(scope, &gen)?;
+    let gen = cast_payload::<Generator>(scope, payload);
+    gen.data_mut().running = false;
+    gen_complete(scope, gen, false, args.get(0), true)?;
+    gen_drain(scope, gen)?;
     Ok(js::value::undefined())
 }
 
@@ -402,10 +340,10 @@ fn gen_return_failed(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let gen = Captures::of(scope, Captures::of(scope, payload)?.get(0)?)?;
-    gen.set(generator::RUNNING, false)?;
-    gen_complete(scope, &gen, true, args.get(0), true)?;
-    gen_drain(scope, &gen)?;
+    let gen = cast_payload::<Generator>(scope, payload);
+    gen.data_mut().running = false;
+    gen_complete(scope, gen, true, args.get(0), true)?;
+    gen_drain(scope, gen)?;
     Ok(js::value::undefined())
 }
 
@@ -413,27 +351,29 @@ fn gen_return_failed(
 /// it with `value`.
 fn gen_end(
     scope: &Scope<'_>,
-    gen: &Captures<'_>,
+    gen: Generator<'_>,
     reject: bool,
     value: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    gen.set(generator::PHASE, phase::DONE)?;
-    gen.set(generator::RUNNING, false)?;
+    {
+        let mut data = gen.data_mut();
+        data.phase = Phase::Done;
+        data.running = false;
+    }
     gen_complete(scope, gen, reject, value, true)?;
     gen_drain(scope, gen)
 }
 
-/// The body of the generator whose body state is `body` yields `value`: once it settles, as the
-/// `await` of a `yield` does, fulfill the current request with `{ value, done: false }`. A
-/// rejection resumes the body with a `throw` request.
+/// The body of `gen` yields `value`: once it settles, as the `await` of a `yield` does, fulfill
+/// the current request with `{ value, done: false }`. A rejection resumes the body with a `throw`
+/// request.
 fn gen_yield(
     scope: &Scope<'_>,
-    body: &Captures<'_>,
+    gen: Generator<'_>,
     value: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let gen = gen_of(scope, body)?;
-    let fulfilled = closure(scope, 1, gen_yielded, &[gen.array_value()?])?;
-    let rejected = closure(scope, 1, gen_yield_failed, &[gen.array_value()?])?;
+    let fulfilled = reaction(scope, gen_yielded, gen)?;
+    let rejected = reaction(scope, gen_yield_failed, gen)?;
     await_value(scope, value, fulfilled, rejected)
 }
 
@@ -442,11 +382,14 @@ fn gen_yielded(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let gen = Captures::of(scope, Captures::of(scope, payload)?.get(0)?)?;
-    gen.set(generator::PHASE, phase::YIELDED)?;
-    gen.set(generator::RUNNING, false)?;
-    gen_complete(scope, &gen, false, args.get(0), false)?;
-    gen_drain(scope, &gen)?;
+    let gen = cast_payload::<Generator>(scope, payload);
+    {
+        let mut data = gen.data_mut();
+        data.phase = Phase::Yielded;
+        data.running = false;
+    }
+    gen_complete(scope, gen, false, args.get(0), false)?;
+    gen_drain(scope, gen)?;
     Ok(js::value::undefined())
 }
 
@@ -455,33 +398,28 @@ fn gen_yield_failed(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let gen = Captures::of(scope, Captures::of(scope, payload)?.get(0)?)?;
-    let kind = scope.root_value(js::value::from_i32(request::THROW));
-    let resume = gen.get(generator::RESUME)?;
-    if call(
-        scope,
-        HandleValue::undefined(),
-        resume,
-        &[kind, args.get(0)],
-    )
-    .is_err()
-    {
-        let error = take_exception(scope);
-        gen_end(scope, &gen, true, error)?;
+    let gen = cast_payload::<Generator>(scope, payload);
+    let body = gen_body(scope, gen)?;
+    let resume = gen.data().resume;
+    let resumed = match resume {
+        Some(resume) => resume(scope, body, Request::Throw, args.get(0)),
+        None => Ok(()),
+    };
+    if resumed.is_err() {
+        let error = js::exception::take_pending_or_undefined(scope);
+        gen_end(scope, gen, true, error)?;
     }
     Ok(js::value::undefined())
 }
 
-/// The body of the generator whose body state is `body` returns `value`: once it settles,
-/// complete the generator with it.
+/// The body of `gen` returns `value`: once it settles, complete the generator with it.
 fn gen_return(
     scope: &Scope<'_>,
-    body: &Captures<'_>,
+    gen: Generator<'_>,
     value: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let gen = gen_of(scope, body)?;
-    let fulfilled = closure(scope, 1, gen_return_settled, &[gen.array_value()?])?;
-    let rejected = closure(scope, 1, gen_throw_settled, &[gen.array_value()?])?;
+    let fulfilled = reaction(scope, gen_return_settled, gen)?;
+    let rejected = reaction(scope, gen_throw_settled, gen)?;
     await_value(scope, value, fulfilled, rejected)
 }
 
@@ -490,8 +428,12 @@ fn gen_return_settled(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let gen = Captures::of(scope, Captures::of(scope, payload)?.get(0)?)?;
-    gen_end(scope, &gen, false, args.get(0))?;
+    gen_end(
+        scope,
+        cast_payload::<Generator>(scope, payload),
+        false,
+        args.get(0),
+    )?;
     Ok(js::value::undefined())
 }
 
@@ -500,137 +442,117 @@ fn gen_throw_settled(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let gen = Captures::of(scope, Captures::of(scope, payload)?.get(0)?)?;
-    gen_end(scope, &gen, true, args.get(0))?;
+    gen_end(
+        scope,
+        cast_payload::<Generator>(scope, payload),
+        true,
+        args.get(0),
+    )?;
     Ok(js::value::undefined())
 }
 
-/// The body of the generator whose body state is `body` throws `error`.
+/// The body of `gen` throws `error`.
 fn gen_throw(
     scope: &Scope<'_>,
-    body: &Captures<'_>,
+    gen: Generator<'_>,
     error: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    gen_end(scope, &gen_of(scope, body)?, true, error)
+    gen_end(scope, gen, true, error)
 }
 
-/// The ways a `for await` loop ends, the first argument of its end callback.
-mod end {
+/// The ways a `for await` loop ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
     /// The iterator is done.
-    pub(super) const DONE: i32 = 0;
-    /// The iterator, or the loop body through [`super::loop_close`], threw the second argument.
-    pub(super) const THROW: i32 = 1;
-    /// [`super::loop_close`] without an error closed the iterator.
-    pub(super) const CLOSED: i32 = 2;
+    Done,
+    /// The iterator, or the loop body through [`loop_close`], threw the value.
+    Throw,
+    /// [`loop_close`] without an error closed the iterator.
+    Closed,
 }
 
-/// The captures of a `for await` loop's reactions: `[iterator, next, sync, onValue, onEnd]`,
-/// where `sync` is set for a sync iterator, whose values the loop awaits.
-mod looping {
-    pub(super) const ITERATOR: u32 = 0;
-    pub(super) const NEXT: u32 = 1;
-    pub(super) const SYNC: u32 = 2;
-    pub(super) const ON_VALUE: u32 = 3;
-    pub(super) const ON_END: u32 = 4;
-    pub(super) const COUNT: usize = 5;
+/// The body of a `for await` loop, which gets the loop's owner and the value.
+type LoopValue = fn(&Scope<'_>, Object<'_>, HandleValue<'_>) -> Result<(), ExnThrown>;
+
+/// The end of a `for await` loop, which gets the loop's owner, how it ended, and the error it
+/// threw.
+type LoopEnd = fn(&Scope<'_>, Object<'_>, End, HandleValue<'_>) -> Result<(), ExnThrown>;
+
+/// A `for await` loop: the iterator record, the owner whose functions run for each value and at
+/// the end, and the error a [`loop_close`] with an error ends it with.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct LoopState {
+    record: Option<Heap<AsyncIteratorRecordImpl>>,
+    owner: Option<Heap<js::object::Object>>,
+    #[no_trace]
+    on_value: Option<LoopValue>,
+    #[no_trace]
+    on_end: Option<LoopEnd>,
+    close_error: Option<Heap<Value>>,
 }
 
-/// Start a `for await (const value of iterable)` loop: get the iterator of `iterable`, its
-/// `Symbol.asyncIterator` method or else its `Symbol.iterator` method, and return the loop's
-/// state. The loop calls `on_value(value)` for each value, which continues it with [`loop_next`]
-/// or leaves it with [`loop_close`], and `on_end(kind, value)` once it ended, with a kind of
-/// [`end`]. Nothing runs before the first [`loop_next`]. `what` names `iterable` in the
-/// `TypeError` for a value that isn't iterable.
+#[core_runtime::jsmethods]
+impl LoopState {}
+
+/// Start a `for await (const value of iterable)` loop: get the iterator of `iterable`, and return
+/// the loop's state. The loop calls `on_value(owner, value)` for each value, which continues it
+/// with [`loop_next`] or leaves it with [`loop_close`], and `on_end(owner, end, error)` once it
+/// ended. Nothing runs before the first [`loop_next`].
 fn loop_open<'s>(
     scope: &'s Scope<'_>,
     iterable: HandleValue<'_>,
-    what: &str,
-    on_value: Object<'_>,
-    on_end: Object<'_>,
-) -> Result<Captures<'s>, ExnThrown> {
-    use looping::*;
-    if iterable.is_null() || iterable.is_undefined() {
-        return Err(type_error(scope, &format!("{what} is not async iterable")));
-    }
-    let object = Object::from_value_coerce(scope, iterable)?;
-    let symbol_method = |code: js::native::SymbolCode| -> Result<HandleValue<'_>, ExnThrown> {
-        let key = js::symbol::get_well_known_key(scope, code);
-        object.get_property_by_id(scope, scope.root_id(key))
-    };
-    let mut sync = false;
-    let mut method = symbol_method(js::native::SymbolCode::asyncIterator)?;
-    if method.is_null() || method.is_undefined() {
-        sync = true;
-        method = symbol_method(js::native::SymbolCode::iterator)?;
-    }
-    if !is_function(scope, method) {
-        return Err(type_error(scope, &format!("{what} is not async iterable")));
-    }
-    let iterable = scope.root_value(iterable.get());
-    let iterator = call(scope, iterable, method, &[])?;
-    let Some(iterator_object) = as_object(scope, iterator) else {
-        return Err(type_error(
-            scope,
-            "Result of the Symbol.asyncIterator method is not an object",
-        ));
-    };
-    let next = iterator_object.val(scope, c"next")?;
-    let state = new_state(scope, COUNT)?;
-    state.set(ITERATOR, iterator)?;
-    state.set(NEXT, next)?;
-    state.set(SYNC, sync)?;
-    state.set(ON_VALUE, on_value)?;
-    state.set(ON_END, on_end)?;
-    Ok(state)
+    owner: Object<'_>,
+    on_value: LoopValue,
+    on_end: LoopEnd,
+) -> Result<LoopState<'s>, ExnThrown> {
+    let record = js::iteration::get_async_iterator(scope, iterable)?;
+    js::class::create_instance_with::<LoopStateImpl>(scope, |_| LoopStateImpl {
+        record: Some(Heap::from(record)),
+        owner: Some(Heap::from(owner)),
+        on_value: Some(on_value),
+        on_end: Some(on_end),
+        close_error: None,
+    })
 }
 
-/// End the loop with `kind` and `value`.
+/// The iterator record of `state`.
+fn loop_record<'s>(
+    scope: &'s Scope<'_>,
+    state: LoopState<'_>,
+) -> Result<AsyncIteratorRecord<'s>, ExnThrown> {
+    state.data().record.get(scope).ok_or(ExnThrown)
+}
+
+/// End the loop with `end` and `value`.
 fn loop_end(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
-    kind: i32,
+    state: LoopState<'_>,
+    end: End,
     value: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let kind = scope.root_value(js::value::from_i32(kind));
-    let on_end = state.get(looping::ON_END)?;
-    call(scope, HandleValue::undefined(), on_end, &[kind, value])?;
-    Ok(())
+    let (owner, on_end) = {
+        let data = state.data();
+        (data.owner.get(scope), data.on_end)
+    };
+    match (owner, on_end) {
+        (Some(owner), Some(on_end)) => on_end(scope, owner, end, value),
+        _ => Ok(()),
+    }
 }
 
 /// End the loop with the pending exception.
-fn loop_end_pending(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    let error = take_exception(scope);
-    loop_end(scope, state, end::THROW, error)
+fn loop_end_pending(scope: &Scope<'_>, state: LoopState<'_>) -> Result<(), ExnThrown> {
+    let error = js::exception::take_pending_or_undefined(scope);
+    loop_end(scope, state, End::Throw, error)
 }
 
 /// Take the loop's next value: call the iterator's `next()`, and await its result.
-fn loop_next(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    use looping::*;
-    let iterator = state.get(ITERATOR)?;
-    let Ok(result) = call(scope, iterator, state.get(NEXT)?, &[]) else {
-        return loop_end_pending(scope, state);
-    };
-    if !state.flag(SYNC)? {
-        let fulfilled = bind(scope, state, 1, loop_result)?;
-        let rejected = bind(scope, state, 1, loop_failed)?;
-        if await_value(scope, result, fulfilled, rejected).is_err() {
-            return loop_end_pending(scope, state);
-        }
-        return Ok(());
-    }
+fn loop_next(scope: &Scope<'_>, state: LoopState<'_>) -> Result<(), ExnThrown> {
     let step = (|| -> Result<(), ExnThrown> {
-        let Some(result) = as_object(scope, result) else {
-            return Err(type_error(scope, "iterator result is not an object"));
-        };
-        let done = truthy(scope, result.val(scope, c"done")?);
-        let value = result.val(scope, c"value")?;
-        let fulfilled = if done {
-            bind(scope, state, 1, loop_sync_done)?
-        } else {
-            bind(scope, state, 1, loop_value)?
-        };
-        let rejected = bind(scope, state, 1, loop_failed)?;
-        await_value(scope, value, fulfilled, rejected)
+        let result = loop_record(scope, state)?.call_next(scope)?;
+        let fulfilled = reaction(scope, loop_result, state)?;
+        let rejected = reaction(scope, loop_failed, state)?;
+        await_value(scope, result, fulfilled, rejected)
     })();
     if step.is_err() {
         return loop_end_pending(scope, state);
@@ -638,53 +560,33 @@ fn loop_next(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
     Ok(())
 }
 
-/// An async iterator's `next()` fulfilled with `result`.
+/// The iterator's `next()` fulfilled with `result`.
 fn loop_result(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
+    let state = cast_payload::<LoopState>(scope, payload);
     let step = (|| -> Result<Option<HandleValue<'_>>, ExnThrown> {
-        let Some(result) = as_object(scope, args.get(0)) else {
-            return Err(type_error(scope, "iterator result is not an object"));
-        };
-        if truthy(scope, result.val(scope, c"done")?) {
+        let result = js::iteration::iter_result_object(scope, args.get(0))?;
+        if js::iteration::iter_result_done(scope, &result)? {
             return Ok(None);
         }
-        Ok(Some(result.val(scope, c"value")?))
+        Ok(Some(js::iteration::iter_result_value(scope, &result)?))
     })();
     match step {
         Ok(Some(value)) => {
-            let on_value = state.get(looping::ON_VALUE)?;
-            call(scope, HandleValue::undefined(), on_value, &[value])?;
+            let (owner, on_value) = {
+                let data = state.data();
+                (data.owner.get(scope), data.on_value)
+            };
+            if let (Some(owner), Some(on_value)) = (owner, on_value) {
+                on_value(scope, owner, value)?;
+            }
         }
-        Ok(None) => loop_end(scope, &state, end::DONE, HandleValue::undefined())?,
-        Err(_) => loop_end_pending(scope, &state)?,
+        Ok(None) => loop_end(scope, state, End::Done, HandleValue::undefined())?,
+        Err(_) => loop_end_pending(scope, state)?,
     }
-    Ok(js::value::undefined())
-}
-
-/// The awaited value of a sync iterator's result.
-fn loop_value(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let on_value = state.get(looping::ON_VALUE)?;
-    call(scope, HandleValue::undefined(), on_value, &[args.get(0)])?;
-    Ok(js::value::undefined())
-}
-
-/// A sync iterator's result with `done` set, once its value settled.
-fn loop_sync_done(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    loop_end(scope, &state, end::DONE, HandleValue::undefined())?;
     Ok(js::value::undefined())
 }
 
@@ -693,64 +595,43 @@ fn loop_failed(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    loop_end(scope, &state, end::THROW, args.get(0))?;
+    loop_end(
+        scope,
+        cast_payload::<LoopState>(scope, payload),
+        End::Throw,
+        args.get(0),
+    )?;
     Ok(js::value::undefined())
 }
 
-/// The captures of the reactions of [`loop_close`]: `[loop, hasError, error]`.
-mod closing {
-    pub(super) const LOOP: u32 = 0;
-    pub(super) const HAS_ERROR: u32 = 1;
-    pub(super) const ERROR: u32 = 2;
-}
-
-/// Leave the loop, as `break` does without `error` and `throw error` does with it: call the
-/// iterator's `return()` if it has one, await its result, and end the loop. The loop ends with
-/// `error` if given, and otherwise with an exception `return()` throws or its rejection.
+/// Leave the loop, as `break` does without `error` and `throw error` does with it: close the
+/// iterator, as `AsyncIteratorClose` does, and end the loop. The loop ends with `error` if given,
+/// and otherwise with an exception `return()` throws, its rejection, or `ERR_INVALID_RETURN_VALUE`
+/// for a result that isn't an object.
 fn loop_close(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
+    state: LoopState<'_>,
     error: Option<HandleValue<'_>>,
 ) -> Result<(), ExnThrown> {
-    let iterator = state.get(looping::ITERATOR)?;
-    let finish = |thrown: Option<HandleValue<'_>>| -> Result<(), ExnThrown> {
-        match (error, thrown) {
-            (Some(error), _) => loop_end(scope, state, end::THROW, error),
-            (None, Some(thrown)) => loop_end(scope, state, end::THROW, thrown),
-            (None, None) => loop_end(scope, state, end::CLOSED, HandleValue::undefined()),
+    let record = loop_record(scope, state)?;
+    let closing = match error {
+        Some(error) => {
+            state.data_mut().close_error = Some(Heap::from(error.get()));
+            Ok(record.close_after_throw(scope))
         }
+        None => record.call_return(scope),
     };
-    let step = (|| -> Result<bool, ExnThrown> {
-        let iterator_object = Object::from_value_coerce(scope, iterator)?;
-        let method = iterator_object.val(scope, c"return")?;
-        if method.is_null() || method.is_undefined() {
-            return Ok(false);
+    match closing {
+        Ok(Some(promise)) => {
+            let fulfilled = reaction(scope, loop_closed, state)?;
+            let rejected = reaction(scope, loop_close_failed, state)?;
+            promise.add_reactions(scope, Some(fulfilled), Some(rejected))
         }
-        if !is_function(scope, method) {
-            return Err(type_error(scope, "iterator.return is not a function"));
-        }
-        let result = call(scope, iterator, method, &[])?;
-        let captures = js::Array::with_contents(
-            scope,
-            &[
-                state.array_value()?,
-                js::value::from_bool(error.is_some()),
-                error.map_or(js::value::undefined(), |error| error.get()),
-            ],
-        )?;
-        let fulfilled = Function::new_callback(scope, c"", 1, loop_closed, *captures)?;
-        let rejected = Function::new_callback(scope, c"", 1, loop_close_failed, *captures)?;
-        await_value(scope, result, *fulfilled, *rejected)?;
-        Ok(true)
-    })();
-    match step {
-        Ok(true) => Ok(()),
-        Ok(false) => finish(None),
-        Err(_) => {
-            let thrown = take_exception(scope);
-            finish(Some(thrown))
-        }
+        Ok(None) => match error {
+            Some(error) => loop_end(scope, state, End::Throw, error),
+            None => loop_end(scope, state, End::Closed, HandleValue::undefined()),
+        },
+        Err(ExnThrown) => loop_end_pending(scope, state),
     }
 }
 
@@ -760,23 +641,24 @@ fn loop_closed(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use closing::*;
-    let captures = Captures::of(scope, payload)?;
-    let state = Captures::of(scope, captures.get(LOOP)?)?;
-    if captures.flag(HAS_ERROR)? {
-        loop_end(scope, &state, end::THROW, captures.get(ERROR)?)?;
+    let state = cast_payload::<LoopState>(scope, payload);
+    let close_error = state
+        .data()
+        .close_error
+        .as_ref()
+        .map(|error| error.get(scope));
+    if let Some(error) = close_error {
+        loop_end(scope, state, End::Throw, error)?;
     } else if !args.get(0).is_object() {
-        let error = error_value(
-            scope,
-            NodeError::new(
-                ErrorKind::TypeError,
-                "ERR_INVALID_RETURN_VALUE",
-                "iterator.return() did not return an object",
-            ),
-        )?;
-        loop_end(scope, &state, end::THROW, error)?;
+        let error = NodeError::new(
+            ErrorKind::TypeError,
+            "ERR_INVALID_RETURN_VALUE",
+            "iterator.return() did not return an object",
+        )
+        .to_value(scope)?;
+        loop_end(scope, state, End::Throw, error)?;
     } else {
-        loop_end(scope, &state, end::CLOSED, HandleValue::undefined())?;
+        loop_end(scope, state, End::Closed, HandleValue::undefined())?;
     }
     Ok(js::value::undefined())
 }
@@ -786,77 +668,83 @@ fn loop_close_failed(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use closing::*;
-    let captures = Captures::of(scope, payload)?;
-    let state = Captures::of(scope, captures.get(LOOP)?)?;
-    let error = if captures.flag(HAS_ERROR)? {
-        captures.get(ERROR)?
-    } else {
-        args.get(0)
-    };
-    loop_end(scope, &state, end::THROW, error)?;
+    let state = cast_payload::<LoopState>(scope, payload);
+    let close_error = state
+        .data()
+        .close_error
+        .as_ref()
+        .map(|error| error.get(scope));
+    let error = close_error.unwrap_or(args.get(0));
+    loop_end(scope, state, End::Throw, error)?;
     Ok(js::value::undefined())
 }
 
-/// The state of a `map` generator: `[generator, stream, fn, options, signal, signalOpt, queue,
-/// next, resume, done, cnt, concurrency, highWaterMark, loop, eof, empty]`, Node's variables of
-/// the same names. `next` and `resume` are the pending promises the body and the pump await, or
-/// `undefined`. `eof` and `empty` are the objects for Node's `kEof` and `kEmpty`.
-mod map {
-    pub(super) const STREAM: u32 = 1;
-    pub(super) const FN: u32 = 2;
-    pub(super) const OPTIONS: u32 = 3;
-    pub(super) const SIGNAL: u32 = 4;
-    pub(super) const SIGNAL_OPT: u32 = 5;
-    pub(super) const QUEUE: u32 = 6;
-    pub(super) const NEXT: u32 = 7;
-    pub(super) const RESUME: u32 = 8;
-    pub(super) const DONE: u32 = 9;
-    pub(super) const CNT: u32 = 10;
-    pub(super) const CONCURRENCY: u32 = 11;
-    pub(super) const HIGH_WATER_MARK: u32 = 12;
-    pub(super) const LOOP: u32 = 13;
-    pub(super) const EOF: u32 = 14;
-    pub(super) const EMPTY: u32 = 15;
-    pub(super) const COUNT: usize = 16;
+/// A result of `map`'s function in its queue, or the end of the stream.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+enum MapEntry {
+    Result(Heap<js::promise::Promise>),
+    Eof,
 }
+
+/// The state of a `map` generator: Node's variables of the same names. `next` and `resume` are the
+/// pending promises the body and the pump await.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct MapState {
+    gen: Option<Heap<GeneratorImpl>>,
+    stream: Heap<Value>,
+    function: Heap<Value>,
+    options: Heap<Value>,
+    signal: Option<Heap<AbortSignalImpl>>,
+    signal_opt: Option<Heap<js::object::Object>>,
+    queue: VecDeque<MapEntry>,
+    next: Option<Heap<js::promise::Promise>>,
+    resume: Option<Heap<js::promise::Promise>>,
+    pump: Option<Heap<LoopStateImpl>>,
+    #[no_trace]
+    done: bool,
+    #[no_trace]
+    cnt: f64,
+    #[no_trace]
+    concurrency: f64,
+    #[no_trace]
+    high_water_mark: f64,
+}
+
+#[core_runtime::jsmethods]
+impl MapState {}
 
 /// `MathFloor(value)`: `Math.floor` of `value` converted to a number.
 fn floor(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<f64, ExnThrown> {
-    use js::conversion::FromJSVal;
     Ok(f64::from_jsval(scope, value, ())
         .map_err(|_| ExnThrown)?
         .floor())
 }
 
-/// Node's `map(fn, options)`: the generator of `fn`'s results for the values of `stream`, with up
-/// to `options.concurrency` calls of `fn` in flight and `options.highWaterMark` results waiting.
-/// A result that is `empty` isn't yielded.
+/// The generator of `map` for `stream`, `fn` and `options`, as an object.
 fn map_generator<'s>(
     scope: &'s Scope<'_>,
     stream: HandleValue<'_>,
     function: HandleValue<'_>,
     options: HandleValue<'_>,
-    empty: Option<Object<'_>>,
 ) -> Result<Object<'s>, Thrown> {
-    use map::*;
     validate_function(scope, function, "fn")?;
     let options = scope.root_value(options.get());
     let options = validate_options(scope, options)?;
     let option = |name: &'static CStr| -> Result<HandleValue<'_>, ExnThrown> {
-        match as_object(scope, options) {
-            Some(options) => options.val(scope, name),
+        match Object::from_value(scope, options).ok() {
+            Some(options) => options.get_property(scope, name),
             None => Ok(HandleValue::undefined()),
         }
     };
     let mut concurrency = 1.0;
     let value = option(c"concurrency")?;
-    if !value.is_null() && !value.is_undefined() {
+    if !value.is_null_or_undefined() {
         concurrency = floor(scope, option(c"concurrency")?)?;
     }
     let mut high_water_mark = concurrency - 1.0;
     let value = option(c"highWaterMark")?;
-    if !value.is_null() && !value.is_undefined() {
+    if !value.is_null_or_undefined() {
         high_water_mark = floor(scope, option(c"highWaterMark")?)?;
     }
     let concurrency_value = scope.root_value(js::value::from_f64(concurrency));
@@ -877,100 +765,116 @@ fn map_generator<'s>(
     )?;
     high_water_mark += concurrency;
 
-    let state = new_state(scope, COUNT)?;
-    state.set(STREAM, stream)?;
-    state.set(FN, function)?;
-    state.set(OPTIONS, options)?;
-    state.set(QUEUE, *js::Array::with_contents(scope, &[] as &[Value])?)?;
-    state.set(DONE, false)?;
-    state.set(CNT, 0)?;
-    state.set(CONCURRENCY, concurrency)?;
-    state.set(HIGH_WATER_MARK, high_water_mark)?;
-    state.set(EOF, Object::new_plain(scope)?)?;
-    let empty = match empty {
-        Some(empty) => empty,
-        None => Object::new_plain(scope)?,
-    };
-    state.set(EMPTY, empty)?;
-    Ok(new_generator(scope, &state, map_start, map_resume)?)
+    let state = js::class::create_instance_with::<MapStateImpl>(scope, |_| MapStateImpl {
+        gen: None,
+        stream: Heap::from(stream.get()),
+        function: Heap::from(function.get()),
+        options: Heap::from(options.get()),
+        signal: None,
+        signal_opt: None,
+        queue: VecDeque::new(),
+        next: None,
+        resume: None,
+        pump: None,
+        done: false,
+        cnt: 0.0,
+        concurrency,
+        high_water_mark,
+    })?;
+    let (gen, object) = new_generator(scope, *state, map_start, map_resume)?;
+    state.data_mut().gen = Some(Heap::from(gen));
+    Ok(object)
+}
+
+/// The [`MapState`] that is `body`.
+fn map_state(body: Object<'_>) -> MapState<'_> {
+    body.cast::<MapState>().expect("the body is a MapState")
+}
+
+/// The generator of `state`.
+fn map_gen<'s>(scope: &'s Scope<'_>, state: MapState<'_>) -> Result<Generator<'s>, ExnThrown> {
+    state.data().gen.get(scope).ok_or(ExnThrown)
 }
 
 /// The start of `map`'s body: create the signal, start the pump, and wait for the first result.
-fn map_start(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use map::*;
-    let state = state_of(scope, payload)?;
-    let signals = js::Array::with_contents(scope, &[] as &[Value])?;
-    if let Some(options) = as_object(scope, state.get(OPTIONS)?) {
-        let signal = options.val(scope, c"signal")?;
-        if truthy(scope, signal) {
-            array_push(scope, *signals, signal)?;
+fn map_start(scope: &Scope<'_>, body: Object<'_>) -> Result<(), ExnThrown> {
+    let state = map_state(body);
+    let signals = js::Array::new(scope, 0)?;
+    let options = state.data().options.get(scope);
+    if let Ok(options) = Object::from_value(scope, options) {
+        let signal = options.get_property(scope, c"signal")?;
+        if js::conversion::to_boolean(signal) {
+            signals.push(scope, signal)?;
         }
     }
-    let abort_signal = scope
-        .global()
-        .obj(scope, c"AbortSignal")?
-        .ok_or_else(|| type_error(scope, "AbortSignal is not defined"))?;
-    let signal = call_method(
-        scope,
-        abort_signal,
-        c"any",
-        &[(*signals).to_jsval_throwing(scope)?],
-    )?;
-    state.set(SIGNAL, signal)?;
+    let signal = AbortSignalImpl::any(scope, signals.to_jsval_throwing(scope)?)?;
     let signal_opt = Object::new_plain(scope)?;
-    signal_opt.set_property(scope, c"signal", signal)?;
-    state.set(SIGNAL_OPT, signal_opt)?;
-    pump_start(scope, &state)?;
-    map_continue(scope, &state);
-    Ok(js::value::undefined())
+    signal_opt.set_property(scope, c"signal", *signal)?;
+    {
+        let mut data = state.data_mut();
+        data.signal = Some(Heap::from(signal));
+        data.signal_opt = Some(Heap::from(signal_opt));
+    }
+    pump_start(scope, state)?;
+    map_continue(scope, state);
+    Ok(())
 }
 
-/// Resolve the pending promise at `index`, if any, and clear it: a call of Node's `next()` or
+/// Whether `state`'s signal aborted.
+fn map_aborted(scope: &Scope<'_>, state: MapState<'_>) -> bool {
+    state
+        .data()
+        .signal
+        .get(scope)
+        .is_some_and(|signal| signal.aborted())
+}
+
+/// The pending promise of a [`MapState`] that a call of Node's `next()` or `resume()` resolves.
+type Slot = fn(&mut MapStateImpl) -> &mut Option<Heap<js::promise::Promise>>;
+
+fn next_slot(data: &mut MapStateImpl) -> &mut Option<Heap<js::promise::Promise>> {
+    &mut data.next
+}
+
+fn resume_slot(data: &mut MapStateImpl) -> &mut Option<Heap<js::promise::Promise>> {
+    &mut data.resume
+}
+
+/// Resolve the pending promise `slot` selects, if any, and clear it: a call of Node's `next()` or
 /// `resume()`.
-fn wake(scope: &Scope<'_>, state: &Captures<'_>, index: u32) -> Result<(), ExnThrown> {
-    let Some(promise) = as_object(scope, state.get(index)?) else {
-        return Ok(());
-    };
-    state.set(index, js::value::undefined())?;
-    if let Ok(promise) = promise.cast::<js::Promise>() {
-        settle(scope, promise, false, HandleValue::undefined())?;
+fn wake(scope: &Scope<'_>, state: MapState<'_>, slot: Slot) -> Result<(), ExnThrown> {
+    let promise = slot(&mut state.data_mut()).take_rooted(scope);
+    if let Some(promise) = promise.filter(|promise| promise.is_pending()) {
+        promise.resolve(scope, HandleValue::undefined())?;
     }
     Ok(())
 }
 
-/// Store a new pending promise at `index`, and run `then` with the captures `[state]` once it is
-/// resolved: `await new Promise((resolve) => { variable = resolve; })`.
+/// Store a new pending promise in `slot`, and run `then` with `state` once it is resolved:
+/// `await new Promise((resolve) => { variable = resolve; })`.
 fn wait(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
-    index: u32,
+    state: MapState<'_>,
+    slot: Slot,
     then: Callback,
 ) -> Result<(), ExnThrown> {
     let promise = js::Promise::new_pending(scope)?;
-    state.set(index, *promise)?;
-    promise.then(scope, Some(bind(scope, state, 1, then)?), None)?;
-    Ok(())
-}
-
-/// The queue's length.
-fn queue_len(scope: &Scope<'_>, state: &Captures<'_>) -> Result<f64, ExnThrown> {
-    Ok(array_len(scope, state.obj(map::QUEUE)?)? as f64)
+    *slot(&mut state.data_mut()) = Some(Heap::from(promise));
+    let fulfilled = reaction(scope, then, state)?;
+    promise.add_reactions(scope, Some(fulfilled), None)
 }
 
 /// Node's `maybeResume()`: resume the pump if it waits and there is room.
-fn maybe_resume(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    use map::*;
-    if !state.get(RESUME)?.is_object() || state.flag(DONE)? {
-        return Ok(());
-    }
-    if state.get(CNT)?.to_number() < state.get(CONCURRENCY)?.to_number()
-        && queue_len(scope, state)? < state.get(HIGH_WATER_MARK)?.to_number()
-    {
-        wake(scope, state, RESUME)?;
+fn maybe_resume(scope: &Scope<'_>, state: MapState<'_>) -> Result<(), ExnThrown> {
+    let resume = {
+        let data = state.data();
+        data.resume.is_some()
+            && !data.done
+            && data.cnt < data.concurrency
+            && (data.queue.len() as f64) < data.high_water_mark
+    };
+    if resume {
+        wake(scope, state, resume_slot)?;
     }
     Ok(())
 }
@@ -981,10 +885,9 @@ fn after_item_processed(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let count = state.get(map::CNT)?.to_number();
-    state.set(map::CNT, count - 1.0)?;
-    maybe_resume(scope, &state)?;
+    let state = cast_payload::<MapState>(scope, payload);
+    state.data_mut().cnt -= 1.0;
+    maybe_resume(scope, state)?;
     Ok(js::value::undefined())
 }
 
@@ -994,97 +897,99 @@ fn on_catch(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    state_of(scope, payload)?.set(map::DONE, true)?;
+    cast_payload::<MapState>(scope, payload).data_mut().done = true;
     after_item_processed(scope, args, payload)
 }
 
 /// Queue `promise`, the result for one value, after the reactions that count it as processed.
 fn queue_result(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
+    state: MapState<'_>,
     promise: js::Promise<'_>,
 ) -> Result<(), ExnThrown> {
-    let processed = bind(scope, state, 0, after_item_processed)?;
-    let failed = bind(scope, state, 0, on_catch)?;
-    promise.then(scope, Some(processed), Some(failed))?;
-    array_push(
-        scope,
-        state.obj(map::QUEUE)?,
-        promise.to_jsval_throwing(scope)?,
-    )
+    let processed = reaction(scope, after_item_processed, state)?;
+    let failed = reaction(scope, on_catch, state)?;
+    promise.add_reactions(scope, Some(processed), Some(failed))?;
+    state
+        .data_mut()
+        .queue
+        .push_back(MapEntry::Result(Heap::from(promise)));
+    Ok(())
 }
 
 /// Node's `pump()`: start the `for await` loop over the stream.
-fn pump_start(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    use map::*;
-    let on_value = bind(scope, state, 1, pump_value)?;
-    let on_end = bind(scope, state, 2, pump_end)?;
-    match loop_open(scope, state.get(STREAM)?, "stream", on_value, on_end) {
-        Ok(lp) => {
-            state.set(LOOP, lp.array)?;
-            loop_next(scope, &lp)
+fn pump_start(scope: &Scope<'_>, state: MapState<'_>) -> Result<(), ExnThrown> {
+    let stream = state.data().stream.get(scope);
+    match loop_open(scope, stream, *state, pump_value, pump_end) {
+        Ok(pump) => {
+            state.data_mut().pump = Some(Heap::from(pump));
+            loop_next(scope, pump)
         }
         Err(_) => {
-            let error = take_exception(scope);
+            let error = js::exception::take_pending_or_undefined(scope);
             pump_catch(scope, state, error)?;
             pump_finally(scope, state)
         }
     }
 }
 
-/// The loop of the pump.
-fn pump_loop<'s>(scope: &'s Scope<'_>, state: &Captures<'s>) -> Result<Captures<'s>, ExnThrown> {
-    Captures::of(scope, state.get(map::LOOP)?)
+/// The pump's loop.
+fn map_pump<'s>(scope: &'s Scope<'_>, state: MapState<'_>) -> Result<LoopState<'s>, ExnThrown> {
+    state.data().pump.get(scope).ok_or(ExnThrown)
 }
 
 /// The body of the pump's loop, for the value `val`.
 fn pump_value(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use map::*;
-    let state = state_of(scope, payload)?;
-    let lp = pump_loop(scope, &state)?;
-    if state.flag(DONE)? {
-        loop_close(scope, &lp, None)?;
-        return Ok(js::value::undefined());
+    owner: Object<'_>,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = map_state(owner);
+    let pump = map_pump(scope, state)?;
+    if state.data().done {
+        return loop_close(scope, pump, None);
     }
-    let signal = state.obj(SIGNAL)?;
-    if truthy(scope, signal.val(scope, c"aborted")?) {
-        let error = abort_error(scope, None)?;
-        loop_close(scope, &lp, Some(error))?;
-        return Ok(js::value::undefined());
+    if map_aborted(scope, state) {
+        let error = crate::errors::abort_error(scope, None)?;
+        return loop_close(scope, pump, Some(error));
     }
     let mapped = (|| -> Result<js::Promise<'_>, ExnThrown> {
-        let value = call(
+        let (function, signal_opt) = {
+            let data = state.data();
+            (data.function.get(scope), data.signal_opt.get(scope))
+        };
+        let signal_opt = match signal_opt {
+            Some(signal_opt) => scope.root_value(signal_opt.as_value()),
+            None => HandleValue::undefined(),
+        };
+        let value = Function::call(
             scope,
             HandleValue::undefined(),
-            state.get(FN)?,
-            &[args.get(0), state.get(SIGNAL_OPT)?],
+            function,
+            &[value, signal_opt],
         )?;
         js::Promise::call_original_resolve(scope, value)
     })();
     let promise = match mapped {
         Ok(promise) => promise,
         Err(_) => {
-            let error = take_exception(scope);
+            let error = js::exception::take_pending_or_undefined(scope);
             js::Promise::new_rejected_with_error(scope, error)?
         }
     };
-    let count = state.get(CNT)?.to_number();
-    state.set(CNT, count + 1.0)?;
-    queue_result(scope, &state, promise)?;
-    wake(scope, &state, NEXT)?;
-    if !state.flag(DONE)?
-        && (queue_len(scope, &state)? >= state.get(HIGH_WATER_MARK)?.to_number()
-            || state.get(CNT)?.to_number() >= state.get(CONCURRENCY)?.to_number())
-    {
-        wait(scope, &state, RESUME, pump_resumed)?;
+    state.data_mut().cnt += 1.0;
+    queue_result(scope, state, promise)?;
+    wake(scope, state, next_slot)?;
+    let wait_for_room = {
+        let data = state.data();
+        !data.done
+            && ((data.queue.len() as f64) >= data.high_water_mark || data.cnt >= data.concurrency)
+    };
+    if wait_for_room {
+        wait(scope, state, resume_slot, pump_resumed)
     } else {
-        loop_next(scope, &lp)?;
+        loop_next(scope, pump)
     }
-    Ok(js::value::undefined())
 }
 
 fn pump_resumed(
@@ -1092,31 +997,31 @@ fn pump_resumed(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    loop_next(scope, &pump_loop(scope, &state)?)?;
+    let state = cast_payload::<MapState>(scope, payload);
+    loop_next(scope, map_pump(scope, state)?)?;
     Ok(js::value::undefined())
 }
 
-/// The end of the pump's loop: queue `kEof` after the last value, or a rejection with the error.
+/// The end of the pump's loop: queue the end after the last value, or a rejection with the error.
 fn pump_end(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    match args.get(0).to_int32() {
-        end::DONE => array_push(scope, state.obj(map::QUEUE)?, state.get(map::EOF)?)?,
-        end::THROW => pump_catch(scope, &state, args.get(1))?,
-        _ => {}
+    owner: Object<'_>,
+    end: End,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = map_state(owner);
+    match end {
+        End::Done => state.data_mut().queue.push_back(MapEntry::Eof),
+        End::Throw => pump_catch(scope, state, error)?,
+        End::Closed => {}
     }
-    pump_finally(scope, &state)?;
-    Ok(js::value::undefined())
+    pump_finally(scope, state)
 }
 
 /// The `catch` block of the pump.
 fn pump_catch(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
+    state: MapState<'_>,
     error: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
     let promise = js::Promise::new_rejected_with_error(scope, error)?;
@@ -1124,30 +1029,50 @@ fn pump_catch(
 }
 
 /// The `finally` block of the pump.
-fn pump_finally(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    state.set(map::DONE, true)?;
-    wake(scope, state, map::NEXT)
+fn pump_finally(scope: &Scope<'_>, state: MapState<'_>) -> Result<(), ExnThrown> {
+    state.data_mut().done = true;
+    wake(scope, state, next_slot)
 }
 
 /// Continue `map`'s body at the top of its loop, and end the body with an exception the step
 /// throws.
-fn map_continue(scope: &Scope<'_>, state: &Captures<'_>) {
+fn map_continue(scope: &Scope<'_>, state: MapState<'_>) {
     if map_loop(scope, state).is_err() {
-        let error = take_exception(scope);
+        let error = js::exception::take_pending_or_undefined(scope);
         let _ = map_fail(scope, state, error);
     }
 }
 
 /// The top of `map`'s loop: await the first queued result, or wait for one.
-fn map_loop(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    let queue = state.obj(map::QUEUE)?;
-    if array_len(scope, queue)? == 0 {
-        return wait(scope, state, map::NEXT, map_woken);
+fn map_loop(scope: &Scope<'_>, state: MapState<'_>) -> Result<(), ExnThrown> {
+    enum Front<'r> {
+        Empty,
+        Result(js::Promise<'r>),
+        Eof,
     }
-    let front = queue.get_element(scope, 0)?;
-    let fulfilled = bind(scope, state, 1, map_awaited)?;
-    let rejected = bind(scope, state, 1, map_rejected)?;
-    await_value(scope, front, fulfilled, rejected)
+    let front = match state.data().queue.front() {
+        None => Front::Empty,
+        Some(MapEntry::Result(promise)) => Front::Result(promise.get(scope)),
+        Some(MapEntry::Eof) => Front::Eof,
+    };
+    match front {
+        Front::Empty => wait(scope, state, next_slot, map_woken),
+        Front::Result(promise) => {
+            let fulfilled = reaction(scope, map_awaited, state)?;
+            let rejected = reaction(scope, map_rejected, state)?;
+            await_value(
+                scope,
+                promise.to_jsval_throwing(scope)?,
+                fulfilled,
+                rejected,
+            )
+        }
+        Front::Eof => {
+            let fulfilled = reaction(scope, map_eof, state)?;
+            let rejected = reaction(scope, map_rejected, state)?;
+            await_value(scope, HandleValue::undefined(), fulfilled, rejected)
+        }
+    }
 }
 
 fn map_woken(
@@ -1155,37 +1080,49 @@ fn map_woken(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    map_continue(scope, &state_of(scope, payload)?);
+    map_continue(scope, cast_payload::<MapState>(scope, payload));
     Ok(js::value::undefined())
 }
 
-/// The first queued result settled with `val`: return at `kEof`, and yield anything but
-/// `kEmpty`.
+/// The end of the stream reached the front of the queue: return.
+fn map_eof(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let state = cast_payload::<MapState>(scope, payload);
+    let step = (|| -> Result<(), ExnThrown> {
+        map_finally(scope, state)?;
+        gen_return(scope, map_gen(scope, state)?, HandleValue::undefined())
+    })();
+    if step.is_err() {
+        let error = js::exception::take_pending_or_undefined(scope);
+        map_fail(scope, state, error)?;
+    }
+    Ok(js::value::undefined())
+}
+
+/// The first queued result settled with `val`: yield anything but `kEmpty`.
 fn map_awaited(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    use map::*;
-    let state = state_of(scope, payload)?;
+    let state = cast_payload::<MapState>(scope, payload);
     let step = (|| -> Result<(), ExnThrown> {
         let value = args.get(0);
-        if same(scope, value, state.get(EOF)?)? {
-            map_finally(scope, &state)?;
-            return gen_return(scope, &state, HandleValue::undefined());
+        if map_aborted(scope, state) {
+            let error = crate::errors::abort_error(scope, None)?;
+            return map_fail(scope, state, error);
         }
-        if truthy(scope, state.obj(SIGNAL)?.val(scope, c"aborted")?) {
-            let error = abort_error(scope, None)?;
-            return map_fail(scope, &state, error);
+        if js::comparison::strictly_equal(scope, value, K_EMPTY.value(scope)?)? {
+            return map_after_yield(scope, state);
         }
-        if same(scope, value, state.get(EMPTY)?)? {
-            return map_after_yield(scope, &state);
-        }
-        gen_yield(scope, &state, value)
+        gen_yield(scope, map_gen(scope, state)?, value)
     })();
     if step.is_err() {
-        let error = take_exception(scope);
-        map_fail(scope, &state, error)?;
+        let error = js::exception::take_pending_or_undefined(scope);
+        map_fail(scope, state, error)?;
     }
     Ok(js::value::undefined())
 }
@@ -1195,13 +1132,13 @@ fn map_rejected(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    map_fail(scope, &state_of(scope, payload)?, args.get(0))?;
+    map_fail(scope, cast_payload::<MapState>(scope, payload), args.get(0))?;
     Ok(js::value::undefined())
 }
 
 /// After the body yielded: remove the result, resume the pump if there is room, and continue.
-fn map_after_yield(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    array_shift(scope, state.obj(map::QUEUE)?)?;
+fn map_after_yield(scope: &Scope<'_>, state: MapState<'_>) -> Result<(), ExnThrown> {
+    drop(state.data_mut().queue.pop_front());
     maybe_resume(scope, state)?;
     map_loop(scope, state)
 }
@@ -1209,96 +1146,120 @@ fn map_after_yield(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThr
 /// A request to `map`'s body after it yielded.
 fn map_resume(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    match args.get(0).to_int32() {
-        request::NEXT => {
-            if map_after_yield(scope, &state).is_err() {
-                let error = take_exception(scope);
-                map_fail(scope, &state, error)?;
+    body: Object<'_>,
+    kind: Request,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = map_state(body);
+    match kind {
+        Request::Next => {
+            if map_after_yield(scope, state).is_err() {
+                let error = js::exception::take_pending_or_undefined(scope);
+                map_fail(scope, state, error)?;
             }
+            Ok(())
         }
-        request::RETURN => {
-            map_finally(scope, &state)?;
-            gen_return(scope, &state, args.get(1))?;
+        Request::Return => {
+            map_finally(scope, state)?;
+            gen_return(scope, map_gen(scope, state)?, value)
         }
-        _ => map_fail(scope, &state, args.get(1))?,
+        Request::Throw => map_fail(scope, state, value),
     }
-    Ok(js::value::undefined())
 }
 
 /// `map`'s body throws `error`, after its `finally` block.
 fn map_fail(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
+    state: MapState<'_>,
     error: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
     map_finally(scope, state)?;
-    gen_throw(scope, state, error)
+    gen_throw(scope, map_gen(scope, state)?, error)
 }
 
 /// The `finally` block of `map`'s body: stop the pump.
-fn map_finally(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    state.set(map::DONE, true)?;
-    wake(scope, state, map::RESUME)
+fn map_finally(scope: &Scope<'_>, state: MapState<'_>) -> Result<(), ExnThrown> {
+    state.data_mut().done = true;
+    wake(scope, state, resume_slot)
 }
 
+/// The function `filterFn` or `forEachFn` wraps: `filter`'s or `forEach`'s `fn`.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct FilterFn {
+    function: Heap<Value>,
+    #[no_trace]
+    for_each: bool,
+}
+
+#[core_runtime::jsmethods]
+impl FilterFn {}
+
 /// `async function filterFn(value, options)` and `async function forEachFn(value, options)`,
-/// whose captures are `[fn, empty, isForEach]`: call `fn`, and fulfill with `value` if `fn`'s
-/// result is truthy and with `empty` otherwise, or always with `empty` for `forEach`.
+/// whose payload is a [`FilterFn`]: call `fn`, and fulfill with `value` if `fn`'s result is truthy
+/// and with `kEmpty` otherwise, or always with `kEmpty` for `forEach`.
 fn filter_fn(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
+    let filter = cast_payload::<FilterFn>(scope, payload);
+    let (function, for_each) = {
+        let data = filter.data();
+        (data.function.get(scope), data.for_each)
+    };
     let value = args.get(0);
-    let result = call(
+    let promise = Function::call(
         scope,
         HandleValue::undefined(),
-        captures.get(0)?,
+        function,
         &[value, args.get(1)],
-    );
-    let promise = match result {
-        Ok(result) => js::Promise::call_original_resolve(scope, result),
-        Err(error) => Err(error),
-    };
+    )
+    .and_then(|result| js::Promise::call_original_resolve(scope, result));
     let promise = match promise {
         Ok(promise) => promise,
         Err(_) => {
-            let error = take_exception(scope);
+            let error = js::exception::take_pending_or_undefined(scope);
             return js::Promise::new_rejected_with_error(scope, error)?
                 .to_jsval_raw_throwing(scope);
         }
     };
-    let decide = closure(
-        scope,
-        1,
-        filter_decide,
-        &[value.get(), captures.get(1)?.get(), captures.get(2)?.get()],
-    )?;
+    let decide = if for_each {
+        js::class::get_or_init_shared_function(
+            scope,
+            empty_result as *const () as usize,
+            |scope| Function::new_callback(scope, c"", 1, empty_result, ()),
+        )?
+    } else {
+        Function::new_callback(scope, c"", 1, filter_decide, value)?
+    };
     promise
-        .then(scope, Some(decide), None)?
+        .then(scope, Some(*decide), None)?
         .to_jsval_raw_throwing(scope)
 }
 
-/// The result of `filterFn` once `fn`'s result settled: `value` if it is truthy, and `empty`
-/// otherwise or for `forEach`. The captures are `[value, empty, isForEach]`.
+/// The result of `filterFn` once `fn`'s result settled, whose payload is the value: the value if
+/// the result is truthy, and `kEmpty` otherwise.
 fn filter_decide(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    if !captures.flag(2)? && truthy(scope, args.get(0)) {
-        return Ok(captures.get(0)?.get());
+    if js::conversion::to_boolean(args.get(0)) {
+        return Ok(payload.get());
     }
-    Ok(captures.get(1)?.get())
+    Ok(K_EMPTY.value(scope)?.get())
 }
 
-/// Node's `filter(fn, options)`: `map` with `filterFn`.
+/// The result of `forEachFn` once `fn`'s result settled: `kEmpty`.
+fn empty_result(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    Ok(K_EMPTY.value(scope)?.get())
+}
+
+/// Node's `filter(fn, options)`: `map` with `filterFn`, or with `forEachFn` for `forEach`.
 fn filter_generator<'s>(
     scope: &'s Scope<'_>,
     stream: HandleValue<'_>,
@@ -1307,46 +1268,36 @@ fn filter_generator<'s>(
     for_each: bool,
 ) -> Result<Object<'s>, Thrown> {
     validate_function(scope, function, "fn")?;
-    let empty = Object::new_plain(scope)?;
-    let wrapped = closure(
-        scope,
-        2,
-        filter_fn,
-        &[
-            function.get(),
-            empty.to_jsval_raw_throwing(scope)?,
-            js::value::from_bool(for_each),
-        ],
-    )?;
-    map_generator(
-        scope,
-        stream,
-        wrapped.to_jsval_throwing(scope)?,
-        options,
-        Some(empty),
-    )
+    let filter = js::class::create_instance_with::<FilterFnImpl>(scope, |_| FilterFnImpl {
+        function: Heap::from(function.get()),
+        for_each,
+    })?;
+    let wrapped = Function::new_callback(scope, c"", 2, filter_fn, filter)?;
+    map_generator(scope, stream, (*wrapped).to_jsval_throwing(scope)?, options)
 }
 
-/// The state of a `drop` or `take` generator: `[generator, stream, options, number, loop, take,
-/// returnValue]`, where `returnValue` is the value of a `return()` request that closes the loop.
-mod skip {
-    pub(super) const STREAM: u32 = 1;
-    pub(super) const OPTIONS: u32 = 2;
-    pub(super) const NUMBER: u32 = 3;
-    pub(super) const LOOP: u32 = 4;
-    pub(super) const TAKE: u32 = 5;
-    pub(super) const RETURN_VALUE: u32 = 6;
-    pub(super) const COUNT: usize = 7;
+/// The state of a `drop` or `take` generator: the stream, the options, the count, the loop, and
+/// the value of a `return()` request that closes the loop.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct SkipState {
+    gen: Option<Heap<GeneratorImpl>>,
+    stream: Heap<Value>,
+    options: Heap<Value>,
+    over: Option<Heap<LoopStateImpl>>,
+    return_value: Heap<Value>,
+    #[no_trace]
+    number: f64,
+    #[no_trace]
+    take: bool,
 }
+
+#[core_runtime::jsmethods]
+impl SkipState {}
 
 /// Node's `toIntegerOrInfinity(number)`: `Number(number)`, 0 for `NaN`, and `ERR_OUT_OF_RANGE`
 /// for a negative number.
 fn to_integer_or_infinity(scope: &Scope<'_>, number: HandleValue<'_>) -> Result<f64, Thrown> {
-    let number_class = scope
-        .global()
-        .val(scope, c"Number")
-        .map(|value| scope.root_value(value.get()))?;
-    let number = call(scope, HandleValue::undefined(), number_class, &[number])?.to_number();
+    let number = f64::from_jsval(scope, number, ()).map_err(|_| ExnThrown)?;
     if number.is_nan() {
         return Ok(0.0);
     }
@@ -1366,124 +1317,151 @@ fn skip_generator<'s>(
     options: HandleValue<'_>,
     take: bool,
 ) -> Result<Object<'s>, Thrown> {
-    use skip::*;
     let options = scope.root_value(options.get());
     let options = validate_options(scope, options)?;
     let number = to_integer_or_infinity(scope, number)?;
-    let state = new_state(scope, COUNT)?;
-    state.set(STREAM, stream)?;
-    state.set(OPTIONS, options)?;
-    state.set(NUMBER, number)?;
-    state.set(TAKE, take)?;
-    Ok(new_generator(scope, &state, skip_start, skip_resume)?)
+    let state = js::class::create_instance_with::<SkipStateImpl>(scope, |_| SkipStateImpl {
+        gen: None,
+        stream: Heap::from(stream.get()),
+        options: Heap::from(options.get()),
+        over: None,
+        return_value: Heap::default(),
+        number,
+        take,
+    })?;
+    let (gen, object) = new_generator(scope, *state, skip_start, skip_resume)?;
+    state.data_mut().gen = Some(Heap::from(gen));
+    Ok(object)
 }
 
-fn skip_start(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use skip::*;
-    let state = state_of(scope, payload)?;
-    if signal_aborted(scope, state.get(OPTIONS)?)? {
-        let error = abort_error(scope, None)?;
-        gen_throw(scope, &state, error)?;
-        return Ok(js::value::undefined());
+/// The [`SkipState`] that is `body`.
+fn skip_state(body: Object<'_>) -> SkipState<'_> {
+    body.cast::<SkipState>().expect("the body is a SkipState")
+}
+
+/// The generator of `state`.
+fn skip_gen<'s>(scope: &'s Scope<'_>, state: SkipState<'_>) -> Result<Generator<'s>, ExnThrown> {
+    state.data().gen.get(scope).ok_or(ExnThrown)
+}
+
+/// The loop of `state`.
+fn skip_loop<'s>(scope: &'s Scope<'_>, state: SkipState<'_>) -> Result<LoopState<'s>, ExnThrown> {
+    state.data().over.get(scope).ok_or(ExnThrown)
+}
+
+fn skip_start(scope: &Scope<'_>, body: Object<'_>) -> Result<(), ExnThrown> {
+    let state = skip_state(body);
+    let (stream, options) = {
+        let data = state.data();
+        (data.stream.get(scope), data.options.get(scope))
+    };
+    if signal_aborted(scope, options)? {
+        let error = crate::errors::abort_error(scope, None)?;
+        return gen_throw(scope, skip_gen(scope, state)?, error);
     }
-    let on_value = bind(scope, &state, 1, skip_value)?;
-    let on_end = bind(scope, &state, 2, skip_end)?;
-    let lp = loop_open(scope, state.get(STREAM)?, "this", on_value, on_end)?;
-    state.set(LOOP, lp.array)?;
-    loop_next(scope, &lp)?;
-    Ok(js::value::undefined())
+    let over = loop_open(scope, stream, body, skip_value, skip_end)?;
+    state.data_mut().over = Some(Heap::from(over));
+    loop_next(scope, over)
 }
 
 /// The body of the loop of `drop` and `take`.
 fn skip_value(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use skip::*;
-    let state = state_of(scope, payload)?;
-    let lp = Captures::of(scope, state.get(LOOP)?)?;
+    owner: Object<'_>,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = skip_state(owner);
+    let over = skip_loop(scope, state)?;
     let step = (|| -> Result<(), ExnThrown> {
-        if signal_aborted(scope, state.get(OPTIONS)?)? {
-            let error = abort_error(scope, None)?;
-            return loop_close(scope, &lp, Some(error));
+        let options = state.data().options.get(scope);
+        if signal_aborted(scope, options)? {
+            let error = crate::errors::abort_error(scope, None)?;
+            return loop_close(scope, over, Some(error));
         }
-        let number = state.get(NUMBER)?.to_number();
-        state.set(NUMBER, number - 1.0)?;
-        let take = state.flag(TAKE)?;
+        let (number, take) = {
+            let mut data = state.data_mut();
+            let number = data.number;
+            data.number -= 1.0;
+            (number, data.take)
+        };
         if (!take && number <= 0.0) || (take && number > 0.0) {
-            return gen_yield(scope, &state, args.get(0));
+            return gen_yield(scope, skip_gen(scope, state)?, value);
         }
-        skip_continue(scope, &state, &lp)
+        skip_continue(scope, state, over)
     })();
     if step.is_err() {
-        let error = take_exception(scope);
-        loop_close(scope, &lp, Some(error))?;
+        let error = js::exception::take_pending_or_undefined(scope);
+        loop_close(scope, over, Some(error))?;
     }
-    Ok(js::value::undefined())
+    Ok(())
 }
 
 /// The end of an iteration of the loop of `drop` and `take`: `take` returns once it took the
 /// number of values.
 fn skip_continue(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
-    lp: &Captures<'_>,
+    state: SkipState<'_>,
+    over: LoopState<'_>,
 ) -> Result<(), ExnThrown> {
-    use skip::*;
-    if state.flag(TAKE)? && state.get(NUMBER)?.to_number() <= 0.0 {
-        return loop_close(scope, lp, None);
+    let finished = {
+        let data = state.data();
+        data.take && data.number <= 0.0
+    };
+    if finished {
+        return loop_close(scope, over, None);
     }
-    loop_next(scope, lp)
+    loop_next(scope, over)
 }
 
 fn skip_resume(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use skip::*;
-    let state = state_of(scope, payload)?;
-    let lp = Captures::of(scope, state.get(LOOP)?)?;
-    match args.get(0).to_int32() {
-        request::NEXT => skip_continue(scope, &state, &lp)?,
-        request::RETURN => {
-            state.set(RETURN_VALUE, args.get(1))?;
-            loop_close(scope, &lp, None)?;
+    body: Object<'_>,
+    kind: Request,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = skip_state(body);
+    let over = skip_loop(scope, state)?;
+    match kind {
+        Request::Next => skip_continue(scope, state, over),
+        Request::Return => {
+            state.data().return_value.set(value.get());
+            loop_close(scope, over, None)
         }
-        _ => loop_close(scope, &lp, Some(args.get(1)))?,
+        Request::Throw => loop_close(scope, over, Some(value)),
     }
-    Ok(js::value::undefined())
 }
 
 fn skip_end(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    match args.get(0).to_int32() {
-        end::THROW => gen_throw(scope, &state, args.get(1))?,
-        end::CLOSED => gen_return(scope, &state, state.get(skip::RETURN_VALUE)?)?,
-        _ => gen_return(scope, &state, HandleValue::undefined())?,
+    owner: Object<'_>,
+    end: End,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = skip_state(owner);
+    let gen = skip_gen(scope, state)?;
+    match end {
+        End::Throw => gen_throw(scope, gen, error),
+        End::Closed => {
+            let value = state.data().return_value.get(scope);
+            gen_return(scope, gen, value)
+        }
+        End::Done => gen_return(scope, gen, HandleValue::undefined()),
     }
-    Ok(js::value::undefined())
 }
 
-/// The state of a `flatMap` generator: `[generator, values, outer, inner, returnValue]`, where
-/// `values` is the `map` generator, `outer` the loop over it, `inner` the loop of the current
-/// `yield*`, and `returnValue` the value of a `return()` request.
-mod flat {
-    pub(super) const VALUES: u32 = 1;
-    pub(super) const OUTER: u32 = 2;
-    pub(super) const INNER: u32 = 3;
-    pub(super) const RETURN_VALUE: u32 = 4;
-    pub(super) const COUNT: usize = 5;
+/// The state of a `flatMap` generator: the `map` generator, the loop over it, the loop of the
+/// current `yield*`, and the value of a `return()` request.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct FlatState {
+    gen: Option<Heap<GeneratorImpl>>,
+    values: Heap<js::object::Object>,
+    outer: Option<Heap<LoopStateImpl>>,
+    inner: Option<Heap<LoopStateImpl>>,
+    return_value: Heap<Value>,
 }
+
+#[core_runtime::jsmethods]
+impl FlatState {}
 
 /// Node's `flatMap(fn, options)`: the values of the iterables `map(fn, options)` yields.
 fn flat_map_generator<'s>(
@@ -1492,109 +1470,125 @@ fn flat_map_generator<'s>(
     function: HandleValue<'_>,
     options: HandleValue<'_>,
 ) -> Result<Object<'s>, Thrown> {
-    let values = map_generator(scope, stream, function, options, None)?;
-    let state = new_state(scope, flat::COUNT)?;
-    state.set(flat::VALUES, values)?;
-    Ok(new_generator(scope, &state, flat_start, flat_resume)?)
+    let values = map_generator(scope, stream, function, options)?;
+    let state = js::class::create_instance_with::<FlatStateImpl>(scope, |_| FlatStateImpl {
+        gen: None,
+        values: Heap::from(values),
+        outer: None,
+        inner: None,
+        return_value: Heap::default(),
+    })?;
+    let (gen, object) = new_generator(scope, *state, flat_start, flat_resume)?;
+    state.data_mut().gen = Some(Heap::from(gen));
+    Ok(object)
 }
 
-fn flat_start(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let on_value = bind(scope, &state, 1, flat_outer_value)?;
-    let on_end = bind(scope, &state, 2, flat_outer_end)?;
-    let lp = loop_open(scope, state.get(flat::VALUES)?, "values", on_value, on_end)?;
-    state.set(flat::OUTER, lp.array)?;
-    loop_next(scope, &lp)?;
-    Ok(js::value::undefined())
+/// The [`FlatState`] that is `body`.
+fn flat_state(body: Object<'_>) -> FlatState<'_> {
+    body.cast::<FlatState>().expect("the body is a FlatState")
+}
+
+fn flat_gen<'s>(scope: &'s Scope<'_>, state: FlatState<'_>) -> Result<Generator<'s>, ExnThrown> {
+    state.data().gen.get(scope).ok_or(ExnThrown)
+}
+
+fn flat_outer<'s>(scope: &'s Scope<'_>, state: FlatState<'_>) -> Result<LoopState<'s>, ExnThrown> {
+    state.data().outer.get(scope).ok_or(ExnThrown)
+}
+
+fn flat_start(scope: &Scope<'_>, body: Object<'_>) -> Result<(), ExnThrown> {
+    let state = flat_state(body);
+    let values = state.data().values.get(scope);
+    let outer = loop_open(
+        scope,
+        values.to_jsval_throwing(scope)?,
+        body,
+        flat_outer_value,
+        flat_outer_end,
+    )?;
+    state.data_mut().outer = Some(Heap::from(outer));
+    loop_next(scope, outer)
 }
 
 /// `yield* val` for a value of the `map` generator.
 fn flat_outer_value(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use flat::*;
-    let state = state_of(scope, payload)?;
+    owner: Object<'_>,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = flat_state(owner);
     let opened = (|| -> Result<(), ExnThrown> {
-        let on_value = bind(scope, &state, 1, flat_inner_value)?;
-        let on_end = bind(scope, &state, 2, flat_inner_end)?;
-        let lp = loop_open(scope, args.get(0), "val", on_value, on_end)?;
-        state.set(INNER, lp.array)?;
-        loop_next(scope, &lp)
+        let inner = loop_open(scope, value, owner, flat_inner_value, flat_inner_end)?;
+        state.data_mut().inner = Some(Heap::from(inner));
+        loop_next(scope, inner)
     })();
     if opened.is_err() {
-        let error = take_exception(scope);
-        let outer = Captures::of(scope, state.get(OUTER)?)?;
-        loop_close(scope, &outer, Some(error))?;
+        let error = js::exception::take_pending_or_undefined(scope);
+        loop_close(scope, flat_outer(scope, state)?, Some(error))?;
     }
-    Ok(js::value::undefined())
+    Ok(())
 }
 
 fn flat_inner_value(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    gen_yield(scope, &state, args.get(0))?;
-    Ok(js::value::undefined())
+    owner: Object<'_>,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    gen_yield(scope, flat_gen(scope, flat_state(owner))?, value)
 }
 
 /// The end of a `yield*`: continue the loop over the `map` generator, or leave it.
 fn flat_inner_end(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use flat::*;
-    let state = state_of(scope, payload)?;
-    state.set(INNER, js::value::undefined())?;
-    let outer = Captures::of(scope, state.get(OUTER)?)?;
-    match args.get(0).to_int32() {
-        end::DONE => loop_next(scope, &outer)?,
-        end::THROW => loop_close(scope, &outer, Some(args.get(1)))?,
-        _ => loop_close(scope, &outer, None)?,
+    owner: Object<'_>,
+    end: End,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = flat_state(owner);
+    state.data_mut().inner = None;
+    let outer = flat_outer(scope, state)?;
+    match end {
+        End::Done => loop_next(scope, outer),
+        End::Throw => loop_close(scope, outer, Some(error)),
+        End::Closed => loop_close(scope, outer, None),
     }
-    Ok(js::value::undefined())
 }
 
 fn flat_outer_end(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    match args.get(0).to_int32() {
-        end::THROW => gen_throw(scope, &state, args.get(1))?,
-        end::CLOSED => gen_return(scope, &state, state.get(flat::RETURN_VALUE)?)?,
-        _ => gen_return(scope, &state, HandleValue::undefined())?,
+    owner: Object<'_>,
+    end: End,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = flat_state(owner);
+    let gen = flat_gen(scope, state)?;
+    match end {
+        End::Throw => gen_throw(scope, gen, error),
+        End::Closed => {
+            let value = state.data().return_value.get(scope);
+            gen_return(scope, gen, value)
+        }
+        End::Done => gen_return(scope, gen, HandleValue::undefined()),
     }
-    Ok(js::value::undefined())
 }
 
 /// A request to `flatMap`'s body, which yielded from the current `yield*`.
 fn flat_resume(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use flat::*;
-    let state = state_of(scope, payload)?;
-    let inner = Captures::of(scope, state.get(INNER)?)?;
-    match args.get(0).to_int32() {
-        request::NEXT => loop_next(scope, &inner)?,
-        request::RETURN => {
-            state.set(RETURN_VALUE, args.get(1))?;
-            loop_close(scope, &inner, None)?;
+    body: Object<'_>,
+    kind: Request,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = flat_state(body);
+    let inner = state.data().inner.get(scope).ok_or(ExnThrown)?;
+    match kind {
+        Request::Next => loop_next(scope, inner),
+        Request::Return => {
+            state.data().return_value.set(value.get());
+            loop_close(scope, inner, None)
         }
-        _ => loop_close(scope, &inner, Some(args.get(1)))?,
+        Request::Throw => loop_close(scope, inner, Some(value)),
     }
-    Ok(js::value::undefined())
 }
 
 /// Run the body of a promise-returning operator, and return its promise, rejected with an
@@ -1606,69 +1600,208 @@ fn promise_operator(
     let promise = js::Promise::new_pending(scope)?;
     if let Err(error) = body(promise) {
         error.throw(scope);
-        let error = take_exception(scope);
-        settle(scope, promise, true, error)?;
+        let error = js::exception::take_pending_or_undefined(scope);
+        if promise.is_pending() {
+            promise.reject(scope, error)?;
+        }
     }
     promise.to_jsval_raw_throwing(scope)
 }
 
-/// The state of a promise-returning operator: `[promise, loop, options, result, ...]`, with the
-/// further elements of `reduce` and of `some` and `find`.
-mod consume {
-    pub(super) const PROMISE: u32 = 0;
-    pub(super) const LOOP: u32 = 1;
-    pub(super) const OPTIONS: u32 = 2;
-    pub(super) const RESULT: u32 = 3;
-    /// `reduce`'s `stream`, `some`'s and `find`'s `isFind`.
-    pub(super) const EXTRA: u32 = 4;
-    /// `reduce`'s `reducer`.
-    pub(super) const REDUCER: u32 = 5;
-    /// `reduce`'s `hasInitialValue`.
-    pub(super) const HAS_INITIAL: u32 = 6;
-    /// `reduce`'s `AbortController`.
-    pub(super) const CONTROLLER: u32 = 7;
-    /// `reduce`'s `gotAnyItemFromStream`.
-    pub(super) const GOT_ANY: u32 = 8;
-    pub(super) const COUNT: usize = 9;
+/// What a promise-returning operator does with the values of its loop.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Consume {
+    /// `toArray`: collect them.
+    #[default]
+    ToArray,
+    /// `forEach`: run the loop to its end.
+    ForEach,
+    /// `some`: fulfill with `true` at the first one.
+    Some,
+    /// `find`: fulfill with the first one.
+    Find,
+    /// `reduce`: reduce them.
+    Reduce,
 }
 
-/// Start the loop of a promise-returning operator over `iterable`, with the body `on_value` and
-/// the end `on_end`.
+/// The state of a promise-returning operator: its promise, its loop and options, and the result,
+/// with the values `toArray` collects and the reducer and controller of `reduce`.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct ConsumeState {
+    promise: Option<Heap<js::promise::Promise>>,
+    over: Option<Heap<LoopStateImpl>>,
+    options: Heap<Value>,
+    result: Heap<Value>,
+    values: Vec<Heap<Value>>,
+    reducer: Heap<Value>,
+    controller: Option<Heap<AbortControllerImpl>>,
+    #[no_trace]
+    kind: Consume,
+    #[no_trace]
+    has_initial: bool,
+    #[no_trace]
+    got_any: bool,
+}
+
+#[core_runtime::jsmethods]
+impl ConsumeState {}
+
+/// A new [`ConsumeState`] for `kind`, which settles `promise`.
+fn new_consume<'s>(
+    scope: &'s Scope<'_>,
+    kind: Consume,
+    promise: js::Promise<'_>,
+    options: HandleValue<'_>,
+    result: HandleValue<'_>,
+) -> Result<ConsumeState<'s>, ExnThrown> {
+    js::class::create_instance_with::<ConsumeStateImpl>(scope, |_| ConsumeStateImpl {
+        promise: Some(Heap::from(promise)),
+        over: None,
+        options: Heap::from(options.get()),
+        result: Heap::from(result.get()),
+        values: Vec::new(),
+        reducer: Heap::default(),
+        controller: None,
+        kind,
+        has_initial: false,
+        got_any: false,
+    })
+}
+
+/// The [`ConsumeState`] that is `owner`.
+fn consume_state(owner: Object<'_>) -> ConsumeState<'_> {
+    owner
+        .cast::<ConsumeState>()
+        .expect("the owner is a ConsumeState")
+}
+
+/// The loop of `state`.
+fn consume_loop_of<'s>(
+    scope: &'s Scope<'_>,
+    state: ConsumeState<'_>,
+) -> Result<LoopState<'s>, ExnThrown> {
+    state.data().over.get(scope).ok_or(ExnThrown)
+}
+
+/// Start the loop of a promise-returning operator over `iterable`.
 fn consume_loop(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
+    state: ConsumeState<'_>,
     iterable: HandleValue<'_>,
-    on_value: Callback,
-    on_end: Callback,
 ) -> Result<(), ExnThrown> {
-    let on_value = bind(scope, state, 1, on_value)?;
-    let on_end = bind(scope, state, 2, on_end)?;
-    let lp = loop_open(scope, iterable, "this", on_value, on_end)?;
-    state.set(consume::LOOP, lp.array)?;
-    loop_next(scope, &lp)
+    let over = loop_open(scope, iterable, *state, consume_value, consume_end)?;
+    state.data_mut().over = Some(Heap::from(over));
+    loop_next(scope, over)
 }
 
 /// Settle the operator's promise.
 fn consume_settle(
     scope: &Scope<'_>,
-    state: &Captures<'_>,
+    state: ConsumeState<'_>,
     reject: bool,
     value: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    settle(
-        scope,
-        promise_at(scope, state, consume::PROMISE)?,
-        reject,
-        value,
-    )
+    let Some(promise) = state.data().promise.get(scope) else {
+        return Ok(());
+    };
+    if !promise.is_pending() {
+        return Ok(());
+    }
+    if reject {
+        promise.reject(scope, value)
+    } else {
+        promise.resolve(scope, value)
+    }
 }
 
-/// The loop of the operator.
-fn consume_loop_of<'s>(
-    scope: &'s Scope<'_>,
-    state: &Captures<'s>,
-) -> Result<Captures<'s>, ExnThrown> {
-    Captures::of(scope, state.get(consume::LOOP)?)
+/// The body of the loop of a promise-returning operator.
+fn consume_value(
+    scope: &Scope<'_>,
+    owner: Object<'_>,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = consume_state(owner);
+    let over = consume_loop_of(scope, state)?;
+    let kind = state.data().kind;
+    match kind {
+        Consume::ToArray => {
+            let step = (|| -> Result<bool, ExnThrown> {
+                let options = state.data().options.get(scope);
+                if signal_aborted(scope, options)? {
+                    let reason = signal_reason(scope, options)?;
+                    let error = crate::errors::abort_error(scope, Some(reason))?;
+                    loop_close(scope, over, Some(error))?;
+                    return Ok(false);
+                }
+                state.data_mut().values.push(Heap::from(value.get()));
+                Ok(true)
+            })();
+            match step {
+                Ok(true) => loop_next(scope, over),
+                Ok(false) => Ok(()),
+                Err(_) => {
+                    let error = js::exception::take_pending_or_undefined(scope);
+                    loop_close(scope, over, Some(error))
+                }
+            }
+        }
+        Consume::ForEach => loop_next(scope, over),
+        Consume::Some => {
+            state.data().result.set(js::value::from_bool(true));
+            loop_close(scope, over, None)
+        }
+        Consume::Find => {
+            state.data().result.set(value.get());
+            loop_close(scope, over, None)
+        }
+        Consume::Reduce => reduce_value(scope, state, over, value),
+    }
+}
+
+/// The end of the loop of a promise-returning operator: reject with the error, or fulfill with
+/// the result.
+fn consume_end(
+    scope: &Scope<'_>,
+    owner: Object<'_>,
+    end: End,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let state = consume_state(owner);
+    let kind = state.data().kind;
+    if kind == Consume::Reduce {
+        reduce_finally(scope, state)?;
+    }
+    if end == End::Throw {
+        return consume_settle(scope, state, true, error);
+    }
+    match kind {
+        Consume::ToArray => {
+            let values: Vec<HandleValue<'_>> = state
+                .data()
+                .values
+                .iter()
+                .map(|value| value.get(scope))
+                .collect();
+            let array = js::Array::with_contents(scope, &values)?;
+            consume_settle(scope, state, false, array.to_jsval_throwing(scope)?)
+        }
+        Consume::Reduce => {
+            let (got_any, has_initial) = {
+                let data = state.data();
+                (data.got_any, data.has_initial)
+            };
+            if !got_any && !has_initial {
+                let error = reduce_missing_initial_value().to_value(scope)?;
+                return consume_settle(scope, state, true, error);
+            }
+            let result = state.data().result.get(scope);
+            consume_settle(scope, state, false, result)
+        }
+        Consume::ForEach | Consume::Some | Consume::Find => {
+            let result = state.data().result.get(scope);
+            consume_settle(scope, state, false, result)
+        }
+    }
 }
 
 /// Node's `toArray(options)`.
@@ -1680,62 +1813,16 @@ fn to_array(
     promise_operator(scope, |promise| {
         let options = scope.root_value(options.get());
         let options = validate_options(scope, options)?;
-        let state = new_state(scope, consume::COUNT)?;
-        state.set(consume::PROMISE, *promise)?;
-        state.set(consume::OPTIONS, options)?;
-        state.set(
-            consume::RESULT,
-            *js::Array::with_contents(scope, &[] as &[Value])?,
+        let state = new_consume(
+            scope,
+            Consume::ToArray,
+            promise,
+            options,
+            HandleValue::undefined(),
         )?;
-        consume_loop(scope, &state, stream, to_array_value, settle_end)?;
+        consume_loop(scope, state, stream)?;
         Ok(())
     })
-}
-
-fn to_array_value(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use consume::*;
-    let state = state_of(scope, payload)?;
-    let lp = consume_loop_of(scope, &state)?;
-    let step = (|| -> Result<bool, ExnThrown> {
-        let options = state.get(OPTIONS)?;
-        if signal_aborted(scope, options)? {
-            let reason = signal_reason(scope, options)?;
-            let error = abort_error(scope, Some(reason))?;
-            loop_close(scope, &lp, Some(error))?;
-            return Ok(false);
-        }
-        array_push(scope, state.obj(RESULT)?, args.get(0))?;
-        Ok(true)
-    })();
-    match step {
-        Ok(true) => loop_next(scope, &lp)?,
-        Ok(false) => {}
-        Err(_) => {
-            let error = take_exception(scope);
-            loop_close(scope, &lp, Some(error))?;
-        }
-    }
-    Ok(js::value::undefined())
-}
-
-/// The end of a loop whose operator fulfills with its result: reject with the error, or fulfill
-/// with `result`.
-fn settle_end(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    if args.get(0).to_int32() == end::THROW {
-        consume_settle(scope, &state, true, args.get(1))?;
-    } else {
-        consume_settle(scope, &state, false, state.get(consume::RESULT)?)?;
-    }
-    Ok(js::value::undefined())
 }
 
 /// Node's `forEach(fn, options)`: run the `map` generator of `forEachFn` to its end.
@@ -1747,28 +1834,16 @@ fn for_each(
 ) -> Result<Value, ExnThrown> {
     promise_operator(scope, |promise| {
         let values = filter_generator(scope, stream, function, options, true)?;
-        let state = new_state(scope, consume::COUNT)?;
-        state.set(consume::PROMISE, *promise)?;
-        consume_loop(
+        let state = new_consume(
             scope,
-            &state,
-            values.to_jsval_throwing(scope)?,
-            next_value,
-            settle_end,
+            Consume::ForEach,
+            promise,
+            HandleValue::undefined(),
+            HandleValue::undefined(),
         )?;
+        consume_loop(scope, state, values.to_jsval_throwing(scope)?)?;
         Ok(())
     })
-}
-
-/// A loop body that only continues the loop.
-fn next_value(
-    scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    loop_next(scope, &consume_loop_of(scope, &state)?)?;
-    Ok(js::value::undefined())
 }
 
 /// Node's `some(fn, options)`, or `find(fn, options)` if `find`: the first value of the `filter`
@@ -1782,81 +1857,57 @@ fn some_or_find(
 ) -> Result<Value, ExnThrown> {
     promise_operator(scope, |promise| {
         let values = filter_generator(scope, stream, function, options, false)?;
-        let state = new_state(scope, consume::COUNT)?;
-        state.set(consume::PROMISE, *promise)?;
-        state.set(consume::EXTRA, find)?;
-        if find {
-            state.set(consume::RESULT, js::value::undefined())?;
+        let (kind, result) = if find {
+            (Consume::Find, HandleValue::undefined())
         } else {
-            state.set(consume::RESULT, false)?;
-        }
-        consume_loop(
-            scope,
-            &state,
-            values.to_jsval_throwing(scope)?,
-            first_value,
-            settle_end,
-        )?;
+            (Consume::Some, scope.root_value(js::value::from_bool(false)))
+        };
+        let state = new_consume(scope, kind, promise, HandleValue::undefined(), result)?;
+        consume_loop(scope, state, values.to_jsval_throwing(scope)?)?;
         Ok(())
     })
 }
 
-/// The body of the loop of `some` and `find`: record the result, and leave the loop.
-fn first_value(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use consume::*;
-    let state = state_of(scope, payload)?;
-    if state.flag(EXTRA)? {
-        state.set(RESULT, args.get(0))?;
-    } else {
-        state.set(RESULT, true)?;
-    }
-    loop_close(scope, &consume_loop_of(scope, &state)?, None)?;
-    Ok(js::value::undefined())
-}
-
-/// `async (...args) => !(await fn(...args))`, whose captures are `[fn]`.
+/// `async (...args) => !(await fn(...args))`, whose payload is `fn`.
 fn every_fn(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let function = Captures::of(scope, payload)?.get(0)?;
     let call_args: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
-    let result = call(scope, HandleValue::undefined(), function, &call_args)
+    let result = Function::call(scope, HandleValue::undefined(), payload, &call_args)
         .and_then(|result| js::Promise::call_original_resolve(scope, result));
     let promise = match result {
         Ok(promise) => promise,
         Err(_) => {
-            let error = take_exception(scope);
+            let error = js::exception::take_pending_or_undefined(scope);
             return js::Promise::new_rejected_with_error(scope, error)?
                 .to_jsval_raw_throwing(scope);
         }
     };
-    let negate = Function::new_callback(scope, c"", 1, negate, ())?;
     promise
-        .then(scope, Some(*negate), None)?
+        .then(scope, Some(negate_function(scope)?), None)?
         .to_jsval_raw_throwing(scope)
-}
-
-fn noop(
-    _scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    Ok(js::value::undefined())
 }
 
 /// `!value`.
 fn negate(
-    scope: &Scope<'_>,
+    _scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    Ok(js::value::from_bool(!truthy(scope, args.get(0))))
+    Ok(js::value::from_bool(!js::conversion::to_boolean(
+        args.get(0),
+    )))
+}
+
+/// The shared function of [`negate`].
+fn negate_function<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+    let function =
+        js::class::get_or_init_shared_function(scope, negate as *const () as usize, |scope| {
+            Function::new_callback(scope, c"", 1, negate, ())
+        })?;
+    Ok(*function)
 }
 
 /// Node's `every(fn, options)`: `!(await some(async (...args) => !(await fn(...args))))`.
@@ -1868,20 +1919,19 @@ fn every(
 ) -> Result<Value, ExnThrown> {
     if let Err(error) = validate_function(scope, function, "fn") {
         error.throw(scope);
-        let error = take_exception(scope);
+        let error = js::exception::take_pending_or_undefined(scope);
         return js::Promise::new_rejected_with_error(scope, error)?.to_jsval_raw_throwing(scope);
     }
-    let wrapped = closure(scope, 0, every_fn, &[function.get()])?;
+    let wrapped = Function::new_callback(scope, c"", 0, every_fn, function)?;
     let some = scope.root_value(some_or_find(
         scope,
         stream,
-        wrapped.to_jsval_throwing(scope)?,
+        (*wrapped).to_jsval_throwing(scope)?,
         options,
         false,
     )?);
     let some = js::Promise::call_original_resolve(scope, some)?;
-    let negate = Function::new_callback(scope, c"", 1, negate, ())?;
-    some.then(scope, Some(*negate), None)?
+    some.then(scope, Some(negate_function(scope)?), None)?
         .to_jsval_raw_throwing(scope)
 }
 
@@ -1903,161 +1953,149 @@ fn reduce(
     initial: Option<HandleValue<'_>>,
     options: HandleValue<'_>,
 ) -> Result<Value, ExnThrown> {
-    use consume::*;
     promise_operator(scope, |promise| {
         validate_function(scope, reducer, "reducer")?;
         let options = scope.root_value(options.get());
         let options = validate_options(scope, options)?;
-        let state = new_state(scope, COUNT)?;
-        state.set(PROMISE, *promise)?;
-        state.set(OPTIONS, options)?;
-        state.set(EXTRA, stream)?;
-        state.set(REDUCER, reducer)?;
-        state.set(HAS_INITIAL, initial.is_some())?;
-        state.set(RESULT, initial.unwrap_or(HandleValue::undefined()))?;
-        state.set(GOT_ANY, false)?;
+        let state = new_consume(
+            scope,
+            Consume::Reduce,
+            promise,
+            options,
+            initial.unwrap_or(HandleValue::undefined()),
+        )?;
+        {
+            let mut data = state.data_mut();
+            data.reducer.set(reducer.get());
+            data.has_initial = initial.is_some();
+        }
         if signal_aborted(scope, options)? {
             let reason = signal_reason(scope, options)?;
-            let error = abort_error(scope, Some(reason))?;
+            let error = crate::errors::abort_error(scope, Some(reason))?;
+            state.data().result.set(error.get());
             let stream_object = Object::from_value_coerce(scope, stream)?;
-            let noop = Function::new_callback(scope, c"", 0, noop, ())?;
-            listen(scope, stream_object, c"once", "error", *noop)?;
-            let destroyed = call_method(scope, stream_object, c"destroy", &[error])?;
+            let noop = crate::support::noop_function(scope)?;
+            crate::events::listen(scope, stream_object, c"once", c"error", noop)?;
+            let destroyed =
+                Function::call_by_name(scope, stream_object.handle(), c"destroy", &[error])?;
             let finished = super::eos::finished_promise(scope, destroyed, None)?;
-            let rejected = closure(
-                scope,
-                0,
-                reject_with,
-                &[promise.to_jsval_raw_throwing(scope)?, error.get()],
-            )?;
-            let failed = closure(
-                scope,
-                1,
-                reject_promise,
-                &[promise.to_jsval_raw_throwing(scope)?],
-            )?;
-            finished.then(scope, Some(rejected), Some(failed))?;
+            let rejected = reaction(scope, reduce_aborted, state)?;
+            let failed = reaction(scope, reduce_aborted_failed, state)?;
+            finished.add_reactions(scope, Some(rejected), Some(failed))?;
             return Ok(());
         }
-        let controller_class = scope
-            .global()
-            .obj(scope, c"AbortController")?
-            .ok_or_else(|| type_error(scope, "AbortController is not defined"))?;
-        let controller = Function::construct(scope, controller_class, &[] as &[HandleValue<'_>])?;
-        state.set(CONTROLLER, controller)?;
-        if let Some(options) = as_object(scope, options) {
-            let signal = options.val(scope, c"signal")?;
-            if let Some(signal) = as_object(scope, signal) {
-                let listener = closure(
-                    scope,
-                    0,
-                    abort_controller,
-                    &[controller.to_jsval_raw_throwing(scope)?],
-                )?;
-                let listen_options = Object::new_plain(scope)?;
-                listen_options.set_property(scope, c"once", true)?;
-                let event = super::util::string(scope, "abort")?;
-                call_method(
-                    scope,
-                    signal,
-                    c"addEventListener",
-                    &[
-                        event,
-                        listener.to_jsval_throwing(scope)?,
-                        listen_options.to_jsval_throwing(scope)?,
-                    ],
-                )?;
-            }
+        let controller = AbortController::new(scope)?;
+        state.data_mut().controller = Some(Heap::from(controller));
+        if let Some(signal) = signal_of(scope, options)? {
+            let listener = Function::new_callback(scope, c"", 0, abort_controller, controller)?;
+            let listen_options = Object::new_plain(scope)?;
+            listen_options.set_property(scope, c"once", true)?;
+            let event = js::class::get_or_init_atom(scope, c"abort")?;
+            Function::call_by_name(
+                scope,
+                signal.handle(),
+                c"addEventListener",
+                &[
+                    event,
+                    (*listener).to_jsval_throwing(scope)?,
+                    listen_options.to_jsval_throwing(scope)?,
+                ],
+            )?;
         }
-        if consume_loop(scope, &state, stream, reduce_value, reduce_end).is_err() {
-            let error = take_exception(scope);
-            reduce_finally(scope, &state)?;
-            consume_settle(scope, &state, true, error)?;
+        if consume_loop(scope, state, stream).is_err() {
+            let error = js::exception::take_pending_or_undefined(scope);
+            reduce_finally(scope, state)?;
+            consume_settle(scope, state, true, error)?;
         }
         Ok(())
     })
 }
 
-/// `() => ac.abort()`, whose captures are `[ac]`.
+/// `() => ac.abort()`, whose payload is the `AbortController`.
 fn abort_controller(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let controller = Captures::of(scope, payload)?.obj(0)?;
-    call_method(scope, controller, c"abort", &[])?;
+    let controller = cast_payload::<AbortController>(scope, payload);
+    controller.js_abort(scope, HandleValue::undefined())?;
     Ok(js::value::undefined())
 }
 
-/// Reject the captured promise with the captured error, whose captures are `[promise, error]`.
-fn reject_with(
+/// The stream of a `reduce` whose signal had aborted finished: reject with the `AbortError` in
+/// the result.
+fn reduce_aborted(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    settle(
-        scope,
-        promise_at(scope, &captures, 0)?,
-        true,
-        captures.get(1)?,
-    )?;
+    let state = cast_payload::<ConsumeState>(scope, payload);
+    let error = state.data().result.get(scope);
+    consume_settle(scope, state, true, error)?;
     Ok(js::value::undefined())
 }
 
-/// Reject the captured promise with the argument, whose captures are `[promise]`.
-fn reject_promise(
+/// The `finished` of a `reduce` whose signal had aborted rejected: reject with its reason.
+fn reduce_aborted_failed(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    settle(scope, promise_at(scope, &captures, 0)?, true, args.get(0))?;
+    let state = cast_payload::<ConsumeState>(scope, payload);
+    consume_settle(scope, state, true, args.get(0))?;
     Ok(js::value::undefined())
 }
 
 /// The body of `reduce`'s loop.
 fn reduce_value(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use consume::*;
-    let state = state_of(scope, payload)?;
-    let lp = consume_loop_of(scope, &state)?;
+    state: ConsumeState<'_>,
+    over: LoopState<'_>,
+    value: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
     let step = (|| -> Result<(), ExnThrown> {
-        state.set(GOT_ANY, true)?;
-        if signal_aborted(scope, state.get(OPTIONS)?)? {
-            let error = abort_error(scope, None)?;
-            return loop_close(scope, &lp, Some(error));
+        state.data_mut().got_any = true;
+        let options = state.data().options.get(scope);
+        if signal_aborted(scope, options)? {
+            let error = crate::errors::abort_error(scope, None)?;
+            return loop_close(scope, over, Some(error));
         }
-        if !state.flag(HAS_INITIAL)? {
-            state.set(RESULT, args.get(0))?;
-            state.set(HAS_INITIAL, true)?;
-            return loop_next(scope, &lp);
+        if !state.data().has_initial {
+            state.data().result.set(value.get());
+            state.data_mut().has_initial = true;
+            return loop_next(scope, over);
         }
-        let controller = state.obj(CONTROLLER)?;
+        let (reducer, accumulator, controller) = {
+            let data = state.data();
+            (
+                data.reducer.get(scope),
+                data.result.get(scope),
+                data.controller.get(scope),
+            )
+        };
         let reducer_options = Object::new_plain(scope)?;
-        reducer_options.set_property(scope, c"signal", controller.val(scope, c"signal")?)?;
-        let result = call(
+        if let Some(controller) = controller {
+            reducer_options.set_property(scope, c"signal", *controller.signal(scope))?;
+        }
+        let result = Function::call(
             scope,
             HandleValue::undefined(),
-            state.get(REDUCER)?,
+            reducer,
             &[
-                state.get(RESULT)?,
-                args.get(0),
+                accumulator,
+                value,
                 reducer_options.to_jsval_throwing(scope)?,
             ],
         )?;
-        let fulfilled = bind(scope, &state, 1, reduce_reduced)?;
-        let rejected = bind(scope, &state, 1, reduce_failed)?;
+        let fulfilled = reaction(scope, reduce_reduced, state)?;
+        let rejected = reaction(scope, reduce_failed, state)?;
         await_value(scope, result, fulfilled, rejected)
     })();
     if step.is_err() {
-        let error = take_exception(scope);
-        loop_close(scope, &lp, Some(error))?;
+        let error = js::exception::take_pending_or_undefined(scope);
+        loop_close(scope, over, Some(error))?;
     }
-    Ok(js::value::undefined())
+    Ok(())
 }
 
 /// The reducer's result settled with the new accumulator.
@@ -2066,9 +2104,9 @@ fn reduce_reduced(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    state.set(consume::RESULT, args.get(0))?;
-    loop_next(scope, &consume_loop_of(scope, &state)?)?;
+    let state = cast_payload::<ConsumeState>(scope, payload);
+    state.data().result.set(args.get(0).get());
+    loop_next(scope, consume_loop_of(scope, state)?)?;
     Ok(js::value::undefined())
 }
 
@@ -2077,35 +2115,17 @@ fn reduce_failed(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    loop_close(scope, &consume_loop_of(scope, &state)?, Some(args.get(0)))?;
-    Ok(js::value::undefined())
-}
-
-/// The end of `reduce`'s loop.
-fn reduce_end(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    use consume::*;
-    let state = state_of(scope, payload)?;
-    reduce_finally(scope, &state)?;
-    if args.get(0).to_int32() == end::THROW {
-        consume_settle(scope, &state, true, args.get(1))?;
-    } else if !state.flag(GOT_ANY)? && !state.flag(HAS_INITIAL)? {
-        let error = error_value(scope, reduce_missing_initial_value())?;
-        consume_settle(scope, &state, true, error)?;
-    } else {
-        consume_settle(scope, &state, false, state.get(RESULT)?)?;
-    }
+    let state = cast_payload::<ConsumeState>(scope, payload);
+    loop_close(scope, consume_loop_of(scope, state)?, Some(args.get(0)))?;
     Ok(js::value::undefined())
 }
 
 /// The `finally` block of `reduce`: abort the signal the reducer gets.
-fn reduce_finally(scope: &Scope<'_>, state: &Captures<'_>) -> Result<(), ExnThrown> {
-    let controller = state.obj(consume::CONTROLLER)?;
-    call_method(scope, controller, c"abort", &[])?;
+fn reduce_finally(scope: &Scope<'_>, state: ConsumeState<'_>) -> Result<(), ExnThrown> {
+    let controller = state.data().controller.get(scope);
+    if let Some(controller) = controller {
+        controller.js_abort(scope, HandleValue::undefined())?;
+    }
     Ok(())
 }
 
@@ -2126,7 +2146,7 @@ fn map_method(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let this = scope.root_value(args.this());
-    let generator = map_generator(scope, this, args.get(0), args.get(1), None);
+    let generator = map_generator(scope, this, args.get(0), args.get(1));
     readable_from(scope, generator)
 }
 
@@ -2245,4 +2265,16 @@ pub(crate) fn define_operators(scope: &Scope<'_>, proto: Object<'_>) -> Result<(
         proto.define_property(scope, name, *function, 0)?;
     }
     Ok(())
+}
+
+/// Register the operators' internal classes for `global`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) {
+    ConsumeState::add_to_global(scope, global);
+    FilterFn::add_to_global(scope, global);
+    FlatState::add_to_global(scope, global);
+    Generator::add_to_global(scope, global);
+    LoopState::add_to_global(scope, global);
+    MapState::add_to_global(scope, global);
+    SkipState::add_to_global(scope, global);
+    AsyncIteratorRecord::add_to_global(scope, global);
 }

@@ -228,8 +228,16 @@ for (const [file, pattern, expected] of [
   ["a1", "a[[:digit:]]", true],
   ["", "", true],
   ["a", "", false],
+  ["a,b{c}", "a,b{c}", true],
+  ["xa{b}c", "x{a{b}c,d}", true],
+  ["xac", "x{a{b,c},d}", true],
+  ["a3b", "a{1,{2,3}}b", true],
+  ["p,q", "{p,q},{r}", false],
+  ["p,{r}", "{p,q},{r}", true],
 ]) {
   eq(path.matchesGlob(file, pattern), expected, `matchesGlob(${file}, ${pattern})`);
 }
 throws(() => path.matchesGlob(1, "a"), "ERR_INVALID_ARG_TYPE", "matchesGlob validates the path");
 throws(() => path.matchesGlob("a"), "ERR_INVALID_ARG_TYPE", "matchesGlob validates the pattern");
+throws(() => path.matchesGlob("a", "{a,".repeat(16000) + "b" + "}".repeat(16000)), RangeError, "deep braces");
+throws(() => path.matchesGlob("a", "+(".repeat(5000) + "a" + ")".repeat(5000)), RangeError, "deep extglobs");

@@ -3,18 +3,24 @@
 //! `events.once` and `events.on`, which wait for events on an `EventEmitter` or `EventTarget`.
 //! See <https://nodejs.org/api/events.html#eventsonceemitter-name-options>.
 //!
-//! The listeners, iterators and promises share their state through a plain object each native
-//! function holds as its payload.
+//! The listeners, iterators and promises share their state through a [`OnceWait`] or an
+//! [`OnIteration`], which each native function holds as its payload.
+
+use std::collections::VecDeque;
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
-use crate::errors::{abort_error, validate_abort_signal, validate_object, NodeError, Thrown};
+use crate::errors::{
+    abort_error, validate_abort_signal, validate_object, validate_plain_object, NodeError, Thrown,
+    MAX_SAFE_INTEGER,
+};
 
 /// Whether `value` is `true`.
 fn flag(value: HandleValue<'_>) -> bool {
@@ -87,11 +93,6 @@ fn remove_listener(
     Ok(())
 }
 
-/// The string `name` as a JS value.
-fn string<'s>(scope: &'s Scope<'_>, name: &str) -> Result<HandleValue<'s>, ExnThrown> {
-    js::JSString::from_str(scope, name)?.to_jsval_throwing(scope)
-}
-
 /// The `AbortError` for an abort of `signal`, with its reason as the cause.
 fn abort_error_for<'s>(
     scope: &'s Scope<'_>,
@@ -101,100 +102,119 @@ fn abort_error_for<'s>(
     abort_error(scope, Some(reason))
 }
 
-/// The payload of a native function as an object.
-fn state_of<'s>(scope: &'s Scope<'_>, payload: HandleValue<'_>) -> Result<Object<'s>, ExnThrown> {
-    Object::from_value(scope, scope.root_value(payload.get())).map_err(|e| e.throw(scope))
-}
-
-/// `state[name]` as an object.
-fn object_at<'s>(
+/// `object`, or `undefined` if it is `None`.
+fn value_or_undefined<'s>(
     scope: &'s Scope<'_>,
-    state: Object<'_>,
-    name: &'static std::ffi::CStr,
+    object: Option<Object<'s>>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    match object {
+        Some(object) => object.to_jsval_throwing(scope),
+        None => Ok(scope.root_value(js::value::undefined())),
+    }
+}
+
+/// `signal`, or a `TypeError` if it is `None`.
+fn required_signal<'s>(
+    scope: &Scope<'_>,
+    signal: Option<Object<'s>>,
 ) -> Result<Object<'s>, ExnThrown> {
-    let value = state.get_property(scope, name)?;
-    Object::from_value(scope, scope.root_value(value.get())).map_err(|e| e.throw(scope))
+    signal.ok_or_else(|| js::error::TypeError("no signal".into()).throw(scope))
 }
 
-/// `state.signal` as an object, if `once` or `on` got one.
-fn signal_of<'s>(scope: &'s Scope<'_>, state: Object<'_>) -> Result<Option<Object<'s>>, ExnThrown> {
-    let signal = state.get_property(scope, c"signal")?;
-    Ok(Object::from_value(scope, scope.root_value(signal.get())).ok())
+/// The payload of the listeners `once` adds: the promise `once` returned, the emitter and the
+/// event name, the listeners, and the signal, if `once` got one.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct OnceWait {
+    promise: Heap<js::promise::Promise>,
+    emitter: Heap<js::object::Object>,
+    name: Heap<Value>,
+    resolver: Option<Heap<js::object::Object>>,
+    error_listener: Option<Heap<js::object::Object>>,
+    abort_listener: Option<Heap<js::object::Object>>,
+    signal: Option<Heap<js::object::Object>>,
 }
 
-/// Remove the listeners `once` added for its `state`.
-fn once_cleanup(scope: &Scope<'_>, state: Object<'_>) -> Result<(), ExnThrown> {
-    let emitter = object_at(scope, state, c"emitter")?;
-    let name = state.get_property(scope, c"name")?;
-    remove_listener(
-        scope,
-        emitter,
-        name,
-        state.get_property(scope, c"resolver")?,
-    )?;
-    let error = string(scope, "error")?;
+#[core_runtime::jsmethods]
+impl OnceWait {}
+
+/// Remove the listeners `once` added for `wait`.
+fn once_cleanup(scope: &Scope<'_>, wait: OnceWait<'_>) -> Result<(), ExnThrown> {
+    let (emitter, name, resolver, error_listener, abort_listener, signal) = {
+        let data = wait.data();
+        (
+            data.emitter.get(scope),
+            data.name.get(scope),
+            data.resolver.get(scope),
+            data.error_listener.get(scope),
+            data.abort_listener.get(scope),
+            data.signal.get(scope),
+        )
+    };
+    remove_listener(scope, emitter, name, value_or_undefined(scope, resolver)?)?;
+    let error = js::class::get_or_init_atom(scope, c"error")?;
     remove_listener(
         scope,
         emitter,
         error,
-        state.get_property(scope, c"errorListener")?,
+        value_or_undefined(scope, error_listener)?,
     )?;
-    if let Some(signal) = signal_of(scope, state)? {
-        let abort = string(scope, "abort")?;
+    if let Some(signal) = signal {
+        let abort = js::class::get_or_init_atom(scope, c"abort")?;
         remove_listener(
             scope,
             signal,
             abort,
-            state.get_property(scope, c"abortListener")?,
+            value_or_undefined(scope, abort_listener)?,
         )?;
     }
     Ok(())
 }
 
-/// The promise `once` returned for `state`.
-fn once_promise<'s>(scope: &'s Scope<'_>, state: Object<'_>) -> Result<js::Promise<'s>, ExnThrown> {
-    object_at(scope, state, c"promise")?
-        .cast::<js::Promise>()
-        .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))
+/// The promise `once` returned for `wait`.
+fn once_promise<'s>(scope: &'s Scope<'_>, wait: OnceWait<'_>) -> js::Promise<'s> {
+    wait.data().promise.get(scope)
 }
 
-/// The listener `once` adds for the event: resolve with the event's arguments.
+/// The listener `once` adds for the event, whose payload is a [`OnceWait`]: resolve with the
+/// event's arguments.
 fn once_resolver(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    once_cleanup(scope, state)?;
+    let wait = cast_payload::<OnceWait>(scope, payload);
+    once_cleanup(scope, wait)?;
     let values: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
     let values = js::Array::with_contents(scope, &values)?;
-    once_promise(scope, state)?.resolve(scope, *values)?;
+    once_promise(scope, wait).resolve(scope, *values)?;
     Ok(js::value::undefined())
 }
 
-/// The listener `once` adds for `error`: reject with the error.
+/// The listener `once` adds for `error`, whose payload is a [`OnceWait`]: reject with the error.
 fn once_error(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    once_cleanup(scope, state)?;
-    once_promise(scope, state)?.reject(scope, args.get(0))?;
+    let wait = cast_payload::<OnceWait>(scope, payload);
+    once_cleanup(scope, wait)?;
+    once_promise(scope, wait).reject(scope, args.get(0))?;
     Ok(js::value::undefined())
 }
 
-/// The listener `once` adds for the signal's `abort`: reject with an `AbortError`.
+/// The listener `once` adds for the signal's `abort`, whose payload is a [`OnceWait`]: reject
+/// with an `AbortError`.
 fn once_abort(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    once_cleanup(scope, state)?;
-    let signal = object_at(scope, state, c"signal")?;
+    let wait = cast_payload::<OnceWait>(scope, payload);
+    once_cleanup(scope, wait)?;
+    let signal = wait.data().signal.get(scope);
+    let signal = required_signal(scope, signal)?;
     let error = abort_error_for(scope, signal)?;
-    once_promise(scope, state)?.reject(scope, error)?;
+    once_promise(scope, wait).reject(scope, error)?;
     Ok(js::value::undefined())
 }
 
@@ -206,7 +226,7 @@ fn read_signal<'s>(
     let Some(options) = options.filter(|options| !options.is_undefined()) else {
         return Ok(None);
     };
-    let options = validate_object(scope, options, "options")?;
+    let options = validate_plain_object(scope, options, "options", false)?;
     let signal = options.get_property(scope, c"signal")?;
     let signal = scope.root_value(signal.get());
     validate_abort_signal(scope, signal, "options.signal")?;
@@ -235,16 +255,24 @@ pub fn once<'s>(
     let started = (|| -> Result<(), Thrown> {
         let signal = read_signal(scope, options)?;
         let emitter = validate_object(scope, emitter, "emitter")?;
-        let state = Object::new_plain(scope)?;
-        state.set_property(scope, c"promise", *promise)?;
-        state.set_property(scope, c"emitter", emitter)?;
-        state.set_property(scope, c"name", name)?;
-        let resolver = Function::new_callback(scope, c"", 0, once_resolver, state)?;
-        let error_listener = Function::new_callback(scope, c"", 1, once_error, state)?;
-        let abort_listener = Function::new_callback(scope, c"", 0, once_abort, state)?;
-        state.set_property(scope, c"resolver", *resolver)?;
-        state.set_property(scope, c"errorListener", *error_listener)?;
-        state.set_property(scope, c"abortListener", *abort_listener)?;
+        let wait = js::class::create_instance_with::<OnceWaitImpl>(scope, |_| OnceWaitImpl {
+            promise: Heap::from(promise),
+            emitter: Heap::from(emitter),
+            name: Heap::from(name.get()),
+            resolver: None,
+            error_listener: None,
+            abort_listener: None,
+            signal: None,
+        })?;
+        let resolver = Function::new_callback(scope, c"", 0, once_resolver, wait)?;
+        let error_listener = Function::new_callback(scope, c"", 1, once_error, wait)?;
+        let abort_listener = Function::new_callback(scope, c"", 0, once_abort, wait)?;
+        {
+            let mut data = wait.data_mut();
+            data.resolver.set(*resolver);
+            data.error_listener.set(*error_listener);
+            data.abort_listener.set(*abort_listener);
+        }
         add_listener(
             scope,
             emitter,
@@ -255,7 +283,7 @@ pub fn once<'s>(
         let is_error = name.is_string()
             && String::from_jsval(scope, name, ()).is_ok_and(|name| name == "error");
         if !is_error && method(scope, emitter, c"once")?.is_some() {
-            let error = string(scope, "error")?;
+            let error = js::class::get_or_init_atom(scope, c"error")?;
             add_listener(
                 scope,
                 emitter,
@@ -265,8 +293,8 @@ pub fn once<'s>(
             )?;
         }
         if let Some(signal) = signal {
-            state.set_property(scope, c"signal", signal)?;
-            let abort = string(scope, "abort")?;
+            wait.data_mut().signal.set(signal);
+            let abort = js::class::get_or_init_atom(scope, c"abort")?;
             add_listener(
                 scope,
                 signal,
@@ -284,35 +312,88 @@ pub fn once<'s>(
     Ok(promise)
 }
 
+/// A listener [`on_add`] added, for [`on_close`] to remove.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+struct AddedListener {
+    target: Heap<js::object::Object>,
+    name: Heap<Value>,
+    listener: Heap<js::object::Object>,
+}
+
+/// The payload of the iterator methods and the listeners of `events.on`: the emitter, the queued
+/// events, pending `next()` promises and added listeners, and the iteration's state.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct OnIteration {
+    emitter: Heap<js::object::Object>,
+    /// The values of the events no `next()` took yet: arrays of their arguments, or their first
+    /// arguments with `first_event_param`.
+    queue: VecDeque<Heap<Value>>,
+    /// The promises of the pending `next()` calls.
+    pending: VecDeque<Heap<js::promise::Promise>>,
+    added: Vec<AddedListener>,
+    signal: Option<Heap<js::object::Object>>,
+    /// The error the next `next()` rejects with, if `has_error` is set.
+    error: Heap<Value>,
+    #[no_trace]
+    has_error: bool,
+    #[no_trace]
+    high_water_mark: f64,
+    #[no_trace]
+    low_water_mark: f64,
+    #[no_trace]
+    paused: bool,
+    #[no_trace]
+    finished: bool,
+    /// Whether the iterator yields the first argument of each event instead of an array of all
+    /// of them, as Node.js's `kFirstEventParam` option selects.
+    #[no_trace]
+    first_event_param: bool,
+}
+
+#[core_runtime::jsmethods]
+impl OnIteration {}
+
 /// Remove `on`'s listeners for `state`, mark its iterator finished and not paused, and resolve the
 /// pending `next()` promises as done. Returns a promise resolved as done. This ports Node's
 /// `closeHandler`.
-fn on_close<'s>(scope: &'s Scope<'_>, state: Object<'_>) -> Result<js::Promise<'s>, ExnThrown> {
-    let added = elements(scope, state.get_property(scope, c"added")?)?;
-    for entry in added {
-        let entry = Object::from_value(scope, entry).map_err(|e| e.throw(scope))?;
-        let target =
-            Object::from_value(scope, entry.get_element(scope, 0)?).map_err(|e| e.throw(scope))?;
-        remove_listener(
-            scope,
-            target,
-            entry.get_element(scope, 1)?,
-            entry.get_element(scope, 2)?,
-        )?;
+fn on_close<'s>(
+    scope: &'s Scope<'_>,
+    state: OnIteration<'_>,
+) -> Result<js::Promise<'s>, ExnThrown> {
+    let added: Vec<_> = {
+        let mut data = state.data_mut();
+        data.finished = true;
+        data.paused = false;
+        let added = data
+            .added
+            .iter()
+            .map(|entry| {
+                (
+                    entry.target.get(scope),
+                    entry.name.get(scope),
+                    entry.listener.get(scope),
+                )
+            })
+            .collect();
+        data.added.clear();
+        added
+    };
+    for (target, name, listener) in added {
+        remove_listener(scope, target, name, listener.to_jsval_throwing(scope)?)?;
     }
-    state.set_property(
-        scope,
-        c"added",
-        *js::Array::with_contents(scope, &[] as &[Value])?,
-    )?;
-    state.set_property(scope, c"finished", true)?;
-    state.set_property(scope, c"paused", false)?;
     let undefined = scope.root_value(js::value::undefined());
-    for pending in take_all(scope, state, c"pending")? {
-        let pending = Object::from_value(scope, pending)
-            .map_err(|e| e.throw(scope))?
-            .cast::<js::Promise>()
-            .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
+    let pending: Vec<_> = {
+        let mut data = state.data_mut();
+        let pending = data
+            .pending
+            .iter()
+            .map(|promise| promise.get(scope))
+            .collect();
+        data.pending.clear();
+        pending
+    };
+    for pending in pending {
         pending.resolve(
             scope,
             js::iteration::create_iter_result(scope, undefined, true)?,
@@ -343,171 +424,137 @@ fn elements<'s>(
         .collect()
 }
 
-/// The `length` of the array `array`, or 0 if it isn't a number.
-fn length_of(scope: &Scope<'_>, array: Object<'_>) -> Result<u32, ExnThrown> {
-    let length = array.get_property(scope, c"length")?;
-    Ok(if length.is_number() {
-        length.to_number() as u32
-    } else {
-        0
-    })
+/// Remove and return the oldest pending `next()` promise of `state`, if there is one.
+fn shift_pending<'s>(scope: &'s Scope<'_>, state: OnIteration<'_>) -> Option<js::Promise<'s>> {
+    let mut data = state.data_mut();
+    let pending = data.pending.front()?.get(scope);
+    drop(data.pending.pop_front());
+    Some(pending)
 }
 
-/// Append `value` to the array `state[name]`, and return its new length.
-fn push(
-    scope: &Scope<'_>,
-    state: Object<'_>,
-    name: &'static std::ffi::CStr,
-    value: HandleValue<'_>,
-) -> Result<u32, ExnThrown> {
-    let array = object_at(scope, state, name)?;
-    Function::call_by_name(scope, array.handle(), c"push", &[value])?;
-    length_of(scope, array)
-}
-
-/// Remove and return the first element of the array `state[name]`, if it has one.
-fn shift<'s>(
-    scope: &'s Scope<'_>,
-    state: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-    let array = object_at(scope, state, name)?;
-    if length_of(scope, array)? == 0 {
-        return Ok(None);
-    }
-    let first = Function::call_by_name(scope, array.handle(), c"shift", js::function::EmptyArgs)?;
-    Ok(Some(scope.root_value(first.get())))
-}
-
-/// Remove and return every element of the array `state[name]`.
-fn take_all<'s>(
-    scope: &'s Scope<'_>,
-    state: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<Vec<HandleValue<'s>>, ExnThrown> {
-    let values = elements(scope, state.get_property(scope, name)?)?;
-    state.set_property_by_name(
-        scope,
-        name,
-        *js::Array::with_contents(scope, &[] as &[Value])?,
-    )?;
-    Ok(values)
-}
-
-/// `state.highWaterMark` or `state.lowWaterMark`.
-fn water_mark(
-    scope: &Scope<'_>,
-    state: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<f64, ExnThrown> {
-    Ok(state.get_property(scope, name)?.to_number())
-}
-
-/// The listener `on` adds for the event: resolve the oldest pending `next()` with the event's
-/// arguments, or queue them, pausing the emitter once more than `highWaterMark` are queued.
+/// The listener `on` adds for the event, whose payload is an [`OnIteration`]: resolve the oldest
+/// pending `next()` with the event's value, or queue it, pausing the emitter once more than
+/// `highWaterMark` are queued.
 fn on_event(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let values: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
-    let values = js::Array::with_contents(scope, &values)?;
-    if let Some(pending) = shift(scope, state, c"pending")? {
-        let pending = Object::from_value(scope, pending)
-            .map_err(|e| e.throw(scope))?
-            .cast::<js::Promise>()
-            .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?;
+    let state = cast_payload::<OnIteration>(scope, payload);
+    let first_event_param = state.data().first_event_param;
+    let value = if first_event_param {
+        args.get(0)
+    } else {
+        let values: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+        js::Array::with_contents(scope, &values)?.to_jsval_throwing(scope)?
+    };
+    if let Some(pending) = shift_pending(scope, state) {
         pending.resolve(
             scope,
-            js::iteration::create_iter_result(scope, *values, false)?,
+            js::iteration::create_iter_result(scope, value, false)?,
         )?;
         return Ok(js::value::undefined());
     }
-    let queued = f64::from(push(
-        scope,
-        state,
-        c"queue",
-        (*values).to_jsval_throwing(scope)?,
-    )?);
-    let paused = flag(state.get_property(scope, c"paused")?);
-    if !paused && queued > water_mark(scope, state, c"highWaterMark")? {
-        let emitter = object_at(scope, state, c"emitter")?;
+    let (queued, paused, high_water_mark, emitter) = {
+        let mut data = state.data_mut();
+        data.queue.push_back(Heap::from(value.get()));
+        (
+            data.queue.len() as f64,
+            data.paused,
+            data.high_water_mark,
+            data.emitter.get(scope),
+        )
+    };
+    if !paused && queued > high_water_mark {
         if method(scope, emitter, c"pause")?.is_some() {
             Function::call_by_name(scope, emitter.handle(), c"pause", js::function::EmptyArgs)?;
         }
-        state.set_property(scope, c"paused", true)?;
+        state.data_mut().paused = true;
     }
     Ok(js::value::undefined())
 }
 
 /// Reject the oldest pending `next()` with `error`, or keep it for the next `next()`, then close
 /// the iterator. This ports Node's `errorHandler`.
-fn on_fail(scope: &Scope<'_>, state: Object<'_>, error: HandleValue<'_>) -> Result<(), ExnThrown> {
-    match shift(scope, state, c"pending")? {
+fn on_fail(
+    scope: &Scope<'_>,
+    state: OnIteration<'_>,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    match shift_pending(scope, state) {
         Some(pending) => {
-            Object::from_value(scope, pending)
-                .map_err(|e| e.throw(scope))?
-                .cast::<js::Promise>()
-                .map_err(|_| js::error::TypeError("not a promise".into()).throw(scope))?
-                .reject(scope, error)?;
+            pending.reject(scope, error)?;
         }
         None => {
-            state.set_property(scope, c"error", error)?;
-            state.set_property(scope, c"hasError", true)?;
+            let mut data = state.data_mut();
+            data.error.set(error.get());
+            data.has_error = true;
         }
     }
     on_close(scope, state)?;
     Ok(())
 }
 
-/// The listener `on` adds for `error`.
+/// The listener `on` adds for `error`, whose payload is an [`OnIteration`].
 fn on_error(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    on_fail(scope, state_of(scope, payload)?, args.get(0))?;
+    on_fail(
+        scope,
+        cast_payload::<OnIteration>(scope, payload),
+        args.get(0),
+    )?;
     Ok(js::value::undefined())
 }
 
-/// The listener `on` adds for the `close` option's events.
+/// The listener `on` adds for the `close` option's events, whose payload is an [`OnIteration`].
 fn on_close_event(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    on_close(scope, state_of(scope, payload)?)?;
+    on_close(scope, cast_payload::<OnIteration>(scope, payload))?;
     Ok(js::value::undefined())
 }
 
-/// The listener `on` adds for the signal's `abort`.
+/// The listener `on` adds for the signal's `abort`, whose payload is an [`OnIteration`].
 fn on_abort(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    let signal = object_at(scope, state, c"signal")?;
+    let state = cast_payload::<OnIteration>(scope, payload);
+    let signal = state.data().signal.get(scope);
+    let signal = required_signal(scope, signal)?;
     let error = abort_error_for(scope, signal)?;
     on_fail(scope, state, error)?;
     Ok(js::value::undefined())
 }
 
-/// The iterator's `next()`: the oldest queued event, else the kept error, else done once the
-/// iterator is finished, else a promise for the next event.
+/// The iterator's `next()`, whose payload is an [`OnIteration`]: the oldest queued event, else
+/// the kept error, else done once the iterator is finished, else a promise for the next event.
 fn on_next(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let state = state_of(scope, payload)?;
-    if let Some(values) = shift(scope, state, c"queue")? {
-        let queued = f64::from(length_of(scope, object_at(scope, state, c"queue")?)?);
-        if flag(state.get_property(scope, c"paused")?)
-            && queued < water_mark(scope, state, c"lowWaterMark")?
-        {
-            let emitter = object_at(scope, state, c"emitter")?;
+    let state = cast_payload::<OnIteration>(scope, payload);
+    let next = {
+        let mut data = state.data_mut();
+        data.queue.pop_front().map(|values| {
+            (
+                values.get(scope),
+                data.queue.len() as f64,
+                data.paused,
+                data.low_water_mark,
+                data.emitter.get(scope),
+            )
+        })
+    };
+    if let Some((values, queued, paused, low_water_mark, emitter)) = next {
+        if paused && queued < low_water_mark {
             if method(scope, emitter, c"resume")?.is_some() {
                 Function::call_by_name(
                     scope,
@@ -516,36 +563,42 @@ fn on_next(
                     js::function::EmptyArgs,
                 )?;
             }
-            state.set_property(scope, c"paused", false)?;
+            state.data_mut().paused = false;
         }
         let result = js::iteration::create_iter_result(scope, values, false)?;
         return js::Promise::new_resolved_with_value(scope, result)?.to_jsval_raw_throwing(scope);
     }
-    if flag(state.get_property(scope, c"hasError")?) {
-        let error = state.get_property(scope, c"error")?;
-        let error = scope.root_value(error.get());
-        state.set_property(scope, c"hasError", false)?;
-        state.set_property(scope, c"error", js::value::undefined())?;
+    let (has_error, error, finished) = {
+        let data = state.data();
+        (data.has_error, data.error.get(scope), data.finished)
+    };
+    if has_error {
+        {
+            let mut data = state.data_mut();
+            data.has_error = false;
+            data.error.set(js::value::undefined());
+        }
         return js::Promise::new_rejected_with_error(scope, error)?.to_jsval_raw_throwing(scope);
     }
-    if flag(state.get_property(scope, c"finished")?) {
+    if finished {
         return on_close(scope, state)?.to_jsval_raw_throwing(scope);
     }
     let pending = js::Promise::new_pending(scope)?;
-    push(scope, state, c"pending", pending.to_jsval_throwing(scope)?)?;
+    state.data_mut().pending.push_back(Heap::from(pending));
     pending.to_jsval_raw_throwing(scope)
 }
 
-/// The iterator's `return()`.
+/// The iterator's `return()`, whose payload is an [`OnIteration`].
 fn on_return(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    on_close(scope, state_of(scope, payload)?)?.to_jsval_raw_throwing(scope)
+    on_close(scope, cast_payload::<OnIteration>(scope, payload))?.to_jsval_raw_throwing(scope)
 }
 
-/// The iterator's `throw(error)`: fail the iterator with `error`, which must be an `Error`.
+/// The iterator's `throw(error)`, whose payload is an [`OnIteration`]: fail the iterator with
+/// `error`, which must be an `Error`.
 fn on_throw(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -561,30 +614,31 @@ fn on_throw(
         )
         .throw(scope));
     }
-    on_fail(scope, state_of(scope, payload)?, error)?;
+    on_fail(scope, cast_payload::<OnIteration>(scope, payload), error)?;
     Ok(js::value::undefined())
 }
 
-/// Add `listener` for `name` to `target` for `on`'s iterator, and record it in `state.added` for
+/// Add `listener` for `name` to `target` for `on`'s iterator, and record it in `state` for
 /// [`on_close`] to remove.
 fn on_add(
     scope: &Scope<'_>,
-    state: Object<'_>,
+    state: OnIteration<'_>,
     target: Object<'_>,
     name: HandleValue<'_>,
     listener: Function<'_>,
 ) -> Result<(), Thrown> {
-    let listener = (*listener).to_jsval_throwing(scope)?;
-    add_listener(scope, target, name, listener, false)?;
-    let entry = js::Array::with_contents(
+    add_listener(
         scope,
-        &[
-            target.to_jsval_raw_throwing(scope)?,
-            name.get(),
-            listener.get(),
-        ],
+        target,
+        name,
+        (*listener).to_jsval_throwing(scope)?,
+        false,
     )?;
-    push(scope, state, c"added", (*entry).to_jsval_throwing(scope)?)?;
+    state.data_mut().added.push(AddedListener {
+        target: Heap::from(target),
+        name: Heap::from(name.get()),
+        listener: Heap::from(*listener),
+    });
     Ok(())
 }
 
@@ -596,7 +650,6 @@ fn water_mark_option(
     names: [&'static std::ffi::CStr; 2],
     default: f64,
 ) -> Result<f64, Thrown> {
-    const MAX_SAFE_INTEGER: f64 = 9007199254740991.0;
     let Some(options) = options else {
         return Ok(default);
     };
@@ -622,30 +675,72 @@ pub fn on<'s>(
         .filter(|options| !options.is_undefined())
         .and_then(|options| Object::from_value(scope, scope.root_value(options.get())).ok());
     let emitter = validate_object(scope, emitter, "emitter")?;
-    const MAX_SAFE_INTEGER: f64 = 9007199254740991.0;
-    let high = water_mark_option(
+    let high_water_mark = water_mark_option(
         scope,
         options,
         [c"highWaterMark", c"highWatermark"],
         MAX_SAFE_INTEGER,
     )?;
-    let low = water_mark_option(scope, options, [c"lowWaterMark", c"lowWatermark"], 1.0)?;
+    let low_water_mark =
+        water_mark_option(scope, options, [c"lowWaterMark", c"lowWatermark"], 1.0)?;
+    let settings = OnSettings {
+        high_water_mark,
+        low_water_mark,
+        signal,
+        first_event_param: false,
+    };
+    on_iterator(scope, emitter, name, settings, |scope| {
+        let Some(options) = options else {
+            return Ok(Vec::new());
+        };
+        let close = options.get_property(scope, c"close")?;
+        Ok(elements(scope, close)?)
+    })
+}
 
-    let state = Object::new_plain(scope)?;
-    let empty = || js::Array::with_contents(scope, &[] as &[Value]);
-    state.set_property(scope, c"emitter", emitter)?;
-    state.set_property(scope, c"queue", *empty()?)?;
-    state.set_property(scope, c"pending", *empty()?)?;
-    state.set_property(scope, c"added", *empty()?)?;
-    state.set_property(scope, c"highWaterMark", high)?;
-    state.set_property(scope, c"lowWaterMark", low)?;
-    if let Some(signal) = signal {
-        state.set_property(scope, c"signal", signal)?;
-    }
+/// The validated options of an `events.on` iterator.
+pub(crate) struct OnSettings<'a> {
+    pub(crate) high_water_mark: f64,
+    pub(crate) low_water_mark: f64,
+    pub(crate) signal: Option<Object<'a>>,
+    /// Whether the iterator yields the first argument of each event, as Node.js's
+    /// `kFirstEventParam` option selects, instead of an array of all of them.
+    pub(crate) first_event_param: bool,
+}
+
+/// The iterator of `events.on(emitter, name, options)` with the options `settings`, which ends at
+/// each event that `close_events` returns. `close_events` is called after the listeners for `name`
+/// and `error` are added, when Node.js reads `options.close`.
+pub(crate) fn on_iterator<'s>(
+    scope: &'s Scope<'_>,
+    emitter: Object<'_>,
+    name: HandleValue<'_>,
+    settings: OnSettings<'_>,
+    close_events: impl FnOnce(&'s Scope<'_>) -> Result<Vec<HandleValue<'s>>, Thrown>,
+) -> Result<Object<'s>, Thrown> {
+    let OnSettings {
+        high_water_mark,
+        low_water_mark,
+        signal,
+        first_event_param,
+    } = settings;
+    let state = js::class::create_instance_with::<OnIterationImpl>(scope, |_| OnIterationImpl {
+        emitter: Heap::from(emitter),
+        queue: VecDeque::new(),
+        pending: VecDeque::new(),
+        added: Vec::new(),
+        signal: signal.map(Heap::from),
+        error: Heap::from(js::value::undefined()),
+        has_error: false,
+        high_water_mark,
+        low_water_mark,
+        paused: false,
+        finished: false,
+        first_event_param,
+    })?;
 
     let proto = js::class::get_async_iterator_prototype(scope)?;
-    let iterator = Object::new_plain(scope)?;
-    iterator.set_prototype(scope, proto)?;
+    let iterator = Object::new_plain_with_proto(scope, proto)?;
     for (key, body) in [
         (c"next", on_next as js::function::Callback),
         (c"return", on_return),
@@ -665,7 +760,7 @@ pub fn on<'s>(
     let is_error =
         name.is_string() && String::from_jsval(scope, name, ()).is_ok_and(|name| name == "error");
     if !is_error && method(scope, emitter, c"on")?.is_some() {
-        let error = string(scope, "error")?;
+        let error = js::class::get_or_init_atom(scope, c"error")?;
         on_add(
             scope,
             state,
@@ -674,20 +769,17 @@ pub fn on<'s>(
             Function::new_callback(scope, c"", 1, on_error, state)?,
         )?;
     }
-    if let Some(options) = options {
-        let close = options.get_property(scope, c"close")?;
-        for event in elements(scope, close)? {
-            on_add(
-                scope,
-                state,
-                emitter,
-                event,
-                Function::new_callback(scope, c"", 0, on_close_event, state)?,
-            )?;
-        }
+    for event in close_events(scope)? {
+        on_add(
+            scope,
+            state,
+            emitter,
+            event,
+            Function::new_callback(scope, c"", 0, on_close_event, state)?,
+        )?;
     }
     if let Some(signal) = signal {
-        let abort = string(scope, "abort")?;
+        let abort = js::class::get_or_init_atom(scope, c"abort")?;
         on_add(
             scope,
             state,

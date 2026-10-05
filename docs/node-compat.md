@@ -152,18 +152,50 @@ module's behavior. `process.binding(name)` returns the same objects for the name
 
 ## Implementation rules
 
+These rules add to the practices for all builtins in
+[builtin-development.md](builtin-development.md).
+
 - Every Node module is implemented natively in Rust with the proc macros (`#[jsmodule]`,
   `#[jsclass]`/`#[jsmethods]`, `#[jsfunction_class]`, `#[jsnamespace]`). No JavaScript from
   Node's `lib/` is vendored.
+- Internal state lives in Rust: in the private data of a `#[jsclass]` instance, with `Heap<T>`
+  fields for JS values. It is not kept in JS properties, symbol-keyed properties or JS arrays.
+  Where Node exposes part of the state publicly, it is an accessor over the Rust state, or an own
+  data property where Node defines one, which the implementation never reads back as state.
 - Classes that Node code subclasses ES5-style (`EventEmitter.call(this)` with `util.inherits`) or
   whose prototype methods it copies onto other objects are `#[jsfunction_class]`es: constructor
-  functions callable without `new`, whose state lives in JS properties as in Node, so every object
-  can be an instance. Rust state lives in a `#[jsclass]` object held in one of those properties.
-  Their methods and static methods are enumerable, as the members Node assigns to its
-  function-style classes are, except for the classes Node writes with `class` syntax, which use
-  `#[jsfunction_class(class_syntax)]`. The classes that return a new instance when called without
-  `new`, such as the stream classes, `net.Socket` and the zlib classes, use
+  functions callable without `new`. With `state = "Type"`, all of an instance's Rust state is the
+  private data of an instance of `Type`'s class:
+  - `new` and `super()` create instances of that class, with the prototype of `new.target`.
+  - `Base.call(obj)` on an object the constructor didn't create gives `obj` a handle: an instance
+    of that class, which `obj` holds in a property under a private name symbol, the kind of key
+    the engine uses for `#private` fields. JavaScript can't read, list, copy or delete it. For a
+    `Proxy`, its innermost target holds the handle.
+  - Methods reach the state with the generated `state_of`, which reads the private data of the
+    instance, of its handle, of a `Proxy`'s target or of an object on the prototype chain without
+    running JavaScript, and throws `ERR_INVALID_THIS` for other objects.
+  - A class whose instances combine the parts of several classes, as `Duplex` combines `Readable`
+    and `Writable`, has one state type holding all parts, which the other classes' methods reach
+    through a `js::class::InstanceState` implementation.
+  - Note: `structuredClone` throws for instances with state, which Node clones as plain objects.
+- Methods and static methods of `#[jsfunction_class]`es are enumerable, as the members Node
+  assigns to its function-style classes are, except for the classes Node writes with `class`
+  syntax, which use `#[jsfunction_class(class_syntax)]` and throw when called without `new`.
+  Those can also be plain `#[jsclass]`es. The classes that return a new instance when called
+  without `new`, such as the stream classes, `net.Socket` and the zlib classes, use
   `#[jsfunction_class(self_construct)]`.
+- The state of a native callback is its payload: the value itself for one value, and a
+  `#[jsclass(hidden)]` instance, read with `js::function::cast_payload`, for several. Work
+  queued for the tick queue is a native callback with a payload and arguments, queued with
+  `js::jobs::queue_native_tick`.
+- Internal classes are `#[jsclass(hidden)]`. Every class is registered for each global when the
+  global is set up, in `register_classes` in `crates/builtins/node/src/lib.rs`, and none is created
+  on first use.
+- Standard classes, web classes, and the objects the global setup installs, such as `process`,
+  `console`, `atob` and `btoa`, are reached through `js::class::get_class_object`, the class
+  registry or realm objects, and not through the global's properties, which code can replace. A
+  stub module is the exception: when it is first imported, an export takes the value of the
+  global of the same name, such as `stream/web`'s classes.
 - Node APIs have no step-structured specification. Each implemented function's doc comment links
   to the section of the Node.js API documentation it implements, and states where the
   implementation deviates from it.
@@ -320,14 +352,15 @@ asymmetric keys, signatures and ciphers.
   SHA-512/256 and SHA3-224, SHA3-256, SHA3-384 and SHA3-512, under their names with or without an
   `RSA-` prefix. The SHAKE extendable-output functions are missing.
 - `Hash` and `Hmac` are the classes `createHash` and `createHmac` instantiate. Their objects
-  have `update`, `digest` and, for `Hash`, `copy`, but aren't streams.
+  have `_options`, `update`, `digest` and, for `Hash`, `copy`, but aren't streams. Calling the
+  classes directly emits DEP0179 and DEP0181.
   `digest` returns a `Buffer` for an encoding it doesn't know, as Node does.
 - `createHmac` takes a secret `KeyObject` as its key, and decodes a string key in
   `options.encoding`.
-- `KeyObject`s are secret keys, which `createSecretKey` creates. They have `type`,
-  `symmetricKeySize`, `equals` and `export`, which returns a `Buffer` or a JSON Web Key.
-  `KeyObject.from` and `toCryptoKey` are missing, and `createPublicKey` and `createPrivateKey` are
-  stubs.
+- `KeyObject`s are secret keys, which `createSecretKey` creates. They keep their material
+  private, and have `type`, `symmetricKeySize`, `equals` and `export`, which returns a `Buffer` or
+  a JSON Web Key. `KeyObject.from` always throws, as `CryptoKey` isn't implemented, `toCryptoKey`
+  is missing, and `createPublicKey` and `createPrivateKey` are stubs.
 - `pbkdf2`, `scrypt` and `hkdf` validate their arguments and options as Node does, and derive the
   keys of RFC 8018, RFC 7914 and RFC 5869 with the supported digests. scrypt's parameters are
   checked as OpenSSL checks them, including `maxmem`. The keys are derived on the JS thread,
@@ -342,8 +375,12 @@ asymmetric keys, signatures and ciphers.
 implemented, including `bindStore`, `unbindStore` and `runStores`, and `TracingChannel`'s
 `traceSync`, `tracePromise` and `traceCallback`.
 
-- A realm keeps its channels by name for as long as it exists. Node collects a channel that has
-  no subscribers and is no longer referenced.
+- A channel with subscribers or bound stores has the prototype of Node's internal
+  `ActiveChannel` class, and `Channel[Symbol.hasInstance]` accepts both prototypes, as in Node.
+  `_subscribers`, `_stores`, `name` and `_index` are own data properties that reflect the
+  channel's state, but changing them doesn't change it.
+- As in Node, a realm holds a channel that has no subscribers or bound stores weakly, so it is
+  collected once nothing references it, and its name's entry is removed.
 - An exception a subscriber or a store's transform throws is uncaught, so it reaches the
   `uncaughtException` listeners, and the remaining subscribers still run.
 
@@ -351,8 +388,8 @@ implemented, including `bindStore`, `unbindStore` and `runStores`, and `TracingC
 
 `EventEmitter`, the module's `default` export, keeps an emitter's listeners in `_events`,
 `_eventsCount` and `_maxListeners`, as Node does. Its static members (`defaultMaxListeners`,
-`errorMonitor`, `captureRejectionSymbol`, `captureRejections`, `usingDomains`) are also named
-exports. `getEventListeners`, `getMaxListeners`, `setMaxListeners` and `listenerCount` are
+`errorMonitor`, `captureRejectionSymbol`, `captureRejections`, `usingDomains`, `init`) are also
+named exports. `getEventListeners`, `getMaxListeners`, `setMaxListeners` and `listenerCount` are
 implemented, as are `once` and `on`, for emitters and `EventTarget`s, except that
 `getEventListeners` can't list an `EventTarget`'s listeners. `on`'s `highWaterMark` and
 `lowWaterMark` options call the emitter's `pause` and `resume` if it has them.
@@ -422,17 +459,21 @@ The legacy internal modules `_stream_duplex`, `_stream_passthrough`, `_stream_re
 
 ### `node:async_hooks`
 
-`AsyncLocalStorage` and `AsyncResource` keep their stores in an async context: a `Map` from each
-`AsyncLocalStorage` to its store, as in Node's `AsyncContextFrame` implementation. Setting a store
-replaces the context with a copy that holds it. Promise reactions, `process.nextTick` and
+`AsyncLocalStorage` and `AsyncResource` keep their stores in an async context: a frame holding
+each `AsyncLocalStorage`'s store, as in Node's `AsyncContextFrame` implementation. Setting a store
+replaces the context with a copy that holds it, and `disable()` removes the store from the current
+frame. Promise reactions, `process.nextTick` and
 `queueMicrotask` callbacks, timers and other event-loop tasks capture the context current when
 they are created, and run with it. Event listeners run with the context current when the event is
 emitted.
 
-- `run`, `exit`, `getStore`, `enterWith`, `disable`, `AsyncLocalStorage.bind`,
+- `run`, `exit`, `getStore`, `enterWith`, `disable`, `withScope`, `AsyncLocalStorage.bind`,
   `AsyncLocalStorage.snapshot`, and the `defaultValue` and `name` options are implemented.
+  `AsyncLocalStorage.bind` and `AsyncLocalStorage.snapshot` bind through a new `AsyncResource`,
+  as in Node.
 - `AsyncResource`'s `runInAsyncScope`, `bind`, `asyncId`, `triggerAsyncId` and `AsyncResource.bind`
-  are implemented. `emitDestroy` does nothing.
+  are implemented. `emitDestroy` does nothing. A bound function has the deprecated
+  `asyncResource` accessor, which emits `DEP0172`.
 - `executionAsyncId()` returns 1, `triggerAsyncId()` returns 0, and `executionAsyncResource()`
   returns the same empty object on every call. `createHook` is a stub.
 - Natively, jobs that off-thread work queues, such as the reactions to `WebAssembly.compile`'s
@@ -499,6 +540,38 @@ clients send requests through the runtime's HTTP client, which also serves `fetc
   assigned with `assignSocket`, and queues what it writes in `outputData` until then, as in
   Node.js.
 
+The own data properties that Node's constructors give `IncomingMessage`, `OutgoingMessage`,
+`ServerResponse` and `ClientRequest` objects, and those of emitters and readable streams, are
+created in Node's order from `js::object::PropertyTemplate`s. The messages that the module creates
+itself, for the requests a server parses or serves, their responses, and the responses of client
+requests, get their properties defined with the values of the request or response head. Objects
+that a constructor is given, including those of the `IncomingMessage` and `ServerResponse`
+classes a server is created with, get them assigned, as in Node.js.
+
+Each message, server and connection keeps its state in one Rust struct:
+
+- An `OutgoingMessage`'s `OutgoingState` holds its headers with the values they were given, the
+  header block `writeHead` stored until it is sent, its socket, the writes it queues until it has
+  one, the request a response responds to, and its transport: HTTP/1.1 written to its socket, the
+  web `Response` of a served request, or the body of a client request. `headersSent`, `socket`,
+  `connection`, `closed`, `errored` and the `writable*` getters are accessors over it.
+  `statusCode` and `statusMessage` are data properties of `ServerResponse.prototype`, as in
+  Node.js.
+- An `IncomingMessage`'s `IncomingState` extends the state of the stream with the source of its
+  body: the connection that parses it, the body the host received, or the body stream of a served
+  request that was read before. It also holds the header and trailer lines, from which `headers`,
+  `trailers`, `headersDistinct` and `trailersDistinct` are built when they are first read, and the
+  controller of `signal`.
+- An `http.Server`'s `HttpServerState` extends the state of the `net.Server` with the connections
+  it accepted, the timer that checks them for timeouts, the port it serves the runtime's requests
+  on, and the classes of the `IncomingMessage` and `ServerResponse` options.
+- A connection's `ConnectionState` holds its parser, the requests waiting for their responses, the
+  responses waiting for the socket, and the bytes those responses queued. It is the payload of
+  the socket's listeners.
+- Served requests and client requests get a host socket, a `Socket` whose private data holds the
+  peer's address the host reported, the local port, whether it was destroyed, and the client
+  request it belongs to.
+
 A server that accepts connections itself handles each connection's requests as Node.js does:
 
 - Request heads are parsed with `httparse` and checked as `llhttp` checks them in its strict mode:
@@ -542,17 +615,25 @@ A server that accepts connections itself handles each connection's requests as N
 
 For served requests:
 
+- The `fetch` listener reads the `FetchEvent`'s `Request` natively: its method, current URL and
+  header list, and the body the host received, which the `IncomingMessage` reads without creating
+  the request's body stream. A request whose body stream was created reads that stream.
+- The response is a web `Response` created natively, with the headers set on the
+  `ServerResponse`. A body that `end` writes whole is the response's body. Otherwise the response
+  is sent with the first write, and its body is a native `ReadableStream` the later writes
+  enqueue chunks on. The headers don't pass through a `Headers` guard, so `Set-Cookie` is sent
+  with `--enforce-fetch-restrictions` too.
 - A served request with an `Upgrade` header, or a `CONNECT` request, gets a 501 response when the
   server has `upgrade` or `connect` listeners, since served requests have no socket to give them.
   Without such listeners it is a `request` event.
 - The `rawHeaders` of served requests and of client responses have the lowercase names the host
   reports, and `httpVersion` is `1.1`. A served request's `url` is the path and query of the URL
   the host parsed, not the raw request target. Its `socket` has the client's `remoteAddress`,
-  `remotePort` and `remoteFamily` natively, and no remote address on wasm, since `wasi:http`
-  doesn't report it. The socket is an `EventEmitter` whose `setTimeout`, `setNoDelay`,
-  `setKeepAlive`, `ref`, `unref` and `address` have no effect on the connection, and whose
-  `destroy` and `end` only mark it destroyed and emit `close`. A
-  `wasi:http` host passes the host as the request's authority, which becomes its `host` header.
+  `remotePort` and `remoteFamily` natively, from the address the serve layer records in the
+  request's `FetchEvent`, and no remote address on wasm, since `wasi:http` doesn't report it.
+  The socket is an `EventEmitter` whose `setTimeout`, `setNoDelay`, `setKeepAlive`, `ref`,
+  `unref` and `address` have no effect on the connection, and whose `destroy` and `end` only mark
+  it destroyed and emit `close`. A `wasi:http` host passes the host as the request's authority, which becomes its `host` header.
   `writeContinue`, `writeProcessing` and `writeEarlyHints` have no effect.
 - The host frames responses and requests, so `Connection`, `Keep-Alive` and `Transfer-Encoding`
   headers set on them are left out, and so are `Content-Length` headers set on requests. A
@@ -591,6 +672,12 @@ TCP sockets and servers, over tokio natively and `wasi:sockets` on wasm: `Socket
 `isIPv4`, `isIPv6` and `_normalizeArgs`, and `dns.lookup`, `dns.promises.lookup` and `node:dns/promises`' `lookup`.
 The rest of the modules, including the DNS queries other than `lookup`, are stubs.
 
+- A socket's state is a `SocketState`, which extends the state of the stream with its
+  connection, its byte counts, its idle timer, its addresses and the server that accepted it.
+  `bytesRead`, `bytesWritten`, `readyState`, `pending`, the address getters and `_handle` are
+  accessors over it. A server's `ServerState` holds its listening socket, the accept in progress
+  and the number of open connections, which `_connections` mirrors. `BlockList` and
+  `SocketAddress` are classes whose private data holds the rules and the address.
 - IPC paths are not supported. A server listens on every IPv4 address unless given an address or
   `localhost`, and its `address()` reports that address.
 - `setNoDelay`, `setKeepAlive`, `ref` and `unref` have no effect, and so do the `noDelay` and
@@ -624,6 +711,7 @@ The rest of the modules, including the DNS queries other than `lookup`, are stub
 of `process.stdin`, a `Readable` of standard input, and only reads descriptor 0. The rest of the
 module is stubs.
 
+- A `ReadStream` is a `net.Socket` whose state holds standard input in place of a connection.
 - `process.stdin` reads only while it flows or has `readable` listeners, and pausing it stops the
   read in progress, so a paused `process.stdin` doesn't keep the process running natively. On
   wasm, the process waits until standard input delivers more bytes or ends.
@@ -635,16 +723,27 @@ Line mode only: `Interface`, `createInterface`, `cursorTo`, `moveCursor`, `clear
 `clearScreenDown` and `emitKeypressEvents`, and the promise `Interface` and `createInterface`.
 `Readline` is a stub.
 
-- An interface emits a `line` event for each line of its input, which ends at `\n`, `\r\n` or
-  `\r`, and decodes `Buffer` input as UTF-8. A line read while a `question` is pending goes to
-  the question instead. `for await` gives the lines emitted after its iterator is created, and
-  rejects with an error the input emits.
-- A `question`'s `signal` option cancels the question when it aborts, and rejects the promise
+- An interface emits a `line` event for each line of its input, which ends at `\n`, `\r\n`,
+  `\r`, U+2028 or U+2029, and decodes `Buffer` input as UTF-8. A `\n` that starts a chunk within
+  `crlfDelay` milliseconds of a chunk that ended with `\r` ends no line. A line read while a
+  `question` is pending goes to the question instead, and the question's query is the prompt
+  until then. An unterminated last line is emitted as a `line` event when the input ends. `[Symbol.asyncIterator]()` returns the same iterator on every call,
+  Node's `events.on` iterator over the `line` events, which ends when the interface closes. It
+  gives the lines emitted after it is created, rejects with an error the input emits, pauses the
+  interface while more than 1024 lines wait, and leaves the interface open when a loop over it
+  ends early.
+- The `signal` option closes the interface when it aborts, or in a tick if it already has. A
+  `question`'s `signal` option cancels the question when it aborts, and rejects the promise
   `node:readline/promises` returns with an `AbortError`.
 - An error the input emits is emitted as the interface's `error`.
 - `terminal` is always `false`: keypresses, history, completion and cursor editing are not
-  supported, and `emitKeypressEvents` has no effect.
+  supported, and `emitKeypressEvents` has no effect. The `history`, `historySize`, `tabSize`,
+  `escapeCodeTimeout` and `completer` options are validated and stored as Node.js stores them,
+  except that a `completer` is stored as it is, where Node.js wraps one that doesn't take two
+  arguments.
 - `close()` pauses the interface, which emits `pause`, before it emits `close`.
+- `line` stays empty, as in Node's line mode, and `getCursorPos()` gives the column after the
+  prompt.
 
 ### `node:constants`
 
@@ -669,9 +768,11 @@ The implementation follows Node.js v24's `lib/internal/streams` function by func
 `isErrored`, `isDisturbed`, `isDestroyed`, `getDefaultHighWaterMark` and
 `setDefaultHighWaterMark`, and `node:stream/promises`' `pipeline` and `finished`.
 
-- A stream's state is in its `_readableState` and `_writableState`, objects with a property per
-  field under the names Node's states expose, such as `objectMode`, `flowing`, `ended` and
-  `needDrain`.
+- A stream's `_readableState` and `_writableState` are `ReadableState` and `WritableState`
+  objects whose prototype accessors read and write the stream's state under the names Node's
+  states expose, such as `objectMode`, `flowing`, `ended` and `needDrain`. They have no own
+  properties. Assigning a value that isn't an array to `buffer` or `pipes` is ignored, as is
+  assigning `bufferedIndex`.
 - Work Node schedules with `process.nextTick` goes in the tick queue `process.nextTick` uses.
 - In a `pipeline`, a function stage's result stays an iterable unless a Node stream consumes it.
   Web streams aren't accepted in a `pipeline`, and `finished` doesn't accept them.
@@ -718,13 +819,16 @@ Node.js's `lib/querystring.js` on UTF-16 code units, so lone surrogates pass thr
 The legacy API, `Url`, `parse`, `format`, `resolve` and `resolveObject`, follows Node's
 `lib/url.js`, including its escaping and IDNA hostnames, except that lone surrogates become
 U+FFFD, and that `xn--` labels the `idna` crate rejects, which Node accepts, are errors.
+`new Url()` assigns its `null` fields by copying them from a `Url` that each global creates when
+it registers the class, with `Object.assign`'s semantics.
 
 ### `node:util` and `node:util/types`
 
 `util.inspect` follows Node's `lib/internal/util/inspect.js`, including its line breaking and the
 grouping of long arrays into columns. Error stacks are rewritten into V8's frame format. It
 doesn't show the entries of `Map` and `Set` iterators or the contents of `WeakMap` and `WeakSet`,
-and a class instance without a prototype is shown without its class name. Colors are not
+and a class instance without a prototype is shown without its class name. A proxy is shown as
+its target without running its traps, or as its target and handler with `showProxy`. Colors are not
 supported, though `inspect.colors` and `inspect.styles` hold Node's tables. `format` and `formatWithOptions` use `inspect` for `%o`, `%O` and non-string
 arguments.
 
@@ -735,15 +839,16 @@ takes the `modifyPrototype` option. `styleText` styles
 its text whatever the output stream. `types` is `node:util/types`, and `TextEncoder` and
 `TextDecoder` are the globals. The rest is stubs.
 
-`node:util/types` implements the predicates with brand checks. `isProxy`, `isExternal`,
-`isKeyObject` and `isCryptoKey` always return `false`.
+`node:util/types` implements the predicates with brand checks. `isExternal` and `isCryptoKey`
+always return `false`.
 
 ### `node:assert` and `node:assert/strict`
 
 The assertion functions follow Node's `lib/assert.js`, and a failed assertion throws an
 `AssertionError` with `code` `ERR_ASSERTION`, the assertion's `actual`, `expected` and `operator`,
 and Node's generated message, including its diff. Deep equality follows Node's
-`lib/internal/util/comparisons.js`. The deprecated `CallTracker` follows Node's
+`lib/internal/util/comparisons.js`. `AssertionError` has an own `name` and a `toString` that
+includes the code, as Node's does. The deprecated `CallTracker` follows Node's
 `lib/internal/assert/calltracker.js`, and emits DEP0173 when the first one is created.
 `partialDeepStrictEqual` and the `Assert` class are stubs.
 
@@ -774,8 +879,18 @@ and `t.assert.snapshot` are missing.
 ### `node:timers`, `node:timers/promises` and the timer globals
 
 `setTimeout` and `setInterval` return `Timeout` objects instead of numbers, and `setImmediate`
-returns an `Immediate`. Both convert to the web timer's ID, so `clearTimeout` and `clearInterval`
-accept them as well as IDs. `node:timers` exports the globals.
+returns an `Immediate`. A `Timeout` converts to its timer's ID, which `clearTimeout` and
+`clearInterval` accept as well. `node:timers` exports the functions the globals start out as.
+
+- `Timeout` and `Immediate` keep their state in Rust. Their own data properties are Node's, such as
+  `_idleTimeout`, `_onTimeout`, `_timerArgs`, `_repeat` and `_destroyed`, and reflect the state.
+  As in Node, a timer reads its callback and arguments from `_onTimeout` and `_timerArgs`, or
+  `_onImmediate` and `_argv`, when it fires. Changing the other properties doesn't change the
+  timer. `_idlePrev` and `_idleNext` are the timer itself while it is queued, where Node links
+  its timer lists.
+- `new Timeout(callback, after, args, isRepeat, isRefed)` creates a timeout without starting it,
+  and `new Immediate(callback, args)` starts an immediate, as in Node.
+- Clearing a timeout by its ID cancels its timer without marking the `Timeout` destroyed.
 
 - `setImmediate` callbacks run as zero-delay timers.
 - `ref()`, `unref()`, `hasRef()`, `refresh()` and `close()` are implemented. An unreferenced timer
@@ -821,6 +936,9 @@ of the modules are stubs.
   and throw `ERR_BLOCKING_NOT_ALLOWED` where blocking isn't allowed. So do the descriptor
   operations on descriptors 0, 1 and 2 and on descriptors `openSync` opened. The synchronous
   forms work on descriptors from the callback and promise forms of `open`, and block on them.
+- A `FileHandle` is an `EventEmitter` that emits `close` when it is closed. Its descriptor is
+  the `fd` getter's, and it lacks `readv`, `writev`, `readLines`, `readableWebStream` and
+  `getAsyncId`.
 - File descriptors index a table of open files, starting at 3. Descriptors 0, 1 and 2 read from
   stdin and write to stdout and stderr. On wasm, a write without a position to a descriptor that
   the callback or promise form of `open` opened for appending leaves its position unchanged.
@@ -864,6 +982,8 @@ of the modules are stubs.
   queue. `ignore` filters the reported changes by filename with minimatch's `matchBase` (see
   [`node:path`](#nodepath)), a `RegExp` or a function. The Linux recursive watcher also drops the
   changes below an ignored directory. `FSWatcher` and `StatWatcher` aren't exported, as in Node.
+  Their Rust state holds the poll handle and the ignore matcher, which `_handle` and
+  `_ignoreMatcher` mirror.
 - `fs.watchFile` stats the file every `interval` milliseconds as libuv's `uv_fs_poll` does: the
   first stat runs right after the call, a failing stat reports zeroed `Stats` as the current ones
   once per error, and the previous `Stats` are those of the last successful stat.
@@ -878,9 +998,15 @@ functions, `crc32`, `constants` and `codes`. The zip archive functions are stubs
 
 - The callback functions compress or decompress synchronously, and call back in a tick.
 - Errors have zlib's message, `code` and `errno`, such as `Z_DATA_ERROR` and -3.
-- Every option is validated as Node validates it. The `level` option is used, and so are
-  `finishFlush` and `maxOutputLength` in the synchronous and callback functions. `windowBits`,
-  `memLevel`, `strategy`, `dictionary`, `chunkSize` and `flush` have no effect.
+- Every option is validated as Node validates it. `level`, `flush` and `finishFlush` are used.
+  The synchronous and callback functions stop once their output exceeds `maxOutputLength`, and
+  fail with `ERR_BUFFER_TOO_LARGE`. Streams push their output in buffers of at most `chunkSize`
+  bytes, and stop producing output while the readable side is full, until it's read.
+  `windowBits`, `memLevel`, `strategy` and `dictionary` have no effect. Streams have Node's
+  `_chunkSize`, `_defaultFlushFlag`, `_finishFlushFlag`, `_maxOutputLength`, `_outOffset` and,
+  for the zlib formats, `_level`, `_strategy` and `_mode` properties, and the `_closed` getter,
+  but no `_outBuffer` or `_writeState`. `flush(kind)` validates `kind` against the flush
+  constants of the stream's format.
 - The legacy `Z_*` constants on the module object are missing. They're in `constants`.
 - `flush(Z_FINISH)` runs as a full flush, without ending the compressed stream. A flush before the
   first input produces no output.
@@ -899,6 +1025,8 @@ functions, `crc32`, `constants` and `codes`. The zip archive functions are stubs
   zstd input decompresses without an error.
 - The Brotli and zstd stream classes extend the zlib stream classes' base class, where Node.js
   gives them their own.
+- A stream's codec, flush constants and `bytesWritten` count are in its Rust state, which extends
+  the state of the stream. `_handle` is an empty object until the stream is destroyed.
 - Destroying a stream frees its codec and sets `_handle` to `null`, as in Node.js. `reset()` of a
   destroyed stream throws `ERR_INVALID_THIS`, where Node.js throws an `AssertionError`.
 

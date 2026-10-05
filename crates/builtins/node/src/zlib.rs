@@ -24,7 +24,8 @@ use brotli::{BrotliDecompressStream, BrotliResult, BrotliState};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
-use js::function::CallbackArgs;
+use js::function::{cast_payload, CallbackArgs};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::{HandleId, Value};
 use js::prelude::HandleValue;
@@ -34,10 +35,8 @@ use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 
 use crate::buffer::{encode_string, new_buffer, Encoding, MAX_LENGTH};
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
-use crate::stream::{
-    call_method, closure, error_value, is_function, next_tick_call, string, take_exception,
-    Captures, Props,
-};
+use crate::stream::state::{StreamState, StreamStateImpl};
+use crate::support::{next_tick_call, Props};
 
 /// `zlib.constants`, as Node.js v24 defines them.
 const CONSTANTS: [(&str, f64); 170] = [
@@ -322,6 +321,23 @@ impl Format {
         }
     }
 
+    /// Node.js's `_mode` of a zlib stream of this format, its `binding` mode constant.
+    fn mode(self) -> f64 {
+        match self {
+            Format::Deflate => 1.0,
+            Format::Inflate => 2.0,
+            Format::Gzip => 3.0,
+            Format::Gunzip => 4.0,
+            Format::DeflateRaw => 5.0,
+            Format::InflateRaw => 6.0,
+            Format::Unzip => 7.0,
+            Format::BrotliDecompress => 8.0,
+            Format::BrotliCompress => 9.0,
+            Format::ZstdCompress => 10.0,
+            Format::ZstdDecompress => 11.0,
+        }
+    }
+
     fn decompresses(self) -> bool {
         matches!(
             self,
@@ -362,7 +378,17 @@ impl Family {
         }
     }
 
-    /// The flush that ends a conversion whose `finishFlush` is `kind`.
+    /// Node.js's `_flushBoundIdx`: the index of this family's flush bounds.
+    fn bound_index(self) -> f64 {
+        match self {
+            Family::Zlib => 0.0,
+            Family::Brotli => 1.0,
+            Family::Zstd => 2.0,
+        }
+    }
+
+    /// The flush for the flush constant `kind`, where the family's default finishing flush
+    /// constant ends the stream.
     fn finish_flush(self, kind: f64) -> Flush {
         if kind == self.flush_constants().3 {
             Flush::Finish
@@ -372,10 +398,27 @@ impl Family {
     }
 }
 
+/// The flush constant of `a` and `b` that flushes more, as Node.js's `maxFlush` compares them:
+/// by the rank of the zlib constants `Z_NO_FLUSH`, `Z_BLOCK`, `Z_PARTIAL_FLUSH`, `Z_SYNC_FLUSH`,
+/// `Z_FULL_FLUSH` and `Z_FINISH`, in this order, for every family.
+fn max_flush(a: f64, b: f64) -> f64 {
+    let rank = |kind: f64| {
+        [0.0, 5.0, 1.0, 2.0, 3.0, 4.0]
+            .iter()
+            .position(|&flag| flag == kind)
+    };
+    if rank(a) > rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
 /// How much of the compressed data a call to [`Codec::process`] produces.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Flush {
     /// Only what the engine doesn't buffer.
+    #[default]
     None,
     /// Everything up to the end of the input, as `Z_SYNC_FLUSH` does.
     Sync,
@@ -414,6 +457,15 @@ impl ZlibError {
         ZlibError {
             message,
             code: "ERR_BUFFER_TOO_LARGE",
+            errno: None,
+        }
+    }
+
+    /// The `RangeError` without a code of an output buffer that can't be allocated.
+    fn out_of_memory() -> Self {
+        ZlibError {
+            message: "Array buffer allocation failed".into(),
+            code: "",
             errno: None,
         }
     }
@@ -469,11 +521,15 @@ impl ZlibError {
 
     /// The error as a JS `Error` with `code` and `errno`.
     fn into_value<'s>(self, scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+        if self.code.is_empty() {
+            let kind = js::error::JSExnType::JSEXN_RANGEERR;
+            return js::error::new_error(scope, kind, &self.message);
+        }
         let kind = match self.errno {
             Some(_) => ErrorKind::Error,
             None => ErrorKind::RangeError,
         };
-        let error = error_value(scope, NodeError::new(kind, self.code, self.message))?;
+        let error = NodeError::new(kind, self.code, self.message).to_value(scope)?;
         if let Some(errno) = self.errno {
             Object::from_value(scope, *error)
                 .map_err(|e| e.throw(scope))?
@@ -543,10 +599,17 @@ enum Engine {
     Decompress(Decompress),
     BrotliCompress(Box<BrotliEncoderStateStruct<StandardAlloc>>),
     BrotliDecompress(Box<BrotliDecoder>),
-    /// The zstd input, which is compressed as one frame once it ends.
-    ZstdCompress(Vec<u8>),
-    /// The zstd input, which is decompressed once it ends.
-    ZstdDecompress(Vec<u8>),
+    /// The zstd input, which is compressed as one frame once it ends, and then the frame and the
+    /// count of its bytes produced.
+    ZstdCompress {
+        pending: Vec<u8>,
+        frame: Option<(Vec<u8>, usize)>,
+    },
+    /// The zstd input, which is decompressed once it ends, and then the decoder of its frame.
+    ZstdDecompress {
+        pending: Vec<u8>,
+        frame: Option<Box<ZstdFrame>>,
+    },
 }
 
 /// A compressor or decompressor that takes its input in pieces.
@@ -566,7 +629,7 @@ pub(crate) struct Codec {
 
 impl Default for Codec {
     fn default() -> Self {
-        Codec::new(Format::Deflate, &Params::default())
+        Codec::closed(Format::Deflate, Params::default())
     }
 }
 
@@ -603,8 +666,14 @@ impl Codec {
                 StandardAlloc::default(),
                 StandardAlloc::default(),
             )))),
-            Format::ZstdCompress => Some(Engine::ZstdCompress(Vec::new())),
-            Format::ZstdDecompress => Some(Engine::ZstdDecompress(Vec::new())),
+            Format::ZstdCompress => Some(Engine::ZstdCompress {
+                pending: Vec::new(),
+                frame: None,
+            }),
+            Format::ZstdDecompress => Some(Engine::ZstdDecompress {
+                pending: Vec::new(),
+                frame: None,
+            }),
         };
         Codec {
             format,
@@ -628,153 +697,269 @@ impl Codec {
         }
     }
 
-    /// Process `input` and return the output. With `Flush::Finish`, a decompressor that hasn't
-    /// reached the end of a compressed stream fails. Decompressors ignore the other flushes.
-    fn process(&mut self, input: &[u8], flush: Flush) -> Result<Vec<u8>, ZlibError> {
+    /// Process `input` with `flush`, and append at most `limit` bytes of output to `output`. With
+    /// `Flush::Finish`, a decompressor that hasn't reached the end of a compressed stream fails
+    /// once it produced all output. Decompressors ignore the other flushes.
+    fn process(
+        &mut self,
+        input: &[u8],
+        flush: Flush,
+        limit: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<Progress, ZlibError> {
         let finish = flush == Flush::Finish;
-        let held;
-        let mut input = input;
+        let start = output.len();
         if self.engine.is_none() {
-            self.held.extend_from_slice(input);
-            if self.held.len() < 2 && !finish {
-                return Ok(Vec::new());
+            let mut head = self.held.clone();
+            head.extend(input.iter().take(2));
+            if head.len() < 2 && !finish {
+                self.held.extend_from_slice(input);
+                return Ok(Progress::done(input.len()));
             }
-            held = std::mem::take(&mut self.held);
-            let format = if held.starts_with(&[0x1f, 0x8b]) {
+            let format = if head.starts_with(&[0x1f, 0x8b]) {
                 Format::Gunzip
             } else {
                 Format::Inflate
             };
+            // At most one byte is held, which is too short for a header and produces no output.
+            let held = std::mem::take(&mut self.held);
             *self = Codec {
                 created: self.created,
                 ..Codec::new(format, &self.params)
             };
-            input = &held;
+            self.decompress(&held, limit, output)?;
         }
-        let mut output = Vec::new();
-        match self.engine.as_mut() {
-            // A flush before the first input produces nothing, and leaves the engine able to
-            // change its level.
-            Some(Engine::Compress(engine))
-                if input.is_empty() && engine.total_in() == 0 && !finish => {}
-            Some(Engine::Compress(engine)) => {
-                let flush = match flush {
-                    Flush::None => FlushCompress::None,
-                    Flush::Sync => FlushCompress::Sync,
-                    Flush::Full => FlushCompress::Full,
-                    Flush::Finish => FlushCompress::Finish,
-                };
-                loop {
-                    let before = engine.total_in();
-                    output.reserve(CHUNK);
-                    let status = engine
-                        .compress_vec(input, &mut output, flush)
-                        .map_err(|error| ZlibError::data(error.message()))?;
-                    input = &input[(engine.total_in() - before) as usize..];
-                    // The engine is done once it consumed all input and left output space
-                    // unused.
-                    if status == Status::StreamEnd
-                        || (input.is_empty() && output.len() < output.capacity())
-                    {
-                        break;
+        let room = limit.saturating_sub(output.len() - start);
+        let progress = if let Some(Engine::Decompress(_)) = self.engine {
+            self.decompress(input, room, output)?
+        } else {
+            match self.engine.as_mut() {
+                // A flush before the first input produces nothing, and leaves the engine able to
+                // change its level.
+                Some(Engine::Compress(engine))
+                    if input.is_empty() && engine.total_in() == 0 && !finish =>
+                {
+                    Progress::done(0)
+                }
+                Some(Engine::Compress(engine)) => deflate(engine, input, flush, room, output)?,
+                Some(Engine::BrotliCompress(state)) => {
+                    brotli_compress(state, input, flush, room, output)?
+                }
+                Some(Engine::BrotliDecompress(_)) if self.ended => Progress::done(input.len()),
+                Some(Engine::BrotliDecompress(state)) => {
+                    let (progress, ended) = brotli_decompress(state, input, room, output)?;
+                    self.ended = ended;
+                    progress
+                }
+                Some(Engine::ZstdCompress { pending, frame }) => {
+                    if frame.is_none() {
+                        hold(pending, input)?;
+                        if !finish {
+                            return Ok(Progress::done(input.len()));
+                        }
+                        let compressed = ruzstd::encoding::compress_to_vec(
+                            pending.as_slice(),
+                            ruzstd::encoding::CompressionLevel::Fastest,
+                        );
+                        *pending = Vec::new();
+                        *frame = Some((compressed, 0));
+                    }
+                    let (compressed, read) = frame.as_mut().expect("compressed above");
+                    let count = room.min(compressed.len() - *read);
+                    hold(output, &compressed[*read..*read + count])?;
+                    *read += count;
+                    Progress {
+                        consumed: input.len(),
+                        done: *read == compressed.len(),
                     }
                 }
-            }
-            Some(Engine::Decompress(_)) => self.decompress(input, &mut output)?,
-            Some(Engine::BrotliCompress(state)) => {
-                brotli_compress(state, input, flush, &mut output)?
-            }
-            Some(Engine::BrotliDecompress(state)) => {
-                if !self.ended {
-                    self.ended = brotli_decompress(state, input, &mut output)?;
+                Some(Engine::ZstdDecompress { .. }) if self.ended => Progress::done(input.len()),
+                Some(Engine::ZstdDecompress { pending, frame }) => {
+                    if frame.is_none() {
+                        hold(pending, input)?;
+                        if !finish {
+                            return Ok(Progress::done(input.len()));
+                        }
+                        *frame = Some(zstd_frame(pending)?);
+                    }
+                    let frame = frame.as_mut().expect("created above");
+                    let done = zstd_decompress(frame, pending, room, output)?;
+                    self.ended = done;
+                    Progress {
+                        consumed: input.len(),
+                        done,
+                    }
+                }
+                Some(Engine::Decompress(_)) | None => {
+                    unreachable!("the engine was created above")
                 }
             }
-            Some(Engine::ZstdCompress(held)) => {
-                held.extend_from_slice(input);
-                if finish {
-                    output = ruzstd::encoding::compress_to_vec(
-                        held.as_slice(),
-                        ruzstd::encoding::CompressionLevel::Fastest,
-                    );
-                    held.clear();
-                }
-            }
-            Some(Engine::ZstdDecompress(held)) => {
-                held.extend_from_slice(input);
-                if finish {
-                    zstd_decompress(held, &mut output)?;
-                    held.clear();
-                    self.ended = true;
-                }
-            }
-            None => unreachable!("the engine was created above"),
-        }
-        if finish && !self.ended && self.format.decompresses() {
+        };
+        if finish && progress.done && !self.ended && self.format.decompresses() {
             return Err(ZlibError::unexpected_end());
         }
-        Ok(output)
+        Ok(progress)
     }
 
-    /// Decompress `input` into `output`. After the end of a gzip member, a non-zero byte starts
-    /// another member, and a zero byte ends the input. Bytes after the end of other formats'
-    /// streams are ignored.
-    fn decompress(&mut self, mut input: &[u8], output: &mut Vec<u8>) -> Result<(), ZlibError> {
-        // A call that fills the output can leave output in the decompressor, which further calls
-        // without input produce.
-        let mut filled = false;
-        while !input.is_empty() || filled {
+    /// Decompress `input` into at most `room` bytes of `output`. After the end of a gzip member, a
+    /// non-zero byte starts another member, and a zero byte ends the input. Bytes after the end of
+    /// other formats' streams are ignored.
+    fn decompress(
+        &mut self,
+        input: &[u8],
+        mut room: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<Progress, ZlibError> {
+        let mut consumed = 0;
+        loop {
             if self.ended {
-                if self.format != Format::Gunzip || input[0] == 0 {
-                    break;
+                let rest = &input[consumed..];
+                if self.format != Format::Gunzip || rest.first().is_none_or(|&byte| byte == 0) {
+                    return Ok(Progress::done(consumed));
                 }
                 *self = Codec {
                     created: self.created,
                     ..Codec::new(Format::Gunzip, &self.params)
                 };
             }
+            if room == 0 {
+                return Ok(Progress::partial(consumed));
+            }
             let Some(Engine::Decompress(engine)) = self.engine.as_mut() else {
                 unreachable!("decompressing formats have a decompressor");
             };
+            let start = grow(output, room)?;
+            let space = output.len() - start;
             let (before_in, before_out) = (engine.total_in(), engine.total_out());
-            output.reserve(CHUNK);
-            let space = output.capacity() - output.len();
-            let status = engine
-                .decompress_vec(input, output, FlushDecompress::None)
-                .map_err(|error| ZlibError::data(error.message()))?;
-            input = &input[(engine.total_in() - before_in) as usize..];
-            filled = (engine.total_out() - before_out) as usize == space;
+            let status = engine.decompress(
+                &input[consumed..],
+                &mut output[start..],
+                FlushDecompress::None,
+            );
+            let produced = (engine.total_out() - before_out) as usize;
+            let taken = (engine.total_in() - before_in) as usize;
+            output.truncate(start + produced);
+            let status = status.map_err(|error| ZlibError::data(error.message()))?;
+            consumed += taken;
+            room -= produced;
             if status == Status::StreamEnd {
                 self.ended = true;
-                filled = false;
-            } else if engine.total_in() == before_in && engine.total_out() == before_out {
-                break;
+            } else if (produced < space && consumed == input.len()) || (produced == 0 && taken == 0)
+            {
+                return Ok(Progress::done(consumed));
             }
         }
-        Ok(())
     }
 }
 
-/// Compress `input` with the Brotli encoder `state` into `output`, with the operation `flush`
-/// selects: `BROTLI_OPERATION_PROCESS` for `Flush::None`, `BROTLI_OPERATION_FINISH` for
-/// `Flush::Finish`, and `BROTLI_OPERATION_FLUSH` otherwise.
+/// What a call to [`Codec::process`] did: the count of input bytes the engine took, and whether
+/// it produced all the output of the input and the flush. When it didn't, the output reached the
+/// limit, and a call with the rest of the input and the same flush continues.
+#[derive(Clone, Copy)]
+struct Progress {
+    consumed: usize,
+    done: bool,
+}
+
+impl Progress {
+    fn done(consumed: usize) -> Self {
+        Progress {
+            consumed,
+            done: true,
+        }
+    }
+
+    fn partial(consumed: usize) -> Self {
+        Progress {
+            consumed,
+            done: false,
+        }
+    }
+}
+
+/// Append zero bytes to `output` for an engine to write into, as many as `room` allows but at most
+/// [`CHUNK`], and return where they start. Fails if allocating them fails.
+fn grow(output: &mut Vec<u8>, room: usize) -> Result<usize, ZlibError> {
+    let length = room.min(CHUNK);
+    output
+        .try_reserve(length)
+        .map_err(|_| ZlibError::out_of_memory())?;
+    let start = output.len();
+    output.resize(start + length, 0);
+    Ok(start)
+}
+
+/// Append `bytes` to `buffer`, or fail if allocating the room fails.
+fn hold(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ZlibError> {
+    buffer
+        .try_reserve(bytes.len())
+        .map_err(|_| ZlibError::out_of_memory())?;
+    buffer.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Compress `input` with the zlib engine `engine` and `flush` into at most `room` bytes of
+/// `output`.
+fn deflate(
+    engine: &mut Compress,
+    input: &[u8],
+    flush: Flush,
+    mut room: usize,
+    output: &mut Vec<u8>,
+) -> Result<Progress, ZlibError> {
+    let flush = match flush {
+        Flush::None => FlushCompress::None,
+        Flush::Sync => FlushCompress::Sync,
+        Flush::Full => FlushCompress::Full,
+        Flush::Finish => FlushCompress::Finish,
+    };
+    let mut consumed = 0;
+    loop {
+        if room == 0 {
+            return Ok(Progress::partial(consumed));
+        }
+        let start = grow(output, room)?;
+        let space = output.len() - start;
+        let (before_in, before_out) = (engine.total_in(), engine.total_out());
+        let status = engine.compress(&input[consumed..], &mut output[start..], flush);
+        let produced = (engine.total_out() - before_out) as usize;
+        output.truncate(start + produced);
+        let status = status.map_err(|error| ZlibError::data(error.message()))?;
+        consumed += (engine.total_in() - before_in) as usize;
+        room -= produced;
+        // The engine is done once it consumed all input and left output space unused.
+        if status == Status::StreamEnd || (consumed == input.len() && produced < space) {
+            return Ok(Progress::done(consumed));
+        }
+    }
+}
+
+/// Compress `input` with the Brotli encoder `state` into at most `room` bytes of `output`, with
+/// the operation `flush` selects: `BROTLI_OPERATION_PROCESS` for `Flush::None`,
+/// `BROTLI_OPERATION_FINISH` for `Flush::Finish`, and `BROTLI_OPERATION_FLUSH` otherwise.
 fn brotli_compress(
     state: &mut BrotliEncoderStateStruct<StandardAlloc>,
     mut input: &[u8],
     flush: Flush,
+    mut room: usize,
     output: &mut Vec<u8>,
-) -> Result<(), ZlibError> {
+) -> Result<Progress, ZlibError> {
     let operation = match flush {
-        Flush::None if input.is_empty() => return Ok(()),
+        Flush::None if input.is_empty() => return Ok(Progress::done(0)),
         Flush::None => BrotliEncoderOperation::BROTLI_OPERATION_PROCESS,
         Flush::Sync | Flush::Full => BrotliEncoderOperation::BROTLI_OPERATION_FLUSH,
         Flush::Finish => BrotliEncoderOperation::BROTLI_OPERATION_FINISH,
     };
     let finish = flush == Flush::Finish;
-    let mut buffer = vec![0; CHUNK];
+    let total = input.len();
     loop {
+        if room == 0 {
+            return Ok(Progress::partial(total - input.len()));
+        }
+        let start = grow(output, room)?;
         let mut available_in = input.len();
         let mut input_offset = 0;
-        let mut available_out = buffer.len();
+        let mut available_out = output.len() - start;
         let mut output_offset = 0;
         let compressed = state.compress_stream(
             operation,
@@ -782,13 +967,14 @@ fn brotli_compress(
             input,
             &mut input_offset,
             &mut available_out,
-            &mut buffer,
+            &mut output[start..],
             &mut output_offset,
             &mut None,
             &mut |_, _, _, _| (),
         );
-        output.extend_from_slice(&buffer[..output_offset]);
+        output.truncate(start + output_offset);
         input = &input[input_offset..];
+        room -= output_offset;
         if !compressed {
             return Err(ZlibError::data(Some("Compression failed")));
         }
@@ -798,23 +984,28 @@ fn brotli_compress(
             input.is_empty() && !state.has_more_output()
         };
         if done {
-            return Ok(());
+            return Ok(Progress::done(total - input.len()));
         }
     }
 }
 
-/// Decompress `input` with the Brotli decoder `state` into `output`. Returns whether the
-/// compressed stream ended. Bytes after its end are ignored.
+/// Decompress `input` with the Brotli decoder `state` into at most `room` bytes of `output`.
+/// Returns the progress and whether the compressed stream ended. Bytes after its end are ignored.
 fn brotli_decompress(
     state: &mut BrotliDecoder,
     mut input: &[u8],
+    mut room: usize,
     output: &mut Vec<u8>,
-) -> Result<bool, ZlibError> {
-    let mut buffer = vec![0; CHUNK];
+) -> Result<(Progress, bool), ZlibError> {
+    let total = input.len();
     loop {
+        if room == 0 {
+            return Ok((Progress::partial(total - input.len()), false));
+        }
+        let start = grow(output, room)?;
         let mut available_in = input.len();
         let mut input_offset = 0;
-        let mut available_out = buffer.len();
+        let mut available_out = output.len() - start;
         let mut output_offset = 0;
         let mut total_out = 0;
         let result = BrotliDecompressStream(
@@ -823,15 +1014,18 @@ fn brotli_decompress(
             input,
             &mut available_out,
             &mut output_offset,
-            &mut buffer,
+            &mut output[start..],
             &mut total_out,
             state,
         );
-        output.extend_from_slice(&buffer[..output_offset]);
+        output.truncate(start + output_offset);
         input = &input[input_offset..];
+        room -= output_offset;
         match result {
-            BrotliResult::ResultSuccess => return Ok(true),
-            BrotliResult::NeedsMoreInput => return Ok(false),
+            BrotliResult::ResultSuccess => return Ok((Progress::done(total - input.len()), true)),
+            BrotliResult::NeedsMoreInput => {
+                return Ok((Progress::done(total - input.len()), false));
+            }
             BrotliResult::NeedsMoreOutput => {}
             BrotliResult::ResultFailure => {
                 return Err(ZlibError::brotli(state.error_code as i32));
@@ -840,18 +1034,27 @@ fn brotli_decompress(
     }
 }
 
-/// Decompress the first zstd frame in `input` into `output`, as Node.js does. Skippable frames
-/// before it are skipped, and the bytes after it are ignored.
-fn zstd_decompress(mut input: &[u8], output: &mut Vec<u8>) -> Result<(), ZlibError> {
+/// The zstd frame a decompressor decodes: the decoder, the count of input bytes it read, whether
+/// the frame header declares the size of the content, and the count of bytes produced.
+struct ZstdFrame {
+    decoder: FrameDecoder,
+    read: usize,
+    declares_size: bool,
+    produced: u64,
+}
+
+/// The decoder of the first zstd frame in `input`, as Node.js decodes it. Skippable frames before
+/// it are skipped.
+fn zstd_frame(input: &[u8]) -> Result<Box<ZstdFrame>, ZlibError> {
+    let mut rest = input;
     let mut decoder = FrameDecoder::new();
-    let mut declares_size;
     loop {
-        if input.is_empty() {
+        if rest.is_empty() {
             return Err(ZlibError::unexpected_end());
         }
         // A frame starts with the magic number 0xFD2FB528, and a skippable frame with one from
         // 0x184D2A50 to 0x184D2A5F, both little-endian.
-        let head = &input[..input.len().min(4)];
+        let head = &rest[..rest.len().min(4)];
         let frame = head == &[0x28, 0xb5, 0x2f, 0xfd][..head.len()];
         let skippable = head[0] & 0xf0 == 0x50 && head[1..] == [0x2a, 0x4d, 0x18][..head.len() - 1];
         if !frame && !skippable {
@@ -859,45 +1062,78 @@ fn zstd_decompress(mut input: &[u8], output: &mut Vec<u8>) -> Result<(), ZlibErr
         }
         // The frame header descriptor's `Frame_Content_Size_flag` and `Single_Segment_flag`
         // tell whether the header holds the size of the frame's content.
-        let descriptor = input.get(4).copied().unwrap_or(0);
-        declares_size = frame && (descriptor >> 6 != 0 || descriptor & 0x20 != 0);
+        let descriptor = rest.get(4).copied().unwrap_or(0);
+        let declares_size = frame && (descriptor >> 6 != 0 || descriptor & 0x20 != 0);
         // Its reserved bit must be 0.
         if frame && descriptor & 0x08 != 0 {
             return Err(ZlibError::zstd_code(ZSTD_FRAME_PARAMETER_UNSUPPORTED));
         }
-        match decoder.init(&mut input) {
-            Ok(()) => break,
+        match decoder.init(&mut rest) {
+            Ok(()) => {
+                return Ok(Box::new(ZstdFrame {
+                    decoder,
+                    read: input.len() - rest.len(),
+                    declares_size,
+                    produced: 0,
+                }))
+            }
             Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
                 length,
                 ..
             })) => {
-                input = input
+                rest = rest
                     .get(length as usize..)
                     .ok_or_else(ZlibError::unexpected_end)?;
             }
             Err(error) => return Err(ZlibError::zstd(&error)),
         }
     }
-    decoder
-        .decode_blocks(&mut input, BlockDecodingStrategy::All)
-        .map_err(|error| ZlibError::zstd(&error))?;
-    if !decoder.is_finished() {
-        return Err(ZlibError::unexpected_end());
-    }
-    let content = decoder.collect().unwrap_or_default();
-    if declares_size && content.len() as u64 != decoder.content_size() {
-        return Err(ZlibError::zstd_code(ZSTD_CORRUPTION_DETECTED));
-    }
-    if let (Some(expected), Some(actual)) = (
-        decoder.get_checksum_from_data(),
-        decoder.get_calculated_checksum(),
-    ) {
-        if expected != actual {
-            return Err(ZlibError::zstd_code(ZSTD_CHECKSUM_WRONG));
+}
+
+/// Decode `frame` of `input` into at most `room` bytes of `output`. Returns whether the frame
+/// ended. The bytes after it are ignored.
+fn zstd_decompress(
+    frame: &mut ZstdFrame,
+    input: &[u8],
+    mut room: usize,
+    output: &mut Vec<u8>,
+) -> Result<bool, ZlibError> {
+    loop {
+        if room == 0 {
+            return Ok(false);
         }
+        let available = frame.decoder.can_collect();
+        if available > 0 {
+            let start = grow(output, room.min(available))?;
+            let read = std::io::Read::read(&mut frame.decoder, &mut output[start..]);
+            let count = read.as_ref().copied().unwrap_or(0);
+            output.truncate(start + count);
+            read.map_err(|_| ZlibError::zstd_code(ZSTD_CORRUPTION_DETECTED))?;
+            room -= count;
+            frame.produced += count as u64;
+            continue;
+        }
+        if frame.decoder.is_finished() {
+            if frame.declares_size && frame.produced != frame.decoder.content_size() {
+                return Err(ZlibError::zstd_code(ZSTD_CORRUPTION_DETECTED));
+            }
+            if let (Some(expected), Some(actual)) = (
+                frame.decoder.get_checksum_from_data(),
+                frame.decoder.get_calculated_checksum(),
+            ) {
+                if expected != actual {
+                    return Err(ZlibError::zstd_code(ZSTD_CHECKSUM_WRONG));
+                }
+            }
+            return Ok(true);
+        }
+        let mut source = &input[frame.read..];
+        frame
+            .decoder
+            .decode_blocks(&mut source, BlockDecodingStrategy::UptoBytes(CHUNK))
+            .map_err(|error| ZlibError::zstd(&error))?;
+        frame.read = input.len() - source.len();
     }
-    output.extend(content);
-    Ok(())
 }
 
 /// The bytes of `data`: a string as UTF-8, or the bytes of a `Buffer`, `TypedArray`, `DataView`
@@ -952,6 +1188,11 @@ fn range_or_default(
 /// The options of a zlib stream or conversion that the codec uses.
 struct ZlibOptions {
     params: Params,
+    /// The flush constant each written chunk is processed with, `options.flush`.
+    flush: f64,
+    chunk_size: f64,
+    /// The zlib strategy, `options.strategy`.
+    strategy: f64,
     /// The largest output a synchronous conversion produces.
     max_output_length: f64,
     /// The flush constant a conversion ends with, `Z_FINISH`, `BROTLI_OPERATION_FINISH` or
@@ -1023,6 +1264,9 @@ fn zlib_options(
     let (min_flush, max_flush, default_flush, default_finish, _) = family.flush_constants();
     let mut result = ZlibOptions {
         params: Params::default(),
+        flush: default_flush,
+        chunk_size: 16384.0,
+        strategy: 0.0,
         max_output_length: MAX_LENGTH,
         finish_flush: default_finish,
     };
@@ -1033,7 +1277,9 @@ fn zlib_options(
         return Ok(result);
     };
     match family {
-        Family::Zlib => result.params.level = zlib_format_options(scope, options, format)?,
+        Family::Zlib => {
+            (result.params.level, result.strategy) = zlib_format_options(scope, options, format)?
+        }
         Family::Brotli => {
             let message = "is not a valid Brotli parameter";
             result.params.brotli =
@@ -1080,8 +1326,9 @@ fn zlib_options(
             NodeError::out_of_range("options.chunkSize", ">= 64", &chunk_size.to_string()).into(),
         );
     }
+    result.chunk_size = chunk_size;
     let flush = options.get_property(scope, c"flush")?;
-    range_or_default(
+    result.flush = range_or_default(
         scope,
         flush,
         "options.flush",
@@ -1112,12 +1359,12 @@ fn zlib_options(
 
 /// The zlib options of `format` in `options`, validated as Node.js's `Zlib` constructor
 /// validates them: `windowBits`, `level`, `memLevel`, `strategy` and `dictionary`. Returns the
-/// level.
+/// level and the strategy.
 fn zlib_format_options(
     scope: &Scope<'_>,
     options: Object<'_>,
     format: Format,
-) -> Result<i32, Thrown> {
+) -> Result<(i32, f64), Thrown> {
     let window_bits = options.get_property(scope, c"windowBits")?;
     let decompressing = matches!(format, Format::Inflate | Format::Gunzip | Format::Unzip);
     let unset = window_bits.is_null_or_undefined()
@@ -1131,7 +1378,7 @@ fn zlib_format_options(
     let mem_level = options.get_property(scope, c"memLevel")?;
     range_or_default(scope, mem_level, "options.memLevel", 1.0, 9.0, 8.0)?;
     let strategy = options.get_property(scope, c"strategy")?;
-    range_or_default(scope, strategy, "options.strategy", 0.0, 4.0, 0.0)?;
+    let strategy = range_or_default(scope, strategy, "options.strategy", 0.0, 4.0, 0.0)?;
     let dictionary = options.get_property(scope, c"dictionary")?;
     let is_buffer_source =
         Object::from_value(scope, dictionary).is_ok_and(js::typedarray::is_buffer_source);
@@ -1141,10 +1388,13 @@ fn zlib_format_options(
             NodeError::invalid_arg_type(scope, "options.dictionary", expected, dictionary).into(),
         );
     }
-    Ok(level)
+    Ok((level, strategy))
 }
 
-/// Compress or decompress all of `data` in `format`.
+/// Compress or decompress all of `data` in `format`, in steps of `chunkSize` bytes of output, as
+/// Node.js's `processChunkSync` does. The conversion fails with `ERR_BUFFER_TOO_LARGE` after the
+/// first step that takes the output past `maxOutputLength`. A codec error in that step takes
+/// precedence.
 fn convert<'s>(
     scope: &'s Scope<'_>,
     format: Format,
@@ -1155,17 +1405,29 @@ fn convert<'s>(
     let bytes = input_bytes(scope, data)?;
     let mut codec = Codec::new(format, &options.params);
     let flush = format.family().finish_flush(options.finish_flush);
-    Ok(match codec.process(&bytes, flush) {
-        Ok(output) if output.len() as f64 > options.max_output_length => {
-            let message = format!(
-                "Cannot create a Buffer larger than {} bytes",
-                options.max_output_length
-            );
-            Err(ZlibError::too_large(message))
+    let max = options.max_output_length as usize;
+    let mut output = Vec::new();
+    let mut offset = 0;
+    loop {
+        let step = codec.process(
+            &bytes[offset..],
+            flush,
+            options.chunk_size as usize,
+            &mut output,
+        );
+        let progress = match step {
+            Ok(progress) => progress,
+            Err(error) => return Ok(Err(error)),
+        };
+        offset += progress.consumed;
+        if output.len() > max {
+            let message = format!("Cannot create a Buffer larger than {max} bytes");
+            return Ok(Err(ZlibError::too_large(message)));
         }
-        Ok(output) => Ok(new_buffer(scope, &output)?),
-        Err(error) => Err(error),
-    })
+        if progress.done {
+            return Ok(Ok(new_buffer(scope, &output)?));
+        }
+    }
 }
 
 /// The body of the synchronous functions, such as `deflateSync`.
@@ -1204,58 +1466,184 @@ fn convert_async(
     Ok(())
 }
 
-/// The state of a zlib stream, in its `_handle` property.
-#[core_runtime::jsclass(hidden)]
-pub struct ZlibHandle {
+/// The state of a zlib stream: the state of the stream, the codec, the flush constants written
+/// chunks and the last chunk are processed with, and the count of bytes written, which
+/// `bytesWritten` mirrors.
+#[core_runtime::jsclass(hidden, extends = StreamState)]
+pub(crate) struct ZlibState {
+    parent: StreamStateImpl,
     #[no_trace]
     codec: Codec,
+    #[no_trace]
+    default_flush: f64,
+    #[no_trace]
+    finish_flush: f64,
+    #[no_trace]
+    bytes_written: f64,
+    /// Whether `_destroy` freed the codec, which `_handle` being `null` mirrors.
+    #[no_trace]
+    closed: bool,
+    /// The largest buffer the stream pushes, `options.chunkSize`.
+    #[no_trace]
+    chunk_size: usize,
+    /// The count of bytes pushed of the current output buffer, Node's `_outOffset`.
+    #[no_trace]
+    out_offset: usize,
+    /// The input of the write that waits for the readable side to be read, and the offset of the
+    /// bytes not processed yet.
+    #[no_trace]
+    paused_input: Vec<u8>,
+    #[no_trace]
+    paused_offset: usize,
+    /// The flush of the waiting write.
+    #[no_trace]
+    paused_flush: Flush,
+    /// The callback of the waiting write, or `None` if no write waits.
+    paused_callback: Option<Heap<Value>>,
 }
 
 #[core_runtime::jsmethods]
-impl ZlibHandle {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
-    }
+impl ZlibState {}
+
+/// Whether `stream` is a zlib stream whose codec `_destroy` freed.
+fn is_closed(scope: &Scope<'_>, stream: Object<'_>) -> Result<bool, ExnThrown> {
+    Ok(zlib_class::try_state_of(scope, stream)?.is_some_and(|state| state.data().closed))
 }
 
-/// The handle of the zlib stream `stream`.
-fn handle_of<'s>(scope: &'s Scope<'_>, stream: Object<'_>) -> Result<ZlibHandle<'s>, Thrown> {
-    let invalid = || {
-        NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_INVALID_THIS",
-            "Value of \"this\" must be a zlib stream",
-        )
-    };
-    let handle = stream.obj(scope, c"_handle")?.ok_or_else(invalid)?;
-    handle.cast::<ZlibHandle>().map_err(|_| invalid().into())
+/// The state of the zlib stream `stream`, or `ERR_INVALID_THIS` if it isn't one or its codec was
+/// freed.
+fn open_state<'s>(scope: &'s Scope<'_>, stream: Object<'s>) -> Result<ZlibState<'s>, Thrown> {
+    zlib_class::try_state_of(scope, stream)?
+        .filter(|state| !state.data().closed)
+        .ok_or_else(|| {
+            NodeError::new(
+                ErrorKind::TypeError,
+                "ERR_INVALID_THIS",
+                "Value of \"this\" must be a zlib stream",
+            )
+            .into()
+        })
 }
 
-/// Process `input` with the codec of `stream`, push the output, and add the input's length to
-/// `bytesWritten`.
-fn write_to(
+/// Process `input` from `offset` with the codec of `stream` and `flush`, push the output in
+/// buffers of at most `chunkSize` bytes, and add the bytes processed to `bytesWritten`, as Node.js's
+/// `processCallback` does. Once all output is pushed, `callback` is called without arguments. It
+/// is called with the error if the codec fails, and without arguments as soon as the stream is
+/// destroyed. When a push fills the readable side and output remains, the write waits until the
+/// readable side is read, and [`resume_write`] continues it.
+fn process_write(
     scope: &Scope<'_>,
     stream: Object<'_>,
-    input: &[u8],
+    input: Vec<u8>,
+    mut offset: usize,
     flush: Flush,
-) -> Result<(), Thrown> {
-    let result = handle_of(scope, stream)?
-        .data_mut()
-        .codec
-        .process(input, flush);
-    let output = result.map_err(|error| Thrown::from(error.throw(scope)))?;
-    let written = stream.num(scope, c"bytesWritten")?;
-    stream.set_property(scope, c"bytesWritten", written + input.len() as f64)?;
-    if !output.is_empty() {
-        let buffer = new_buffer(scope, &output)?.to_jsval_throwing(scope)?;
-        call_method(scope, stream, c"push", &[buffer])?;
+    callback: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let undefined = HandleValue::undefined();
+    loop {
+        let Some(state) = zlib_class::try_state_of(scope, stream)? else {
+            return Ok(());
+        };
+        if state.data().closed {
+            js::Function::call(scope, undefined, callback, js::function::EmptyArgs)?;
+            return Ok(());
+        }
+        let mut output = Vec::new();
+        let (result, written) = {
+            let mut data = state.data_mut();
+            let data = &mut *data;
+            let limit = data.chunk_size - data.out_offset;
+            let result = data
+                .codec
+                .process(&input[offset..], flush, limit, &mut output);
+            if let Ok(progress) = result {
+                data.bytes_written += progress.consumed as f64;
+                data.out_offset += output.len();
+                if !progress.done || data.out_offset >= data.chunk_size {
+                    data.out_offset = 0;
+                }
+            }
+            (result, data.bytes_written)
+        };
+        let progress = match result {
+            Ok(progress) => progress,
+            Err(error) => {
+                let error = error.into_value(scope)?;
+                js::Function::call(scope, undefined, callback, &[error])?;
+                return Ok(());
+            }
+        };
+        offset += progress.consumed;
+        stream.set_property(scope, c"bytesWritten", written)?;
+        let mut full = false;
+        if !output.is_empty() {
+            let buffer = new_buffer(scope, &output)?.to_jsval_throwing(scope)?;
+            let pushed = js::Function::call_by_name(scope, stream.handle(), c"push", &[buffer])?;
+            full = !js::conversion::to_boolean(pushed);
+        }
+        if progress.done || is_closed(scope, stream)? {
+            js::Function::call(scope, undefined, callback, js::function::EmptyArgs)?;
+            return Ok(());
+        }
+        if full {
+            {
+                let mut data = state.data_mut();
+                data.paused_input = input;
+                data.paused_offset = offset;
+                data.paused_flush = flush;
+                data.paused_callback = Some(Heap::from(callback.get()));
+            }
+            // `Transform.prototype._read` calls the stored callback once the readable side is
+            // read.
+            let resume = js::Function::new_callback(scope, c"", 0, resume_write, stream)?;
+            let resume = (*resume).to_jsval_throwing(scope)?;
+            if let Some(stream_state) = crate::stream::state::try_state(scope, stream)? {
+                stream_state.data_mut().transform_callback = Some(Heap::from(resume.get()));
+            }
+            return Ok(());
+        }
     }
-    Ok(())
+}
+
+/// The callback `_read` calls for a write that waits, whose payload is the stream: continue the
+/// write in a tick.
+fn resume_write(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    js::jobs::queue_native_tick(scope, continue_write, payload, &[])?;
+    Ok(js::value::undefined())
+}
+
+/// Continue the write of the stream `payload` that waits, if one still does.
+fn continue_write(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let stream = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
+    let Some(state) = zlib_class::try_state_of(scope, stream)? else {
+        return Ok(js::value::undefined());
+    };
+    let (input, offset, flush, callback) = {
+        let mut data = state.data_mut();
+        let callback = data
+            .paused_callback
+            .as_ref()
+            .map(|callback| callback.get(scope));
+        data.paused_callback = None;
+        (
+            std::mem::take(&mut data.paused_input),
+            data.paused_offset,
+            data.paused_flush,
+            callback,
+        )
+    };
+    if let Some(callback) = callback {
+        process_write(scope, stream, input, offset, flush, callback)?;
+    }
+    Ok(js::value::undefined())
 }
 
 /// Call the stream callback `callback` with the error of `result`, or with no arguments if it
@@ -1270,7 +1658,7 @@ fn complete(
         Ok(()) => None,
         Err(thrown) => {
             thrown.throw(scope);
-            Some(take_exception(scope))
+            Some(js::exception::take_pending_or_undefined(scope))
         }
     };
     js::Function::call(scope, undefined, callback, error.as_slice())?;
@@ -1280,26 +1668,41 @@ fn complete(
 /// The key of the property that marks the empty chunks [`flush_stream`] writes, whose value is
 /// the zlib flush constant.
 fn flush_flag<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
-    let symbol = crate::symbol(scope, "nodejs.zlib.flushFlag", true)?;
-    Ok(scope.root_id(js::id::value_to_id(scope, symbol)?))
+    static FLUSH_FLAG: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"kFlushFlag");
+    FLUSH_FLAG.id(scope)
 }
 
-/// The flush the chunk `chunk` written to `stream` requests: the flush of its flush flag, or
-/// `Flush::None`.
+/// The flush the chunk `chunk` written to `stream` is processed with, as Node.js's `_transform`
+/// chooses it: the flush constant of the chunk's flush flag, or the stream's `flush` option, and
+/// at least the stream's `finishFlush` for the last chunk written before `end()`.
 fn chunk_flush(
     scope: &Scope<'_>,
     stream: Object<'_>,
     chunk: HandleValue<'_>,
+    length: usize,
 ) -> Result<Flush, Thrown> {
-    let Ok(chunk) = Object::from_value(scope, *chunk) else {
-        return Ok(Flush::None);
+    let (family, default_flush, finish_flush) = {
+        let state = open_state(scope, stream)?;
+        let data = state.data();
+        (
+            data.codec.format.family(),
+            data.default_flush,
+            data.finish_flush,
+        )
     };
-    let kind = chunk.get_property_by_id(scope, flush_flag(scope)?)?;
-    if !kind.is_number() {
-        return Ok(Flush::None);
+    let mut kind = default_flush;
+    if let Ok(chunk) = Object::from_value(scope, *chunk) {
+        let flag = chunk.get_property_by_id(scope, flush_flag(scope)?)?;
+        if flag.is_number() {
+            kind = flag.to_number();
+        }
     }
-    let family = handle_of(scope, stream)?.data().codec.format.family();
-    Ok(family.flush(kind.to_number()))
+    if stream.flag(scope, c"writableEnded")?
+        && stream.num(scope, c"writableLength")? == length as f64
+    {
+        kind = max_flush(kind, finish_flush);
+    }
+    Ok(family.finish_flush(kind))
 }
 
 /// Flush `stream` with the zlib flush constant `kind` after the chunks written before, and then
@@ -1313,29 +1716,49 @@ fn flush_stream(
     if stream.flag(scope, c"writableFinished")? {
         next_tick_call(scope, callback, &[])?;
     } else if stream.flag(scope, c"writableEnded")? {
-        if is_function(scope, callback) {
-            call_method(scope, stream, c"once", &[string(scope, "end")?, callback])?;
+        if js::function::is_callable(callback) {
+            js::Function::call_by_name(
+                scope,
+                stream.handle(),
+                c"once",
+                &[js::class::get_or_init_atom(scope, c"end")?, callback],
+            )?;
         }
     } else {
         let marker = new_buffer(scope, &[])?;
         marker.set_property_by_id(scope, flush_flag(scope)?, kind)?;
         let marker = marker.to_jsval_throwing(scope)?;
-        call_method(scope, stream, c"write", &[marker, callback])?;
+        js::Function::call_by_name(scope, stream.handle(), c"write", &[marker, callback])?;
     }
     Ok(())
 }
 
-/// The flush callback of `params`, whose captures are `[stream, level, callback]`: set the level
-/// and call the callback.
+/// The payload of [`apply_params`]: the stream, the level `params` sets, and the callback of
+/// `params`.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct ParamsRequest {
+    stream: Heap<js::object::Object>,
+    #[no_trace]
+    level: i32,
+    callback: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl ParamsRequest {}
+
+/// The flush callback of `params`, whose payload is a [`ParamsRequest`]: set the level and call
+/// the callback.
 fn apply_params(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let captures = Captures::of(scope, payload)?;
-    let level = captures.get(1)?.to_number() as i32;
-    let handle = handle_of(scope, captures.obj(0)?).map_err(|thrown| thrown.throw(scope))?;
-    let mut state = handle.data_mut();
+    let request = cast_payload::<ParamsRequest>(scope, payload);
+    let stream = request.data().stream.get(scope);
+    let level = request.data().level;
+    let callback = request.data().callback.get(scope);
+    let state = open_state(scope, stream).map_err(|thrown| thrown.throw(scope))?;
+    let mut state = state.data_mut();
     let changed = match state.codec.engine.as_mut() {
         Some(Engine::Compress(engine)) => engine.set_level(compression(level)).is_ok(),
         _ => true,
@@ -1344,8 +1767,7 @@ fn apply_params(
         state.codec.params.level = level;
     }
     drop(state);
-    let callback = captures.get(2)?;
-    if is_function(scope, callback) {
+    if js::function::is_callable(callback) {
         js::Function::call(
             scope,
             js::value::undefined(),
@@ -1364,16 +1786,46 @@ fn init_stream(
     format: Format,
 ) -> Result<(), Thrown> {
     crate::stream::init_transform(scope, stream, options)?;
-    let codec = Codec::new(format, &zlib_options(scope, options, format)?.params);
-    let handle =
-        js::class::create_instance_with::<ZlibHandleImpl>(scope, |_| ZlibHandleImpl { codec })?;
-    stream.set_property(scope, c"_handle", handle.to_jsval_throwing(scope)?)?;
+    let options = zlib_options(scope, options, format)?;
+    let codec = Codec::new(format, &options.params);
+    let family = format.family();
+    let (_, _, _, _, full_flush) = family.flush_constants();
+    {
+        let state = zlib_class::state_of(scope, stream)?;
+        let mut data = state.data_mut();
+        data.codec = codec;
+        data.default_flush = options.flush;
+        data.finish_flush = options.finish_flush;
+        data.bytes_written = 0.0;
+        data.closed = false;
+        data.chunk_size = options.chunk_size as usize;
+        data.out_offset = 0;
+    }
+    stream.set_property(scope, c"_handle", Object::new_plain(scope)?)?;
+    stream.set_property(scope, c"_outOffset", 0)?;
+    stream.set_property(scope, c"_chunkSize", options.chunk_size)?;
+    stream.set_property(scope, c"_defaultFlushFlag", options.flush)?;
+    stream.set_property(scope, c"_finishFlushFlag", options.finish_flush)?;
+    stream.set_property(scope, c"_defaultFullFlushFlag", full_flush)?;
+    stream.set_property(scope, c"_flushBoundIdx", family.bound_index())?;
+    stream.set_property(scope, c"_info", js::value::undefined())?;
+    stream.set_property(scope, c"_maxOutputLength", options.max_output_length)?;
+    stream.set_property(scope, c"_rejectGarbageAfterEnd", false)?;
+    if family == Family::Zlib {
+        stream.set_property(scope, c"_level", f64::from(options.params.level))?;
+        stream.set_property(scope, c"_strategy", options.strategy)?;
+        stream.set_property(scope, c"_mode", format.mode())?;
+    }
     stream.set_property(scope, c"bytesWritten", 0)?;
     Ok(())
 }
 
 /// The base of the zlib stream classes. It isn't exported.
-#[core_runtime::jsfunction_class(name = "Zlib", extends = "crate::stream::transform")]
+#[core_runtime::jsfunction_class(
+    name = "Zlib",
+    extends = "crate::stream::transform",
+    state = "ZlibState"
+)]
 pub mod zlib_class {
     use super::*;
 
@@ -1394,14 +1846,17 @@ pub mod zlib_class {
         _encoding: HandleValue<'_>,
         callback: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        if this.val(scope, c"_handle")?.is_null() {
+        if is_closed(scope, this)? {
             return next_tick_call(scope, callback, &[]);
         }
-        let result = chunk_flush(scope, this, chunk).and_then(|flush| {
-            let bytes = input_bytes(scope, chunk)?;
-            write_to(scope, this, &bytes, flush)
+        let input = input_bytes(scope, chunk).and_then(|bytes| {
+            let flush = chunk_flush(scope, this, chunk, bytes.len())?;
+            Ok((bytes, flush))
         });
-        complete(scope, callback, result)
+        match input {
+            Ok((bytes, flush)) => process_write(scope, this, bytes, 0, flush, callback),
+            Err(error) => complete(scope, callback, Err(error)),
+        }
     }
 
     #[method(name = "_flush")]
@@ -1410,11 +1865,18 @@ pub mod zlib_class {
         this: Object<'_>,
         callback: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        if this.val(scope, c"_handle")?.is_null() {
+        if is_closed(scope, this)? {
             return next_tick_call(scope, callback, &[]);
         }
-        let result = write_to(scope, this, &[], Flush::Finish);
-        complete(scope, callback, result)
+        let flush = open_state(scope, this).map(|state| {
+            let data = state.data();
+            let kind = max_flush(data.default_flush, data.finish_flush);
+            data.codec.format.family().finish_flush(kind)
+        });
+        match flush {
+            Ok(flush) => process_write(scope, this, Vec::new(), 0, flush, callback),
+            Err(error) => complete(scope, callback, Err(error)),
+        }
     }
 
     /// Node's `_destroy`: free the codec, set `_handle` to `null`, and call `callback` with
@@ -1426,12 +1888,13 @@ pub mod zlib_class {
         error: HandleValue<'_>,
         callback: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        if let Some(handle) = this.obj(scope, c"_handle")? {
-            if let Ok(handle) = handle.cast::<ZlibHandle>() {
-                let mut state = handle.data_mut();
-                let params = state.codec.params.clone();
-                state.codec = Codec::closed(state.codec.created, params);
-            }
+        if let Some(state) = zlib_class::try_state_of(scope, this)? {
+            let mut data = state.data_mut();
+            let params = data.codec.params.clone();
+            data.codec = Codec::closed(data.codec.created, params);
+            data.closed = true;
+            data.paused_input = Vec::new();
+            data.paused_callback = None;
         }
         this.set_property(scope, c"_handle", js::value::null())?;
         js::Function::call(scope, js::value::undefined(), callback, &[error])?;
@@ -1447,14 +1910,14 @@ pub mod zlib_class {
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
         let (kind, callback) = match kind {
-            Some(kind) if is_function(scope, kind) => (None, Some(kind)),
+            Some(kind) if js::function::is_callable(kind) => (None, Some(kind)),
             _ => (kind, callback),
         };
         // A destroyed stream has no handle, and fails the write below.
-        let family = if this.val(scope, c"_handle")?.is_null() {
+        let family = if is_closed(scope, this)? {
             Family::Zlib
         } else {
-            handle_of(scope, this)?.data().codec.format.family()
+            open_state(scope, this)?.data().codec.format.family()
         };
         let full_flush = family.flush_constants().4;
         let kind = kind
@@ -1473,16 +1936,15 @@ pub mod zlib_class {
         _strategy: Option<HandleValue<'_>>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), ExnThrown> {
-        let done = closure(
-            scope,
-            0,
-            apply_params,
-            &[
-                this.to_jsval_raw_throwing(scope)?,
-                js::value::from_f64(level),
-                callback.map_or(js::value::undefined(), |callback| callback.get()),
-            ],
-        )?;
+        let request =
+            js::class::create_instance_with::<ParamsRequestImpl>(scope, |_| ParamsRequestImpl {
+                stream: Heap::from(this),
+                level: level as i32,
+                callback: Heap::from(
+                    callback.map_or(js::value::undefined(), |callback| callback.get()),
+                ),
+            })?;
+        let done = js::Function::new_callback(scope, c"", 0, apply_params, request)?;
         flush_stream(scope, this, 2.0, done.to_jsval_throwing(scope)?)
     }
 
@@ -1493,21 +1955,20 @@ pub mod zlib_class {
         this: Object<'_>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        if let Some(callback) = callback.filter(|callback| crate::stream::truthy(scope, *callback))
-        {
+        if let Some(callback) = callback.filter(|callback| js::conversion::to_boolean(*callback)) {
             let stream = this.to_jsval_throwing(scope)?;
             crate::stream::end_of_stream(scope, stream, None, callback)?;
         }
-        call_method(scope, this, c"destroy", &[])?;
+        js::Function::call_by_name(scope, this.handle(), c"destroy", js::function::EmptyArgs)?;
         Ok(())
     }
 
     /// <https://nodejs.org/api/zlib.html#zlibreset>
     pub fn reset(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
-        let handle = handle_of(scope, this)?;
-        let mut state = handle.data_mut();
-        let params = state.codec.params.clone();
-        state.codec = Codec::new(state.codec.created, &params);
+        let state = open_state(scope, this)?;
+        let mut data = state.data_mut();
+        let params = data.codec.params.clone();
+        data.codec = Codec::new(data.codec.created, &params);
         Ok(())
     }
 }
@@ -1519,7 +1980,7 @@ macro_rules! zlib_stream_class {
         pub mod $module {
             use super::*;
 
-            #[constructor]
+            #[constructor(length = 1)]
             pub fn init(
                 scope: &Scope<'_>,
                 this: Object<'_>,
@@ -1547,6 +2008,23 @@ zlib_stream_class!(
 zlib_stream_class!(zstd_compress_class, "ZstdCompress", ZstdCompress);
 zlib_stream_class!(zstd_decompress_class, "ZstdDecompress", ZstdDecompress);
 
+/// Create the zlib classes in the current realm.
+pub(crate) fn register_classes(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    zlib_class::register(scope)?;
+    deflate_class::register(scope)?;
+    inflate_class::register(scope)?;
+    gzip_class::register(scope)?;
+    gunzip_class::register(scope)?;
+    deflate_raw_class::register(scope)?;
+    inflate_raw_class::register(scope)?;
+    unzip_class::register(scope)?;
+    brotli_compress_class::register(scope)?;
+    brotli_decompress_class::register(scope)?;
+    zstd_compress_class::register(scope)?;
+    zstd_decompress_class::register(scope)?;
+    Ok(())
+}
+
 /// A new instance of the class `class`, constructed with `options`.
 fn create<'s>(
     scope: &'s Scope<'_>,
@@ -1573,6 +2051,7 @@ pub mod module {
     pub use super::zstd_compress_class as ZstdCompress;
     pub use super::zstd_decompress_class as ZstdDecompress;
 
+    #[function(length = 2)]
     pub fn deflate_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1581,6 +2060,7 @@ pub mod module {
         convert_sync(scope, Format::Deflate, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn inflate_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1589,6 +2069,7 @@ pub mod module {
         convert_sync(scope, Format::Inflate, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn gzip_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1597,6 +2078,7 @@ pub mod module {
         convert_sync(scope, Format::Gzip, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn gunzip_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1605,6 +2087,7 @@ pub mod module {
         convert_sync(scope, Format::Gunzip, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn deflate_raw_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1613,6 +2096,7 @@ pub mod module {
         convert_sync(scope, Format::DeflateRaw, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn inflate_raw_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1621,6 +2105,7 @@ pub mod module {
         convert_sync(scope, Format::InflateRaw, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn unzip_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1629,6 +2114,7 @@ pub mod module {
         convert_sync(scope, Format::Unzip, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn brotli_compress_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1637,6 +2123,7 @@ pub mod module {
         convert_sync(scope, Format::BrotliCompress, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn brotli_decompress_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1645,6 +2132,7 @@ pub mod module {
         convert_sync(scope, Format::BrotliDecompress, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn zstd_compress_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1653,6 +2141,7 @@ pub mod module {
         convert_sync(scope, Format::ZstdCompress, buffer, options)
     }
 
+    #[function(length = 2)]
     pub fn zstd_decompress_sync<'s>(
         scope: &'s Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1661,6 +2150,7 @@ pub mod module {
         convert_sync(scope, Format::ZstdDecompress, buffer, options)
     }
 
+    #[function(length = 3)]
     pub fn deflate(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1669,6 +2159,7 @@ pub mod module {
         convert_async(scope, Format::Deflate, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn inflate(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1677,6 +2168,7 @@ pub mod module {
         convert_async(scope, Format::Inflate, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn gzip(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1685,6 +2177,7 @@ pub mod module {
         convert_async(scope, Format::Gzip, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn gunzip(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1693,6 +2186,7 @@ pub mod module {
         convert_async(scope, Format::Gunzip, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn deflate_raw(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1701,6 +2195,7 @@ pub mod module {
         convert_async(scope, Format::DeflateRaw, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn inflate_raw(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1709,6 +2204,7 @@ pub mod module {
         convert_async(scope, Format::InflateRaw, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn unzip(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1717,6 +2213,7 @@ pub mod module {
         convert_async(scope, Format::Unzip, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn brotli_compress(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1725,6 +2222,7 @@ pub mod module {
         convert_async(scope, Format::BrotliCompress, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn brotli_decompress(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1733,6 +2231,7 @@ pub mod module {
         convert_async(scope, Format::BrotliDecompress, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn zstd_compress(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1741,6 +2240,7 @@ pub mod module {
         convert_async(scope, Format::ZstdCompress, buffer, &rest)
     }
 
+    #[function(length = 3)]
     pub fn zstd_decompress(
         scope: &Scope<'_>,
         buffer: HandleValue<'_>,
@@ -1749,6 +2249,7 @@ pub mod module {
         convert_async(scope, Format::ZstdDecompress, buffer, &rest)
     }
 
+    #[function(length = 1)]
     pub fn create_deflate<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1760,6 +2261,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_inflate<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1771,6 +2273,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_gzip<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1778,6 +2281,7 @@ pub mod module {
         create(scope, super::gzip_class::class_constructor(scope)?, options)
     }
 
+    #[function(length = 1)]
     pub fn create_gunzip<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1789,6 +2293,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_deflate_raw<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1800,6 +2305,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_inflate_raw<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1811,6 +2317,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_unzip<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1822,6 +2329,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_brotli_compress<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1833,6 +2341,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_brotli_decompress<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1844,6 +2353,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_zstd_compress<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1855,6 +2365,7 @@ pub mod module {
         )
     }
 
+    #[function(length = 1)]
     pub fn create_zstd_decompress<'s>(
         scope: &'s Scope<'_>,
         options: Option<HandleValue<'_>>,
@@ -1912,21 +2423,4 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         name,
         &[("constants", constants), ("codes", codes)],
     )
-}
-
-/// Register the stream classes of `node:zlib`.
-pub(crate) fn register_classes(scope: &Scope<'_>) -> Result<(), ExnThrown> {
-    zlib_class::register(scope)?;
-    deflate_class::register(scope)?;
-    inflate_class::register(scope)?;
-    gzip_class::register(scope)?;
-    gunzip_class::register(scope)?;
-    deflate_raw_class::register(scope)?;
-    inflate_raw_class::register(scope)?;
-    unzip_class::register(scope)?;
-    brotli_compress_class::register(scope)?;
-    brotli_decompress_class::register(scope)?;
-    zstd_compress_class::register(scope)?;
-    zstd_decompress_class::register(scope)?;
-    Ok(())
 }

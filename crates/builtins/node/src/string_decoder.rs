@@ -17,8 +17,9 @@ use js::native::Value;
 use js::prelude::HandleValue;
 use js::{ArrayBufferView, Object};
 
-use crate::buffer::{encode_base64, Encoding};
+use crate::buffer::{hex_digits, Encoding};
 use crate::errors::{ErrorKind, NodeError, Thrown};
+use web_globals::base64::encode as encode_base64;
 
 /// The size of the buffer for an incomplete character or base64 group.
 const INCOMPLETE_LENGTH: usize = 4;
@@ -38,13 +39,46 @@ fn decode_units(bytes: &[u8], encoding: Encoding) -> Vec<u16> {
         Encoding::Ascii => bytes.iter().map(|byte| u16::from(byte & 0x7f)).collect(),
         Encoding::Base64 | Encoding::Base64Url => {
             encode_base64(bytes, encoding == Encoding::Base64Url)
+                .expect("allocating the base64 text failed")
                 .encode_utf16()
                 .collect()
         }
-        Encoding::Hex => bytes
-            .iter()
-            .flat_map(|byte| format!("{byte:02x}").encode_utf16().collect::<Vec<_>>())
-            .collect(),
+        Encoding::Hex => hex_digits(bytes).into_iter().map(u16::from).collect(),
+    }
+}
+
+/// The text of a chunk a decoder decoded: the characters completed from earlier chunks, followed
+/// by the complete characters of the chunk's bytes `body`.
+struct Decoded<'d> {
+    prepend: Vec<u16>,
+    body: &'d [u8],
+    encoding: Encoding,
+}
+
+impl Decoded<'_> {
+    /// The text as UTF-16 code units.
+    fn into_units(self) -> Vec<u16> {
+        let mut units = self.prepend;
+        units.extend(decode_units(self.body, self.encoding));
+        units
+    }
+
+    /// The text as a JS string. For UTF-8, Latin-1, ASCII, hex and base64, text without characters
+    /// completed from earlier chunks is created without an intermediate UTF-16 copy.
+    fn into_js_string<'s>(self, scope: &'s Scope<'_>) -> Result<js::JSString<'s>, ExnThrown> {
+        if !self.prepend.is_empty() {
+            return js::JSString::from_utf16(scope, &self.into_units());
+        }
+        match self.encoding {
+            Encoding::Utf8 => js::JSString::from_utf8_lossy(scope, self.body),
+            Encoding::Latin1 => js::JSString::from_latin1(scope, self.body),
+            Encoding::Ascii if self.body.is_ascii() => js::JSString::from_latin1(scope, self.body),
+            Encoding::Hex => js::JSString::from_latin1(scope, &hex_digits(self.body)),
+            Encoding::Base64 | Encoding::Base64Url => {
+                crate::buffer::decode_bytes(scope, self.body, self.encoding)
+            }
+            _ => js::JSString::from_utf16(scope, &decode_units(self.body, self.encoding)),
+        }
     }
 }
 
@@ -61,13 +95,14 @@ fn encoding_name(encoding: Encoding) -> &'static str {
     }
 }
 
-/// The bytes of a `write` or `end` argument that is a `Buffer`, a typed array or a `DataView`.
-fn chunk_bytes(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<Vec<u8>, Thrown> {
+/// The `write` or `end` argument `value` as a `Buffer`, a typed array or a `DataView`.
+fn chunk_view<'s>(
+    scope: &'s Scope<'_>,
+    value: HandleValue<'_>,
+) -> Result<ArrayBufferView<'s>, Thrown> {
     Object::from_value(scope, *value)
         .ok()
         .and_then(ArrayBufferView::from_object)
-        .map(|view| view.copy_bytes(scope))
-        .transpose()?
         .ok_or_else(|| {
             NodeError::invalid_arg_type(
                 scope,
@@ -79,7 +114,7 @@ fn chunk_bytes(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<Vec<u8>, Thr
         })
 }
 
-/// A decoder's state, which a `StringDecoder` holds in its `_starlingNativeDecoder` property.
+/// The state of a `StringDecoder`.
 #[core_runtime::jsclass(hidden)]
 pub struct NativeDecoder {
     #[no_trace]
@@ -97,13 +132,22 @@ pub struct NativeDecoder {
 impl NativeDecoderImpl {
     /// Node.js's `StringDecoder::DecodeData`: decode `data`, after the bytes held back from the
     /// previous chunk, and buffer the bytes of an incomplete character or group at its end.
-    fn decode(&mut self, mut data: &[u8]) -> Vec<u16> {
+    pub(crate) fn decode(&mut self, data: &[u8]) -> Vec<u16> {
+        self.decode_chunk(data).into_units()
+    }
+
+    /// [`decode`](Self::decode), as a [`Decoded`] that borrows the chunk's complete characters.
+    fn decode_chunk<'d>(&mut self, mut data: &'d [u8]) -> Decoded<'d> {
         let encoding = self.encoding;
         if !matches!(
             encoding,
             Encoding::Utf8 | Encoding::Utf16le | Encoding::Base64 | Encoding::Base64Url
         ) {
-            return decode_units(data, encoding);
+            return Decoded {
+                prepend: Vec::new(),
+                body: data,
+                encoding,
+            };
         }
         let mut prepend = None;
         if self.missing > 0 {
@@ -130,7 +174,11 @@ impl NativeDecoderImpl {
             }
         }
         if data.is_empty() {
-            return prepend.unwrap_or_default();
+            return Decoded {
+                prepend: prepend.unwrap_or_default(),
+                body: data,
+                encoding,
+            };
         }
         let length = data.len();
         match encoding {
@@ -183,13 +231,10 @@ impl NativeDecoderImpl {
         }
         let complete = length - self.buffered;
         self.incomplete[..self.buffered].copy_from_slice(&data[complete..]);
-        let body = decode_units(&data[..complete], encoding);
-        match prepend {
-            Some(mut units) => {
-                units.extend(body);
-                units
-            }
-            None => body,
+        Decoded {
+            prepend: prepend.unwrap_or_default(),
+            body: &data[..complete],
+            encoding,
         }
     }
 
@@ -208,16 +253,7 @@ impl NativeDecoderImpl {
 }
 
 #[core_runtime::jsmethods]
-impl NativeDecoder {
-    #[constructor]
-    fn new() -> Result<Self, NodeError> {
-        Err(NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_ILLEGAL_CONSTRUCTOR",
-            "Illegal constructor",
-        ))
-    }
-}
+impl NativeDecoder {}
 
 /// The encoding a `StringDecoder` constructor argument selects: `undefined`, `null` and `""`
 /// select UTF-8.
@@ -247,29 +283,28 @@ fn parse_encoding(
     Ok(Encoding::parse(&name).ok_or_else(unknown)?)
 }
 
-/// The decoder state `this` holds, or `ERR_INVALID_THIS` if it holds none.
-fn native_decoder<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<NativeDecoder<'s>, Thrown> {
-    let native = this.get_property(scope, c"_starlingNativeDecoder")?;
-    Object::from_value(scope, *native)
-        .ok()
-        .and_then(|native| native.cast::<NativeDecoder>().ok())
-        .ok_or_else(|| {
-            NodeError::new(
-                ErrorKind::TypeError,
-                "ERR_INVALID_THIS",
-                "Value of \"this\" must be of type StringDecoder",
-            )
-            .into()
-        })
+/// A new `StringDecoder` for the encoding in `encoding`, as `new StringDecoder(encoding)` creates
+/// with the module's own constructor.
+pub(crate) fn new_decoder<'s>(
+    scope: &'s Scope<'_>,
+    encoding: HandleValue<'_>,
+) -> Result<Object<'s>, Thrown> {
+    let decoder = string_decoder_class::new_instance(scope)?;
+    string_decoder_class::init(scope, decoder, Some(encoding))?;
+    Ok(decoder)
 }
 
-#[core_runtime::jsfunction_class(name = "StringDecoder")]
+#[core_runtime::jsfunction_class(
+    name = "StringDecoder",
+    state = "NativeDecoder",
+    invalid_this = "crate::errors::invalid_this"
+)]
 pub mod string_decoder_class {
     use super::*;
 
     /// <https://nodejs.org/api/string_decoder.html#new-stringdecoderencoding>: initialize `this`
     /// with the canonical name of the encoding in `encoding` and an empty decoder state.
-    #[constructor]
+    #[constructor(length = 1)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -277,14 +312,12 @@ pub mod string_decoder_class {
     ) -> Result<(), Thrown> {
         let encoding = parse_encoding(scope, encoding)?;
         this.set_property(scope, c"encoding", encoding_name(encoding))?;
-        let native =
-            js::class::create_instance_with::<NativeDecoderImpl>(scope, |_| NativeDecoderImpl {
-                encoding,
-                incomplete: [0; INCOMPLETE_LENGTH],
-                missing: 0,
-                buffered: 0,
-            })?;
-        this.define_property(scope, c"_starlingNativeDecoder", native, 0)?;
+        *state_of(scope, this)?.data_mut() = NativeDecoderImpl {
+            encoding,
+            incomplete: [0; INCOMPLETE_LENGTH],
+            missing: 0,
+            buffered: 0,
+        };
         Ok(())
     }
 
@@ -298,14 +331,18 @@ pub mod string_decoder_class {
         if buffer.is_string() {
             return Ok(js::JSString::from_value(scope, *buffer)?);
         }
-        let bytes = chunk_bytes(scope, buffer)?;
-        let native = native_decoder(scope, this)?;
-        let units = native.data_mut().decode(&bytes);
-        Ok(js::JSString::from_utf16(scope, &units)?)
+        let view = chunk_view(scope, buffer)?;
+        let native = state_of(scope, this)?;
+        // Creating the string can GC and move the data of a small buffer, so the string is
+        // created from a copy.
+        let bytes = view.copy_bytes(scope)?;
+        let decoded = native.data_mut().decode_chunk(&bytes);
+        Ok(decoded.into_js_string(scope)?)
     }
 
     /// <https://nodejs.org/api/string_decoder.html#stringdecoderendbuffer>: decodes `buffer` with
     /// `this.write`, then the buffered bytes.
+    #[method(length = 1)]
     pub fn end<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
@@ -371,15 +408,11 @@ pub mod string_decoder_class {
 /// `end`, `text` and getters throw when they read the state of `undefined`.
 fn decoder_state<'s>(
     scope: &'s Scope<'_>,
-    this: Object<'_>,
+    this: Object<'s>,
 ) -> Result<NativeDecoder<'s>, ExnThrown> {
-    let native = this.get_property(scope, c"_starlingNativeDecoder")?;
-    Object::from_value(scope, *native)
-        .ok()
-        .and_then(|native| native.cast::<NativeDecoder>().ok())
-        .ok_or_else(|| {
-            js::error::TypeError("Cannot read properties of undefined".into()).throw(scope)
-        })
+    string_decoder_class::try_state_of(scope, this)?.ok_or_else(|| {
+        js::error::TypeError("Cannot read properties of undefined".into()).throw(scope)
+    })
 }
 
 /// The decoder state of the `this` of `args`, as [`decoder_state`] finds it.
@@ -387,8 +420,7 @@ fn this_decoder<'s>(
     scope: &'s Scope<'_>,
     args: &CallbackArgs<'_>,
 ) -> Result<NativeDecoder<'s>, ExnThrown> {
-    let this = scope.root_value(args.this());
-    let this = Object::from_value(scope, *this).map_err(|_| {
+    let this = Object::from_value(scope, args.this()).map_err(|_| {
         js::error::TypeError("Cannot read properties of undefined".into()).throw(scope)
     })?;
     decoder_state(scope, this)

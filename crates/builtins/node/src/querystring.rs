@@ -9,7 +9,6 @@ use js::conversion::FromJSVal;
 use js::error::ExnThrown;
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
-use js::string::StrChars as Chars;
 use js::{Function, Object};
 
 use crate::errors::{ErrorKind, NodeError, Thrown};
@@ -39,14 +38,7 @@ pub fn escape_str(text: &str) -> String {
 
 /// The UTF-16 code units of `value` converted to a string.
 fn units(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<Vec<u16>, ExnThrown> {
-    let string = js::JSString::from_value(scope, value)?;
-    // SAFETY: the closure makes no call into SpiderMonkey.
-    unsafe {
-        string.with_chars(scope, |chars| match chars {
-            Chars::Latin1(bytes) => bytes.iter().map(|byte| u16::from(*byte)).collect(),
-            Chars::TwoByte(units) => units.to_vec(),
-        })
-    }
+    js::JSString::from_value(scope, value)?.to_utf16_vec(scope)
 }
 
 /// A JS string of `units`, as a value.
@@ -366,6 +358,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/querystring.html#querystringunescapestr>: `decodeURIComponent`, or
     /// if that throws, [`unescape_buffer`]'s bytes as UTF-8.
+    #[function(length = 2)]
     pub fn unescape<'s>(
         scope: &'s Scope<'_>,
         text: HandleValue<'_>,
@@ -378,6 +371,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/querystring.html#querystringunescapebufferstr-decodespaces>: a
     /// `Buffer` of the bytes `%XX` escapes encode, with `+` as a space if `decode_spaces`.
+    #[function(length = 2)]
     pub fn unescape_buffer<'s>(
         scope: &'s Scope<'_>,
         text: HandleValue<'_>,
@@ -394,6 +388,7 @@ pub mod module {
     /// `options.maxKeys` (1000 by default, any number but a positive one for no limit) pairs are
     /// read. Keys and values are decoded only if they hold an escape, or with a custom
     /// `options.decodeURIComponent`.
+    #[function(length = 4)]
     pub fn parse<'s>(
         scope: &'s Scope<'_>,
         text: HandleValue<'_>,
@@ -581,6 +576,7 @@ pub mod module {
     /// <https://nodejs.org/api/querystring.html#querystringstringifyobj-sep-eq-options>: the
     /// object's own enumerable string-keyed properties, an array value as one pair per element and
     /// an empty array as none.
+    #[function(length = 4)]
     pub fn stringify<'s>(
         scope: &'s Scope<'_>,
         object: HandleValue<'_>,

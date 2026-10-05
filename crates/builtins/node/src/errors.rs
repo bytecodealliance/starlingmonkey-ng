@@ -5,15 +5,68 @@
 //!
 //! See <https://nodejs.org/api/errors.html#nodejs-error-codes>.
 
-use std::ffi::CString;
-
 use js::conversion::FromJSVal;
-use js::error::{
-    throw_plain_error, throw_range_error, throw_type_error, ExnThrown, ThrowException,
-};
+use js::error::JSExnType;
+use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::Object;
+
+/// `Number.MAX_SAFE_INTEGER`.
+pub(crate) const MAX_SAFE_INTEGER: f64 = 9007199254740991.0;
+
+/// A `SystemError` with the code `key` and the message `message`: an `Error` named `SystemError`
+/// with a `toString` that includes the code, the `info` object `fill_info` fills, and that
+/// object's `errno`, `syscall` and `path`.
+pub(crate) fn system_error<'s>(
+    scope: &'s Scope<'_>,
+    key: &'static str,
+    message: String,
+    fill_info: impl FnOnce(Object<'_>) -> Result<(), ExnThrown>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let error = NodeError::new(ErrorKind::Error, key, message).to_value(scope)?;
+    let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
+    object.define_property(scope, c"name", "SystemError", 0)?;
+    let to_string = js::Function::new_callback(scope, c"toString", 0, system_error_to_string, ())?;
+    object.define_property(scope, c"toString", to_string, 0)?;
+    let info = Object::new_plain(scope)?;
+    fill_info(info)?;
+    object.set_property(scope, c"info", info)?;
+    for name in [c"errno", c"syscall", c"path"] {
+        object.set_property(scope, name, info.get_property(scope, name)?)?;
+    }
+    Ok(error)
+}
+
+/// The `toString` of a `SystemError`: `${name} [${code}]: ${message}`.
+fn system_error_to_string(
+    scope: &Scope<'_>,
+    args: js::function::CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<js::native::Value, ExnThrown> {
+    let this = crate::support::this_object(scope, &args)?;
+    let part = |name| -> Result<String, ExnThrown> {
+        js::JSString::from_value(scope, this.get_property(scope, name)?)?.to_utf8(scope)
+    };
+    let text = format!(
+        "{} [{}]: {}",
+        part(c"name")?,
+        part(c"code")?,
+        part(c"message")?
+    );
+    Ok(js::JSString::from_str(scope, &text)?.as_value())
+}
+
+/// `ERR_BLOCKING_NOT_ALLOWED` for `what`, such as `fs.readFileSync`, where blocking host I/O
+/// isn't allowed, and `None` where it is.
+pub(crate) fn blocking_not_allowed(what: &str) -> Option<NodeError> {
+    let reason = core_runtime::event_loop::blocking_host_io_refusal()?;
+    Some(NodeError::new(
+        ErrorKind::Error,
+        "ERR_BLOCKING_NOT_ALLOWED",
+        format!("{what} would block {reason}"),
+    ))
+}
 
 /// The JS error constructor a [`NodeError`] is an instance of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +92,24 @@ impl NodeError {
             code,
             message: message.into(),
         }
+    }
+
+    /// `ERR_ILLEGAL_CONSTRUCTOR`, for a constructor that only the runtime calls.
+    pub fn illegal_constructor() -> Self {
+        Self::new(
+            ErrorKind::TypeError,
+            "ERR_ILLEGAL_CONSTRUCTOR",
+            "Illegal constructor",
+        )
+    }
+
+    /// `ERR_INVALID_THIS`: `this` is not an instance of `class`.
+    pub fn invalid_this(class: &str) -> Self {
+        Self::new(
+            ErrorKind::TypeError,
+            "ERR_INVALID_THIS",
+            format!("Value of \"this\" must be of type {class}"),
+        )
     }
 
     /// `ERR_INVALID_ARG_TYPE`: the argument `name` is `received`, which is not `expected`, a
@@ -112,29 +183,95 @@ impl NodeError {
     }
 }
 
+/// `String(value)`, which converts a symbol to its descriptive string where `ToString` throws.
+pub(crate) fn js_string(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<String, ExnThrown> {
+    if value.is_symbol() {
+        return Ok(crate::inspect::symbol_to_string(scope, value));
+    }
+    String::from_jsval(scope, value, ()).map_err(|_| ExnThrown)
+}
+
+/// The message of the `RangeError` that Node.js throws when the call stack overflows.
+const STACK_OVERFLOW_MESSAGE: &std::ffi::CStr = c"Maximum call stack size exceeded";
+
+/// The message of SpiderMonkey's `InternalError` for a script that overflows the stack.
+const OVER_RECURSED_MESSAGE: &std::ffi::CStr = c"too much recursion";
+
+/// Throw the `RangeError` "Maximum call stack size exceeded", which Node.js throws when the call
+/// stack overflows.
+pub(crate) fn stack_overflow(scope: &Scope<'_>) -> ExnThrown {
+    js::error::throw_range_error(scope, STACK_OVERFLOW_MESSAGE)
+}
+
+/// Enter a level of recursion with [`js::context::RecursionGuard`], or throw [`stack_overflow`]'s
+/// error at the recursion limit. Native code that recurses over a structure from content code
+/// calls this at each level, and holds the guard until the level returns.
+pub(crate) fn check_stack<'s>(
+    scope: &'s Scope<'_>,
+) -> Result<js::context::RecursionGuard<'s>, ExnThrown> {
+    js::context::RecursionGuard::enter(scope).ok_or_else(|| stack_overflow(scope))
+}
+
+/// Whether the pending exception is a stack overflow, as Node.js's `isStackOverflowError` checks
+/// it: the error of [`stack_overflow`], or the `InternalError` SpiderMonkey throws for a script
+/// that overflows the stack. Leaves the exception pending.
+pub(crate) fn is_stack_overflow_pending(scope: &Scope<'_>) -> bool {
+    let Some(error) = js::exception::get_pending(scope) else {
+        return false;
+    };
+    if !error.is_object() {
+        return false;
+    }
+    let Some(object) = std::ptr::NonNull::new(error.to_object()) else {
+        return false;
+    };
+    let object = scope.root_object(object);
+    let Some(report) = js::exception::error_from_exception(scope, object) else {
+        return false;
+    };
+    let expected = match report.exnType {
+        kind if kind == JSExnType::JSEXN_RANGEERR as i16 => STACK_OVERFLOW_MESSAGE,
+        kind if kind == JSExnType::JSEXN_INTERNALERR as i16 => OVER_RECURSED_MESSAGE,
+        _ => return false,
+    };
+    let message = report._base.message_.data_;
+    // SAFETY: a non-null `message_` is a NUL-terminated UTF-8 string that the report owns, and the
+    // report lives as long as `object`.
+    !message.is_null() && unsafe { std::ffi::CStr::from_ptr(message) } == expected
+}
+
+/// Throw `ERR_INVALID_THIS` for a `this` that isn't an instance of `class`. This is the
+/// `invalid_this` function of the `#[jsfunction_class]`es with state.
+pub(crate) fn invalid_this(scope: &Scope<'_>, class: &str) -> ExnThrown {
+    NodeError::invalid_this(class).throw(scope)
+}
+
+impl NodeError {
+    /// The error as a JS error object, with its `code`, without throwing it.
+    pub fn to_value<'s>(self, scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+        let kind = match self.kind {
+            ErrorKind::Error => JSExnType::JSEXN_ERR,
+            ErrorKind::TypeError => JSExnType::JSEXN_TYPEERR,
+            ErrorKind::RangeError => JSExnType::JSEXN_RANGEERR,
+            ErrorKind::UriError => JSExnType::JSEXN_URIERR,
+        };
+        let error = js::error::new_error(scope, kind, &self.message)?;
+        let object = Object::from_value(scope, error).map_err(|e| e.throw(scope))?;
+        object.set_property(scope, c"code", self.code)?;
+        let internal = self.code.starts_with("ERR_") && !self.code.starts_with("ERR__");
+        if internal {
+            define_to_string(scope, object)?;
+        }
+        Ok(error)
+    }
+}
+
 impl ThrowException for NodeError {
     fn throw(self, scope: &Scope<'_>) -> ExnThrown {
-        let message = CString::new(self.message.replace('\0', "\\0")).expect("NULs were replaced");
-        match self.kind {
-            ErrorKind::Error => throw_plain_error(scope, &message),
-            ErrorKind::TypeError => throw_type_error(scope, &message),
-            ErrorKind::RangeError => throw_range_error(scope, &message),
-            ErrorKind::UriError => js::error::throw_uri_error(scope, &message),
-        };
-        let Some(error) = js::exception::take_pending(scope) else {
-            return ExnThrown;
-        };
-        if let Ok(object) = Object::from_value(scope, error) {
-            // Only an out-of-memory error can stop this, and that one is then pending instead.
-            if object.set_property(scope, c"code", self.code).is_err() {
-                return ExnThrown;
-            }
-            let internal = self.code.starts_with("ERR_") && !self.code.starts_with("ERR__");
-            if internal && define_to_string(scope, object).is_err() {
-                return ExnThrown;
-            }
+        // Only an out-of-memory error can stop this, and that one is then pending instead.
+        if let Ok(error) = self.to_value(scope) {
+            js::exception::set_pending(scope, error, js::native::ExceptionStackBehavior::Capture);
         }
-        js::exception::set_pending(scope, error, js::native::ExceptionStackBehavior::Capture);
         ExnThrown
     }
 }
@@ -197,11 +334,40 @@ fn describe_received(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
             None => "Received [object Object]".into(),
         };
     }
-    format!(
-        "Received type {} ({})",
-        type_of(value),
-        inspect_short(scope, value)
-    )
+    format!("Received {}", describe_primitive(scope, value))
+}
+
+/// The primitive `value`, which is neither `null` nor `undefined`, as Node.js's
+/// `determineSpecificType` describes it, such as `type number (70000)` or `type string ('abc')`.
+fn describe_primitive(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
+    if value.is_string() {
+        let text = String::from_jsval(scope, value, ()).unwrap_or_default();
+        let text = if text.encode_utf16().count() > 28 {
+            let head: Vec<u16> = text.encode_utf16().take(25).collect();
+            format!("{}...", String::from_utf16_lossy(&head))
+        } else {
+            text
+        };
+        if !text.contains('\'') {
+            return format!("type string ('{text}')");
+        }
+        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        return format!("type string (\"{escaped}\")");
+    }
+    if value.is_symbol() {
+        return format!(
+            "type symbol ({})",
+            crate::inspect::symbol_to_string(scope, value)
+        );
+    }
+    if value.is_number() && value.to_number() == 0.0 && value.to_number().is_sign_negative() {
+        return "type number (-0)".into();
+    }
+    let suffix = if value.is_bigint() { "n" } else { "" };
+    let text = js::JSString::from_value(scope, value)
+        .and_then(|text| text.to_utf8(scope))
+        .unwrap_or_default();
+    format!("type {} ({text}{suffix})", type_of(value))
 }
 
 /// `value` as Node.js's `determineSpecificType` describes it in an error message, such as "type
@@ -323,6 +489,25 @@ pub fn validate_integer(
             &out_of_range_received(number),
         )
         .into());
+    }
+    Ok(number)
+}
+
+/// The argument `value`, named `name`, as a number of at least `min`, as Node.js's
+/// `validateNumber(value, name, min)` checks it. `NaN` is out of range.
+pub fn validate_number(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+    min: f64,
+) -> Result<f64, Thrown> {
+    if !value.is_number() {
+        return Err(NodeError::invalid_arg_type(scope, name, "of type number", value).into());
+    }
+    let number = value.to_number();
+    if number.is_nan() || number < min {
+        let range = format!(">= {}", number_to_string(min));
+        return Err(NodeError::out_of_range(name, &range, &out_of_range_received(number)).into());
     }
     Ok(number)
 }
@@ -461,12 +646,9 @@ pub fn abort_error<'s>(
     scope: &'s Scope<'_>,
     cause: Option<HandleValue<'_>>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    throw_plain_error(scope, c"The operation was aborted");
-    let error = js::exception::take_pending_or_undefined(scope);
-    let error = scope.root_value(error.get());
+    let error = js::error::new_error(scope, JSExnType::JSEXN_ERR, "The operation was aborted")?;
     let object = Object::from_value(scope, error).map_err(|e| e.throw(scope))?;
-    let proto = abort_error_class::class_constructor(scope)?.get_property(scope, c"prototype")?;
-    let proto = Object::from_value(scope, proto).map_err(|e| e.throw(scope))?;
+    let proto = abort_error_class::prototype_object(scope)?;
     object.set_prototype(scope, proto.handle())?;
     object.set_property(scope, c"code", "ABORT_ERR")?;
     object.set_property(scope, c"name", "AbortError")?;
@@ -500,17 +682,29 @@ pub mod abort_error_class {
     /// Make `AbortError.prototype` inherit from `Error.prototype`.
     #[setup]
     pub fn setup(scope: &Scope<'_>, ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        let error_ctor = Object::from_value(scope, scope.global().get_property(scope, c"Error")?)
-            .map_err(|e| e.throw(scope))?;
-        let error_proto = Object::from_value(scope, error_ctor.get_property(scope, c"prototype")?)
-            .map_err(|e| e.throw(scope))?;
-        proto.set_prototype(scope, error_proto.handle())?;
+        let error_ctor = crate::stack_trace::error_constructor(scope)?;
+        let error_proto =
+            js::class::get_class_prototype(scope, js::class_spec::JSProtoKey::JSProto_Error)?;
+        proto.set_prototype(scope, error_proto)?;
         ctor.set_prototype(scope, error_ctor.handle())
     }
 }
 
 /// `value` as a callable object, or `ERR_INVALID_ARG_TYPE` naming the argument `name` if it
 /// isn't one.
+/// Node.js's `validateBoolean`: `value`, or `ERR_INVALID_ARG_TYPE` naming `name` if it isn't a
+/// boolean.
+pub(crate) fn validate_boolean(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+) -> Result<bool, Thrown> {
+    if !value.is_boolean() {
+        return Err(NodeError::invalid_arg_type(scope, name, "of type boolean", value).into());
+    }
+    Ok(value.to_boolean())
+}
+
 pub fn validate_function<'s>(
     scope: &'s Scope<'_>,
     value: HandleValue<'_>,

@@ -11,6 +11,7 @@ use std::cell::Cell;
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
+use js::object::{PropertyInit, PropertyTemplate, PropertyWriter, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
@@ -51,30 +52,26 @@ fn is_hostless(protocol: Option<&str>) -> bool {
     protocol.is_some_and(|protocol| HOSTLESS_PROTOCOLS.contains(&protocol))
 }
 
-/// The global's `URL` constructor.
+/// The realm's `URL` constructor.
 fn url_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let url = scope.global().get_property(scope, c"URL")?;
-    Object::from_value(scope, url).map_err(|e| e.throw(scope))
+    js::class::class_constructor::<web_url::url::URLImpl>(scope)
 }
 
-/// Whether `class.prototype` is on the prototype chain of `object`.
-fn is_instance(
-    scope: &Scope<'_>,
-    object: Object<'_>,
-    class: Object<'_>,
-) -> Result<bool, ExnThrown> {
-    let prototype = class.get_property(scope, c"prototype")?;
-    if !prototype.is_object() {
-        return Ok(false);
-    }
-    let mut current = object.get_prototype(scope)?;
-    while let Some(object) = current {
-        if object.as_raw() == prototype.to_object() {
-            return Ok(true);
+/// `decodeURIComponent(text)`, or `None` for a `%` that doesn't start two hex digits or a result
+/// that isn't UTF-8, for which `decodeURIComponent` throws.
+pub(crate) fn decode_uri_component(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut input = text.bytes();
+    while let Some(byte) = input.next() {
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
         }
-        current = object.get_prototype(scope)?;
+        let high = (input.next()? as char).to_digit(16)?;
+        let low = (input.next()? as char).to_digit(16)?;
+        bytes.push((high * 16 + low) as u8);
     }
-    Ok(false)
+    String::from_utf8(bytes).ok()
 }
 
 /// Whether `value` passes Node's `isURL` check: an object with a truthy `href` and `protocol`, and
@@ -83,34 +80,11 @@ pub(crate) fn is_url(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, 
     let Ok(object) = Object::from_value(scope, *value) else {
         return Ok(false);
     };
-    let truthy = |name| -> Result<bool, ExnThrown> {
-        Ok(crate::stream::truthy(
-            scope,
-            object.get_property(scope, name)?,
-        ))
-    };
+    let truthy = |name| crate::support::truthy(scope, object, name);
     Ok(truthy(c"href")?
         && truthy(c"protocol")?
         && object.get_property(scope, c"auth")?.is_undefined()
         && object.get_property(scope, c"path")?.is_undefined())
-}
-
-/// `decodeURIComponent(input)`, or `None` for a malformed escape or invalid UTF-8.
-fn decode_uri_component(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            out.push(bytes[i]);
-            i += 1;
-            continue;
-        }
-        let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
-        out.push(u8::from_str_radix(hex, 16).ok()?);
-        i += 3;
-    }
-    String::from_utf8(out).ok()
 }
 
 /// `decodeURIComponent(input)`, which throws a `URIError` for a malformed escape or invalid UTF-8.
@@ -960,7 +934,7 @@ fn read_field(
     if value.is_string() {
         return Ok(Some(String::from_jsval(scope, value, ())?));
     }
-    if !crate::stream::truthy(scope, value) {
+    if !js::conversion::to_boolean(value) {
         return Ok(None);
     }
     Ok(Some(
@@ -988,7 +962,7 @@ fn read_legacy_url(
     let slashes = object.get_property(scope, c"slashes")?;
     Ok(LegacyUrl {
         protocol: read_field(scope, object, c"protocol")?,
-        slashes: crate::stream::truthy(scope, slashes),
+        slashes: js::conversion::to_boolean(slashes),
         auth: read_field(scope, object, c"auth")?,
         host: read_field(scope, object, c"host")?,
         port: read_field(scope, object, c"port")?,
@@ -1002,40 +976,70 @@ fn read_legacy_url(
     })
 }
 
-/// Set the fields of `target` to those of `url`. A `query` object is the `query` of `this` or
-/// `relative`, by its origin.
+/// The fields of a `url.Url`, in the order its constructor creates them.
+pub(crate) static URL_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"protocol"),
+    TemplateKey::Name(c"slashes"),
+    TemplateKey::Name(c"auth"),
+    TemplateKey::Name(c"host"),
+    TemplateKey::Name(c"port"),
+    TemplateKey::Name(c"hostname"),
+    TemplateKey::Name(c"hash"),
+    TemplateKey::Name(c"search"),
+    TemplateKey::Name(c"query"),
+    TemplateKey::Name(c"pathname"),
+    TemplateKey::Name(c"path"),
+    TemplateKey::Name(c"href"),
+]);
+
+/// The key of the per-global `url.Url` whose fields are all `null`, which the constructor copies.
+static EMPTY_URL: u8 = 0;
+
+/// Write the field `name` of a `url.Url`: `value`, or `null` for `None`.
+fn write_field<'w>(
+    scope: &'w Scope<'_>,
+    properties: &mut PropertyWriter<'w>,
+    name: &'static std::ffi::CStr,
+    value: &Option<String>,
+) -> Result<(), ExnThrown> {
+    match value {
+        Some(value) => properties.write(scope, name, value.as_str()),
+        None => properties.write(scope, name, HandleValue::null()),
+    }
+}
+
+/// Set the fields of `target` to those of `url`, creating them as `init` creates properties. A
+/// `query` object is the `query` of `this` or `relative`, by its origin.
 fn write_legacy_url(
     scope: &Scope<'_>,
     target: Object<'_>,
     url: &LegacyUrl,
     this: Option<Object<'_>>,
     relative: Option<Object<'_>>,
+    init: PropertyInit,
 ) -> Result<(), Thrown> {
-    let set = |name: &'static std::ffi::CStr, value: &Option<String>| -> Result<(), ExnThrown> {
-        match value {
-            Some(value) => target.set_property(scope, name, value.as_str()),
-            None => target.set_property(scope, name, js::value::null()),
-        }
-    };
-    set(c"protocol", &url.protocol)?;
+    // SAFETY: the caller guarantees the requirements of `Define`. The JavaScript that runs before
+    // the writer finishes can't reach `target`.
+    let mut properties = unsafe { target.property_writer(scope, &URL_PROPERTIES, init) }?;
+    write_field(scope, &mut properties, c"protocol", &url.protocol)?;
     if url.slashes {
-        target.set_property(scope, c"slashes", true)?;
+        properties.write(scope, c"slashes", true)?;
     } else {
-        target.set_property(scope, c"slashes", js::value::null())?;
+        properties.write(scope, c"slashes", HandleValue::null())?;
     }
-    set(c"auth", &url.auth)?;
-    set(c"host", &url.host)?;
-    set(c"port", &url.port)?;
-    set(c"hostname", &url.hostname)?;
-    set(c"hash", &url.hash)?;
-    set(c"search", &url.search)?;
+    write_field(scope, &mut properties, c"auth", &url.auth)?;
+    write_field(scope, &mut properties, c"host", &url.host)?;
+    write_field(scope, &mut properties, c"port", &url.port)?;
+    write_field(scope, &mut properties, c"hostname", &url.hostname)?;
+    write_field(scope, &mut properties, c"hash", &url.hash)?;
+    write_field(scope, &mut properties, c"search", &url.search)?;
     match &url.query {
-        Query::Null => target.set_property(scope, c"query", js::value::null())?,
-        Query::Text(text) => target.set_property(scope, c"query", text.as_str())?,
+        Query::Null => properties.write(scope, c"query", HandleValue::null())?,
+        Query::Text(text) => properties.write(scope, c"query", text.as_str())?,
         Query::Parsed(text) => {
             let text = js::JSString::from_str(scope, text)?.to_jsval_throwing(scope)?;
             let query = crate::querystring::module::parse(scope, text, None, None, None)?;
-            target.set_property(scope, c"query", query)?;
+            properties.write(scope, c"query", query)?;
         }
         Query::Object(origin, _) => {
             let source = match origin {
@@ -1044,23 +1048,24 @@ fn write_legacy_url(
             };
             match source {
                 Some(source) => {
-                    target.set_property(scope, c"query", source.get_property(scope, c"query")?)?
+                    properties.write(scope, c"query", source.get_property(scope, c"query")?)?
                 }
-                None => target.set_property(scope, c"query", js::value::null())?,
+                None => properties.write(scope, c"query", HandleValue::null())?,
             }
         }
     }
-    set(c"pathname", &url.pathname)?;
-    set(c"path", &url.path)?;
-    set(c"href", &url.href)?;
+    write_field(scope, &mut properties, c"pathname", &url.pathname)?;
+    write_field(scope, &mut properties, c"path", &url.path)?;
+    write_field(scope, &mut properties, c"href", &url.href)?;
+    properties.finish(scope)?;
     Ok(())
 }
 
-/// A new `url.Url` with the fields of `url`.
+/// A new `url.Url` with the fields of `url`, as `new Url()` creates it followed by assignments of
+/// the fields.
 fn new_url<'s>(scope: &'s Scope<'_>, url: &LegacyUrl) -> Result<Object<'s>, Thrown> {
-    let class = url_class::class_constructor(scope)?;
-    let object = Function::construct(scope, class, js::function::EmptyArgs)?;
-    write_legacy_url(scope, object, url, None, None)?;
+    let object = url_class::new_instance(scope)?;
+    write_legacy_url(scope, object, url, None, None, PropertyInit::Define)?;
     Ok(object)
 }
 
@@ -1074,7 +1079,7 @@ fn url_parse<'s>(
 ) -> Result<Object<'s>, Thrown> {
     warn_parse(scope)?;
     if let Ok(object) = Object::from_value(scope, *input) {
-        if is_instance(scope, object, url_class::class_constructor(scope)?)? {
+        if url_class::class_constructor(scope)?.ordinary_has_instance(scope, input)? {
             return Ok(object);
         }
     }
@@ -1100,7 +1105,14 @@ fn resolve_object_of<'s>(
     if let Some(relative) = relative.filter(|_| copy != Copy::Nothing) {
         result.assign(scope, relative)?;
     }
-    write_legacy_url(scope, result, &resolved, Some(this), relative)?;
+    write_legacy_url(
+        scope,
+        result,
+        &resolved,
+        Some(this),
+        relative,
+        PropertyInit::Assign,
+    )?;
     Ok(result)
 }
 
@@ -1131,21 +1143,46 @@ fn resolve_of(
 }
 
 /// Whether `value` is present and truthy.
-fn flag(scope: &Scope<'_>, value: Option<HandleValue<'_>>) -> bool {
-    value.is_some_and(|value| crate::stream::truthy(scope, value))
+fn flag(value: Option<HandleValue<'_>>) -> bool {
+    value.is_some_and(js::conversion::to_boolean)
 }
 
 #[core_runtime::jsfunction_class(name = "Url")]
 pub mod url_class {
     use super::*;
 
-    /// <https://nodejs.org/api/url.html#legacy-urlobject>: every field `null`.
+    /// <https://nodejs.org/api/url.html#legacy-urlobject>: every field `null`, assigned in order.
     #[constructor]
     pub fn init(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
-        write_legacy_url(scope, this, &LegacyUrl::default(), None, None)
+        let key = std::ptr::from_ref(&EMPTY_URL).addr();
+        let empty = js::class::get_shared_object(scope, key).ok_or_else(|| {
+            js::error::TypeError(String::from("Url isn't registered")).throw(scope)
+        })?;
+        Ok(this.assign(scope, empty)?)
+    }
+
+    /// Create the `url.Url` with every field `null` that the constructor copies.
+    #[setup]
+    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
+        let key = std::ptr::from_ref(&EMPTY_URL).addr();
+        js::class::get_or_init_shared_object(scope, key, |scope| {
+            let empty = Object::new_plain_with_proto(scope, proto.handle())?;
+            write_legacy_url(
+                scope,
+                empty,
+                &LegacyUrl::default(),
+                None,
+                None,
+                PropertyInit::Define,
+            )
+            .map_err(|thrown| thrown.throw(scope))?;
+            Ok(empty)
+        })?;
+        Ok(())
     }
 
     /// Set the fields of this object to those of the URL `url`.
+    #[method(length = 3)]
     pub fn parse<'s>(
         scope: &'s Scope<'_>,
         this: Object<'s>,
@@ -1157,10 +1194,10 @@ pub mod url_class {
         let parsed = parse_legacy(
             scope,
             &input,
-            flag(scope, parse_query_string),
-            flag(scope, slashes_denote_host),
+            flag(parse_query_string),
+            flag(slashes_denote_host),
         )?;
-        write_legacy_url(scope, this, &parsed, None, None)?;
+        write_legacy_url(scope, this, &parsed, None, None, PropertyInit::Assign)?;
         Ok(this)
     }
 
@@ -1256,7 +1293,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/url.html#urlpathtofileurlpath-options>
-    #[function(name = "pathToFileURL")]
+    #[function(name = "pathToFileURL", length = 2)]
     pub fn path_to_file_url<'s>(
         scope: &'s Scope<'_>,
         path: HandleValue<'_>,
@@ -1299,7 +1336,7 @@ pub mod module {
         let pathname = url.get_property(scope, c"pathname")?;
         options.set_property(scope, c"pathname", pathname)?;
         let part = |value: HandleValue<'_>| -> Result<String, Thrown> {
-            match crate::stream::truthy(scope, value) {
+            match js::conversion::to_boolean(value) {
                 true => string(value),
                 false => Ok(String::new()),
             }
@@ -1314,7 +1351,7 @@ pub mod module {
         }
         let username = url.get_property(scope, c"username")?;
         let password = url.get_property(scope, c"password")?;
-        if crate::stream::truthy(scope, username) || crate::stream::truthy(scope, password) {
+        if js::conversion::to_boolean(username) || js::conversion::to_boolean(password) {
             let auth = format!(
                 "{}:{}",
                 decode_uri_component_throwing(scope, &string(username)?)?,
@@ -1326,7 +1363,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/url.html#urldomaintoasciidomain>: empty if it's invalid.
-    #[function(name = "domainToASCII")]
+    #[function(name = "domainToASCII", length = 1)]
     pub fn domain_to_ascii(
         scope: &Scope<'_>,
         domain: Option<HandleValue<'_>>,
@@ -1336,6 +1373,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/url.html#urldomaintounicodedomain>: empty if it's invalid.
+    #[function(length = 1)]
     pub fn domain_to_unicode(
         scope: &Scope<'_>,
         domain: Option<HandleValue<'_>>,
@@ -1348,6 +1386,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/url.html#urlparseurlstring-parsequerystring-slashesdenotehost>:
     /// a `url.Url`, with `query` an object if `parseQueryString`. A `url.Url` is returned as is.
+    #[function(length = 3)]
     pub fn parse<'s>(
         scope: &'s Scope<'_>,
         url: HandleValue<'_>,
@@ -1357,14 +1396,15 @@ pub mod module {
         url_parse(
             scope,
             url,
-            flag(scope, parse_query_string),
-            flag(scope, slashes_denote_host),
+            flag(parse_query_string),
+            flag(slashes_denote_host),
         )
     }
 
     /// <https://nodejs.org/api/url.html#urlformaturlobject-options>: the URL string of a legacy
     /// URL object or string, or the `href` of a WHATWG `URL` without the parts `options` turns
     /// off, and with a Unicode host for `options.unicode`.
+    #[function(length = 2)]
     pub fn format(
         scope: &Scope<'_>,
         url: HandleValue<'_>,
@@ -1383,14 +1423,14 @@ pub mod module {
             )
             .into());
         };
-        if !is_instance(scope, object, url_constructor(scope)?)? {
+        if !is_url(scope, url)? {
             return Ok(read_legacy_url(scope, object, Origin::This)?.format());
         }
         let mut fragment = true;
         let mut unicode = false;
         let mut search = true;
         let mut auth = true;
-        if let Some(options) = options.filter(|options| crate::stream::truthy(scope, *options)) {
+        if let Some(options) = options.filter(|options| js::conversion::to_boolean(*options)) {
             let options = crate::errors::validate_object(scope, options, "options")?;
             for (name, flag) in [
                 (c"fragment", &mut fragment),
@@ -1400,7 +1440,7 @@ pub mod module {
             ] {
                 let value = options.get_property(scope, name)?;
                 if !value.is_null() && !value.is_undefined() {
-                    *flag = crate::stream::truthy(scope, value);
+                    *flag = js::conversion::to_boolean(value);
                 }
             }
         }
@@ -1446,7 +1486,7 @@ pub mod module {
         source: HandleValue<'_>,
         relative: HandleValue<'_>,
     ) -> Result<HandleValue<'s>, Thrown> {
-        if !crate::stream::truthy(scope, source) {
+        if !js::conversion::to_boolean(source) {
             return Ok(scope.root_value(relative.get()));
         }
         let source = url_parse(scope, source, false, true)?;
@@ -1459,10 +1499,13 @@ pub mod module {
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let globals = || -> Result<Vec<(&'static str, HandleValue<'_>)>, ExnThrown> {
         Ok(vec![
-            ("URL", scope.global().get_property(scope, c"URL")?),
+            ("URL", url_constructor(scope)?.to_jsval_throwing(scope)?),
             (
                 "URLSearchParams",
-                scope.global().get_property(scope, c"URLSearchParams")?,
+                js::class::class_constructor::<web_url::url_search_params::URLSearchParamsImpl>(
+                    scope,
+                )?
+                .to_jsval_throwing(scope)?,
             ),
         ])
     };
