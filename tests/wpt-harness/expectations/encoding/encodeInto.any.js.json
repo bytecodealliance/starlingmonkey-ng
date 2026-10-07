@@ -330,6 +330,6 @@
     "status": "PASS"
   },
   "encodeInto() and a detached output buffer": {
-    "status": "FAIL"
+    "status": "PASS"
   }
 }

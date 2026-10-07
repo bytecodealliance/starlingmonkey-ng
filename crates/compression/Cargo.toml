@@ -1,0 +1,15 @@
+[package]
+name = "compression"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+brotli.workspace = true
+flate2.workspace = true
+ruzstd.workspace = true
+
+[lints]
+workspace = true

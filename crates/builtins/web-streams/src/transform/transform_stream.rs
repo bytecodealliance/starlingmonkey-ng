@@ -13,6 +13,7 @@ use crate::readable::readable_stream::ReadableStreamImpl;
 use crate::readable::ReadableStream;
 use crate::writable::writable_stream::WritableStreamImpl;
 use crate::writable::WritableStream;
+use crate::AlgorithmArg;
 use core_runtime::{webidl_interface, webidl_methods};
 use js::conversion::FromJSVal;
 use js::error::ExnThrown;
@@ -172,16 +173,106 @@ impl TransformStream {
         Ok(())
     }
 
+    /// A new `TransformStream`, set up with the native algorithms `transform`, `flush` and
+    /// `cancel`. A thrown exception rejects an algorithm's promise, and a result that isn't a
+    /// promise resolves it. `transform` is called with the chunk and the stream's
+    /// [`TransformStreamDefaultController`], `flush` with the controller, and `cancel` with the
+    /// reason.
+    ///
+    /// <https://streams.spec.whatwg.org/#transformstream-set-up>
+    pub fn new_native<'r>(
+        scope: &'r Scope<'_>,
+        transform: AlgorithmArg<'_>,
+        flush: AlgorithmArg<'_>,
+        cancel: AlgorithmArg<'_>,
+    ) -> Result<TransformStream<'r>, ExnThrown> {
+        let stream = js::class::create_instance_with::<TransformStreamImpl>(scope, |_| {
+            TransformStreamImpl::default()
+        })?;
+        // Step 1: Let _writableHighWaterMark_ be 1.
+        let writable_high_water_mark = 1.0;
+        // Step 2: Let _writableSizeAlgorithm_ be an algorithm that returns 1.
+        // Step 4: Let _readableSizeAlgorithm_ be an algorithm that returns 1.
+        // An undefined size algorithm returns 1.
+        let size_algorithm = HandleValue::undefined();
+        // Step 3: Let _readableHighWaterMark_ be 0.
+        let readable_high_water_mark = 0.0;
+        // Step 5: Let _transformAlgorithmWrapper_ be an algorithm that runs these steps given a
+        //         value _chunk_:
+        // Step 5.1: Let _result_ be the result of running _transformAlgorithm_ given _chunk_. If
+        //           this throws an exception _e_, return `a promise rejected with` _e_.
+        // Step 5.2: If _result_ is a ``Promise``, then return _result_.
+        // Step 5.3: Return `a promise resolved with` undefined.
+        // Step 6: Let _flushAlgorithmWrapper_ be an algorithm that runs these steps:
+        // Step 6.1: Let _result_ be the result of running _flushAlgorithm_, if _flushAlgorithm_
+        //           was given, or null otherwise. If this throws an exception _e_, return `a
+        //           promise rejected with` _e_.
+        // Step 6.2: If _result_ is a ``Promise``, then return _result_.
+        // Step 6.3: Return `a promise resolved with` undefined.
+        // Step 7: Let _cancelAlgorithmWrapper_ be an algorithm that runs these steps given a value
+        //         _reason_:
+        // Step 7.1: Let _result_ be the result of running _cancelAlgorithm_ given _reason_, if
+        //           _cancelAlgorithm_ was given, or null otherwise. If this throws an exception
+        //           _e_, return `a promise rejected with` _e_.
+        // Step 7.2: If _result_ is a ``Promise``, then return _result_.
+        // Step 7.3: Return `a promise resolved with` undefined.
+        // `support::invoke_promise_algorithm` runs native algorithms as these wrappers do.
+        // Step 8: Let _startPromise_ be `a promise resolved with` undefined.
+        let start_promise = Promise::new_resolved_with_value(scope, HandleValue::undefined())?;
+        // Step 9: Perform ! `InitializeTransformStream`(_stream_, _startPromise_,
+        //         _writableHighWaterMark_, _writableSizeAlgorithm_, _readableHighWaterMark_,
+        //         _readableSizeAlgorithm_).
+        algorithms::initialize_transform_stream(
+            scope,
+            &stream,
+            &start_promise,
+            writable_high_water_mark,
+            size_algorithm,
+            readable_high_water_mark,
+            size_algorithm,
+        )?;
+        // Step 10: Let _controller_ be a `new` ``TransformStreamDefaultController``.
+        let controller = TransformStreamDefaultController::new(scope, stream)?;
+        // Step 11: Perform ! `SetUpTransformStreamDefaultController`(_stream_, _controller_,
+        //          _transformAlgorithmWrapper_, _flushAlgorithmWrapper_,
+        //          _cancelAlgorithmWrapper_).
+        algorithms::set_up_transform_stream_default_controller(
+            scope,
+            &stream,
+            &controller,
+            transform,
+            flush,
+            cancel,
+            HandleValue::undefined(),
+        );
+        Ok(stream)
+    }
+
+    /// Enqueue `chunk` into the readable side of a stream from [`TransformStream::new_native`].
+    /// Throws if the readable side is closed or errored, or if its size algorithm throws.
+    ///
+    /// <https://streams.spec.whatwg.org/#transformstream-enqueue>
+    pub fn enqueue(&self, scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<(), ExnThrown> {
+        // To `enqueue` the JavaScript value _chunk_ into a ``TransformStream`` _stream_, perform
+        // ! `TransformStreamDefaultControllerEnqueue`(_stream_.`[[controller]]`, _chunk_).
+        let controller: TransformStreamDefaultController<'_> = self
+            .data()
+            .controller
+            .get(scope)
+            .expect("controller is set");
+        algorithms::transform_stream_default_controller_enqueue(scope, &controller, chunk)
+    }
+
     /// <https://streams.spec.whatwg.org/#ts-readable>
     #[getter]
-    fn readable<'r>(&self, scope: &'r Scope<'_>) -> ReadableStream<'r> {
+    pub fn readable<'r>(&self, scope: &'r Scope<'_>) -> ReadableStream<'r> {
         // Step 1: Return `this`.`[[readable]]`.
         self.data().readable.get(scope)
     }
 
     /// <https://streams.spec.whatwg.org/#ts-writable>
     #[getter]
-    fn writable<'r>(&self, scope: &'r Scope<'_>) -> WritableStream<'r> {
+    pub fn writable<'r>(&self, scope: &'r Scope<'_>) -> WritableStream<'r> {
         // Step 1: Return `this`.`[[writable]]`.
         self.data().writable.get(scope)
     }

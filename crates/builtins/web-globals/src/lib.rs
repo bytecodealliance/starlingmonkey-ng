@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod dom_exception;
 pub mod encoding;
 pub mod events;
+pub mod messaging;
 pub mod navigator;
 pub mod performance;
 pub mod signals;
@@ -31,6 +32,7 @@ pub fn add_to_global(scope: &js::prelude::Scope<'_>, global: js::Object<'_>) {
     dom_exception::DOMException::add_to_global(scope, global);
     encoding::add_to_global(scope, global);
     events::add_to_global(scope, global);
+    messaging::add_to_global(scope, global);
     performance::add_to_global(scope, global);
     signals::add_to_global(scope, global);
     base64::add_to_global(scope, global);

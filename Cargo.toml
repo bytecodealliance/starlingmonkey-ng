@@ -9,6 +9,7 @@ edition = "2021"
 members = [
     "starling",
     "crates/component-model",
+    "crates/compression",
     "crates/dap-relay",
     "crates/debugger",
     "crates/platform",
@@ -26,6 +27,7 @@ bytes = "1"
 clap = { version = "4.5.60", features = ["derive"] }
 crc32fast = "1.5"
 component-model = { path = "crates/component-model" }
+compression = { path = "crates/compression" }
 core-runtime = { path = "crates/core-runtime" }
 data-url = "0.3"
 digest = { version = "0.11", features = ["alloc"] }
@@ -64,6 +66,7 @@ smallvec = "1.16"
 starling-macro = { path = "crates/starling-macro" }
 tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
 url = "2.5.8"
+urlpattern = "0.6"
 wasip3 = { version = "0.9.0", features = ["http-compat"] }
 # Must equal the `wit-bindgen` version `wasip3` depends on. See `starling/Cargo.toml`.
 wit-bindgen = { version = "=0.62.0", features = ["macros"] }
@@ -71,6 +74,8 @@ wpt-support = { path = "crates/wpt-support" }
 
 # Builtins
 fetch-event = { path = "crates/builtins/fetch-event" }
+web-compression = { path = "crates/builtins/web-compression" }
+web-encoding-streams = { path = "crates/builtins/web-encoding-streams" }
 web-fetch = { path = "crates/builtins/web-fetch" }
 web-files = { path = "crates/builtins/web-files" }
 web-globals = { path = "crates/builtins/web-globals" }

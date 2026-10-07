@@ -1,0 +1,5 @@
+{
+  "Throw a DataCloneError when a host object (e.g. a DOM node) is used with postMessage.": {
+    "status": "PASS"
+  }
+}

@@ -12,10 +12,10 @@
     "status": "PASS"
   },
   "URL: no structured serialize/deserialize support": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "URLSearchParams: no structured serialize/deserialize support": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "Constructor only takes strings": {
     "status": "PASS"

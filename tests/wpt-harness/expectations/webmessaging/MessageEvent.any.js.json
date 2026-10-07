@@ -1,0 +1,29 @@
+{
+  "mozInitMessageEvent on the prototype": {
+    "status": "PASS"
+  },
+  "mozInitMessageEvent on the instance": {
+    "status": "PASS"
+  },
+  "msInitMessageEvent on the prototype": {
+    "status": "PASS"
+  },
+  "msInitMessageEvent on the instance": {
+    "status": "PASS"
+  },
+  "oInitMessageEvent on the prototype": {
+    "status": "PASS"
+  },
+  "oInitMessageEvent on the instance": {
+    "status": "PASS"
+  },
+  "webkitInitMessageEvent on the prototype": {
+    "status": "PASS"
+  },
+  "webkitInitMessageEvent on the instance": {
+    "status": "PASS"
+  },
+  "initMessageEvent with no arguments": {
+    "status": "PASS"
+  }
+}

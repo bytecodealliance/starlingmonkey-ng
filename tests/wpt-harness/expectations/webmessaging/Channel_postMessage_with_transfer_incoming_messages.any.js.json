@@ -1,0 +1,5 @@
+{
+  "When transferring a non-enabled port mutiple times,\n    incoming messages sent at various transfer steps are received in order upon enablement.": {
+    "status": "PASS"
+  }
+}

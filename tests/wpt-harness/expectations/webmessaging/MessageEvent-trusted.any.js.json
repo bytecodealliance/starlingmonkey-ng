@@ -1,0 +1,8 @@
+{
+  "With a MessageChannel and its MessagePorts": {
+    "status": "PASS"
+  },
+  "With a BroadcastChannel": {
+    "status": "FAIL"
+  }
+}

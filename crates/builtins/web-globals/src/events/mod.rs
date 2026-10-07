@@ -9,6 +9,7 @@ pub mod algorithms;
 pub mod custom_event;
 pub mod event;
 pub mod event_target;
+pub mod message_event;
 
 pub use event::Event;
 pub use event_target::EventTarget;
@@ -20,6 +21,7 @@ use js::Object;
 pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     event::Event::add_to_global(scope, global);
     custom_event::CustomEvent::add_to_global(scope, global);
+    message_event::MessageEvent::add_to_global(scope, global);
     event_target::EventTarget::add_to_global(scope, global);
 
     // For now, the main global simply *is* an `EventTarget`.

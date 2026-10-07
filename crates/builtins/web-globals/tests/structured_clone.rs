@@ -342,3 +342,26 @@ fn clone_string_object() {
         "object,true"
     );
 }
+
+// ── Shared memory ──
+
+#[test]
+fn clone_shared_array_buffer_shares_its_memory() {
+    setup();
+    let config = core_runtime::config::RuntimeConfig {
+        shared_memory: true,
+        ..Default::default()
+    };
+    let rt = core_runtime::runtime::Runtime::init(&config).expect("runtime init");
+    let scope = rt.default_global();
+    let result = js::compile::evaluate(
+        &scope,
+        "const sab = new SharedArrayBuffer(4);
+         const copy = structuredClone(sab);
+         new Uint8Array(sab)[0] = 7;
+         [copy instanceof SharedArrayBuffer, copy === sab, new Uint8Array(copy)[0]].join()",
+    )
+    .expect("cloning a SharedArrayBuffer succeeds");
+    let result = <String as js::conversion::FromJSVal>::from_jsval(&scope, result, ()).unwrap();
+    assert_eq!(result, "true,false,7");
+}

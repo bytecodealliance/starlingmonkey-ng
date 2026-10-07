@@ -1,0 +1,35 @@
+{
+  "a code point split between chunks should not be emitted until all bytes are available; split point = 2": {
+    "status": "PASS"
+  },
+  "a code point split between chunks should not be emitted until all bytes are available; split point = 3": {
+    "status": "PASS"
+  },
+  "a code point split between chunks should not be emitted until all bytes are available; split point = 4": {
+    "status": "PASS"
+  },
+  "a code point split between chunks should not be emitted until all bytes are available; split point = 5": {
+    "status": "PASS"
+  },
+  "a code point should be emitted as soon as all bytes are available": {
+    "status": "PASS"
+  },
+  "an empty chunk inside a code point split between chunks should not change the output; split point = 1": {
+    "status": "PASS"
+  },
+  "an empty chunk inside a code point split between chunks should not change the output; split point = 2": {
+    "status": "PASS"
+  },
+  "an empty chunk inside a code point split between chunks should not change the output; split point = 3": {
+    "status": "PASS"
+  },
+  "an empty chunk inside a code point split between chunks should not change the output; split point = 4": {
+    "status": "PASS"
+  },
+  "an empty chunk inside a code point split between chunks should not change the output; split point = 5": {
+    "status": "PASS"
+  },
+  "an empty chunk inside a code point split between chunks should not change the output; split point = 6": {
+    "status": "PASS"
+  }
+}

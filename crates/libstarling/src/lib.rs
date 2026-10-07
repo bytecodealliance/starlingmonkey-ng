@@ -21,6 +21,8 @@ pub mod serve_wasm;
 pub fn register_builtins() {
     runtime::register_global_initializer(web_globals::add_to_global);
     runtime::register_global_initializer(web_streams::add_to_global);
+    runtime::register_global_initializer(web_compression::add_to_global);
+    runtime::register_global_initializer(web_encoding_streams::add_to_global);
     runtime::register_global_initializer(web_url::add_to_global);
     runtime::register_global_initializer(web_files::add_to_global);
     runtime::register_global_initializer(web_fetch::add_to_global);
@@ -54,6 +56,7 @@ pub fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), Strin
     }
     if config.node_compat {
         cpp_builtins::set_console_level_prefixes(false);
+        web_globals::messaging::set_node_ports(true);
     }
     Ok(())
 }

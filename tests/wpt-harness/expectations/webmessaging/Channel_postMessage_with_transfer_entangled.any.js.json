@@ -1,0 +1,5 @@
+{
+  "An entangled port transferred to the same origin receives messages in order": {
+    "status": "PASS"
+  }
+}

@@ -97,6 +97,7 @@ impl EventTarget {
         // Step 2: `Add an event listener` with `this` and an `event listener` whose `type` is
         //         _type_, `callback` is _callback_, `capture` is _capture_, `passive` is _passive_,
         //         `once` is _once_, and `signal` is _signal_.
+        let message = event_type == "message";
         algorithms::add_an_event_listener(
             self,
             event_type,
@@ -106,6 +107,9 @@ impl EventTarget {
             options.once,
             options.signal,
         );
+        if message {
+            crate::messaging::message_port::message_listeners_changed(self, true);
+        }
         Ok(())
     }
 
@@ -129,6 +133,9 @@ impl EventTarget {
         //         is _type_, `callback` is _callback_, and `capture` is _capture_, then `remove an
         //         event listener` with `this` and that `event listener`.
         algorithms::remove_an_event_listener(&mut self.data_mut(), &event_type, &callback, capture);
+        if event_type == "message" {
+            crate::messaging::message_port::message_listeners_changed(self, false);
+        }
         Ok(())
     }
 

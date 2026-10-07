@@ -5,7 +5,7 @@
 //! Implements the [structured cloning API] from the HTML specification,
 //! which deep-copies a JavaScript value using the structured clone algorithm.
 //! Supports an optional `transfer` list for transferring ownership of
-//! `ArrayBuffer` and other transferable objects.
+//! `ArrayBuffer`s and `MessagePort`s.
 //!
 //! [structured cloning API]: https://html.spec.whatwg.org/multipage/structured-data.html#dom-structuredclone
 
@@ -20,7 +20,6 @@ pub struct StructuredSerializeOptions<'a> {
 #[core_runtime::jsglobals]
 pub mod structured_clone_globals {
     use super::StructuredSerializeOptions;
-    use js::conversion::ToJSVal;
     use js::error::ExnThrown;
     use js::gc::scope::Scope;
     use js::prelude::HandleValue;
@@ -37,15 +36,6 @@ pub mod structured_clone_globals {
         // Step 2: Let _deserializeRecord_ be ? StructuredDeserializeWithTransfer(_serialized_,
         //         `this`'s `relevant realm`).
         // Step 3: Return _deserializeRecord_.[[Deserialized]].
-        // (SpiderMonkey's structured clone performs all three steps.)
-        if transfer.is_empty() {
-            // SAFETY: null callbacks select SpiderMonkey's defaults, and the closure is unused.
-            unsafe {
-                js::structured_clone::clone(scope, value, std::ptr::null(), std::ptr::null_mut())
-            }
-        } else {
-            let transfer = js::Array::with_contents(scope, &transfer)?.to_jsval_throwing(scope)?;
-            js::structured_clone::clone_with_transfer(scope, value, transfer)
-        }
+        crate::messaging::message_port::structured_clone(scope, value, &transfer)
     }
 }

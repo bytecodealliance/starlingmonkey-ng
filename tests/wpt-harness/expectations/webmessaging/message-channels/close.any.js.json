@@ -1,0 +1,20 @@
+{
+  "Message sent to closed port should not arrive.": {
+    "status": "PASS"
+  },
+  "Message sent from closed port should not arrive.": {
+    "status": "PASS"
+  },
+  "Message sent to closed port from transferred port should not arrive.": {
+    "status": "PASS"
+  },
+  "Inflight messages should be delivered even when sending port is closed afterwards.": {
+    "status": "PASS"
+  },
+  "Close in onmessage should not cancel inflight messages.": {
+    "status": "PASS"
+  },
+  "close() detaches a MessagePort (but not the one its entangled with)": {
+    "status": "PASS"
+  }
+}

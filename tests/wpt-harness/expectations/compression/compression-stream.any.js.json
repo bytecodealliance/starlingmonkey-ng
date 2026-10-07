@@ -1,0 +1,41 @@
+{
+  "CompressionStream constructor should throw on invalid format": {
+    "status": "PASS"
+  },
+  "deflate empty data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "deflate small amount data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "deflate large amount data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "deflate-raw empty data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "deflate-raw small amount data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "deflate-raw large amount data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "gzip empty data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "gzip small amount data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "gzip large amount data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "brotli empty data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "brotli small amount data should be reinflated back to its origin": {
+    "status": "PASS"
+  },
+  "brotli large amount data should be reinflated back to its origin": {
+    "status": "PASS"
+  }
+}

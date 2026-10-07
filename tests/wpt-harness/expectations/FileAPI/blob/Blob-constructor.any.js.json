@@ -99,7 +99,7 @@
     "status": "PASS"
   },
   "Passing a FrozenArray as the blobParts array should work (FrozenArray<MessagePort>).": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "Array with two blobs": {
     "status": "PASS"

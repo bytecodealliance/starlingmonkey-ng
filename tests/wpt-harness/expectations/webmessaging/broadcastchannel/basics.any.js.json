@@ -1,0 +1,23 @@
+{
+  "BroadcastChannel constructor called as normal function": {
+    "status": "PASS"
+  },
+  "postMessage results in correct event": {
+    "status": "PASS"
+  },
+  "messages are delivered in port creation order": {
+    "status": "PASS"
+  },
+  "messages aren't delivered to a closed port": {
+    "status": "PASS"
+  },
+  "messages aren't delivered to a port closed after calling postMessage.": {
+    "status": "PASS"
+  },
+  "closing and creating channels during message delivery works correctly": {
+    "status": "PASS"
+  },
+  "Closing a channel in onmessage prevents already queued tasks from firing onmessage events": {
+    "status": "PASS"
+  }
+}

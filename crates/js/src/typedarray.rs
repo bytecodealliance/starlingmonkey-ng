@@ -354,6 +354,24 @@ impl<'s> Stack<'s, SharedArrayBuffer> {
         let obj = unsafe { wrappers2::NewSharedArrayBuffer(scope.cx_mut(), byte_length) };
         root_or_throw(scope, obj)
     }
+
+    /// Borrow the buffer's backing bytes.
+    ///
+    /// # Safety
+    ///
+    /// No GC may run while the returned slice is live. Other threads sharing the buffer can
+    /// write to it concurrently.
+    pub unsafe fn bytes(self) -> &'s [u8] {
+        let mut len = 0;
+        let mut is_shared = false;
+        let mut ptr = std::ptr::null_mut();
+        JS::GetSharedArrayBufferLengthAndData(self.as_raw(), &mut len, &mut is_shared, &mut ptr);
+        if ptr.is_null() || len == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(ptr, len)
+        }
+    }
 }
 
 crate::gc::handle::deref_to_object!(SharedArrayBuffer);
@@ -489,6 +507,12 @@ impl<'s> Stack<'s, ArrayBufferView> {
     /// Get the byte offset of this view into its underlying buffer.
     pub fn byte_offset(self) -> usize {
         unsafe { mozjs::jsapi::JS_GetArrayBufferViewByteOffset(self.as_raw()) }
+    }
+
+    /// Whether this view's buffer is a `SharedArrayBuffer`.
+    pub fn is_shared(self) -> bool {
+        // SAFETY: `self` is a live, rooted array buffer view.
+        unsafe { JS::IsArrayBufferViewShared(self.as_raw()) }
     }
 
     /// Get this view's underlying `ArrayBuffer` (its `[[ViewedArrayBuffer]]`).

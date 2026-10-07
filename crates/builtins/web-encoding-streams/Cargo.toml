@@ -1,0 +1,21 @@
+[package]
+name = "web-encoding-streams"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+# No unit tests; skip building the (SpiderMonkey-sized) lib test harness binary.
+test = false
+
+[dependencies]
+core-runtime.workspace = true
+encoding_rs.workspace = true
+js.workspace = true
+web-globals.workspace = true
+web-streams.workspace = true
+
+[lints]
+workspace = true

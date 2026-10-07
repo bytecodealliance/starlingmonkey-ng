@@ -15,6 +15,7 @@ core-runtime.workspace = true
 form_urlencoded.workspace = true
 js.workspace = true
 url.workspace = true
+urlpattern.workspace = true
 
 [dev-dependencies]
 libstarling.workspace = true
