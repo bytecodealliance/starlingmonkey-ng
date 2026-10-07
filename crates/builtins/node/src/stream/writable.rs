@@ -326,7 +326,7 @@ fn onwrite_error_tick(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     onwrite_error(scope, stream, side, args.get(0), args.get(1))?;
     Ok(js::value::undefined())
@@ -338,7 +338,7 @@ fn onwrite(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     if !side.has(W::EXPECT_WRITE_CB) {
         error_or_destroy_with(scope, stream, multiple_callback(), false)?;
@@ -436,7 +436,7 @@ fn after_write_tick_noop(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     after_write(scope, stream, side, 1.0, HandleValue::undefined())?;
     Ok(js::value::undefined())
@@ -692,7 +692,7 @@ fn on_final(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     let error = args.get(0);
     if side.has(W::PREFINISHED) {
@@ -771,7 +771,7 @@ fn finish_if_needed_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     if need_finish(side) {
         finish(scope, stream, side)?;
@@ -786,7 +786,7 @@ fn finish_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     finish(scope, stream, side)?;
     Ok(js::value::undefined())
@@ -1123,7 +1123,9 @@ pub(crate) fn init_writable(
     let view = super::state::new_writable_view(scope, state)?;
     state.data_mut().writable_view = Some(Heap::from(*view));
     stream.set_property(scope, c"_writableState", view)?;
-    if let Some(options) = options.and_then(|options| Object::from_value(scope, options).ok()) {
+    let options = options.and_then(|options| Object::from_value(scope, options).ok());
+    // The `Duplex` constructor assigns the methods of both sides itself.
+    if let Some(options) = options.filter(|_| !is_duplex) {
         for (option, method) in [
             (c"write", c"_write"),
             (c"writev", c"_writev"),
@@ -1136,11 +1138,9 @@ pub(crate) fn init_writable(
                 stream.set_property(scope, method, value)?;
             }
         }
-        if !is_duplex {
-            let signal = options.get_property(scope, c"signal")?;
-            if js::conversion::to_boolean(signal) {
-                super::add_abort_signal(scope, signal, stream.to_jsval_throwing(scope)?)?;
-            }
+        let signal = options.get_property(scope, c"signal")?;
+        if js::conversion::to_boolean(signal) {
+            super::add_abort_signal(scope, signal, stream.to_jsval_throwing(scope)?)?;
         }
     }
     Ok(())

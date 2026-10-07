@@ -97,6 +97,19 @@ pub(crate) fn init_duplex(
                 side.get_mut().writable = Some(false);
                 side.set(W::ENDING | W::ENDED | W::FINISHED, true);
             }
+            for (option, method) in [
+                (c"read", c"_read"),
+                (c"write", c"_write"),
+                (c"writev", c"_writev"),
+                (c"destroy", c"_destroy"),
+                (c"final", c"_final"),
+                (c"construct", c"_construct"),
+            ] {
+                let value = options.get_property(scope, option)?;
+                if js::function::is_callable(value) {
+                    stream.set_property(scope, method, value)?;
+                }
+            }
             let signal = options.get_property(scope, c"signal")?;
             if js::conversion::to_boolean(signal) {
                 super::add_abort_signal(scope, signal, stream.to_jsval_throwing(scope)?)?;

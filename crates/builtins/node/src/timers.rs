@@ -27,6 +27,7 @@ use js::function::{cast_payload, CallbackArgs};
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::{CallArgs, Value};
+use js::object::{PropertyInit, PropertyTemplate, PropertyWriter, TemplateKey};
 use js::prelude::HandleValue;
 use js::symbol::CachedSymbol;
 use js::{Function, Object};
@@ -62,6 +63,39 @@ static ASYNC_CONTEXT_FRAME: CachedSymbol = CachedSymbol::new(c"kAsyncContextFram
 
 /// The longest timer delay, in milliseconds.
 const TIMEOUT_MAX: f64 = 2147483647.0;
+
+/// The duration `value`, named `name`, as Node.js's `getTimerDuration` checks it: a non-negative
+/// finite number, or `ERR_INVALID_ARG_TYPE` or `ERR_OUT_OF_RANGE`. A duration above
+/// [`TIMEOUT_MAX`] emits a `TimeoutOverflowWarning` and becomes [`TIMEOUT_MAX`].
+pub(crate) fn get_timer_duration(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+) -> Result<f64, crate::errors::Thrown> {
+    if !value.is_number() {
+        return Err(NodeError::invalid_arg_type(scope, name, "of type number", value).into());
+    }
+    let msecs = value.to_number();
+    if !(msecs >= 0.0 && msecs.is_finite()) {
+        let received = crate::errors::out_of_range_received(msecs);
+        return Err(
+            NodeError::out_of_range(name, "a non-negative finite number", &received).into(),
+        );
+    }
+    if msecs > TIMEOUT_MAX {
+        let shown = crate::errors::number_to_string(msecs);
+        crate::process::emit_warning(
+            scope,
+            &format!(
+                "{shown} does not fit into a 32-bit signed integer.\nTimer duration was truncated to {}.",
+                crate::errors::number_to_string(TIMEOUT_MAX)
+            ),
+            "TimeoutOverflowWarning",
+        )?;
+        return Ok(TIMEOUT_MAX);
+    }
+    Ok(msecs)
+}
 
 /// The delay of a timer created with the delay argument `delay`, as Node's `Timeout` constructor
 /// computes it: `delay` converted to a number, or 1 if it is `undefined`, below 1, above
@@ -101,17 +135,56 @@ pub(crate) fn timer_delay(scope: &Scope<'_>, delay: HandleValue<'_>) -> Result<f
     Ok(1.0)
 }
 
-/// Write the async resource properties of Node's `initAsyncResource` to `timer`: its ID under
-/// `Symbol(asyncId)`, the ID of the resource that created it under `Symbol(triggerId)`, which is
-/// always 1, and the current async context under `Symbol(kAsyncContextFrame)`.
-fn write_async_resource(scope: &Scope<'_>, timer: Object<'_>, id: u64) -> Result<(), ExnThrown> {
-    timer.set_property_by_id(scope, ASYNC_ID.id(scope)?, id as f64)?;
-    timer.set_property_by_id(scope, TRIGGER_ID.id(scope)?, 1)?;
+/// The own properties the `Timeout` constructor creates before those of
+/// [`ASYNC_RESOURCE_PROPERTIES`], in Node's order.
+pub(crate) static TIMEOUT_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"_idleTimeout"),
+    TemplateKey::Name(c"_idlePrev"),
+    TemplateKey::Name(c"_idleNext"),
+    TemplateKey::Name(c"_idleStart"),
+    TemplateKey::Name(c"_onTimeout"),
+    TemplateKey::Name(c"_timerArgs"),
+    TemplateKey::Name(c"_repeat"),
+    TemplateKey::Name(c"_destroyed"),
+    TemplateKey::Symbol(&REFED),
+    TemplateKey::Symbol(&HAS_PRIMITIVE),
+]);
+
+/// The own properties the `Immediate` constructor creates before those of
+/// [`ASYNC_RESOURCE_PROPERTIES`], in Node's order.
+pub(crate) static IMMEDIATE_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"_idleNext"),
+    TemplateKey::Name(c"_idlePrev"),
+    TemplateKey::Name(c"_onImmediate"),
+    TemplateKey::Name(c"_argv"),
+    TemplateKey::Name(c"_destroyed"),
+    TemplateKey::Symbol(&REFED),
+]);
+
+/// The async resource properties of Node's `initAsyncResource`, in its order.
+pub(crate) static ASYNC_RESOURCE_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Symbol(&ASYNC_ID),
+    TemplateKey::Symbol(&TRIGGER_ID),
+    TemplateKey::Symbol(&ASYNC_CONTEXT_FRAME),
+]);
+
+/// Write the async resource properties of Node's `initAsyncResource` with `properties`: the
+/// timer's ID under `Symbol(asyncId)`, the ID of the resource that created it under
+/// `Symbol(triggerId)`, which is always 1, and the current async context under
+/// `Symbol(kAsyncContextFrame)`.
+fn write_async_resource<'w>(
+    scope: &'w Scope<'_>,
+    properties: &mut PropertyWriter<'w>,
+    id: u64,
+) -> Result<(), ExnThrown> {
+    properties.continue_with(scope, &ASYNC_RESOURCE_PROPERTIES)?;
+    properties.write(scope, &ASYNC_ID, id as f64)?;
+    properties.write(scope, &TRIGGER_ID, 1)?;
     let frame = match js::async_context::current(scope) {
         Some(frame) => frame.to_jsval_throwing(scope)?,
         None => HandleValue::undefined(),
     };
-    timer.set_property_by_id(scope, ASYNC_CONTEXT_FRAME.id(scope)?, frame)
+    properties.write(scope, &ASYNC_CONTEXT_FRAME, frame)
 }
 
 /// Set whether the event loop timer `id` keeps the event loop running.
@@ -154,7 +227,11 @@ fn apply(
 
 /// A `Timeout`, which `setTimeout` and `setInterval` return, as Node's `class Timeout`. See
 /// <https://nodejs.org/api/timers.html#class-timeout>.
-#[core_runtime::jsclass(name = "Timeout", hidden)]
+#[core_runtime::jsclass(
+    name = "Timeout",
+    hidden,
+    templates = "TIMEOUT_PROPERTIES, ASYNC_RESOURCE_PROPERTIES"
+)]
 pub struct Timeout {
     /// The ID of the event loop timer the timeout runs on, and its `Symbol(asyncId)`.
     #[no_trace]
@@ -203,21 +280,26 @@ impl Timeout {
             data.refed = js::conversion::to_boolean(is_refed);
         }
         let this = self.as_object();
-        this.set_property(scope, c"_idleTimeout", delay)?;
-        this.set_property(scope, c"_idlePrev", this)?;
-        this.set_property(scope, c"_idleNext", this)?;
-        this.set_property(scope, c"_idleStart", HandleValue::null())?;
-        this.set_property(scope, c"_onTimeout", callback)?;
-        this.set_property(scope, c"_timerArgs", timer_args)?;
+        // SAFETY: the constructor's `this` is a new instance, and no JavaScript runs before the
+        // writer finishes.
+        let mut properties =
+            unsafe { this.property_writer(scope, &TIMEOUT_PROPERTIES, PropertyInit::Define) }?;
+        properties.write(scope, c"_idleTimeout", delay)?;
+        properties.write(scope, c"_idlePrev", this)?;
+        properties.write(scope, c"_idleNext", this)?;
+        properties.write(scope, c"_idleStart", HandleValue::null())?;
+        properties.write(scope, c"_onTimeout", callback)?;
+        properties.write(scope, c"_timerArgs", timer_args)?;
         if repeat {
-            this.set_property(scope, c"_repeat", delay)?;
+            properties.write(scope, c"_repeat", delay)?;
         } else {
-            this.set_property(scope, c"_repeat", HandleValue::null())?;
+            properties.write(scope, c"_repeat", HandleValue::null())?;
         }
-        this.set_property(scope, c"_destroyed", false)?;
-        this.set_property_by_id(scope, REFED.id(scope)?, is_refed)?;
-        this.set_property_by_id(scope, HAS_PRIMITIVE.id(scope)?, false)?;
-        write_async_resource(scope, this, id)
+        properties.write(scope, c"_destroyed", false)?;
+        properties.write(scope, &REFED, is_refed)?;
+        properties.write(scope, &HAS_PRIMITIVE, false)?;
+        write_async_resource(scope, &mut properties, id)?;
+        properties.finish(scope)
     }
 
     /// <https://nodejs.org/api/timers.html#timeoutrefresh>: restart the timeout with its delay,
@@ -255,7 +337,12 @@ impl Timeout {
             self.data_mut().destroyed = false;
             let this = self.as_object();
             this.set_property(scope, c"_destroyed", false)?;
-            write_async_resource(scope, this, id)?;
+            // SAFETY: `Assign` has no requirements.
+            let mut properties = unsafe {
+                this.property_writer(scope, &ASYNC_RESOURCE_PROPERTIES, PropertyInit::Assign)
+            }?;
+            write_async_resource(scope, &mut properties, id)?;
+            properties.finish(scope)?;
         }
         Ok(self.as_object())
     }
@@ -476,7 +563,11 @@ pub(crate) fn create_timeout<'s>(
 
 /// An `Immediate`, which `setImmediate` returns, as Node's `class Immediate`. See
 /// <https://nodejs.org/api/timers.html#class-immediate>.
-#[core_runtime::jsclass(name = "Immediate", hidden)]
+#[core_runtime::jsclass(
+    name = "Immediate",
+    hidden,
+    templates = "IMMEDIATE_PROPERTIES, ASYNC_RESOURCE_PROPERTIES"
+)]
 pub struct Immediate {
     /// The ID of the event loop timer the immediate runs on, and its `Symbol(asyncId)`.
     #[no_trace]
@@ -500,12 +591,16 @@ impl Immediate {
         argv: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
         let this = self.as_object();
-        this.set_property(scope, c"_idleNext", HandleValue::null())?;
-        this.set_property(scope, c"_idlePrev", HandleValue::null())?;
-        this.set_property(scope, c"_onImmediate", callback)?;
-        this.set_property(scope, c"_argv", argv)?;
-        this.set_property(scope, c"_destroyed", false)?;
-        this.set_property_by_id(scope, REFED.id(scope)?, true)?;
+        // SAFETY: the constructor's `this` is a new instance, and no JavaScript runs before the
+        // writer finishes.
+        let mut properties =
+            unsafe { this.property_writer(scope, &IMMEDIATE_PROPERTIES, PropertyInit::Define) }?;
+        properties.write(scope, c"_idleNext", HandleValue::null())?;
+        properties.write(scope, c"_idlePrev", HandleValue::null())?;
+        properties.write(scope, c"_onImmediate", callback)?;
+        properties.write(scope, c"_argv", argv)?;
+        properties.write(scope, c"_destroyed", false)?;
+        properties.write(scope, &REFED, true)?;
         let fire = js::class::get_or_init_shared_function(
             scope,
             fire_immediate as *const () as usize,
@@ -527,7 +622,8 @@ impl Immediate {
             data.refed = true;
         }
         IMMEDIATE_IDS.with_borrow_mut(|ids| ids.insert(id));
-        write_async_resource(scope, this, id)
+        write_async_resource(scope, &mut properties, id)?;
+        properties.finish(scope)
     }
 
     /// <https://nodejs.org/api/timers.html#immediateref>

@@ -1278,7 +1278,7 @@ fn read(scope: &Scope<'_>, args: &[HandleValue<'_>], variant: Variant) -> Result
             let end = (offset + bytes.len()).min(view.byte_length());
             if offset < end {
                 view.with_bytes_mut(|target| {
-                    target[offset..end].copy_from_slice(&bytes[..end - offset])
+                    target[offset..end].copy_from_slice(&bytes[..end - offset]);
                 });
             }
         }

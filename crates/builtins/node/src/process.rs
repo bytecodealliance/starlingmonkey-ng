@@ -370,6 +370,9 @@ fn emit(
     emitted.is_err()
 }
 
+/// The `rejection_handled` lifecycle hook, which does nothing.
+fn rejection_handled(_scope: &Scope<'_>, _promise: js::Promise<'_>, _id: u64) {}
+
 /// The `uncaught` lifecycle hook: emit `unhandledRejection` for a rejection if something listens,
 /// or else call the `process.setUncaughtExceptionCaptureCallback` callback if one is set, or else
 /// emit `uncaughtException` if something listens, and return `true`. If that listener or callback
@@ -385,10 +388,10 @@ fn uncaught(
     error: HandleValue<'_>,
     rejection: Option<core_runtime::lifecycle::Rejection<'_>>,
 ) -> bool {
+    let promise = rejection.map(|rejection| rejection.promise);
     let Ok(process) = global_process(scope) else {
         return false;
     };
-    let promise = rejection.map(|rejection| rejection.promise);
     let abort = crate::runtime_flags::get().abort_on_uncaught_exception
         && capture_callback(scope).is_none();
     if abort && promise.is_none() {
@@ -451,9 +454,6 @@ fn uncaught(
         }
     }
 }
-
-/// The `rejection_handled` lifecycle hook, which does nothing.
-fn rejection_handled(_scope: &Scope<'_>, _promise: js::Promise<'_>, _id: u64) {}
 
 /// Print uncaught exception `error` as Node.js does under `--abort-on-uncaught-exception`, as
 /// `Uncaught` followed by the error's string and the frames of its stack, and abort the process.

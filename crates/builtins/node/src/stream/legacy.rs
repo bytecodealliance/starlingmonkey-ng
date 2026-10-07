@@ -197,6 +197,37 @@ pub mod stream {
         crate::events::event_emitter::init(scope, this, options)
     }
 
+    /// Node.js's legacy `Stream.prototype.eventNames`: the keys of `this._events` whose value is
+    /// a function or an array with elements. An `_events` that isn't an object is a `TypeError`.
+    #[method(length = 0)]
+    pub fn event_names<'s>(
+        scope: &'s Scope<'_>,
+        this: Object<'_>,
+    ) -> Result<js::Array<'s>, ExnThrown> {
+        let events = this.get_property(scope, c"_events")?;
+        let events = Object::from_value(scope, events).map_err(|_| {
+            let message = String::from("Reflect.ownKeys called on non-object");
+            js::error::TypeError(message).throw(scope)
+        })?;
+        let mut names = Vec::new();
+        for key in events.own_keys(scope)? {
+            let id = scope.root_id(js::id::value_to_id(scope, key)?);
+            let value = events.get_property_by_id(scope, id)?;
+            let listed = if js::Array::is_array_value(scope, value)? {
+                let length = Object::from_value(scope, value)
+                    .map_err(|error| error.throw(scope))?
+                    .get_property(scope, c"length")?;
+                length.is_number() && length.to_number() > 0.0
+            } else {
+                js::function::is_callable(value)
+            };
+            if listed {
+                names.push(key);
+            }
+        }
+        js::Array::with_contents(scope, &names)
+    }
+
     /// The legacy `pipe`: write `data` to `dest`, pausing on backpressure, and end or destroy
     /// `dest` once this ends or closes.
     #[method(length = 2)]

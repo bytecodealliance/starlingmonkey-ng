@@ -6,7 +6,8 @@ use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
 use js::gc::scope::Scope;
-use js::native::{HandleId, Value};
+use js::native::Value;
+use js::object::{PropertyInit, PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 use platform::fs::{FileKind, Stat};
@@ -16,22 +17,22 @@ use crate::buffer::Encoding;
 use crate::errors::Thrown;
 
 /// The numeric fields of `Stats`, in the order of the `Stats` constructor's parameters.
-const FIELDS: [&std::ffi::CStr; 14] = [
-    c"dev",
-    c"mode",
-    c"nlink",
-    c"uid",
-    c"gid",
-    c"rdev",
-    c"blksize",
-    c"ino",
-    c"size",
-    c"blocks",
-    c"atimeMs",
-    c"mtimeMs",
-    c"ctimeMs",
-    c"birthtimeMs",
-];
+pub(crate) static STATS_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"dev"),
+    TemplateKey::Name(c"mode"),
+    TemplateKey::Name(c"nlink"),
+    TemplateKey::Name(c"uid"),
+    TemplateKey::Name(c"gid"),
+    TemplateKey::Name(c"rdev"),
+    TemplateKey::Name(c"blksize"),
+    TemplateKey::Name(c"ino"),
+    TemplateKey::Name(c"size"),
+    TemplateKey::Name(c"blocks"),
+    TemplateKey::Name(c"atimeMs"),
+    TemplateKey::Name(c"mtimeMs"),
+    TemplateKey::Name(c"ctimeMs"),
+    TemplateKey::Name(c"birthtimeMs"),
+]);
 
 /// The date accessors of `Stats`, each with the field holding its milliseconds.
 const DATES: [(&std::ffi::CStr, &std::ffi::CStr); 4] = [
@@ -96,21 +97,24 @@ fn date_setter(
     Ok(js::value::undefined())
 }
 
-#[core_runtime::jsfunction_class(name = "Stats")]
+#[core_runtime::jsfunction_class(name = "Stats", templates = "STATS_PROPERTIES")]
 pub mod stats_class {
     use super::*;
 
-    /// <https://nodejs.org/api/fs.html#class-fsstats>: the fields, in [`FIELDS`] order.
+    /// <https://nodejs.org/api/fs.html#class-fsstats>: the fields, in [`STATS_PROPERTIES`] order.
     #[constructor(length = 14)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
         fields: RestArgs<HandleValue<'_>>,
     ) -> Result<(), ExnThrown> {
-        for (name, value) in FIELDS.iter().zip(fields.iter()) {
-            this.set_property(scope, name, *value)?;
+        // SAFETY: `Assign` has no requirements.
+        let mut properties =
+            unsafe { this.property_writer(scope, &STATS_PROPERTIES, PropertyInit::Assign) }?;
+        for (key, value) in STATS_PROPERTIES.keys().iter().zip(fields.iter()) {
+            properties.write(scope, *key, *value)?;
         }
-        Ok(())
+        properties.finish(scope)
     }
 
     pub fn is_file(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
@@ -172,6 +176,9 @@ pub(super) fn stats_value<'s>(
     stat: &Stat,
 ) -> Result<HandleValue<'s>, ExnThrown> {
     let stats = stats_class::new_instance(scope)?;
+    // SAFETY: `stats` was just created, and no JavaScript runs before the writer finishes.
+    let mut properties =
+        unsafe { stats.property_writer(scope, &STATS_PROPERTIES, PropertyInit::Define) }?;
     let values = [
         stat.dev as f64,
         f64::from(stat.mode),
@@ -188,21 +195,27 @@ pub(super) fn stats_value<'s>(
         stat.ctime_ms,
         stat.birthtime_ms,
     ];
-    for (name, value) in FIELDS.iter().zip(values) {
-        stats.set_property(scope, name, value)?;
+    for (key, value) in STATS_PROPERTIES.keys().iter().zip(values) {
+        properties.write(scope, *key, value)?;
     }
+    properties.finish(scope)?;
     stats.to_jsval_throwing(scope)
 }
 
-/// The key of the property of a `Dirent` that holds its type, a `UV_DIRENT_*` constant.
-fn type_key<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
-    static K_TYPE: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"type");
-    K_TYPE.id(scope)
-}
+/// Node's `Symbol('type')`, the key of the property of a `Dirent` that holds its type, a
+/// `UV_DIRENT_*` constant.
+static K_TYPE: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"type");
+
+/// The own properties of a `Dirent`, in the order its constructor creates them.
+pub(crate) static DIRENT_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"name"),
+    TemplateKey::Name(c"parentPath"),
+    TemplateKey::Symbol(&K_TYPE),
+]);
 
 /// Whether the type of the `Dirent` `this` is `kind`.
 fn is_kind(scope: &Scope<'_>, this: Object<'_>, kind: FileKind) -> Result<bool, ExnThrown> {
-    let value = this.get_property_by_id(scope, type_key(scope)?)?;
+    let value = this.get_property_by_id(scope, K_TYPE.id(scope)?)?;
     Ok(value.is_number() && value.to_number() == f64::from(dirent_type(kind)))
 }
 
@@ -220,20 +233,31 @@ fn dirent_type(kind: FileKind) -> u8 {
     }
 }
 
-/// Make `this` a `Dirent` named `name` of the type `type` in the directory `path`.
-fn init_dirent(
+/// Make `this` a `Dirent` named `name` of the type `type` in the directory `path`, creating its
+/// properties as `init` creates them.
+///
+/// # Safety
+///
+/// With [`PropertyInit::Define`], `this` is a `Dirent` this module just created, which nothing
+/// else references.
+unsafe fn init_dirent(
     scope: &Scope<'_>,
     this: Object<'_>,
     name: HandleValue<'_>,
     r#type: HandleValue<'_>,
     path: HandleValue<'_>,
+    init: PropertyInit,
 ) -> Result<(), ExnThrown> {
-    this.set_property(scope, c"name", name)?;
-    this.set_property(scope, c"parentPath", path)?;
-    this.set_property_by_id(scope, type_key(scope)?, r#type)
+    // SAFETY: the caller guarantees the requirements of `Define`, and no JavaScript runs before
+    // the writer finishes.
+    let mut properties = unsafe { this.property_writer(scope, &DIRENT_PROPERTIES, init) }?;
+    properties.write(scope, c"name", name)?;
+    properties.write(scope, c"parentPath", path)?;
+    properties.write(scope, &K_TYPE, r#type)?;
+    properties.finish(scope)
 }
 
-#[core_runtime::jsfunction_class(name = "Dirent", class_syntax)]
+#[core_runtime::jsfunction_class(name = "Dirent", class_syntax, templates = "DIRENT_PROPERTIES")]
 pub mod dirent_class {
     use super::*;
 
@@ -247,7 +271,8 @@ pub mod dirent_class {
         r#type: HandleValue<'_>,
         path: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        init_dirent(scope, this, name, r#type, path)
+        // SAFETY: `Assign` has no requirements.
+        unsafe { init_dirent(scope, this, name, r#type, path, PropertyInit::Assign) }
     }
 
     pub fn is_file(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
@@ -298,7 +323,8 @@ pub(crate) fn new_dirent<'s>(
     };
     let dirent = dirent_class::new_instance(scope)?;
     let kind = scope.root_value(js::value::from_f64(kind));
-    init_dirent(scope, dirent, name, kind, parent)?;
+    // SAFETY: `dirent` was just created, and nothing else references it.
+    unsafe { init_dirent(scope, dirent, name, kind, parent, PropertyInit::Define) }?;
     Ok(dirent.to_jsval_throwing(scope)?)
 }
 
@@ -312,6 +338,7 @@ pub(super) fn dirent_value<'s>(
     let name = text_value(scope, &entry.name, encoding)?;
     let kind = scope.root_value(js::value::from_f64(f64::from(dirent_type(entry.kind))));
     let parent = js::JSString::from_str(scope, &entry.parent)?.to_jsval_throwing(scope)?;
-    init_dirent(scope, dirent, name, kind, parent)?;
+    // SAFETY: `dirent` was just created, and nothing else references it.
+    unsafe { init_dirent(scope, dirent, name, kind, parent, PropertyInit::Define) }?;
     dirent.to_jsval_throwing(scope)
 }

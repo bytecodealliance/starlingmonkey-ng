@@ -20,7 +20,7 @@ use js::function::{CallbackArgs, EmptyArgs};
 use js::gc::handle::{Heap, RootedHeap};
 use js::gc::scope::Scope;
 use js::native::{SymbolCode, Value};
-use js::object::ESClass;
+use js::object::{ESClass, PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
@@ -200,35 +200,63 @@ impl InspectOptions {
     /// The options object a custom inspection method receives, with a `stylize` function that
     /// returns its first argument.
     pub fn to_object<'r>(&self, scope: &'r Scope<'_>) -> Result<Object<'r>, ExnThrown> {
-        let object = Object::new_plain(scope)?;
-        let stylize = Function::new_callback(scope, c"stylize", 2, stylize_no_color, ())?;
-        object.set_property(scope, c"stylize", *stylize)?;
-        object.set_property(scope, c"showHidden", self.show_hidden)?;
-        match self.depth {
-            Some(depth) => object.set_property(scope, c"depth", depth)?,
-            None => object.set_property(scope, c"depth", HandleValue::null())?,
-        }
-        object.set_property(scope, c"colors", self.colors)?;
-        object.set_property(scope, c"customInspect", self.custom_inspect)?;
-        object.set_property(scope, c"showProxy", self.show_proxy)?;
-        object.set_property(scope, c"maxArrayLength", self.max_array_length)?;
-        object.set_property(scope, c"maxStringLength", self.max_string_length)?;
-        object.set_property(scope, c"breakLength", self.break_length)?;
-        match self.compact {
-            Compact::Bool(compact) => object.set_property(scope, c"compact", compact)?,
-            Compact::Number(compact) => object.set_property(scope, c"compact", compact)?,
-        }
-        object.set_property(scope, c"sorted", self.sorted)?;
-        match self.getters {
-            Getters::None => object.set_property(scope, c"getters", false)?,
-            Getters::All => object.set_property(scope, c"getters", true)?,
-            Getters::Get => object.set_property(scope, c"getters", "get")?,
-            Getters::Set => object.set_property(scope, c"getters", "set")?,
-        }
-        object.set_property(scope, c"numericSeparator", self.numeric_separator)?;
-        Ok(object)
+        let stylize = js::class::get_or_init_shared_function(
+            scope,
+            stylize_no_color as *const () as usize,
+            |scope| Function::new_callback(scope, c"stylize", 2, stylize_no_color, ()),
+        )?;
+        let depth = match self.depth {
+            Some(depth) => depth.to_jsval_throwing(scope)?,
+            None => HandleValue::null(),
+        };
+        let compact = match self.compact {
+            Compact::Bool(compact) => compact.to_jsval_throwing(scope)?,
+            Compact::Number(compact) => compact.to_jsval_throwing(scope)?,
+        };
+        let getters = match self.getters {
+            Getters::None => false.to_jsval_throwing(scope)?,
+            Getters::All => true.to_jsval_throwing(scope)?,
+            Getters::Get => "get".to_jsval_throwing(scope)?,
+            Getters::Set => "set".to_jsval_throwing(scope)?,
+        };
+        Object::new_plain_with_template(
+            scope,
+            &CUSTOM_OPTIONS_PROPERTIES,
+            &[
+                stylize.to_jsval_throwing(scope)?,
+                self.show_hidden.to_jsval_throwing(scope)?,
+                depth,
+                self.colors.to_jsval_throwing(scope)?,
+                self.custom_inspect.to_jsval_throwing(scope)?,
+                self.show_proxy.to_jsval_throwing(scope)?,
+                self.max_array_length.to_jsval_throwing(scope)?,
+                self.max_string_length.to_jsval_throwing(scope)?,
+                self.break_length.to_jsval_throwing(scope)?,
+                compact,
+                self.sorted.to_jsval_throwing(scope)?,
+                getters,
+                self.numeric_separator.to_jsval_throwing(scope)?,
+            ],
+        )
     }
 }
+
+/// The properties of the options object a custom inspection method receives, in Node's order.
+pub(crate) static CUSTOM_OPTIONS_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"stylize"),
+    TemplateKey::Name(c"showHidden"),
+    TemplateKey::Name(c"depth"),
+    TemplateKey::Name(c"colors"),
+    TemplateKey::Name(c"customInspect"),
+    TemplateKey::Name(c"showProxy"),
+    TemplateKey::Name(c"maxArrayLength"),
+    TemplateKey::Name(c"maxStringLength"),
+    TemplateKey::Name(c"breakLength"),
+    TemplateKey::Name(c"compact"),
+    TemplateKey::Name(c"sorted"),
+    TemplateKey::Name(c"getters"),
+    TemplateKey::Name(c"numericSeparator"),
+]);
 
 /// Node.js's `stylizeNoColor`: the first argument as it is.
 fn stylize_no_color(
@@ -1181,17 +1209,15 @@ impl<'s> Inspector<'s> {
         scope: &Scope<'_>,
         object: Object<'_>,
     ) -> Result<String, ExnThrown> {
+        let bytes = js::ArrayBufferView::from_object(object)
+            .map(|view| view.copy_bytes(scope))
+            .transpose()?
+            .unwrap_or_default();
         let max = crate::buffer::inspect_max_bytes() as usize;
-        let (mut text, length) = match js::ArrayBufferView::from_object(object) {
-            Some(view) => view.with_bytes(|bytes| {
-                let text: Vec<String> =
-                    bytes.iter().take(max).map(|b| format!("{b:02x}")).collect();
-                (text.join(" "), bytes.len())
-            }),
-            None => (String::new(), 0),
-        };
-        if length > max {
-            let remaining = length - max;
+        let mut text: Vec<String> = bytes.iter().take(max).map(|b| format!("{b:02x}")).collect();
+        let mut text = std::mem::take(&mut text).join(" ");
+        if bytes.len() > max {
+            let remaining = bytes.len() - max;
             text.push_str(&format!(
                 " ... {remaining} more byte{}",
                 if remaining > 1 { "s" } else { "" }
@@ -1213,7 +1239,7 @@ impl<'s> Inspector<'s> {
                 scope.root_value(extras.to_jsval_raw_throwing(scope)?),
                 options,
             )?;
-            if length != 0 {
+            if !bytes.is_empty() {
                 text.push_str(", ");
             }
             let units: Vec<u16> = shown.encode_utf16().collect();
@@ -2296,7 +2322,7 @@ impl<'s> Inspector<'s> {
             (text.join(" "), bytes.len())
         })
         .unwrap_or_default();
-        let remaining = length as f64 - self.options.max_array_length;
+        let remaining = length as f64 - max_array_length;
         if remaining > 0.0 {
             text.push_str(&format!(
                 " ... {} more byte{}",
@@ -2627,7 +2653,7 @@ fn strip_comments(text: &str) -> String {
 
 /// The frames of a stack in SpiderMonkey's `function@location` form, as V8 writes them after the
 /// first line, or `None` if `stack` isn't in that form.
-fn spidermonkey_frames(stack: &str) -> Option<String> {
+pub(crate) fn spidermonkey_frames(stack: &str) -> Option<String> {
     let lines: Vec<&str> = stack.lines().filter(|line| !line.is_empty()).collect();
     if lines.is_empty()
         || stack.contains("\n    at ")
@@ -2648,8 +2674,22 @@ fn spidermonkey_frames(stack: &str) -> Option<String> {
     Some(frames)
 }
 
+/// `stack`, the `stack` of `error`, in V8's form: a stack in SpiderMonkey's form becomes the first
+/// line [`error_to_string`] writes followed by its frames, and other stacks are returned as they
+/// are.
+pub(crate) fn v8_stack(
+    scope: &Scope<'_>,
+    error: Object<'_>,
+    stack: String,
+) -> Result<String, ExnThrown> {
+    match spidermonkey_frames(&stack) {
+        Some(frames) => Ok(format!("{}{frames}", error_to_string(scope, error)?)),
+        None => Ok(stack),
+    }
+}
+
 /// `Error.prototype.toString` applied to `error`.
-fn error_to_string(scope: &Scope<'_>, error: Object<'_>) -> Result<String, ExnThrown> {
+pub(crate) fn error_to_string(scope: &Scope<'_>, error: Object<'_>) -> Result<String, ExnThrown> {
     let name = error.get_property(scope, c"name")?;
     let name = if name.is_undefined() {
         "Error".to_string()

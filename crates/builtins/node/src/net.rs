@@ -27,6 +27,17 @@ pub(crate) fn validate_port(
     value: HandleValue<'_>,
     name: &str,
 ) -> Result<u16, Thrown> {
+    validate_port_allowing(scope, value, name, true)
+}
+
+/// [`validate_port`], which rejects port 0 unless `allow_zero`, as Node.js's
+/// `validatePort(value, name, allowZero)` does.
+pub(crate) fn validate_port_allowing(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+    allow_zero: bool,
+) -> Result<u16, Thrown> {
     let number = if value.is_number() {
         value.to_number()
     } else if value.is_string() {
@@ -42,12 +53,14 @@ pub(crate) fn validate_port(
     } else {
         f64::NAN
     };
-    if !(0.0..=65535.0).contains(&number) || number.fract() != 0.0 {
+    let rejected_zero = !allow_zero && number == 0.0;
+    if !(0.0..=65535.0).contains(&number) || number.fract() != 0.0 || rejected_zero {
         return Err(NodeError::new(
             ErrorKind::RangeError,
             "ERR_SOCKET_BAD_PORT",
             format!(
-                "{name} should be >= 0 and < 65536. Received {}.",
+                "{name} should be {} 0 and < 65536. Received {}.",
+                if allow_zero { ">=" } else { ">" },
                 crate::errors::describe_value(scope, value)
             ),
         )
@@ -124,24 +137,25 @@ fn set_auto_select(update: impl FnOnce(&mut (bool, f64))) {
 }
 
 /// A new socket connected with the `connect` arguments `args`, as `net.connect` does.
-fn connect<'s>(scope: &'s Scope<'_>, args: &[HandleValue<'_>]) -> Result<Object<'s>, ExnThrown> {
+pub(crate) fn connect<'s>(
+    scope: &'s Scope<'_>,
+    args: &[HandleValue<'_>],
+) -> Result<Object<'s>, ExnThrown> {
     let class = socket::socket_class::class_constructor(scope)?;
-    let options = args
-        .first()
-        .filter(|first| first.is_object() && !js::function::is_callable(**first))
-        .map(|options| scope.root_value(options.get()));
-    let socket = match options {
-        Some(options) => Function::construct(scope, class, &[options])?,
-        None => Function::construct(scope, class, js::function::EmptyArgs)?,
-    };
-    if let Some(options) = options.and_then(|options| Object::from_value(scope, *options).ok()) {
+    let args = js::Array::with_contents(scope, args)?;
+    let normalized = module::normalize_args(scope, (*args).to_jsval_throwing(scope)?)
+        .map_err(|thrown| js::error::ThrowException::throw(thrown, scope))?;
+    let options = normalized.get_element(scope, 0)?;
+    let socket = Function::construct(scope, class, &[options])?;
+    if let Ok(options) = Object::from_value(scope, *options) {
         let timeout = options.get_property(scope, c"timeout")?;
         if js::conversion::to_boolean(timeout) {
             let timeout = scope.root_value(timeout.get());
             Function::call_by_name(scope, socket.handle(), c"setTimeout", &[timeout])?;
         }
     }
-    Function::call_by_name(scope, socket.handle(), c"connect", args)?;
+    let normalized = normalized.to_jsval_throwing(scope)?;
+    Function::call_by_name(scope, socket.handle(), c"connect", &[normalized])?;
     Ok(socket)
 }
 
@@ -184,9 +198,15 @@ pub mod module {
         super::auto_select().0
     }
 
-    /// <https://nodejs.org/api/net.html#netsetdefaultautoselectfamilyvalue>
-    pub fn set_default_auto_select_family(value: bool) {
+    /// <https://nodejs.org/api/net.html#netsetdefaultautoselectfamilyvalue>: `value` must be a
+    /// boolean.
+    pub fn set_default_auto_select_family(
+        scope: &Scope<'_>,
+        value: HandleValue<'_>,
+    ) -> Result<(), Thrown> {
+        let value = crate::errors::validate_boolean(scope, value, "value")?;
         super::set_auto_select(|settings| settings.0 = value);
+        Ok(())
     }
 
     /// <https://nodejs.org/api/net.html#netgetdefaultautoselectfamilyattempttimeout>
@@ -194,10 +214,15 @@ pub mod module {
         super::auto_select().1
     }
 
-    /// <https://nodejs.org/api/net.html#netsetdefaultautoselectfamilyattempttimeoutvalue>: values
-    /// below 10 become 10.
-    pub fn set_default_auto_select_family_attempt_timeout(value: f64) {
+    /// <https://nodejs.org/api/net.html#netsetdefaultautoselectfamilyattempttimeoutvalue>: `value`
+    /// must be an integer from 1 to 2**31 - 1, and values below 10 become 10.
+    pub fn set_default_auto_select_family_attempt_timeout(
+        scope: &Scope<'_>,
+        value: HandleValue<'_>,
+    ) -> Result<(), Thrown> {
+        let value = crate::errors::validate_integer(scope, value, "value", 1.0, 2147483647.0)?;
         super::set_auto_select(|settings| settings.1 = value.max(10.0));
+        Ok(())
     }
 
     /// <https://nodejs.org/api/net.html#netconnect>

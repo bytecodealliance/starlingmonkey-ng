@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! `node:dns` and `node:dns/promises`: `lookup` over the host's name lookup in `platform::net`,
-//! and `setDefaultResultOrder` and `getDefaultResultOrder`. See <https://nodejs.org/api/dns.html>.
+//! `node:dns` and `node:dns/promises`: `lookup` and `lookupService` over the host's name lookup in
+//! `platform::net`, `setDefaultResultOrder` and `getDefaultResultOrder`, and the resolver of
+//! [`resolver`], which queries name servers itself. See <https://nodejs.org/api/dns.html>.
+
+mod channel;
+mod resolver;
+mod wire;
 
 use std::cell::Cell;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
@@ -12,6 +17,7 @@ use js::function::{cast_payload, CallbackArgs};
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
+use js::object::{PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
 use js::promise::{PromiseFuture, PromiseOutcome};
 use js::{Function, Object};
@@ -19,8 +25,28 @@ use js::{Function, Object};
 use crate::errors::{validate_function, NodeError, Thrown};
 use crate::support::Props;
 
-/// The key of the shared object `dns.promises` is.
-static PROMISES_KEY: u8 = 0;
+/// The `getaddrinfo` flags `lookup`'s `hints` can have, the values of `dns.ADDRCONFIG`,
+/// `dns.ALL` and `dns.V4MAPPED`.
+const ADDRCONFIG: u32 = 1024;
+const ALL: u32 = 256;
+const V4MAPPED: u32 = 2048;
+
+/// The properties of the result of `dnsPromises.lookupService`.
+pub(crate) static SERVICE_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"hostname"),
+    TemplateKey::Name(c"service"),
+]);
+
+/// The properties of an address a lookup gives.
+static ENTRY_PROPERTIES: PropertyTemplate =
+    PropertyTemplate::new(&[TemplateKey::Name(c"address"), TemplateKey::Name(c"family")]);
+
+/// Intern the keys of the property templates of `node:dns`.
+pub(crate) fn register_templates(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    SERVICE_PROPERTIES.register(scope)?;
+    ENTRY_PROPERTIES.register(scope)?;
+    resolver::register_templates(scope)
+}
 
 /// The order of the addresses a lookup gives.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,10 +77,11 @@ js::instance_local! {
     static DEFAULT_ORDER: Cell<Order> = const { Cell::new(Order::Verbatim) };
 }
 
-/// The options of a lookup: the address family to keep, 0 for both, whether to give every
-/// address, and their order.
-struct LookupOptions {
-    family: u8,
+/// The options of a lookup: the address family to keep, 0 for both, its `getaddrinfo` flags,
+/// whether to give every address, and their order.
+pub(crate) struct LookupOptions {
+    pub(crate) family: u8,
+    pub(crate) hints: u32,
     all: bool,
     order: Order,
 }
@@ -119,13 +146,14 @@ fn boolean_option(
 /// The lookup options the argument `options` gives, as Node.js validates them: a family number,
 /// or an object with `hints`, `family`, `all`, `verbatim` and `order`. The family names `IPv4`
 /// and `IPv6` are accepted if `family_names`.
-fn lookup_options(
+pub(crate) fn lookup_options(
     scope: &Scope<'_>,
     options: Option<HandleValue<'_>>,
     family_names: bool,
 ) -> Result<LookupOptions, Thrown> {
     let mut parsed = LookupOptions {
         family: 0,
+        hints: 0,
         all: false,
         order: DEFAULT_ORDER.with(Cell::get),
     };
@@ -136,7 +164,7 @@ fn lookup_options(
         parsed.family = validate_family(scope, options, "family")?;
         return Ok(parsed);
     }
-    if !options.is_object() && !options.is_null() {
+    if js::function::is_callable(options) || (!options.is_object() && !options.is_null()) {
         return Err(NodeError::invalid_arg_type(
             scope,
             "options",
@@ -149,10 +177,22 @@ fn lookup_options(
         return Ok(parsed);
     };
     let hints = object.val(scope, c"hints")?;
-    if !hints.is_null() && !hints.is_undefined() && !hints.is_number() {
-        return Err(
-            NodeError::invalid_arg_type(scope, "options.hints", "of type number", hints).into(),
-        );
+    if !hints.is_null() && !hints.is_undefined() {
+        if !hints.is_number() {
+            return Err(NodeError::invalid_arg_type(
+                scope,
+                "options.hints",
+                "of type number",
+                hints,
+            )
+            .into());
+        }
+        let flags = crate::dgram::to_uint32(scope, hints)?;
+        if flags & !(ADDRCONFIG | ALL | V4MAPPED) != 0 {
+            let flags = f64::from(flags).to_jsval_throwing(scope)?;
+            return Err(NodeError::invalid_arg_value(scope, "hints", flags, "is invalid").into());
+        }
+        parsed.hints = flags;
     }
     let family = object.val(scope, c"family")?;
     if !family.is_null() && !family.is_undefined() {
@@ -214,31 +254,63 @@ fn family_of(addr: &IpAddr) -> u8 {
     }
 }
 
+/// The addresses of `addrs` that a lookup of the address family `family` with the `getaddrinfo`
+/// flags `hints` gives, in their order: all of them for family 0, and those of the family
+/// otherwise. For family 6 with `V4MAPPED`, the IPv4 addresses mapped to IPv6 follow the IPv6
+/// addresses if there are none or if `hints` also has `ALL`. `ADDRCONFIG` has no effect.
+pub(crate) fn addresses_of_family(addrs: Vec<IpAddr>, family: u8, hints: u32) -> Vec<IpAddr> {
+    if family == 0 {
+        return addrs;
+    }
+    let (wanted, others): (Vec<IpAddr>, Vec<IpAddr>) = addrs
+        .into_iter()
+        .partition(|addr| family_of(addr) == family);
+    if family != 6 || hints & V4MAPPED == 0 || (!wanted.is_empty() && hints & ALL == 0) {
+        return wanted;
+    }
+    let mapped = others.into_iter().filter_map(|addr| match addr {
+        IpAddr::V4(v4) => Some(IpAddr::V6(v4.to_ipv6_mapped())),
+        IpAddr::V6(_) => None,
+    });
+    wanted.into_iter().chain(mapped).collect()
+}
+
 /// A `{ address, family }` object.
 fn entry<'s>(
     scope: &'s Scope<'_>,
     address: Option<&str>,
     family: u8,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let entry = Object::new_plain(scope)?;
-    match address {
-        Some(address) => entry.set_property(scope, c"address", address)?,
-        None => entry.set_property(scope, c"address", js::value::null())?,
-    }
-    entry.set_property(scope, c"family", f64::from(family))?;
-    entry.to_jsval_throwing(scope)
+    let address = match address {
+        Some(address) => address.to_jsval_throwing(scope)?,
+        None => HandleValue::null(),
+    };
+    let family = scope.root_value(js::value::from_f64(f64::from(family)));
+    Object::new_plain_with_template(scope, &ENTRY_PROPERTIES, &[address, family])?
+        .to_jsval_throwing(scope)
 }
 
 /// The result of looking `host` up without the host's lookup, if it needs none: for no host
 /// name, no address, and for an IP address, that address with its own family. The result is an
-/// array of the `{ address, family }` objects if `options.all`, and the first one otherwise.
+/// array of the `{ address, family }` objects if `options.all`, and the first one otherwise. No
+/// host name emits the `DEP0118` deprecation warning for `hostname`, the argument `host` came
+/// from, once per process.
 fn immediate_result<'s>(
     scope: &'s Scope<'_>,
+    hostname: HandleValue<'_>,
     host: Option<&str>,
     options: &LookupOptions,
 ) -> Result<Option<HandleValue<'s>>, ExnThrown> {
     let found = match host {
-        None => None,
+        None => {
+            let message = format!(
+                "The provided hostname \"{}\" is not a valid hostname, and is supported in the dns \
+                 module solely for compatibility.",
+                crate::errors::js_string(scope, hostname)?
+            );
+            crate::process::deprecate_once(scope, &message, "DEP0118")?;
+            None
+        }
         Some(host) if crate::net::is_ipv4(host) => Some((host, 4)),
         Some(host) if crate::net::is_ipv6(host) => Some((host, 6)),
         Some(_) => return Ok(None),
@@ -271,11 +343,11 @@ fn start_lookup<'s>(
                     .hostname(&host)
                     .throw(scope)
             };
-            let mut addrs: Vec<IpAddr> = result
-                .map_err(|error| fail(scope, &error))?
-                .into_iter()
-                .filter(|addr| options.family == 0 || family_of(addr) == options.family)
-                .collect();
+            let mut addrs = addresses_of_family(
+                result.map_err(|error| fail(scope, &error))?,
+                options.family,
+                options.hints,
+            );
             match options.order {
                 Order::Verbatim => {}
                 Order::Ipv4First => addrs.sort_by_key(family_of),
@@ -366,7 +438,7 @@ fn lookup_promise_impl<'s>(
 ) -> Result<js::Promise<'s>, Thrown> {
     let host = validate_hostname(scope, hostname)?;
     let options = lookup_options(scope, options, false)?;
-    if let Some(result) = immediate_result(scope, host.as_deref(), &options)? {
+    if let Some(result) = immediate_result(scope, hostname, host.as_deref(), &options)? {
         let promise = js::Promise::new_pending(scope)?;
         promise.resolve(scope, result)?;
         return Ok(promise);
@@ -417,38 +489,148 @@ fn get_order_callback(
     js::JSString::from_str(scope, name)?.to_jsval_raw_throwing(scope)
 }
 
-/// The object `dns.promises` and `node:dns/promises` export: `lookup`, `setDefaultResultOrder`,
-/// `getDefaultResultOrder`, and stubs for the rest.
-fn promises_object<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
-    let object = js::class::get_or_init_shared_object(
-        scope,
-        &PROMISES_KEY as *const u8 as usize,
-        |scope| {
-            let object = Object::new_plain(scope)?;
-            for &(name, kind) in crate::stub::exports_of("node:dns/promises").unwrap_or_default() {
-                let key = std::ffi::CString::new(name).expect("names have no NULs");
-                let implemented: Option<(u32, js::function::Callback)> = match name {
-                    "lookup" => Some((2, lookup_promise)),
-                    "setDefaultResultOrder" => Some((1, set_order_callback)),
-                    "getDefaultResultOrder" => Some((0, get_order_callback)),
-                    _ => None,
-                };
-                let value = match implemented {
-                    Some((nargs, body)) => Function::new_callback(scope, &key, nargs, body, ())?
-                        .to_jsval_throwing(scope)?,
-                    None => crate::stub::stub_value(scope, "node:dns/promises", name, kind)?,
-                };
-                object.set_property_by_name(scope, &key, value)?;
+/// The address and port that `lookupService` looks up: `address`, an IP address whose IPv6 zone
+/// is the name or number of an interface, and `port`.
+fn service_addr(address: &str, port: u16) -> Option<SocketAddr> {
+    let (ip, zone) = match address.split_once('%') {
+        Some((ip, zone)) => (ip, Some(zone)),
+        None => (address, None),
+    };
+    match ip.parse::<IpAddr>().ok()? {
+        IpAddr::V4(ip) => Some(SocketAddr::new(ip.into(), port)),
+        IpAddr::V6(ip) => {
+            let scope_id = zone
+                .and_then(|zone| {
+                    zone.parse()
+                        .ok()
+                        .or_else(|| platform::net::interface_index(zone))
+                })
+                .unwrap_or(0);
+            Some(SocketAddrV6::new(ip, port, 0, scope_id).into())
+        }
+    }
+}
+
+/// The address of `lookupService` and its port, checked as Node.js checks them.
+fn service_args(
+    scope: &Scope<'_>,
+    address: HandleValue<'_>,
+    port: HandleValue<'_>,
+) -> Result<(String, u16), Thrown> {
+    let text = crate::errors::validate_string(scope, address, "address")?;
+    if !crate::net::is_ipv4(&text) && !crate::net::is_ipv6(&text) {
+        return Err(NodeError::invalid_arg_value(scope, "address", address, "is invalid").into());
+    }
+    let port = crate::net::validate_port(scope, port, "Port")?;
+    Ok((text, port))
+}
+
+/// Start looking up the host and service names of `address` and `port`, and return a promise
+/// for a `{ hostname, service }` object.
+fn start_lookup_service<'s>(
+    scope: &'s Scope<'_>,
+    address: String,
+    port: u16,
+) -> Result<js::Promise<'s>, ExnThrown> {
+    let addr = service_addr(&address, port);
+    let future = async move {
+        let result = match addr {
+            Some(addr) => platform::net::lookup_service(addr).await,
+            None => Err(platform::net::NetError::NoAddress(address.clone())),
+        };
+        PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| match result {
+            Ok((hostname, service)) => {
+                let values = [
+                    hostname.as_str().to_jsval_throwing(scope)?,
+                    service.as_str().to_jsval_throwing(scope)?,
+                ];
+                Object::new_plain_with_template(scope, &SERVICE_PROPERTIES, &values)?
+                    .to_jsval_throwing(scope)
             }
-            Ok(object)
-        },
-    )?;
-    object.to_jsval_throwing(scope)
+            Err(error) => Err(crate::fs::UvError::net(&error, "getnameinfo")
+                .suffix(format!(" {address}"))
+                .hostname(&address)
+                .throw(scope)),
+        }))
+    };
+    let promise = js::Promise::new_pending(scope)?;
+    promise.spawn(PromiseFuture::new(future));
+    Ok(promise)
+}
+
+/// The fulfillment reaction of a callback `lookupService`, whose payload is the callback: call it
+/// with `null` and the `hostname` and `service` of the result.
+fn on_lookup_service(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    callback: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let result = Object::from_value(scope, *args.get(0)).map_err(|e| e.throw(scope))?;
+    let hostname = result.val(scope, c"hostname")?;
+    let service = result.val(scope, c"service")?;
+    crate::support::call_reporting(scope, callback, &[HandleValue::null(), hostname, service])?;
+    Ok(js::value::undefined())
+}
+
+/// The body of `dnsPromises.lookupService(address, port)`.
+fn lookup_service_promise(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let run = || -> Result<js::Promise<'_>, Thrown> {
+        if args.len() != 2 {
+            return Err(NodeError::missing_args(&["address", "port"]).into());
+        }
+        let (address, port) = service_args(scope, args.get(0), args.get(1))?;
+        Ok(start_lookup_service(scope, address, port)?)
+    };
+    let promise = run().map_err(|e| e.throw(scope))?;
+    promise.to_jsval_raw_throwing(scope)
+}
+
+/// The values of the exports of `node:dns/promises`: `lookup`, `lookupService`, `Resolver`,
+/// `setDefaultResultOrder`, `getDefaultResultOrder`, `setServers`, the functions bound to the
+/// default resolver, and the error codes.
+fn promises_exports<'s>(
+    scope: &'s Scope<'_>,
+    name: &'static str,
+) -> Result<Vec<(&'static str, HandleValue<'s>)>, ExnThrown> {
+    let bound = resolver::bound_functions(scope, resolver::default_resolver(scope)?, true)?;
+    let mut exports = Vec::new();
+    for &(export, kind) in crate::stub::exports_of(name).unwrap_or_default() {
+        let function: Option<(&std::ffi::CStr, u32, js::function::Callback)> = match export {
+            "lookup" => Some((c"lookup", 2, lookup_promise)),
+            "lookupService" => Some((c"lookupService", 2, lookup_service_promise)),
+            "setDefaultResultOrder" => Some((c"setDefaultResultOrder", 1, set_order_callback)),
+            "getDefaultResultOrder" => Some((c"getDefaultResultOrder", 0, get_order_callback)),
+            "setServers" => Some((
+                c"defaultResolverSetServers",
+                1,
+                resolver::set_servers_promise,
+            )),
+            _ => None,
+        };
+        let value = if let Some((function_name, nargs, body)) = function {
+            Function::new_callback(scope, function_name, nargs, body, ())?
+                .to_jsval_throwing(scope)?
+        } else if export == "Resolver" {
+            resolver::promises_resolver_class::class_constructor(scope)?.to_jsval_throwing(scope)?
+        } else if let Some((_, value)) = bound.iter().find(|(key, _)| *key == export) {
+            *value
+        } else {
+            crate::stub::stub_value(scope, name, export, kind)?
+        };
+        exports.push((export, value));
+    }
+    Ok(exports)
 }
 
 #[core_runtime::jsmodule(node_args, name = "node:dns", default_namespace)]
 pub mod module {
     use super::*;
+
+    pub use super::resolver::resolver_class as Resolver;
 
     /// <https://nodejs.org/api/dns.html#dnslookuphostname-options-callback>
     #[function(length = 3)]
@@ -478,7 +660,7 @@ pub mod module {
                 callback: Heap::from(callback.get()),
                 all,
             })?;
-        if let Some(result) = immediate_result(scope, host.as_deref(), &options)? {
+        if let Some(result) = immediate_result(scope, hostname, host.as_deref(), &options)? {
             js::jobs::queue_native_tick(scope, on_lookup, request, &[result])?;
             return Ok(Object::new_plain(scope)?);
         }
@@ -486,6 +668,27 @@ pub mod module {
         let on_lookup = Function::new_callback(scope, c"", 1, on_lookup, request)?;
         let on_error = Function::new_callback(scope, c"", 1, on_lookup_error, callback)?;
         promise.add_reactions(scope, Some(*on_lookup), Some(*on_error))?;
+        Ok(Object::new_plain(scope)?)
+    }
+
+    /// <https://nodejs.org/api/dns.html#dnslookupserviceaddress-port-callback>: natively with
+    /// the host's `getnameinfo`. On wasm, the lookup fails with `ENOTSUP`, since `wasi:sockets`
+    /// provides no such lookup.
+    #[function(length = 3)]
+    pub fn lookup_service<'s>(
+        scope: &'s Scope<'_>,
+        args: RestArgs<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        if args.len() != 3 {
+            return Err(NodeError::missing_args(&["address", "port", "callback"]).into());
+        }
+        let (address, port) = service_args(scope, args[0], args[1])?;
+        let callback = args[2];
+        validate_function(scope, callback, "callback")?;
+        let promise = start_lookup_service(scope, address, port)?;
+        let on_service = Function::new_callback(scope, c"", 1, on_lookup_service, callback)?;
+        let on_error = Function::new_callback(scope, c"", 1, on_lookup_error, callback)?;
+        promise.add_reactions(scope, Some(*on_service), Some(*on_error))?;
         Ok(Object::new_plain(scope)?)
     }
 
@@ -506,44 +709,60 @@ pub mod module {
 #[core_runtime::jsmodule(node_args, name = "node:dns/promises", default_namespace)]
 pub mod promises_module {}
 
-/// Register `node:dns` with `promises`, and define Node's `customPromisifyArgs` on `lookup`.
+/// Register `node:dns`: its `promises` is the `default` export of `node:dns/promises`, and the
+/// functions bound to the default resolver are those of [`resolver::bound_functions`]. Defines
+/// Node's `customPromisifyArgs` on `lookup` and `lookupService`.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
-    let Ok(promises) = promises_object(scope) else {
-        return false;
-    };
-    if !crate::stub::register_implemented_with::<module::js_module>(
-        scope,
-        name,
-        &[("promises", promises)],
-    ) {
-        return false;
-    }
-    let mark_lookup = || -> Result<(), ExnThrown> {
-        let namespace = core_runtime::module::builtin_namespace(scope, name)?.ok_or_else(|| {
-            js::error::TypeError(format!("{name} is not a builtin module")).throw(scope)
-        })?;
-        let lookup = namespace.get_property(scope, c"lookup")?;
-        let lookup = Object::from_value(scope, *lookup).map_err(|e| e.throw(scope))?;
-        crate::util::define_promisify_args(scope, lookup, &["address", "family"])
-    };
-    mark_lookup().is_ok()
-}
-
-/// Register `node:dns/promises` with the properties of [`promises_object`].
-pub(crate) fn register_promises(scope: &Scope<'_>, name: &'static str) -> bool {
     let exports = || -> Result<Vec<(&'static str, HandleValue<'_>)>, ExnThrown> {
-        let object = promises_object(scope)?;
-        let object = Object::from_value(scope, *object).map_err(|e| e.throw(scope))?;
-        let mut exports = Vec::new();
-        for &(export, _) in crate::stub::exports_of(name).unwrap_or_default() {
-            let key = std::ffi::CString::new(export).expect("names have no NULs");
-            let value = object.get_property_by_name(scope, &key)?;
-            exports.push((export, scope.root_value(value.get())));
-        }
+        let namespace = core_runtime::module::builtin_namespace(scope, "node:dns/promises")?
+            .ok_or_else(|| {
+                js::error::TypeError("node:dns/promises is not a builtin module".into())
+                    .throw(scope)
+            })?;
+        let promises = namespace.get_property(scope, c"default")?;
+        let resolver = resolver::default_resolver(scope)?;
+        let mut exports = resolver::bound_functions(scope, resolver, false)?;
+        let set_servers = Function::new_callback(
+            scope,
+            c"defaultResolverSetServers",
+            1,
+            resolver::set_servers_callback,
+            (),
+        )?;
+        exports.push(("setServers", set_servers.to_jsval_throwing(scope)?));
+        exports.push(("promises", promises));
         Ok(exports)
     };
     let Ok(exports) = exports() else {
         return false;
     };
+    if !crate::stub::register_implemented_with::<module::js_module>(scope, name, &exports) {
+        return false;
+    }
+    let mark = || -> Result<(), ExnThrown> {
+        let namespace = core_runtime::module::builtin_namespace(scope, name)?.ok_or_else(|| {
+            js::error::TypeError(format!("{name} is not a builtin module")).throw(scope)
+        })?;
+        let lookup = namespace.get_property(scope, c"lookup")?;
+        let lookup = Object::from_value(scope, *lookup).map_err(|e| e.throw(scope))?;
+        crate::util::define_promisify_args(scope, lookup, &["address", "family"])?;
+        let service = namespace.get_property(scope, c"lookupService")?;
+        let service = Object::from_value(scope, *service).map_err(|e| e.throw(scope))?;
+        crate::util::define_promisify_args(scope, service, &["hostname", "service"])
+    };
+    mark().is_ok()
+}
+
+/// Register `node:dns/promises` with the values of [`promises_exports`].
+pub(crate) fn register_promises(scope: &Scope<'_>, name: &'static str) -> bool {
+    let Ok(exports) = promises_exports(scope, name) else {
+        return false;
+    };
     crate::stub::register_implemented_with::<promises_module::js_module>(scope, name, &exports)
+}
+
+/// Register the classes of `node:dns` on `global`.
+pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
+    LookupRequest::add_to_global(scope, global);
+    resolver::register_classes(scope, global)
 }

@@ -12,6 +12,7 @@ pub mod commonjs;
 mod console;
 pub mod constants;
 pub mod crypto;
+pub mod dgram;
 pub mod diagnostics_channel;
 pub mod dns;
 pub mod errors;
@@ -28,6 +29,7 @@ pub mod net;
 pub mod os;
 mod parse_args;
 pub mod path;
+pub mod perf_hooks;
 pub mod process;
 pub mod punycode;
 pub mod querystring;
@@ -43,6 +45,7 @@ pub mod timers;
 pub mod tty;
 pub mod url;
 pub mod util;
+mod vm;
 pub mod zlib;
 
 use core_runtime::module::{register_builtin_module, BuiltinModule};
@@ -67,6 +70,7 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
         "node:buffer" => buffer::register_module(scope, name),
         "node:constants" => constants::register_module(scope, name),
         "node:crypto" => crypto::register_module(scope, name),
+        "node:dgram" => stub::register_implemented::<dgram::module::js_module>(scope, name),
         "node:diagnostics_channel" => {
             stub::register_implemented::<diagnostics_channel::module::js_module>(scope, name)
         }
@@ -90,6 +94,7 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
         "node:url" => url::register_module(scope, name),
         "node:util" => util::register_module(scope, name),
         "node:util/types" => stub::register_implemented::<util::types::js_module>(scope, name),
+        "node:vm" => vm::register_module(scope, name),
         "node:querystring" => {
             stub::register_implemented::<querystring::module::js_module>(scope, name)
         }
@@ -101,6 +106,7 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
         "node:fs" => fs::register_module(scope, name),
         "node:fs/promises" => fs::register_promises(scope, name),
         "node:path" => stub::register_implemented::<path::path::js_module>(scope, name),
+        "node:perf_hooks" => perf_hooks::register_module(scope, name),
         "node:process" => process::register_module(scope, name),
         "node:zlib" => zlib::register_module(scope, name),
         name if internal_modules::is_implemented(name) => internal_modules::register(scope, name),
@@ -114,7 +120,10 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
 /// with `--expose-gc`.
 pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
     let install = || -> Result<(), ExnThrown> {
+        perf_hooks::mark_start();
         register_classes(scope, global)?;
+        perf_hooks::mark_environment();
+        perf_hooks::install(scope)?;
         js::async_context::install_job_queue(scope)?;
         process::install(scope, global)?;
         timers::install(scope, global)?;
@@ -127,7 +136,9 @@ pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
             let gc = js::Function::new_callback(scope, c"gc", 0, collect_garbage, ())?;
             global.define_property(scope, c"gc", *gc, 0)?;
         }
-        global.set_property(scope, c"global", global)
+        global.set_property(scope, c"global", global)?;
+        perf_hooks::mark_bootstrap_complete();
+        Ok(())
     };
     if install().is_err() {
         js::exception::report_and_clear(scope, "installing the Node.js globals");
@@ -138,8 +149,18 @@ pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
 /// Intern the keys of the property templates that the builtins create objects with.
 fn register_templates(scope: &Scope<'_>) -> Result<(), ExnThrown> {
     events::EMITTER_PROPERTIES.register(scope)?;
+    stream::READABLE_PROPERTIES.register(scope)?;
     http::register_templates(scope)?;
-    url::URL_PROPERTIES.register(scope)
+    url::URL_PROPERTIES.register(scope)?;
+    timers::TIMEOUT_PROPERTIES.register(scope)?;
+    timers::IMMEDIATE_PROPERTIES.register(scope)?;
+    timers::ASYNC_RESOURCE_PROPERTIES.register(scope)?;
+    fs::STATS_PROPERTIES.register(scope)?;
+    fs::DIRENT_PROPERTIES.register(scope)?;
+    inspect::CUSTOM_OPTIONS_PROPERTIES.register(scope)?;
+    net::socket::ADDRESS_PROPERTIES.register(scope)?;
+    dns::register_templates(scope)?;
+    test_runner::MOCK_CALL_PROPERTIES.register(scope)
 }
 
 /// Register the classes of the Node.js modules on `global`, without defining their constructors
@@ -148,7 +169,7 @@ fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), Exn
     register_templates(scope)?;
     events::event_emitter::register(scope)?;
     stream::register_classes(scope, global)?;
-    dns::LookupRequest::add_to_global(scope, global);
+    dns::register_classes(scope, global)?;
     events::OnceState::add_to_global(scope, global);
     events::RejectionState::add_to_global(scope, global);
     events_async::OnIteration::add_to_global(scope, global);
@@ -169,6 +190,8 @@ fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), Exn
     buffer::buffer::register(scope)?;
     commonjs::module_class::register(scope)?;
     crypto::register_classes(scope, global)?;
+    dgram::register_classes(scope, global)?;
+    perf_hooks::register_classes(scope, global)?;
     inspect::register_classes(scope, global)?;
     util::register_classes(scope, global);
     diagnostics_channel::register_classes(scope, global)?;
@@ -180,6 +203,7 @@ fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), Exn
     timers::register_classes(scope, global)?;
     tty::read_stream_class::register(scope)?;
     url::url_class::register(scope)?;
+    vm::register_classes(scope, global)?;
     zlib::register_classes(scope)?;
     Ok(())
 }
@@ -211,6 +235,7 @@ fn collect_garbage(
 /// [`runtime_flags::set`] enabled them: the `internal/` modules with `--expose-internals`, and
 /// `stream/iter` and `zlib/iter` with `--experimental-stream-iter`.
 pub fn register() {
+    perf_hooks::register();
     core_runtime::runtime::register_global_initializer(add_to_global);
     core_runtime::runtime::register_resume_fixup(process::on_resume);
     core_runtime::module::set_commonjs_loader(Some(commonjs::load_for_import));

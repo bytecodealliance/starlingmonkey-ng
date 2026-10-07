@@ -267,6 +267,14 @@ pub fn new_buffer<'s>(scope: &'s Scope<'_>, bytes: &[u8]) -> Result<Object<'s>, 
     Ok(array)
 }
 
+/// A new `Buffer` holding a copy of `bytes`.
+pub(crate) fn buffer_from_vec<'s>(
+    scope: &'s Scope<'_>,
+    bytes: Vec<u8>,
+) -> Result<Object<'s>, ExnThrown> {
+    new_buffer(scope, &bytes)
+}
+
 /// A new zero-filled `Buffer` of `length` bytes.
 fn new_zeroed_buffer<'s>(scope: &'s Scope<'_>, length: usize) -> Result<Object<'s>, ExnThrown> {
     let array = js::Uint8Array::new(scope, length)?;
@@ -275,7 +283,7 @@ fn new_zeroed_buffer<'s>(scope: &'s Scope<'_>, length: usize) -> Result<Object<'
     Ok(array)
 }
 
-/// A new `Buffer` of `length` bytes that `fill` writes. `fill` must not call into SpiderMonkey.
+/// A new `Buffer` of `length` bytes that `fill` writes.
 pub(crate) fn new_buffer_with<'s>(
     scope: &'s Scope<'_>,
     length: usize,
@@ -623,11 +631,12 @@ fn index_of(
         }
     };
     let (offset, end) = (integer(offset), integer(end));
+    let search = |needle: &Needle| {
+        view.with_bytes(|haystack| search_haystack(haystack, needle, offset, end, forward))
+    };
     if value.is_number() {
         let needle = Needle::Byte(to_uint8(value.to_number()));
-        return Ok(
-            view.with_bytes(|haystack| search_haystack(haystack, &needle, offset, end, forward))
-        );
+        return Ok(search(&needle));
     }
     let encoding_value = encoding.filter(|encoding| !encoding.is_undefined());
     let found = match encoding_value {
@@ -664,7 +673,7 @@ fn index_of(
         )
         .into());
     };
-    Ok(view.with_bytes(|haystack| search_haystack(haystack, &needle, offset, end, forward)))
+    Ok(search(&needle))
 }
 
 // ============================================================================
@@ -1109,7 +1118,7 @@ fn write_number(
             return Err(out_of_bounds(None));
         }
         view.with_bytes_mut(|target| {
-            target[offset..offset + width].copy_from_slice(&bytes[..width])
+            target[offset..offset + width].copy_from_slice(&bytes[..width]);
         });
         Ok(js::value::from_f64((offset + width) as f64))
     };
@@ -1426,7 +1435,11 @@ fn slice_as<'s>(
         )
         .into());
     }
-    let bytes = view.with_bytes(|bytes| bytes[start..end].to_vec());
+    let bytes = view.with_bytes(|bytes| js::typedarray::try_copy(&bytes[start..end]));
+    let bytes = bytes.ok_or_else(|| {
+        js::exception::report_out_of_memory(scope);
+        Thrown::Pending
+    })?;
     Ok(decode_bytes(scope, &bytes, encoding)?)
 }
 
@@ -1960,7 +1973,11 @@ pub mod buffer {
         // The conversions can run JS that shrinks the buffer.
         let end = (end as usize).min(view.byte_length());
         let start = (start as usize).min(end);
-        let bytes = view.with_bytes(|bytes| bytes[start..end].to_vec());
+        let bytes = view.with_bytes(|bytes| js::typedarray::try_copy(&bytes[start..end]));
+        let bytes = bytes.ok_or_else(|| {
+            js::exception::report_out_of_memory(scope);
+            Thrown::Pending
+        })?;
         Ok(decode_bytes(scope, &bytes, encoding)?)
     }
 
@@ -2041,8 +2058,12 @@ pub mod buffer {
         if end <= start {
             return Ok(new_buffer(scope, &[])?);
         }
-        let bytes =
-            typed.with_bytes(|bytes| bytes[start * element_size..end * element_size].to_vec());
+        let range = start * element_size..end * element_size;
+        let bytes = typed.with_bytes(|bytes| js::typedarray::try_copy(&bytes[range]));
+        let bytes = bytes.ok_or_else(|| {
+            js::exception::report_out_of_memory(scope);
+            Thrown::Pending
+        })?;
         Ok(new_buffer(scope, &bytes)?)
     }
 
@@ -2335,7 +2356,7 @@ pub mod buffer {
             (target_start as usize, source_start as usize, count as usize);
         target.with_bytes_mut(|target| {
             target[target_start..target_start + count]
-                .copy_from_slice(&source[source_start..source_start + count])
+                .copy_from_slice(&source[source_start..source_start + count]);
         });
         Ok(count as f64)
     }

@@ -1951,9 +1951,336 @@ const httpGenerator = {
   },
 };
 
+/**
+ * Code for a script that runs in a context whose contextified object has `a`, `b` and `f`: up to
+ * three statements, or one that throws. A `var` declaration whose initializer doesn't run defines
+ * the variable on the contextified object, which Node.js doesn't, so throwing statements stand
+ * alone.
+ */
+function contextCode(g) {
+  if (g.chance(0.2)) {
+    return g.pick(["nope", "'use strict'; undeclared = 1", "throw new Error('thrown')", "throw a", "null.x"]);
+  }
+  const statements = g.many(g.range(1, 3), () =>
+    g.pick([
+      "x = 1", "var y = 2", "function h() { return 3; } h()", "let z = 4; z", "const k = [a, b]; k", "a + b", "a++",
+      "b = 'str'", "typeof process", "typeof require", "typeof Object", "typeof console", "this.q = 5", "globalThis.w = 6",
+      "globalThis.a", "[1, 2].map((v) => v * a)", "JSON.stringify({ a, b })", "eval('a + 1')", "new Function('return a')()",
+      "f(2)", "Object.getPrototypeOf([]) === Array.prototype", "(() => { var inner = 7; return inner; })()", "var a = 10; a",
+      "Array.isArray([])", "typeof setTimeout", "Math.max(a, b)",
+    ]),
+  );
+  return statements.join(";\n");
+}
+
+const vmGenerator = {
+  name: "vm",
+  variants: {
+    context: (g) => {
+      const code = contextCode(g);
+      const options = g.pick(["", ", \"file.js\"", ", { filename: \"f.js\", lineOffset: 2 }", ", { timeout: 1000 }"]);
+      const run = g.pick([
+        `vm.runInNewContext(${g.lit(code)}, sandbox${options})`,
+        `(vm.createContext(sandbox), vm.runInContext(${g.lit(code)}, sandbox${options}))`,
+        `new vm.Script(${g.lit(code)}).runInNewContext(sandbox)`,
+      ]);
+      return `const vm = require("node:vm");\nconst sandbox = { a: 1, b: 2, f(n) { return n * 2; } };\nlet result;\ntry {\n  result = ${run};\n} catch (error) {\n  result = ["threw", error?.name ?? error];\n}\nreturn { result: JSON.stringify(result) ?? String(result), sandbox: Object.keys(sandbox).sort().map((key) => [key, typeof sandbox[key], JSON.stringify(sandbox[key])]) };`;
+    },
+    "this-context": (g) => {
+      const code = g.pick(["1 + 1", "typeof require", "typeof process", "(() => { const t = 3; return t; })()", "(function () { return typeof this; })()", "[typeof Buffer, typeof globalThis]"]);
+      return `const vm = require("node:vm");\nreturn vm.runInThisContext(${g.lit(code)});`;
+    },
+    script: (g) => {
+      const code = g.pick(["count = (typeof count === 'number' ? count : 0) + 1", "var seen = (seen || 0) + 1; seen", "typeof a", "a.push(a.length); a.length"]);
+      return `const vm = require("node:vm");\nconst script = new vm.Script(${g.lit(code)});\nconst sandbox = vm.createContext({ a: [] });\nconst results = [script.runInContext(sandbox), script.runInContext(sandbox), script.runInNewContext({ a: [1] })];\nreturn { results, keys: Object.keys(script), sandbox: JSON.stringify(sandbox) };`;
+    },
+    "compile-function": (g) => {
+      // Node.js's compile cache returns the function compiled earlier from the same source and parameters, ignoring
+      // the contextExtensions of the later call, so each body is unique.
+      const body = `${g.pick(["return a + b", "return typeof c", "return c", "return this === undefined", "'use strict'; return this", "return arguments.length", "var v = 1; return v"])} // ${g.int(1e9)}`;
+      const params = g.pick([undefined, [], ["a"], ["a", "b"], ["c"]]);
+      const options = g.pick([undefined, {}, { contextExtensions: [{ c: 3 }] }, { filename: "cf.js" }, { __raw: "{ parsingContext: vm.createContext({ c: 4 }) }" }]);
+      return `const vm = require("node:vm");\nconst fn = vm.compileFunction(${args(g, body, params, options)});\nreturn [fn.name, fn.length, fn(1, 2)];`;
+    },
+    validation: (g) => {
+      const value = g.lit(g.pick([undefined, null, 1, "s", true, {}, [], { __raw: "Symbol(\"s\")" }, { __raw: "() => {}" }]));
+      const call = g.pick([
+        `vm.createContext(${value})`,
+        `vm.createContext({}, ${value})`,
+        `vm.createContext({}, { name: ${value} })`,
+        `vm.createContext({}, { codeGeneration: ${value} })`,
+        `vm.createContext({}, { microtaskMode: ${value} })`,
+        `vm.isContext(${value})`,
+        `vm.runInContext("1", ${value})`,
+        `vm.runInNewContext("1", ${value})`,
+        `vm.runInThisContext("1", ${value})`,
+        `new vm.Script("1", ${value})`,
+        `new vm.Script("1", { filename: ${value} })`,
+        `new vm.Script("1", { lineOffset: ${g.lit(g.number())} })`,
+        `new vm.Script("1", { columnOffset: ${g.lit(g.number())} })`,
+        `new vm.Script("1", { cachedData: ${value} })`,
+        `new vm.Script("1", { produceCachedData: ${value} })`,
+        `new vm.Script("1", { importModuleDynamically: ${value} })`,
+        `new vm.Script("1").runInThisContext({ timeout: ${g.lit(g.number())} })`,
+        `new vm.Script("1").runInThisContext({ displayErrors: ${value} })`,
+        `new vm.Script("1").runInThisContext({ breakOnSigint: ${value} })`,
+        `new vm.Script("1").runInContext(${value})`,
+        `vm.compileFunction(${value})`,
+        `vm.compileFunction("", ${value})`,
+        `vm.compileFunction("", [], ${value})`,
+        `vm.compileFunction("", [], { contextExtensions: ${value} })`,
+        `vm.compileFunction("", [], { parsingContext: ${value} })`,
+        `vm.measureMemory(${value})`,
+        `vm.measureMemory({ mode: ${value} })`,
+      ]);
+      return `const vm = require("node:vm");\nconst result = ${call};\nreturn typeof result === "object" && result !== null ? Object.keys(result).length : result;`;
+    },
+  },
+};
+
+/** An argument of a `dgram` send: buffers, strings, lists, and values of other types. */
+function dgramMessage(g) {
+  return g.pick([
+    () => bufferExpr(g),
+    () => g.lit(g.string(6)),
+    () => `[${g.many(g.range(0, 3), () => (g.chance(0.5) ? bufferExpr(g) : g.lit(g.string(4)))).join(", ")}]`,
+    () => `new Uint8Array(${g.int(4)})`,
+    () => `new DataView(new ArrayBuffer(${g.int(4)}))`,
+    () => g.pick(["1", "null", "undefined", "{}", "[1]", "[\"a\", 2]", "true"]),
+  ])();
+}
+
+/** A port argument of a `dgram` method, mostly valid. */
+function dgramPort(g) {
+  return g.lit(g.chance(0.4) ? g.pick([0, 1, 65535, 65536, -1, 1.5, "80", "", " ", "0", NaN, null, undefined, true]) : g.range(1, 65535));
+}
+
+/** An address argument of a `dgram` method. */
+function dgramAddress(g) {
+  return g.lit(g.pick(["127.0.0.1", "::1", "localhost", "", undefined, null, 1, "256.1.1.1", "not an address", "0.0.0.0", "::"]));
+}
+
+/** The code and name of the error `f` throws, or `ok`. */
+const DGRAM_RECORD = `const errors = [];\nconst record = (f) => { try { const value = f(); errors.push(typeof value === "object" && value !== null ? "object" : value); } catch (e) { errors.push([e.name, e.code, e.syscall]); } };`;
+
+const dgramGenerator = {
+  name: "dgram",
+  variants: {
+    // `send`'s argument forms on an unbound socket, which bind it unless they throw.
+    send: (g) => {
+      const type = g.pick(["udp4", "udp6"]);
+      const callArgs = g.pick([
+        () => [dgramMessage(g), dgramPort(g)],
+        () => [dgramMessage(g), dgramPort(g), dgramAddress(g)],
+        () => [dgramMessage(g), dgramPort(g), dgramAddress(g), "() => {}"],
+        () => [dgramMessage(g), g.lit(g.index(4)), g.lit(g.index(4)), dgramPort(g), dgramAddress(g)],
+        () => [dgramMessage(g), g.lit(g.index(4)), g.lit(g.index(4)), dgramPort(g)],
+        () => [dgramMessage(g), "() => {}"],
+        () => [dgramMessage(g)],
+      ])();
+      return [
+        `const dgram = require("node:dgram");`,
+        DGRAM_RECORD,
+        `const s = dgram.createSocket(${g.lit(type)});`,
+        `s.on("error", () => {});`,
+        `record(() => s.send(${callArgs.join(", ")}));`,
+        `record(() => s.getSendQueueCount());`,
+        `s.close();`,
+        `return errors;`,
+      ].join("\n");
+    },
+    // `sendto`, `connect`, `bind` and `bindSync` argument errors.
+    validation: (g) => {
+      const call = g.pick([
+        () => `s.sendto(${dgramMessage(g)}, ${g.lit(g.number())}, ${g.lit(g.number())}, ${dgramPort(g)}, ${dgramAddress(g)})`,
+        () => `s.connect(${dgramPort(g)}, ${dgramAddress(g)})`,
+        () => `s.connectSync(${dgramPort(g)}, ${dgramAddress(g)})`,
+        () => `s.bindSync(${g.pick(["", "{}", "null", "[]", "1", `{ port: ${dgramPort(g)} }`, `{ address: ${dgramAddress(g)} }`])})`,
+        () => `s.disconnect()`,
+        () => `s.remoteAddress()`,
+        () => `s.address()`,
+      ])();
+      return [
+        `const dgram = require("node:dgram");`,
+        DGRAM_RECORD,
+        `const s = dgram.createSocket(${g.lit(g.pick(["udp4", "udp6"]))});`,
+        `s.on("error", () => {});`,
+        `record(() => ${call});`,
+        `record(() => s.close());`,
+        `return errors;`,
+      ].join("\n");
+    },
+    // `createSocket`'s types and options.
+    options: (g) => {
+      const option = g.pick([
+        () => g.lit(g.pick(["udp4", "udp6", "udp", "UDP4", "tcp", 4, null, undefined])),
+        () => `{ type: ${g.lit(g.pick(["udp4", "udp6", "udp7", undefined]))}, ${g.pick(["recvBufferSize", "sendBufferSize"])}: ${g.lit(g.number())} }`,
+        () => `{ type: "udp4", lookup: ${g.pick(["1", "null", "undefined", "() => {}", "\"x\"", "{}"])} }`,
+        () => `{ type: "udp4", ${g.pick(["receiveBlockList", "sendBlockList"])}: ${g.pick(["{}", "1", "null", "new (require(\"node:net\").BlockList)()"])} }`,
+        () => `{ type: "udp4", signal: ${g.pick(["1", "{}", "null", "AbortSignal.abort()", "new AbortController().signal"])} }`,
+      ])();
+      return [
+        `const dgram = require("node:dgram");`,
+        `let s;`,
+        `try { s = dgram.createSocket(${option}); } catch (e) { return [e.name, e.code]; }`,
+        `const type = s.type;`,
+        `try { s.close(); } catch (e) { return [type, e.code]; }`,
+        `return type;`,
+      ].join("\n");
+    },
+    // The option methods on an unbound, a bound and a closed socket. Memberships are left out
+    // on unbound sockets, which Node.js binds for them and the runtime doesn't.
+    methods: (g) => {
+      const state = g.pick(["unbound", "bound", "closed"]);
+      const memberships = [
+        () => `s.${g.pick(["addMembership", "dropMembership"])}(${dgramAddress(g)})`,
+        () => `s.${g.pick(["addSourceSpecificMembership", "dropSourceSpecificMembership"])}(${dgramAddress(g)}, ${dgramAddress(g)})`,
+      ];
+      const calls = g.many(g.range(1, 4), () =>
+        g.pick([
+          ...(state === "unbound" ? [] : memberships),
+          () => `s.setTTL(${g.lit(g.number())})`,
+          () => `s.setMulticastTTL(${g.lit(g.number())})`,
+          () => `s.setBroadcast(${g.lit(g.pick([true, false, 1, undefined]))})`,
+          () => `s.setMulticastLoopback(${g.lit(g.pick([true, false, 16, 0, undefined]))})`,
+          () => `s.setMulticastInterface(${dgramAddress(g)})`,
+          () => `s.${g.pick(["setRecvBufferSize", "setSendBufferSize"])}(${g.lit(g.pick([0, 1, 4096, -1, NaN, 1.5, "1", undefined, null, 2 ** 32]))})`,
+          () => `typeof s.${g.pick(["getRecvBufferSize", "getSendBufferSize"])}()`,
+          () => `s.${g.pick(["getSendQueueSize", "getSendQueueCount"])}()`,
+          () => `s.${g.pick(["ref", "unref"])}() === s`,
+        ])(),
+      );
+      return [
+        `const dgram = require("node:dgram");`,
+        DGRAM_RECORD,
+        `const s = dgram.createSocket(${g.lit(g.pick(["udp4", "udp4", "udp6"]))});`,
+        state === "bound" ? `await new Promise((resolve) => s.bind(0, resolve));` : "",
+        state === "closed" ? `s.close();` : "",
+        ...calls.map((call) => `record(() => ${call});`),
+        state === "closed" ? "" : `s.close();`,
+        `return errors;`,
+      ].join("\n");
+    },
+    // A datagram sent to a socket on the loopback interface, and what it receives.
+    loopback: (g) => {
+      const message = g.pick([
+        () => bufferExpr(g),
+        () => g.lit(g.string(6)),
+        () => `[${g.many(g.range(0, 3), () => bufferExpr(g)).join(", ")}]`,
+      ])();
+      const connected = g.chance(0.3);
+      return [
+        `const dgram = require("node:dgram");`,
+        `const server = dgram.createSocket("udp4");`,
+        `await new Promise((resolve) => server.bind(0, "127.0.0.1", resolve));`,
+        `const port = server.address().port;`,
+        `const client = dgram.createSocket("udp4");`,
+        `const received = new Promise((resolve) => server.once("message", (msg, rinfo) => resolve([msg.toString("hex"), rinfo.size, rinfo.family, Object.keys(rinfo)])));`,
+        connected
+          ? `await new Promise((resolve) => client.connect(port, "127.0.0.1", resolve));\nconst sent = await new Promise((resolve) => client.send(${message}, (...args) => resolve(args)));`
+          : `const sent = await new Promise((resolve) => client.send(${message}, port, "127.0.0.1", (...args) => resolve(args)));`,
+        `const result = [sent, await received];`,
+        `client.close();`,
+        `server.close();`,
+        `return result;`,
+      ].join("\n");
+    },
+    shape: () =>
+      [
+        `const { Socket, createSocket } = require("node:dgram");`,
+        `const proto = Object.getOwnPropertyNames(Socket.prototype).sort().map((name) => { const d = Object.getOwnPropertyDescriptor(Socket.prototype, name); return [name, d.enumerable, typeof d.value === "function" ? d.value.length : typeof d.get]; });`,
+        `const s = createSocket("udp4");`,
+        `const own = Object.keys(s);`,
+        `s.close();`,
+        `return [Socket.length, createSocket.length, proto, own, typeof Socket.prototype[Symbol.asyncDispose]];`,
+      ].join("\n"),
+  },
+};
+
+/** A server string for `setServers`, valid or not. */
+function dnsServer(g) {
+  return g.pick([
+    () => g.pick(["1.2.3.4", "::1", "8.8.8.8", "2001:4860:4860::8888", "::ffff:1.2.3.4", "::1:53", "0.0.0.0", "fe80::1%lo0"]),
+    () => `${g.pick(["1.2.3.4", "127.0.0.1"])}:${g.pick([0, 53, 54, 5353, 65535, 65536, "", "x", "0x10", "00053"])}`,
+    () => `[${g.pick(["::1", "1.2.3.4", "fe80::1", "", "x"])}]${g.pick(["", ":", ":53", ":54", ":99999", "x", ":0"])}`,
+    // Lone surrogates are replaced: error messages are Rust strings, which can't hold them.
+    () => g.string(10).replace(/[\ud800-\udfff]/g, "?"),
+  ])();
+}
+
+/** A query name, valid or not, that needs no name server: the resolver has none. */
+function dnsName(g) {
+  return g.pick([
+    () => g.pick(["a.test", "", ".", "a..b", ".a", "a.", "x.onion", "X.ONION.", "a b", "a$b", "a_b", "a\\.b", "a\\066", "a\\256", "a\\", "bücher.test", "a‍b", "a\u0000b"]),
+    () => `${"x".repeat(g.pick([62, 63, 64]))}.test`,
+    () => g.many(g.range(1, 6), () => "y".repeat(g.range(1, 63))).join("."),
+    () => g.string(16),
+  ])();
+}
+
+// Returned promises are caught, and request objects are recorded as "object", since Node.js's have
+// an `oncomplete` function.
+const DNS_RECORD = `const out = [];\nconst record = (f) => { try { const value = f(); if (value instanceof Promise) value.catch(() => {}); out.push(value instanceof Promise ? "promise" : typeof value === "object" && value !== null ? "object" : value); } catch (e) { out.push([e.name, e.code, e.message]); } };`;
+
+const dnsGenerator = {
+  name: "dns",
+  variants: {
+    // `setServers` parsing, deduplication and `getServers` formatting.
+    servers: (g) => {
+      const servers = g.many(g.range(0, 4), () => dnsServer(g));
+      return [
+        `const dns = require("node:dns");`,
+        DNS_RECORD,
+        `const r = new dns.${g.pick(["Resolver", "promises.Resolver"])}();`,
+        `record(() => r.setServers(${g.lit(g.chance(0.9) ? servers : g.pick([null, "1.2.3.4", [1], [{}]]))}));`,
+        `out.push(r.getServers());`,
+        `return out;`,
+      ].join("\n");
+    },
+    // Constructor options and argument validation of the resolver methods.
+    validation: (g) => {
+      // Node.js aborts for a `maxTimeout` above 2 ** 31 - 1, which its validation accepts.
+      const option = g.pick(["timeout", "tries", "maxTimeout"]);
+      const large = option === "maxTimeout" ? [] : [2 ** 31, 2 ** 32];
+      const value = () => g.lit(g.pick([undefined, null, -1, 0, 1, 1.5, -0, NaN, "1", true, {}, [], ...large]));
+      const call = g.pick([
+        () => `new dns.Resolver({ ${option}: ${value()} })`,
+        () => `new dns.promises.Resolver(${g.pick(["5", "'x'", "null", "{}"])}).getServers().length > 0`,
+        () => `r.${g.pick(["resolve4", "resolveMx", "reverse", "resolveAny"])}(${g.lit(g.pick(["a.test", 5, null, undefined]))}${g.pick(["", ", {}", ", () => {}", ", {}, 5"])})`,
+        () => `r.resolve("a.test", ${g.lit(g.pick(["A", "a", "BOGUS", "__proto__", 5, null]))}${g.pick(["", ", 5", ", () => {}"])})`,
+        () => `p.resolve(${g.lit(g.pick(["a.test", 5]))}, ${g.lit(g.pick(["A", "BOGUS", "__proto__", 5, undefined]))})`,
+        () => `r.setLocalAddress(${g.lit(g.pick(["1.2.3.4", "::1", "x", 5, undefined]))}, ${g.lit(g.pick(["1.2.3.4", "::1", "x", 5, undefined]))})`,
+        () => `dns.lookupService(${g.lit(g.pick(["x", 5]))}, ${g.lit(g.pick([80, -1, 65536, "80", null]))}${g.pick(["", ", 5", ", () => {}"])})`,
+        () => `dns.lookup("", { hints: ${g.lit(g.pick([0, 1024, 256 | 2048, 1, 3329, "1", -1]))} }, () => {})`,
+      ])();
+      return [
+        `const dns = require("node:dns");`,
+        DNS_RECORD,
+        `const r = new dns.Resolver();`,
+        `r.setServers([]);`,
+        `const p = new dns.promises.Resolver();`,
+        `p.setServers([]);`,
+        `record(() => ${call});`,
+        `return out;`,
+      ].join("\n");
+    },
+    // Queries that fail before any server is asked: without servers, bad names and `.onion`.
+    offline: (g) => {
+      const method = g.pick(["resolve4", "resolve6", "resolveTxt", "resolveSrv", "resolveAny", "reverse"]);
+      // `reverse` queries addresses outside `/etc/hosts`, which only Node.js consults.
+      const name = method === "reverse" ? g.pick(["192.0.2.1", "2001:db8::1", "nope", "01.2.3.4", "fe80::1%lo0"]) : dnsName(g);
+      return [
+        `const r = new (require("node:dns").promises.Resolver)();`,
+        `r.setServers([]);`,
+        `try { return await r.${method}(${g.lit(name)}); } catch (e) { return [e.code, e.syscall, e.message, Object.keys(e)]; }`,
+      ].join("\n");
+    },
+  },
+};
+
 export const GENERATORS = [
   buffer, stringDecoder, path, querystring, crypto, events, stream, fsGenerator, zlib, util, assert, url, timers, punycode, os,
-  processGenerator, shape, stackTrace, testRunner, netGenerator, httpGenerator,
+  processGenerator, shape, stackTrace, testRunner, netGenerator, httpGenerator, vmGenerator, dgramGenerator, dnsGenerator,
 ];
 
 /** An operation drawn from a random variant of `generator` with `g`. */

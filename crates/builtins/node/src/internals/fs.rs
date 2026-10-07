@@ -143,12 +143,7 @@ fn join(scope: &Scope<'_>, path: HandleValue<'_>, name: HandleValue<'_>) -> Resu
         let view = Object::from_value(scope, value)
             .ok()
             .and_then(js::ArrayBufferView::from_object);
-        let Some(view) = view else {
-            return Ok(None);
-        };
-        Ok(Some(
-            String::from_utf8_lossy(&view.copy_bytes(scope)?).into_owned(),
-        ))
+        Ok(view.map(|view| view.with_bytes(|bytes| String::from_utf8_lossy(bytes).into_owned())))
     };
     let invalid = || {
         NodeError::invalid_arg_type(

@@ -9,6 +9,8 @@ mod binding;
 mod fs;
 mod functions;
 
+pub(crate) use functions::warn_experimental;
+
 use std::ffi::{CStr, CString};
 
 use js::conversion::ToJSVal;

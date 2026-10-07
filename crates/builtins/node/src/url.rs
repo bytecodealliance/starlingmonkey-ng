@@ -53,7 +53,7 @@ fn is_hostless(protocol: Option<&str>) -> bool {
 }
 
 /// The realm's `URL` constructor.
-fn url_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+pub(crate) fn url_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
     js::class::class_constructor::<web_url::url::URLImpl>(scope)
 }
 
@@ -1010,9 +1010,14 @@ fn write_field<'w>(
 
 /// Set the fields of `target` to those of `url`, creating them as `init` creates properties. A
 /// `query` object is the `query` of `this` or `relative`, by its origin.
-fn write_legacy_url(
-    scope: &Scope<'_>,
-    target: Object<'_>,
+///
+/// # Safety
+///
+/// With [`PropertyInit::Define`], `target` is a `url.Url` this module just created, which nothing
+/// else references, and `this` and `relative` don't reference it.
+unsafe fn write_legacy_url<'w>(
+    scope: &'w Scope<'_>,
+    target: Object<'w>,
     url: &LegacyUrl,
     this: Option<Object<'_>>,
     relative: Option<Object<'_>>,
@@ -1057,15 +1062,15 @@ fn write_legacy_url(
     write_field(scope, &mut properties, c"pathname", &url.pathname)?;
     write_field(scope, &mut properties, c"path", &url.path)?;
     write_field(scope, &mut properties, c"href", &url.href)?;
-    properties.finish(scope)?;
-    Ok(())
+    Ok(properties.finish(scope)?)
 }
 
 /// A new `url.Url` with the fields of `url`, as `new Url()` creates it followed by assignments of
 /// the fields.
 fn new_url<'s>(scope: &'s Scope<'_>, url: &LegacyUrl) -> Result<Object<'s>, Thrown> {
     let object = url_class::new_instance(scope)?;
-    write_legacy_url(scope, object, url, None, None, PropertyInit::Define)?;
+    // SAFETY: `object` was just created, and nothing else references it.
+    unsafe { write_legacy_url(scope, object, url, None, None, PropertyInit::Define) }?;
     Ok(object)
 }
 
@@ -1105,14 +1110,17 @@ fn resolve_object_of<'s>(
     if let Some(relative) = relative.filter(|_| copy != Copy::Nothing) {
         result.assign(scope, relative)?;
     }
-    write_legacy_url(
-        scope,
-        result,
-        &resolved,
-        Some(this),
-        relative,
-        PropertyInit::Assign,
-    )?;
+    // SAFETY: `Assign` has no requirements.
+    unsafe {
+        write_legacy_url(
+            scope,
+            result,
+            &resolved,
+            Some(this),
+            relative,
+            PropertyInit::Assign,
+        )
+    }?;
     Ok(result)
 }
 
@@ -1147,7 +1155,7 @@ fn flag(value: Option<HandleValue<'_>>) -> bool {
     value.is_some_and(js::conversion::to_boolean)
 }
 
-#[core_runtime::jsfunction_class(name = "Url")]
+#[core_runtime::jsfunction_class(name = "Url", templates = "URL_PROPERTIES")]
 pub mod url_class {
     use super::*;
 
@@ -1167,14 +1175,17 @@ pub mod url_class {
         let key = std::ptr::from_ref(&EMPTY_URL).addr();
         js::class::get_or_init_shared_object(scope, key, |scope| {
             let empty = Object::new_plain_with_proto(scope, proto.handle())?;
-            write_legacy_url(
-                scope,
-                empty,
-                &LegacyUrl::default(),
-                None,
-                None,
-                PropertyInit::Define,
-            )
+            // SAFETY: `empty` was just created, and nothing else references it.
+            unsafe {
+                write_legacy_url(
+                    scope,
+                    empty,
+                    &LegacyUrl::default(),
+                    None,
+                    None,
+                    PropertyInit::Define,
+                )
+            }
             .map_err(|thrown| thrown.throw(scope))?;
             Ok(empty)
         })?;
@@ -1197,7 +1208,8 @@ pub mod url_class {
             flag(parse_query_string),
             flag(slashes_denote_host),
         )?;
-        write_legacy_url(scope, this, &parsed, None, None, PropertyInit::Assign)?;
+        // SAFETY: `Assign` has no requirements.
+        unsafe { write_legacy_url(scope, this, &parsed, None, None, PropertyInit::Assign) }?;
         Ok(this)
     }
 
@@ -1240,15 +1252,6 @@ pub mod url_class {
         }
         Ok(())
     }
-}
-
-/// `ERR_MISSING_ARGS` for the argument `name`.
-fn missing_args(name: &str) -> NodeError {
-    NodeError::new(
-        ErrorKind::TypeError,
-        "ERR_MISSING_ARGS",
-        format!("The \"{name}\" argument must be specified"),
-    )
 }
 
 /// The hostname of the `ws:` URL whose hostname is set to `domain`, or `None` if that fails or
@@ -1368,7 +1371,7 @@ pub mod module {
         scope: &Scope<'_>,
         domain: Option<HandleValue<'_>>,
     ) -> Result<String, Thrown> {
-        let domain = domain.ok_or_else(|| missing_args("domain"))?;
+        let domain = domain.ok_or_else(|| NodeError::missing_args(&["domain"]))?;
         Ok(ascii_hostname(scope, domain)?.unwrap_or_default())
     }
 
@@ -1378,7 +1381,7 @@ pub mod module {
         scope: &Scope<'_>,
         domain: Option<HandleValue<'_>>,
     ) -> Result<String, Thrown> {
-        let domain = domain.ok_or_else(|| missing_args("domain"))?;
+        let domain = domain.ok_or_else(|| NodeError::missing_args(&["domain"]))?;
         Ok(ascii_hostname(scope, domain)?
             .map(|host| idna::domain_to_unicode(&host).0)
             .unwrap_or_default())
@@ -1500,6 +1503,11 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let globals = || -> Result<Vec<(&'static str, HandleValue<'_>)>, ExnThrown> {
         Ok(vec![
             ("URL", url_constructor(scope)?.to_jsval_throwing(scope)?),
+            (
+                "URLPattern",
+                js::class::class_constructor::<web_url::url_pattern::URLPatternImpl>(scope)?
+                    .to_jsval_throwing(scope)?,
+            ),
             (
                 "URLSearchParams",
                 js::class::class_constructor::<web_url::url_search_params::URLSearchParamsImpl>(

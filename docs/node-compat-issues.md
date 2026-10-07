@@ -10,16 +10,12 @@ the end. Check that an item still applies before working on it, and remove it on
 Ordered by the use real applications make of them, not by the number of Node.js tests they
 unblock:
 
-1. `node:vm`: `createContext`, `runInContext`, `runInNewContext`, `runInThisContext`, `Script`
-   and `compileFunction`. About 80 Node.js tests fail on it.
-2. Web globals that Node.js has: `CompressionStream` and `DecompressionStream`,
-   `TextEncoderStream` and `TextDecoderStream`, `MessageChannel` and `MessagePort`, which React's
-   scheduler uses, and `URLPattern`.
-3. `node:dgram`, for UDP clients such as statsd and DNS clients. 73 Node.js tests fail on it.
-4. An HTTP client on the runtime's own sockets, for protocol upgrades (the `ws` client), 1xx
-   responses and Node's header handling (see "The HTTP client").
-5. `perf_hooks` (`PerformanceObserver`, histograms, `timerify`), `dns.Resolver`, `domain` and the
-   global `WebSocket`.
+1. `domain` and the global `WebSocket`.
+2. Node's error codes from the web classes in `--node-compat` mode. Node.js implements its web
+   classes (`performance`, `MessagePort`, `CompressionStream` and others) on its own validators, so
+   their argument errors carry codes such as `ERR_INVALID_ARG_TYPE` and `ERR_MISSING_ARGS`. The
+   web builtins throw plain `TypeError`s. One shared mechanism in the WebIDL conversions would
+   cover all of them.
 
 Node.js internals that only Node's own tests load (`internal/repl`, `internal/webstreams/*`,
 `internal/dgram` and others) and `repl`, `child_process`, `cluster` and `worker_threads` come
@@ -29,10 +25,12 @@ after these.
 
 ### Regressions and unexplained failures
 
-- **Three HTTP tests fail on wasm only.** `test-http-extra-response`, `test-http-keepalive-client`
-  and `test-http-keepalive-request` pass natively and fail on wasm since the net and http state
-  refactor (b2cfbf68). `expectations.json` records them with a `wasm_status` of `FAIL`, so the
-  wasm harness run passes, but the cause is unknown.
+- **Two HTTP tests fail on wasm only.** `test-http-missing-header-separator-lf` and
+  `test-http-server-unconsume-consume` pass natively and fail on wasm, also with a
+  `starling.wasm` built from 145a6f2d, where `expectations.json` recorded them as passing. In
+  both, a server writes to a socket and destroys it at once, and the client gets the end of the
+  connection without the bytes. A plain `net` server that does the same delivers them. The cause
+  is unknown.
 - **`js::Unbox` crashes on scripted proxies.** A guard in `unbox` avoids the segmentation fault,
   but the root cause in the binding is unknown. A cross-compartment wrapper around a proxy may
   still reach it.
@@ -42,6 +40,24 @@ after these.
 
 ### Behavior that differs from Node.js
 
+- `url.resolveObject` and `Url.prototype.resolveObject` give the result the fields they copy from
+  the relative URL object as strings or `null`, where Node.js copies the values: a `port` of `80`
+  becomes `'80'`, a `hash` of `0` becomes `null`, and a missing `hash` becomes `null` instead of
+  `undefined`. The legacy URL code holds each field as a Rust `Option<String>`.
+- The DNS resolver differs from c-ares in these ways: `reverse` doesn't consult `/etc/hosts`,
+  timeouts don't adapt to the measured latency of a server, `setLocalAddress` doesn't apply to
+  TCP queries, and `--dns-result-order` is rejected. The Node.js tests that replace
+  `internalBinding('cares_wrap')` functions (`test-dns-default-order-*`, `test-dns-lookup`,
+  `test-dns-lookup-promises`, `test-dns-lookupService`, `test-dns-resolve-promises` and
+  `test-dns-set-default-order`) and `test-dns-get-server`, which replaces
+  `resolver._handle.getServers`, fail, since the implementation doesn't go through those objects.
+- `net.Server.prototype.listen` ignores `backlog`, `ipv6Only`, `reusePort` and `exclusive`:
+  `platform::net::listen_stream` takes no socket options, and natively listens with a backlog of
+  511.
+  `exclusive` has no effect in Node.js either without cluster workers.
+- The `ADDRCONFIG` hint of `dns.lookup` and of a connect's lookup has no effect, since
+  `platform::net` can't list the addresses the host's interfaces have. Node.js's `getaddrinfo`
+  then leaves out the addresses of a family the host has no address of.
 - `eos`, `pipeline` and `addAbortSignal` reject web streams. Node.js accepts them. The stream
   predicates misreport web streams too (see the review findings).
 - Assigning a non-array to `_readableState.buffer` or `_readableState.pipes`, or any value to
@@ -68,6 +84,25 @@ after these.
   review findings).
 - `new Console(stream)` routes `group`, `count`, `time` and `table` to the global console, not to
   the given stream.
+- Messaging (`MessageChannel`, `MessagePort`, `BroadcastChannel`):
+  - Open `BroadcastChannel`s stay in a per-global registry until `close()`, including channels
+    without listeners, which the spec lets the garbage collector free. A server that creates
+    channels and never closes them grows without bound.
+  - Disentangled ports emit no `close` event, keep-alive isn't recomputed when a listener is
+    removed through an `AbortSignal`, and ports lack Node's `EventEmitter` methods (`port.on`).
+  - Within one event-loop step, messages run before timers. Node.js runs timers first.
+  - Node's error codes and messages (`ERR_INVALID_ARG_VALUE`, `ERR_STREAM_NULL_VALUES`, the
+    `MessageEvent` messages) differ, and `CompressionStream` rejects string chunks, which Node.js
+    accepts.
+- `node:perf_hooks`:
+  - The timeline classes are the web platform's, whose argument conversions throw `TypeError`s
+    without Node.js's `ERR_INVALID_ARG_TYPE` and `ERR_MISSING_ARGS` codes, and whose
+    `PerformanceObserver` callbacks get a third argument.
+  - No `resource`, `http`, `http2`, `net` or `dns` entries are produced, and
+    `markResourceTiming`, `setResourceTimingBufferSize` and `clearResourceTimings` are missing.
+  - Histograms can't be transferred through a `MessagePort` or cloned, and `samplePerIteration`
+    samples with a timer. `nodeTiming.uvMetricsInfo` reports zeros.
+- `node:zlib` lacks the `rejectGarbageAfterEnd` option.
 - `console.log` truncates strings at a NUL character, in the C++ console.
 - `Buffer.from` rejects a `SharedArrayBuffer`.
 - `Buffer.allocUnsafe` and `Buffer.from` of a string don't allocate from a pool, so their
@@ -93,14 +128,36 @@ after these.
 
 ### The HTTP client
 
-The client is built on reqwest:
+Requests over the runtime's sockets, which `http:` requests in a script the CLI runs as a command
+are (see `docs/node-compat.md`):
+
+- `socketPath` fails, since `net` has no IPC sockets.
+- Requests an agent queues until it has a socket don't keep the async context they were created
+  in, so `AsyncLocalStorage` reads in their `socket` and `response` listeners see the context of
+  the code that freed the socket.
+- A listener that throws while the parser handles a response's head or body leaves the parser
+  failed and reports the exception, as in Node.js, but the socket's other `data` listeners still
+  get the chunk, which Node.js's exception skips.
+- `https.Agent` has `http.Agent`'s `getName` and `createConnection`, and lacks the TLS session
+  cache methods.
+- `proxyEnv`, `NODE_USE_ENV_PROXY` and `--use-env-proxy` have no effect.
+- The `http.client.*` diagnostics channels get no messages, and `perf_hooks` gets no `http`
+  entries.
+- A client socket can read the end of the connection before its response's `end` closes it,
+  where Node.js destroys the socket first, so the socket emits `end` where Node.js's doesn't.
+  The order depends on when the peer's FIN arrives.
+- `net` doesn't emit `lookup` without the `lookup` option, or `connectionAttemptFailed`.
+
+Requests through the runtime's HTTP client, reqwest natively and `wasi:http` on wasm, which
+`https:` requests and every request while the runtime serves requests are:
 
 - It adds `accept: */*`, lowercases header names, normalizes paths, strips hop-by-hop headers and
   reports the standard reason phrase.
 - It exposes no 1xx responses or `information` events.
-- Agent socket pools are partial.
-- `server.unref()` and `socket.unref()` do nothing.
-- `ws` as a client hangs, because outgoing requests can't be upgraded to a raw connection.
+- Upgrades and `CONNECT` aren't supported, so `ws` as a client can't connect in serve mode, in
+  components or to `wss:` URLs.
+- Agents only keep the sockets of finished requests for reuse. A keep-alive agent's
+  `freeSockets` ignore `maxFreeSockets`, and empty per-host arrays are never deleted.
 
 ### Missing APIs
 
@@ -118,23 +175,36 @@ The client is built on reqwest:
 - `Hash` and `Hmac` aren't `LazyTransform` streams.
 - Fetch and files: `Body.blob()` throws, and `Blob.textStream` is missing.
 - `stream`: `Readable.prototype.compose`.
-- `ClientRequest` lacks `socketPath`, `maxHeaderSize` and `parser`.
 - `net.Socket` lacks Node's `on`/`addListener` overrides.
-- Unimplemented modules: `dgram`, `repl`, `vm`, `domain`, `child_process`, `worker_threads`,
-  `cluster`, `inspector`.
-  - `vm.createContext` and `runInNewContext` are implementable with a new SpiderMonkey global.
-  - `dgram` is implementable on WASI sockets.
+- Unimplemented modules: `repl`, `domain`, `child_process`, `worker_threads`, `cluster`,
+  `inspector`.
+- `vm`:
+  - `vm.Module`, `vm.SourceTextModule` and `vm.SyntheticModule`.
+  - The top-level `this` of a script in a context is a proxy of the contextified object, not the
+    context's global, and reflection on a context's global doesn't see the contextified object's
+    properties.
+  - `timeout` isn't enforced on wasm. `breakOnSigint` and `microtaskMode` have no effect.
+  - `import()` with `importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER` in a
+    script that runs in a context fails with `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`, where
+    Node.js loads the module with the main context's loader. A context is a global of its own,
+    and the engine's module loading creates the imported module in the importing global, where
+    the Node.js classes that builtin modules such as `fs` and CommonJS loading use aren't
+    registered. Loading the module in the main global and resolving the context's `import()`
+    with that namespace needs another import path in `core_runtime::module`.
+  - No code cache is produced or used, and a `vm.Script` is compiled again each time it runs.
+    The stencil APIs that would compile a script once for every context return
+    `already_AddRefed` by value, which the mozjs bindings can't call. A glue function in the
+    mozjs fork's engine patch would make them usable.
 
 ### Serve mode and components
 
 - Synchronous `fs` is refused while serving. EJS calls `fs.existsSync` on every render, so the
   `ssr-site` app needs `--allow-blocking-host-io`.
-- An unreferenced timer from the top level is dropped from a Wizer snapshot without an error.
-  `ensure_idle_for_snapshot` doesn't count it as pending work.
 - Timers and `http.request`s still running after a served response ends are abandoned. Open
   response bodies and pending `fs` operations keep a request alive, but timers and outgoing
   requests don't.
 - WebSocket upgrades can't work in serve mode, because served requests have no raw socket.
+  Client requests there go through the runtime's HTTP client, which can't upgrade either.
 - Under Spin, `wasi:http` provides no client address, so `req.ip` is undefined and
   `express-rate-limit` logs `ERR_ERL_UNDEFINED_IP_ADDRESS`.
 - Spin's default instance reuse (128 requests per instance, 1 s idle) drops in-memory state such
@@ -159,10 +229,14 @@ These tests fail only on wasm because of the platform:
 
 - **CPU per request is about twice Node's.** On rest-api `/health` at c=32 natively it is about
   45 µs per request, against Node's 23 µs. The latest profile is in `docs/express-benchmarks.md`.
-- **Defines per new object.** About 70 property defines per request remain. The mozjs fork's glue
-  creates objects with their slot capacity and adds their properties in one call
-  (`Object::new_with_property_capacity`, `Object::add_new_data_properties` and
-  `Object::new_plain_with_unique_names`), but `PropertyTemplate` and its writers don't use it yet.
+- **Adding properties to new objects.** The messages, `Url`s, timers, `Stats` and `Dirent`s the
+  builtins create get all their properties in one engine call, and fixed slots for them, up to
+  SpiderMonkey's 16 fixed slots, which include the state slot of a class's instances. Most of the remaining time is SpiderMonkey's `NativeObject::addProperty`, one shape
+  transition per property, and growing the dynamic slots of a `ServerResponse` (33 properties) and
+  an `IncomingMessage` (23). Creating them with a shape cached per template and
+  their dynamic slots allocated up front needs more glue. Objects that constructors called from
+  JavaScript create, such as the `new Url()` of Express's `parseurl` and each `net.Socket`, still
+  get their properties one by one, by assignment as in Node.
 - **Memory under load grew.** Peak RSS under load rose by 17 to 43% on six of the seven apps with
   the state refactor, more than throughput rose. The cause is unknown. One candidate is Rust state
   that stays alive until its wrapper is finalized.
@@ -196,6 +270,9 @@ These tests fail only on wasm because of the platform:
   - `test-http-server-headers-timeout-keepalive`, `test-http-server-request-timeout-keepalive`,
     `test-string-decoder-fuzz`, `test-net-socket-reset-send`, `test-net-connect-reset-after-destroy`
     and `test-http-parser-free` (marked `FLAKY`)
+  - `test-http-agent-maxsockets` on wasm (marked `FLAKY` there): in about half of the runs one of
+    the agent's two sockets isn't free yet when the test counts the free sockets. The cause is
+    unknown.
   - WPT `hr-time/basic.any.js`
   - The Express `realtime` app, and `auth` timing out at startup on wasm
 - **Fuzzer signatures not on the accepted list.** `http/raw:log-differs["bytes"]` appears in about 1
@@ -232,6 +309,9 @@ These deviate from the rules in `docs/builtin-development.md` on purpose:
   delete the property, as for `#private` fields.
 - `Props` remains for reading caller options and Node-public properties that Node.js itself reads
   dynamically.
+- An `http.Agent`'s `requests`, `sockets`, `freeSockets` and `totalSocketCount` stay own data
+  properties, which the agent reads and changes as Node.js's does, because libraries such as
+  `agent-base` change them in place.
 
 ## Review findings (2026-10-06)
 
@@ -366,8 +446,6 @@ for its structure.
     sentence.
   - stub.rs:186-188, internal_modules.rs:188 and internals/mod.rs:261 have safety prose on safe
     code.
-  - `HostSocket::owner` (host_socket.rs:36) is documented as the client request, but `on_fetch`
-    sets it to the served response (server.rs:250).
   - The SAFETY comment of `JSString::write_utf8` (crates/js string.rs) says that it makes no call
     into SpiderMonkey, but `with_chars` flattens a rope, which allocates. Callers flatten first.
 - **Low: `docs/node-compat.md` statements that don't match the code.** Starting `fs.watchFile`
@@ -383,7 +461,7 @@ for its structure.
 - **Medium: exceptions left pending after a swallowed error.** `from_jsval(..).unwrap_or(..)`,
   `.ok()` and `unwrap_or_else` return success with an exception pending at process.rs:202-203,
   internal_modules.rs:95 and 106, assert.rs:1549-1554 (`CallTracker.calls` with a throwing `name`
-  getter), destroy.rs:630-633, operators.rs:1039-1044, http/client.rs:294-296 and watch.rs:621.
+  getter), destroy.rs:630-633, operators.rs:1039-1044 and watch.rs:621.
   `process.hrtime(time)` doesn't validate its argument. Propagate
   with `from_jsval_throwing(..)?`, or clear the exception explicitly.
 - **Medium: `ExnThrown` without a pending exception.** `property` and `set` in parse_args.rs:50
@@ -433,11 +511,6 @@ for its structure.
   its callback gets no error, and `end` still emits `finish`. Node.js reports
   `ERR_STREAM_DESTROYED` and returns `false`. Server-sent event handlers that keep writing see
   success. Check `destroyed` as `wire::write` does, and validate the chunk first.
-- **Medium: assigning `http.globalAgent` or `https.globalAgent` has no effect.** `ClientRequest`
-  falls back to the per-realm shared agent (http.rs:208-222, client.rs:624-628), not to the current
-  export. Proxy and keep-alive setups that replace the global agent are ignored. `https.request`
-  also sets `_defaultAgent` before assigning the caller's options (http.rs:235-249), where Node.js
-  sets it last. Keep the global agents as per-realm values that the export's setter updates.
 - **Medium: `net.Server` stops accepting after most accept errors.** net/server.rs:86-101 accepts
   again only after `ECONNABORTED`, `ECONNRESET` and `ENOTCONN`. After `EMFILE` the server stays
   `listening` but never accepts again. Node.js keeps accepting. Keep accepting while listening,
@@ -517,7 +590,7 @@ for its structure.
   through `handle.read` and `handle.write` and refuses an `fs` option. Operations other than
   streams don't take a reference on the handle while they run.
 - **Low: `promisify` details.** `internal/util`'s `customPromisifyArgs` is a stub symbol, not
-  `util::CUSTOM_PROMISIFY_ARGS`. `readv`, `writev`, `dns.lookupService`, `stream.pipeline` and
+  `util::CUSTOM_PROMISIFY_ARGS`. `readv`, `writev`, `stream.pipeline` and
   `stream.finished` define no `customPromisifyArgs` or `promisify.custom`. Native functions have no
   `prototype` property, which Node's JavaScript functions have.
 - **Low: wasm blocking checks run before the work.** On wasm, `refuse_blocking` runs when an
@@ -529,10 +602,6 @@ for its structure.
   `undefined is not a function`, because `store_header` flushes through the `HostSocket`, which has
   no `write` (wire.rs:369-371, 500-506). The served `finish` handling calls `_dump` without Node's
   `resumeScheduled` check and emits `close` synchronously (outgoing.rs:506-529).
-- **Low: HTTP client details.** `http.request` validates `options.host` even when `hostname` is
-  given, because `Option::or` is eager, and its message differs (client.rs:706-708). A keep-alive
-  agent's `freeSockets` ignore `maxFreeSockets`, and empty per-host arrays are never deleted
-  (client.rs:377-399, 490-513).
 - **Low: `stream` details.** `endReadableNT` reads `allowHalfOpen` before `writable`
   (readable.rs:869-874). `prepend_listener` appends for emitters without `prependListener`
   (readable.rs:1213-1224). `readable[Symbol.asyncIterator]()` returns a plain object with own
@@ -597,13 +666,11 @@ for its structure.
   `init_message` allocates an options object and misses `readableHighWaterMark` on the `HostSocket`
   (incoming.rs:596-610), and `server_for` copies the listening servers' JS array
   (server.rs:79-98). Pass the values from `on_fetch`, and keep the servers in Rust.
-- **Medium: own properties of new objects are set one by one.** `Timeout` and `Immediate` set
-  about 14 and 9 properties with `set_property` (timers.rs:196-211, 108-115, 304-305, 477-483),
-  `Stats` and `Dirent` 14 and 3 (fs/classes.rs:174-194, 299-316), on every `setTimeout` and
-  `fs.stat`. readline's `Interface` (readline.rs:269-281), assertion errors (assert.rs:1172-1181),
-  mock call records (test_runner/mock.rs:669-676) and the options of custom inspect calls
-  (inspect.rs:205-228) do the same. `set_property` also calls setters on the prototypes. Add
-  `PropertyTemplate`s in Node's key order. readline's keys are in alphabetical order today, and
+- **Low: own properties of new objects are set one by one.** readline's `Interface`
+  (readline.rs:269-281) and assertion errors (assert.rs:1172-1181) set their properties with
+  `set_property`, which also calls setters on the prototypes. Add `PropertyTemplate`s in Node's
+  key order. readline's keys are in alphabetical order today, `history`, `historyIndex`,
+  `historySize` and `isFlushing` are data properties where Node has accessors, and
   `historyManager` is missing.
 - **Medium: every `net.Socket` write clones the chunk.** socket.rs:650-662 passes `bytes.clone()`
   to `defer_until_connected`, which drops it unless the socket is connecting, and `write_or_shutdown`
@@ -662,9 +729,8 @@ for its structure.
   (events.rs:524, 878-879) create a new `JSString` for `newListener` or `removeListener`, as does
   async_hooks.rs:481. Use `js::class::get_or_init_atom`.
 - **Low: functions created per call for stateless callbacks.** A `toString` per `SystemError`
-  (errors.rs:30), the `enable` and `disable` of `createHook` (async_hooks.rs:691-694),
-  `AsyncLocalStorage.snapshot` (async_hooks.rs:247) and `stylize` per custom inspect call
-  (inspect.rs:200-231). Use `js::class::get_or_init_shared_function`.
+  (errors.rs:30), the `enable` and `disable` of `createHook` (async_hooks.rs:691-694) and
+  `AsyncLocalStorage.snapshot` (async_hooks.rs:247). Use `js::class::get_or_init_shared_function`.
 - **Low: header handling copies.** Each `setHeader` converts the name to a `String` twice, copies
   it once more and converts the value only to scan it (http.rs:187-201, outgoing.rs:296-328).
   `store_header_value` and `header_value` allocate a lowercase copy per call

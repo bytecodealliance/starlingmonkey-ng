@@ -39,7 +39,7 @@ fn decode_units(bytes: &[u8], encoding: Encoding) -> Vec<u16> {
         Encoding::Ascii => bytes.iter().map(|byte| u16::from(byte & 0x7f)).collect(),
         Encoding::Base64 | Encoding::Base64Url => {
             encode_base64(bytes, encoding == Encoding::Base64Url)
-                .expect("allocating the base64 text failed")
+                .expect("allocating the base64 text succeeds")
                 .encode_utf16()
                 .collect()
         }
@@ -75,7 +75,12 @@ impl Decoded<'_> {
             Encoding::Ascii if self.body.is_ascii() => js::JSString::from_latin1(scope, self.body),
             Encoding::Hex => js::JSString::from_latin1(scope, &hex_digits(self.body)),
             Encoding::Base64 | Encoding::Base64Url => {
-                crate::buffer::decode_bytes(scope, self.body, self.encoding)
+                let url = self.encoding == Encoding::Base64Url;
+                let Some(text) = encode_base64(self.body, url) else {
+                    js::exception::report_out_of_memory(scope);
+                    return Err(ExnThrown);
+                };
+                js::JSString::from_str(scope, &text)
             }
             _ => js::JSString::from_utf16(scope, &decode_units(self.body, self.encoding)),
         }

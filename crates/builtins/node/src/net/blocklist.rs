@@ -105,7 +105,7 @@ fn parse_ipv6(text: &str) -> Option<Ipv6Addr> {
 /// `ip` as libuv's `uv_inet_ntop` formats an IPv6 address: the first longest run of at least two
 /// zero groups is `::`, and the last four bytes of an IPv4-mapped address, or of an address whose
 /// first six groups are zero and seventh isn't, are in dotted decimal.
-fn format_ipv6(ip: Ipv6Addr) -> String {
+pub(crate) fn format_ipv6(ip: Ipv6Addr) -> String {
     let words = ip.segments();
     let bytes = ip.octets();
     let mut best: Option<(usize, usize)> = None;
@@ -318,7 +318,7 @@ pub(crate) fn validate_block_list(
     name: &str,
 ) -> Result<(), Thrown> {
     if as_block_list(scope, value).is_none() {
-        return Err(NodeError::invalid_arg_type(scope, name, "net.BlockList", value).into());
+        return Err(NodeError::invalid_arg_type(scope, name, "an net.BlockList", value).into());
     }
     Ok(())
 }

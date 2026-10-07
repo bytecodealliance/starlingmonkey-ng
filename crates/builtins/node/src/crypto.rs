@@ -138,9 +138,11 @@ fn data_bytes(
         }
         return Ok(encode_string(scope, string, encoding)?);
     }
-    let view = Object::from_value(scope, *data)
+    Object::from_value(scope, *data)
         .ok()
         .and_then(ArrayBufferView::from_object)
+        .map(|view| view.copy_bytes(scope))
+        .transpose()?
         .ok_or_else(|| {
             NodeError::invalid_arg_type(
                 scope,
@@ -148,8 +150,8 @@ fn data_bytes(
                 "of type string or an instance of Buffer, TypedArray, or DataView",
                 data,
             )
-        })?;
-    Ok(view.copy_bytes(scope)?)
+            .into()
+        })
 }
 
 /// `bytes` as a `Buffer`, or as a string in the encoding `encoding` names. An unknown encoding
@@ -1535,11 +1537,11 @@ pub mod module {
             }
             None => length - offset,
         };
+        let fill = |bytes: &mut [u8]| platform::random::fill(&mut bytes[offset..offset + size]);
         if let Some(view) = view {
-            view.with_bytes_mut(|bytes| platform::random::fill(&mut bytes[offset..offset + size]));
+            view.with_bytes_mut(fill);
         } else if let Some(array_buffer) = array_buffer {
-            array_buffer
-                .with_bytes_mut(|bytes| platform::random::fill(&mut bytes[offset..offset + size]));
+            array_buffer.with_bytes_mut(fill);
         }
         Ok(buffer)
     }
@@ -1644,14 +1646,14 @@ pub mod module {
         b: HandleValue<'_>,
     ) -> Result<bool, Thrown> {
         let bytes = |value: HandleValue<'_>, name: &str| -> Result<Vec<u8>, Thrown> {
-            let object = Object::from_value(scope, *value)
-                .ok()
-                .filter(|object| js::typedarray::is_buffer_source(*object))
-                .ok_or_else(|| {
-                    let expected = "an instance of ArrayBuffer, Buffer, TypedArray, or DataView";
-                    NodeError::invalid_arg_type(scope, name, expected, value)
-                })?;
-            Ok(js::typedarray::copy_buffer_source_bytes(scope, object)?.unwrap_or_default())
+            let bytes = match Object::from_value(scope, *value) {
+                Ok(object) => js::typedarray::copy_buffer_source_bytes(scope, object)?,
+                Err(_) => None,
+            };
+            bytes.ok_or_else(|| {
+                let expected = "an instance of ArrayBuffer, Buffer, TypedArray, or DataView";
+                NodeError::invalid_arg_type(scope, name, expected, value).into()
+            })
         };
         let a = bytes(a, "buf1")?;
         let b = bytes(b, "buf2")?;

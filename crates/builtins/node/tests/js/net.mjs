@@ -121,6 +121,25 @@ throws(() => server.listen(0), "ERR_SERVER_ALREADY_LISTEN", "listening twice");
   throws(() => net.connect(70000), "ERR_SOCKET_BAD_PORT", "ports");
   throws(() => net.connect(), "ERR_MISSING_ARGS", "connecting needs a port");
   throws(() => net.connect({ port: true }), "ERR_INVALID_ARG_TYPE", "port types");
+  throws(() => net.connect({ port: 42, hints: 3370 }), "ERR_INVALID_ARG_VALUE", "connect hints");
+  throws(() => net.connect({ port: 1, host: "localhost", family: 5 }), "ERR_INVALID_ARG_VALUE", "connect families");
+  net.connect({ port: 1, host: "127.0.0.1", family: 5 }).on("error", () => {}).destroy();
+  throws(() => net.connect({ port: 1, host: "127.0.0.1", autoSelectFamily: "x" }), "ERR_INVALID_ARG_TYPE", "autoSelectFamily");
+  throws(() => net.connect({ port: 1, host: "127.0.0.1", autoSelectFamilyAttemptTimeout: 0 }), "ERR_OUT_OF_RANGE", "autoSelectFamilyAttemptTimeout");
+  throws(() => net.setDefaultAutoSelectFamily("x"), "ERR_INVALID_ARG_TYPE", "setDefaultAutoSelectFamily");
+  throws(() => net.setDefaultAutoSelectFamilyAttemptTimeout(1.5), "ERR_OUT_OF_RANGE", "setDefaultAutoSelectFamilyAttemptTimeout integers");
+  throws(() => net.setDefaultAutoSelectFamilyAttemptTimeout(-5), "ERR_OUT_OF_RANGE", "setDefaultAutoSelectFamilyAttemptTimeout range");
+  const timeout = net.getDefaultAutoSelectFamilyAttemptTimeout();
+  net.setDefaultAutoSelectFamilyAttemptTimeout(5);
+  eq(net.getDefaultAutoSelectFamilyAttemptTimeout(), 10, "attempt timeouts below 10 become 10");
+  net.setDefaultAutoSelectFamilyAttemptTimeout(timeout);
+  const listener = () => {};
+  deepEq(net._normalizeArgs({}), [{}, null], "_normalizeArgs of an object without a length");
+  deepEq(net._normalizeArgs({ length: "x" }), [{}, null], "_normalizeArgs of a non-numeric length");
+  deepEq(net._normalizeArgs({ length: -1, 0: { a: 1 } }), [{ a: 1 }, null], "_normalizeArgs ignores a negative length");
+  deepEq(net._normalizeArgs([80, "h"]), [{ port: 80, host: "h" }, null], "_normalizeArgs of a port and a host");
+  eq(net._normalizeArgs({ length: "2", 0: 80, 1: listener })[1], listener, "_normalizeArgs of a string length");
+  throws(() => net._normalizeArgs({ length: 2n }), TypeError, "_normalizeArgs of a BigInt length");
   throws(() => net.createServer().listen({ path: "/tmp/socket" }), "ERR_METHOD_NOT_IMPLEMENTED", "IPC paths");
   throws(() => net.createServer().listen({}), "ERR_INVALID_ARG_VALUE", "listen options need a port");
   throws(() => net.createServer().listen(true), "ERR_INVALID_ARG_VALUE", "listen port types");
@@ -135,11 +154,29 @@ throws(() => server.listen(0), "ERR_SERVER_ALREADY_LISTEN", "listening twice");
   deepEq(await dnsPromises.lookup("127.0.0.1", { all: true }), [{ address: "127.0.0.1", family: 4 }], "literal addresses");
   eq(dns.promises.lookup, dnsPromises.lookup, "dns.promises");
   deepEq(await dnsPromises.lookup("::1", 4), { address: "::1", family: 6 }, "literal addresses keep their family");
+  const warned = new Promise((resolve) => process.once("warning", resolve));
   deepEq(await new Promise((resolve) => dns.lookup("", (...args) => resolve(args))), [null, null, 4], "empty host names");
+  const warning = await within(warned, "the empty host name warning");
+  deepEq(
+    [warning.name, warning.code, warning.message],
+    ["DeprecationWarning", "DEP0118", 'The provided hostname "" is not a valid hostname, and is supported in the dns module solely for compatibility.'],
+    "empty host name warning",
+  );
+  Object.defineProperty(Object.prototype, "address", { set() { throw new Error("setter called"); }, configurable: true });
+  try {
+    deepEq(await dnsPromises.lookup("127.0.0.1"), { address: "127.0.0.1", family: 4 }, "results don't call setters");
+  } finally {
+    delete Object.prototype.address;
+  }
   throws(() => dns.lookup(5, () => {}), "ERR_INVALID_ARG_TYPE", "host names");
   throws(() => dnsPromises.lookup(5), "ERR_INVALID_ARG_TYPE", "promise lookups throw synchronously");
   throws(() => dns.lookup("localhost", { family: "4" }, () => {}), "ERR_INVALID_ARG_VALUE", "family values");
   throws(() => dns.lookup("localhost", { all: 1 }, () => {}), "ERR_INVALID_ARG_TYPE", "all is a boolean");
+  const mapped = await dnsPromises.lookup("localhost", { family: 6, hints: dns.V4MAPPED | dns.ALL, all: true });
+  eq(mapped.every((entry) => entry.family === 6), true, "V4MAPPED gives IPv6 addresses");
+  eq(mapped.at(-1).address, "::ffff:127.0.0.1", "V4MAPPED with ALL adds the mapped IPv4 addresses");
+  const v6 = await dnsPromises.lookup("localhost", { family: 6, hints: dns.V4MAPPED, all: true });
+  eq(v6.length > 0 && v6.every((entry) => entry.family === 6), true, "V4MAPPED alone gives IPv6 addresses");
   eq(dns.getDefaultResultOrder(), "verbatim", "getDefaultResultOrder");
   dns.setDefaultResultOrder("ipv4first");
   eq(dnsPromises.getDefaultResultOrder(), "ipv4first", "setDefaultResultOrder");
@@ -208,4 +245,68 @@ throws(() => server.listen(0), "ERR_SERVER_ALREADY_LISTEN", "listening twice");
   deepEq([error.code, error.message], ["ERR_IP_BLOCKED", "IP(127.0.0.1) is blocked by net.BlockList"], "blocked connects");
   throws(() => net.createServer({ blockList: {} }), "ERR_INVALID_ARG_TYPE", "blockList options");
   await within(new Promise((resolve) => guarded.close(resolve)), "closing the guarded server");
+}
+
+// A socket connects again from its `close` listener, as Node's `test-net-reconnect.js` does.
+{
+  const server = net.createServer((socket) => socket.end());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const client = new Socket();
+  const ports = [];
+  let connects = 0;
+  client.on("connect", () => {
+    connects++;
+    ports.push(client.localPort);
+  });
+  client.resume();
+  const reconnected = new Promise((resolve) =>
+    client.on("close", () => {
+      if (connects < 2) client.connect(server.address().port, "127.0.0.1");
+      else resolve();
+    }),
+  );
+  client.connect(server.address().port, "127.0.0.1");
+  await within(reconnected, "reconnecting a closed socket");
+  eq(connects, 2, "a closed socket connects again");
+  eq(ports[0] !== ports[1], true, "the second connection has a new local port");
+  eq(client.connecting, false, "connecting after the reconnect");
+  await within(new Promise((resolve) => server.close(resolve)), "closing the reconnect server");
+}
+
+// `localPort` without `localAddress` binds the unspecified address with that port.
+{
+  const server = net.createServer((socket) => socket.end());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const localPort = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+  const client = net.connect({ port: server.address().port, host: "127.0.0.1", localPort });
+  await within(once(client, "connect"), "connecting from a local port");
+  eq(client.localPort, localPort, "the local port of a connect with localPort only");
+  client.destroy();
+  await within(new Promise((resolve) => server.close(resolve)), "closing the localPort server");
+}
+
+// `listen`'s `signal` option closes the server, and a truthy `host` must be a string.
+{
+  throws(() => net.createServer().listen({ port: 0, host: 123 }), "ERR_INVALID_ARG_TYPE", "listen hosts");
+  throws(() => net.createServer().listen({ port: 0, signal: 5 }), "ERR_INVALID_ARG_TYPE", "listen signals");
+  const controller = new AbortController();
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen({ port: 0, host: "127.0.0.1", signal: controller.signal }, resolve));
+  const closed = once(server, "close");
+  controller.abort();
+  await within(closed, "closing on abort");
+  eq(server.listening, false, "a server closed by its signal");
+
+  const aborted = AbortSignal.abort();
+  const events = [];
+  const early = net.createServer();
+  early.on("listening", () => events.push("listening"));
+  early.on("close", () => events.push("close"));
+  early.listen({ port: 0, host: "127.0.0.1", signal: aborted });
+  eq(early.listening, true, "listening until the tick queue runs");
+  await within(once(early, "close"), "closing on an aborted signal");
+  deepEq(events, ["close"], "an aborted signal closes the server before listening is emitted");
 }

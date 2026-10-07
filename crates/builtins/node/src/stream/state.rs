@@ -25,6 +25,7 @@ use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{NodeError, Thrown};
+use crate::support::as_array;
 
 js::instance_local! {
     /// The default high water mark of byte streams, which `setDefaultHighWaterMark` changes.
@@ -714,14 +715,6 @@ fn writable_view<'s>(scope: &'s Scope<'_>, args: &CallbackArgs<'_>) -> Option<Wr
         .ok()?;
     let holder = view.data().holder.get(scope);
     WritableSide::of_state(holder)
-}
-
-/// `value` as an array, if it is one.
-fn as_array<'s>(scope: &'s Scope<'_>, value: HandleValue<'_>) -> Option<js::Array<'s>> {
-    Object::from_value(scope, *value)
-        .ok()?
-        .cast::<js::Array>()
-        .ok()
 }
 
 /// The `ReadableState` accessors for flags, Node's `makeBitMapDescriptor`s.

@@ -42,6 +42,11 @@ pub(crate) struct RuntimeFlags {
     pub network_family_autoselection_attempt_timeout: f64,
     /// `--experimental-stream-iter`: the `stream/iter` module exists.
     pub experimental_stream_iter: bool,
+    /// `--test-udp-no-try-send`: `dgram` sockets queue every send instead of sending at once.
+    pub test_udp_no_try_send: bool,
+    /// `--insecure-http-parser`: HTTP messages are parsed leniently unless their server or
+    /// request sets `insecureHTTPParser` or `httpValidation`.
+    pub insecure_http_parser: bool,
 }
 
 impl Default for RuntimeFlags {
@@ -60,6 +65,8 @@ impl Default for RuntimeFlags {
             network_family_autoselection: true,
             network_family_autoselection_attempt_timeout: 250.0,
             experimental_stream_iter: false,
+            test_udp_no_try_send: false,
+            insecure_http_parser: false,
         }
     }
 }
@@ -71,7 +78,6 @@ js::instance_local! {
 /// The flags that are accepted without effect.
 const IGNORED: &[&str] = &[
     "zero-fill-buffers",
-    "insecure-http-parser",
     "max-old-space-size",
     "max-semi-space-size",
     "no-concurrent-array-buffer-sweeping",
@@ -158,6 +164,8 @@ fn apply(settings: &mut RuntimeFlags, flag: &str) -> Result<(), String> {
         "throw-deprecation" => switch(&mut settings.throw_deprecation, true),
         "abort-on-uncaught-exception" => switch(&mut settings.abort_on_uncaught_exception, true),
         "experimental-stream-iter" => switch(&mut settings.experimental_stream_iter, true),
+        "test-udp-no-try-send" => switch(&mut settings.test_udp_no_try_send, true),
+        "insecure-http-parser" => switch(&mut settings.insecure_http_parser, true),
         "network-family-autoselection" => switch(&mut settings.network_family_autoselection, true),
         "no-network-family-autoselection" => {
             switch(&mut settings.network_family_autoselection, false)

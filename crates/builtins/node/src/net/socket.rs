@@ -16,6 +16,7 @@ use js::function::CallbackArgs;
 use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
+use js::object::{PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 use platform::net::{Connection, ConnectionReader, ConnectionWriter, NetError};
@@ -25,7 +26,7 @@ use crate::buffer::new_buffer;
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
 use crate::fs::UvError;
 use crate::stream::state::{StreamState, StreamStateImpl, WritableSide, W};
-use crate::support::{chunk_bytes, spawn_cancellable, until_cancelled, Canceller};
+use crate::support::{chunk_bytes, spawn_cancellable_with_ref, until_cancelled, Canceller};
 
 /// The halves of a TCP connection that no read or write in progress holds, and the cancellations
 /// of the read and the write in progress.
@@ -103,6 +104,36 @@ pub(crate) struct SocketState {
     handle: Option<Heap<js::object::Object>>,
     /// The server that accepted the socket.
     pub(crate) server: Option<Heap<js::object::Object>>,
+    /// Whether the socket's connect, reads and writes keep the event loop alive: unset by `unref`
+    /// and set again by `ref`.
+    #[no_trace]
+    referenced: js::promise::FutureRef,
+    /// The connect waiting for the `lookup` option's callback.
+    #[no_trace]
+    lookup: Option<PendingLookup>,
+    /// Whether the socket destroys itself once it reads anything, which [`guard_reads`] sets.
+    #[no_trace]
+    read_guard: bool,
+}
+
+/// A connect waiting for the addresses the `lookup` option's callback gives: the host and the
+/// target, and whether the callback gets all addresses.
+pub(crate) struct PendingLookup {
+    host: String,
+    target: ConnectTarget,
+    all: bool,
+}
+
+/// Where a connect goes besides the host: the port, the address family of the addresses the
+/// host resolves to (4, 6, or 0 for both) and the lookup's `getaddrinfo` flags, the `BlockList`
+/// rules, and the local address and port to connect from.
+pub(crate) struct ConnectTarget {
+    port: u16,
+    family: u8,
+    hints: u32,
+    rules: Option<Rules>,
+    local_ip: Option<IpAddr>,
+    local_port: u16,
 }
 
 #[core_runtime::jsmethods]
@@ -155,16 +186,31 @@ pub(crate) fn family(addr: &SocketAddr) -> &'static str {
     }
 }
 
+/// `dns.ADDRCONFIG`, the lookup hint a connect without an address family passes.
+const ADDRCONFIG: f64 = 1024.0;
+
+/// The properties of the address objects that `address()` returns and `_peername` holds, in
+/// Node's order.
+pub(crate) static ADDRESS_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"address"),
+    TemplateKey::Name(c"family"),
+    TemplateKey::Name(c"port"),
+]);
+
 /// `{ address, family, port }` for `addr`.
 pub(crate) fn address_object<'s>(
     scope: &'s Scope<'_>,
     addr: SocketAddr,
 ) -> Result<Object<'s>, ExnThrown> {
-    let object = Object::new_plain(scope)?;
-    object.set_property(scope, c"address", addr.ip().to_string().as_str())?;
-    object.set_property(scope, c"family", family(&addr))?;
-    object.set_property(scope, c"port", f64::from(addr.port()))?;
-    Ok(object)
+    Object::new_plain_with_template(
+        scope,
+        &ADDRESS_PROPERTIES,
+        &[
+            addr.ip().to_string().as_str().to_jsval_throwing(scope)?,
+            family(&addr).to_jsval_throwing(scope)?,
+            f64::from(addr.port()).to_jsval_throwing(scope)?,
+        ],
+    )
 }
 
 /// The current monotonic clock reading in milliseconds.
@@ -211,6 +257,7 @@ pub(super) fn release(
     let (link, connecting) = {
         let mut data = state.data_mut();
         data.handle = None;
+        data.lookup = None;
         let link = std::mem::take(&mut data.link);
         let connecting = matches!(link, Link::Connecting(_));
         (link, connecting)
@@ -321,35 +368,70 @@ enum ConnectFailure {
     Blocked(IpAddr),
 }
 
-/// The body of the connect: resolve `host`, and connect to its first address of the address
-/// family `family` (4, 6, or 0 for both) that `rules` doesn't block and that accepts.
+/// The body of the connect: resolve `host` to the addresses of the target's address family and
+/// lookup flags, unless `addrs` gives its addresses, and connect to the first address that the
+/// target's rules don't block and that accepts. The connect is from the target's local address
+/// and port if it has either, with the unspecified address of the address's family in place of a
+/// missing local address.
 async fn connect_to(
     host: String,
-    port: u16,
-    family: u8,
-    rules: Option<Rules>,
+    addrs: Option<Vec<IpAddr>>,
+    target: ConnectTarget,
 ) -> Result<Connection, ConnectFailure> {
-    let addrs = platform::net::resolve(&host)
-        .await
-        .map_err(|error| ConnectFailure::Net(error, None))?;
-    let mut last = None;
-    let wanted = |addr: &IpAddr| match family {
-        4 => addr.is_ipv4(),
-        6 => addr.is_ipv6(),
-        _ => true,
+    let ConnectTarget {
+        port,
+        family,
+        hints,
+        rules,
+        local_ip,
+        local_port,
+    } = target;
+    let addrs = match addrs {
+        Some(addrs) => addrs,
+        None => {
+            let addrs = platform::net::resolve(&host)
+                .await
+                .map_err(|error| ConnectFailure::Net(error, None))?;
+            crate::dns::addresses_of_family(addrs, family, hints)
+        }
     };
-    for addr in addrs.into_iter().filter(wanted) {
+    let mut last = None;
+    for addr in addrs {
         if rules.as_ref().is_some_and(|rules| rules.blocks(addr)) {
             last = Some(ConnectFailure::Blocked(addr));
             continue;
         }
+        let local = (local_ip.is_some() || local_port != 0).then(|| {
+            let ip = local_ip.unwrap_or(match addr {
+                IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            });
+            SocketAddr::new(ip, local_port)
+        });
         let addr = SocketAddr::new(addr, port);
-        match platform::net::connect_stream(addr, None).await {
+        match platform::net::connect_stream_from(addr, local, None).await {
             Ok(connection) => return Ok(connection),
             Err(error) => last = Some(ConnectFailure::Net(error, Some(addr))),
         }
     }
     Err(last.unwrap_or(ConnectFailure::Net(NetError::NoAddress(host), None)))
+}
+
+/// Make `socket` destroy itself once it reads data or the end of the connection while `guard`,
+/// without emitting them, and start reading now. Sockets of other classes are left alone.
+pub(crate) fn guard_reads(
+    scope: &Scope<'_>,
+    socket: Object<'_>,
+    guard: bool,
+) -> Result<(), ExnThrown> {
+    let Some(state) = state_of(scope, socket)? else {
+        return Ok(());
+    };
+    state.data_mut().read_guard = guard;
+    if guard && matches!(state.data().link, Link::Tcp(_)) {
+        start_read(scope, socket, &state)?;
+    }
+    Ok(())
 }
 
 /// Start the first read of `socket` unless it is paused, so `end` is emitted even without a
@@ -395,23 +477,23 @@ fn connect_done(
     read_zero(scope, socket)
 }
 
-/// Connect `socket` to `port` on `host`, keeping only addresses of the address family `family`
-/// that `rules` doesn't block.
+/// Connect `socket` to `target` on `host`, or on `addrs` if they are given, as
+/// [`connect_to`] does.
 fn connect(
     scope: &Scope<'_>,
     socket: Object<'_>,
     state: &SocketState<'_>,
     host: String,
-    port: u16,
-    family: u8,
-    rules: Option<Rules>,
+    addrs: Option<Vec<IpAddr>>,
+    target: ConnectTarget,
 ) -> Result<(), ExnThrown> {
     socket.set_property(scope, c"connecting", true)?;
-    let target = host.clone();
-    let canceller = spawn_cancellable(
+    let name = host.clone();
+    let referenced = state.data().referenced.clone();
+    let canceller = spawn_cancellable_with_ref(
         scope,
         socket,
-        |cancelled| until_cancelled(cancelled, connect_to(target, port, family, rules)),
+        |cancelled| until_cancelled(cancelled, connect_to(name, addrs, target)),
         move |scope, socket, result| {
             let Some(state) = state_of(scope, socket)? else {
                 return Ok(HandleValue::undefined());
@@ -442,9 +524,232 @@ fn connect(
             }
         },
         connect_done,
+        referenced,
     )?;
     state.data_mut().link = Link::Connecting(canceller);
     Ok(())
+}
+
+/// Call the `lookup` option `lookup` of the connect of `socket` with the host of `pending` and the
+/// `family` and `hints` of `options`, and wait for its callback, as Node.js's `lookupAndConnect`
+/// does.
+fn connect_after_lookup(
+    scope: &Scope<'_>,
+    socket: Object<'_>,
+    state: &SocketState<'_>,
+    lookup: HandleValue<'_>,
+    options: Object<'_>,
+    pending: PendingLookup,
+) -> Result<(), ExnThrown> {
+    socket.set_property(scope, c"connecting", true)?;
+    let family = options.get_property(scope, c"family")?;
+    let hints = options.get_property(scope, c"hints")?;
+    let host = pending.host.clone();
+    let all = pending.all;
+    let (canceller, _) = futures_channel::oneshot::channel();
+    {
+        let mut data = state.data_mut();
+        data.link = Link::Connecting(canceller);
+        data.lookup = Some(pending);
+    }
+    let options = Object::new_plain(scope)?;
+    let family = if crate::support::is_str(scope, family, c"IPv4")? {
+        scope.root_value(js::value::from_f64(4.0))
+    } else if crate::support::is_str(scope, family, c"IPv6")? {
+        scope.root_value(js::value::from_f64(6.0))
+    } else {
+        family
+    };
+    options.set_property(scope, c"family", family)?;
+    let hints = if js::conversion::to_boolean(hints) {
+        hints
+    } else {
+        scope.root_value(js::value::from_f64(0.0))
+    };
+    let any_family = !(family.is_number() && matches!(family.to_number(), 4.0 | 6.0));
+    if any_family && hints.is_number() && hints.to_number() == 0.0 && !cfg!(windows) {
+        options.set_property(scope, c"hints", ADDRCONFIG)?;
+    } else {
+        options.set_property(scope, c"hints", hints)?;
+    }
+    if all {
+        options.set_property(scope, c"all", true)?;
+    }
+    let done = Function::new_callback(scope, c"emitLookup", 3, lookup_done, socket)?;
+    let args = [
+        host.as_str().to_jsval_throwing(scope)?,
+        options.to_jsval_throwing(scope)?,
+        (*done).to_jsval_throwing(scope)?,
+    ];
+    Function::call(scope, HandleValue::undefined(), lookup, &args)?;
+    Ok(())
+}
+
+/// The tick callback whose payload is a socket and whose argument is an error: destroy the
+/// socket with the error, as Node.js's `connectErrorNT` does.
+fn connect_error_tick(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let socket = js::function::cast_payload::<js::Object>(scope, payload);
+    Function::call_by_name(scope, socket.handle(), c"destroy", &[args.get(0)])?;
+    Ok(js::value::undefined())
+}
+
+/// `ERR_INVALID_IP_ADDRESS` for `address`.
+fn invalid_ip(scope: &Scope<'_>, address: HandleValue<'_>) -> NodeError {
+    let shown = crate::errors::describe_value(scope, address);
+    NodeError::new(
+        ErrorKind::TypeError,
+        "ERR_INVALID_IP_ADDRESS",
+        format!("Invalid IP address: {shown}"),
+    )
+}
+
+/// The IP address `address` is, if it is a string of one, and its family `family` is 4 or 6.
+fn lookup_address(
+    scope: &Scope<'_>,
+    address: HandleValue<'_>,
+    family: HandleValue<'_>,
+) -> Option<IpAddr> {
+    let family = family.is_number().then(|| family.to_number())?;
+    let address = crate::support::rust_string(scope, address)?;
+    let ip = address.parse::<IpAddr>().ok()?;
+    matches!(family, 4.0 | 6.0).then_some(ip)
+}
+
+/// The callback of the `lookup` option, whose payload is the socket and whose arguments are the
+/// error and the address and its family, or all addresses: emit `lookup` for each address, and
+/// connect to the addresses of family 4 or 6, alternating between the families, starting with the
+/// family of the first address. The socket is destroyed with the error, or with
+/// `ERR_INVALID_IP_ADDRESS` or `ERR_INVALID_ADDRESS_FAMILY` if no address is valid. A destroyed
+/// socket ignores the callback.
+fn lookup_done(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let socket = js::function::cast_payload::<js::Object>(scope, payload);
+    let Some(state) = state_of(scope, socket)? else {
+        return Ok(js::value::undefined());
+    };
+    let Some(pending) = state.data_mut().lookup.take() else {
+        return Ok(js::value::undefined());
+    };
+    let PendingLookup { host, target, all } = pending;
+    let host_value = host.as_str().to_jsval_throwing(scope)?;
+    let error = args.get(0);
+    let connecting = |scope: &Scope<'_>| -> Result<bool, ExnThrown> {
+        Ok(js::conversion::to_boolean(
+            socket.get_property(scope, c"connecting")?,
+        ))
+    };
+    let fail = |scope: &Scope<'_>, error: HandleValue<'_>| -> Result<Value, ExnThrown> {
+        js::jobs::queue_native_tick(scope, connect_error_tick, socket, &[error])?;
+        Ok(js::value::undefined())
+    };
+    let undefined = HandleValue::undefined();
+    if !all {
+        let (address, family) = (args.get(1), args.get(2));
+        crate::events::emit(
+            scope,
+            socket,
+            c"lookup",
+            &[error, address, family, host_value],
+        )?;
+        if !connecting(scope)? {
+            return Ok(js::value::undefined());
+        }
+        if js::conversion::to_boolean(error) {
+            return fail(scope, error);
+        }
+        let Some(ip) = lookup_address(scope, address, family) else {
+            let ip = crate::support::rust_string(scope, address)
+                .and_then(|address| address.parse::<IpAddr>().ok());
+            let error = match ip {
+                None => invalid_ip(scope, address),
+                Some(_) => invalid_family(scope, family, &host, target.port),
+            };
+            let error = error.to_value(scope)?;
+            return fail(scope, error);
+        };
+        connect(scope, socket, &state, host, Some(vec![ip]), target)?;
+        return Ok(js::value::undefined());
+    }
+    if !connecting(scope)? {
+        return Ok(js::value::undefined());
+    }
+    if js::conversion::to_boolean(error) {
+        crate::events::emit(
+            scope,
+            socket,
+            c"lookup",
+            &[error, undefined, undefined, host_value],
+        )?;
+        return fail(scope, error);
+    }
+    let addresses = crate::support::array_elements(scope, args.get(1))?.unwrap_or_default();
+    let mut groups: [Vec<IpAddr>; 2] = [Vec::new(), Vec::new()];
+    let mut first_family = None;
+    let mut first = None;
+    for entry in &addresses {
+        let entry = Object::from_value(scope, **entry).map_err(|e| e.throw(scope))?;
+        let address = entry.get_property(scope, c"address")?;
+        let family = entry.get_property(scope, c"family")?;
+        if first.is_none() {
+            first = Some((address, family));
+        }
+        crate::events::emit(
+            scope,
+            socket,
+            c"lookup",
+            &[error, address, family, host_value],
+        )?;
+        if !connecting(scope)? {
+            return Ok(js::value::undefined());
+        }
+        if let Some(ip) = lookup_address(scope, address, family) {
+            let ipv6 = ip.is_ipv6();
+            let first_ipv6 = *first_family.get_or_insert(ipv6);
+            let group = &mut groups[usize::from(ipv6 != first_ipv6)];
+            if !group.contains(&ip) {
+                group.push(ip);
+            }
+        }
+    }
+    if groups[0].is_empty() && groups[1].is_empty() {
+        let Some((address, family)) = first else {
+            return Ok(js::value::undefined());
+        };
+        let valid_ip = crate::support::rust_string(scope, address)
+            .is_some_and(|address| address.parse::<IpAddr>().is_ok());
+        let error = if !valid_ip {
+            invalid_ip(scope, address)
+        } else {
+            invalid_family(scope, family, &host, target.port)
+        };
+        let error = error.to_value(scope)?;
+        return fail(scope, error);
+    }
+    let [preferred, other] = groups;
+    let mut addrs = Vec::with_capacity(preferred.len() + other.len());
+    for index in 0..preferred.len().max(other.len()) {
+        addrs.extend(preferred.get(index));
+        addrs.extend(other.get(index));
+    }
+    connect(scope, socket, &state, host, Some(addrs), target)?;
+    Ok(js::value::undefined())
+}
+
+/// `ERR_INVALID_ADDRESS_FAMILY` for the family `family` of an address of `host` and `port`.
+fn invalid_family(scope: &Scope<'_>, family: HandleValue<'_>, host: &str, port: u16) -> NodeError {
+    let shown = crate::errors::describe_value(scope, family);
+    NodeError::new(
+        ErrorKind::RangeError,
+        "ERR_INVALID_ADDRESS_FAMILY",
+        format!("Invalid address family: {shown} {host}:{port}"),
+    )
 }
 
 /// The completion of a read: push the `Buffer` read, or `null` at the end, or destroy the socket
@@ -461,6 +766,10 @@ fn read_done(
             return Ok(());
         }
     };
+    if state_of(scope, socket)?.is_some_and(|state| state.data().read_guard) {
+        Function::call_by_name(scope, socket.handle(), c"destroy", js::function::EmptyArgs)?;
+        return Ok(());
+    }
     if let Some(view) = Object::from_value(scope, chunk)
         .ok()
         .and_then(js::ArrayBufferView::from_object)
@@ -492,7 +801,8 @@ fn start_read(
     let Some(mut reader) = reader else {
         return Ok(());
     };
-    let canceller = spawn_cancellable(
+    let referenced = state.data().referenced.clone();
+    let canceller = spawn_cancellable_with_ref(
         scope,
         socket,
         |cancelled| async move {
@@ -513,6 +823,7 @@ fn start_read(
             }
         },
         read_done,
+        referenced,
     )?;
     if let Link::Tcp(tcp) = &mut state.data_mut().link {
         tcp.cancel_read = Some(canceller);
@@ -613,8 +924,12 @@ fn write_or_shutdown(
         return socket_closed(scope, callback);
     };
     let shutdown = bytes.is_none();
-    state.data_mut().write_callback = Some(Heap::from(callback.get()));
-    let canceller = spawn_cancellable(
+    let referenced = {
+        let mut data = state.data_mut();
+        data.write_callback = Some(Heap::from(callback.get()));
+        data.referenced.clone()
+    };
+    let canceller = spawn_cancellable_with_ref(
         scope,
         socket,
         |cancelled| async move {
@@ -639,6 +954,7 @@ fn write_or_shutdown(
             Ok(scope.root_value(js::value::from_bool(!shutdown)))
         },
         write_done,
+        referenced,
     )?;
     if let Link::Tcp(tcp) = &mut state.data_mut().link {
         tcp.cancel_write = Some(canceller);
@@ -692,9 +1008,73 @@ fn emit_close(
     Ok(js::value::undefined())
 }
 
-/// The port, host and address family `connect`'s options give, as Node.js's `lookupAndConnect`
-/// validates them.
-fn connect_target(scope: &Scope<'_>, options: Object<'_>) -> Result<(u16, String, u8), Thrown> {
+/// The `end` listener of a socket, whose `this` is the socket, as Node.js's
+/// `onReadableStreamEnd`: unless the socket allows half-open connections, its `write` becomes
+/// [`write_after_fin`].
+fn on_readable_stream_end(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let socket = crate::support::this_object(scope, &args)?;
+    if !js::conversion::to_boolean(socket.get_property(scope, c"allowHalfOpen")?) {
+        let write =
+            crate::support::shared_named_function(scope, write_after_fin, c"writeAfterFIN", 3)?;
+        socket.set_property(scope, c"write", write)?;
+    }
+    Ok(js::value::undefined())
+}
+
+/// The `write` of a socket whose peer ended the connection, whose `this` is the socket, as
+/// Node.js's `writeAfterFIN`: a write before the socket ended writes, and a later one destroys
+/// the socket with an `EPIPE` error, which the callback gets in the tick queue.
+fn write_after_fin(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let socket = crate::support::this_object(scope, &args)?;
+    if !js::conversion::to_boolean(socket.get_property(scope, c"writableEnded")?) {
+        let (chunk, encoding, callback) = (args.get(0), args.get(1), args.get(2));
+        let wrote = crate::stream::writable_class::write(
+            scope,
+            socket,
+            chunk,
+            Some(encoding),
+            Some(callback),
+        )
+        .map_err(|thrown| thrown.throw(scope))?;
+        return Ok(js::value::from_bool(wrote));
+    }
+    let callback = if js::function::is_callable(args.get(1)) {
+        args.get(1)
+    } else {
+        args.get(2)
+    };
+    let error = NodeError::new(
+        ErrorKind::Error,
+        "EPIPE",
+        "This socket has been ended by the other party",
+    )
+    .to_value(scope)?;
+    crate::support::next_tick_call(scope, callback, &[error])?;
+    Function::call_by_name(scope, socket.handle(), c"destroy", &[error])?;
+    Ok(js::value::from_bool(false))
+}
+
+/// The options of a connect, as Node.js's `lookupAndConnect` validates them before the lookup.
+struct ConnectOptions {
+    host: String,
+    port: u16,
+    local_ip: Option<IpAddr>,
+    local_port: u16,
+    auto_select: bool,
+}
+
+/// The options `connect`'s `options` give, validated in the order of Node.js's
+/// `lookupAndConnect`: `host`, `localAddress`, `localPort`, `port`, `autoSelectFamily` and
+/// `autoSelectFamilyAttemptTimeout`.
+fn connect_options(scope: &Scope<'_>, options: Object<'_>) -> Result<ConnectOptions, Thrown> {
     let given = options.get_property(scope, c"host")?;
     let host = if js::conversion::to_boolean(given) {
         let host = crate::errors::validate_string(scope, given, "options.host")?;
@@ -711,6 +1091,24 @@ fn connect_target(scope: &Scope<'_>, options: Object<'_>) -> Result<(u16, String
     } else {
         "localhost".to_string()
     };
+    let local_address = options.get_property(scope, c"localAddress")?;
+    let local_ip = if js::conversion::to_boolean(local_address) {
+        let ip = crate::support::rust_string(scope, local_address)
+            .and_then(|address| address.parse::<IpAddr>().ok());
+        match ip {
+            Some(ip) => Some(ip),
+            None => return Err(invalid_ip(scope, local_address).into()),
+        }
+    } else {
+        None
+    };
+    let local_port = options.get_property(scope, c"localPort")?;
+    let local_port = if js::conversion::to_boolean(local_port) {
+        crate::errors::validate_number(scope, local_port, "options.localPort", f64::NEG_INFINITY)?
+            as u16
+    } else {
+        0
+    };
     let port = options.get_property(scope, c"port")?;
     let port = if port.is_undefined() {
         0
@@ -726,22 +1124,65 @@ fn connect_target(scope: &Scope<'_>, options: Object<'_>) -> Result<(u16, String
         }
         super::validate_port(scope, port, "Port")?
     };
-    let family = options.get_property(scope, c"family")?;
-    let family = if family.is_number() {
-        family.to_number() as u8
+    let auto_select = options.get_property(scope, c"autoSelectFamily")?;
+    let auto_select = if auto_select.is_null_or_undefined() {
+        super::auto_select().0
     } else {
-        let name = if family.is_string() {
-            Some(String::from_jsval(scope, family, ())?)
-        } else {
-            None
-        };
-        match name.as_deref() {
-            Some("IPv4") => 4,
-            Some("IPv6") => 6,
-            _ => 0,
-        }
+        crate::errors::validate_boolean(scope, auto_select, "options.autoSelectFamily")?
     };
-    Ok((port, host, family))
+    let timeout = options.get_property(scope, c"autoSelectFamilyAttemptTimeout")?;
+    if !timeout.is_null_or_undefined() {
+        crate::errors::validate_integer(
+            scope,
+            timeout,
+            "options.autoSelectFamilyAttemptTimeout",
+            1.0,
+            2147483647.0,
+        )?;
+    }
+    Ok(ConnectOptions {
+        host,
+        port,
+        local_ip,
+        local_port,
+        auto_select,
+    })
+}
+
+/// The address family 4 or 6 that the `family` option `family` names as a number or as `IPv4` or
+/// `IPv6`, or 0.
+fn family_number(scope: &Scope<'_>, family: HandleValue<'_>) -> Result<u8, ExnThrown> {
+    if family.is_number() {
+        return Ok(match family.to_number() {
+            4.0 => 4,
+            6.0 => 6,
+            _ => 0,
+        });
+    }
+    Ok(if crate::support::is_str(scope, family, c"IPv4")? {
+        4
+    } else if crate::support::is_str(scope, family, c"IPv6")? {
+        6
+    } else {
+        0
+    })
+}
+
+/// The lookup options of a connect to a host that isn't an IP address with `dns.lookup`: the
+/// options' `family`, and their `hints`, or 0 if they are falsy, as `dns.lookup` validates them.
+fn default_lookup_options(
+    scope: &Scope<'_>,
+    options: Object<'_>,
+) -> Result<crate::dns::LookupOptions, Thrown> {
+    let dns_options = Object::new_plain(scope)?;
+    let family = options.get_property(scope, c"family")?;
+    dns_options.set_property(scope, c"family", family)?;
+    let hints = options.get_property(scope, c"hints")?;
+    if js::conversion::to_boolean(hints) {
+        dns_options.set_property(scope, c"hints", hints)?;
+    }
+    let dns_options = dns_options.to_jsval_throwing(scope)?;
+    crate::dns::lookup_options(scope, Some(dns_options), true)
 }
 
 /// The state of the `this` of an accessor, if it is a socket.
@@ -974,6 +1415,13 @@ pub mod socket_class {
         base.set_property(scope, c"emitClose", false)?;
         base.set_property(scope, c"autoDestroy", true)?;
         crate::stream::init_duplex(scope, this, Some(base.to_jsval_throwing(scope)?))?;
+        let on_end = crate::support::shared_named_function(
+            scope,
+            on_readable_stream_end,
+            c"onReadableStreamEnd",
+            0,
+        )?;
+        crate::events::listen(scope, this, c"on", c"end", on_end)?;
         this.set_property(scope, c"_sockname", js::value::null())?;
         this.set_property(scope, c"_pendingData", js::value::null())?;
         this.set_property(scope, c"_pendingEncoding", "")?;
@@ -994,7 +1442,11 @@ pub mod socket_class {
     /// <https://nodejs.org/api/net.html#socketconnect>: connect to `port` on `host`, which
     /// defaults to `localhost`, from `(port[, host][, listener])`, `(options[, listener])`, or an
     /// array of `[options, listener]` that `net._normalizeArgs` returned.
-    /// The option `family` keeps only addresses of that family. IPC paths are not supported.
+    /// The options `family` and `hints` select the addresses of a host that isn't an IP address
+    /// as `dns.lookup` does, `lookup` replaces the lookup of the host, and `localAddress` and
+    /// `localPort` set the local address and port. IPC paths are not
+    /// supported. A socket without a connection, including a destroyed one, is reset with
+    /// `_undestroy()` before it connects.
     pub fn connect<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
@@ -1052,13 +1504,71 @@ pub mod socket_class {
             )
             .into());
         }
+        let (destroyed, unlinked) = {
+            let data = state.data();
+            (data.destroyed(), matches!(data.link, Link::None))
+        };
+        if destroyed && std::mem::take(&mut state.data_mut().peername_defined) {
+            this.set_property(scope, c"_peername", HandleValue::null())?;
+        }
+        if unlinked {
+            crate::stream::readable_class::undestroy(scope, this)?;
+            this.set_property(scope, c"_sockname", HandleValue::null())?;
+        }
         if js::conversion::to_boolean(path) {
             return Err(NodeError::not_implemented("connect() to an IPC path").into());
         }
-        let (port, host, family) = super::connect_target(scope, options)?;
+        let ConnectOptions {
+            host,
+            port,
+            local_ip,
+            local_port,
+            auto_select,
+        } = super::connect_options(scope, options)?;
         this.set_property(scope, c"_host", host.as_str())?;
         let rules = crate::net::blocklist::rules_of(scope, this.get_property(scope, c"blockList")?);
-        super::connect(scope, this, &state, host, port, family, rules)?;
+        if host.parse::<IpAddr>().is_ok() {
+            let target = ConnectTarget {
+                port,
+                family: 0,
+                hints: 0,
+                rules,
+                local_ip,
+                local_port,
+            };
+            super::connect(scope, this, &state, host, None, target)?;
+            return Ok(this);
+        }
+        let lookup = options.get_property(scope, c"lookup")?;
+        if !lookup.is_null_or_undefined() {
+            validate_function(scope, lookup, "options.lookup")?;
+        }
+        let (family, hints) = if lookup.is_null_or_undefined() {
+            let parsed = super::default_lookup_options(scope, options)?;
+            (parsed.family, parsed.hints)
+        } else {
+            let family = options.get_property(scope, c"family")?;
+            (super::family_number(scope, family)?, 0)
+        };
+        let target = ConnectTarget {
+            port,
+            family,
+            hints,
+            rules,
+            local_ip,
+            local_port,
+        };
+        if !lookup.is_null_or_undefined() {
+            let all = !matches!(family, 4 | 6) && local_ip.is_none() && auto_select;
+            let pending = PendingLookup {
+                host: host.clone(),
+                target,
+                all,
+            };
+            super::connect_after_lookup(scope, this, &state, lookup, options, pending)?;
+            return Ok(this);
+        }
+        super::connect(scope, this, &state, host, None, target)?;
         Ok(this)
     }
 
@@ -1210,30 +1720,12 @@ pub mod socket_class {
         if state.data().destroyed() {
             return Ok(this);
         }
-        if !timeout.is_number() {
-            return Err(
-                NodeError::invalid_arg_type(scope, "msecs", "of type number", timeout).into(),
-            );
-        }
-        let msecs = timeout.to_number();
-        if !(msecs >= 0.0 && msecs.is_finite()) {
-            let received = String::from_jsval_throwing(scope, timeout, ())?;
-            return Err(NodeError::out_of_range(
-                "msecs",
-                "a non-negative finite number",
-                &received,
-            )
-            .into());
-        }
+        let msecs = crate::timers::get_timer_duration(scope, timeout, "msecs")?;
         let callback = callback.filter(|callback| !callback.is_undefined());
         if let Some(callback) = callback {
             validate_function(scope, callback, "callback")?;
         }
-        let delay = if msecs > 0.0 {
-            crate::timers::timer_delay(scope, timeout)?
-        } else {
-            0.0
-        };
+        let delay = if msecs > 0.0 { msecs.max(1.0) } else { 0.0 };
         let now = now_ms();
         // A pending timer that fires before the new timeout ends stays, and waits for the rest
         // of the timeout once it fires. A timeout of 0 lets it fire without effect.
@@ -1290,14 +1782,24 @@ pub mod socket_class {
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/net.html#socketref>: has no effect.
+    /// <https://nodejs.org/api/net.html#socketref>: the socket's connect, reads and writes keep
+    /// the event loop alive again.
     #[method(name = "ref")]
-    pub fn ref_impl<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+    pub fn ref_impl<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+        state_of(scope, this)?
+            .data()
+            .referenced
+            .set_referenced(true);
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/net.html#socketunref>: has no effect.
-    pub fn unref<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+    /// <https://nodejs.org/api/net.html#socketunref>: the socket's connect, reads and writes
+    /// don't keep the event loop alive. Its idle timer never does.
+    pub fn unref<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+        state_of(scope, this)?
+            .data()
+            .referenced
+            .set_referenced(false);
         Ok(this)
     }
 

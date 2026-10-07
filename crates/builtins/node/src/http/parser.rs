@@ -1,37 +1,68 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! The HTTP/1.x request parser of the listening `http.Server`: request heads through `httparse`,
-//! and bodies framed by `Content-Length` or decoded from chunked transfer coding.
+//! The HTTP/1.x parser of the listening `http.Server` and of client requests: request and
+//! response heads through `httparse`, and bodies framed by `Content-Length`, decoded from chunked
+//! transfer coding, or, for responses, read until the connection closes.
 //!
 //! [`Parser::feed`] appends received bytes, and each [`Parser::next`] returns the next event the
 //! buffered bytes complete. Error codes and reasons are those of Node.js's `llhttp`. After an
-//! error, each further chunk fed reports the error again.
+//! error, each further chunk fed reports the error again. A lenient parser accepts what
+//! `llhttp`'s lenient flags accept: header values with control characters, line feeds without a
+//! carriage return, `Transfer-Encoding` with `Content-Length`, and data after a message that
+//! closes the connection.
 
-/// The parsed head of a request.
+/// The parsed head of a message.
 pub(super) struct Head {
+    /// The method of a request, and empty for a response.
     pub method: String,
+    /// The request target of a request, and empty for a response.
     pub url: String,
-    /// The major and minor HTTP version: 0.9, 1.0, 1.1 or 2.0.
+    /// The status code of a response, and 0 for a request.
+    pub status: u16,
+    /// The reason phrase of a response as received, decoded as Latin-1, and empty for a request.
+    pub reason: String,
+    /// The major and minor HTTP version: 0.9, 1.0, 1.1 or 2.0 for a request, and any digits for
+    /// a response.
     pub major: u8,
     pub minor: u8,
     /// The header lines as received, with values decoded as Latin-1.
     pub headers: Vec<(String, String)>,
     /// Whether the request is a `CONNECT` request, or asks to upgrade the connection with an
-    /// `Upgrade` header and an `upgrade` token in `Connection`.
+    /// `Upgrade` header and an `upgrade` token in `Connection`. A response upgrades the
+    /// connection with both headers and status 101.
     pub upgrade: bool,
     /// Whether the connection stays open after the message: HTTP/1.1 without `Connection: close`,
-    /// or another version with `Connection: keep-alive`.
+    /// or another version with `Connection: keep-alive`. A response whose body lasts until the
+    /// connection closes doesn't keep it open.
     pub keep_alive: bool,
 }
 
 /// What the buffered bytes complete.
 pub(super) enum Event {
-    /// A request head.
+    /// A message head.
     Head(Head),
-    /// Bytes of the body of the current request.
+    /// Bytes of the body of the current message.
     Body(Vec<u8>),
-    /// The end of the current request, with its trailer lines.
+    /// The end of the current message, with its trailer lines.
     Complete(Vec<(String, String)>),
+}
+
+/// The messages a parser parses.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Kind {
+    Request,
+    Response,
+}
+
+/// What follows a head, which [`Parser::after_head`] sets.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum HeadAction {
+    /// The body the head frames.
+    Body,
+    /// No body: the message is complete.
+    SkipBody,
+    /// No body, and the rest of the connection's bytes belong to another protocol.
+    Upgrade,
 }
 
 /// A parse error, with `llhttp`'s code and reason.
@@ -48,12 +79,14 @@ pub(super) struct ParseError {
 /// parsed.
 struct Failure(&'static str, &'static str, Option<usize>);
 
-/// How the body of the current request ends.
+/// How the body of the current message ends.
 enum Body {
     /// After this many more bytes.
     Length(u64),
     /// Chunked transfer coding, at this point of a chunk.
     Chunked(Chunk),
+    /// When the connection closes.
+    UntilClose,
 }
 
 /// The position in a chunked body.
@@ -70,10 +103,12 @@ enum Chunk {
 
 /// What the parser expects next.
 enum State {
-    /// A request head.
+    /// A message head.
     Head,
-    /// The body of the current request.
+    /// The body of the current message.
     Body(Body),
+    /// The end of a message whose connection is upgraded, then [`State::Done`].
+    Upgraded,
     /// Nothing: the connection was upgraded.
     Done,
     /// Nothing but line breaks, after a message that closes the connection.
@@ -85,8 +120,11 @@ enum State {
 /// The longest chunk size line accepted, including chunk extensions.
 const MAX_CHUNK_LINE: usize = 16 * 1024;
 
-/// The parser of one connection's requests.
+/// The parser of one connection's requests or responses.
 pub(super) struct Parser {
+    kind: Kind,
+    /// Whether the parser accepts what `llhttp`'s lenient flags accept.
+    lenient: bool,
     /// The bytes received and not parsed yet.
     buffer: Vec<u8>,
     /// The position of the first byte of `buffer` in the connection's bytes.
@@ -94,9 +132,9 @@ pub(super) struct Parser {
     /// The position of the first byte of the last chunk fed in the connection's bytes.
     chunk_start: usize,
     state: State,
-    /// The largest request head accepted, in bytes.
+    /// The largest message head accepted, in bytes.
     max_header_size: usize,
-    /// The most header lines a request may have, or `None` for no limit.
+    /// The most header lines a message may have, or `None` for no limit.
     max_headers: Option<usize>,
     /// When the current message began, in milliseconds of the monotonic clock, or `None` between
     /// messages. A connection's first message begins when the parser is created.
@@ -111,7 +149,7 @@ pub(super) struct Parser {
 
 impl Default for Parser {
     fn default() -> Self {
-        Parser::new(16384, None)
+        Parser::new(Kind::Request, 16384, None, false)
     }
 }
 
@@ -150,10 +188,17 @@ fn bare_carriage_return(bytes: &[u8]) -> Option<usize> {
 }
 
 impl Parser {
-    /// A parser accepting request heads of up to `max_header_size` bytes with up to
-    /// `max_headers` header lines.
-    pub fn new(max_header_size: usize, max_headers: Option<usize>) -> Self {
+    /// A parser of `kind` messages accepting heads of up to `max_header_size` bytes with up to
+    /// `max_headers` header lines, leniently if `lenient`.
+    pub fn new(
+        kind: Kind,
+        max_header_size: usize,
+        max_headers: Option<usize>,
+        lenient: bool,
+    ) -> Self {
         Parser {
+            kind,
+            lenient,
             buffer: Vec::new(),
             position: 0,
             chunk_start: 0,
@@ -210,6 +255,17 @@ impl Parser {
         self.started = None;
     }
 
+    /// Fail with `code` and `llhttp`'s reason for a callback error, which the next bytes fed
+    /// report.
+    pub fn fail_callback(&mut self, code: &'static str) {
+        let error = ParseError {
+            code,
+            reason: "User callback error",
+            bytes_parsed: 0,
+        };
+        self.state = State::Failed(error, false);
+    }
+
     /// Stop parsing, and return the bytes received and not parsed.
     pub fn take_rest(&mut self) -> Vec<u8> {
         self.state = State::Done;
@@ -217,12 +273,33 @@ impl Parser {
         std::mem::take(&mut self.buffer)
     }
 
+    /// Set what follows the head [`Parser::next`] returned last, unless it upgraded the
+    /// connection.
+    pub fn after_head(&mut self, action: HeadAction) {
+        if !matches!(self.state, State::Body(_)) {
+            return;
+        }
+        match action {
+            HeadAction::Body => {}
+            HeadAction::SkipBody => self.state = State::Body(Body::Length(0)),
+            HeadAction::Upgrade => {
+                self.closing = false;
+                self.state = State::Upgraded;
+            }
+        }
+    }
+
     /// Check that the peer may end the connection now: between messages, or in a message whose
-    /// body lasts until the end, which requests don't have.
-    pub fn finish(&mut self) -> Result<(), ParseError> {
+    /// body lasts until the end, a response's or a lenient parser's request's. Returns the end of
+    /// that message.
+    pub fn finish(&mut self) -> Result<Option<Event>, ParseError> {
         match self.state {
-            State::Head if !has_content(&self.buffer) => Ok(()),
-            State::Done | State::Closed | State::Failed(..) => Ok(()),
+            State::Head if !has_content(&self.buffer) => Ok(None),
+            State::Done | State::Closed | State::Failed(..) => Ok(None),
+            State::Body(Body::UntilClose) => {
+                self.closing = true;
+                Ok(Some(self.complete(Vec::new())))
+            }
             _ => {
                 let error = ParseError {
                     code: "HPE_INVALID_EOF_STATE",
@@ -241,7 +318,20 @@ impl Parser {
             State::Head => self.parse_head(),
             State::Body(Body::Length(_)) => Ok(self.length_body()),
             State::Body(Body::Chunked(_)) => self.chunked_body(),
+            State::Body(Body::UntilClose) => {
+                Ok((!self.buffer.is_empty()).then(|| Event::Body(self.consume(self.buffer.len()))))
+            }
+            State::Upgraded => {
+                self.state = State::Done;
+                self.in_message = false;
+                self.started = None;
+                Ok(Some(Event::Complete(Vec::new())))
+            }
             State::Done => Ok(None),
+            State::Closed if self.lenient => {
+                self.consume(self.buffer.len());
+                Ok(None)
+            }
             State::Closed => match self
                 .buffer
                 .iter()
@@ -252,7 +342,10 @@ impl Parser {
                     "Data after `Connection: close`",
                     Some(index + 1),
                 )),
-                None => Ok(None),
+                None => {
+                    self.consume(self.buffer.len());
+                    Ok(None)
+                }
             },
             State::Failed(error, report) => {
                 if !*report {
@@ -296,7 +389,7 @@ impl Parser {
     }
 
     fn parse_head(&mut self) -> Result<Option<Event>, Failure> {
-        // Line breaks before a request line are ignored.
+        // Line breaks before a start line are ignored.
         let leading = self
             .buffer
             .iter()
@@ -310,51 +403,34 @@ impl Parser {
         }
         let overflow =
             |length: usize| Failure("HPE_HEADER_OVERFLOW", "Header overflow", Some(length));
-        let Some(line) = request_line(&self.buffer)? else {
+        let line = match self.kind {
+            Kind::Request => request_line(&self.buffer)?,
+            Kind::Response => status_line(&self.buffer)?,
+        };
+        let Some(line) = line else {
             if self.buffer.len() > self.max_header_size {
                 return Err(overflow(self.buffer.len()));
             }
             return Ok(None);
         };
-        let fields = &self.buffer[line.end..];
-        let lines = memchr::memchr_iter(b'\n', fields).count() + 1;
-        let mut slots = vec![httparse::EMPTY_HEADER; lines];
-        let (head_end, count) = match httparse::parse_headers(fields, &mut slots) {
-            Ok(httparse::Status::Complete((length, parsed))) => (line.end + length, parsed.len()),
-            Ok(httparse::Status::Partial) => {
-                if let Some(index) = bare_carriage_return(fields) {
-                    return Err(lf_expected(line.end + index));
-                }
-                if self.buffer.len() > self.max_header_size {
-                    return Err(overflow(self.buffer.len()));
-                }
-                return Ok(None);
+        let Some((head_end, parsed)) = self.header_fields(line.end)? else {
+            if self.buffer.len() > self.max_header_size {
+                return Err(overflow(self.buffer.len()));
             }
-            Err(_) => {
-                // The error is the first of the rejected header byte and a carriage return
-                // without a line feed, which a later request in the buffer can have.
-                let error = header_error(fields, line.end);
-                return Err(match bare_carriage_return(fields) {
-                    Some(index) if Some(line.end + index) < error.2 => {
-                        lf_expected(line.end + index)
-                    }
-                    _ => error,
-                });
-            }
+            return Ok(None);
         };
-        if let Some(index) = bare_carriage_return(&self.buffer[..head_end]) {
-            return Err(lf_expected(index));
+        if !self.lenient {
+            if let Some(index) = bare_carriage_return(&self.buffer[..head_end]) {
+                return Err(lf_expected(index));
+            }
         }
         if head_end > self.max_header_size {
             return Err(overflow(self.max_header_size));
         }
-        let parsed = &slots[..count];
         // The position in the buffer of the first byte of `bytes`, a slice of it.
         let offset = |bytes: &[u8]| bytes.as_ptr() as usize - self.buffer.as_ptr() as usize;
         if let Some(excess) = self.max_headers.and_then(|max| parsed.get(max)) {
-            return Err(overflow(
-                offset(excess.name.as_bytes()) + excess.name.len() + 1,
-            ));
+            return Err(overflow(offset(excess.name) + excess.name.len() + 1));
         }
 
         let mut connection_close = false;
@@ -364,55 +440,56 @@ impl Parser {
         let mut content_length: Option<u64> = None;
         let mut chunked = false;
         let mut transfer_encoding = false;
-        for header in parsed {
+        for header in &parsed {
             let name = header.name;
-            let value = header.value;
-            if name.eq_ignore_ascii_case("connection") {
+            let value: &[u8] = &header.value;
+            let at = header.at;
+            if name.eq_ignore_ascii_case(b"connection") {
                 let value = latin1(value);
                 connection_close |= has_token(&value, "close");
                 connection_keep_alive |= has_token(&value, "keep-alive");
                 connection_upgrade |= has_token(&value, "upgrade");
-            } else if name.eq_ignore_ascii_case("upgrade") {
+            } else if name.eq_ignore_ascii_case(b"upgrade") {
                 has_upgrade = true;
-            } else if name.eq_ignore_ascii_case("content-length") {
+            } else if name.eq_ignore_ascii_case(b"content-length") {
                 if let Some(index) = value.iter().position(|byte| !byte.is_ascii_digit()) {
                     return Err(Failure(
                         "HPE_INVALID_CONTENT_LENGTH",
                         "Invalid character in Content-Length",
-                        Some(offset(value) + index),
+                        Some(at + index),
                     ));
                 }
                 if value.is_empty() {
                     return Err(Failure(
                         "HPE_INVALID_CONTENT_LENGTH",
                         "Invalid character in Content-Length",
-                        Some(offset(value)),
+                        Some(at),
                     ));
                 }
                 if content_length.is_some() {
                     return Err(Failure(
                         "HPE_UNEXPECTED_CONTENT_LENGTH",
                         "Duplicate Content-Length",
-                        Some(offset(value)),
+                        Some(at),
                     ));
                 }
                 let length = latin1(value).parse::<u64>().map_err(|_| {
                     Failure(
                         "HPE_INVALID_CONTENT_LENGTH",
                         "Content-Length overflow",
-                        Some(offset(value)),
+                        Some(at),
                     )
                 })?;
                 content_length = Some(length);
-            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
                 transfer_encoding = true;
                 let mut start = 0;
                 for token in value.split(|&byte| byte == b',') {
-                    if chunked {
+                    if chunked && !self.lenient {
                         return Err(Failure(
                             "HPE_INVALID_TRANSFER_ENCODING",
                             "Invalid `Transfer-Encoding` header value",
-                            Some(offset(value) + start),
+                            Some(at + start),
                         ));
                     }
                     chunked = latin1(token).trim().eq_ignore_ascii_case("chunked");
@@ -420,38 +497,54 @@ impl Parser {
                 }
             }
         }
-        let connect = line.method == "CONNECT";
-        let upgrade = connect || (has_upgrade && connection_upgrade);
-        let keep_alive = if line.major > 0 && line.minor > 0 {
+        let request = self.kind == Kind::Request;
+        let connect = request && line.method == "CONNECT";
+        let upgrade = if request {
+            connect || (has_upgrade && connection_upgrade)
+        } else {
+            has_upgrade && connection_upgrade && line.status == 101
+        };
+        let mut keep_alive = if line.major > 0 && line.minor > 0 {
             !connection_close
         } else {
             connection_keep_alive
         };
+        // Responses with status 1xx, 204 or 304 have no body without framing headers.
+        let bodiless = !request
+            && ((100..200).contains(&line.status) || line.status == 204 || line.status == 304);
         let body = match (transfer_encoding, content_length) {
-            (true, Some(_)) => {
+            (true, Some(_)) if !self.lenient => {
                 return Err(Failure(
                     "HPE_INVALID_TRANSFER_ENCODING",
                     "Transfer-Encoding can't be present with Content-Length",
                     Some(head_end),
                 ))
             }
-            (true, None) if !chunked => {
+            (true, _) if chunked => Body::Chunked(Chunk::Size),
+            (true, _) if request && !self.lenient => {
                 return Err(Failure(
                     "HPE_INVALID_TRANSFER_ENCODING",
                     "Request has invalid `Transfer-Encoding`",
                     Some(head_end),
                 ))
             }
-            (true, None) => Body::Chunked(Chunk::Size),
-            (false, length) => Body::Length(length.unwrap_or(0)),
+            (true, _) => Body::UntilClose,
+            (false, Some(length)) => Body::Length(length),
+            (false, None) if request || bodiless => Body::Length(0),
+            (false, None) => Body::UntilClose,
         };
+        if matches!(body, Body::UntilClose) {
+            keep_alive = false;
+        }
         let headers: Vec<(String, String)> = parsed
             .iter()
-            .map(|header| (header.name.to_string(), latin1(header.value)))
+            .map(|header| (latin1(header.name), latin1(&header.value)))
             .collect();
-        let RequestLine {
+        let StartLine {
             method,
             url,
+            status,
+            reason,
             major,
             minor,
             ..
@@ -461,18 +554,62 @@ impl Parser {
         self.closing = !keep_alive;
         self.state = if connect {
             State::Done
+        } else if !request && status == 101 {
+            // A 101 response ends the connection's HTTP messages, as in `llhttp`.
+            State::Upgraded
         } else {
             State::Body(body)
         };
         Ok(Some(Event::Head(Head {
             method,
             url,
+            status,
+            reason,
             major,
             minor,
             headers,
             upgrade,
             keep_alive,
         })))
+    }
+
+    /// The header fields after the start line, which ends at `start`, and the position after the
+    /// head, or `None` if the buffer ends before the head does.
+    fn header_fields(&self, start: usize) -> Result<Option<(usize, Vec<Field<'_>>)>, Failure> {
+        let fields = &self.buffer[start..];
+        if self.lenient {
+            return Ok(
+                lenient_fields(fields, start)?.map(|(length, parsed)| (start + length, parsed))
+            );
+        }
+        let mut slots = header_slots(fields, self.max_header_size, start)?;
+        let line_break = line_break_error(fields, start);
+        match httparse::parse_headers(fields, &mut slots) {
+            Ok(httparse::Status::Complete((length, parsed))) => {
+                if let Some(failure) = line_break {
+                    return Err(failure);
+                }
+                let parsed = parsed
+                    .iter()
+                    .map(|header| Field {
+                        name: header.name.as_bytes(),
+                        value: std::borrow::Cow::Borrowed(header.value),
+                        at: header.value.as_ptr() as usize - self.buffer.as_ptr() as usize,
+                    })
+                    .collect();
+                Ok(Some((start + length, parsed)))
+            }
+            Ok(httparse::Status::Partial) => match line_break {
+                Some(failure) => Err(failure),
+                None => Ok(None),
+            },
+            Err(httparse::Error::TooManyHeaders) => Err(Failure(
+                "HPE_HEADER_OVERFLOW",
+                "Header overflow",
+                Some(self.max_header_size),
+            )),
+            Err(_) => Err(first_failure(header_error(fields, start), line_break)),
+        }
     }
 
     fn length_body(&mut self) -> Option<Event> {
@@ -571,10 +708,17 @@ impl Parser {
                         self.consume(2);
                         return Ok(Some(self.complete(Vec::new())));
                     }
-                    let lines = memchr::memchr_iter(b'\n', &self.buffer).count() + 1;
-                    let mut headers = vec![httparse::EMPTY_HEADER; lines];
+                    let mut headers = header_slots(&self.buffer, self.max_header_size, 0)?;
+                    let line_break = if self.lenient {
+                        None
+                    } else {
+                        line_break_error(&self.buffer, 0)
+                    };
                     match httparse::parse_headers(&self.buffer, &mut headers) {
                         Ok(httparse::Status::Complete((length, parsed))) => {
+                            if let Some(failure) = line_break {
+                                return Err(failure);
+                            }
                             let trailers = parsed
                                 .iter()
                                 .map(|header| (header.name.to_string(), latin1(header.value)))
@@ -583,6 +727,9 @@ impl Parser {
                             return Ok(Some(self.complete(trailers)));
                         }
                         Ok(httparse::Status::Partial) => {
+                            if let Some(failure) = line_break {
+                                return Err(failure);
+                            }
                             if self.buffer.len() > self.max_header_size {
                                 return Err(Failure(
                                     "HPE_HEADER_OVERFLOW",
@@ -592,11 +739,82 @@ impl Parser {
                             }
                             return Ok(None);
                         }
-                        Err(_) => return Err(header_error(&self.buffer, 0)),
+                        Err(httparse::Error::TooManyHeaders) => {
+                            return Err(Failure(
+                                "HPE_HEADER_OVERFLOW",
+                                "Header overflow",
+                                Some(self.max_header_size),
+                            ))
+                        }
+                        Err(_) => {
+                            return Err(first_failure(header_error(&self.buffer, 0), line_break))
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/// The slots for `httparse` to parse the header lines at the start of `bytes` into: one for each
+/// line within the first `max_header_size` + 1 bytes, since longer header lines fail. Fails with
+/// `HPE_HEADER_OVERFLOW` at the position `at` if the slots can't be allocated.
+fn header_slots<'h>(
+    bytes: &[u8],
+    max_header_size: usize,
+    at: usize,
+) -> Result<Vec<httparse::Header<'h>>, Failure> {
+    let scanned = &bytes[..bytes.len().min(max_header_size.saturating_add(1))];
+    let lines = memchr::memchr_iter(b'\n', scanned).count() + 1;
+    let mut slots = Vec::new();
+    if slots.try_reserve_exact(lines).is_err() {
+        return Err(Failure("HPE_HEADER_OVERFLOW", "Header overflow", Some(at)));
+    }
+    slots.resize(lines, httparse::EMPTY_HEADER);
+    Ok(slots)
+}
+
+/// The `llhttp` error in strict mode for the first malformed line break in the header lines
+/// `bytes` before the empty line that ends them, at its position counted from `base`: a carriage
+/// return without a line feed, a line feed without a carriage return that ends a header line, and
+/// a line feed without a carriage return in place of the empty line.
+fn line_break_error(bytes: &[u8], base: usize) -> Option<Failure> {
+    let mut line_start = 0;
+    let mut breaks = memchr::memchr2_iter(b'\r', b'\n', bytes);
+    while let Some(index) = breaks.next() {
+        if bytes[index] == b'\n' {
+            return Some(if index == line_start {
+                Failure(
+                    "HPE_INVALID_HEADER_TOKEN",
+                    "Invalid header field char",
+                    Some(base + index + 1),
+                )
+            } else {
+                Failure(
+                    "HPE_CR_EXPECTED",
+                    "Missing expected CR after header value",
+                    Some(base + index),
+                )
+            });
+        }
+        match bytes.get(index + 1) {
+            None => return None,
+            Some(b'\n') if index == line_start => return None,
+            Some(b'\n') => {
+                breaks.next();
+                line_start = index + 2;
+            }
+            Some(_) => return Some(lf_expected(base + index)),
+        }
+    }
+    None
+}
+
+/// `error`, or `line_break` if it comes before `error`.
+fn first_failure(error: Failure, line_break: Option<Failure>) -> Failure {
+    match line_break {
+        Some(line_break) if line_break.2 < error.2 => line_break,
+        _ => error,
     }
 }
 
@@ -626,20 +844,34 @@ const OTHER_METHODS: [&str; 12] = [
     "PRI",
 ];
 
-/// A parsed request line.
-struct RequestLine {
+/// A parsed request line or status line.
+struct StartLine {
+    /// The method of a request line, and empty for a status line.
     method: String,
+    /// The request target of a request line, and empty for a status line.
     url: String,
+    /// The status code of a status line, and 0 for a request line.
+    status: u16,
+    /// The reason phrase of a status line, and empty for a request line.
+    reason: String,
     major: u8,
     minor: u8,
     /// The position after the line's line break.
     end: usize,
 }
 
+/// A header field of a head: its name, a slice of the parser's buffer, its value, a slice of the
+/// buffer unless obsolete line folding continues it, and the position of the value in the buffer.
+struct Field<'b> {
+    name: &'b [u8],
+    value: std::borrow::Cow<'b, [u8]>,
+    at: usize,
+}
+
 /// The request line at the start of `bytes`, or `None` if `bytes` ends before it does, as
 /// `llhttp` parses it in its strict mode: a method of `METHODS`, a URL of visible ASCII characters,
 /// and HTTP/0.9, 1.0, 1.1 or 2.0, separated by single spaces and ended by CRLF.
-fn request_line(bytes: &[u8]) -> Result<Option<RequestLine>, Failure> {
+fn request_line(bytes: &[u8]) -> Result<Option<StartLine>, Failure> {
     let method_end = bytes.iter().position(|&byte| byte == b' ');
     let token = &bytes[..method_end.unwrap_or(bytes.len())];
     let matched = (0..=token.len())
@@ -710,42 +942,19 @@ fn request_line(bytes: &[u8]) -> Result<Option<RequestLine>, Failure> {
     }
     let version = protocol + 5;
     let byte_at = |index: usize| bytes.get(index).copied();
-    let reasons = [
-        "Invalid major version",
-        "Expected dot",
-        "Invalid minor version",
-    ];
-    for (offset, reason) in reasons.into_iter().enumerate() {
-        match byte_at(version + offset) {
-            None => return Ok(None),
-            Some(byte)
-                if (offset == 1) == (byte == b'.') && (offset == 1 || byte.is_ascii_digit()) => {}
-            Some(_) => {
-                return Err(Failure(
-                    "HPE_INVALID_VERSION",
-                    reason,
-                    Some(version + offset),
-                ))
-            }
-        }
-    }
-    let major = bytes[version] - b'0';
-    let minor = bytes[version + 2] - b'0';
-    if !matches!((major, minor), (0, 9) | (1, 0) | (1, 1) | (2, 0)) {
-        return Err(Failure(
-            "HPE_INVALID_VERSION",
-            "Invalid HTTP version",
-            Some(version + 3),
-        ));
-    }
+    let Some((major, minor)) = http_version(bytes, version)? else {
+        return Ok(None);
+    };
+    // `llhttp` reports a line feed without a carriage return at the position after it, and any
+    // other byte at its own position.
     match byte_at(version + 3) {
         None => return Ok(None),
         Some(b'\r') => {}
-        Some(_) => {
+        Some(byte) => {
             return Err(Failure(
                 "HPE_INVALID_VERSION",
                 "Expected CRLF after version",
-                Some(version + 4),
+                Some(version + 3 + usize::from(byte == b'\n')),
             ))
         }
     }
@@ -754,19 +963,207 @@ fn request_line(bytes: &[u8]) -> Result<Option<RequestLine>, Failure> {
         Some(b'\n') => {}
         Some(_) => {
             return Err(Failure(
-                "HPE_LF_EXPECTED",
-                "Expected LF after version",
-                Some(version + 5),
+                "HPE_STRICT",
+                "Expected CRLF after version",
+                Some(version + 4),
             ))
         }
     }
-    Ok(Some(RequestLine {
+    Ok(Some(StartLine {
         method,
         url,
+        status: 0,
+        reason: String::new(),
         major,
         minor,
         end: version + 5,
     }))
+}
+
+/// The HTTP version at `at` in `bytes`, after `HTTP/`, or `None` if `bytes` ends before it does:
+/// a digit, a dot and a digit, of 0.9, 1.0, 1.1 or 2.0.
+fn http_version(bytes: &[u8], at: usize) -> Result<Option<(u8, u8)>, Failure> {
+    let reasons = [
+        "Invalid major version",
+        "Expected dot",
+        "Invalid minor version",
+    ];
+    for (offset, reason) in reasons.into_iter().enumerate() {
+        match bytes.get(at + offset).copied() {
+            None => return Ok(None),
+            Some(byte)
+                if (offset == 1) == (byte == b'.') && (offset == 1 || byte.is_ascii_digit()) => {}
+            Some(_) => return Err(Failure("HPE_INVALID_VERSION", reason, Some(at + offset))),
+        }
+    }
+    let major = bytes[at] - b'0';
+    let minor = bytes[at + 2] - b'0';
+    if !matches!((major, minor), (0, 9) | (1, 0) | (1, 1) | (2, 0)) {
+        return Err(Failure(
+            "HPE_INVALID_VERSION",
+            "Invalid HTTP version",
+            Some(at + 3),
+        ));
+    }
+    Ok(Some((major, minor)))
+}
+
+/// The status line at the start of `bytes`, or `None` if `bytes` ends before it does, as `llhttp`
+/// parses it in its strict mode: `HTTP/` with a version of 0.9, 1.0, 1.1 or 2.0, a space, a
+/// status code of three digits, and a reason phrase after a space, which can be empty or left
+/// out, ended by CRLF.
+fn status_line(bytes: &[u8]) -> Result<Option<StartLine>, Failure> {
+    for (offset, &expected) in b"HTTP/".iter().enumerate() {
+        match bytes.get(offset) {
+            None => return Ok(None),
+            Some(&byte) if byte == expected => {}
+            Some(_) => {
+                return Err(Failure(
+                    "HPE_INVALID_CONSTANT",
+                    "Expected HTTP/, RTSP/ or ICE/",
+                    Some(offset),
+                ))
+            }
+        }
+    }
+    let Some((major, minor)) = http_version(bytes, 5)? else {
+        return Ok(None);
+    };
+    match bytes.get(8) {
+        None => return Ok(None),
+        Some(b' ') => {}
+        Some(_) => {
+            return Err(Failure(
+                "HPE_INVALID_VERSION",
+                "Expected space after version",
+                Some(8),
+            ))
+        }
+    }
+    let mut status = 0;
+    for index in 9..12 {
+        match bytes.get(index) {
+            None => return Ok(None),
+            Some(&byte) if byte.is_ascii_digit() => status = status * 10 + u16::from(byte - b'0'),
+            Some(_) => {
+                return Err(Failure(
+                    "HPE_INVALID_STATUS",
+                    "Invalid status code",
+                    Some(index),
+                ))
+            }
+        }
+    }
+    let reason_start = match bytes.get(12) {
+        None => return Ok(None),
+        Some(b' ') => 13,
+        Some(b'\r') => 12,
+        Some(&byte) => {
+            // The reported position includes a line feed, as `llhttp`'s does.
+            return Err(Failure(
+                "HPE_INVALID_STATUS",
+                "Invalid response status",
+                Some(12 + usize::from(byte == b'\n')),
+            ));
+        }
+    };
+    let Some(index) = memchr::memchr2(b'\r', b'\n', &bytes[reason_start.min(bytes.len())..]) else {
+        return Ok(None);
+    };
+    let line_break = reason_start + index;
+    if bytes[line_break] == b'\n' {
+        return Err(Failure(
+            "HPE_CR_EXPECTED",
+            "Missing expected CR after response line",
+            Some(line_break + 1),
+        ));
+    }
+    match bytes.get(line_break + 1) {
+        None => return Ok(None),
+        Some(b'\n') => {}
+        Some(_) => {
+            return Err(Failure(
+                "HPE_STRICT",
+                "Expected LF after CR",
+                Some(line_break + 1),
+            ))
+        }
+    }
+    Ok(Some(StartLine {
+        method: String::new(),
+        url: String::new(),
+        status,
+        reason: latin1(&bytes[reason_start..line_break]),
+        major,
+        minor,
+        end: line_break + 2,
+    }))
+}
+
+/// The header fields at the start of `bytes`, up to the empty line that ends them, as `llhttp`
+/// parses them with its lenient flags: names of token characters, values of any bytes but CR and
+/// LF without the spaces and tabs around them, and lines ended by CRLF or LF. A line that starts
+/// with a space or a tab continues the value of the field before it, after a space. `base` is the
+/// position of `bytes` in the parser's buffer. Returns the length of the fields with the empty
+/// line, or `None` if `bytes` ends before the empty line.
+fn lenient_fields(bytes: &[u8], base: usize) -> Result<Option<(usize, Vec<Field<'_>>)>, Failure> {
+    let mut fields = Vec::new();
+    let mut position = 0;
+    loop {
+        let Some(index) = memchr::memchr(b'\n', &bytes[position..]) else {
+            return Ok(None);
+        };
+        let line_end = position + index;
+        let line = &bytes[position..line_end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            return Ok(Some((line_end + 1, fields)));
+        }
+        let is_space = |byte: &u8| *byte == b' ' || *byte == b'\t';
+        if line.first().is_some_and(is_space) {
+            if let Some(field) = fields.last_mut() {
+                let start = line
+                    .iter()
+                    .position(|byte| !is_space(byte))
+                    .unwrap_or(line.len());
+                let end = line
+                    .iter()
+                    .rposition(|byte| !is_space(byte))
+                    .map_or(start, |end| end + 1);
+                let value = field.value.to_mut();
+                value.push(b' ');
+                value.extend_from_slice(&line[start..end]);
+                position = line_end + 1;
+                continue;
+            }
+        }
+        let name_end = line
+            .iter()
+            .position(|&byte| !is_token_byte(byte))
+            .unwrap_or(line.len());
+        if name_end == 0 || line.get(name_end) != Some(&b':') {
+            return Err(Failure(
+                "HPE_INVALID_HEADER_TOKEN",
+                "Invalid header token",
+                Some(base + position + name_end),
+            ));
+        }
+        let value = &line[name_end + 1..];
+        let start = value
+            .iter()
+            .position(|byte| !is_space(byte))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|byte| !is_space(byte))
+            .map_or(start, |end| end + 1);
+        fields.push(Field {
+            name: &line[..name_end],
+            value: std::borrow::Cow::Borrowed(&value[start..end]),
+            at: base + position + name_end + 1 + start,
+        });
+        position = line_end + 1;
+    }
 }
 
 /// `HPE_INVALID_METHOD` at the position `at`.
@@ -828,4 +1225,86 @@ fn header_error(bytes: &[u8], base: usize) -> Failure {
         "Invalid header token",
         Some(base),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The events `parser` returns for the bytes fed so far, up to the first error.
+    fn drain(parser: &mut Parser) -> Result<Vec<Event>, ParseError> {
+        let mut events = Vec::new();
+        while let Some(event) = parser.next()? {
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    /// The events `parser` returns for the bytes fed so far. Panics on a parse error.
+    fn events(parser: &mut Parser) -> Vec<Event> {
+        drain(parser).unwrap_or_else(|error| panic!("{error:?}"))
+    }
+
+    #[test]
+    fn line_breaks_after_a_closing_message_are_consumed() {
+        let mut parser = Parser::new(Kind::Request, 16384, None, false);
+        parser.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        let received = events(&mut parser);
+        assert!(matches!(received.last(), Some(Event::Complete(_))));
+        for _ in 0..100 {
+            parser.feed(&b"\r\n".repeat(512));
+            assert!(events(&mut parser).is_empty());
+            assert!(parser.buffer.is_empty());
+        }
+        parser.feed(b"\r\nX");
+        let error = drain(&mut parser)
+            .err()
+            .expect("data after the closing message");
+        assert_eq!(error.code, "HPE_CLOSED_CONNECTION");
+        assert_eq!(error.bytes_parsed, 3);
+    }
+
+    #[test]
+    fn trailers_beyond_the_header_limit_overflow() {
+        let mut parser = Parser::new(Kind::Request, 64, None, false);
+        parser.feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+        assert_eq!(events(&mut parser).len(), 1);
+        parser.feed(&b"A: b\r\n".repeat(64));
+        let error = drain(&mut parser).err().expect("too many trailer lines");
+        assert_eq!(error.code, "HPE_HEADER_OVERFLOW");
+    }
+
+    #[test]
+    fn trailers_within_the_header_limit_are_parsed() {
+        let mut parser = Parser::new(Kind::Request, 64, None, false);
+        parser.feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n");
+        parser.feed(b"1\r\nx\r\n0\r\nA: b\r\nC: d\r\n\r\n");
+        let received = events(&mut parser);
+        let Some(Event::Complete(trailers)) = received.last() else {
+            panic!("the message completes");
+        };
+        assert_eq!(
+            trailers,
+            &[("A".to_string(), "b".to_string()), ("C".into(), "d".into())]
+        );
+    }
+
+    #[test]
+    fn malformed_line_breaks_after_the_request_version() {
+        let cases: [(&[u8], &str, usize); 4] = [
+            (b"GET / HTTP/1.1X\r\n\r\n", "HPE_INVALID_VERSION", 14),
+            (b"GET / HTTP/1.1 \r\n\r\n", "HPE_INVALID_VERSION", 14),
+            (b"GET / HTTP/1.1\n\r\n", "HPE_INVALID_VERSION", 15),
+            (b"GET / HTTP/1.1\rX\r\n\r\n", "HPE_STRICT", 15),
+        ];
+        for (request, code, bytes_parsed) in cases {
+            let mut parser = Parser::new(Kind::Request, 16384, None, false);
+            parser.feed(request);
+            let error = drain(&mut parser).err().expect("a malformed request line");
+            assert_eq!(
+                (error.code, error.reason, error.bytes_parsed),
+                (code, "Expected CRLF after version", bytes_parsed)
+            );
+        }
+    }
 }

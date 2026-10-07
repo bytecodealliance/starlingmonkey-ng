@@ -173,6 +173,22 @@ impl NodeError {
         )
     }
 
+    /// `ERR_MISSING_ARGS`: the arguments `names` must be specified.
+    pub fn missing_args(names: &[&str]) -> Self {
+        let names: Vec<String> = names.iter().map(|name| format!("\"{name}\"")).collect();
+        let list = match names.as_slice() {
+            [name] => format!("{name} argument"),
+            [first, second] => format!("{first} and {second} arguments"),
+            [rest @ .., last] => format!("{}, and {last} arguments", rest.join(", ")),
+            [] => "arguments".to_string(),
+        };
+        Self::new(
+            ErrorKind::TypeError,
+            "ERR_MISSING_ARGS",
+            format!("The {list} must be specified"),
+        )
+    }
+
     /// `ERR_METHOD_NOT_IMPLEMENTED`: `what` cannot work in this runtime.
     pub fn not_implemented(what: &str) -> Self {
         Self::new(

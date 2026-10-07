@@ -22,6 +22,13 @@ const respond = (request) =>
 
 eq(new IncomingMessage() instanceof Readable, true, "IncomingMessage is a Readable");
 eq(new ServerResponse() instanceof OutgoingMessage, true, "ServerResponse extends OutgoingMessage");
+eq(new OutgoingMessage({ highWaterMark: "x" }).writableHighWaterMark, new OutgoingMessage().writableHighWaterMark, "a highWaterMark that isn't a number gives the default");
+{
+  const timeouts = [];
+  const socket = { setKeepAlive() {}, unref() {}, setTimeout(timeout) { timeouts.push(timeout); } };
+  eq(new Agent({ timeout: "x" }).keepSocketAlive(socket), true, "keepSocketAlive with a string timeout");
+  deepEq(timeouts, ["x"], "keepSocketAlive passes the timeout option on");
+}
 eq(http.globalAgent instanceof Agent && https.globalAgent instanceof https.Agent, true, "global agents");
 eq(new https.Agent().defaultPort, 443, "https agents default to port 443");
 eq(http.STATUS_CODES[418], "I'm a Teapot", "STATUS_CODES");
@@ -52,7 +59,7 @@ eq(http.STATUS_CODES[418], "I'm a Teapot", "STATUS_CODES");
   eq(request instanceof ClientRequest && request instanceof Writable === false, true, "ClientRequest is an OutgoingMessage");
   eq(request.getHeader("content-type"), "text/plain", "getHeader");
   request.setHeader("X-Later", 5);
-  deepEq(request.getHeaderNames().sort(), ["authorization", "content-type", "x-later", "x-many"], "getHeaderNames");
+  deepEq(request.getHeaderNames().sort(), ["authorization", "content-type", "host", "x-later", "x-many"], "getHeaderNames");
   request.write("hello ");
   request.end("world");
   eq(request.headersSent, true, "headersSent after write");
@@ -168,4 +175,38 @@ eq(http.STATUS_CODES[418], "I'm a Teapot", "STATUS_CODES");
   deepEq([headers.statusCode, headers.getHeader("x-a")], [200, ["2", "3"]], "writeHead truncates the status and replaces headers");
   throws(() => new ServerResponse({}).writeHead(200, ["X-A"]), "ERR_INVALID_ARG_VALUE", "header arrays have pairs");
   throws(() => http.validateHeaderValue("x", Symbol()), TypeError, "header values convert to strings");
+}
+
+// A message the runtime creates reads an inherited `_maxListeners` through an accessor, which can
+// define the message's own properties before the message has the rest of them.
+{
+  const { EventEmitter } = await import("node:events");
+  const original = Object.getOwnPropertyDescriptor(EventEmitter.prototype, "_maxListeners");
+  const seen = [];
+  Object.defineProperty(EventEmitter.prototype, "_maxListeners", {
+    configurable: true,
+    get() {
+      if (this instanceof IncomingMessage) {
+        seen.push(Object.keys(this).join());
+        Object.defineProperty(this, "complete", { value: "early", writable: true, enumerable: true, configurable: true });
+      }
+      return undefined;
+    },
+    set(value) {
+      Object.defineProperty(this, "_maxListeners", { value, writable: true, enumerable: true, configurable: true });
+    },
+  });
+  try {
+    const response = await new Promise((resolve) => http.get(`${base}/echo`, resolve));
+    eq(seen[0], "_readableState,_events,_eventsCount", "the accessor sees the properties created before it");
+    await read(response);
+    eq(response.complete, true, "the message's own value replaces the accessor's");
+    deepEq(
+      Object.keys(response).slice(0, 8),
+      ["_readableState", "_events", "_eventsCount", "complete", "_maxListeners", "socket", "httpVersionMajor", "httpVersionMinor"],
+      "properties after the accessor's",
+    );
+  } finally {
+    Object.defineProperty(EventEmitter.prototype, "_maxListeners", original);
+  }
 }

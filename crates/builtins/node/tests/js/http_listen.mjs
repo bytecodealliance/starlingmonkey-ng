@@ -177,6 +177,54 @@ eq(new Server() instanceof net.Server, true, "http.Server extends net.Server");
   await within(once(server, "close"), "server close");
 }
 
+// The parser rejects a line feed without a carriage return in a request head, in chunked trailers,
+// and in a response head, with `llhttp`'s strict errors.
+{
+  // A parse error in the trailers aborts the request, whose body `read` then rejects.
+  const server = http.createServer((req, res) => read(req).then(() => res.end(), () => {}));
+  const errors = [];
+  server.on("clientError", (error, socket) => {
+    errors.push([error.code, error.bytesParsed]);
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+  });
+  const port = await listen(server);
+  const chunked = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n";
+  for (const request of [
+    "GET / HTTP/1.1\r\nHost: a\nX-A: b\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\n\n",
+    `${chunked}X-T: v\n\r\n`,
+    `${chunked}\n`,
+  ]) {
+    eq(await exchange(port, request), "HTTP/1.1 400 Bad Request\r\n\r\n", `rejects ${JSON.stringify(request)}`);
+  }
+  deepEq(
+    errors,
+    [["HPE_CR_EXPECTED", 23], ["HPE_INVALID_HEADER_TOKEN", 26], ["HPE_CR_EXPECTED", 72], ["HPE_INVALID_HEADER_TOKEN", 67]],
+    "the errors of line feeds without a carriage return",
+  );
+  server.close();
+  await within(once(server, "close"), "server close");
+
+  const responses = ["HTTP/1.1 200 OK\r\nX-A: b\nContent-Length: 0\r\n\r\n", "HTTP/1.1 200 OK\nContent-Length: 0\r\n\r\n"];
+  const raw = net.createServer((socket) => socket.end(responses.shift()));
+  const rawPort = await listen(raw);
+  const responseErrors = [];
+  for (let i = 0; i < 2; i++) {
+    const request = http.get({ port: rawPort, host: "127.0.0.1", agent: false });
+    const [error] = await within(once(request, "error"), "a response head with a bare line feed");
+    responseErrors.push([error.code, error.reason, error.bytesParsed]);
+  }
+  deepEq(
+    responseErrors,
+    [
+      ["HPE_CR_EXPECTED", "Missing expected CR after header value", 23],
+      ["HPE_CR_EXPECTED", "Missing expected CR after response line", 16],
+    ],
+    "the responses' parse errors",
+  );
+  raw.close();
+}
+
 // A client request emits `socket` in a later tick, and a proxy that pipes the request body from
 // its `socket` listener, as httpxy does, completes.
 {

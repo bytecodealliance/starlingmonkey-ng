@@ -50,6 +50,9 @@ pub(crate) struct HttpServerState {
     pub(super) incoming_class: Option<Heap<js::object::Object>>,
     /// The class of the responses, from the `ServerResponse` option.
     pub(super) response_class: Option<Heap<js::object::Object>>,
+    /// The lowercase names of the `uniqueHeaders` option, which the responses get.
+    #[no_trace]
+    pub(super) unique_headers: Option<Vec<String>>,
 }
 
 #[core_runtime::jsmethods]
@@ -317,11 +320,14 @@ fn store_options(
     });
     let [incoming_class, response_class] = classes;
     let (incoming_class, response_class) = (incoming_class?, response_class?);
+    let unique = option(scope, options, c"uniqueHeaders")?;
+    let unique = super::outgoing::parse_unique_headers(scope, unique)?;
     {
         let state = server_class::state_of(scope, server)?;
         let mut data = state.data_mut();
         data.incoming_class = incoming_class.map(Heap::from);
         data.response_class = response_class.map(Heap::from);
+        data.unique_headers = unique;
     }
     let max_header_size = option(scope, options, c"maxHeaderSize")?;
     if !max_header_size.is_undefined() {
@@ -339,32 +345,9 @@ fn store_options(
         crate::errors::validate_boolean(scope, optimize, "options.optimizeEmptyRequests")?;
     }
     let insecure = option(scope, options, c"insecureHTTPParser")?;
-    if !insecure.is_undefined() {
-        crate::errors::validate_boolean(scope, insecure, "options.insecureHTTPParser")?;
-    }
-    server.set_property(scope, c"insecureHTTPParser", insecure)?;
     let validation = option(scope, options, c"httpValidation")?;
-    if !validation.is_undefined() {
-        let text = crate::support::rust_string(scope, validation);
-        if !matches!(text.as_deref(), Some("strict" | "relaxed" | "insecure")) {
-            return Err(NodeError::invalid_arg_value(
-                scope,
-                "options.httpValidation",
-                validation,
-                "must be one of: 'strict', 'relaxed', 'insecure'",
-            )
-            .into());
-        }
-        if !insecure.is_undefined() {
-            return Err(NodeError::invalid_arg_value(
-                scope,
-                "options.httpValidation",
-                validation,
-                "cannot be used together with options.insecureHTTPParser",
-            )
-            .into());
-        }
-    }
+    super::validate_parser_options(scope, insecure, validation)?;
+    server.set_property(scope, c"insecureHTTPParser", insecure)?;
     server.set_property(scope, c"httpValidation", validation)?;
     let request_timeout = integer_option(scope, options, c"requestTimeout", 300_000.0)?;
     server.set_property(scope, c"requestTimeout", request_timeout)?;
@@ -517,7 +500,8 @@ pub mod server_class {
             return crate::net::server::server_class::listen(scope, this, args);
         }
         let args: Vec<HandleValue<'_>> = args.iter().copied().collect();
-        let (port, _, callback) = crate::net::listen_args(scope, &args)?;
+        let crate::net::server::ListenArgs { port, callback, .. } =
+            crate::net::listen_args(scope, &args)?;
         if core_runtime::event_loop::without_request_handler() {
             return Err(NodeError::new(
                 ErrorKind::Error,

@@ -81,14 +81,18 @@ These flags take effect:
   Connecting tries the addresses a host resolves to in turn either way.
 - `--experimental-stream-iter`: `stream/iter` and `zlib/iter` can be imported. Their exports are
   stubs.
+- `--test-udp-no-try-send`: `dgram` sockets queue every send instead of sending it at once.
+- `--insecure-http-parser`: HTTP servers and client requests without the `insecureHTTPParser` and
+  `httpValidation` options parse messages leniently (see [`node:http`](#nodehttp-and-nodehttps)),
+  and the first one to do so emits a warning.
 
 These flags are accepted without effect:
 
 - `--zero-fill-buffers`: every new `Buffer` is zero-filled, including those of `allocUnsafe`.
-- `--insecure-http-parser`: the HTTP parser has no lenient mode, so it stays strict.
 - `--max-old-space-size`, `--max-semi-space-size` and `--no-concurrent-array-buffer-sweeping`:
   V8 heap settings.
-- `--experimental-vm-modules`: `node:vm` is a stub.
+- `--experimental-vm-modules`: `vm.Module`, `vm.SourceTextModule` and `vm.SyntheticModule`
+  aren't implemented.
 
 These flags are rejected:
 
@@ -143,6 +147,8 @@ these members, and nothing else:
 
 - `buffer`: `fill`.
 - `constants`: `fs` and `os`, which are `fs.constants` and `os.constants`.
+- `performance`: `constants`, which are `perf_hooks.constants`, and `observerCounts`, a
+  `Uint32Array` of the number of observers of each `NODE_PERFORMANCE_ENTRY_TYPE_*` type.
 - `timers`: `getLibuvNow`, which is `process.uptime()` in milliseconds, as an integer.
 - `uv`: a `UV_` constant for each libuv error code, and `errname`.
 
@@ -338,6 +344,54 @@ on macOS and Windows, and never on wasm. Segment patterns compile to minimatch's
 expressions, which run on the JS engine's `RegExp`. Matching follows minimatch's POSIX rules on
 every platform, without its Windows drive and UNC handling.
 
+### `node:perf_hooks`
+
+`performance`, `Performance`, `PerformanceEntry`, `PerformanceMark`, `PerformanceMeasure`,
+`PerformanceObserver` and `PerformanceObserverEntryList` are the globals, the web performance
+timeline of `web_globals::performance`, so marks, measures and observers are shared with code that
+uses the globals. `createHistogram`, `monitorEventLoopDelay`, `eventLoopUtilization`, `timerify`
+and `constants` are implemented. `PerformanceResourceTiming` is a stub, and no `resource` entries
+are produced.
+
+- The timeline is the `Performance` object's Rust state: the `mark` and `measure` buffers and the
+  registered observers. An observer's callback runs in a zero-delay timer queued once for all
+  observers with new entries, as Node.js's `setImmediate`, with the entries sorted by start
+  time. Errors of the shared classes are the web platform's: argument conversions throw a
+  `TypeError` without a `code` where Node.js throws `ERR_INVALID_ARG_TYPE` or
+  `ERR_MISSING_ARGS`, and `performance.mark` throws a `SyntaxError` `DOMException` for a
+  `nodeTiming` milestone name, where Node.js throws `ERR_INVALID_ARG_VALUE`.
+- `Performance.prototype` gets Node.js's non-enumerable `eventLoopUtilization`, `nodeTiming` and
+  `timerify`, and Node.js's `toJSON`. `markResourceTiming`, `clearResourceTimings`,
+  `setResourceTimingBufferSize` and `onresourcetimingbufferfull` are missing. `measure` takes
+  options with neither `start` nor `end`, as Node.js's does, and resolves the `nodeTiming`
+  milestone names.
+- `PerformanceObserver.supportedEntryTypes` is Node.js's list. Of the types Node.js produces itself,
+  `function` entries come from `timerify` and `gc` entries from the engine's collection
+  callbacks, which are installed only while an observer observes `gc`. A nursery collection is
+  `NODE_PERFORMANCE_GC_MINOR`, a slice of an incremental major collection other than the last is
+  `NODE_PERFORMANCE_GC_INCREMENTAL`, and the last slice of a major collection is
+  `NODE_PERFORMANCE_GC_MAJOR`. Collections that `gc()` or the embedding requested have
+  `NODE_PERFORMANCE_GC_FLAGS_FORCED`, and others `NODE_PERFORMANCE_GC_FLAGS_NO`. The entries are
+  queued by an unreferenced timer, which doesn't keep the event loop running. `dns`, `http`,
+  `http2`, `net` and `quic` entries are never produced.
+- `nodeTiming`'s `nodeStart` and `v8Start` are when the Node.js setup of the global started,
+  `environment` when the classes of the Node.js builtins were registered, and
+  `bootstrapComplete` when the setup finished. `loopStart` is when the event loop first stepped,
+  `-1` before that, and `loopExit` is always `-1`. `idleTime` is the time the event loop's driver
+  spent waiting for timers, tasks and I/O. `uvMetricsInfo`'s counts are 0.
+- `eventLoopUtilization` computes Node.js's idle and active times from the event loop's start and
+  idle time, and returns zeros before the event loop's first step. In serve mode, it is the
+  utilization of the event loop of the request that calls it.
+- Histograms hold their counts in the `hdrhistogram` crate, which has HdrHistogram_c's bucket
+  layout. The statistics are ports of HdrHistogram_c's and Node.js's, so percentiles, the
+  `percentiles` map, means and the analysis methods match Node.js's results, apart from the last
+  bits of some floating-point results. A histogram can't be transferred or cloned.
+- `monitorEventLoopDelay` samples with an unreferenced repeating timer of `resolution`
+  milliseconds, which records the time between its runs. With `samplePerIteration`, it samples
+  with the timer as well, as the event loop has no hook that runs on each of its iterations.
+- `logBuckets` with a `base` below 2 stops after the first bucket, where Node.js's iteration
+  doesn't end.
+
 ### `node:crypto`
 
 Hashes, HMACs, secret keys, key derivation and random values are implemented: `createHash`,
@@ -513,11 +567,12 @@ without `--node-compat`. `resolveObjectURL` is a stub.
 
 ### `node:http` and `node:https`
 
-Servers serve the runtime's incoming requests, or accept HTTP/1.1 connections themselves, and
-clients send requests through the runtime's HTTP client, which also serves `fetch`. `Server`,
-`createServer`, `IncomingMessage`, `OutgoingMessage`, `ServerResponse`, `ClientRequest`,
-`request`, `get`, `Agent`, `globalAgent`, `METHODS`, `STATUS_CODES`, `validateHeaderName` and
-`validateHeaderValue` are implemented. The rest of the modules are stubs.
+Servers serve the runtime's incoming requests, or accept HTTP/1.1 connections themselves.
+Clients write HTTP/1.1 to sockets, or send requests through the runtime's HTTP client, which also
+serves `fetch` (see "For clients" below). `Server`, `createServer`, `IncomingMessage`,
+`OutgoingMessage`, `ServerResponse`, `ClientRequest`, `request`, `get`, `Agent`, `globalAgent`,
+`METHODS`, `STATUS_CODES`, `validateHeaderName` and `validateHeaderValue` are implemented. The
+rest of the modules are stubs.
 
 - `Server` extends `net.Server`. Its options are validated and stored as Node.js stores them.
 - `listen()` depends on how the runtime runs:
@@ -551,14 +606,16 @@ classes a server is created with, get them assigned, as in Node.js.
 Each message, server and connection keeps its state in one Rust struct:
 
 - An `OutgoingMessage`'s `OutgoingState` holds its headers with the values they were given, the
-  header block `writeHead` stored until it is sent, its socket, the writes it queues until it has
-  one, the request a response responds to, and its transport: HTTP/1.1 written to its socket, the
-  web `Response` of a served request, or the body of a client request. `headersSent`, `socket`,
-  `connection`, `closed`, `errored` and the `writable*` getters are accessors over it.
-  `statusCode` and `statusMessage` are data properties of `ServerResponse.prototype`, as in
-  Node.js.
+  header block `writeHead` or `_implicitHeader` stored until it is sent, its socket, the writes it
+  queues until it has one, the request a response responds to, the names of `uniqueHeaders`, and
+  its transport: HTTP/1.1 written to its socket, the web `Response` of a served request, or the
+  body of a client request through the runtime's HTTP client. A client request's state also holds
+  its agent, its `path`, the error it was destroyed with and, while its agent queues it, the
+  options it waits with. `headersSent`, `socket`, `connection`, `closed`, `errored` and the
+  `writable*` getters are accessors over it. `statusCode` and `statusMessage` are data properties
+  of `ServerResponse.prototype`, as in Node.js.
 - An `IncomingMessage`'s `IncomingState` extends the state of the stream with the source of its
-  body: the connection that parses it, the body the host received, or the body stream of a served
+  body: the socket it is parsed from, the body the host received, or the body stream of a served
   request that was read before. It also holds the header and trailer lines, from which `headers`,
   `trailers`, `headersDistinct` and `trailersDistinct` are built when they are first read, and the
   controller of `signal`.
@@ -568,9 +625,16 @@ Each message, server and connection keeps its state in one Rust struct:
 - A connection's `ConnectionState` holds its parser, the requests waiting for their responses, the
   responses waiting for the socket, and the bytes those responses queued. It is the payload of
   the socket's listeners.
-- Served requests and client requests get a host socket, a `Socket` whose private data holds the
-  peer's address the host reported, the local port, whether it was destroyed, and the client
-  request it belongs to.
+- The `parser` of a connection or of a client request's socket is a `ParserHandle`, whose private
+  data holds the parser, the message it parses, and for a client request the socket and the
+  options of the response's headers. A client request's parser is reused by a later request once
+  it is freed, as in Node.js.
+- An agent's own data properties `requests`, `sockets`, `freeSockets` and `totalSocketCount`
+  hold its pools, as in Node.js. The listeners it adds to its sockets are native functions whose
+  payload, an `AgentSocket`, holds the agent, the socket and the socket's options.
+- Served requests and client requests through the runtime's HTTP client get a host socket, a
+  `Socket` whose private data holds the peer's address the host reported, the local port, whether
+  it was destroyed, and the request it belongs to.
 
 A server that accepts connections itself handles each connection's requests as Node.js does:
 
@@ -578,7 +642,12 @@ A server that accepts connections itself handles each connection's requests as N
   methods of `METHODS`, URLs of visible ASCII characters, HTTP/0.9, 1.0, 1.1 and 2.0, header
   names of token characters, header values without control characters other than a tab, CRLF
   line ends, and at most `maxHeadersCount` (by default 1000) header lines in at most
-  `maxHeaderSize` (by default 16 KiB) bytes. Bodies are framed by `Content-Length` or chunked
+  `maxHeaderSize` (by default 16 KiB) bytes. With `insecureHTTPParser`, an `httpValidation` of
+  `'relaxed'` or `'insecure'`, or `--insecure-http-parser`, the parser is lenient as `llhttp` is
+  with its lenient flags: header values can have control characters, lines can end with a line
+  feed alone, a line that starts with a space or a tab continues the header before it, a request
+  can have both `Transfer-Encoding` and `Content-Length`, and data after a request that closes
+  the connection is ignored. `'relaxed'` relaxes more than `llhttp` does. Bodies are framed by `Content-Length` or chunked
   transfer coding, with trailers. A parse error has `llhttp`'s `code`, `reason` and the position it
   reports as `bytesParsed`, and `rawPacket`. It is emitted as `clientError`, and without
   listeners the server responds with a 400, 408, 413 or 431 and destroys the socket. Data after a
@@ -650,27 +719,83 @@ For served requests:
   [`node:fs`](#nodefs-and-nodefspromises)).
 - When a client disconnects, the response doesn't emit `close`.
 
-For clients:
+For clients, a request takes one of two paths:
 
-- A client request is sent once `end()` is called, with everything written as its body. Agents
-  hold their options and have no effect on connections, which the host manages. The TLS options,
-  `createConnection` and upgrades aren't supported, and `signal` is. `setTimeout` emits `timeout`
-  when no response arrives in time. Transport errors have `code` `ECONNREFUSED`, `ECONNRESET`,
-  `ENOTFOUND` or `ETIMEDOUT` where the host's message names the cause.
-- A client request emits `socket` in the tick queue after it is created, unless it was destroyed
-  by then, and `socket` and `connection` are the socket from then on, as is its response's
-  `socket`. The socket is the one of served requests (see above), with `pending` and `connecting`
-  `false`, the host as its `remoteAddress` if the host is an IP address, and `encrypted` set for
-  `https:`. Its `destroy` destroys the request. A `keepAlive` agent takes the socket back when the
-  response ends, and gives it to its next request to the same host and port, whose `reusedSocket`
-  is then `true`.
+- A request to an `http:` URL in a script the CLI runs as a command, natively or on wasm, writes
+  HTTP/1.1 to a socket, as Node.js's `ClientRequest` does.
+- Every other request goes through the runtime's HTTP client, reqwest natively and `wasi:http` on
+  wasm: requests to `https:` URLs, since the runtime's sockets have no TLS, and every request while
+  the runtime serves requests, with `--serve` or in a `wasi:http` component, including Spin. There
+  `net` sockets work natively, but a component's host may not grant `wasi:sockets`, and a socket a
+  served request's event loop reads isn't read once its response is sent, so an agent couldn't
+  reuse it.
+
+A request over a socket behaves as in Node.js:
+
+- It gets its socket from `agent.addRequest`, from the `createConnection` option, or from
+  `net.createConnection` with `agent: false` and without `createConnection`, all called by name,
+  so agents and options can replace them. `onSocket` assigns the socket in the tick queue, and the
+  request emits `socket`, writes its queued header block and body, and parses the response with
+  the parser of the server's requests in response mode (see above). Its `rawHeaders` keep the
+  names as received, and `statusMessage` is the reason phrase as received.
+- The header block is Node.js's, from `_storeHeader`: the headers in the order they were set, with
+  `Host` (unless `setHost` is `false`), `Authorization` for `auth`, and `Connection`, and
+  `Content-Length` or chunked transfer coding as the method and `end()` allow. `headers` given as
+  an array is sent as given, `uniqueHeaders` sends the values of its headers on one line, and
+  `setDefaultHeaders: false` leaves out `Connection`, `Content-Length` and `Transfer-Encoding`.
+  The request target is `path` as given, and nothing is added or normalized.
+- A response with status 100 emits `continue`, and every informational response but 101 emits
+  `information`. A response with status 101 and `Upgrade`, or any response to a `CONNECT`
+  request, emits `upgrade` or `connect` with the response, the socket and the bytes after the
+  head, and destroys the socket without listeners. Responses to `HEAD` requests and with status
+  304 have no body, and a response without `Content-Length` or chunked transfer coding ends when
+  the connection closes. `maxHeaderSize` (by default 16 KiB), `maxHeadersCount`,
+  `insecureHTTPParser`, `httpValidation` and `joinDuplicateHeaders` apply to the response's head.
+  A listener that throws while the response's head or body is handled throws an uncaught
+  exception, and the parser fails the bytes that follow.
+- Errors before a response are `error` events, such as `ECONNRESET` "socket hang up" when the
+  connection closes, and the parser's errors with `llhttp`'s codes. A response whose connection
+  closes before it is complete is destroyed with `ECONNRESET` "aborted". `timeout`, `setTimeout`,
+  `setNoDelay`, `setSocketKeepAlive` and `signal` work on the socket, as in Node.js.
+- An `Agent` keeps sockets per connection name from `getName`, creates them with
+  `createConnection` up to `maxSockets` per name and `maxTotalSockets` in all, and queues the
+  requests that find none in `requests`. With `keepAlive`, a socket whose response ended goes to
+  `freeSockets`, up to `maxFreeSockets` per name, with the agent's `timeout` or the response's
+  `Keep-Alive` timeout less `agentKeepAliveTimeoutBuffer`, and is given to the next request in
+  `scheduling` order, whose `reusedSocket` is then `true`. A free socket doesn't keep the event
+  loop alive, and is destroyed if it receives data. `http.globalAgent` keeps connections alive
+  with a timeout of 5 seconds, as in Node.js, and assigning `http.globalAgent` replaces the
+  default agent of later requests. Queued requests don't keep the async context they were
+  created in. `proxyEnv` and the environment's proxy settings have no effect.
+- `socketPath` is passed to `createConnection` as `path`, where `net` refuses it, since `net` has
+  no IPC sockets. `localAddress`, `family` and `lookup` reach `net.connect`.
+
+A request through the runtime's HTTP client is sent once `end()` is called, with everything
+written as its body:
+
+- The host manages its connections and TLS. The TLS options and `createConnection` are ignored,
+  and so are agents but for `keepAlive` (see below). Upgrades, `CONNECT` and informational
+  responses aren't supported. `signal` is. `setTimeout` emits `timeout` when no response arrived
+  in time. Transport errors have `code` `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND` or `ETIMEDOUT`
+  where the host's message names the cause.
+- The host may add headers, such as `accept: */*` natively, lowercases header names, normalizes
+  the path and sets the headers that frame the request. The response's `rawHeaders` have the
+  lowercase names the host reports, and `statusMessage` is the standard reason phrase.
+- The request emits `socket` in the tick queue after it is created, unless it was destroyed by
+  then, and `socket` and `connection` are the socket from then on, as is its response's `socket`.
+  The socket is the one of served requests (see above), with `pending` and `connecting` `false`,
+  the host as its `remoteAddress` if the host is an IP address, and `encrypted` set for `https:`.
+  Its `destroy` destroys the request. A `keepAlive` agent takes the socket back when the response
+  ends, and gives it to its next request to the same host and port, whose `reusedSocket` is then
+  `true`.
+- `https.Agent` has `http.Agent`'s methods.
 
 ### `node:net` and `node:dns`
 
 TCP sockets and servers, over tokio natively and `wasi:sockets` on wasm: `Socket`, `Stream`,
 `Server`, `connect`, `createConnection`, `createServer`, `BlockList`, `SocketAddress`, `isIP`,
-`isIPv4`, `isIPv6` and `_normalizeArgs`, and `dns.lookup`, `dns.promises.lookup` and `node:dns/promises`' `lookup`.
-The rest of the modules, including the DNS queries other than `lookup`, are stubs.
+`isIPv4`, `isIPv6` and `_normalizeArgs`, and `dns.lookup` (see [`node:dns`](#nodedns)). The rest of
+`node:net` is stubs.
 
 - A socket's state is a `SocketState`, which extends the state of the stream with its
   connection, its byte counts, its idle timer, its addresses and the server that accepted it.
@@ -680,19 +805,26 @@ The rest of the modules, including the DNS queries other than `lookup`, are stub
   `SocketAddress` are classes whose private data holds the rules and the address.
 - IPC paths are not supported. A server listens on every IPv4 address unless given an address or
   `localhost`, and its `address()` reports that address.
-- `setNoDelay`, `setKeepAlive`, `ref` and `unref` have no effect, and so do the `noDelay` and
-  `keepAlive` options. `connect` supports the `family` and `signal` options, and ignores `lookup`,
-  `localAddress` and `localPort`, so it emits no `lookup` event. Servers support `allowHalfOpen`,
-  `pauseOnConnect` and `maxConnections`. `setTimeout` emits `timeout` once the socket was idle for
-  the given time.
+- `setNoDelay` and `setKeepAlive` have no effect, and so do the `noDelay` and `keepAlive` options.
+  `unref` on a socket or server keeps its connect, reads, writes and accepts from keeping the event
+  loop alive, and `ref` undoes it. `connect` supports the `family`, `hints`, `signal`,
+  `localAddress` and `localPort` options, and `lookup`, which it calls for a host that isn't an IP
+  address, with `all: true` unless the connect has an address family or a local address or
+  `autoSelectFamily` is `false`, and emits a `lookup` event for each address the callback gives.
+  It tries the addresses in turn. Without `lookup` it emits no `lookup` event. Servers support
+  `allowHalfOpen`, `pauseOnConnect` and `maxConnections`, and `listen` supports the `signal`
+  option. The `backlog`, `ipv6Only`, `reusePort` and `exclusive` options of `listen` have no
+  effect. `setTimeout` emits `timeout` once the
+  socket was idle for the given time. Unless the socket allows half-open connections, a write
+  after the peer ended the connection destroys the socket with `EPIPE`, as in Node.js.
 - Natively, a write sends what the connection takes at once before returning, and waits for the
   rest. On wasm, every write waits. `bytesWritten` counts the bytes handed to the connection and
   the bytes the socket buffers, as in Node.js, and `destroySoon` ends the socket and destroys it
   once it finished writing.
 - A socket's `blockList` option makes `connect` skip the addresses the list blocks, and fail with
   `ERR_IP_BLOCKED` if it blocks the last address tried. A server's `blockList` closes connections
-  from the peers it blocks without emitting an event. `http.request` ignores `createConnection`,
-  so a block list passed through it has no effect.
+  from the peers it blocks without emitting an event. A `blockList` in the options of a request
+  over a socket reaches `net.connect`.
 - `BlockList` and `SocketAddress` parse, format and match addresses as Node.js does, with these
   differences: `rules` lists address rules in the order they were first added, where Node.js lists
   them in hash table order. An IPv6 zone ID is accepted and ignored, so addresses that differ
@@ -704,6 +836,87 @@ The rest of the modules, including the DNS queries other than `lookup`, are stub
 - On wasm, `localhost` resolves to `127.0.0.1` and `::1` without asking the host, since
   `wasi:sockets` hosts may not resolve it. The wasm module must be run with network access, such
   as `wasmtime run -Sinherit-network=y,tcp=y`.
+
+### `node:dns`
+
+`node:dns` and `node:dns/promises`, which is `dns.promises`: `lookup` and `lookupService` over the
+host's name lookup, `setDefaultResultOrder` and `getDefaultResultOrder`, and the resolver, with
+`Resolver`, `resolve`, `resolve4`, `resolve6`, `resolveAny`, `resolveCaa`, `resolveCname`,
+`resolveMx`, `resolveNaptr`, `resolveNs`, `resolvePtr`, `resolveSoa`, `resolveSrv`, `resolveTlsa`,
+`resolveTxt`, `reverse`, `getServers` and `setServers`, and the error code constants.
+
+- The resolver queries name servers itself, with DNS messages that `hickory-proto` encodes and
+  decodes, over the UDP and TCP sockets of `platform::net`, natively and on wasm alike. A query
+  goes over UDP, and over TCP after a truncated response. It goes to the servers in turn, `tries`
+  times through all of them, with c-ares's timeouts: `timeout`, at least 250 ms and at most
+  `maxTimeout` or 5 s, doubled for each pass after the first, reduced by a random amount of up to
+  half after the first pass, and at most `maxTimeout`. Servers that failed are tried last.
+  c-ares's adaptation of the timeouts to the latency it measures isn't implemented.
+- Results, their key order, error codes (`ENODATA`, `ENOTFOUND`, `ESERVFAIL`, `EREFUSED`,
+  `ETIMEOUT`, `ECONNREFUSED`, `EBADNAME`, `EBADRESP`, `ECANCELLED` and the others) and errors'
+  `errno`, `code`, `syscall` and `hostname` are those of Node.js with c-ares. Query names go
+  through UTS #46 and c-ares's checks, names in results are escaped as c-ares escapes them, and
+  `.onion` names fail with `ENOTFOUND` without a query. A query without servers fails with
+  `UNKNOWN_ARES_ERROR`, as in Node.js.
+- A resolver's state is a `ResolverState`, which holds its servers, options, local addresses, and
+  the queries in progress, which keep the event loop alive. `cancel` completes them with
+  `ECANCELLED`, and `setServers` throws `ERR_DNS_SET_SERVERS_FAILED` while there are any.
+  `_handle` is an own data property holding a plain object, which the methods don't use.
+- `dns.setServers` and `dnsPromises.setServers` replace the default resolver and bind the
+  module-level functions to the new one, as in Node.js. The ES module named exports keep the
+  functions they had when the module was first imported.
+- Natively, a resolver's servers are the `nameserver` lines of `/etc/resolv.conf` when it is
+  created. Its options and search domains aren't used. Without servers, and on wasm, where WASI
+  provides no resolver configuration, the server is `127.0.0.1`, c-ares's fallback, until
+  `setServers` names others.
+  A resolver whose only server is that fallback reads the configuration again after a query is
+  refused, as Node.js does.
+- `reverse` queries the PTR record of the address only, and doesn't consult `/etc/hosts`, which
+  c-ares does first. It fails with `ENOTFOUND` for every error but `ECANCELLED`, as c-ares does.
+- `setLocalAddress` sets the source address of UDP queries. TCP queries don't use it.
+- Responses are bounded by the size of a datagram or of a TCP message, 64 KiB, and decoding
+  rejects names whose compression pointers don't point backwards. A NAPTR record whose flags
+  aren't alphanumeric makes the whole response `EBADRESP`.
+- `lookup` filters the addresses of the host's name lookup by `family`. With `family: 6`, the
+  `V4MAPPED` hint maps the IPv4 addresses to IPv6 if there are no IPv6 addresses, and with `ALL`
+  also adds them after the IPv6 addresses. The `ADDRCONFIG` hint has no effect.
+- `lookupService` uses the host's `getnameinfo` natively. On wasm, `wasi:sockets` has no such
+  lookup, and it fails with `ENOTSUP`. Failed lookups are `ENOTFOUND`.
+- Node.js's `--dns-result-order` flag isn't supported.
+
+### `node:dgram`
+
+UDP sockets, over tokio natively and `wasi:sockets` on wasm: `createSocket` and `Socket`, with
+`bind`, `bindSync`, `connect`, `connectSync`, `disconnect`, `send`, `sendto`, `close`, `address`,
+`remoteAddress`, `ref`, `unref`, the buffer size and send queue methods, the TTL, broadcast and
+multicast methods, `Symbol.asyncDispose`, and the deprecated `_`-prefixed members.
+`_createSocketHandle` is a stub.
+
+- A socket's state is a `DgramState`, which holds its OS socket once bound, its bind and connect
+  states, the operations waiting for an implicit bind, the sends the OS socket hasn't taken yet
+  and the receive in progress. The OS socket is created when the socket binds, so options set
+  before that throw `EBADF`, as in Node.js.
+- Addresses go through the socket's `lookup` option, or through `dns.lookup`, which is read from
+  `node:dns` for each lookup. An IP address of the socket's family needs no lookup.
+- A send that the OS socket takes at once calls its callback in the tick queue. Others wait for
+  the earlier ones, and their callbacks are called once sent. A datagram above 65535 bytes fails
+  with `EMSGSIZE` without being sent. `--test-udp-no-try-send` makes every send wait.
+- `unref` makes the receive in progress stop keeping the event loop alive, and it goes on
+  receiving while other work keeps the loop alive. Sends and lookups keep the loop alive until
+  they complete. Closing a socket can drop a datagram that arrived but wasn't emitted yet.
+- `bind` doesn't take a file descriptor or a handle, and throws `ERR_METHOD_NOT_IMPLEMENTED` for
+  them. The `exclusive` option has no effect, since there are no cluster workers.
+- `addMembership`, `dropMembership` and the source-specific variants throw `EBADF` on an unbound
+  socket, which Node.js binds instead. The source-specific variants support IPv4 groups only, and
+  throw `ENOSYS` for IPv6 groups.
+- `reuseAddr` sets `SO_REUSEPORT` on macOS and the BSDs and `SO_REUSEADDR` elsewhere, so
+  sockets with the option can bind the same address and port, as in Node.js. `reusePort` is
+  supported on Linux only. Elsewhere, binding with `reusePort` emits `ENOTSUP`.
+- On wasm, `wasi:sockets` provides no broadcast and no multicast: `setBroadcast`,
+  `setMulticastTTL`, `setMulticastLoopback`, `setMulticastInterface` and the membership methods
+  throw `ENOTSUP` once the arguments are valid. `reuseAddr` and `ipv6Only` have no effect there,
+  and binding with `reusePort` emits `ENOTSUP`. Every send waits. The wasm module must be run
+  with UDP access, such as `wasmtime run -Sinherit-network=y,udp=y`.
 
 ### `node:tty` and `process.stdin`
 
@@ -814,13 +1027,25 @@ Node.js's `lib/querystring.js` on UTF-16 code units, so lone surrogates pass thr
 
 ### `node:url`
 
-`URL` and `URLSearchParams` are the globals. `fileURLToPath`, `pathToFileURL`,
+`URL`, `URLSearchParams` and `URLPattern` are the globals. `fileURLToPath`, `pathToFileURL`,
 `urlToHttpOptions`, `domainToASCII` and `domainToUnicode` are implemented, with POSIX paths only.
 The legacy API, `Url`, `parse`, `format`, `resolve` and `resolveObject`, follows Node's
 `lib/url.js`, including its escaping and IDNA hostnames, except that lone surrogates become
 U+FFFD, and that `xn--` labels the `idna` crate rejects, which Node accepts, are errors.
 `new Url()` assigns its `null` fields by copying them from a `Url` that each global creates when
 it registers the class, with `Object.assign`'s semantics.
+
+### `node:worker_threads`
+
+Workers aren't implemented, and the module is a stub whose `MessageChannel`, `MessagePort` and
+`BroadcastChannel` are the globals. They deliver messages within the global, with Node's
+`ref()` and `unref()`, and `hasRef()` for ports:
+
+- Adding a `message` listener with `addEventListener` starts a port, as `start()` does.
+- A started port keeps the event loop alive while it is entangled, has a `message` listener and
+  isn't closed, transferred or unreferenced. An open `BroadcastChannel` keeps it alive until it is
+  closed or unreferenced.
+- `port.on()` and the other `EventEmitter` methods of Node's ports don't exist.
 
 ### `node:util` and `node:util/types`
 
@@ -1010,8 +1235,10 @@ functions, `crc32`, `constants` and `codes`. The zip archive functions are stubs
 - The legacy `Z_*` constants on the module object are missing. They're in `constants`.
 - `flush(Z_FINISH)` runs as a full flush, without ending the compressed stream. A flush before the
   first input produces no output.
-- `params` ignores the strategy, and leaves the level unchanged when the stream has already
-  compressed input and the new level uses a different zlib strategy function.
+- `params` validates the level and the strategy as Node does, and flushes and records them in
+  `_level` and `_strategy` unless both are unchanged. The codec ignores the strategy, and keeps
+  its level when the stream has already compressed input and the new level uses a different zlib
+  strategy function.
 - Brotli's `params` are validated as Node validates them. `BROTLI_PARAM_MODE`,
   `BROTLI_PARAM_QUALITY`, `BROTLI_PARAM_LGWIN`, `BROTLI_PARAM_LGBLOCK`,
   `BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING`, `BROTLI_PARAM_SIZE_HINT` and
@@ -1025,10 +1252,49 @@ functions, `crc32`, `constants` and `codes`. The zip archive functions are stubs
   zstd input decompresses without an error.
 - The Brotli and zstd stream classes extend the zlib stream classes' base class, where Node.js
   gives them their own.
-- A stream's codec, flush constants and `bytesWritten` count are in its Rust state, which extends
-  the state of the stream. `_handle` is an empty object until the stream is destroyed.
+- A stream's codec, flush constants, level, strategy and `bytesWritten` count are in its Rust
+  state, which extends the state of the stream. `_handle` is an empty object until the stream is destroyed.
 - Destroying a stream frees its codec and sets `_handle` to `null`, as in Node.js. `reset()` of a
   destroyed stream throws `ERR_INVALID_THIS`, where Node.js throws an `AssertionError`.
+
+### `node:vm`
+
+`vm.Script`, `createContext`, `isContext`, `runInContext`, `runInNewContext`, `runInThisContext`,
+`createScript`, `compileFunction`, `measureMemory` and `constants` are implemented, with Node's
+option validation. `vm.Module`, `vm.SourceTextModule` and `vm.SyntheticModule` aren't.
+
+- A context's global is a new global in a new realm of the creating global's compartment, so
+  objects pass between them without wrappers, and a context's objects have its own `Object`,
+  `Array` and other prototypes. It has the standard classes and a `console` whose methods do
+  nothing, as a new V8 context has, and none of the runtime's web or Node.js globals.
+- A proxy of the contextified object is on the environment chain of the scripts that run in its
+  context, so they find its properties before the global's own, and their `var` and function
+  declarations define its properties. A declaration that the contextified object refuses, such as
+  one in a frozen object, defines a property of the context's global instead. The global's
+  prototype is a proxy that reads properties the global
+  lacks from the contextified object and assigns them to it, and properties added to the global,
+  such as by an assignment to an undeclared variable, move to it.
+- The top-level `this` of a script that runs in a context is the proxy of the contextified object,
+  where it is the context's global in Node.js. Reflection on the global (`Object.keys`, `hasOwnProperty`,
+  `Object.getOwnPropertyDescriptor`, `delete`) sees the global's own properties only. `var`
+  declarations are non-configurable properties of the contextified object, including those
+  without an initializer, which Node.js leaves off it.
+- `timeout` interrupts a script that runs past it with `ERR_SCRIPT_EXECUTION_TIMEOUT`, natively.
+  On wasm, which has no threads, it isn't enforced. `breakOnSigint` and `microtaskMode` are
+  validated and have no effect: microtasks run in the runtime's queue.
+- `codeGeneration.strings: false` makes `eval` and `Function` throw an `EvalError`.
+  `codeGeneration.wasm` has no effect.
+- `import()` in a script fails with `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`, or
+  `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG` for an `importModuleDynamically` function, which
+  isn't called. With `vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER`, it loads modules as the
+  runtime's loader does in a script that runs in the current global.
+- No code cache is produced or used: `createCachedData` and `produceCachedData` produce an empty
+  `Buffer`, and any `cachedData` is rejected.
+- An error that a script created and throws gets Node's location, source line and caret
+  prepended to its `stack`, unless `displayErrors` is `false`. The rest of such a stack is
+  rewritten in V8's format, with the error's name and message first, as `util.inspect` shows
+  SpiderMonkey's stacks.
+- `measureMemory` resolves with the size of the GC heap.
 
 ## Testing
 

@@ -24,9 +24,9 @@ mod writable;
 
 pub(crate) use destroy::stream_destroyed;
 pub(crate) use duplex::{duplex as duplex_class, init_duplex, init_transform, transform};
-pub(crate) use eos::eos as end_of_stream;
+pub(crate) use eos::{eos as end_of_stream, eos_native, EosCallback, EosOptions};
 pub(crate) use legacy::stream as stream_class;
-pub(crate) use readable::{init_new_readable, readable as readable_class};
+pub(crate) use readable::{init_new_readable, readable as readable_class, READABLE_PROPERTIES};
 pub(crate) use writable::writable as writable_class;
 
 use js::conversion::ToJSVal;
@@ -38,7 +38,7 @@ use js::native::Value;
 use js::prelude::HandleValue;
 use js::Object;
 
-use crate::errors::{validate_abort_signal, NodeError, Thrown};
+use crate::errors::{NodeError, Thrown};
 use util::{is_node_stream, sides, Field};
 
 /// Register the stream module's classes for `global`: its internal classes, and the stream
@@ -187,6 +187,25 @@ fn remove_abort_listener(
     Ok(js::value::undefined())
 }
 
+/// The check of `addAbortSignal`'s `signal`, Node.js's own `validateAbortSignal` in
+/// `add-abort-signal.js`: an object that isn't a function and has an `aborted` property. `null`
+/// throws the `TypeError` of the `in` operator.
+fn validate_signal(scope: &Scope<'_>, signal: HandleValue<'_>) -> Result<(), Thrown> {
+    if signal.is_null() {
+        let message = "Cannot use 'in' operator to search for 'aborted' in null";
+        return Err(js::error::TypeError(message.into()).throw(scope).into());
+    }
+    let valid = match js::Object::from_value(scope, signal) {
+        Ok(object) if !object.is_callable() => object.has_property(scope, c"aborted")?,
+        _ => false,
+    };
+    if !valid {
+        let expected = "an instance of AbortSignal";
+        return Err(NodeError::invalid_arg_type(scope, "signal", expected, signal).into());
+    }
+    Ok(())
+}
+
 /// `stream.addAbortSignal(signal, stream)`: destroy `stream` with an `AbortError` once `signal`
 /// aborts.
 pub(crate) fn add_abort_signal<'s>(
@@ -194,7 +213,7 @@ pub(crate) fn add_abort_signal<'s>(
     signal: HandleValue<'_>,
     stream: HandleValue<'s>,
 ) -> Result<HandleValue<'s>, Thrown> {
-    validate_abort_signal(scope, signal, "signal")?;
+    validate_signal(scope, signal)?;
     if !is_node_stream(scope, stream)? {
         return Err(NodeError::invalid_arg_type(
             scope,

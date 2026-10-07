@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! The HTTP/1.1 wire format of a `ServerResponse` that writes to a socket, ported from Node.js's
-//! `lib/_http_outgoing.js`.
+//! The HTTP/1.1 wire format of an `OutgoingMessage` that writes to a socket, a `ServerResponse` or
+//! a `ClientRequest`, ported from Node.js's `lib/_http_outgoing.js`.
 //!
-//! `writeHead` stores the serialized header block in the message's state, and sets
-//! `_header` to it. The first write sends it before its own bytes. A response writes to its `socket`
-//! while it owns the socket, and queues its bytes otherwise, until `assignSocket` gives it the
-//! socket. The body is framed by `Content-Length` when `end` gives the whole body before the
-//! header is stored, and with chunked transfer coding otherwise. `finish` is emitted once the
-//! socket wrote the last bytes.
+//! `writeHead` or `_implicitHeader` stores the serialized header block in the message's state,
+//! and sets `_header` to it. The first write sends it before its own bytes. A message writes to
+//! its `socket` while it owns the socket, and queues its bytes otherwise, until `assignSocket` or
+//! `onSocket` gives it the socket. The body is framed by `Content-Length` when `end` gives the
+//! whole body before the header is stored, and with chunked transfer coding otherwise. `finish`
+//! is emitted once the socket wrote the last bytes.
 //!
 //! The message's own data properties that Node.js reads to frame the message, such as
 //! `chunkedEncoding`, `shouldKeepAlive` and `_hasBody`, are read once per operation, since code
@@ -236,8 +236,8 @@ fn add_line(
 /// Store the header block of `message`, starting with `first_line`, as Node.js's `_storeHeader`
 /// builds it: the headers set, in the order they were set, then `Date` if `sendDate` is set,
 /// `Connection` unless set, and `Content-Length` or `Transfer-Encoding: chunked` unless either
-/// is set. An array value is a line per element, except for `Cookie`, whose values are joined
-/// with `; `. The block becomes `_header`.
+/// is set. An array value is a line per element, except for `Cookie` and the headers of
+/// `uniqueHeaders`, whose values are joined with `; `. The block becomes `_header`.
 pub(super) fn store_header(
     scope: &Scope<'_>,
     message: Object<'_>,
@@ -249,6 +249,7 @@ pub(super) fn store_header(
     let read = Framing::read(scope, message)?;
     let mut framing = read;
     for (name, value) in header_entries(scope, state) {
+        let is_array = js::Array::is_array_value(scope, value)?;
         let mut texts = values(scope, value)?
             .into_iter()
             .map(|value| String::from_jsval_throwing(scope, value, ()))
@@ -265,7 +266,9 @@ pub(super) fn store_header(
                 *value = String::from_utf8_lossy(&bytes).into_owned();
             }
         }
-        if texts.len() >= 2 && name.eq_ignore_ascii_case("cookie") {
+        if (texts.len() >= 2 && name.eq_ignore_ascii_case("cookie"))
+            || (is_array && super::outgoing::is_unique(state, &name))
+        {
             let joined = texts.join("; ");
             add_line(&mut framing, &mut lines, &mut header, &name, &joined);
         } else {
@@ -442,7 +445,7 @@ fn header_join(
 }
 
 /// Whether `socket` was destroyed.
-fn socket_destroyed(scope: &Scope<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
+pub(super) fn socket_destroyed(scope: &Scope<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
     if let Some(state) = crate::net::socket::state_of(scope, socket)? {
         return Ok(state.data().destroyed());
     }
@@ -452,7 +455,7 @@ fn socket_destroyed(scope: &Scope<'_>, socket: Object<'_>) -> Result<bool, ExnTh
 }
 
 /// Whether `socket` can be written to.
-fn socket_writable(scope: &Scope<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
+pub(super) fn socket_writable(scope: &Scope<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
     if let Some(side) = crate::stream::state::WritableSide::try_of(scope, socket)? {
         return Ok(side.get().is_writable());
     }

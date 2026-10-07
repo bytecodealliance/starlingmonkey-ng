@@ -3,10 +3,12 @@
 //! `node:http` and `node:https`. See <https://nodejs.org/api/http.html>.
 //!
 //! Servers serve the runtime's incoming requests, or HTTP/1.1 connections they accept themselves
-//! (see [`server`]), and clients send requests through `platform::http` (see [`client`]), which
-//! handles connections and TLS.
+//! (see [`server`]). Clients write HTTP/1.1 to sockets their agents give them, or send requests
+//! through `platform::http`, which handles connections and TLS (see [`client`]).
 
+mod agent;
 mod client;
+mod client_socket;
 mod connection;
 mod host_socket;
 mod incoming;
@@ -16,7 +18,7 @@ mod server;
 mod wire;
 
 use js::conversion::ToJSVal;
-use js::error::ExnThrown;
+use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::{Function, Object};
@@ -154,6 +156,17 @@ fn to_int32(number: f64) -> i32 {
     number.trunc().rem_euclid(4294967296.0) as u32 as i32
 }
 
+/// Whether `object[name]` is truthy.
+fn flag(
+    scope: &Scope<'_>,
+    object: Object<'_>,
+    name: &'static std::ffi::CStr,
+) -> Result<bool, ExnThrown> {
+    Ok(js::conversion::to_boolean(
+        object.get_property(scope, name)?,
+    ))
+}
+
 /// `object[key]`.
 pub(crate) fn get_by_key<'s>(
     scope: &'s Scope<'_>,
@@ -173,6 +186,71 @@ pub(crate) fn set_by_key(
 ) -> Result<(), ExnThrown> {
     let id = scope.root_id(js::id::value_to_id(scope, key)?);
     object.set_property_by_id(scope, id, value)
+}
+
+js::instance_local! {
+    /// Whether the warning about `--insecure-http-parser` was emitted.
+    static WARNED_LENIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the HTTP parser of a server or request with the options `validation`, its
+/// `httpValidation`, and `insecure`, its `insecureHTTPParser`, is lenient, as Node.js's
+/// `calculateLenientFlags` computes it. `'strict'` is strict, `'relaxed'` and `'insecure'` are
+/// lenient, and otherwise the parser is lenient if `insecure` is truthy, or, if it is
+/// `undefined`, with `--insecure-http-parser`, whose first use emits a warning.
+pub(crate) fn lenient_parser(
+    scope: &Scope<'_>,
+    validation: HandleValue<'_>,
+    insecure: HandleValue<'_>,
+) -> Result<bool, ExnThrown> {
+    match crate::support::rust_string(scope, validation).as_deref() {
+        Some("strict") => return Ok(false),
+        Some("relaxed" | "insecure") => return Ok(true),
+        _ => {}
+    }
+    if !insecure.is_undefined() {
+        return Ok(js::conversion::to_boolean(insecure));
+    }
+    let lenient = crate::runtime_flags::get().insecure_http_parser;
+    if lenient && !WARNED_LENIENT.replace(true) {
+        crate::process::emit_warning(scope, "Using insecure HTTP parsing", "Warning")?;
+    }
+    Ok(lenient)
+}
+
+/// Check the `insecureHTTPParser` option `insecure` and the `httpValidation` option
+/// `validation` of a server or request, as Node.js checks them.
+pub(crate) fn validate_parser_options(
+    scope: &Scope<'_>,
+    insecure: HandleValue<'_>,
+    validation: HandleValue<'_>,
+) -> Result<(), Thrown> {
+    if !insecure.is_undefined() {
+        crate::errors::validate_boolean(scope, insecure, "options.insecureHTTPParser")?;
+    }
+    if validation.is_undefined() {
+        return Ok(());
+    }
+    let text = crate::support::rust_string(scope, validation);
+    if !matches!(text.as_deref(), Some("strict" | "relaxed" | "insecure")) {
+        return Err(NodeError::invalid_arg_value(
+            scope,
+            "options.httpValidation",
+            validation,
+            "must be one of: 'strict', 'relaxed', 'insecure'",
+        )
+        .into());
+    }
+    if !insecure.is_undefined() {
+        return Err(NodeError::invalid_arg_value(
+            scope,
+            "options.httpValidation",
+            validation,
+            "cannot be used together with options.insecureHTTPParser",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// The reason phrase of `status` in Node's table.
@@ -213,49 +291,71 @@ pub(crate) fn global_agent<'s>(scope: &'s Scope<'_>, https: bool) -> Result<Obje
     };
     js::class::get_or_init_shared_object(scope, key as *const u8 as usize, |scope| {
         let class = if https {
-            client::https_agent_class::class_constructor(scope)?
+            agent::https_agent_class::class_constructor(scope)?
         } else {
-            client::agent_class::class_constructor(scope)?
+            agent::agent_class::class_constructor(scope)?
         };
-        Function::construct(scope, class, js::function::EmptyArgs)
+        let options = Object::new_plain(scope)?;
+        options.set_property(scope, c"keepAlive", true)?;
+        options.set_property(scope, c"scheduling", "lifo")?;
+        options.set_property(scope, c"timeout", 5000)?;
+        options.set_property(scope, c"proxyEnv", HandleValue::undefined())?;
+        Function::construct(scope, class, &[options.to_jsval_throwing(scope)?])
     })
 }
 
+/// The current `globalAgent` of `node:https` if `https`, and of `node:http` otherwise: the
+/// agent the module's exports object holds, which code can replace, or the agent the module was
+/// created with if it holds none.
+pub(crate) fn current_global_agent<'s>(
+    scope: &'s Scope<'_>,
+    https: bool,
+) -> Result<Object<'s>, ExnThrown> {
+    let name = if https { "node:https" } else { "node:http" };
+    if let Some(namespace) = core_runtime::module::builtin_namespace(scope, name)? {
+        if let Ok(exports) = Object::from_value(scope, *namespace.get_property(scope, c"default")?)
+        {
+            let agent = exports.get_property(scope, c"globalAgent")?;
+            if let Ok(agent) = Object::from_value(scope, *agent) {
+                return Ok(agent);
+            }
+        }
+    }
+    global_agent(scope, https)
+}
+
 /// Create a client request with the arguments `args`, as `http.request` does. For `https`, the
-/// request's default agent is `https.globalAgent`.
+/// options are made as Node.js's `https.request` makes them: from the URL that comes first, with
+/// the options that follow assigned, and `https.globalAgent` as the default agent.
 fn request<'s>(
     scope: &'s Scope<'_>,
     args: &[HandleValue<'_>],
     https: bool,
 ) -> Result<Object<'s>, ExnThrown> {
-    let class = client::client_request_class::class_constructor(scope)?;
+    if !https {
+        return client::new_request(scope, args);
+    }
     let mut args: Vec<HandleValue<'_>> =
         args.iter().map(|arg| scope.root_value(arg.get())).collect();
-    if https {
-        let defaults = Object::new_plain(scope)?;
-        defaults.set_property(scope, c"_defaultAgent", global_agent(scope, true)?)?;
-        let options_index = if args.first().is_some_and(|arg| arg.is_object())
-            && client::url_of(scope, args[0])?.is_none()
-        {
-            0
-        } else {
-            1
-        };
-        let given = args
-            .get(options_index)
-            .copied()
-            .filter(|arg| arg.is_object() && !js::function::is_callable(*arg));
-        if let Some(given) = given.and_then(|given| Object::from_value(scope, *given).ok()) {
-            defaults.assign(scope, given)?;
-            args[options_index] = defaults.to_jsval_throwing(scope)?;
-        } else {
-            args.insert(
-                options_index.min(args.len()),
-                defaults.to_jsval_throwing(scope)?,
-            );
+    let first = args.first().copied().unwrap_or(HandleValue::undefined());
+    let options = match client::url_input(scope, first).map_err(|thrown| thrown.throw(scope))? {
+        Some(options) => {
+            args.remove(0);
+            options
+        }
+        None => Object::new_plain(scope)?,
+    };
+    if let Some(first) = args.first().copied() {
+        if js::conversion::to_boolean(first) && !js::function::is_callable(first) {
+            if let Ok(given) = Object::from_value(scope, *first) {
+                options.assign(scope, given)?;
+            }
+            args.remove(0);
         }
     }
-    Function::construct(scope, class, &args)
+    options.set_property(scope, c"_defaultAgent", current_global_agent(scope, true)?)?;
+    args.insert(0, options.to_jsval_throwing(scope)?);
+    client::new_request(scope, &args)
 }
 
 /// Create a client request with `args` and end it, as `http.get` does.
@@ -283,7 +383,7 @@ fn create_server<'s>(
 pub mod module {
     use super::*;
 
-    pub use super::client::agent_class as Agent;
+    pub use super::agent::agent_class as Agent;
     pub use super::client::client_request_class as ClientRequest;
     pub use super::incoming::incoming_message_class as IncomingMessage;
     pub use super::outgoing::outgoing_message_class as OutgoingMessage;
@@ -375,7 +475,7 @@ pub mod module {
 pub mod https {
     use super::*;
 
-    pub use super::client::https_agent_class as Agent;
+    pub use super::agent::https_agent_class as Agent;
     pub use super::server::server_class as Server;
 
     /// <https://nodejs.org/api/https.html#httpscreateserveroptions-requestlistener>: the TLS
@@ -452,11 +552,16 @@ pub(crate) fn register_templates(scope: &Scope<'_>) -> Result<(), ExnThrown> {
     incoming::MESSAGE_PROPERTIES.register(scope)?;
     outgoing::OUTGOING_PROPERTIES.register(scope)?;
     outgoing::RESPONSE_PROPERTIES.register(scope)?;
-    client::REQUEST_PROPERTIES.register(scope)
+    client::REQUEST_PROPERTIES.register(scope)?;
+    client_socket::INFORMATION_PROPERTIES.register(scope)
 }
 
 /// Register the internal classes of `node:http` on `global`.
 pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), ExnThrown> {
+    agent::AgentSocket::add_to_global(scope, global);
+    agent::SocketRequest::add_to_global(scope, global);
+    client_socket::DeferredCall::add_to_global(scope, global);
+    client_socket::ParserPool::add_to_global(scope, global);
     connection::ConnectionState::add_to_global(scope, global);
     connection::ParserHandle::add_to_global(scope, global);
     host_socket::register_class(scope, global);
@@ -467,8 +572,8 @@ pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Res
     outgoing::server_response_class::register(scope)?;
     incoming::incoming_message_class::register(scope)?;
     client::client_request_class::register(scope)?;
-    client::agent_class::register(scope)?;
-    client::https_agent_class::register(scope)?;
+    agent::agent_class::register(scope)?;
+    agent::https_agent_class::register(scope)?;
     server::server_class::register(scope)?;
     Ok(())
 }

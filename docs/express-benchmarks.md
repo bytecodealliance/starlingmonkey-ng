@@ -252,6 +252,49 @@ each 5 s after a 2 s warmup:
 | `rest-api` `GET /health` | `serve` | 65.1 / 63.6 | 9923 / 10100 | 55.1 / 51.5 | 18181 / 19424 |
 | `koa-portal` `GET /` | `listen` | 130.0 / 129.2 | 6737 / 6779 | 100.2 / 95.2 | 10802 / 11356 |
 
+## Properties in one call
+
+On 2026-10-07, the writers of `PropertyTemplate`s started adding all of an object's properties in
+one engine call, SpiderMonkey's `AddDataPropertiesToNewObject`, and the classes whose instances
+get their properties from templates started creating them with fixed slots for the templates'
+keys, up to SpiderMonkey's 16 fixed slots, which include the state slot of a class's instances.
+`Timeout`s, `Immediate`s, `fs.Stats`, `fs.Dirent`s, socket addresses, the options
+object of custom inspection methods and mock call records moved to templates too.
+
+In profiles of `listen` serving `GET /health` at 32 connections, `NativeDefineProperty` had 2.4%
+of the main thread's samples before the change and 0.1% after, and `AddDataPropertiesToNewObject`
+had 1.8% after, most of it in `NativeObject::addProperty` and in growing the dynamic slots of the
+messages. Creating `IncomingMessage`s fell from 4.3% to 3.6% of the samples, and creating
+`ServerResponse`s stayed at 1.4%.
+
+Other work loaded the machine during these measurements, with a load average of 9 to 17, which
+roughly doubled the CPU time per request against the sections above. So the servers of both builds
+ran side by side, and 12 pairs of 2 s runs alternated between them, in ABBA order, after a 1 s
+warmup of each server on each route. CPU per request in µs and requests per second, the medians
+of the runs:
+
+| Route | Config | c=1 µs before / after | c=1 req/s before / after | c=32 µs before / after | c=32 req/s before / after |
+|---|---|--:|--:|--:|--:|
+| `rest-api` `GET /health` | `listen` | 127.9 / 125.1 | 5454 / 5723 | 125.9 / 120.7 | 6075 / 6391 |
+| `rest-api` `GET /health` | `serve` | 254.3 / 260.1 | 2301 / 2227 | 177.6 / 175.9 | 3321 / 3297 |
+| `rest-api` `GET /api/v1/big` | `listen` | 319.1 / 321.5 | 1892 / 1882 | 269.7 / 264.7 | 2113 / 2126 |
+| `rest-api` `GET /api/v1/big` | `serve` | 350.6 / 321.1 | 1959 / 2171 | 264.6 / 253.9 | 2439 / 2906 |
+
+The median ratio of the CPU per request of the pairs, after to before, was 0.985 to 1.013 in each
+cell. A second measurement gave 0.94 to 1.05. The change of the CPU per request is smaller than
+the noise of these measurements.
+
+Operations that create such objects, in ns of wall time per operation, the median of 5 alternating
+runs of each build with 3 measurements each:
+
+| Operation | Before | After |
+|---|--:|--:|
+| `url.parse('/api/v1/items?x=1')` | 706 | 572 |
+| `fs.statSync('.')` | 1799 | 1391 |
+| `clearTimeout(setTimeout(f, 1000))` | 1191 | 865 |
+| `clearImmediate(setImmediate(f))` | 921 | 766 |
+| `util.inspect` of an object with a custom inspection method | 1200 | 934 |
+
 ## Fixes
 
 On 2026-10-05, profiles of `listen` under load (an unstripped release build sampled with macOS's
@@ -392,7 +435,7 @@ time of this route.
 
 | Gap | Cause | Fixable |
 |---|---|---|
-| Native CPU per request 1.3 to 2.1 times Node.js's (`GET /health` 48 against 23 µs, `koa-portal` `GET /` 97 against 76 µs at 32 connections) | Node's own data properties defined on each message and emitter through generic sets, emitters' listeners in JS properties as in Node.js, objects created per request and their nursery collections, and a `sendto` per response | partly, such as by creating messages and emitters with their own properties from a cached shape |
+| Native CPU per request 1.3 to 2.1 times Node.js's (`GET /health` 48 against 23 µs, `koa-portal` `GET /` 97 against 76 µs at 32 connections) | Node's own data properties of each message and emitter, added one shape transition at a time, emitters' listeners in JS properties as in Node.js, objects created per request and their nursery collections, and a `sendto` per response | partly, such as by creating messages from a shape cached per template |
 | Less gain from concurrency than Node.js | not established | unknown |
 | `serve` 7 to 30% slower than `listen` | the fetch objects are created for each request, besides the `http` objects | partly |
 | Higher maximum RSS under load than before the state refactor, 17 to 43% for `listen` on six apps | not established | unknown |

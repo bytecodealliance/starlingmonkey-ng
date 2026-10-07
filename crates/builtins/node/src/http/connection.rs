@@ -23,23 +23,33 @@ use js::{Function, Object};
 
 use super::incoming::{set_join_duplicates, set_lines, MessageHead};
 use super::outgoing::{emit_close_tick, ConnectionFields};
-use super::parser::{Event, Head, ParseError, Parser};
+use super::parser::{Event, Head, Kind, ParseError, Parser};
 use super::server::{server_class, HttpServerState};
-use crate::buffer::new_buffer;
+use super::wire::socket_destroyed;
+use crate::buffer::{buffer_from_vec, new_buffer};
 use crate::errors::{ErrorKind, NodeError};
 
-/// The request parser of a connection, which is its socket's `parser`.
+/// The parser of a connection's requests or of a client request's response, which is its
+/// socket's `parser`.
 #[core_runtime::jsclass(hidden)]
 pub struct ParserHandle {
     #[no_trace]
-    parser: Parser,
-    /// The request being parsed.
-    incoming: Option<Heap<js::object::Object>>,
+    pub(super) parser: Parser,
+    /// The message being parsed.
+    pub(super) incoming: Option<Heap<js::object::Object>>,
+    /// The socket of a client request's parser.
+    pub(super) socket: Option<Heap<js::object::Object>>,
+    /// Whether a client response joins duplicates of the single-valued headers.
+    #[no_trace]
+    pub(super) join_duplicates: bool,
+    /// The most header lines a client response keeps, or `None` for all.
+    #[no_trace]
+    pub(super) max_headers: Option<usize>,
 }
 
 #[core_runtime::jsmethods]
 impl ParserHandle {
-    /// The request being parsed, or `null`.
+    /// The message being parsed, or `null`.
     #[getter]
     fn incoming<'r>(&self, scope: &'r Scope<'_>) -> HandleValue<'r> {
         match self.data().incoming.get(scope) {
@@ -150,10 +160,20 @@ pub(super) fn on_connection(
     } else {
         Some(DEFAULT_MAX_HEADERS)
     };
+    let lenient = super::lenient_parser(
+        scope,
+        server.get_property(scope, c"httpValidation")?,
+        server.get_property(scope, c"insecureHTTPParser")?,
+    )?;
     let parser =
         js::class::create_instance_with::<ParserHandleImpl>(scope, |_| ParserHandleImpl {
-            parser: Parser::new(max_header_size as usize, max_headers),
-            incoming: None,
+            parser: Parser::new(
+                Kind::Request,
+                max_header_size as usize,
+                max_headers,
+                lenient,
+            ),
+            ..Default::default()
         })?;
     socket.set_property(scope, c"parser", parser)?;
     let state =
@@ -210,7 +230,7 @@ fn on_pending_data(
 
 /// The error for the parse error `error` of the bytes `raw`, as Node.js's parser and
 /// `prepareError` create it.
-fn parse_error_value<'s>(
+pub(super) fn parse_error_value<'s>(
     scope: &'s Scope<'_>,
     error: &ParseError,
     raw: HandleValue<'_>,
@@ -267,7 +287,7 @@ fn socket_on_data(
                 }
             }
             Ok(Some(Event::Body(body))) => {
-                on_body(scope, state, socket, &body)?;
+                on_body(scope, state, socket, body)?;
                 if tcp {
                     js::jobs::run_jobs(scope);
                 }
@@ -286,16 +306,6 @@ fn socket_on_data(
         }
     }
     Ok(js::value::undefined())
-}
-
-/// Whether `socket` was destroyed.
-fn socket_destroyed(scope: &Scope<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
-    if let Some(state) = crate::net::socket::state_of(scope, socket)? {
-        return Ok(state.data().destroyed());
-    }
-    Ok(js::conversion::to_boolean(
-        socket.get_property(scope, c"destroyed")?,
-    ))
 }
 
 /// Handle the request head `head`, as Node.js's `parserOnHeadersComplete` does. Returns whether
@@ -345,7 +355,7 @@ fn on_head(
             super::incoming::new_message(scope, socket_value, fields)?
         }
     };
-    super::incoming::set_wire_source(scope, req, state)?;
+    super::incoming::set_wire_source(scope, req, Some(state))?;
     handle.data_mut().incoming = Some(Heap::from(req));
     if !on_incoming(scope, state, socket, req, &head.method, head.keep_alive)? {
         return Ok(false);
@@ -386,7 +396,7 @@ fn upgrade(
     if crate::events::listener_count(scope, server, js::class::get_or_init_atom(scope, event)?)?
         > 0.0
     {
-        let head = new_buffer(scope, &rest)?.to_jsval_throwing(scope)?;
+        let head = buffer_from_vec(scope, rest)?.to_jsval_throwing(scope)?;
         socket.set_property(scope, c"readableFlowing", js::value::null())?;
         crate::events::emit(
             scope,
@@ -427,7 +437,7 @@ fn on_body(
     scope: &Scope<'_>,
     state: ConnectionState<'_>,
     socket: Object<'_>,
-    body: &[u8],
+    body: Vec<u8>,
 ) -> Result<(), ExnThrown> {
     let req = match state.data().parser.get(scope) {
         Some(handle) => handle.data().incoming.get(scope),
@@ -439,7 +449,7 @@ fn on_body(
     if js::conversion::to_boolean(req.get_property(scope, c"_dumped")?) {
         return Ok(());
     }
-    let chunk = new_buffer(scope, body)?.to_jsval_throwing(scope)?;
+    let chunk = buffer_from_vec(scope, body)?.to_jsval_throwing(scope)?;
     let more = Function::call_by_name(scope, req.handle(), c"push", &[chunk])?;
     if !js::conversion::to_boolean(more) {
         Function::call_by_name(scope, socket.handle(), c"pause", js::function::EmptyArgs)?;
@@ -608,6 +618,13 @@ fn on_incoming(
             res
         }
     };
+    let unique = server_class::state_of(scope, server)?
+        .data()
+        .unique_headers
+        .clone();
+    super::outgoing::state_of(scope, res)?
+        .data_mut()
+        .unique_headers = unique;
     let writing = state.data().current.is_some();
     if writing {
         state.data_mut().outgoing.push_back(Heap::from(res));
@@ -901,7 +918,8 @@ fn clear_incoming_on_end(
 }
 
 /// The `end` listener of a connection, whose payload is the connection: report a request the
-/// peer cut off, and otherwise end the socket, as Node.js's `socketOnEnd` does.
+/// peer cut off, end a request whose body lasts until the connection's end, and otherwise end the
+/// socket, as Node.js's `socketOnEnd` does.
 fn socket_on_end(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
@@ -912,15 +930,24 @@ fn socket_on_end(
         let data = state.data();
         (data.socket.get(scope), data.server.get(scope))
     };
-    let result = match state.data().parser.get(scope) {
+    let handle = state.data().parser.get(scope);
+    let result = match handle {
         Some(handle) => handle.data_mut().parser.finish(),
-        None => Ok(()),
+        None => Ok(None),
     };
-    if let Err(error) = result {
-        let raw = new_buffer(scope, &[])?.to_jsval_throwing(scope)?;
-        let error = parse_error_value(scope, &error, raw)?;
-        socket_error(scope, state, error)?;
-        return Ok(js::value::undefined());
+    match result {
+        Err(error) => {
+            let raw = new_buffer(scope, &[])?.to_jsval_throwing(scope)?;
+            let error = parse_error_value(scope, &error, raw)?;
+            socket_error(scope, state, error)?;
+            return Ok(js::value::undefined());
+        }
+        Ok(Some(Event::Complete(trailers))) => {
+            if let Some(handle) = handle {
+                on_complete(scope, state, handle, trailers)?;
+            }
+        }
+        Ok(_) => {}
     }
     let (last, current) = {
         let data = state.data();

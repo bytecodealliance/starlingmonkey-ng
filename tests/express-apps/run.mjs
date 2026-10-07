@@ -339,11 +339,11 @@ async function runApp(name) {
   for (let i = 0; i < n; i++) {
     let e = expected.records[i];
     let a = actual.records[i];
-    // With `--serve`, the host frames a body it has in memory by its length where Node.js sends
-    // it chunked. On wasm, the host's HTTP client leaves `Transfer-Encoding` out of the upstream
-    // responses a proxy copies. So in both modes, a chunked body under Node.js matches a body of
-    // either framing.
-    const hostFramed = mode === 'serve' || mode === 'wasm' || mode === 'spin';
+    // With `--serve` and under Spin, the host frames a body it has in memory by its length where
+    // Node.js sends it chunked. Under Spin, the host's HTTP client also leaves `Transfer-Encoding`
+    // out of the upstream responses a proxy copies. So in those modes, a chunked body under
+    // Node.js matches a body of either framing.
+    const hostFramed = mode === 'serve' || mode === 'spin';
     if (hostFramed && e?.headers?.['transfer-encoding'] === 'chunked' && a?.headers) {
       const { 'transfer-encoding': _te, ...expectedHeaders } = e.headers;
       const { 'transfer-encoding': _ate, 'content-length': _cl, ...actualHeaders } = a.headers;

@@ -49,11 +49,18 @@ pub(super) fn emit_experimental_warning(
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let feature = js::JSString::from_value(scope, args.get(0))?.to_utf8(scope)?;
-    if EXPERIMENTAL_WARNED.with(|warned| warned.borrow_mut().insert(feature.clone())) {
+    warn_experimental(scope, &feature)?;
+    Ok(js::value::undefined())
+}
+
+/// Emit an `ExperimentalWarning` for `feature`, once per feature, as `emitExperimentalWarning`
+/// does.
+pub(crate) fn warn_experimental(scope: &Scope<'_>, feature: &str) -> Result<(), ExnThrown> {
+    if EXPERIMENTAL_WARNED.with(|warned| warned.borrow_mut().insert(feature.to_string())) {
         let message = format!("{feature} is an experimental feature and might change at any time");
         crate::process::emit_warning(scope, &message, "ExperimentalWarning")?;
     }
-    Ok(js::value::undefined())
+    Ok(())
 }
 
 /// `internal/util`'s `pendingDeprecate(fn, msg, code)`: `util.deprecate(fn, msg, code)` with
@@ -252,6 +259,7 @@ pub(super) fn get_option_value(
         "--experimental-stream-iter" => flags
             .experimental_stream_iter
             .to_jsval_raw_throwing(scope)?,
+        "--insecure-http-parser" => flags.insecure_http_parser.to_jsval_raw_throwing(scope)?,
         "--network-family-autoselection" => flags
             .network_family_autoselection
             .to_jsval_raw_throwing(scope)?,

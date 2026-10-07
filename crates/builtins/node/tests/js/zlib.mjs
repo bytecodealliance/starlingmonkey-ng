@@ -20,7 +20,7 @@ import zlib, {
 } from "node:zlib";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { eq, throws } from "./harness.mjs";
+import { deepEq, eq, throws } from "./harness.mjs";
 
 const text = "hello hello hello world";
 const fixtures = {
@@ -64,6 +64,9 @@ const failure = (fn) => {
 eq(failure(() => inflateSync(Buffer.from("garbage"))), "Error Z_DATA_ERROR -3 incorrect header check", "bad header");
 eq(failure(() => gunzipSync(fixture("gzip").subarray(0, 10))), "Error Z_BUF_ERROR -5 unexpected end of file", "truncated input");
 eq(failure(() => inflateRawSync(Buffer.from([0xff, 0xff]))), "Error Z_DATA_ERROR -3 invalid block type", "bad block");
+// `deflateSync("abcabcabc", { dictionary: Buffer.from("abc") })`.
+const needsDictionary = Buffer.from([120, 187, 2, 77, 1, 39, 75, 132, 33, 0, 17, 61, 3, 115]);
+eq(failure(() => inflateSync(needsDictionary)), "Error Z_NEED_DICT 2 Missing dictionary", "data that needs a dictionary");
 eq(failure(() => gunzipSync(Buffer.concat([gzipSync("ab"), Buffer.from("junk")]))), "Error Z_DATA_ERROR -3 incorrect header check", "non-zero bytes after a member start another");
 throws(() => deflateSync(5), "ERR_INVALID_ARG_TYPE", "input type");
 throws(() => deflate("x"), "ERR_INVALID_ARG_TYPE", "callback functions need a callback");
@@ -169,6 +172,16 @@ eq(constants.Z_BEST_COMPRESSION, 9, "constants");
   broken.end(Buffer.from("garbage"));
   eq((await error).code, "Z_DATA_ERROR", "stream errors");
 
+  const finished = createDeflate();
+  const finishedError = new Promise((resolve) => finished.on("error", resolve));
+  finished.write("a");
+  finished.flush(zlib.constants.Z_FINISH, () => {
+    finished.write("b");
+    finished.end();
+  });
+  const { code, errno, message } = await finishedError;
+  eq(`${code} ${errno} ${message}`, "Z_STREAM_ERROR -2 stream error", "a write after Z_FINISH");
+
   const truncated = createGunzip();
   const truncatedError = new Promise((resolve) => truncated.on("error", resolve));
   truncated.resume();
@@ -198,6 +211,17 @@ eq(constants.Z_BEST_COMPRESSION, 9, "constants");
   levels.end("x".repeat(1000));
   await new Promise((resolve) => levels.on("end", resolve));
   eq(Buffer.concat(stored).length < 100, true, "params changes the level");
+  deepEq([levels._level, levels._strategy], [9, 0], "params records the level and strategy");
+  throws(() => createDeflate().params(99, 0, () => {}), "ERR_OUT_OF_RANGE", "params validates the level");
+  throws(() => createDeflate().params(1, 9, () => {}), "ERR_OUT_OF_RANGE", "params validates the strategy");
+  throws(() => createDeflate().params("x", 0, () => {}), "ERR_INVALID_ARG_TYPE", "params needs a number");
+  throws(() => createDeflate().params(-1, 0), "ERR_INVALID_ARG_TYPE", "params without a change needs a callback");
+  const unchanged = createDeflate();
+  const order = [];
+  unchanged.params(-1, 0, () => order.push("params"));
+  queueMicrotask(() => order.push("microtask"));
+  await new Promise((resolve) => setImmediate(resolve));
+  deepEq(order, ["microtask", "params"], "params without a change calls back in a tick");
 
   const reused = zlib.createUnzip();
   const reusedChunks = [];

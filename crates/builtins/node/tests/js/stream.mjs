@@ -719,3 +719,17 @@ eq({} instanceof Writable, false, "plain objects aren't Writables");
   throws(() => new Readable({ read() {} }).map((x) => x, () => {}), "ERR_INVALID_ARG_TYPE", "map rejects function options");
   throws(() => Readable.fromWeb(new ReadableStream(), []), "ERR_INVALID_ARG_TYPE", "fromWeb rejects array options");
 }
+
+// Node.js's own-property order of a `Duplex`, apart from `_events`, legacy `eventNames`,
+// `addAbortSignal`'s signal check, and `wrap` copying every method of the wrapped stream.
+{
+  const options = { read() {}, write() {}, writev() {}, destroy() {}, final() {}, construct(cb) { cb(); } };
+  const keys = Object.keys(new Duplex(options)).filter((key) => !key.startsWith("_events"));
+  deepEq(keys.slice(0, 9), ["_readableState", "_writableState", "allowHalfOpen", "_read", "_write", "_writev", "_destroy", "_final", "_construct"], "Duplex own-property order");
+  eq(Object.hasOwn(stream.Stream.prototype, "eventNames"), true, "Stream.prototype has its own eventNames");
+  deepEq(stream.Stream.prototype.eventNames.call({ _events: { a: [], b() {}, c: [1] } }), ["b", "c"], "eventNames skips empty arrays");
+  throws(() => stream.addAbortSignal(undefined, new Readable({ read() {} })), "ERR_INVALID_ARG_TYPE", "addAbortSignal of undefined");
+  throws(() => stream.addAbortSignal({}, new Readable({ read() {} })), "ERR_INVALID_ARG_TYPE", "addAbortSignal of an object without aborted");
+  const legacy = { foo() { return "foo"; }, on() { return this; }, pause() {}, resume() {} };
+  eq(new Readable({ read() {} }).wrap(legacy).foo(), "foo", "wrap binds the first method of the wrapped stream");
+}

@@ -4,14 +4,13 @@
 
 use std::ffi::CStr;
 
-use js::class_spec::JSPROP_ENUMERATE;
 use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
 use js::function::{cast_payload, Callback, CallbackArgs};
 use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
-use js::object::PropertyInit;
+use js::object::{PropertyTemplate, PropertyWriter, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
@@ -20,7 +19,7 @@ use super::eos::{EosCallback, EosOptions};
 use super::state::{ReadablePart, ReadableSide, StreamState, WritableSide, R, W};
 use crate::errors::{ErrorKind, NodeError, Thrown};
 use crate::events::{listen, listener_count};
-use crate::support::{has_method, is_true, rust_string, this_object};
+use crate::support::{has_method, is_str, is_true, rust_string, this_object};
 
 /// `Buffer.concat(parts)`.
 fn concat_buffers<'s>(
@@ -446,7 +445,7 @@ fn emit_readable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     emit_readable_now(scope, stream, side)?;
     Ok(js::value::undefined())
@@ -505,7 +504,7 @@ fn maybe_read_more_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     let zero = zero(scope);
     loop {
@@ -843,7 +842,7 @@ fn end_readable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     let emit = {
         let part = side.get();
@@ -884,7 +883,7 @@ fn end_writable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let writable = js::conversion::to_boolean(stream.get_property(scope, c"writable")?)
         && !js::conversion::to_boolean(stream.get_property(scope, c"writableEnded")?)
         && !js::conversion::to_boolean(stream.get_property(scope, c"destroyed")?);
@@ -927,7 +926,7 @@ fn resume_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     let zero = zero(scope);
     if !side.has(R::READING) {
@@ -959,7 +958,7 @@ fn update_readable_listening(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     let readable = js::class::get_or_init_atom(scope, c"readable")?;
     let listening = listener_count(scope, stream, readable)? > 0.0;
@@ -988,7 +987,7 @@ fn read_zero_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     Function::call_by_name(scope, stream.handle(), c"read", &[zero(scope)])?;
     Ok(js::value::undefined())
 }
@@ -1003,28 +1002,26 @@ pub(crate) fn on<'s>(
 ) -> Result<Object<'s>, Thrown> {
     let result = crate::events::add_listener(scope, stream, event, listener, false)?;
     let side = ReadableSide::of(scope, stream)?;
-    match rust_string(scope, event).as_deref() {
-        Some("data") => {
-            side.set(R::DATA_LISTENING, true);
-            let readable = js::class::get_or_init_atom(scope, c"readable")?;
-            if listener_count(scope, stream, readable)? > 0.0 {
-                side.set(R::READABLE_LISTENING, true);
-            }
-            if side.get().flowing != Some(false) {
-                Function::call_by_name(scope, stream.handle(), c"resume", js::function::EmptyArgs)?;
-            }
+    if is_str(scope, event, c"data")? {
+        side.set(R::DATA_LISTENING, true);
+        let readable = js::class::get_or_init_atom(scope, c"readable")?;
+        if listener_count(scope, stream, readable)? > 0.0 {
+            side.set(R::READABLE_LISTENING, true);
         }
-        Some("readable") if !side.any(R::END_EMITTED | R::READABLE_LISTENING) => {
-            side.set(R::READABLE_LISTENING | R::NEED_READABLE, true);
-            side.get_mut().flowing = Some(false);
-            side.set(R::EMITTED_READABLE, false);
-            if side.length() > 0.0 {
-                emit_readable(scope, stream, side)?;
-            } else if !side.has(R::READING) {
-                tick(scope, read_zero_tick, stream)?;
-            }
+        if side.get().flowing != Some(false) {
+            Function::call_by_name(scope, stream.handle(), c"resume", js::function::EmptyArgs)?;
         }
-        _ => {}
+    } else if !side.any(R::END_EMITTED | R::READABLE_LISTENING)
+        && is_str(scope, event, c"readable")?
+    {
+        side.set(R::READABLE_LISTENING | R::NEED_READABLE, true);
+        side.get_mut().flowing = Some(false);
+        side.set(R::EMITTED_READABLE, false);
+        if side.length() > 0.0 {
+            emit_readable(scope, stream, side)?;
+        } else if !side.has(R::READING) {
+            tick(scope, read_zero_tick, stream)?;
+        }
     }
     Ok(result)
 }
@@ -1038,12 +1035,10 @@ pub(crate) fn remove_listener<'s>(
 ) -> Result<Object<'s>, Thrown> {
     let result = crate::events::remove_listener(scope, stream, event, listener)?;
     let side = ReadableSide::of(scope, stream)?;
-    match rust_string(scope, event).as_deref() {
-        Some("readable") => tick(scope, update_readable_listening, stream)?,
-        Some("data") if listener_count(scope, stream, event)? == 0.0 => {
-            side.set(R::DATA_LISTENING, false);
-        }
-        _ => {}
+    if is_str(scope, event, c"readable")? {
+        tick(scope, update_readable_listening, stream)?;
+    } else if is_str(scope, event, c"data")? && listener_count(scope, stream, event)? == 0.0 {
+        side.set(R::DATA_LISTENING, false);
     }
     Ok(result)
 }
@@ -2069,11 +2064,7 @@ pub(crate) fn wrap<'s>(
     }
     let read = Function::new_callback(scope, c"_read", 0, wrap_read, state)?;
     readable.set_property(scope, c"_read", *read)?;
-    for key in wrapped_object
-        .own_enumerable_keys(scope)?
-        .into_iter()
-        .skip(1)
-    {
+    for key in wrapped_object.own_enumerable_keys(scope)? {
         let Some(name) = rust_string(scope, key) else {
             continue;
         };
@@ -2308,8 +2299,8 @@ pub mod readable {
         event: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
         crate::events::event_emitter::remove_all_listeners(scope, this, event)?;
-        let name = rust_string(scope, event.unwrap_or(HandleValue::undefined()));
-        if event.is_none_or(|event| event.is_undefined()) || name.as_deref() == Some("readable") {
+        let event = event.unwrap_or(HandleValue::undefined());
+        if event.is_undefined() || is_str(scope, event, c"readable")? {
             super::tick(scope, update_readable_listening, this)?;
         }
         Ok(this)
@@ -2402,48 +2393,62 @@ pub(crate) fn init_readable(
     options: Option<HandleValue<'_>>,
     is_duplex: bool,
 ) -> Result<(), Thrown> {
-    init_readable_with(scope, stream, options, is_duplex, PropertyInit::Assign)
+    init_readable_with(scope, stream, options, is_duplex, None)
 }
 
-/// Initialize `stream`, which this crate created, as the `Readable` constructor does for
-/// `options`, or for `{ highWaterMark: high_water_mark }` if `high_water_mark` is a valid high
-/// water mark. It has no `_events` yet, so its emitter is initialized with
-/// [`crate::events::init_new_emitter`].
-pub(crate) fn init_new_readable(
-    scope: &Scope<'_>,
-    stream: Object<'_>,
+/// The own property of a readable stream that [`init_new_readable`] creates before those of the
+/// emitter.
+pub(crate) static READABLE_PROPERTIES: PropertyTemplate =
+    PropertyTemplate::new(&[TemplateKey::Name(c"_readableState")]);
+
+/// Initialize `stream`, which this crate created and `properties` writes to, as the `Readable`
+/// constructor does for `options`, or for `{ highWaterMark: high_water_mark }` if
+/// `high_water_mark` is a valid high water mark. It has no `_events` yet, so its emitter is
+/// initialized with [`crate::events::init_new_emitter`].
+pub(crate) fn init_new_readable<'w>(
+    scope: &'w Scope<'_>,
+    stream: Object<'w>,
+    properties: &mut PropertyWriter<'w>,
     options: Option<HandleValue<'_>>,
     high_water_mark: Option<f64>,
 ) -> Result<(), Thrown> {
     match high_water_mark {
         Some(mark) => {
-            init_readable_with(scope, stream, None, false, PropertyInit::Define)?;
+            init_readable_with(scope, stream, None, false, Some(properties))?;
             ReadableSide::of(scope, stream)?.get_mut().high_water_mark = mark;
         }
-        None => init_readable_with(scope, stream, options, false, PropertyInit::Define)?,
+        None => init_readable_with(scope, stream, options, false, Some(properties))?,
     }
-    crate::events::init_new_emitter(scope, stream)?;
+    crate::events::init_new_emitter(scope, properties)?;
+    if properties.get(scope, c"_construct")?.is_null_or_undefined() {
+        return Ok(());
+    }
+    properties.flush(scope)?;
     finish_construction(scope, stream)
 }
 
-/// Run [`init_readable`], creating `_readableState` as `init` creates properties.
-fn init_readable_with(
-    scope: &Scope<'_>,
-    stream: Object<'_>,
+/// Run [`init_readable`], creating `_readableState` with `properties`, or by assignment without
+/// it.
+fn init_readable_with<'w>(
+    scope: &'w Scope<'_>,
+    stream: Object<'w>,
     options: Option<HandleValue<'_>>,
     is_duplex: bool,
-    init: PropertyInit,
+    mut properties: Option<&mut PropertyWriter<'w>>,
 ) -> Result<(), Thrown> {
     let state = readable::state_of(scope, stream)?;
     init_readable_part(scope, state, options, is_duplex)?;
     let view = super::state::new_readable_view(scope, state)?;
-    match init {
-        PropertyInit::Define => {
-            stream.define_property(scope, c"_readableState", view, JSPROP_ENUMERATE as u32)?
+    match properties.as_deref_mut() {
+        Some(properties) => {
+            properties.continue_with(scope, &READABLE_PROPERTIES)?;
+            properties.write(scope, c"_readableState", view)?;
         }
-        PropertyInit::Assign => stream.set_property(scope, c"_readableState", view)?,
+        None => stream.set_property(scope, c"_readableState", view)?,
     }
-    if let Some(options) = options.and_then(|options| Object::from_value(scope, options).ok()) {
+    let options = options.and_then(|options| Object::from_value(scope, options).ok());
+    // The `Duplex` constructor assigns the methods of both sides itself.
+    if let Some(options) = options.filter(|_| !is_duplex) {
         for (option, method) in [
             (c"read", c"_read"),
             (c"destroy", c"_destroy"),
@@ -2451,14 +2456,18 @@ fn init_readable_with(
         ] {
             let value = options.get_property(scope, option)?;
             if js::function::is_callable(value) {
+                if let Some(properties) = properties.as_deref_mut() {
+                    properties.flush(scope)?;
+                }
                 stream.set_property(scope, method, value)?;
             }
         }
-        if !is_duplex {
-            let signal = options.get_property(scope, c"signal")?;
-            if js::conversion::to_boolean(signal) {
-                super::add_abort_signal(scope, signal, stream.to_jsval_throwing(scope)?)?;
+        let signal = options.get_property(scope, c"signal")?;
+        if js::conversion::to_boolean(signal) {
+            if let Some(properties) = properties {
+                properties.flush(scope)?;
             }
+            super::add_abort_signal(scope, signal, stream.to_jsval_throwing(scope)?)?;
         }
     }
     Ok(())
@@ -2483,7 +2492,7 @@ fn on_constructed(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let Some(state) = super::state::try_state(scope, stream)? else {
         return Ok(js::value::undefined());
     };

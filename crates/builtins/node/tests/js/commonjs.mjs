@@ -43,6 +43,19 @@ delete require.cache[cachedKey];
 const reloaded = require("./commonjs/replace.cjs");
 eq(reloaded === greet, false, "deleting from require.cache reloads the module");
 throws(() => require("./commonjs/missing.cjs"), "MODULE_NOT_FOUND", "a missing module");
+throws(() => require("dual/missing"), "ERR_PACKAGE_PATH_NOT_EXPORTED", "a subpath exports omits");
+throws(() => require("node:nonexistent"), "ERR_UNKNOWN_BUILTIN_MODULE", "an unknown builtin");
+for (const [specifier, code] of [
+  ["nonexistent_pkg", "ERR_MODULE_NOT_FOUND"],
+  ["./commonjs/missing.mjs", "ERR_MODULE_NOT_FOUND"],
+  ["dual/missing", "ERR_PACKAGE_PATH_NOT_EXPORTED"],
+  ["node:nonexistent", "ERR_UNKNOWN_BUILTIN_MODULE"],
+]) {
+  const error = await import(specifier).then(() => null, (error) => error);
+  eq(error?.code, code, `the error of import("${specifier}")`);
+}
+eq(import.meta.resolve("./nope.js"), new URL("./nope.js", import.meta.url).href, "import.meta.resolve of a missing file");
+throws(() => import.meta.resolve("nonexistent_pkg"), "ERR_MODULE_NOT_FOUND", "import.meta.resolve of a missing package");
 throws(() => require(42), "ERR_INVALID_ARG_TYPE", "require validates its argument");
 
 eq(Module, createRequire.Module ?? Module, "node:module's default export is Module");

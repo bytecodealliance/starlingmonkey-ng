@@ -15,7 +15,7 @@ use js::function::CallbackArgs;
 use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::{HandleId, Value};
-use js::object::{PropertyInit, PropertyTemplate, TemplateKey};
+use js::object::{PropertyTemplate, PropertyWriter, TemplateKey};
 use js::prelude::HandleValue;
 use js::symbol::CachedSymbol;
 use js::{Function, Object};
@@ -45,14 +45,14 @@ pub(crate) static EMITTER_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&
     TemplateKey::Symbol(&K_CAPTURE),
 ]);
 
-/// Initialize `emitter`, which this crate created without `_events`, as `EventEmitter.init()`
-/// does without options: with no listeners. It reads `_maxListeners` through the prototype chain,
-/// and `kCapture` from `EventEmitter.prototype`.
-pub(crate) fn init_new_emitter(scope: &Scope<'_>, emitter: Object<'_>) -> Result<(), ExnThrown> {
-    // SAFETY: the caller guarantees the requirements of `Define`. Only the writer's own reads run
-    // JavaScript that can reach `emitter`, until it finishes.
-    let mut properties =
-        unsafe { emitter.property_writer(scope, &EMITTER_PROPERTIES, PropertyInit::Define) }?;
+/// Initialize the emitter `properties` writes to, which this crate created without `_events`, as
+/// `EventEmitter.init()` does without options: with no listeners. It reads `_maxListeners`
+/// through the prototype chain, and `kCapture` from `EventEmitter.prototype`.
+pub(crate) fn init_new_emitter<'w>(
+    scope: &'w Scope<'_>,
+    properties: &mut PropertyWriter<'w>,
+) -> Result<(), ExnThrown> {
+    properties.continue_with(scope, &EMITTER_PROPERTIES)?;
     properties.write(scope, c"_events", Object::new_with_null_prototype(scope)?)?;
     properties.write(scope, c"_eventsCount", 0)?;
     properties.write(scope, &SHAPE_MODE, false)?;
@@ -65,8 +65,7 @@ pub(crate) fn init_new_emitter(scope: &Scope<'_>, emitter: Object<'_>) -> Result
     let proto = emitter_constructor(scope)?.get_property(scope, c"prototype")?;
     let proto = Object::from_value(scope, proto).map_err(|e| e.throw(scope))?;
     let capture = proto.get_property_by_id(scope, capture_symbol(scope)?)?;
-    properties.write(scope, &K_CAPTURE, capture)?;
-    properties.finish(scope)
+    properties.write(scope, &K_CAPTURE, capture)
 }
 
 /// The symbol of the listener limit `setMaxListeners` stores on an `EventTarget`.
@@ -74,7 +73,7 @@ static MAX_EVENT_TARGET_LISTENERS: CachedSymbol =
     CachedSymbol::new(c"events.maxEventTargetListeners");
 
 /// `EventEmitter.errorMonitor`.
-static ERROR_MONITOR: CachedSymbol = CachedSymbol::new(c"events.errorMonitor");
+pub(crate) static ERROR_MONITOR: CachedSymbol = CachedSymbol::new(c"events.errorMonitor");
 
 /// `EventEmitter.captureRejectionSymbol`, `Symbol.for('nodejs.rejection')`.
 pub(crate) static REJECTION: CachedSymbol = CachedSymbol::registered(c"nodejs.rejection");

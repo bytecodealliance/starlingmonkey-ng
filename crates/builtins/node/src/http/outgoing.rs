@@ -15,7 +15,7 @@ use js::function::CallbackArgs;
 use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::Value;
-use js::object::{PropertyInit, PropertyTemplate, TemplateKey};
+use js::object::{PropertyInit, PropertyTemplate, PropertyWriter, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 use web_streams::readable::default_controller::ReadableStreamDefaultControllerImpl;
@@ -24,6 +24,7 @@ use web_streams::readable::ReadableStreamDefaultController;
 use super::connection::ConnectionStateImpl;
 use super::{has_invalid_header_char, status_text, validate_name, validate_value};
 use crate::errors::{validate_string, ErrorKind, NodeError, Thrown};
+use crate::events::EMITTER_PROPERTIES;
 use crate::support::{array_elements, chunk_bytes, next_tick_call, Canceller};
 
 /// The number of bytes a response body stream queues before `write` returns `false`.
@@ -75,7 +76,9 @@ impl Served {
     }
 }
 
-/// The state of a client request.
+/// The state of a client request, which sends HTTP/1.1 over its socket, or, with
+/// [`Transport::Host`], through `platform::http`. Only a request through `platform::http` uses
+/// `url`, `body`, `timer`, `cancel`, `socket_name` and `response`.
 #[js::must_root]
 #[derive(core_runtime::Traceable, Default)]
 pub(crate) struct ClientPart {
@@ -99,6 +102,18 @@ pub(crate) struct ClientPart {
     pub(super) path: Option<Heap<Value>>,
     /// The response, once it arrived.
     pub(super) response: Option<Heap<js::object::Object>>,
+    /// The error `destroy` was given: Node's `kError`.
+    pub(super) error: Option<Heap<Value>>,
+    /// The error `onSocket` was given with a socket, while the socket is destroyed.
+    pub(super) socket_error: Option<Heap<Value>>,
+    /// The options of the request an agent queued until it has a socket: Node's
+    /// `kRequestOptions`.
+    pub(super) agent_options: Option<Heap<js::object::Object>>,
+    /// The socket `onSocket` destroyed, until it finished.
+    pub(super) destroyed_socket: Option<Heap<js::object::Object>>,
+    /// Whether the `createConnection` option created a socket or failed.
+    #[no_trace]
+    pub(super) created: bool,
 }
 
 /// How a message sends its body.
@@ -110,8 +125,8 @@ pub(crate) enum Transport {
     Wire,
     /// As the web `Response` to a served request.
     Served(Served),
-    /// As the body of a request `platform::http` sends.
-    Client(ClientPart),
+    /// As the body of a client request `platform::http` sends.
+    Host,
 }
 
 /// The state of an `OutgoingMessage`.
@@ -170,6 +185,12 @@ pub(crate) struct OutgoingState {
     /// The connection of a response a listening server writes.
     pub(super) connection: Option<Heap<ConnectionStateImpl>>,
     pub(super) transport: Transport,
+    /// The state of a client request.
+    pub(super) client: Option<ClientPart>,
+    /// The lowercase names of the headers whose values are sent on one line: Node's
+    /// `kUniqueHeaders`, from the `uniqueHeaders` option.
+    #[no_trace]
+    pub(super) unique_headers: Option<Vec<String>>,
 }
 
 #[core_runtime::jsmethods]
@@ -192,7 +213,7 @@ pub(super) fn try_state_of<'s>(
 }
 
 /// `ERR_HTTP_HEADERS_SENT` for `action`, such as "set".
-fn headers_sent(action: &str) -> NodeError {
+pub(super) fn headers_sent(action: &str) -> NodeError {
     NodeError::new(
         ErrorKind::Error,
         "ERR_HTTP_HEADERS_SENT",
@@ -292,6 +313,31 @@ pub(super) fn header_pairs(
     Ok(pairs)
 }
 
+/// The lowercase names of the `uniqueHeaders` option `value`, or `None` if it isn't an array, as
+/// Node.js's `parseUniqueHeadersOption` makes them.
+pub(super) fn parse_unique_headers(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+) -> Result<Option<Vec<String>>, ExnThrown> {
+    let Some(names) = array_elements(scope, value)? else {
+        return Ok(None);
+    };
+    let mut unique = Vec::with_capacity(names.len());
+    for name in names {
+        unique.push(String::from_jsval_throwing(scope, name, ())?.to_lowercase());
+    }
+    Ok(Some(unique))
+}
+
+/// Whether the header `name` is one of the `uniqueHeaders` of the message of `state`.
+pub(super) fn is_unique(state: &OutgoingState<'_>, name: &str) -> bool {
+    state.data().unique_headers.as_ref().is_some_and(|unique| {
+        unique
+            .iter()
+            .any(|unique| unique.eq_ignore_ascii_case(name))
+    })
+}
+
 /// The index of the header set as `lower` in `headers`.
 fn find(headers: &[Header], lower: &str) -> Option<usize> {
     headers.iter().position(|header| header.lower == lower)
@@ -387,7 +433,7 @@ fn apply_headers(
 /// Store `headers` as the headers `writeHead` was given without any header set before, after
 /// checking each name and value as `setHeader` does: from an object, a flat array of names and
 /// values, or an array of pairs.
-fn store_head_headers(
+pub(super) fn store_head_headers(
     scope: &Scope<'_>,
     state: &OutgoingState<'_>,
     headers: HandleValue<'_>,
@@ -540,8 +586,8 @@ fn send(
     bytes: Vec<u8>,
     last: bool,
 ) -> Result<bool, ExnThrown> {
-    let client = matches!(state.data().transport, Transport::Client(_));
-    if client {
+    let host = matches!(state.data().transport, Transport::Host);
+    if host {
         return super::client::send(scope, message, state, bytes, last);
     }
     send_served(scope, message, state, bytes, last)
@@ -579,9 +625,13 @@ pub(crate) static OUTGOING_PROPERTIES: PropertyTemplate = PropertyTemplate::new(
 /// The values of the properties of an `OutgoingMessage` that differ between the kinds of
 /// messages. The default holds the values `new OutgoingMessage()` gives them.
 pub(super) struct OutgoingFields<'a> {
+    /// `_last`.
+    pub last: bool,
     pub should_keep_alive: bool,
     pub use_chunked_encoding_by_default: bool,
     pub send_date: bool,
+    /// `_removedConnection`, `_removedContLen` and `_removedTE`.
+    pub removed: bool,
     pub has_body: bool,
     /// `_keepAliveTimeout`, or `0` for `None`.
     pub keep_alive_timeout: Option<HandleValue<'a>>,
@@ -592,9 +642,11 @@ pub(super) struct OutgoingFields<'a> {
 impl Default for OutgoingFields<'_> {
     fn default() -> Self {
         OutgoingFields {
+            last: false,
             should_keep_alive: true,
             use_chunked_encoding_by_default: true,
             send_date: false,
+            removed: false,
             has_body: true,
             keep_alive_timeout: None,
             on_pending_data: None,
@@ -603,26 +655,25 @@ impl Default for OutgoingFields<'_> {
 }
 
 /// Initialize `message` as an emitter, and create the own properties of an `OutgoingMessage` with
-/// `fields`, as `init` creates properties. With [`PropertyInit::Define`], `message` is an
-/// instance this crate created that has no own properties yet.
-fn init_outgoing(
-    scope: &Scope<'_>,
-    message: Object<'_>,
-    fields: &OutgoingFields<'_>,
+/// `fields` with `properties`, which writes to `message` as `init` creates properties. With
+/// [`PropertyInit::Define`], `message` is an instance this crate created without `_events`.
+pub(super) fn init_outgoing<'w>(
+    scope: &'w Scope<'_>,
+    message: Object<'w>,
+    properties: &mut PropertyWriter<'w>,
+    fields: &OutgoingFields<'w>,
     init: PropertyInit,
 ) -> Result<(), Thrown> {
     match init {
-        PropertyInit::Define => crate::events::init_new_emitter(scope, message)?,
+        PropertyInit::Define => crate::events::init_new_emitter(scope, properties)?,
         PropertyInit::Assign => crate::stream::stream_class::init(scope, message, None)?,
     }
-    // SAFETY: the caller guarantees the requirements of `Define`, and no JavaScript runs before
-    // the writer finishes.
-    let mut properties = unsafe { message.property_writer(scope, &OUTGOING_PROPERTIES, init) }?;
+    properties.continue_with(scope, &OUTGOING_PROPERTIES)?;
     properties.write(scope, c"outputData", *js::Array::new(scope, 0)?)?;
     properties.write(scope, c"outputSize", 0)?;
     properties.write(scope, c"writable", true)?;
     properties.write(scope, c"destroyed", false)?;
-    properties.write(scope, c"_last", false)?;
+    properties.write(scope, c"_last", fields.last)?;
     properties.write(scope, c"chunkedEncoding", false)?;
     properties.write(scope, c"shouldKeepAlive", fields.should_keep_alive)?;
     properties.write(scope, c"maxRequestsOnConnectionReached", false)?;
@@ -633,9 +684,9 @@ fn init_outgoing(
         fields.use_chunked_encoding_by_default,
     )?;
     properties.write(scope, c"sendDate", fields.send_date)?;
-    properties.write(scope, c"_removedConnection", false)?;
-    properties.write(scope, c"_removedContLen", false)?;
-    properties.write(scope, c"_removedTE", false)?;
+    properties.write(scope, c"_removedConnection", fields.removed)?;
+    properties.write(scope, c"_removedContLen", fields.removed)?;
+    properties.write(scope, c"_removedTE", fields.removed)?;
     properties.write(scope, c"strictContentLength", false)?;
     properties.write(scope, c"_contentLength", HandleValue::null())?;
     properties.write(scope, c"_hasBody", fields.has_body)?;
@@ -656,7 +707,6 @@ fn init_outgoing(
             crate::support::noop_function(scope)?,
         )?,
     }
-    properties.finish(scope)?;
     Ok(())
 }
 
@@ -707,12 +757,17 @@ pub mod outgoing_message_class {
         this: Object<'_>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
+        // SAFETY: `Assign` has no requirements.
+        let mut properties =
+            unsafe { this.property_writer(scope, &OUTGOING_PROPERTIES, PropertyInit::Assign) }?;
         init_outgoing(
             scope,
             this,
+            &mut properties,
             &OutgoingFields::default(),
             PropertyInit::Assign,
         )?;
+        properties.finish(scope)?;
         store_options(scope, this, options)
     }
 
@@ -1128,11 +1183,12 @@ pub mod outgoing_message_class {
             }
             pairs
         };
+        let state = state_of(scope, this)?;
         for (field, value) in pairs {
             super::super::module::validate_header_name(scope, field, Some("Trailer name".into()))?;
             let field = String::from_jsval(scope, field, ())?;
             let lines = match array_elements(scope, value)? {
-                Some(items) if items.len() > 1 => items,
+                Some(items) if items.len() > 1 && !is_unique(&state, &field) => items,
                 Some(_) => {
                     let array = Object::from_value(scope, *value).map_err(|e| e.throw(scope))?;
                     let joined = Function::call_by_name(
@@ -1199,8 +1255,8 @@ pub mod outgoing_message_class {
             }
             return Ok(this);
         }
-        let client = matches!(state.data().transport, Transport::Client(_));
-        if client {
+        let host = matches!(state.data().transport, Transport::Host);
+        if host {
             super::super::client::destroy(scope, this, &state, error)?;
         } else {
             destroy_served(scope, this, &state, error)?;
@@ -1239,6 +1295,20 @@ pub mod outgoing_message_class {
                 Function::call_by_name(scope, socket.handle(), c"uncork", js::function::EmptyArgs)?;
             }
         }
+        Ok(())
+    }
+
+    /// Write what the message queued to its socket, as Node.js's `_flush` does.
+    #[method(name = "_flush")]
+    pub fn flush_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        let state = state_of(scope, this)?;
+        super::super::wire::flush(scope, this, &state)
+    }
+
+    /// Emit `prefinish`, as Node.js's `_finish` does once all data was handed to the socket.
+    #[method(name = "_finish")]
+    pub fn finish_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        crate::events::emit(scope, this, c"prefinish", &[])?;
         Ok(())
     }
 
@@ -1305,14 +1375,22 @@ pub(super) fn socket_writable_length(
 /// finished and its socket wrote everything, whether `drain` is due, whether the message emitted
 /// `close`, the error it was destroyed with, the bytes it and its socket haven't written, the
 /// high water mark of its socket or its own, the number of `cork` calls not undone, and `false`.
+/// For an object that isn't an `OutgoingMessage`, such as the prototype, they are what Node.js's
+/// getters compute from its missing properties: `false`, `NaN` and `undefined`.
 fn outgoing_getter(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
-    let state = state_of(scope, this)?;
     let index = payload.to_number() as usize;
+    let Some(state) = try_state_of(scope, this)? else {
+        return Ok(match index {
+            0 | 9 => js::value::from_bool(false),
+            6 => js::value::from_f64(f64::NAN),
+            _ => js::value::undefined(),
+        });
+    };
     let socket = state.data().socket.get(scope);
     let socket_length = |scope: &Scope<'_>| -> Result<f64, ExnThrown> {
         match socket {
@@ -1756,7 +1834,8 @@ pub(super) fn new_response<'s>(
     reject_body_writes: bool,
 ) -> Result<Object<'s>, ExnThrown> {
     let response = server_response_class::new_instance(scope)?;
-    init_response(scope, response, Some(req), connection, PropertyInit::Define)
+    // SAFETY: `response` was just created, and nothing else references it.
+    unsafe { init_response(scope, response, Some(req), connection, PropertyInit::Define) }
         .map_err(|thrown| thrown.throw(scope))?;
     let state = state_of(scope, response)?;
     let mut data = state.data_mut();
@@ -1767,14 +1846,18 @@ pub(super) fn new_response<'s>(
 }
 
 /// Initialize `response` as the `ServerResponse` constructor does for `req`, with the fields of
-/// `connection`, creating its properties as `init` creates them. With [`PropertyInit::Define`],
-/// `response` is an instance this crate created that has no own properties yet. The response to
-/// a `HEAD` request has no body, and the response to an HTTP/1.0 request closes the connection,
-/// unless `connection` keeps it alive, and uses chunked encoding only if the request's `TE`
-/// header names it.
-fn init_response(
-    scope: &Scope<'_>,
-    response: Object<'_>,
+/// `connection`, creating its properties as `init` creates them. The response to a `HEAD` request
+/// has no body, and the response to an HTTP/1.0 request closes the connection, unless
+/// `connection` keeps it alive, and uses chunked encoding only if the request's `TE` header
+/// names it.
+///
+/// # Safety
+///
+/// With [`PropertyInit::Define`], `response` is an instance [`new_response`] created that nothing
+/// else references.
+unsafe fn init_response<'w>(
+    scope: &'w Scope<'_>,
+    response: Object<'w>,
     req: Option<Object<'_>>,
     connection: Option<ConnectionFields<'_>>,
     init: PropertyInit,
@@ -1803,10 +1886,11 @@ fn init_response(
         fields.keep_alive_timeout = Some(connection.keep_alive_timeout);
         fields.on_pending_data = connection.on_pending_data;
     }
-    init_outgoing(scope, response, &fields, init)?;
-    // SAFETY: the caller guarantees the requirements of `Define`, and no JavaScript runs before
-    // the writer finishes.
-    let mut properties = unsafe { response.property_writer(scope, &RESPONSE_PROPERTIES, init) }?;
+    // SAFETY: the caller guarantees the requirements of `Define`. Only the writer's own reads run
+    // JavaScript that can reach `response`, until it is flushed.
+    let mut properties = unsafe { response.property_writer(scope, &EMITTER_PROPERTIES, init) }?;
+    init_outgoing(scope, response, &mut properties, &fields, init)?;
+    properties.continue_with(scope, &RESPONSE_PROPERTIES)?;
     match req {
         Some(req) => {
             state_of(scope, response)?.data_mut().request = Some(Heap::from(req));
@@ -1823,13 +1907,13 @@ fn init_response(
             connection.max_requests_per_socket,
         )?;
     }
-    properties.finish(scope)?;
-    Ok(())
+    Ok(properties.finish(scope)?)
 }
 
 #[core_runtime::jsfunction_class(
     name = "ServerResponse",
-    extends = "super::outgoing_message_class"
+    extends = "super::outgoing_message_class",
+    templates = "EMITTER_PROPERTIES, OUTGOING_PROPERTIES, RESPONSE_PROPERTIES"
 )]
 pub mod server_response_class {
     use super::*;
@@ -1847,7 +1931,8 @@ pub mod server_response_class {
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
         let req = req.and_then(|req| Object::from_value(scope, *req).ok());
-        init_response(scope, this, req, None, PropertyInit::Assign)?;
+        // SAFETY: `Assign` has no requirements.
+        unsafe { init_response(scope, this, req, None, PropertyInit::Assign) }?;
         store_options(scope, this, options)
     }
 
@@ -1903,13 +1988,6 @@ pub mod server_response_class {
             socket.set_property(scope, c"_httpMessage", js::value::null())?;
         }
         Ok(())
-    }
-
-    /// Write what the response queued to its socket, as Node.js's `_flush` does.
-    #[method(name = "_flush")]
-    pub fn flush_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        let state = state_of(scope, this)?;
-        super::super::wire::flush(scope, this, &state)
     }
 
     /// Emit `prefinish`, as Node.js's `_finish` does once all data was handed to the socket.

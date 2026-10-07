@@ -288,7 +288,7 @@ fn emit_error_close_tick(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     emit_error(scope, stream, args.get(0))?;
     emit_close(scope, stream)?;
     Ok(js::value::undefined())
@@ -300,7 +300,7 @@ fn emit_close_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    emit_close(scope, cast_payload::<Object>(scope, payload))?;
+    emit_close(scope, cast_payload::<js::Object>(scope, payload))?;
     Ok(js::value::undefined())
 }
 
@@ -310,7 +310,11 @@ fn emit_error_tick(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    emit_error(scope, cast_payload::<Object>(scope, payload), args.get(0))?;
+    emit_error(
+        scope,
+        cast_payload::<js::Object>(scope, payload),
+        args.get(0),
+    )?;
     Ok(js::value::undefined())
 }
 
@@ -487,7 +491,7 @@ fn construct_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     let state =
         js::class::create_instance_with::<ConstructStateImpl>(scope, |_| ConstructStateImpl {
             stream: Heap::from(stream),
@@ -560,7 +564,12 @@ fn emit_close_legacy(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    crate::events::emit(scope, cast_payload::<Object>(scope, payload), c"close", &[])?;
+    crate::events::emit(
+        scope,
+        cast_payload::<js::Object>(scope, payload),
+        c"close",
+        &[],
+    )?;
     Ok(js::value::undefined())
 }
 
@@ -571,7 +580,7 @@ fn emit_error_close_legacy(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<Object>(scope, payload);
+    let stream = cast_payload::<js::Object>(scope, payload);
     crate::events::emit(scope, stream, c"error", &[args.get(0)])?;
     js::jobs::queue_native_tick(scope, emit_close_legacy, stream, &[])?;
     Ok(js::value::undefined())

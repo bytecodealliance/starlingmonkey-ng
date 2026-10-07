@@ -18,6 +18,8 @@
 mod mock;
 mod report;
 
+pub(crate) use mock::CALL_PROPERTIES as MOCK_CALL_PROPERTIES;
+
 use std::collections::VecDeque;
 
 use js::async_context::Snapshot;

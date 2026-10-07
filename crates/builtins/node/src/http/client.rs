@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! `ClientRequest`, which sends a request through `platform::http`, and `Agent`.
+//! `ClientRequest`, ported from Node.js's `lib/_http_client.js`.
 //!
-//! The request body is collected in the request's state until `end()` and then sent with the
-//! request. The host handles connections, so an agent only keeps its options, and the sockets of
-//! a `keepAlive` agent's finished requests in its `freeSockets`.
+//! A request to an `http:` URL in a script the runtime runs as a command writes HTTP/1.1 to a
+//! socket: the one its agent's `addRequest` gives it, the one its `createConnection` option
+//! creates, or a new `net.Socket` (see [`super::client_socket`]). Every other request, to an
+//! `https:` URL, while the runtime serves requests, or in a component, is sent through
+//! `platform::http`, which handles connections and TLS. Its body is collected in the request's
+//! state until `end()` and then sent with the request, and it gets a host socket (see
+//! [`super::host_socket`]). An agent only keeps its options for those, and the sockets of a
+//! `keepAlive` agent's finished requests in its `freeSockets`.
 
 use std::time::Duration;
 
@@ -21,10 +26,12 @@ use platform::http::{OutgoingBody, Request};
 
 use super::incoming::{new_message, set_host_source, MessageHead};
 use super::outgoing::{
-    header_args, header_pairs, outgoing_message_class, ClientPart, OutgoingState, Transport,
+    header_pairs, outgoing_message_class, ClientPart, OutgoingFields, OutgoingState, Transport,
+    OUTGOING_PROPERTIES,
 };
 use super::status_text;
 use crate::errors::{ErrorKind, NodeError, Thrown};
+use crate::events::EMITTER_PROPERTIES;
 use crate::support::{emit_later, spawn_cancellable, until_cancelled};
 
 /// The headers the client leaves out besides those that frame the request, which the host sets:
@@ -47,6 +54,12 @@ const HOST_HEADERS: [&str; 4] = [
     "transfer-encoding",
     "content-length",
 ];
+
+/// Whether a request with `protocol` writes HTTP/1.1 to a socket: an `http:` request in a script
+/// the runtime runs as a command. Other requests go through `platform::http`.
+fn uses_socket(protocol: &str) -> bool {
+    protocol == "http:" && core_runtime::event_loop::running_as_command()
+}
 
 /// Throw the error for the transport failure `message` of a request to `url`, with the `code`
 /// its cause has in Node.js where the message names one: `ECONNREFUSED`, `ECONNRESET`,
@@ -82,58 +95,28 @@ pub(super) fn transport_error(scope: &Scope<'_>, message: &str, url: Option<&str
     }
 }
 
-/// The options a URL gives a request: `protocol`, `hostname`, `port`, `path` and `auth`.
-fn url_options<'s>(scope: &'s Scope<'_>, href: &str) -> Result<Object<'s>, Thrown> {
-    let url = url::Url::parse(href)
-        .map_err(|_| NodeError::new(ErrorKind::TypeError, "ERR_INVALID_URL", "Invalid URL"))?;
-    let options = Object::new_plain(scope)?;
-    options.set_property(scope, c"protocol", format!("{}:", url.scheme()).as_str())?;
-    let host = url.host_str().unwrap_or_default();
-    options.set_property(
-        scope,
-        c"hostname",
-        host.trim_start_matches('[').trim_end_matches(']'),
-    )?;
-    if let Some(port) = url.port() {
-        options.set_property(scope, c"port", f64::from(port))?;
-    }
-    let path = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    };
-    options.set_property(scope, c"path", path.as_str())?;
-    let password = url.password().unwrap_or_default();
-    if !url.username().is_empty() || !password.is_empty() {
-        let (Some(user), Some(password)) = (
-            crate::url::decode_uri_component(url.username()),
-            crate::url::decode_uri_component(password),
-        ) else {
-            return Err(Thrown::from(js::error::throw_uri_error(
-                scope,
-                c"URI malformed",
-            )));
-        };
-        options.set_property(scope, c"auth", format!("{user}:{password}").as_str())?;
-    }
-    Ok(options)
-}
-
-/// The URL `value` is, a string or a WHATWG `URL`.
-pub(super) fn url_of(
-    scope: &Scope<'_>,
-    value: HandleValue<'_>,
-) -> Result<Option<String>, ExnThrown> {
-    if value.is_string() {
-        return Ok(Some(String::from_jsval_throwing(scope, value, ())?));
-    }
-    let Ok(object) = Object::from_value(scope, *value) else {
+/// The request options of the URL `input`, a string or an object `isURL` accepts, as Node.js's
+/// `urlToHttpOptions` creates them, or `None` if `input` is neither. A string that isn't a URL
+/// throws `ERR_INVALID_URL`.
+pub(super) fn url_input<'s>(
+    scope: &'s Scope<'_>,
+    input: HandleValue<'_>,
+) -> Result<Option<Object<'s>>, Thrown> {
+    let url = if input.is_string() {
+        let href = String::from_jsval(scope, input, ())?;
+        if url::Url::parse(&href).is_err() {
+            return Err(
+                NodeError::new(ErrorKind::TypeError, "ERR_INVALID_URL", "Invalid URL").into(),
+            );
+        }
+        Function::construct(scope, crate::url::url_constructor(scope)?, &[input])?
+    } else if crate::url::is_url(scope, input)? {
+        Object::from_value(scope, *input)?
+    } else {
         return Ok(None);
     };
-    let href = object.get_property(scope, c"href")?;
-    if href.is_string() && object.get_property(scope, c"searchParams")?.is_object() {
-        return Ok(Some(String::from_jsval_throwing(scope, href, ())?));
-    }
-    Ok(None)
+    let url = url.to_jsval_throwing(scope)?;
+    Ok(Some(crate::url::module::url_to_http_options(scope, url)?))
 }
 
 /// `options[name]` as a string, or `None` if it is `null` or `undefined`.
@@ -149,8 +132,9 @@ fn string_option(
     Ok(Some(String::from_jsval_throwing(scope, value, ())?))
 }
 
-/// `options[name]` as a host name, or `None` if it is `null` or `undefined`, or
-/// `ERR_INVALID_ARG_TYPE` naming the option `label` if it is not a string.
+/// The host name `options[name]`, if it is a non-empty string, or `ERR_INVALID_ARG_TYPE` naming
+/// the option `options.{label}` if it is neither a string, `null` nor `undefined`, as Node.js's
+/// `validateHost` checks it.
 fn host_option(
     scope: &Scope<'_>,
     options: Object<'_>,
@@ -162,22 +146,33 @@ fn host_option(
         return Ok(None);
     }
     if !value.is_string() {
-        return Err(NodeError::invalid_arg_type(scope, label, "of type string", value).into());
+        return Err(NodeError::invalid_arg_type(
+            scope,
+            label,
+            "of type string or one of undefined or null",
+            value,
+        )
+        .into());
     }
     Ok(Some(String::from_jsval(scope, value, ())?).filter(|host| !host.is_empty()))
 }
 
 /// Run `f` on the client part of the state of a request, if it is a client request.
-fn with_client<R>(state: &OutgoingState<'_>, f: impl FnOnce(&mut ClientPart) -> R) -> Option<R> {
-    match &mut state.data_mut().transport {
-        Transport::Client(client) => Some(f(client)),
-        _ => None,
-    }
+pub(super) fn with_client<R>(
+    state: &OutgoingState<'_>,
+    f: impl FnOnce(&mut ClientPart) -> R,
+) -> Option<R> {
+    state.data_mut().client.as_mut().map(f)
 }
 
-/// The completion of a request's send: emit `response` with the response, consuming it if
-/// nothing listens, or emit `error` and `close` after a failure, unless the request was
-/// destroyed.
+/// Whether the request of `state` goes through `platform::http`.
+pub(super) fn through_host(state: &OutgoingState<'_>) -> bool {
+    matches!(state.data().transport, Transport::Host)
+}
+
+/// The completion of a request's send through `platform::http`: emit `response` with the
+/// response, consuming it if nothing listens, or emit `error` and `close` after a failure, unless
+/// the request was destroyed.
 fn send_done(
     scope: &Scope<'_>,
     request: Object<'_>,
@@ -228,8 +223,8 @@ fn send_done(
     Ok(())
 }
 
-/// The `end` listener of a response, whose payload is its request: return the request's socket
-/// to its agent, and emit `close` on the request.
+/// The `end` listener of a response through `platform::http`, whose payload is its request:
+/// return the request's socket to its agent, and emit `close` on the request.
 fn emit_request_close(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
@@ -241,7 +236,8 @@ fn emit_request_close(
     Ok(js::value::undefined())
 }
 
-/// The timer callback of `setTimeout`, whose `this` is the request: emit `timeout`.
+/// The timer callback of `setTimeout` of a request through `platform::http`, whose `this` is the
+/// request: emit `timeout`.
 fn on_timeout(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -261,8 +257,8 @@ fn clear_timer(state: &OutgoingState<'_>) {
     }
 }
 
-/// Send `request` with the bytes written to it as its body. `destroy` cancels the send. A request
-/// whose host name can't be in a URL fails with `ENOTFOUND`.
+/// Send `request` through `platform::http` with the bytes written to it as its body. `destroy`
+/// cancels the send. A request whose host name can't be in a URL fails with `ENOTFOUND`.
 fn start(
     scope: &Scope<'_>,
     request: Object<'_>,
@@ -292,8 +288,15 @@ fn start(
         })
         .collect();
     let method = request.get_property(scope, c"method")?;
+    let method = match String::from_jsval_throwing(scope, method, ()) {
+        Ok(method) => method,
+        Err(ExnThrown) => {
+            js::exception::clear(scope);
+            "GET".into()
+        }
+    };
     let outgoing = Request {
-        method: String::from_jsval(scope, method, ()).unwrap_or_else(|_| "GET".into()),
+        method,
         url: url.clone(),
         headers,
         body: OutgoingBody::Bytes(body.into()),
@@ -326,8 +329,8 @@ fn start(
     Ok(())
 }
 
-/// Keep `bytes` of the body of the request `request`, and send the request with the body kept if
-/// `last` and it wasn't destroyed.
+/// Keep `bytes` of the body of the request `request` through `platform::http`, and send the
+/// request with the body kept if `last` and it wasn't destroyed.
 pub(super) fn send(
     scope: &Scope<'_>,
     request: Object<'_>,
@@ -335,16 +338,30 @@ pub(super) fn send(
     bytes: Vec<u8>,
     last: bool,
 ) -> Result<bool, ExnThrown> {
-    with_client(state, |client| client.body.extend_from_slice(&bytes));
+    let kept = with_client(state, |client| {
+        if client.body.is_empty() {
+            client.body = bytes;
+            return true;
+        }
+        let reserved = client.body.try_reserve(bytes.len()).is_ok();
+        if reserved {
+            client.body.extend_from_slice(&bytes);
+        }
+        reserved
+    });
+    if kept == Some(false) {
+        js::exception::report_out_of_memory(scope);
+        return Err(ExnThrown);
+    }
     if last && !state.data().destroyed {
         start(scope, request, state)?;
     }
     Ok(true)
 }
 
-/// Cancel the send of the request `request`, destroy the response if it arrived, and emit
-/// `error` and `close`. The error is `error`, or, if none is given and neither a response
-/// arrived nor the request was aborted, an `ECONNRESET` "socket hang up" error.
+/// Cancel the send of the request `request` through `platform::http`, destroy the response if it
+/// arrived, and emit `error` and `close`. The error is `error`, or, if none is given and neither
+/// a response arrived nor the request was aborted, an `ECONNRESET` "socket hang up" error.
 pub(super) fn destroy(
     scope: &Scope<'_>,
     request: Object<'_>,
@@ -405,11 +422,12 @@ fn keeps_alive(scope: &Scope<'_>, agent: Object<'_>) -> Result<bool, ExnThrown> 
     ))
 }
 
-/// Assign `request` a socket for a connection to `host` and `port` in the tick queue, as Node.js's
-/// agent does once it has one: `socket` and `connection` become the socket, and `socket` is
-/// emitted. A request destroyed before then gets no socket. A `keepAlive` agent reuses a socket
-/// a response of the same host and port returned to its `freeSockets`, and sets `reusedSocket`.
-/// The socket's remote address is `host` if it is an IP address.
+/// Assign `request`, which goes through `platform::http`, a socket for a connection to `host` and
+/// `port` in the tick queue, as Node.js's agent does once it has one: `socket` and `connection`
+/// become the socket, and `socket` is emitted. A request destroyed before then gets no socket. A
+/// `keepAlive` agent reuses a socket a response of the same host and port returned to its
+/// `freeSockets`, and sets `reusedSocket`. The socket's remote address is `host` if it is an IP
+/// address.
 fn assign_socket_later(
     scope: &Scope<'_>,
     request: Object<'_>,
@@ -485,8 +503,8 @@ fn assign_socket(
     Ok(js::value::undefined())
 }
 
-/// Return the socket of `request` to its agent's `freeSockets`, if the agent keeps connections
-/// alive and the socket isn't destroyed.
+/// Return the socket of `request`, which goes through `platform::http`, to its agent's
+/// `freeSockets`, if the agent keeps connections alive and the socket isn't destroyed.
 fn release_socket(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrown> {
     let state = super::outgoing::state_of(scope, request)?;
     let (agent, name) = with_client(&state, |client| {
@@ -512,23 +530,8 @@ fn release_socket(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrow
     Ok(())
 }
 
-/// Add the headers `headers` gives to `request`: from an object, a flat array of names and
-/// values, or an array of `[name, value]` pairs.
-fn add_headers(scope: &Scope<'_>, request: Object<'_>, headers: Object<'_>) -> Result<(), Thrown> {
-    let value = headers.to_jsval_throwing(scope)?;
-    let is_array = super::outgoing::as_array(scope, value)?.is_some();
-    for (name, value) in header_args(scope, value, false)? {
-        if is_array {
-            outgoing_message_class::append_header(scope, request, name, value)?;
-        } else {
-            outgoing_message_class::set_header(scope, request, name, value)?;
-        }
-    }
-    Ok(())
-}
-
-/// The URL of a request to `host` and `port` with `path`, whose request target always starts
-/// with `/`, or an empty string if `host` can't be in a URL.
+/// The URL of a request through `platform::http` to `host` and `port` with `path`, whose request
+/// target always starts with `/`, or an empty string if `host` can't be in a URL.
 fn request_url(protocol: &str, host: &str, port: u16, default_port: f64, path: &str) -> String {
     let bracketed = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -544,6 +547,21 @@ fn request_url(protocol: &str, host: &str, port: u16, default_port: f64, path: &
     } else {
         format!("{protocol}//{host}:{port}{slash}{path}")
     }
+}
+
+/// `path` converted to a string, or `ERR_UNESCAPED_CHARACTERS` if it has a character outside
+/// `\u{21}` to `\u{ff}`, as Node.js's `INVALID_PATH_REGEX` checks it.
+fn validate_path(scope: &Scope<'_>, path: HandleValue<'_>) -> Result<String, Thrown> {
+    let path = String::from_jsval(scope, path, ())?;
+    if path.chars().any(|c| !('\u{21}'..='\u{ff}').contains(&c)) {
+        return Err(NodeError::new(
+            ErrorKind::TypeError,
+            "ERR_UNESCAPED_CHARACTERS",
+            "Request path contains unescaped characters",
+        )
+        .into());
+    }
+    Ok(path)
 }
 
 /// The getter of `path`.
@@ -563,129 +581,393 @@ fn get_path(
     Ok(path.map_or_else(js::value::undefined, |path| path.get()))
 }
 
-/// The setter of `path`.
+/// The setter of `path`: `ERR_UNESCAPED_CHARACTERS` for a path with a character outside
+/// `\u{21}` to `\u{ff}`.
 fn set_path(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
+    let path = validate_path(scope, args.get(0)).map_err(|thrown| thrown.throw(scope))?;
+    let path = path.as_str().to_jsval_throwing(scope)?;
     if let Some(state) = super::outgoing::try_state_of(scope, this)? {
-        let value = args.get(0);
-        with_client(&state, |client| client.path = Some(Heap::from(value.get())));
+        with_client(&state, |client| client.path = Some(Heap::from(path.get())));
     }
     Ok(js::value::undefined())
 }
 
 /// The own properties the `ClientRequest` constructor creates after those of `OutgoingMessage`, in
-/// Node's order.
+/// Node's order. `timeout` is left out without the `timeout` option.
 pub(crate) static REQUEST_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
     TemplateKey::Name(c"agent"),
+    TemplateKey::Name(c"socketPath"),
+    TemplateKey::Name(c"timeout"),
     TemplateKey::Name(c"method"),
+    TemplateKey::Name(c"maxHeaderSize"),
+    TemplateKey::Name(c"insecureHTTPParser"),
+    TemplateKey::Name(c"httpValidation"),
+    TemplateKey::Name(c"joinDuplicateHeaders"),
+    TemplateKey::Name(c"_ended"),
     TemplateKey::Name(c"res"),
     TemplateKey::Name(c"aborted"),
+    TemplateKey::Name(c"timeoutCb"),
+    TemplateKey::Name(c"upgradeOrConnect"),
+    TemplateKey::Name(c"parser"),
+    TemplateKey::Name(c"maxHeadersCount"),
     TemplateKey::Name(c"reusedSocket"),
     TemplateKey::Name(c"host"),
     TemplateKey::Name(c"protocol"),
 ]);
 
-#[core_runtime::jsfunction_class(name = "ClientRequest", extends = "super::outgoing_message_class")]
-pub mod client_request_class {
-    use super::*;
+/// The arguments of the `ClientRequest` constructor as Node.js normalizes them: the options,
+/// a copy without a prototype unless a URL is given with a callback, and the callback.
+fn request_options<'s>(
+    scope: &'s Scope<'_>,
+    input: HandleValue<'s>,
+    options: Option<HandleValue<'s>>,
+    callback: Option<HandleValue<'s>>,
+) -> Result<(Object<'s>, Option<Object<'s>>), Thrown> {
+    let (input, options, callback) = match url_input(scope, input)? {
+        Some(url) => (Some(url), options, callback),
+        None => (None, Some(input), options),
+    };
+    let callback_of = |value: Option<HandleValue<'s>>| {
+        value
+            .and_then(|value| Object::from_value(scope, *value).ok())
+            .filter(|value| value.is_callable())
+    };
+    if let Some(callback) = callback_of(options) {
+        let options = match input {
+            Some(input) => input,
+            None => Object::new_with_null_prototype(scope)?,
+        };
+        return Ok((options, Some(callback)));
+    }
+    let merged = Object::new_with_null_prototype(scope)?;
+    let options = options.and_then(|options| Object::from_value(scope, *options).ok());
+    for source in [input, options].into_iter().flatten() {
+        merged.assign(scope, source)?;
+    }
+    Ok((merged, callback_of(callback)))
+}
 
-    /// <https://nodejs.org/api/http.html#class-httpclientrequest>: a request to the URL `input`
-    /// or with the options `input`, with `options` added, whose response goes to `callback`. Of
-    /// the options, `signal` destroys the request when aborted, and the TLS options and
-    /// `createConnection` are ignored.
-    #[constructor(length = 3)]
-    pub fn init(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        input: HandleValue<'_>,
-        options: Option<HandleValue<'_>>,
-        callback: Option<HandleValue<'_>>,
-    ) -> Result<(), Thrown> {
-        super::outgoing_message_class::init(scope, this, None)?;
-        let state = super::super::outgoing::state_of(scope, this)?;
-        state.data_mut().transport = Transport::Client(ClientPart::default());
-        let merged = Object::new_plain(scope)?;
-        let (options, callback) = match options {
-            Some(options) if js::function::is_callable(options) => (None, Some(options)),
-            options => (options, callback),
+/// The agent of a request with `options`, whose default agent is `default_agent`: a new agent of
+/// the default agent's class for `false`, the default agent for `null` or `undefined` unless the
+/// options give `createConnection`, and otherwise the agent given, which must have an
+/// `addRequest` method.
+fn request_agent<'s>(
+    scope: &'s Scope<'_>,
+    options: Object<'_>,
+    default_agent: Object<'s>,
+) -> Result<Option<Object<'s>>, Thrown> {
+    let agent = options.get_property(scope, c"agent")?;
+    if agent.is_boolean() && !agent.to_boolean() {
+        let class = default_agent.get_property(scope, c"constructor")?;
+        let class = Object::from_value(scope, *class)?;
+        return Ok(Some(Function::construct(
+            scope,
+            class,
+            js::function::EmptyArgs,
+        )?));
+    }
+    if agent.is_null_or_undefined() {
+        let create = options.get_property(scope, c"createConnection")?;
+        return Ok((!js::function::is_callable(create)).then_some(default_agent));
+    }
+    let agent_object = Object::from_value(scope, *agent).ok();
+    let add_request = match agent_object {
+        Some(agent) => agent.get_property(scope, c"addRequest")?,
+        None => HandleValue::undefined(),
+    };
+    match agent_object {
+        Some(agent) if js::function::is_callable(add_request) => Ok(Some(agent)),
+        _ => Err(NodeError::invalid_arg_type(
+            scope,
+            "options.agent",
+            "one of Agent-like Object, undefined, or false",
+            agent,
+        )
+        .into()),
+    }
+}
+
+/// Initialize `this` as the `ClientRequest` constructor does for its arguments, creating its
+/// properties as `init` creates them, and start connecting.
+///
+/// # Safety
+///
+/// With [`PropertyInit::Define`], `this` is an instance [`new_request`] created that nothing else
+/// references.
+unsafe fn init_request<'w>(
+    scope: &'w Scope<'_>,
+    this: Object<'w>,
+    input: HandleValue<'_>,
+    options: Option<HandleValue<'_>>,
+    callback: Option<HandleValue<'_>>,
+    init: PropertyInit,
+) -> Result<(), Thrown> {
+    let (options, callback) = request_options(scope, input, options, callback)?;
+    let high_water_mark = options.get_property(scope, c"highWaterMark")?;
+    let default_agent =
+        match Object::from_value(scope, *options.get_property(scope, c"_defaultAgent")?) {
+            Ok(agent) => agent,
+            Err(_) => crate::http::current_global_agent(scope, false)?,
         };
-        let input_options = match url_of(scope, input)? {
-            Some(href) => Some(url_options(scope, &href)?),
-            None => Object::from_value(scope, *input).ok(),
-        };
-        let options = options.and_then(|options| Object::from_value(scope, *options).ok());
-        for source in [input_options, options].into_iter().flatten() {
-            merged.assign(scope, source)?;
+    let agent = request_agent(scope, options, default_agent)?;
+    let default_protocol = string_option(scope, default_agent, c"protocol")?.unwrap_or_default();
+    let protocol = match options.get_property(scope, c"protocol")? {
+        protocol if js::conversion::to_boolean(protocol) => {
+            String::from_jsval_throwing(scope, protocol, ())?
         }
-        let default_agent =
-            match Object::from_value(scope, *merged.get_property(scope, c"_defaultAgent")?) {
-                Ok(agent) => agent,
-                Err(_) => crate::http::global_agent(scope, false)?,
-            };
-        let agent = merged.get_property(scope, c"agent")?;
-        let agent = if agent.is_boolean() && !agent.to_boolean() {
-            let ctor = default_agent.get_property(scope, c"constructor")?;
-            let ctor =
-                Object::from_value(scope, *ctor).map_err(|e| Thrown::from(e.throw(scope)))?;
-            Some(Function::construct(scope, ctor, js::function::EmptyArgs)?)
-        } else if agent.is_null_or_undefined() {
-            (!js::function::is_callable(merged.get_property(scope, c"createConnection")?))
-                .then_some(default_agent)
-        } else {
-            Object::from_value(scope, *agent).ok()
-        };
-        let default_protocol =
-            string_option(scope, default_agent, c"protocol")?.unwrap_or_default();
-        let protocol = match string_option(scope, merged, c"protocol")? {
-            Some(protocol) if !protocol.is_empty() => protocol,
-            _ => default_protocol.clone(),
-        };
-        let expected = match agent {
-            Some(agent) => string_option(scope, agent, c"protocol")?
-                .filter(|protocol| !protocol.is_empty())
-                .unwrap_or(default_protocol),
-            None => default_protocol,
-        };
-        let path = merged.get_property(scope, c"path")?;
-        let path = if js::conversion::to_boolean(path) {
-            let path = String::from_jsval(scope, path, ())?;
-            if path.chars().any(|c| !('\u{21}'..='\u{ff}').contains(&c)) {
-                return Err(NodeError::new(
-                    ErrorKind::TypeError,
-                    "ERR_UNESCAPED_CHARACTERS",
-                    "Request path contains unescaped characters",
-                )
-                .into());
+        _ => default_protocol.clone(),
+    };
+    let expected = match agent {
+        Some(agent) => match agent.get_property(scope, c"protocol")? {
+            protocol if js::conversion::to_boolean(protocol) => {
+                String::from_jsval_throwing(scope, protocol, ())?
             }
-            path
-        } else {
-            "/".to_string()
-        };
-        if protocol != expected {
+            _ => default_protocol,
+        },
+        None => default_protocol,
+    };
+    let given_path = options.get_property(scope, c"path")?;
+    if js::conversion::to_boolean(given_path) {
+        validate_path(scope, given_path)?;
+    }
+    if protocol != expected {
+        return Err(NodeError::new(
+            ErrorKind::TypeError,
+            "ERR_INVALID_PROTOCOL",
+            format!("Protocol \"{protocol}\" not supported. Expected \"{expected}\""),
+        )
+        .into());
+    }
+    let over_socket = uses_socket(&protocol);
+    let default_port = match options.get_property(scope, c"defaultPort")? {
+        port if js::conversion::to_boolean(port) => port,
+        _ => match agent {
+            Some(agent) => agent.get_property(scope, c"defaultPort")?,
+            None => HandleValue::undefined(),
+        },
+    };
+    let port = match options.get_property(scope, c"port")? {
+        port if js::conversion::to_boolean(port) => port,
+        _ if js::conversion::to_boolean(default_port) => default_port,
+        _ => scope.root_value(js::value::from_f64(80.0)),
+    };
+    let host = match host_option(scope, options, c"hostname", "options.hostname")? {
+        Some(host) => host,
+        None => host_option(scope, options, c"host", "options.host")?
+            .unwrap_or_else(|| "localhost".into()),
+    };
+    let set_default_headers = options.get_property(scope, c"setDefaultHeaders")?;
+    let removed = set_default_headers.is_boolean() && !set_default_headers.to_boolean();
+    let set_host = match options.get_property(scope, c"setHost")? {
+        set_host if !set_host.is_undefined() => js::conversion::to_boolean(set_host),
+        _ => !removed,
+    };
+    let given_socket_path = options.get_property(scope, c"socketPath")?;
+    let timeout = options.get_property(scope, c"timeout")?;
+    let timeout = if timeout.is_undefined() {
+        None
+    } else {
+        Some(crate::timers::get_timer_duration(
+            scope, timeout, "timeout",
+        )?)
+    };
+    let signal = options.get_property(scope, c"signal")?;
+    let method = options.get_property(scope, c"method")?;
+    let method = if method.is_null_or_undefined() {
+        String::new()
+    } else {
+        crate::errors::validate_string(scope, method, "options.method")?
+    };
+    let method = if method.is_empty() {
+        "GET".to_string()
+    } else {
+        if !super::is_token(&method) {
             return Err(NodeError::new(
                 ErrorKind::TypeError,
-                "ERR_INVALID_PROTOCOL",
-                format!("Protocol \"{protocol}\" not supported. Expected \"{expected}\""),
+                "ERR_INVALID_HTTP_TOKEN",
+                format!("Method must be a valid HTTP token [\"{method}\"]"),
             )
             .into());
         }
-        let default_port = match merged.get_property(scope, c"defaultPort")? {
-            port if js::conversion::to_boolean(port) => port,
-            _ => match agent {
-                Some(agent) => agent.get_property(scope, c"defaultPort")?,
-                None => HandleValue::undefined(),
-            },
+        method.to_ascii_uppercase()
+    };
+    let max_header_size = options.get_property(scope, c"maxHeaderSize")?;
+    if !max_header_size.is_undefined() {
+        crate::errors::validate_integer(
+            scope,
+            max_header_size,
+            "maxHeaderSize",
+            0.0,
+            9007199254740991.0,
+        )?;
+    }
+    let insecure = options.get_property(scope, c"insecureHTTPParser")?;
+    let validation = options.get_property(scope, c"httpValidation")?;
+    super::validate_parser_options(scope, insecure, validation)?;
+    let join_duplicates = options.get_property(scope, c"joinDuplicateHeaders")?;
+    if !join_duplicates.is_undefined() {
+        crate::errors::validate_boolean(scope, join_duplicates, "options.joinDuplicateHeaders")?;
+    }
+    let path = if js::conversion::to_boolean(given_path) {
+        validate_path(scope, given_path)?
+    } else {
+        "/".to_string()
+    };
+    let chunked_default = !matches!(
+        method.as_str(),
+        "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE" | "CONNECT"
+    );
+    // A request without an agent closes its connection, which it records once its header block
+    // is stored, as Node.js does.
+    let keep_alive = match agent {
+        Some(agent) => {
+            let keep_alive = keeps_alive(scope, agent)?;
+            let max_sockets = agent.get_property(scope, c"maxSockets")?;
+            keep_alive || (max_sockets.is_number() && max_sockets.to_number().is_finite())
+        }
+        None => true,
+    };
+
+    let fields = OutgoingFields {
+        should_keep_alive: keep_alive,
+        use_chunked_encoding_by_default: chunked_default,
+        removed,
+        last: !keep_alive,
+        ..OutgoingFields::default()
+    };
+    // SAFETY: the caller guarantees the requirements of `Define`. Only the writer's own reads run
+    // JavaScript that can reach `this`, until it is flushed.
+    let mut properties = unsafe { this.property_writer(scope, &EMITTER_PROPERTIES, init) }?;
+    super::outgoing::init_outgoing(scope, this, &mut properties, &fields, init)?;
+    properties.continue_with(scope, &REQUEST_PROPERTIES)?;
+    match agent {
+        Some(agent) => properties.write(scope, c"agent", agent)?,
+        None => properties.write(scope, c"agent", HandleValue::undefined())?,
+    }
+    properties.write(scope, c"socketPath", given_socket_path)?;
+    match timeout {
+        Some(timeout) => properties.write(scope, c"timeout", timeout)?,
+        None => properties.skip(c"timeout"),
+    }
+    properties.write(scope, c"method", method.as_str())?;
+    properties.write(scope, c"maxHeaderSize", max_header_size)?;
+    properties.write(scope, c"insecureHTTPParser", insecure)?;
+    properties.write(scope, c"httpValidation", validation)?;
+    properties.write(scope, c"joinDuplicateHeaders", join_duplicates)?;
+    properties.write(scope, c"_ended", false)?;
+    properties.write(scope, c"res", HandleValue::null())?;
+    properties.write(scope, c"aborted", false)?;
+    properties.write(scope, c"timeoutCb", HandleValue::null())?;
+    properties.write(scope, c"upgradeOrConnect", false)?;
+    properties.write(scope, c"parser", HandleValue::null())?;
+    properties.write(scope, c"maxHeadersCount", HandleValue::null())?;
+    properties.write(scope, c"reusedSocket", false)?;
+    properties.write(scope, c"host", host.as_str())?;
+    properties.write(scope, c"protocol", protocol.as_str())?;
+    properties.finish(scope)?;
+
+    let state = super::outgoing::state_of(scope, this)?;
+    let path_value = path.as_str().to_jsval_throwing(scope)?;
+    {
+        let mut data = state.data_mut();
+        data.high_water_mark = if high_water_mark.is_number() {
+            high_water_mark.to_number()
+        } else {
+            crate::stream::state::default_high_water_mark(false)
         };
-        let port = match merged.get_property(scope, c"port")? {
-            port if js::conversion::to_boolean(port) => port,
-            _ if js::conversion::to_boolean(default_port) => default_port,
-            _ => scope.root_value(js::value::from_f64(80.0)),
-        };
-        f64::from_jsval(scope, port, ())?;
+        if !over_socket {
+            data.transport = Transport::Host;
+        }
+        data.client = Some(ClientPart {
+            agent: agent.map(Heap::from),
+            path: Some(Heap::from(path_value.get())),
+            ..ClientPart::default()
+        });
+    }
+    if js::conversion::to_boolean(signal) {
+        crate::stream::add_abort_signal(scope, signal, this.to_jsval_throwing(scope)?)?;
+    }
+    if let Some(callback) = callback {
+        crate::events::listen(scope, this, c"once", c"response", callback)?;
+    }
+    // The `Host` header names the port unless it is the default port.
+    let mut host_header = host.clone();
+    if host_header.matches(':').count() > 1 && !host_header.starts_with('[') {
+        host_header = format!("[{host_header}]");
+    }
+    let port_number = if port.is_number() {
+        port.to_number()
+    } else {
+        f64::from_jsval_throwing(scope, port, ())?
+    };
+    let default_number = if default_port.is_number() {
+        Some(default_port.to_number())
+    } else {
+        None
+    };
+    if js::conversion::to_boolean(port) && Some(port_number) != default_number {
+        let port_text = String::from_jsval_throwing(scope, port, ())?;
+        host_header = format!("{host_header}:{port_text}");
+    }
+    let headers = options.get_property(scope, c"headers")?;
+    let request_line = format!("{method} {path} HTTP/1.1\r\n");
+    if super::outgoing::as_array(scope, headers)?.is_some() {
+        super::outgoing::store_head_headers(scope, &state, headers)?;
+        if over_socket {
+            super::wire::store_header(scope, this, &state, &request_line)?;
+        } else {
+            state.data_mut().header_stored = true;
+        }
+    } else {
+        if let Ok(headers) = Object::from_value(scope, *headers) {
+            for key in headers.own_enumerable_keys(scope)? {
+                let value = crate::http::get_by_key(scope, headers, key)?;
+                outgoing_message_class::set_header(scope, this, key, value)?;
+            }
+        }
+        if !host.is_empty()
+            && super::outgoing::header_value(scope, &state, "host").is_none()
+            && set_host
+        {
+            let name = js::class::get_or_init_atom(scope, c"Host")?;
+            let value = host_header.as_str().to_jsval_throwing(scope)?;
+            outgoing_message_class::set_header(scope, this, name, value)?;
+        }
+        if let Some(auth) = string_option(scope, options, c"auth")? {
+            if !auth.is_empty()
+                && super::outgoing::header_value(scope, &state, "authorization").is_none()
+            {
+                let Some(encoded) = web_globals::base64::encode(auth.as_bytes(), false) else {
+                    js::exception::report_out_of_memory(scope);
+                    return Err(ExnThrown.into());
+                };
+                let name = js::class::get_or_init_atom(scope, c"Authorization")?;
+                let value = format!("Basic {encoded}")
+                    .as_str()
+                    .to_jsval_throwing(scope)?;
+                outgoing_message_class::set_header(scope, this, name, value)?;
+            }
+        }
+        if super::outgoing::header_value(scope, &state, "expect")
+            .is_some_and(|expect| js::conversion::to_boolean(expect))
+        {
+            if state.data().header_stored {
+                return Err(super::outgoing::headers_sent("render").into());
+            }
+            if over_socket {
+                super::wire::store_header(scope, this, &state, &request_line)?;
+            }
+        }
+    }
+    let unique = options.get_property(scope, c"uniqueHeaders")?;
+    state.data_mut().unique_headers = super::outgoing::parse_unique_headers(scope, unique)?;
+
+    if !over_socket {
         if !port.is_number() && !port.is_string() {
             return Err(NodeError::invalid_arg_type(
                 scope,
@@ -696,72 +978,22 @@ pub mod client_request_class {
             .into());
         }
         let port = crate::net::validate_port(scope, port, "Port")?;
-        let default_port = if default_port.is_number() {
-            default_port.to_number()
-        } else if protocol == "https:" {
-            443.0
-        } else {
-            80.0
+        let default_port = match default_number {
+            Some(port) => port,
+            None if protocol == "https:" => 443.0,
+            None => 80.0,
         };
-        let host = host_option(scope, merged, c"hostname", "options.hostname")?
-            .or(host_option(scope, merged, c"host", "options.host")?)
-            .unwrap_or_else(|| "localhost".into());
-        let method = string_option(scope, merged, c"method")?
-            .unwrap_or_else(|| "GET".into())
-            .to_ascii_uppercase();
         let url = request_url(&protocol, &host, port, default_port, &path);
-        // SAFETY: `Assign` has no requirements.
-        let mut properties =
-            unsafe { this.property_writer(scope, &REQUEST_PROPERTIES, PropertyInit::Assign) }?;
-        match agent {
-            Some(agent) => properties.write(scope, c"agent", agent)?,
-            None => properties.write(scope, c"agent", HandleValue::undefined())?,
+        with_client(&state, |client| client.url = url);
+        if let Some(timeout) = timeout {
+            client_request_class::set_timeout(
+                scope,
+                this,
+                scope.root_value(js::value::from_f64(timeout)),
+                None,
+            )?;
         }
-        properties.write(scope, c"method", method.as_str())?;
-        properties.write(scope, c"res", HandleValue::null())?;
-        properties.write(scope, c"aborted", false)?;
-        properties.write(scope, c"reusedSocket", false)?;
-        properties.write(scope, c"host", host.as_str())?;
-        properties.write(scope, c"protocol", protocol.as_str())?;
-        properties.finish(scope)?;
-        let path_value = path.as_str().to_jsval_throwing(scope)?;
-        with_client(&state, |client| {
-            client.url = url;
-            client.agent = agent.map(Heap::from);
-            client.path = Some(Heap::from(path_value.get()));
-        });
-        if let Ok(headers) = Object::from_value(scope, *merged.get_property(scope, c"headers")?) {
-            super::add_headers(scope, this, headers)?;
-        }
-        if let Some(auth) = string_option(scope, merged, c"auth")? {
-            if super::super::outgoing::header_value(scope, &state, "authorization").is_none() {
-                let Some(encoded) = web_globals::base64::encode(auth.as_bytes(), false) else {
-                    js::exception::report_out_of_memory(scope);
-                    return Err(ExnThrown.into());
-                };
-                let name = js::class::get_or_init_atom(scope, c"Authorization")?;
-                let value = format!("Basic {encoded}")
-                    .as_str()
-                    .to_jsval_throwing(scope)?;
-                super::outgoing_message_class::set_header(scope, this, name, value)?;
-            }
-        }
-        if let Some(callback) =
-            callback.and_then(|callback| Object::from_value(scope, *callback).ok())
-        {
-            if callback.is_callable() {
-                crate::events::listen(scope, this, c"once", c"response", callback)?;
-            }
-        }
-        let timeout = merged.get_property(scope, c"timeout")?;
-        if timeout.is_number() {
-            client_request_class::set_timeout(scope, this, timeout.to_number(), None)?;
-        }
-        let signal = merged.get_property(scope, c"signal")?;
-        if js::conversion::to_boolean(signal) {
-            crate::stream::add_abort_signal(scope, signal, this.to_jsval_throwing(scope)?)?;
-        }
-        super::assign_socket_later(
+        assign_socket_later(
             scope,
             this,
             &state,
@@ -770,16 +1002,86 @@ pub mod client_request_class {
             port,
             protocol == "https:",
         )?;
-        Ok(())
+        return Ok(());
+    }
+    if agent.is_none() {
+        this.set_property(scope, c"_last", true)?;
+        this.set_property(scope, c"shouldKeepAlive", false)?;
+    }
+    let connect_options = Object::new_with_null_prototype(scope)?;
+    connect_options.assign(scope, options)?;
+    connect_options.set_property(scope, c"port", port)?;
+    connect_options.set_property(scope, c"host", host.as_str())?;
+    if js::conversion::to_boolean(signal) {
+        connect_options.delete_property(scope, c"signal")?;
+    }
+    super::client_socket::connect(scope, this, agent, connect_options)
+}
+
+/// A new `ClientRequest` for the arguments `args` of `http.request`, as `new ClientRequest(...)`
+/// creates it with the module's own constructor.
+pub(super) fn new_request<'s>(
+    scope: &'s Scope<'_>,
+    args: &[HandleValue<'_>],
+) -> Result<Object<'s>, ExnThrown> {
+    let request = client_request_class::new_instance(scope)?;
+    let arg = |index: usize| args.get(index).copied();
+    let input = arg(0).unwrap_or(HandleValue::undefined());
+    // SAFETY: `request` was just created, and nothing else references it.
+    unsafe { init_request(scope, request, input, arg(1), arg(2), PropertyInit::Define) }
+        .map_err(|thrown| thrown.throw(scope))?;
+    Ok(request)
+}
+
+#[core_runtime::jsfunction_class(
+    name = "ClientRequest",
+    extends = "super::outgoing_message_class",
+    templates = "EMITTER_PROPERTIES, OUTGOING_PROPERTIES, REQUEST_PROPERTIES"
+)]
+pub mod client_request_class {
+    use super::*;
+
+    /// <https://nodejs.org/api/http.html#class-httpclientrequest>: a request to the URL `input`
+    /// or with the options `input`, with `options` added, whose response goes to `callback`. The
+    /// TLS options are ignored, and so is `createConnection` for a request through
+    /// `platform::http`.
+    #[constructor(length = 3)]
+    pub fn init(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        input: HandleValue<'_>,
+        options: Option<HandleValue<'_>>,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        // SAFETY: `Assign` has no requirements.
+        unsafe { init_request(scope, this, input, options, callback, PropertyInit::Assign) }
     }
 
-    /// Mark the headers sent, which `headersSent` returns. The runtime's HTTP client writes the
-    /// request head.
+    /// Store the header block with the request line, as Node.js's `_implicitHeader` does, or
+    /// `ERR_HTTP_HEADERS_SENT` if it was stored. A request through `platform::http` only marks
+    /// the headers sent, which `headersSent` returns, since the host writes the request head.
     #[method(name = "_implicitHeader")]
-    pub fn implicit_header_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
-        super::super::outgoing::state_of(scope, this)?
-            .data_mut()
-            .header_stored = true;
+    pub fn implicit_header_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
+        let state = super::super::outgoing::state_of(scope, this)?;
+        if through_host(&state) {
+            state.data_mut().header_stored = true;
+            return Ok(());
+        }
+        if js::conversion::to_boolean(this.get_property(scope, c"_header")?) {
+            return Err(super::super::outgoing::headers_sent("render").into());
+        }
+        let method = this.get_property(scope, c"method")?;
+        let method = String::from_jsval_throwing(scope, method, ())?;
+        let path = this.get_property(scope, c"path")?;
+        let path = String::from_jsval_throwing(scope, path, ())?;
+        let line = format!("{method} {path} HTTP/1.1\r\n");
+        super::super::wire::store_header(scope, this, &state, &line)
+    }
+
+    /// Emit `prefinish`, as Node.js's `_finish` does.
+    #[method(name = "_finish")]
+    pub fn finish_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+        crate::events::emit(scope, this, c"prefinish", &[])?;
         Ok(())
     }
 
@@ -790,31 +1092,77 @@ pub mod client_request_class {
         }
         this.set_property(scope, c"aborted", true)?;
         emit_later(scope, this, c"abort", &[])?;
-        super::outgoing_message_class::destroy(scope, this, None)?;
+        Function::call_by_name(scope, this.handle(), c"destroy", js::function::EmptyArgs)?;
         Ok(())
     }
 
-    /// <https://nodejs.org/api/http.html#requestsettimeouttimeout-callback>: emit `timeout` if
-    /// no response arrived within `timeout` milliseconds.
+    /// <https://nodejs.org/api/http.html#requestdestroyerror>: mark the request destroyed, dump
+    /// its response, and destroy its socket with `error`. A request through `platform::http`
+    /// cancels its send instead.
+    #[method(length = 1)]
+    pub fn destroy<'s>(
+        scope: &Scope<'_>,
+        this: Object<'s>,
+        error: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        let state = super::super::outgoing::state_of(scope, this)?;
+        if through_host(&state) {
+            return super::outgoing_message_class::destroy(scope, this, error);
+        }
+        super::super::client_socket::destroy(scope, this, &state, error)?;
+        Ok(this)
+    }
+
+    /// Assign the request `socket`, or fail it with `error`, in the tick queue, as Node.js's
+    /// `onSocket` does. An `error` listener on the socket forwards its errors to the request
+    /// until then.
+    #[method(length = 2)]
+    pub fn on_socket(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        socket: Option<HandleValue<'_>>,
+        error: Option<HandleValue<'_>>,
+    ) -> Result<(), ExnThrown> {
+        let socket = socket.unwrap_or(HandleValue::undefined());
+        let error = error.unwrap_or(HandleValue::undefined());
+        super::super::client_socket::on_socket(scope, this, socket, error)
+    }
+
+    /// Call the socket's method `method` with `args` once the request has a writable socket, as
+    /// Node.js's `_deferToConnect` does.
+    #[method(name = "_deferToConnect", length = 2)]
+    pub fn defer_to_connect(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        method: HandleValue<'_>,
+        args: Option<HandleValue<'_>>,
+    ) -> Result<(), ExnThrown> {
+        let args = args.unwrap_or(HandleValue::undefined());
+        super::super::client_socket::defer_to_connect(scope, this, method, args)
+    }
+
+    /// <https://nodejs.org/api/http.html#requestsettimeouttimeout-callback>: emit `timeout`
+    /// once the socket was idle for `timeout` milliseconds. A request through `platform::http`
+    /// emits `timeout` if no response arrived in time.
     #[method(length = 2)]
     pub fn set_timeout<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
-        timeout: f64,
+        timeout: HandleValue<'_>,
         callback: Option<HandleValue<'_>>,
-    ) -> Result<Object<'s>, ExnThrown> {
+    ) -> Result<Object<'s>, Thrown> {
         let state = super::super::outgoing::state_of(scope, this)?;
-        clear_timer(&state);
-        if let Some(callback) =
-            callback.and_then(|callback| Object::from_value(scope, *callback).ok())
-        {
-            if callback.is_callable() {
-                crate::events::listen(scope, this, c"once", c"timeout", callback)?;
-            }
+        if !through_host(&state) {
+            super::super::client_socket::set_timeout(scope, this, timeout, callback)?;
+            return Ok(this);
         }
+        let timeout = crate::timers::get_timer_duration(scope, timeout, "msecs")?;
+        if let Some(callback) = callback.filter(|callback| js::conversion::to_boolean(*callback)) {
+            let timeout = js::class::get_or_init_atom(scope, c"timeout")?;
+            Function::call_by_name(scope, this.handle(), c"once", &[timeout, callback])?;
+        }
+        clear_timer(&state);
         if timeout > 0.0 {
-            let timeout = scope.root_value(js::value::from_f64(timeout));
-            let timeout = crate::timers::timer_delay(scope, timeout)?;
             let fire = crate::support::shared_function(scope, on_timeout, 0)?;
             let fire = js::Callable::from_jsval(scope, fire.to_jsval_throwing(scope)?, ())
                 .map_err(|e| e.throw(scope))?;
@@ -823,7 +1171,7 @@ pub mod client_request_class {
                 fire,
                 this.to_jsval_throwing(scope)?,
                 &[],
-                Duration::from_millis(timeout as u64),
+                Duration::from_millis(timeout.max(1.0) as u64),
                 false,
                 None,
             )
@@ -835,16 +1183,50 @@ pub mod client_request_class {
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/http.html#requestsetnodelaynodelay>: has no effect.
+    /// <https://nodejs.org/api/http.html#requestsetnodelaynodelay>: calls the socket's
+    /// `setNoDelay` once the request has a socket.
     #[method(length = 1)]
-    pub fn set_no_delay() -> Result<(), ExnThrown> {
-        Ok(())
+    pub fn set_no_delay(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        no_delay: Option<HandleValue<'_>>,
+    ) -> Result<(), ExnThrown> {
+        let no_delay = no_delay.unwrap_or(HandleValue::undefined());
+        let args = js::Array::with_contents(scope, &[no_delay])?;
+        let method = js::class::get_or_init_atom(scope, c"setNoDelay")?;
+        defer_to_connect(scope, this, method, Some((*args).to_jsval_throwing(scope)?))
     }
 
-    /// <https://nodejs.org/api/http.html#requestsetsocketkeepaliveenable-initialdelay>: has no
-    /// effect.
+    /// <https://nodejs.org/api/http.html#requestsetsocketkeepaliveenable-initialdelay>: calls
+    /// the socket's `setKeepAlive` once the request has a socket.
     #[method(length = 2)]
-    pub fn set_socket_keep_alive() -> Result<(), ExnThrown> {
+    pub fn set_socket_keep_alive(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        enable: Option<HandleValue<'_>>,
+        initial_delay: Option<HandleValue<'_>>,
+    ) -> Result<(), ExnThrown> {
+        let enable = enable.unwrap_or(HandleValue::undefined());
+        let initial_delay = initial_delay.unwrap_or(HandleValue::undefined());
+        let args = js::Array::with_contents(scope, &[enable, initial_delay])?;
+        let method = js::class::get_or_init_atom(scope, c"setKeepAlive")?;
+        defer_to_connect(scope, this, method, Some((*args).to_jsval_throwing(scope)?))
+    }
+
+    /// <https://nodejs.org/api/http.html#requestcleartimeout>: `setTimeout(0, callback)`.
+    #[method(length = 1)]
+    pub fn clear_timeout(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        let zero = scope.root_value(js::value::from_f64(0.0));
+        Function::call_by_name(
+            scope,
+            this.handle(),
+            c"setTimeout",
+            &[zero, callback.unwrap_or(HandleValue::undefined())],
+        )?;
         Ok(())
     }
 
@@ -860,94 +1242,5 @@ pub mod client_request_class {
             Some(*setter),
             js::class_spec::JSPROP_ENUMERATE as u32,
         )
-    }
-}
-
-/// Initialize the agent `this` with `options` and the default port and protocol, with Node.js's
-/// own data properties.
-fn init_agent(
-    scope: &Scope<'_>,
-    this: Object<'_>,
-    options: Option<HandleValue<'_>>,
-    default_port: f64,
-    protocol: &str,
-) -> Result<(), ExnThrown> {
-    crate::events::event_emitter::init(scope, this, None).map_err(|thrown| thrown.throw(scope))?;
-    let options = match options.and_then(|options| Object::from_value(scope, *options).ok()) {
-        Some(options) => options,
-        None => Object::new_plain(scope)?,
-    };
-    this.set_property(scope, c"options", options)?;
-    this.set_property(scope, c"defaultPort", default_port)?;
-    this.set_property(scope, c"protocol", protocol)?;
-    for name in [c"requests", c"sockets", c"freeSockets"] {
-        this.set_property(scope, name, Object::new_with_null_prototype(scope)?)?;
-    }
-    this.set_property(scope, c"keepAliveMsecs", 1000)?;
-    let keep_alive = js::conversion::to_boolean(options.get_property(scope, c"keepAlive")?);
-    this.set_property(scope, c"keepAlive", keep_alive)?;
-    this.set_property(scope, c"maxSockets", f64::INFINITY)?;
-    this.set_property(scope, c"maxFreeSockets", 256)?;
-    this.set_property(scope, c"scheduling", "lifo")?;
-    this.set_property(scope, c"maxTotalSockets", f64::INFINITY)?;
-    this.set_property(scope, c"totalSocketCount", 0)?;
-    this.set_property(scope, c"agentKeepAliveTimeoutBuffer", 1000)?;
-    Ok(())
-}
-
-#[core_runtime::jsfunction_class(
-    name = "Agent",
-    extends = "crate::events::event_emitter",
-    self_construct
-)]
-pub mod agent_class {
-    use super::*;
-
-    /// <https://nodejs.org/api/http.html#class-httpagent>: the options are kept, and have no
-    /// effect besides `keepAlive`, which keeps the sockets of finished requests in
-    /// `freeSockets`.
-    #[constructor(length = 1)]
-    pub fn init(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        options: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        super::init_agent(scope, this, options, 80.0, "http:")
-    }
-
-    /// <https://nodejs.org/api/http.html#agentdestroy>: has no effect.
-    pub fn destroy() -> Result<(), ExnThrown> {
-        Ok(())
-    }
-
-    /// <https://nodejs.org/api/http.html#agentgetnameoptions>
-    pub fn get_name(
-        scope: &Scope<'_>,
-        options: Option<HandleValue<'_>>,
-    ) -> Result<String, ExnThrown> {
-        let Some(options) = options.and_then(|options| Object::from_value(scope, *options).ok())
-        else {
-            return Ok("localhost::".into());
-        };
-        let host = string_option(scope, options, c"host")?.unwrap_or_else(|| "localhost".into());
-        let port = string_option(scope, options, c"port")?.unwrap_or_default();
-        let address = string_option(scope, options, c"localAddress")?.unwrap_or_default();
-        Ok(format!("{host}:{port}:{address}"))
-    }
-}
-
-#[core_runtime::jsfunction_class(name = "Agent", extends = "super::agent_class", self_construct)]
-pub mod https_agent_class {
-    use super::*;
-
-    /// <https://nodejs.org/api/https.html#class-httpsagent>: the options are kept, and have no
-    /// effect besides `keepAlive`.
-    #[constructor(length = 1)]
-    pub fn init(
-        scope: &Scope<'_>,
-        this: Object<'_>,
-        options: Option<HandleValue<'_>>,
-    ) -> Result<(), ExnThrown> {
-        super::init_agent(scope, this, options, 443.0, "https:")
     }
 }

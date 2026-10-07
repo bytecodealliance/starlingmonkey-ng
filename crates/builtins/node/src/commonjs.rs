@@ -197,12 +197,12 @@ fn prefetch_requires(dir: &Path, source: &str) {
 
 /// The path and format `specifier` resolves to from `dir`: the resolution
 /// [`prefetch_requires`] found, or the result of resolving it now.
-fn resolve(specifier: &str, dir: &Path) -> Result<(PathBuf, SourceFormat), NodeError> {
+fn resolve(specifier: &str, dir: &Path) -> Result<(PathBuf, SourceFormat), ResolveError> {
     let key = (dir.to_path_buf(), specifier.to_string());
     if let Some(resolution) = RESOLVED.with_borrow(|resolved| resolved.get(&key).cloned()) {
         return Ok(resolution);
     }
-    resolve_require(specifier, dir).map_err(resolve_failed)
+    resolve_require(specifier, dir)
 }
 
 /// What loading a module file produced.
@@ -364,7 +364,7 @@ fn require_from<'s>(
         return Ok(namespace.get_property(scope, c"default")?);
     }
     let base = module_dir(scope, parent)?;
-    let (path, format) = resolve(specifier, &base)?;
+    let (path, format) = resolve(specifier, &base).map_err(resolve_failed)?;
     match load_file(scope, &path, format, Some(parent))? {
         Loaded::Exports(exports) => Ok(exports),
         Loaded::EsModule => {
@@ -432,7 +432,7 @@ fn resolve_callback(
             return Ok(name.to_jsval_raw_throwing(scope)?);
         }
         let base = module_dir(scope, parent)?;
-        let (path, _) = resolve(&specifier, &base)?;
+        let (path, _) = resolve(&specifier, &base).map_err(resolve_failed)?;
         Ok(path
             .to_string_lossy()
             .as_ref()

@@ -199,6 +199,12 @@ pub(crate) fn binding_object<'s>(
             binding.set_property(scope, c"fill", *fill)?;
         }
         "constants" => add_constants(scope, binding)?,
+        "performance" => {
+            let counts = crate::perf_hooks::observer_counts_array(scope)?;
+            binding.set_property(scope, c"observerCounts", counts)?;
+            let constants = crate::perf_hooks::constants(scope)?;
+            binding.set_property(scope, c"constants", constants)?;
+        }
         "timers" => {
             let now = Function::new_callback(scope, c"getLibuvNow", 0, get_libuv_now, ())?;
             binding.set_property(scope, c"getLibuvNow", *now)?;

@@ -156,9 +156,9 @@ pub(crate) fn rust_string(scope: &Scope<'_>, value: HandleValue<'_>) -> Option<S
         .flatten()
 }
 
-/// Call `callee` with `args` and an undefined `this`, and rethrow an exception it throws in the
-/// tick queue, as Node.js's `process.nextTick(() => { throw err; })` reports it as uncaught.
-/// Returns the result if the call completed.
+/// Call `callee` with `args` and an undefined `this`, and report an exception it throws as
+/// uncaught in a microtask, as Node.js reports an exception a callback throws. Returns the result
+/// if the call completed.
 pub(crate) fn call_reporting<'s>(
     scope: &'s Scope<'_>,
     callee: impl ToJSVal<'s>,
@@ -168,7 +168,7 @@ pub(crate) fn call_reporting<'s>(
         Ok(result) => Ok(Some(result)),
         Err(ExnThrown) => {
             let error = js::exception::take_pending_or_undefined(scope);
-            js::jobs::queue_native_tick(scope, throw_in_tick, error, &[])?;
+            core_runtime::event_loop::timer::rethrow_in_microtask(scope, error)?;
             Ok(None)
         }
     }
@@ -221,14 +221,24 @@ pub(crate) fn shared_function<'s>(
     body: Callback,
     nargs: u32,
 ) -> Result<Object<'s>, ExnThrown> {
+    shared_named_function(scope, body, c"", nargs)
+}
+
+/// [`shared_function`] with the name `name`, which the first call for `body` gives it.
+pub(crate) fn shared_named_function<'s>(
+    scope: &'s Scope<'_>,
+    body: Callback,
+    name: &'static CStr,
+    nargs: u32,
+) -> Result<Object<'s>, ExnThrown> {
     let function =
         js::class::get_or_init_shared_function(scope, body as *const () as usize, |scope| {
-            js::Function::new_callback(scope, c"", nargs, body, ())
+            js::Function::new_callback(scope, name, nargs, body, ())
         })?;
     Ok(*function)
 }
 
-/// `value` as an array, if it is an `Array` object.
+/// `value` as an array, if it is one.
 pub(crate) fn as_array<'s>(scope: &'s Scope<'_>, value: HandleValue<'_>) -> Option<js::Array<'s>> {
     Object::from_value(scope, *value)
         .ok()?
@@ -285,10 +295,10 @@ pub(crate) fn chunk_bytes(
         };
         return Ok(Some((bytes, length)));
     }
-    let view = Object::from_value(scope, *chunk)
+    let Some(view) = Object::from_value(scope, *chunk)
         .ok()
-        .and_then(js::ArrayBufferView::from_object);
-    let Some(view) = view else {
+        .and_then(js::ArrayBufferView::from_object)
+    else {
         return Ok(None);
     };
     let bytes = view.copy_bytes(scope)?;
@@ -370,6 +380,41 @@ where
     F: std::future::Future<Output = Option<T>> + 'static,
     S: for<'r> FnOnce(&'r Scope<'_>, Object<'r>, T) -> Result<HandleValue<'r>, ExnThrown> + 'static,
 {
+    spawn_operation(scope, target, operation, settle, done, None)
+}
+
+/// [`spawn_cancellable`], with the operation keeping the event loop alive only while
+/// `referenced` is set.
+pub(crate) fn spawn_cancellable_with_ref<T, F, S>(
+    scope: &Scope<'_>,
+    target: Object<'_>,
+    operation: impl FnOnce(Cancelled) -> F,
+    settle: S,
+    done: OpDone,
+    referenced: js::promise::FutureRef,
+) -> Result<Canceller, ExnThrown>
+where
+    T: 'static,
+    F: std::future::Future<Output = Option<T>> + 'static,
+    S: for<'r> FnOnce(&'r Scope<'_>, Object<'r>, T) -> Result<HandleValue<'r>, ExnThrown> + 'static,
+{
+    spawn_operation(scope, target, operation, settle, done, Some(referenced))
+}
+
+/// The body of [`spawn_cancellable`] and [`spawn_cancellable_with_ref`].
+fn spawn_operation<T, F, S>(
+    scope: &Scope<'_>,
+    target: Object<'_>,
+    operation: impl FnOnce(Cancelled) -> F,
+    settle: S,
+    done: OpDone,
+    referenced: Option<js::promise::FutureRef>,
+) -> Result<Canceller, ExnThrown>
+where
+    T: 'static,
+    F: std::future::Future<Output = Option<T>> + 'static,
+    S: for<'r> FnOnce(&'r Scope<'_>, Object<'r>, T) -> Result<HandleValue<'r>, ExnThrown> + 'static,
+{
     let (canceller, cancelled) = futures_channel::oneshot::channel();
     let future = operation(cancelled);
     let op = js::class::create_instance_with::<PendingOpImpl>(scope, |_| PendingOpImpl {
@@ -380,7 +425,7 @@ where
     })?;
     let rooted = js::gc::handle::RootedHeap::<js::object::Object>::new(op.as_object());
     let promise = js::Promise::new_pending(scope)?;
-    promise.spawn(js::promise::PromiseFuture::new(async move {
+    let future = js::promise::PromiseFuture::new(async move {
         let output = future.await;
         js::promise::PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
             let op = rooted
@@ -398,7 +443,11 @@ where
             }
             result
         }))
-    }));
+    });
+    match referenced {
+        Some(referenced) => promise.spawn_with_ref(future, referenced),
+        None => promise.spawn(future),
+    }
     let reaction = js::Function::new_callback(scope, c"", 1, op_reaction, op)?;
     promise.add_reactions(scope, Some(*reaction), Some(*reaction))?;
     Ok(canceller)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! The socket of a served request and of a client request, whose connection the host manages.
+//! The socket of a served request and of a client request through the runtime's HTTP client,
+//! whose connection the host manages.
 //!
 //! It is an `EventEmitter` with the accessors of a connected `net.Socket` over the addresses the
 //! host provides, and `net.Socket`'s connection options as methods without effect. `_httpMessage` is
@@ -33,7 +34,8 @@ pub struct HostSocket {
     local_port: Option<u16>,
     #[no_trace]
     destroyed: bool,
-    /// The client request the socket belongs to, which `destroy` destroys.
+    /// The message the socket belongs to, a client request or the response to a served request,
+    /// which `destroy` destroys.
     owner: Option<Heap<js::object::Object>>,
 }
 
@@ -146,7 +148,7 @@ impl HostSocket {
     }
 
     /// <https://nodejs.org/api/net.html#socketdestroyerror>: marks the socket destroyed, destroys
-    /// the client request it belongs to with `error`, and emits `close` in the tick queue.
+    /// the message it belongs to with `error`, and emits `close` in the tick queue.
     #[method]
     fn destroy<'r>(
         &self,
@@ -168,8 +170,8 @@ fn self_object<'r>(scope: &'r Scope<'_>, socket: &HostSocket<'_>) -> Object<'r> 
     Object::from_value(scope, socket.as_object().as_value()).expect("a socket is an object")
 }
 
-/// Destroy the host socket `socket`: mark it destroyed, destroy the client request it belongs to
-/// with `error`, and emit `close` in the tick queue.
+/// Destroy the host socket `socket`: mark it destroyed, destroy the message it belongs to with
+/// `error`, and emit `close` in the tick queue.
 fn destroy<'s>(
     scope: &Scope<'_>,
     socket: Object<'s>,

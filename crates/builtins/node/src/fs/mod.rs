@@ -40,7 +40,7 @@ use platform::fs::{FileKind, FsError, Stat};
 use crate::buffer::{decode_bytes, encode_string, new_buffer, Encoding};
 use crate::errors::{validate_function, validate_integer, NodeError, Thrown};
 
-pub(crate) use classes::new_dirent;
+pub(crate) use classes::{new_dirent, DIRENT_PROPERTIES, STATS_PROPERTIES};
 pub(crate) use promises::register_promises;
 pub(crate) use watch::{active_watchers, is_poll_timer};
 
@@ -97,7 +97,12 @@ impl UvError {
     /// The network error `error` of `syscall`, with the message `syscall CODE`. `ENOTFOUND` and
     /// `EAI_AGAIN` have libuv's `getaddrinfo` error numbers.
     pub(crate) fn net(error: &platform::net::NetError, syscall: &'static str) -> Self {
-        let code = error.code();
+        Self::net_code(error.code(), syscall)
+    }
+
+    /// The network error with the POSIX error name `code` of `syscall`, with the message
+    /// `syscall CODE`, as [`UvError::net`] describes it.
+    pub(crate) fn net_code(code: &'static str, syscall: &'static str) -> Self {
         let error = match code {
             "ENOTFOUND" => FsError {
                 code,
@@ -130,6 +135,23 @@ impl UvError {
         if let Some(net) = &mut self.net {
             net.address = Some(addr.ip().to_string());
             net.port = Some(addr.port());
+        }
+        self
+    }
+
+    /// The network error as Node.js's `ExceptionWithHostPort` reports it for `address` and
+    /// `port`: the message ends in ` address:port` for a port above 0, and in ` address`
+    /// otherwise, if there is an address. `address` is the address property if given, and `port`
+    /// the port property if it isn't 0.
+    pub(crate) fn host_port(mut self, address: Option<&str>, port: u16) -> Self {
+        if let Some(net) = &mut self.net {
+            net.suffix = match address {
+                Some(address) if port > 0 => format!(" {address}:{port}"),
+                Some(address) if !address.is_empty() => format!(" {address}"),
+                _ => String::new(),
+            };
+            net.address = address.map(str::to_string);
+            net.port = (port > 0).then_some(port);
         }
         self
     }
@@ -456,7 +478,7 @@ pub(crate) fn path_arg(
     } else {
         let object = Object::from_value(scope, *value).map_err(|_| invalid())?;
         if let Some(view) = js::ArrayBufferView::from_object(object) {
-            String::from_utf8_lossy(&view.copy_bytes(scope)?).into_owned()
+            view.with_bytes(|bytes| String::from_utf8_lossy(bytes).into_owned())
         } else if crate::url::is_url(scope, value)? {
             let href = object.get_property(scope, c"href")?;
             let href = js::JSString::from_value(scope, href)?.to_utf8(scope)?;
@@ -750,9 +772,11 @@ pub(crate) fn data_arg(
         let string = js::JSString::from_value(scope, value)?;
         return Ok(encode_string(scope, string, encoding)?);
     }
-    let view = Object::from_value(scope, *value)
+    Object::from_value(scope, *value)
         .ok()
         .and_then(js::ArrayBufferView::from_object)
+        .map(|view| view.copy_bytes(scope))
+        .transpose()?
         .ok_or_else(|| {
             NodeError::invalid_arg_type(
                 scope,
@@ -760,8 +784,8 @@ pub(crate) fn data_arg(
                 "of type string or an instance of Buffer, TypedArray, or DataView",
                 value,
             )
-        })?;
-    Ok(view.copy_bytes(scope)?)
+            .into()
+        })
 }
 
 // ============================================================================

@@ -13,6 +13,7 @@ use js::function::{cast_payload, CallbackArgs};
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
+use js::object::{PropertyInit, PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
@@ -666,18 +667,32 @@ impl<'s> MockFunctionContext<'s> {
         target: HandleValue<'_>,
         this: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        let call = Object::new_with_null_prototype(scope)?;
-        call.set_property(scope, c"arguments", arguments)?;
-        call.set_property(scope, c"error", error)?;
-        call.set_property(scope, c"result", result)?;
+        let call = Object::new_with_property_capacity(scope, None, None, CALL_PROPERTIES.len())?;
+        // SAFETY: `call` was just created, and no JavaScript runs before the writer finishes.
+        let mut properties =
+            unsafe { call.property_writer(scope, &CALL_PROPERTIES, PropertyInit::Define) }?;
+        properties.write(scope, c"arguments", arguments)?;
+        properties.write(scope, c"error", error)?;
+        properties.write(scope, c"result", result)?;
         let stack = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, "")?;
-        call.set_property(scope, c"stack", stack)?;
-        call.set_property(scope, c"target", target)?;
-        call.set_property(scope, c"this", this)?;
+        properties.write(scope, c"stack", stack)?;
+        properties.write(scope, c"target", target)?;
+        properties.write(scope, c"this", this)?;
+        properties.finish(scope)?;
         self.data_mut().calls.push(Heap::from(call));
         Ok(())
     }
 }
+
+/// The properties of the null-prototype object that records a call of a mock, in Node's order.
+pub(crate) static CALL_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&[
+    TemplateKey::Name(c"arguments"),
+    TemplateKey::Name(c"error"),
+    TemplateKey::Name(c"result"),
+    TemplateKey::Name(c"stack"),
+    TemplateKey::Name(c"target"),
+    TemplateKey::Name(c"this"),
+]);
 
 /// The `apply` trap of a mock, whose payload is its context: call the next implementation and
 /// record the call.

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! `IncomingMessage`: a request a listening server parses from its socket, a served request, read
-//! from the body the host received, or a client response, read from the `platform::http`
-//! response body.
+//! from the body the host received, or a client response, which a client request parses from its
+//! socket or reads from the `platform::http` response body.
 //!
 //! A message's state is an [`IncomingState`], which extends the state of the stream with where
 //! its body comes from, and its header lines, from which `headers`, `trailers`,
@@ -54,7 +54,7 @@ pub(crate) enum Source {
     /// Nowhere: the message has no body.
     #[default]
     None,
-    /// The socket a listening server parses the message from, which pushes the body.
+    /// The socket the message is parsed from, which pushes the body.
     Wire,
     /// A body the host received, which a read in progress takes, and the URL its errors name.
     Host {
@@ -76,14 +76,21 @@ pub(crate) struct IncomingState {
     /// The cancellation of the body read in progress.
     #[no_trace]
     read_cancel: Option<Canceller>,
-    /// The connection of [`Source::Wire`].
+    /// The connection of [`Source::Wire`] for a request a listening server parses.
     wire: Option<Heap<super::connection::ConnectionStateImpl>>,
+    /// Whether the parser drops the rest of the message's body: Node's `kSkipPendingData`.
+    #[no_trace]
+    pub(super) skip_pending: bool,
+    /// The `close` listener `signal` added to the socket, and the socket.
+    signal_listener: Option<(Heap<js::object::Object>, Heap<js::object::Object>)>,
+    /// The error and the callback of `_destroy`, while it waits for the socket to close.
+    destroying: Option<(Heap<Value>, Heap<Value>)>,
     /// The header lines, which `rawHeaders` holds too.
     #[no_trace]
-    pub(super) raw_headers: Vec<(String, String)>,
+    pub(super) raw_headers: std::rc::Rc<Vec<(String, String)>>,
     /// The trailer lines, which `rawTrailers` holds too.
     #[no_trace]
-    raw_trailers: Vec<(String, String)>,
+    raw_trailers: std::rc::Rc<Vec<(String, String)>>,
     /// Whether duplicates of the single-valued headers are joined with `, `.
     #[no_trace]
     join_duplicates: bool,
@@ -117,6 +124,14 @@ pub(super) fn state_of<'s>(
     message: Object<'s>,
 ) -> Result<IncomingState<'s>, ExnThrown> {
     incoming_message_class::state_of(scope, message)
+}
+
+/// The state of `message`, if it is an `IncomingMessage`.
+pub(super) fn try_state_of<'s>(
+    scope: &'s Scope<'_>,
+    message: Object<'s>,
+) -> Result<Option<IncomingState<'s>>, ExnThrown> {
+    incoming_message_class::try_state_of(scope, message)
 }
 
 /// The value Node.js's `headers` has for the header lowercased as `lower` in `lines`: the first
@@ -194,11 +209,11 @@ fn store_lines<'s>(
     {
         let mut data = state.data_mut();
         if trailers {
-            data.raw_trailers = lines;
+            data.raw_trailers = std::rc::Rc::new(lines);
             data.trailers = None;
             data.trailers_distinct = None;
         } else {
-            data.raw_headers = lines;
+            data.raw_headers = std::rc::Rc::new(lines);
             data.headers = None;
             data.headers_distinct = None;
         }
@@ -217,17 +232,54 @@ pub(super) fn set_join_duplicates(
     message.set_property(scope, c"joinDuplicateHeaders", join)
 }
 
-/// Make the socket of the connection `connection` the body source of `message`, which a
-/// listening server parses.
+/// Make the socket `message` is parsed from its body source: the socket of the connection
+/// `connection` of a listening server, or the `socket` of a client response for `None`.
 pub(super) fn set_wire_source(
     scope: &Scope<'_>,
     message: Object<'_>,
-    connection: super::connection::ConnectionState<'_>,
+    connection: Option<super::connection::ConnectionState<'_>>,
 ) -> Result<(), ExnThrown> {
     let state = state_of(scope, message)?;
     let mut data = state.data_mut();
     data.source = Source::Wire;
-    data.wire = Some(Heap::from(connection));
+    data.wire = connection.map(Heap::from);
+    Ok(())
+}
+
+/// Remove the `close` listener the `signal` of `message` added to its socket, as Node.js's
+/// `kDetachAbortSignal` does.
+pub(super) fn detach_abort_signal(scope: &Scope<'_>, message: Object<'_>) -> Result<(), ExnThrown> {
+    let listener = match incoming_message_class::try_state_of(scope, message)? {
+        Some(state) => {
+            let mut data = state.data_mut();
+            let listener = data
+                .signal_listener
+                .as_ref()
+                .map(|(socket, listener)| (socket.get(scope), listener.get(scope)));
+            data.signal_listener = None;
+            listener
+        }
+        None => None,
+    };
+    if let Some((socket, listener)) = listener {
+        crate::events::listen(scope, socket, c"removeListener", c"close", listener)?;
+    }
+    Ok(())
+}
+
+/// Resume `socket` unless it is paused for its server or isn't readable, as Node.js's
+/// `readStart` does.
+pub(super) fn read_start_socket(scope: &Scope<'_>, socket: Object<'_>) -> Result<(), ExnThrown> {
+    if js::conversion::to_boolean(socket.get_property(scope, c"_paused")?) {
+        return Ok(());
+    }
+    let readable = match ReadableSide::try_of(scope, socket)? {
+        Some(side) => side.get().is_readable(),
+        None => js::conversion::to_boolean(socket.get_property(scope, c"readable")?),
+    };
+    if readable {
+        Function::call_by_name(scope, socket.handle(), c"resume", js::function::EmptyArgs)?;
+    }
     Ok(())
 }
 
@@ -348,13 +400,12 @@ fn web_chunk(
     message: Object<'_>,
     chunk: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let bytes = match Object::from_value(scope, *chunk)
+    let bytes = Object::from_value(scope, *chunk)
         .ok()
         .and_then(js::ArrayBufferView::from_object)
-    {
-        Some(view) => view.copy_bytes(scope)?,
-        None => Vec::new(),
-    };
+        .map(|view| view.copy_bytes(scope))
+        .transpose()?
+        .unwrap_or_default();
     let buffer = new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?;
     push(scope, message, buffer)
 }
@@ -472,9 +523,9 @@ fn get_lines(
     let (lines, join) = {
         let data = state.data();
         let lines = if index.is_multiple_of(2) {
-            data.raw_headers.clone()
+            std::rc::Rc::clone(&data.raw_headers)
         } else {
-            data.raw_trailers.clone()
+            std::rc::Rc::clone(&data.raw_trailers)
         };
         (lines, data.join_duplicates)
     };
@@ -578,17 +629,22 @@ fn get_signal(
         } else {
             let listener = Function::new_callback(scope, c"", 0, on_socket_close, this)?;
             crate::events::listen(scope, socket, c"once", c"close", *listener)?;
+            state.data_mut().signal_listener = Some((Heap::from(socket), Heap::from(*listener)));
         }
     }
     Ok(controller.signal(scope).as_value())
 }
 
 /// Initialize `message` as the `IncomingMessage` constructor does for `socket`, creating its
-/// properties as `init` creates them, with the fields of `head`. With [`PropertyInit::Define`],
-/// `message` is an instance this crate created that has no own properties yet.
-fn init_message(
-    scope: &Scope<'_>,
-    message: Object<'_>,
+/// properties as `init` creates them, with the fields of `head`.
+///
+/// # Safety
+///
+/// With [`PropertyInit::Define`], `message` is an instance [`new_message`] created that nothing
+/// else references.
+unsafe fn init_message<'w>(
+    scope: &'w Scope<'_>,
+    message: Object<'w>,
     socket: HandleValue<'_>,
     head: MessageHead<'_>,
     init: PropertyInit,
@@ -610,9 +666,12 @@ fn init_message(
         }
         _ => None,
     };
+    // SAFETY: the caller guarantees the requirements of `Define`. Only the writer's own reads run
+    // JavaScript that can reach `message`, until it is flushed.
+    let mut properties = unsafe { message.property_writer(scope, &MESSAGE_PROPERTIES, init) }?;
     match init {
         PropertyInit::Define => {
-            crate::stream::init_new_readable(scope, message, options, socket_mark)?
+            crate::stream::init_new_readable(scope, message, &mut properties, options, socket_mark)?
         }
         PropertyInit::Assign => crate::stream::readable_class::init(scope, message, options)?,
     }
@@ -625,9 +684,7 @@ fn init_message(
     let join = head.join_duplicates.unwrap_or(false);
     state.data_mut().join_duplicates = join;
     let null = HandleValue::null();
-    // SAFETY: the caller guarantees the requirements of `Define`, and no JavaScript runs before
-    // the writer finishes.
-    let mut properties = unsafe { message.property_writer(scope, &MESSAGE_PROPERTIES, init) }?;
+    properties.continue_with(scope, &MESSAGE_PROPERTIES)?;
     properties.write(scope, c"socket", socket)?;
     match head.version {
         Some((major, minor)) => {
@@ -675,15 +732,15 @@ fn init_message(
     properties.write(scope, c"client", socket)?;
     properties.write(scope, c"_consuming", false)?;
     properties.write(scope, c"_dumped", false)?;
-    properties.finish(scope)?;
-    Ok(())
+    Ok(properties.finish(scope)?)
 }
 
 #[core_runtime::jsfunction_class(
     name = "IncomingMessage",
     extends = "crate::stream::readable_class",
     state = "IncomingState",
-    invalid_this = "crate::errors::invalid_this"
+    invalid_this = "crate::errors::invalid_this",
+    templates = "crate::stream::READABLE_PROPERTIES, crate::events::EMITTER_PROPERTIES, MESSAGE_PROPERTIES"
 )]
 pub mod incoming_message_class {
     use super::*;
@@ -697,18 +754,21 @@ pub mod incoming_message_class {
         socket: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
         let socket = socket.unwrap_or(HandleValue::undefined());
-        init_message(
-            scope,
-            this,
-            socket,
-            MessageHead::default(),
-            PropertyInit::Assign,
-        )
+        // SAFETY: `Assign` has no requirements.
+        unsafe {
+            init_message(
+                scope,
+                this,
+                socket,
+                MessageHead::default(),
+                PropertyInit::Assign,
+            )
+        }
     }
 
-    /// Read the next chunk from the body source: a host body or a body stream, or the socket of
-    /// a request a listening server parses, which this resumes unless the server paused it. A
-    /// message without a body source ends.
+    /// Read the next chunk from the body source: a host body or a body stream, or the socket the
+    /// message is parsed from, which this resumes unless its server paused it. A message without
+    /// a body source ends.
     #[method(name = "_read")]
     pub fn read_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
         if !js::conversion::to_boolean(this.get_property(scope, c"_consuming")?) {
@@ -729,7 +789,10 @@ pub mod incoming_message_class {
         match kind {
             1 => match connection {
                 Some(connection) => super::super::connection::read_start(scope, connection),
-                None => Ok(()),
+                None => match Object::from_value(scope, *this.get_property(scope, c"socket")?) {
+                    Ok(socket) => read_start_socket(scope, socket),
+                    Err(_) => Ok(()),
+                },
             },
             2 => read_host_body(scope, this, &state),
             3 => match reader {
@@ -754,9 +817,9 @@ pub mod incoming_message_class {
         msecs: Option<HandleValue<'_>>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, ExnThrown> {
-        if let Some(callback) = callback.filter(|callback| js::function::is_callable(*callback)) {
-            let callback = Object::from_value(scope, *callback).map_err(|e| e.throw(scope))?;
-            crate::events::listen(scope, this, c"on", c"timeout", callback)?;
+        if let Some(callback) = callback.filter(|callback| js::conversion::to_boolean(*callback)) {
+            let timeout = js::class::get_or_init_atom(scope, c"timeout")?;
+            Function::call_by_name(scope, this.handle(), c"on", &[timeout, callback])?;
         }
         if let Ok(socket) = Object::from_value(scope, *this.get_property(scope, c"socket")?) {
             if crate::support::has_method(scope, socket, c"setTimeout")? {
@@ -770,7 +833,8 @@ pub mod incoming_message_class {
     /// Set `aborted` and emit `aborted` if the message didn't end, then call `callback` with
     /// `error` in the tick queue. The error is passed on only if the message has an `error`
     /// listener. An aborted message destroys its socket with `error`, unless the socket was
-    /// destroyed.
+    /// destroyed. A client response calls `callback` once its socket finished then, with the
+    /// socket's error if it has one.
     #[method(name = "_destroy")]
     pub fn destroy_impl(
         scope: &Scope<'_>,
@@ -788,12 +852,31 @@ pub mod incoming_message_class {
         }
         let aborted = js::conversion::to_boolean(this.get_property(scope, c"aborted")?);
         if aborted {
-            let connection = state.data().wire.get(scope);
-            let socket =
-                connection.map(|connection| super::super::connection::socket_of(scope, connection));
-            if let Some(socket) = socket {
+            let (wire, connection) = {
+                let data = state.data();
+                (matches!(data.source, Source::Wire), data.wire.get(scope))
+            };
+            if let Some(connection) = connection {
+                let socket = super::super::connection::socket_of(scope, connection);
                 if !js::conversion::to_boolean(socket.get_property(scope, c"destroyed")?) {
                     Function::call_by_name(scope, socket.handle(), c"destroy", &[error])?;
+                }
+            } else if wire {
+                let socket = this.get_property(scope, c"socket")?;
+                if let Ok(socket) = Object::from_value(scope, *socket) {
+                    if !js::conversion::to_boolean(socket.get_property(scope, c"destroyed")?) {
+                        Function::call_by_name(scope, socket.handle(), c"destroy", &[error])?;
+                        state.data_mut().destroying =
+                            Some((Heap::from(error.get()), Heap::from(callback.get())));
+                        let options = crate::stream::EosOptions::default();
+                        let done = crate::stream::EosCallback::Native(
+                            socket_finished,
+                            this.to_jsval_throwing(scope)?,
+                        );
+                        crate::stream::eos_native(scope, socket, options, done)
+                            .map_err(|thrown| thrown.throw(scope))?;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -833,6 +916,46 @@ pub mod incoming_message_class {
         Function::call_by_name(scope, this.handle(), c"resume", js::function::EmptyArgs)?;
         Ok(())
     }
+}
+
+/// The `finished` callback of the socket a client response destroyed, whose payload is the
+/// response: call the callback of `_destroy` in the tick queue, with the socket's error unless it
+/// closed prematurely, or with the error `_destroy` was given.
+fn socket_finished(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let message = js::function::cast_payload::<js::Object>(scope, payload);
+    let destroying = {
+        let state = state_of(scope, message)?;
+        let mut data = state.data_mut();
+        let destroying = data
+            .destroying
+            .as_ref()
+            .map(|(error, callback)| (error.get(scope), callback.get(scope)));
+        data.destroying = None;
+        destroying
+    };
+    let Some((error, callback)) = destroying else {
+        return Ok(js::value::undefined());
+    };
+    let finished = args.get(0);
+    let premature = match Object::from_value(scope, *finished) {
+        Ok(finished) => crate::support::is_str(
+            scope,
+            finished.get_property(scope, c"code")?,
+            c"ERR_STREAM_PREMATURE_CLOSE",
+        )?,
+        Err(_) => false,
+    };
+    let error = if js::conversion::to_boolean(finished) && !premature {
+        finished
+    } else {
+        error
+    };
+    js::jobs::queue_native_tick(scope, call_destroy_callback, message, &[error, callback])?;
+    Ok(js::value::undefined())
 }
 
 /// The tick callback of `_destroy`, whose payload is the message and whose arguments are the
@@ -907,7 +1030,8 @@ pub(super) fn new_message<'s>(
     head: MessageHead<'_>,
 ) -> Result<Object<'s>, ExnThrown> {
     let message = incoming_message_class::new_instance(scope)?;
-    init_message(scope, message, socket, head, PropertyInit::Define)
+    // SAFETY: `message` was just created, and nothing else references it.
+    unsafe { init_message(scope, message, socket, head, PropertyInit::Define) }
         .map_err(|thrown| thrown.throw(scope))?;
     Ok(message)
 }

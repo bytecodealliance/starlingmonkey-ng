@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 
-use js::conversion::{FromJSVal, ToJSVal};
+use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
 use js::gc::scope::Scope;
@@ -22,7 +22,9 @@ use platform::net::StreamListener;
 use super::socket::{address_object, attach, read_zero, release, socket_class};
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
 use crate::fs::UvError;
-use crate::support::{emit_later, next_tick_call, spawn_cancellable, until_cancelled, Canceller};
+use crate::support::{
+    emit_later, next_tick_call, spawn_cancellable_with_ref, until_cancelled, Canceller,
+};
 
 /// The state of a `net.Server`.
 #[core_runtime::jsclass(hidden)]
@@ -40,6 +42,10 @@ pub(crate) struct ServerState {
     /// Whether the server listens, which `listening` returns.
     #[no_trace]
     pub(crate) listening: bool,
+    /// Whether accepting connections keeps the event loop alive: unset by `unref` and set again by
+    /// `ref`.
+    #[no_trace]
+    referenced: js::promise::FutureRef,
 }
 
 #[core_runtime::jsmethods]
@@ -140,7 +146,8 @@ fn accept(scope: &Scope<'_>, server: Object<'_>) -> Result<(), ExnThrown> {
     let Some(listener) = state.data().listener.clone() else {
         return Ok(());
     };
-    let canceller = spawn_cancellable(
+    let referenced = state.data().referenced.clone();
+    let canceller = spawn_cancellable_with_ref(
         scope,
         server,
         |cancelled| {
@@ -161,6 +168,7 @@ fn accept(scope: &Scope<'_>, server: Object<'_>) -> Result<(), ExnThrown> {
             socket.to_jsval_throwing(scope)
         },
         accept_done,
+        referenced,
     )?;
     state.data_mut().cancel_accept = Some(canceller);
     Ok(())
@@ -194,13 +202,23 @@ fn emit_close_if_drained(scope: &Scope<'_>, server: Object<'_>) -> Result<(), Ex
     Ok(())
 }
 
-/// The port, host and callback `listen`'s arguments give, as Node.js's `Server.listen`
+/// What `listen`'s arguments give.
+pub(crate) struct ListenArgs<'s> {
+    pub(crate) port: u16,
+    pub(crate) host: Option<String>,
+    pub(crate) callback: Option<HandleValue<'s>>,
+    /// The `signal` option.
+    pub(crate) signal: Option<Object<'s>>,
+}
+
+/// The port, host, callback and signal `listen`'s arguments give, as Node.js's `Server.listen`
 /// normalizes and validates them: `([port][, host][, backlog][, callback])` or `(options[,
-/// callback])`. A port that is omitted, `undefined` or `null` is 0, for a free port.
+/// callback])`. A port that is omitted, `undefined` or `null` is 0, for a free port. The `signal`
+/// option must be an `AbortSignal`, and a truthy `host` option a string.
 pub(crate) fn listen_args<'s>(
     scope: &'s Scope<'_>,
     args: &[HandleValue<'s>],
-) -> Result<(u16, Option<String>, Option<HandleValue<'s>>), Thrown> {
+) -> Result<ListenArgs<'s>, Thrown> {
     let callback = args
         .last()
         .copied()
@@ -223,22 +241,37 @@ pub(crate) fn listen_args<'s>(
         }
         None => Object::new_plain(scope)?,
     };
+    let signal = options.get_property(scope, c"signal")?;
+    let signal = if signal.is_undefined() {
+        None
+    } else {
+        crate::errors::validate_abort_signal(scope, signal, "options.signal")?;
+        Some(Object::from_value(scope, *signal).map_err(|e| Thrown::from(e.throw(scope)))?)
+    };
     let port = options.get_property(scope, c"port")?;
     let free_port = first.is_none_or(|first| js::function::is_callable(first))
         || (port.is_undefined() && options.has_property(scope, c"port")?)
         || port.is_null();
-    let host = options.get_property(scope, c"host")?;
-    let host = if host.is_string() && js::conversion::to_boolean(host) {
-        Some(String::from_jsval(scope, host, ())?)
+    let port = if free_port {
+        Some(0)
+    } else if port.is_number() || port.is_string() {
+        Some(super::validate_port(scope, port, "options.port")?)
     } else {
         None
     };
-    if free_port {
-        return Ok((0, host, callback));
-    }
-    if port.is_number() || port.is_string() {
-        let port = super::validate_port(scope, port, "options.port")?;
-        return Ok((port, host, callback));
+    if let Some(port) = port {
+        let host = options.get_property(scope, c"host")?;
+        let host = if js::conversion::to_boolean(host) {
+            Some(crate::errors::validate_string(scope, host, "hostname")?)
+        } else {
+            None
+        };
+        return Ok(ListenArgs {
+            port,
+            host,
+            callback,
+            signal,
+        });
     }
     let path = options.get_property(scope, c"path")?;
     if js::conversion::to_boolean(path) && super::is_pipe_name(scope, path)? {
@@ -255,6 +288,33 @@ pub(crate) fn listen_args<'s>(
         .into());
     }
     Err(NodeError::invalid_arg_value(scope, "options", options_value, "is invalid").into())
+}
+
+/// The tick callback and `abort` listener whose payload is a server: call its `close`, as the
+/// `signal` option of `listen` does.
+fn close_tick(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let server = js::function::cast_payload::<js::Object>(scope, payload);
+    Function::call_by_name(scope, server.handle(), c"close", js::function::EmptyArgs)?;
+    Ok(js::value::undefined())
+}
+
+/// The tick callback whose payload is a server that started listening: emit `listening`, unless
+/// it stopped listening since, as Node.js's `emitListeningNT` does.
+fn listening_tick(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let server = js::function::cast_payload::<js::Object>(scope, payload);
+    let listening = server_class::state_of(scope, server)?.data().listening;
+    if listening {
+        crate::events::emit(scope, server, c"listening", &[])?;
+    }
+    Ok(js::value::undefined())
 }
 
 /// The `close` listener `close` adds for a server that was not listening, whose payload is the
@@ -427,7 +487,12 @@ pub mod server_class {
             )
             .into());
         }
-        let (port, host, callback) = listen_args(scope, &args)?;
+        let ListenArgs {
+            port,
+            host,
+            callback,
+            signal,
+        } = listen_args(scope, &args)?;
         let ip = match host.as_deref() {
             None => IpAddr::from([0, 0, 0, 0]),
             Some("localhost") => IpAddr::from([127, 0, 0, 1]),
@@ -443,6 +508,14 @@ pub mod server_class {
                 &[js::class::get_or_init_atom(scope, c"listening")?, callback],
             )?;
         }
+        if let Some(signal) = signal {
+            if js::conversion::to_boolean(signal.get_property(scope, c"aborted")?) {
+                js::jobs::queue_native_tick(scope, close_tick, this, &[])?;
+            } else {
+                let close = Function::new_callback(scope, c"onAborted", 0, close_tick, this)?;
+                crate::dgram::listen_for_abort_until_close(scope, this, signal, *close)?;
+            }
+        }
         let addr = SocketAddr::new(ip, port);
         match platform::net::listen_stream(addr) {
             Ok(listener) => {
@@ -453,7 +526,7 @@ pub mod server_class {
                     data.listening = true;
                 }
                 this.set_property(scope, c"_handle", Object::new_plain(scope)?)?;
-                emit_later(scope, this, c"listening", &[])?;
+                js::jobs::queue_native_tick(scope, listening_tick, this, &[])?;
                 accept(scope, this)?;
             }
             Err(error) => {
@@ -532,15 +605,26 @@ pub mod server_class {
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/net.html#serverref>: has no effect.
+    /// <https://nodejs.org/api/net.html#serverref>: accepting connections keeps the event loop
+    /// alive again.
     #[method(name = "ref")]
-    pub fn ref_impl<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+    pub fn ref_impl<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+        this.set_property(scope, c"_unref", false)?;
+        state_of(scope, this)?
+            .data()
+            .referenced
+            .set_referenced(true);
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/net.html#serverunref>: has no effect, so a listening server
-    /// keeps the event loop alive.
-    pub fn unref<'s>(this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+    /// <https://nodejs.org/api/net.html#serverunref>: accepting connections doesn't keep the
+    /// event loop alive.
+    pub fn unref<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+        this.set_property(scope, c"_unref", true)?;
+        state_of(scope, this)?
+            .data()
+            .referenced
+            .set_referenced(false);
         Ok(this)
     }
 

@@ -369,14 +369,6 @@ fn add_listener(
     Ok(())
 }
 
-fn nop(
-    _scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    Ok(js::value::undefined())
-}
-
 /// `eos`'s cleanup: remove its listeners, and make the callback a no-op.
 pub(crate) fn cleanup(scope: &Scope<'_>, state: EosState<'_>) -> Result<(), ExnThrown> {
     state.data_mut().called = true;
@@ -490,12 +482,8 @@ pub(crate) fn eos_native<'s>(
     }
     if immediate.is_some() {
         if options.error {
-            let nop = js::class::get_or_init_shared_function(
-                scope,
-                nop as *const () as usize,
-                |scope| Function::new_callback(scope, c"nop", 0, nop, ()),
-            )?;
-            add_listener(scope, state, stream, c"error", *nop)?;
+            let nop = crate::support::noop_function(scope)?;
+            add_listener(scope, state, stream, c"error", nop)?;
         }
     } else if let Some(signal) = options.signal {
         if js::conversion::to_boolean(signal.get_property(scope, c"aborted")?) {

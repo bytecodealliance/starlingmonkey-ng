@@ -40,6 +40,16 @@ fn crypto() {
 }
 
 #[test]
+fn dgram() {
+    run_js("dgram.mjs");
+}
+
+#[test]
+fn dns() {
+    run_js("dns.mjs");
+}
+
+#[test]
 fn fs() {
     run_js("fs.mjs");
 }
@@ -88,6 +98,19 @@ fn os() {
 #[test]
 fn path() {
     run_js("path.mjs");
+}
+
+#[test]
+fn perf_hooks() {
+    run_js("perf_hooks.mjs");
+}
+
+#[test]
+fn perf_hooks_gc() {
+    run_js_with_flags(
+        "perf_hooks_gc.mjs",
+        &["--allow-node-runtime-flags", "--expose-gc", "--no-warnings"],
+    );
 }
 
 #[test]
@@ -156,6 +179,16 @@ fn util() {
 }
 
 #[test]
+fn vm() {
+    run_js("vm.mjs");
+}
+
+#[test]
+fn vm_gc() {
+    run_js_with_flags("vm_gc.mjs", &["--allow-node-runtime-flags", "--expose-gc"]);
+}
+
+#[test]
 fn zlib() {
     run_js("zlib.mjs");
 }
@@ -177,8 +210,9 @@ fn http() {
 fn http_listen() {
     run_js_with_flags("http_listen.mjs", &["--node-http-listen"]);
 }
-/// Serve HTTP/1.1 on a local port for the rest of the process, and return the port. Each request
-/// gets its own connection, which the response closes:
+/// Serve HTTP/1.1 on a local port for the rest of the process, and return the port. A request
+/// body has a `Content-Length` or chunked transfer coding without trailers. Each request gets its
+/// own connection, which the response closes:
 ///
 /// - The response to `/chunked` is the chunks `one`, `two` and `three`.
 /// - `/redirect` redirects to `/echo`.
@@ -204,6 +238,7 @@ fn start_http_server() -> u16 {
                 );
                 let mut headers = Vec::new();
                 let mut length = 0;
+                let mut chunked = false;
                 loop {
                     let mut line = String::new();
                     reader.read_line(&mut line).expect("reading a header");
@@ -215,10 +250,22 @@ fn start_http_server() -> u16 {
                     if name.eq_ignore_ascii_case("content-length") {
                         length = value.trim().parse().expect("a length");
                     }
+                    if name.eq_ignore_ascii_case("transfer-encoding") {
+                        chunked = value.trim().eq_ignore_ascii_case("chunked");
+                    }
                     headers.push((name.to_string(), value.trim().to_string()));
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).expect("reading the body");
+                while chunked {
+                    let mut size = String::new();
+                    reader.read_line(&mut size).expect("reading a chunk size");
+                    let size = usize::from_str_radix(size.trim(), 16).expect("a chunk size");
+                    let mut chunk = vec![0; size + 2];
+                    reader.read_exact(&mut chunk).expect("reading a chunk");
+                    body.extend_from_slice(&chunk[..size]);
+                    chunked = size > 0;
+                }
                 let quote =
                     |text: &str| format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""));
                 let mut stream = stream;
