@@ -1,0 +1,5 @@
+{
+  "Types observed are forgotten when disconnect() is called.": {
+    "status": "PASS"
+  }
+}

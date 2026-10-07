@@ -23,7 +23,9 @@ use mozjs::jsapi::{
     DelazificationOption, EnvironmentChain, JSFunction, JSScript, ReadOnlyCompileOptions,
     SourceText,
 };
-use mozjs::rust::{transform_str_to_source_text, wrappers2, CompileOptionsWrapper};
+use mozjs::rust::{transform_str_to_source_text, wrappers2};
+
+pub use mozjs::rust::CompileOptionsWrapper;
 
 use super::error::ExnThrown;
 
@@ -250,6 +252,48 @@ pub fn execute_script_no_rval(scope: &Scope<'_>, script: HandleScript) -> Result
     ExnThrown::check(ok)
 }
 
+/// Execute `script`, which was compiled with the `nonSyntacticScope` option, with the objects of
+/// `env` on its environment chain, the innermost first, and return its completion value. A
+/// global is on the chain through a proxy that forwards to it, as
+/// [`realm::environment_object`](crate::realm::environment_object) creates it.
+///
+/// Names resolve to the properties of the objects of `env` before the global's. `var` and
+/// function declarations define properties of the innermost object, which is also the top-level
+/// `this`. `let` and `const` declarations persist across executions with the same innermost
+/// object in the same realm.
+pub fn execute_script_with_env<'s>(
+    scope: &'s Scope<'_>,
+    script: HandleScript,
+    env: &[crate::Object<'_>],
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let chain = mozjs::rust::EnvironmentChain::new(
+        scope.cx_mut(),
+        mozjs::jsapi::JS::SupportUnscopables::No,
+    );
+    for &object in env {
+        chain.append(crate::realm::environment_object(scope, object)?.as_raw());
+    }
+    let mut rval = scope.root_value_mut(crate::value::undefined());
+    // SAFETY: the chain roots its objects, and the script and result are rooted.
+    let ok = unsafe {
+        wrappers2::JS_ExecuteScript2(scope.cx_mut(), chain.get(), script, rval.reborrow())
+    };
+    ExnThrown::check(ok)?;
+    Ok(rval.handle())
+}
+
+/// Compile the UTF-16 script `source` with `options` into a `JSScript` of the current realm,
+/// without executing it.
+pub fn compile_utf16<'s>(
+    scope: &'s Scope<'_>,
+    source: &[u16],
+    options: &CompileOptionsWrapper,
+) -> Result<Handle<'s, *mut JSScript>, ExnThrown> {
+    let mut source = mozjs::rust::transform_u16_to_source_text(source);
+    // SAFETY: the options and the source are valid.
+    unsafe { compile_utf16_raw(scope, options.ptr, &mut source) }
+}
+
 /// Compile a function from UTF-16 source.
 ///
 /// # Safety
@@ -289,17 +333,33 @@ pub fn compile_function<'s>(
     filename: &str,
     lineno: u32,
 ) -> Result<crate::Function<'s>, ExnThrown> {
+    let filename = CString::new(filename.replace('\0', "")).expect("NULs were removed");
+    let options = options(scope, filename, lineno);
+    let units: Vec<u16> = body.encode_utf16().collect();
+    compile_function_with_env(scope, &[], name, params, &units, &options)
+}
+
+/// Compile the UTF-16 `body` as the body of a function named `name` with the parameters
+/// `params`, with `options`, in the current realm. Names in it resolve to the properties of the
+/// objects of `env`, the innermost first, before the global's. The function's one-line header is
+/// the line `options` starts at, so `body` starts at the line after it.
+pub fn compile_function_with_env<'s>(
+    scope: &'s Scope<'_>,
+    env: &[crate::Object<'_>],
+    name: &std::ffi::CStr,
+    params: &[&std::ffi::CStr],
+    body: &[u16],
+    options: &CompileOptionsWrapper,
+) -> Result<crate::Function<'s>, ExnThrown> {
     let chain = mozjs::rust::EnvironmentChain::new(
         scope.cx_mut(),
         mozjs::jsapi::JS::SupportUnscopables::No,
     );
-    let filename = CString::new(filename.replace('\0', "")).expect("NULs were removed");
-    let options = options(scope, filename, lineno);
+    for &object in env {
+        chain.append(crate::realm::environment_object(scope, object)?.as_raw());
+    }
     let argnames: Vec<*const std::os::raw::c_char> = params.iter().map(|p| p.as_ptr()).collect();
-    // SpiderMonkey's function compiler reads UTF-8 source as one Latin-1 character per byte, so the
-    // body goes in as UTF-16.
-    let units: Vec<u16> = body.encode_utf16().collect();
-    let mut source = mozjs::rust::transform_u16_to_source_text(&units);
+    let mut source = mozjs::rust::transform_u16_to_source_text(body);
     // SAFETY: the chain, options, names and source are live locals.
     let fun = unsafe {
         compile_function_utf16_raw(

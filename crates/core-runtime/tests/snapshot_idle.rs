@@ -8,9 +8,10 @@
 
 use core_runtime::config::RuntimeConfig;
 use core_runtime::event_loop::timer::install_timer_globals;
-use core_runtime::event_loop::{with_event_loop, EventLoop};
+use core_runtime::event_loop::{with_event_loop, EventLoop, Task, TaskId};
 use core_runtime::runtime::Runtime;
 use js::compile::evaluate_with_filename;
+use js::error::ExnThrown;
 use js::gc::scope::Scope;
 
 /// Evaluate `code` from `filename` with `event_loop` active.
@@ -19,6 +20,19 @@ fn eval_on(scope: &Scope<'_>, event_loop: &EventLoop, filename: &str, code: &str
         evaluate_with_filename(scope, code, filename, 1)
             .unwrap_or_else(|_| panic!("{filename} threw"));
     });
+}
+
+/// A task that does nothing, waiting to be signalled ready.
+struct Waiting;
+
+impl Task for Waiting {
+    fn kind(&self) -> &'static str {
+        "waiting"
+    }
+
+    fn run(self: Box<Self>, _scope: &Scope<'_>, _id: TaskId) -> Result<(), ExnThrown> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -34,34 +48,23 @@ fn pending_work_is_reported_with_its_origin() {
     // A loop that holds nothing can be wizened.
     assert!(EventLoop::new().ensure_idle_for_snapshot().is_ok());
 
-    // A timer is reported with the stack that created it, and clearing it leaves the loop idle.
+    // Timers are not reported: a timeout, an interval that has fired and re-queued itself, and an
+    // unreferenced timer.
     {
         let el = EventLoop::new();
         eval_on(
             &scope,
             &el,
-            "arm.js",
-            "function arm() {\n  return setTimeout(() => {}, 60000);\n}\nglobalThis.timer = arm();",
+            "timers.js",
+            "globalThis.ticks = 0;\n\
+             globalThis.timeout = setTimeout(() => {}, 60000);\n\
+             globalThis.interval = setInterval(() => { globalThis.ticks++; }, 0);\n\
+             globalThis.unref = setTimeout(() => {}, 60000);",
         );
-        let message = el.ensure_idle_for_snapshot().unwrap_err();
-        assert!(
-            message.contains("a pending `timeout` timer, created at:\n      arm@arm.js:2:"),
-            "{message}"
-        );
-        assert!(message.contains("\n      @arm.js:4:"), "{message}");
-        eval_on(&scope, &el, "clear.js", "clearTimeout(globalThis.timer);");
-        assert!(el.ensure_idle_for_snapshot().is_ok());
-    }
-
-    // An interval keeps the origin of the call that created it each time it re-queues itself.
-    {
-        let el = EventLoop::new();
-        eval_on(
-            &scope,
-            &el,
-            "interval.js",
-            "globalThis.ticks = 0;\nglobalThis.interval = setInterval(() => { globalThis.ticks++; }, 0);",
-        );
+        let id = evaluate_with_filename(&scope, "globalThis.unref", "id.js", 1)
+            .unwrap()
+            .to_number() as u64;
+        el.set_js_timer_ref(id, false);
         while evaluate_with_filename(&scope, "globalThis.ticks", "ticks.js", 1)
             .unwrap()
             .to_int32()
@@ -70,36 +73,27 @@ fn pending_work_is_reported_with_its_origin() {
             std::thread::sleep(std::time::Duration::from_millis(1));
             with_event_loop(&el, |el| el.step(&scope));
         }
-        let message = el.ensure_idle_for_snapshot().unwrap_err();
-        assert!(
-            message.contains("a pending `interval` timer, created at:\n      @interval.js:2:"),
-            "{message}"
-        );
-        eval_on(
-            &scope,
-            &el,
-            "clear.js",
-            "clearInterval(globalThis.interval);",
-        );
         assert!(el.ensure_idle_for_snapshot().is_ok());
+        assert_eq!(el.len(), 3, "the timers stay queued");
     }
 
-    // An unreferenced timer is reported too.
+    // A task without a deadline is reported, and a timer queued with it is not.
     {
         let el = EventLoop::new();
         eval_on(
             &scope,
             &el,
-            "unref.js",
-            "globalThis.unref = setTimeout(() => {}, 60000);",
+            "timer.js",
+            "globalThis.timer = setTimeout(() => {}, 60000);",
         );
-        let id = evaluate_with_filename(&scope, "globalThis.unref", "id.js", 1)
-            .unwrap()
-            .to_number() as u64;
-        el.set_js_timer_ref(id, false);
+        let task = el.queue(Box::new(Waiting));
         let message = el.ensure_idle_for_snapshot().unwrap_err();
-        assert!(message.contains("a pending `timeout` timer"), "{message}");
-        eval_on(&scope, &el, "clear.js", "clearTimeout(globalThis.unref);");
+        assert!(
+            message.contains("a queued `waiting` task, created with no JavaScript on the stack"),
+            "{message}"
+        );
+        assert!(!message.contains("timer"), "{message}");
+        assert!(el.cancel_if_queued(task));
         assert!(el.ensure_idle_for_snapshot().is_ok());
     }
 
@@ -118,24 +112,5 @@ fn pending_work_is_reported_with_its_origin() {
         );
         drop(interest);
         assert!(el.ensure_idle_for_snapshot().is_ok());
-    }
-
-    // Once recording stops, work is still reported, without an origin.
-    {
-        // SAFETY: stopping the recording has no precondition.
-        unsafe { js::stack::record_origins(None) };
-        let el = EventLoop::new();
-        eval_on(
-            &scope,
-            &el,
-            "late.js",
-            "globalThis.late = setTimeout(() => {}, 60000);",
-        );
-        let message = el.ensure_idle_for_snapshot().unwrap_err();
-        assert!(
-            message.contains("a pending `timeout` timer, created with no JavaScript on the stack"),
-            "{message}"
-        );
-        eval_on(&scope, &el, "clear.js", "clearTimeout(globalThis.late);");
     }
 }

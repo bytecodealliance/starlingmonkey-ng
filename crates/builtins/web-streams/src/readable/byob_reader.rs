@@ -64,8 +64,9 @@ impl BYOBReader {
         // Step 1: If _view_.[[ByteLength]] is 0, return `a promise rejected with` a ``TypeError``
         //         exception.
         if view.byte_length() == 0 {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBReader",
                 c"read() view has a byte length of 0",
             ));
         }
@@ -73,16 +74,18 @@ impl BYOBReader {
         //         with` a ``TypeError`` exception.
         let buffer = view.viewed_buffer(scope)?;
         if buffer.byte_length() == 0 {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBReader",
                 c"read() view's buffer has a byte length of 0",
             ));
         }
         // Step 3: If ! `IsDetachedBuffer`(_view_.[[ViewedArrayBuffer]]) is true, return `a promise
         //         rejected with` a ``TypeError`` exception.
         if buffer.is_detached() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBReader",
                 c"read() view's buffer is detached",
             ));
         }
@@ -118,8 +121,9 @@ impl BYOBReader {
         // Step 7: If `this`.`[[stream]]` is undefined, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if self.data().stream.is_none() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBReader",
                 c"Cannot read from a reader that is not attached to a stream",
             ));
         }
@@ -167,8 +171,9 @@ impl BYOBReader {
         // Step 1: If `this`.`[[stream]]` is undefined, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if self.data().stream.is_none() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBReader",
                 c"Cannot cancel a reader that has no stream",
             ));
         }

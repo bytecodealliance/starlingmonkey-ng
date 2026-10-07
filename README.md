@@ -992,9 +992,19 @@ wasmtime run -Shttp=y,p3=y -Wcomponent-model-async=y tool.wasm
 A snapshot whose main module registers no `fetch` listener and exports no `run`
 function is refused, since it can neither serve nor run.
 A snapshot is also refused while the top level has not settled, or has left work
-behind, such as a timer or a `fetch` in flight. A host resource the script keeps
-without pending work, such as the body of a `fetch` response it did not read, is
-not detected. Its handle is not valid in an instance resumed from the snapshot.
+behind other than timers, such as a `fetch` in flight. A host resource the script
+keeps without pending work, such as the body of a `fetch` response it did not
+read, is not detected. Its handle is not valid in an instance resumed from the
+snapshot.
+
+The snapshot holds the timers the top level left pending, referenced and
+unreferenced. Timers that come due while the top level awaits run before the
+snapshot is taken, and the others run in the resumed instance once the time they
+had left when the snapshot was taken has passed. A served instance runs them from
+its first request on, between requests too, as it runs a timer a script started
+without a snapshot. `run` runs on the loop holding them, so they run while `run`
+does and are dropped once it has finished, as the timers `run` itself leaves
+behind are.
 
 ### Componentizing JavaScript
 
@@ -1101,19 +1111,24 @@ did not load reads the file when an export calls it, through the component's own
 filesystem imports and relative to the working directory the host gives it, so it
 fails with `--disable filesystem`.
 
-A snapshot holds memory, not a running event loop, so the top level must leave no
-asynchronous work behind when it finishes: no timer or interval still pending, no
-`fetch` it did not await. Componentization fails otherwise, listing each piece of
-work with the stack that created it:
+A snapshot holds memory but no host resources, so the top level must leave no
+asynchronous work behind when it finishes other than timers, such as a `fetch` it
+did not await. Componentization fails otherwise, listing
+each piece of work with the stack that created it:
 
 ```text
 Error: the application's top level finished evaluating with asynchronous work still pending, [...]
-  - a pending `interval` timer, created at:
+  - a host operation in flight, created at:
       startPolling@app.js:2:14
       @app.js:4:1
-  - a host operation in flight, created at:
-      @app.js:6:20
 ```
+
+The snapshot holds the timers and intervals the top level left pending,
+referenced and unreferenced, and the resumed instance runs each one once the time
+it had left when the snapshot was taken has passed. A component serving
+`wasi:http/handler` runs them from its first request on, between requests too. A
+`wasi:cli/run` export runs them while `run` does. A component that exports
+neither doesn't run them.
 
 The component opens its own standard streams when it first writes after
 resuming. Calling an import during initialization throws a `TypeError` naming

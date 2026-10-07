@@ -1,0 +1,5 @@
+{
+  "Clearing a non-existent measure doesn't affect existing measures": {
+    "status": "PASS"
+  }
+}

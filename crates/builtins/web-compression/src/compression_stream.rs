@@ -90,7 +90,7 @@ impl CompressionStream {
         chunk: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
         // Step 1: If _chunk_ is not a ``BufferSource`` type, then throw a ``TypeError``.
-        let input = buffer_source_bytes(scope, chunk)?;
+        let input = buffer_source_bytes(scope, chunk, "CompressionStream")?;
         // Step 2: Let _buffer_ be the result of compressing _chunk_ with _cs_'s `format` and
         //         `context`.
         // Step 3: If _buffer_ is empty, return.

@@ -118,16 +118,35 @@ impl ReadableStream {
                 // The WebIDL `object underlyingSource` argument is non-nullable, so `null` (and any
                 // non-object such as a number or string) throws a `TypeError`.
                 if !v.is_object() {
-                    return Err(js::error::throw_type_error(
+                    return Err(js::error::throw_binding_error(
                         scope,
-                        c"ReadableStream constructor: underlyingSource must be an object",
+                        &js::class::constructor_site::<ReadableStreamImpl>(),
+                        js::error::BindingError::InvalidArgument {
+                            index: 0,
+                            value: v,
+                            message:
+                                c"ReadableStream constructor: underlyingSource must be an object",
+                        },
                     ));
                 }
                 v
             }
         };
         let underlying_source_dict =
-            UnderlyingSource::from_jsval_throwing(scope, underlying_source_value, ())?;
+            UnderlyingSource::from_jsval(scope, underlying_source_value, ()).map_err(|error| {
+                match error {
+                    js::conversion::ConversionError::ExnPending => js::error::ExnThrown,
+                    js::conversion::ConversionError::Failure(message) => {
+                        let error = js::error::BindingError::InvalidArgument {
+                            index: 0,
+                            value: underlying_source_value,
+                            message: &message,
+                        };
+                        let site = js::class::constructor_site::<ReadableStreamImpl>();
+                        js::error::throw_binding_error(scope, &site, error)
+                    }
+                }
+            })?;
         // Step 3: Perform ! `InitializeReadableStream`(`this`).
         algorithms::initialize_readable_stream(self);
         // Step 4: If _underlyingSourceDict_["``type``"] is "``bytes``": ...
@@ -325,8 +344,9 @@ impl ReadableStream {
         // Step 1: If ! `IsReadableStreamLocked`(`this`) is true, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if self.is_locked() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStream",
                 c"Cannot cancel a stream that already has a reader",
             ));
         }
@@ -365,16 +385,18 @@ impl ReadableStream {
     ) -> Result<ReadableStream<'r>, ExnThrown> {
         // Step 1: If ! `IsReadableStreamLocked`(`this`) is true, throw a ``TypeError`` exception.
         if self.is_locked() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStream",
                 c"cannot pipe from a locked ReadableStream",
             ));
         }
         // Step 2: If ! `IsWritableStreamLocked`(_transform_["``writable``"]) is true, throw a
         //         ``TypeError`` exception.
         if crate::writable::algorithms::is_writable_stream_locked(&transform.writable) {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStream",
                 c"cannot pipe to a locked WritableStream",
             ));
         }
@@ -409,16 +431,18 @@ impl ReadableStream {
         // Step 1: If ! `IsReadableStreamLocked`(`this`) is true, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if self.is_locked() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStream",
                 c"cannot pipe from a locked ReadableStream",
             ));
         }
         // Step 2: If ! `IsWritableStreamLocked`(_destination_) is true, return `a promise rejected
         //         with` a ``TypeError`` exception.
         if crate::writable::algorithms::is_writable_stream_locked(&destination) {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStream",
                 c"cannot pipe to a locked WritableStream",
             ));
         }

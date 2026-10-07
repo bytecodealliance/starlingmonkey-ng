@@ -8,7 +8,8 @@
 
 use core_runtime::webidl_interface;
 use core_runtime::webidl_methods;
-use js::error::{throw_type_error, ExnThrown};
+use js::class::member_site;
+use js::error::{throw_binding_error, BindingError, ExnThrown, MemberKind};
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
@@ -44,18 +45,26 @@ pub(crate) struct EventListener {
     pub(crate) once: bool,
 }
 
-/// Convert an `EventListener?` argument: `None` for `null` and `undefined`, the
-/// object for any object, and a TypeError for anything else.
+/// Convert the `EventListener?` argument `callback` of the method `member`: `None` for `null` and
+/// `undefined`, the object for any object, and the binding error of an invalid second argument
+/// for anything else.
 fn event_listener_argument<'s>(
     scope: &'s Scope<'_>,
     callback: HandleValue<'_>,
+    member: &'static str,
 ) -> Result<Option<Object<'s>>, ExnThrown> {
     if callback.is_null_or_undefined() {
         return Ok(None);
     }
-    Object::from_value(scope, *callback)
-        .map(Some)
-        .map_err(|_| throw_type_error(scope, c"event listener must be an object"))
+    Object::from_value(scope, *callback).map(Some).map_err(|_| {
+        let error = BindingError::InvalidArgument {
+            index: 1,
+            value: callback,
+            message: c"event listener must be an object",
+        };
+        let site = member_site::<EventTargetImpl>(member, MemberKind::Method);
+        throw_binding_error(scope, &site, error)
+    })
 }
 
 /// <https://dom.spec.whatwg.org/#interface-eventtarget>
@@ -90,7 +99,7 @@ impl EventTarget {
         //         must happen even when `callback` is null.
         let options = algorithms::flatten_more_options(scope, options)?;
 
-        let Some(callback) = event_listener_argument(scope, callback)? else {
+        let Some(callback) = event_listener_argument(scope, callback, "addEventListener")? else {
             return Ok(());
         };
 
@@ -125,7 +134,8 @@ impl EventTarget {
         // Step 1: Let _capture_ be the result of `flattening` _options_.
         let capture = algorithms::flatten_options(scope, options)?;
 
-        let Some(callback) = event_listener_argument(scope, callback)? else {
+        let Some(callback) = event_listener_argument(scope, callback, "removeEventListener")?
+        else {
             return Ok(());
         };
 

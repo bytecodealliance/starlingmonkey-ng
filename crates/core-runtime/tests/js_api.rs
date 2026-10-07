@@ -925,3 +925,98 @@ fn objects_get_their_properties_in_one_call() {
         check(object.unwrap());
     }
 }
+
+/// A `PropertyWriter` with `PropertyInit::Define` collects the properties of its templates and
+/// adds them in order when it finishes, without calling the prototype's setters. Its `get` reads
+/// collected values and data properties of the prototype chain without adding the properties, and
+/// a read through an accessor adds them first and defines the later ones one by one. With
+/// `PropertyInit::Assign`, the prototype's setters are called.
+#[test]
+fn property_writer_creates_template_properties_in_order() {
+    use js::object::{PropertyInit, PropertyTemplate, TemplateKey};
+
+    static SYMBOL: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"s");
+    static FIRST: PropertyTemplate =
+        PropertyTemplate::new(&[TemplateKey::Name(c"a"), TemplateKey::Name(c"b")]);
+    static SECOND: PropertyTemplate =
+        PropertyTemplate::new(&[TemplateKey::Name(c"c"), TemplateKey::Symbol(&SYMBOL)]);
+
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    FIRST.register(&scope).unwrap();
+    SECOND.register(&scope).unwrap();
+    let proto = js::compile::evaluate(
+        &scope,
+        "globalThis.calls = []; ({ \
+           set a(v) { calls.push('set a'); }, \
+           inherited: 'from proto', \
+           get probe() { calls.push(Object.keys(this).join()); \
+                         Object.defineProperty(this, 'c', { value: 42, enumerable: true, \
+                                                            writable: true, configurable: true }); \
+                         return 'probed'; } \
+         })",
+    )
+    .unwrap();
+    let proto = Object::from_value(&scope, proto).unwrap();
+    let describe = |object: Object<'_>| -> String {
+        let global = scope.global();
+        global.set_property(&scope, c"object", object).unwrap();
+        let script = "Reflect.ownKeys(object).map((key) => { \
+                        const d = Object.getOwnPropertyDescriptor(object, key); \
+                        return [String(key), d.value, d.enumerable, d.writable, d.configurable]; \
+                      }).join(';') + '|' + calls.join(';')";
+        let value = js::compile::evaluate(&scope, script).unwrap();
+        String::from_jsval(&scope, value, ()).unwrap()
+    };
+
+    let object = Object::new_with_property_capacity(&scope, None, Some(proto), 4).unwrap();
+    // SAFETY: the object was just created, and the JavaScript that runs before the writer
+    // finishes adds no properties to it, apart from what the writer's reads run.
+    let mut properties =
+        unsafe { object.property_writer(&scope, &FIRST, PropertyInit::Define) }.unwrap();
+    properties.write(&scope, c"a", 1).unwrap();
+    properties.write(&scope, c"b", 2).unwrap();
+    let b = properties.get(&scope, c"b").unwrap();
+    assert_eq!(b.to_int32(), 2);
+    let inherited = properties.get(&scope, c"inherited").unwrap();
+    assert_eq!(
+        String::from_jsval(&scope, inherited, ()).unwrap(),
+        "from proto"
+    );
+    properties.continue_with(&scope, &SECOND).unwrap();
+    properties.write(&scope, c"c", 3).unwrap();
+    properties.write(&scope, &SYMBOL, 4).unwrap();
+    assert_eq!(describe(object), "|");
+    properties.finish(&scope).unwrap();
+    assert_eq!(
+        describe(object),
+        "a,1,true,true,true;b,2,true,true,true;c,3,true,true,true;Symbol(s),4,true,true,true|"
+    );
+
+    let object = Object::new_with_property_capacity(&scope, None, Some(proto), 4).unwrap();
+    // SAFETY: as above.
+    let mut properties =
+        unsafe { object.property_writer(&scope, &FIRST, PropertyInit::Define) }.unwrap();
+    properties.write(&scope, c"a", 1).unwrap();
+    properties.write(&scope, c"b", 2).unwrap();
+    let probed = properties.get(&scope, c"probe").unwrap();
+    assert_eq!(String::from_jsval(&scope, probed, ()).unwrap(), "probed");
+    properties.continue_with(&scope, &SECOND).unwrap();
+    properties.write(&scope, c"c", 3).unwrap();
+    properties.skip(&SYMBOL);
+    properties.finish(&scope).unwrap();
+    assert_eq!(
+        describe(object),
+        "a,1,true,true,true;b,2,true,true,true;c,3,true,true,true|a,b"
+    );
+
+    js::compile::evaluate(&scope, "calls.length = 0").unwrap();
+    let object = Object::new_with_property_capacity(&scope, None, Some(proto), 2).unwrap();
+    // SAFETY: `Assign` has no requirements.
+    let mut properties =
+        unsafe { object.property_writer(&scope, &FIRST, PropertyInit::Assign) }.unwrap();
+    properties.write(&scope, c"a", 1).unwrap();
+    properties.write(&scope, c"b", 2).unwrap();
+    properties.finish(&scope).unwrap();
+    assert_eq!(describe(object), "b,2,true,true,true|set a");
+}

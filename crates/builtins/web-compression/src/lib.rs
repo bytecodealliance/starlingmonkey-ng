@@ -11,7 +11,10 @@ pub mod decompression_stream;
 
 use compression::{Flush, Progress, ZlibError};
 use js::conversion::FromJSVal;
-use js::error::{ExnThrown, ThrowException, TypeError};
+use js::error::{
+    throw_binding_error, BindingError, BindingSite, ExnThrown, MemberKind, ThrowException,
+    TypeError,
+};
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::{Object, Uint8Array};
@@ -36,9 +39,15 @@ pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     decompression_stream::DecompressionStream::add_to_global(scope, global);
 }
 
-/// A copy of the bytes of `chunk`, or a `TypeError` if `chunk` isn't a `BufferSource`: an
-/// `ArrayBuffer`, or a view on one that isn't a `SharedArrayBuffer`.
-fn buffer_source_bytes(scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<Vec<u8>, ExnThrown> {
+/// A copy of the bytes of `chunk`, a chunk written to a stream of the class `interface`. A
+/// `chunk` that isn't a `BufferSource`, which is an `ArrayBuffer` or a view on one that isn't a
+/// `SharedArrayBuffer`, throws the binding error of an invalid argument of the class's transform
+/// algorithm, whose member name is empty.
+fn buffer_source_bytes(
+    scope: &Scope<'_>,
+    chunk: HandleValue<'_>,
+    interface: &'static str,
+) -> Result<Vec<u8>, ExnThrown> {
     // SAFETY: the slices are copied before anything can run a GC.
     let bytes = match ArrayBufferViewOrArrayBuffer::from_jsval(scope, chunk, ()) {
         Ok(ArrayBufferViewOrArrayBuffer::Buffer(buffer)) => unsafe { buffer.bytes() },
@@ -47,9 +56,17 @@ fn buffer_source_bytes(scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<Vec<
         },
         Err(js::conversion::ConversionError::ExnPending) => return Err(ExnThrown),
         _ => {
-            return Err(
-                TypeError("The chunk is not an ArrayBuffer or ArrayBufferView".into()).throw(scope),
-            )
+            let site = BindingSite {
+                interface,
+                member: "",
+                kind: MemberKind::Method,
+            };
+            let error = BindingError::InvalidArgument {
+                index: 0,
+                value: chunk,
+                message: c"The chunk is not an ArrayBuffer or ArrayBufferView",
+            };
+            return Err(throw_binding_error(scope, &site, error));
         }
     };
     let mut copy = Vec::new();

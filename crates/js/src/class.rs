@@ -25,7 +25,9 @@ use crate::class_spec::{
     JS_ResolveStandardClass,
 };
 use crate::conversion::{ConversionBehavior, ConversionError, FromJSVal, ToJSVal};
-use crate::error::{capture_stack_from_error, ExnThrown};
+use crate::error::{
+    capture_stack_from_error, throw_binding_error, BindingError, BindingSite, ExnThrown, MemberKind,
+};
 use crate::function::Callback;
 use crate::gc::handle::Stack;
 use crate::gc::scope::{RootScope, Scope};
@@ -1178,18 +1180,25 @@ pub static STARLING_GLOBAL_CLASS: JSClass = JSClass {
     oOps: ptr::null(),
 };
 
-static STARLING_GLOBAL_OPS: JSClassOps = JSClassOps {
-    addProperty: None,
-    delProperty: None,
-    enumerate: Some(JS_EnumerateStandardClasses),
-    newEnumerate: None,
-    resolve: Some(JS_ResolveStandardClass),
-    mayResolve: Some(JS_MayResolveStandardClass),
-    finalize: Some(finalize_starling_global),
-    call: None,
-    construct: None,
-    trace: Some(JS_GlobalObjectTraceHook),
-};
+static STARLING_GLOBAL_OPS: JSClassOps = starling_global_ops(None);
+
+/// The class ops of [`STARLING_GLOBAL_CLASS`], with `add_property` as the `addProperty` hook. A
+/// global of a class with these ops resolves the standard classes lazily, and its per-global
+/// [`ClassRegistry`] is dropped when it is finalized.
+pub const fn starling_global_ops(add_property: mozjs::jsapi::JSAddPropertyOp) -> JSClassOps {
+    JSClassOps {
+        addProperty: add_property,
+        delProperty: None,
+        enumerate: Some(JS_EnumerateStandardClasses),
+        newEnumerate: None,
+        resolve: Some(JS_ResolveStandardClass),
+        mayResolve: Some(JS_MayResolveStandardClass),
+        finalize: Some(finalize_starling_global),
+        call: None,
+        construct: None,
+        trace: Some(JS_GlobalObjectTraceHook),
+    }
+}
 
 /// Destructor for Starling's global class — drops the global's
 /// class's private data (if any) and the class registry.
@@ -1553,11 +1562,15 @@ pub trait ClassDef: Sized + Trace + 'static {
     /// `#[jsclass]` overrides it with the message of a JS class constructor.
     const CALL_WITHOUT_NEW_ERROR: &'static CStr = c"Constructor must be called with 'new'";
 
-    /// Throw the error for a method or accessor called on a `this` that isn't an initialized
-    /// instance, with `message` describing the problem. The default throws a `TypeError` with
-    /// `message`. `#[jsclass(invalid_this = "path")]` overrides it.
-    fn throw_invalid_this(scope: &Scope<'_>, message: &'static CStr) -> ExnThrown {
-        crate::error::throw_type_error(scope, message)
+    /// Throw the error for the member at `site` called on a `this` that isn't an initialized
+    /// instance, with `message` describing the problem. The default throws the
+    /// [`BindingError::InvalidThis`] error. `#[jsclass(invalid_this = "path")]` overrides it.
+    fn throw_invalid_this(
+        scope: &Scope<'_>,
+        site: &BindingSite,
+        message: &'static CStr,
+    ) -> ExnThrown {
+        throw_binding_error(scope, site, BindingError::InvalidThis { message })
     }
 
     /// Return the `JSClass` descriptor for this type.
@@ -1576,6 +1589,14 @@ pub trait ClassDef: Sized + Trace + 'static {
     /// private Rust data).  Override to request additional user-defined slots
     /// beyond this one.
     const RESERVED_SLOTS: u32 = MIN_CLASS_RESERVED_SLOTS;
+
+    /// The number of own properties an instance gets when it is created. [`create_instance_with`]
+    /// gives instances fixed slots for them, up to SpiderMonkey's maximum number of fixed slots.
+    /// `#[jsclass(templates = "...")]` sets it to the number of keys of those
+    /// [`PropertyTemplate`](crate::object::PropertyTemplate)s. The default is 0.
+    fn property_count() -> usize {
+        0
+    }
 
     /// Construct a new instance from JavaScript constructor arguments.
     ///
@@ -2088,6 +2109,20 @@ pub unsafe fn register_class<'s, T: ClassDef>(
     proto
 }
 
+/// The [`BindingSite`] of `T`'s constructor.
+pub fn constructor_site<T: ClassDef>() -> BindingSite {
+    member_site::<T>("constructor", MemberKind::Constructor)
+}
+
+/// The [`BindingSite`] of `T`'s member `member` of kind `kind`.
+pub fn member_site<T: ClassDef>(member: &'static str, kind: MemberKind) -> BindingSite {
+    BindingSite {
+        interface: T::NAME,
+        member,
+        kind,
+    }
+}
+
 /// Generic constructor callback for all ClassDef types.
 ///
 /// This is the `JSNative` that gets called when `new MyClass(...)` is invoked in JS.
@@ -2101,12 +2136,19 @@ unsafe extern "C" fn generic_constructor<T: ClassDef>(
     let args = CallArgs::from_vp(vp, argc);
 
     if !args.is_constructing() {
-        crate::error::throw_type_error(&scope, T::CALL_WITHOUT_NEW_ERROR);
+        let error = BindingError::CallWithoutNew {
+            message: T::CALL_WITHOUT_NEW_ERROR,
+        };
+        throw_binding_error(&scope, &constructor_site::<T>(), error);
         return false;
     }
 
     if !T::has_js_constructor() {
-        crate::error::throw_type_error(&scope, c"Illegal constructor");
+        throw_binding_error(
+            &scope,
+            &constructor_site::<T>(),
+            BindingError::IllegalConstructor,
+        );
         return false;
     }
 
@@ -2192,23 +2234,46 @@ pub unsafe extern "C" fn generic_class_trace<T: ClassDef>(trc: *mut JSTracer, ob
 /// - `args` must be from a valid JSNative call.
 unsafe fn extract_arg<'s, 'v, T: FromJSVal<'s, 'v>>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
     required: bool,
     config: T::Config,
 ) -> Result<T, ExnThrown> {
     if required && index >= args.argc_ {
-        return Err(crate::error::throw_type_error(
-            scope,
-            c"Not enough arguments",
-        ));
+        return Err(missing_argument(scope, site, args, index));
     }
     // `CallArgs::get` yields `undefined` for an out-of-range index.
     let val = crate::native::Handle::from_raw(args.get(index));
     T::from_jsval(scope, val, config).map_err(|e| match e {
         ConversionError::ExnPending => ExnThrown,
-        ConversionError::Failure(msg) => crate::error::throw_type_error(scope, &msg),
+        ConversionError::Failure(message) => throw_binding_error(
+            scope,
+            site,
+            BindingError::InvalidArgument {
+                index,
+                value: val,
+                message: &message,
+            },
+        ),
     })
+}
+
+/// Throw the [`BindingError::MissingArgument`] error for the argument at `index`.
+fn missing_argument(
+    scope: &Scope<'_>,
+    site: &BindingSite,
+    args: &CallArgs,
+    index: u32,
+) -> ExnThrown {
+    throw_binding_error(
+        scope,
+        site,
+        BindingError::MissingArgument {
+            index,
+            given: args.argc_,
+        },
+    )
 }
 
 /// Extract an argument from CallArgs and convert it to the desired Rust type.
@@ -2221,10 +2286,11 @@ unsafe fn extract_arg<'s, 'v, T: FromJSVal<'s, 'v>>(
 /// - `args` must be from a valid JSNative call.
 pub unsafe fn get_arg<'s, 'v, T: FromJSVal<'s, 'v, Config = ()>>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
 ) -> Result<T, ExnThrown> {
-    extract_arg(scope, args, index, true, ())
+    extract_arg(scope, site, args, index, true, ())
 }
 
 /// Extract an argument like [`get_arg`], but treat a missing argument as
@@ -2240,13 +2306,15 @@ pub unsafe fn get_arg<'s, 'v, T: FromJSVal<'s, 'v, Config = ()>>(
 /// - `args` must be from a valid JSNative call.
 pub unsafe fn get_arg_or_undefined<'s, 'v, T: FromJSVal<'s, 'v, Config = ()>>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
 ) -> Result<T, ExnThrown> {
-    extract_arg(scope, args, index, false, ())
+    extract_arg(scope, site, args, index, false, ())
 }
 
-/// Extract an integer argument with configurable conversion behavior.
+/// Extract an integer argument with configurable conversion behavior. A missing argument throws
+/// "Not enough arguments" if `required` is set, and converts as `undefined` otherwise.
 ///
 /// # Safety
 ///
@@ -2254,11 +2322,13 @@ pub unsafe fn get_arg_or_undefined<'s, 'v, T: FromJSVal<'s, 'v, Config = ()>>(
 /// - `args` must be from a valid JSNative call.
 pub unsafe fn get_int_arg<'s, 'v, T: FromJSVal<'s, 'v, Config = ConversionBehavior>>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
+    required: bool,
     behavior: ConversionBehavior,
 ) -> Result<T, ExnThrown> {
-    extract_arg(scope, args, index, true, behavior)
+    extract_arg(scope, site, args, index, required, behavior)
 }
 
 /// Extract an argument with an explicit conversion config.
@@ -2266,7 +2336,7 @@ pub unsafe fn get_int_arg<'s, 'v, T: FromJSVal<'s, 'v, Config = ConversionBehavi
 /// Used for container types like `Vec<T>` and `Record<V>` whose
 /// `FromJSVal::Config` forwards the inner type's config. When the inner
 /// type is an integer, the config is `ConversionBehavior`; for other
-/// inner types it is `()`.
+/// inner types it is `()`. A missing argument is handled as in [`get_int_arg`].
 ///
 /// # Safety
 ///
@@ -2275,18 +2345,20 @@ pub unsafe fn get_int_arg<'s, 'v, T: FromJSVal<'s, 'v, Config = ConversionBehavi
 #[doc(hidden)]
 pub unsafe fn get_arg_with_config<'s, 'v, T: FromJSVal<'s, 'v>>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
+    required: bool,
     config: T::Config,
 ) -> Result<T, ExnThrown> {
-    extract_arg(scope, args, index, true, config)
+    extract_arg(scope, site, args, index, required, config)
 }
 
 /// Extract a WebIDL `Promise<T>` argument from CallArgs.
 ///
-/// Performs an eager argc check that throws on missing arguments, and then
-/// registers a type check for `T` on the value a promise resolved with the
-/// argument resolves to.
+/// A missing argument throws "Not enough arguments" if `required` is set, and
+/// is `undefined` otherwise. A type check for `T` is then registered on the
+/// value a promise resolved with the argument resolves to.
 ///
 /// # Safety
 ///
@@ -2295,11 +2367,13 @@ pub unsafe fn get_arg_with_config<'s, 'v, T: FromJSVal<'s, 'v>>(
 #[doc(hidden)]
 pub unsafe fn get_checked_promise_arg<'s, T>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
+    required: bool,
     check: Callback,
 ) -> Result<PromiseOf<'s, T>, ExnThrown> {
-    let value = promise_arg_value(scope, args, index)?;
+    let value = promise_arg_value(scope, site, args, index, required)?;
     PromiseOf::new(scope, value, check)
 }
 
@@ -2313,24 +2387,26 @@ pub unsafe fn get_checked_promise_arg<'s, T>(
 #[doc(hidden)]
 pub unsafe fn get_unchecked_promise_arg<'s>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
+    required: bool,
 ) -> Result<crate::Promise<'s>, ExnThrown> {
-    let value = promise_arg_value(scope, args, index)?;
+    let value = promise_arg_value(scope, site, args, index, required)?;
     crate::Promise::new_resolved_with_value(scope, value)
 }
 
-/// The raw value a `Promise<T>` argument wraps, or a "Not enough arguments" exception.
+/// The raw value a `Promise<T>` argument wraps: `undefined` for a missing argument that isn't
+/// `required`, and a "Not enough arguments" exception for a missing one that is.
 unsafe fn promise_arg_value<'s>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
+    required: bool,
 ) -> Result<mozjs::gc::HandleValue<'s>, ExnThrown> {
-    if index >= args.argc_ {
-        return Err(crate::error::throw_type_error(
-            scope,
-            c"Not enough arguments",
-        ));
+    if required && index >= args.argc_ {
+        return Err(missing_argument(scope, site, args, index));
     }
     Ok(Handle::from_raw(args.get(index)))
 }
@@ -2348,14 +2424,12 @@ unsafe fn promise_arg_value<'s>(
 #[doc(hidden)]
 pub unsafe fn get_stack_arg<'s, T: StackType<'s>>(
     scope: &'s Scope<'_>,
+    site: &BindingSite,
     args: &CallArgs,
     index: u32,
 ) -> Result<T, ExnThrown> {
     if index >= args.argc_ {
-        return Err(crate::error::throw_type_error(
-            scope,
-            c"Not enough arguments",
-        ));
+        return Err(missing_argument(scope, site, args, index));
     }
     let val = *args.get(index);
     if !val.is_object() || !<T::Inner as JSType>::is_instance(val.to_object()) {
@@ -2365,7 +2439,12 @@ pub unsafe fn get_stack_arg<'s, T: StackType<'s>>(
             T::Inner::NAME,
         ))
         .unwrap_or_else(|_| c"argument is not the expected class".into());
-        return Err(crate::error::throw_type_error(scope, &msg));
+        let error = BindingError::InvalidArgument {
+            index,
+            value: Handle::from_raw(args.get(index)),
+            message: &msg,
+        };
+        return Err(throw_binding_error(scope, site, error));
     }
     let obj = val.to_object();
     let nn = NonNull::new(obj).unwrap();
@@ -2390,6 +2469,7 @@ pub unsafe fn get_stack_arg<'s, T: StackType<'s>>(
 #[inline]
 unsafe fn resolve_webidl_this<T: ClassDef>(
     scope: &Scope<'_>,
+    site: &BindingSite,
     args: &CallArgs,
     target_tag: usize,
 ) -> Result<*mut JSObject, ExnThrown> {
@@ -2403,7 +2483,11 @@ unsafe fn resolve_webidl_this<T: ClassDef>(
             return Ok(global);
         }
     }
-    Err(T::throw_invalid_this(scope, c"'this' is not an object"))
+    Err(T::throw_invalid_this(
+        scope,
+        site,
+        c"'this' is not an object",
+    ))
 }
 
 /// Extract the `this` object's private data in a method callback.
@@ -2416,10 +2500,11 @@ unsafe fn resolve_webidl_this<T: ClassDef>(
 /// - The `this` object must have private data of type `T`.
 pub unsafe fn get_this_data<'a, T: ClassDef>(
     scope: &'a Scope<'_>,
+    site: &BindingSite,
     args: &CallArgs,
 ) -> Result<Ref<'a, T>, ExnThrown> {
-    let obj = resolve_webidl_this::<T>(scope, args, class_tag::<T>())?;
-    unsafe { borrow::<T>(obj) }.ok_or_else(|| T::throw_invalid_this(scope, T::NOT_TYPE_ERROR))
+    let obj = resolve_webidl_this::<T>(scope, site, args, class_tag::<T>())?;
+    unsafe { borrow::<T>(obj) }.ok_or_else(|| T::throw_invalid_this(scope, site, T::NOT_TYPE_ERROR))
 }
 
 /// Extract the `this` object's private data mutably.
@@ -2431,10 +2516,12 @@ pub unsafe fn get_this_data<'a, T: ClassDef>(
 /// Same as [`get_this_data`], plus no other references to the data may exist.
 pub unsafe fn get_this_data_mut<'a, T: ClassDef>(
     scope: &'a Scope<'_>,
+    site: &BindingSite,
     args: &CallArgs,
 ) -> Result<RefMut<'a, T>, ExnThrown> {
-    let obj = resolve_webidl_this::<T>(scope, args, class_tag::<T>())?;
-    unsafe { borrow_mut::<T>(obj) }.ok_or_else(|| T::throw_invalid_this(scope, T::NOT_TYPE_ERROR))
+    let obj = resolve_webidl_this::<T>(scope, site, args, class_tag::<T>())?;
+    unsafe { borrow_mut::<T>(obj) }
+        .ok_or_else(|| T::throw_invalid_this(scope, site, T::NOT_TYPE_ERROR))
 }
 
 /// Extract the `this` object as a rooted stack newtype in a method callback.
@@ -2450,17 +2537,19 @@ pub unsafe fn get_this_data_mut<'a, T: ClassDef>(
 #[inline]
 pub unsafe fn get_this<'s, T: StackType<'s>>(
     scope: &'s Scope<'s>,
+    site: &BindingSite,
     args: &CallArgs,
 ) -> Result<T, ExnThrown>
 where
     T::Inner: ClassDef,
 {
-    let obj = resolve_webidl_this::<T::Inner>(scope, args, class_tag::<T::Inner>())?;
+    let obj = resolve_webidl_this::<T::Inner>(scope, site, args, class_tag::<T::Inner>())?;
     let concrete_tag = crate::object::get_object_class(obj) as usize;
     let target_tag = class_tag::<T::Inner>();
     if !is_derived_from_type(concrete_tag, target_tag) {
         return Err(T::Inner::throw_invalid_this(
             scope,
+            site,
             T::Inner::NOT_TYPE_ERROR,
         ));
     }
@@ -2470,6 +2559,7 @@ where
     if get_private::<T::Inner>(obj).is_none() {
         return Err(T::Inner::throw_invalid_this(
             scope,
+            site,
             T::Inner::PROTOTYPE_CALL_ERROR,
         ));
     }
@@ -2726,8 +2816,12 @@ pub fn try_create_instance_with<'s, T: ClassDef>(
     init: impl FnOnce(Object<'s>) -> Result<T, ExnThrown>,
 ) -> Result<T::Rooted<'s>, ExnThrown> {
     let proto = registered_prototype::<T>(scope)?;
-    let class = T::class();
-    let obj = Object::new_with_proto(scope, class, proto)?;
+    let obj = Object::new_with_property_capacity(
+        scope,
+        Some(T::class()),
+        Some(proto),
+        T::property_count(),
+    )?;
     T::install_unforgeable(scope, obj)?;
     let data = init(obj)?;
     unsafe {
@@ -2741,13 +2835,19 @@ pub fn try_create_instance_with<'s, T: ClassDef>(
 /// Create a JS object backed by `data` for the constructor call `args`. Its prototype is the
 /// `prototype` of `args`' `new.target`, as for an instance that the class's own constructor
 /// creates, so a constructor function that isn't `T`'s can create instances of `T` for the
-/// subclasses that extend it.
+/// subclasses that extend it. A `property_count` other than 0 gives it fixed slots for that many
+/// own properties, as [`create_instance_with_proto`] does.
 pub fn create_instance_for_constructor<'s, T: ClassDef>(
     scope: &'s Scope<'_>,
     args: &CallArgs,
     data: T,
+    property_count: usize,
 ) -> Result<T::Rooted<'s>, ExnThrown> {
-    let obj = Object::new_for_constructor(scope, T::class(), args)?;
+    let obj = if property_count == 0 {
+        Object::new_for_constructor(scope, T::class(), args)?
+    } else {
+        Object::new_with_capacity_for_constructor(scope, Some(T::class()), args, property_count)?
+    };
     T::install_unforgeable(scope, obj)?;
     // SAFETY: `obj` was just created with `T`'s class, which finalizes private data of type `T`.
     unsafe { set_private(obj.as_raw(), data) };
@@ -2756,13 +2856,16 @@ pub fn create_instance_for_constructor<'s, T: ClassDef>(
     Ok(T::Rooted::from(stack))
 }
 
-/// Create a JS object backed by `data`, whose prototype is `proto`.
+/// Create a JS object backed by `data`, whose prototype is `proto`, with fixed slots for
+/// `property_count` own properties, up to SpiderMonkey's maximum number of fixed slots.
 pub fn create_instance_with_proto<'s, T: ClassDef>(
     scope: &'s Scope<'_>,
     proto: Object<'s>,
     data: T,
+    property_count: usize,
 ) -> Result<T::Rooted<'s>, ExnThrown> {
-    let obj = Object::new_with_proto(scope, T::class(), proto)?;
+    let obj =
+        Object::new_with_property_capacity(scope, Some(T::class()), Some(proto), property_count)?;
     T::install_unforgeable(scope, obj)?;
     // SAFETY: `obj` was just created with `T`'s class, which finalizes private data of type `T`.
     unsafe { set_private(obj.as_raw(), data) };

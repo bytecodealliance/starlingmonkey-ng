@@ -4,7 +4,7 @@
 //!
 //! A main module `import`s from a synthesized interface module, calls the
 //! imported functions and observes the lifted results, while a recording
-//! [`ImportInvoker`] stands in for the wit-dylib host call by driving the real
+//! [`ImportInvoker`] replaces the wit-dylib host call by driving the real
 //! `value::pop_*`/`push_*` conversions by hand.
 //!
 //! Like the other native suites this is one `#[test]` against a once-per-process
@@ -207,26 +207,11 @@ impl ImportInvoker for RecordingInvoker {
                 let desc = component_model::ResourceDesc::Imported {
                     type_idx: self.resource_type_idx,
                 };
-                let dispose = no_op_dispose(scope);
-                value::push_own(stack, scope, &desc, self.ctor_handle, dispose)
+                value::push_own(stack, scope, &desc, self.ctor_handle)
             }
             other => panic!("recording invoker: unexpected result shape {other:?}"),
         }
     }
-}
-
-/// A no-op dispose callback for minted wrappers (the test does not exercise
-/// drop here; `sync_native` covers dispose semantics).
-fn no_op_dispose<'s>(scope: &'s Scope<'_>) -> js::prelude::HandleValue<'s> {
-    let f = js::Function::new_callback(
-        scope,
-        c"noopDispose",
-        0,
-        |_scope, _args, _payload| Ok(js::value::undefined()),
-        (),
-    )
-    .unwrap();
-    scope.root_value(f.as_value())
 }
 
 /// Import indices, assigned by hand (the synthesis records every import by its
@@ -350,6 +335,7 @@ fn build_world() -> WorldDesc {
                 )],
             }],
         }],
+        unexported_error_classes: Vec::new(),
     }
 }
 
@@ -403,6 +389,7 @@ fn imports_native() {
     result_typed_import_ok_unwraps_to_bare_value();
     result_typed_import_err_throws_component_error();
     async_import_with_sync_invoker_throws();
+    method_without_receiver_throws();
     resource_constructor_method_and_static(&log);
     enums_and_flags_are_frozen_objects();
     #[cfg(feature = "debugmozjs")]
@@ -435,6 +422,21 @@ fn async_import_with_sync_invoker_throws() {
             "an async import on a sync-only invoker throws a TypeError, not a panic"
         );
         assert!(!js::exception::is_pending(scope));
+    });
+}
+
+/// A method import called with no arguments, so without its receiver, throws a
+/// `TypeError` counting the arguments without the receiver.
+fn method_without_receiver_throws() {
+    with_main_scope(|scope, _ns| {
+        assert!(component_model::call_import_from_js(scope, IDX_METHOD, &[]).is_err());
+        let message = js::error::ExnThrown::capture(scope).message;
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.ends_with("takes 1 argument, got 0")),
+            "{message:?}"
+        );
     });
 }
 
@@ -547,16 +549,10 @@ fn resource_constructor_method_and_static(log: &Rc<RefCell<Recording>>) {
                 rec.u32_args
             );
         }
-        // The wrapper holds the hidden canonical handle the invoker returned.
-        let inst_obj = Object::from_value(scope, inst).expect("instance is an object");
-        let handle = inst_obj
-            .get_property(scope, component_model::resources::HANDLE_FIELD)
-            .expect("handle field readable")
-            .get();
-        // A handle above `i32::MAX` is boxed as a double, so it is read through
-        // the number path.
-        assert!(
-            handle.is_number() && handle.to_number() as u32 == CTOR_HANDLE,
+        // The wrapper holds the canonical handle the invoker returned.
+        assert_eq!(
+            component_model::resources::imported_handle(scope, scope.root_value(inst)),
+            Some(CTOR_HANDLE),
             "minted wrapper carries the constructor's canonical handle"
         );
 
@@ -604,16 +600,14 @@ fn resource_constructor_method_and_static(log: &Rc<RefCell<Recording>>) {
 /// Stage 4: the imported-resource prototype registry survives a relocating GC.
 ///
 /// `push_own`'s imported arm re-reads `RESOURCE_PROTOTYPES` on every wrapper and
-/// re-parents the new wrapper to the registered prototype. If that registry's
+/// creates the new wrapper with the registered prototype. If that registry's
 /// boxed `Heap` were not traced by `trace_resources`, a compacting GC would move
 /// the prototype without updating the stored pointer and a later mint would crash
 /// under `debugmozjs`.
 ///
 /// The synthesis-time compacting zeal set in the `initialize_runtime` closure
 /// above already relocates the prototype, so an un-traced `RESOURCE_PROTOTYPES`
-/// holds a stale pointer by the time stage 3 builds its first wrapper. Fault
-/// injection confirms it: dropping the `RESOURCE_PROTOTYPES` trace SIGSEGVs in
-/// `set_prototype`.
+/// holds a stale pointer by the time stage 3 builds its first wrapper.
 ///
 /// This stage adds a positive exercise on top. It mints a wrapper, forces another
 /// compacting GC, builds a second wrapper whose registry re-read happens after the
@@ -634,7 +628,7 @@ fn resource_prototype_registry_survives_relocation() {
         force_compacting_gc(scope);
 
         // The registry re-read now happens after relocation, so
-        // `with_resource_prototype` reifies the moved `Heap`.
+        // `resource_prototype` reifies the moved `Heap`.
         let second = call_named(scope, ns, c"ctorR", &[num(scope, 22)]);
         let second_obj = Object::from_value(scope, second).expect("second instance is an object");
 

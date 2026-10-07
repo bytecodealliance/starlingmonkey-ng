@@ -1,0 +1,5 @@
+{
+  "PerformanceObserver modifications inside callback should update filtering and not clear buffer": {
+    "status": "PASS"
+  }
+}

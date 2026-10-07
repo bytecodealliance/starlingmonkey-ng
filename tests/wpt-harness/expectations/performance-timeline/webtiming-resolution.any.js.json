@@ -1,0 +1,9 @@
+{
+  "Verifies the resolution of performance.now() is at least 5 microseconds.": {
+    "status": "FAIL"
+  },
+  "Verifies the resolution of entry.startTime is at least 5 microseconds.": {
+    "status": "PASS",
+    "wasm_status": "FLAKY"
+  }
+}

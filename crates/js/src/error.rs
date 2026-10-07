@@ -307,6 +307,14 @@ static mut URI_ERROR_FMT: JSErrorFormatString = JSErrorFormatString {
     exnType: JSExnType::JSEXN_URIERR as i16,
 };
 
+/// Format string struct for `EvalError`.
+static mut EVAL_ERROR_FMT: JSErrorFormatString = JSErrorFormatString {
+    name: c"RUSTMSG_EVAL_ERROR".as_ptr(),
+    format: ERROR_FORMAT_STRING.as_ptr(),
+    argCount: 1,
+    exnType: JSExnType::JSEXN_EVALERR as i16,
+};
+
 /// Callback for [`JS_ReportErrorNumberUTF8`].
 unsafe extern "C" fn get_error_message(
     _user_ref: *mut std::os::raw::c_void,
@@ -320,6 +328,7 @@ unsafe extern "C" fn get_error_message(
         JSExnType::JSEXN_INTERNALERR => &raw const INTERNAL_ERROR_FMT,
         JSExnType::JSEXN_SYNTAXERR => &raw const SYNTAX_ERROR_FMT,
         JSExnType::JSEXN_URIERR => &raw const URI_ERROR_FMT,
+        JSExnType::JSEXN_EVALERR => &raw const EVAL_ERROR_FMT,
         _ => panic!("Bad error number: {error_number}"),
     }
 }
@@ -354,6 +363,24 @@ pub fn throw_syntax_error(scope: &Scope<'_>, error: &CStr) -> ExnThrown {
 /// Throw a `URIError` with the given message and return `ExnThrown`.
 pub fn throw_uri_error(scope: &Scope<'_>, error: &CStr) -> ExnThrown {
     throw_js_error(scope, error, JSExnType::JSEXN_URIERR as u32)
+}
+
+/// Throw an `EvalError` with the message `error` on `cx`, for callbacks that get a raw context.
+///
+/// # Safety
+///
+/// `cx` must be a live context.
+pub(crate) unsafe fn report_eval_error(cx: *mut mozjs::jsapi::JSContext, error: &CStr) {
+    // SAFETY: the caller passes a live context, and the format callback and message are valid.
+    unsafe {
+        JS_ReportErrorNumberUTF8(
+            cx,
+            Some(get_error_message),
+            std::ptr::null_mut(),
+            JSExnType::JSEXN_EVALERR as u32,
+            error.as_ptr(),
+        )
+    };
 }
 
 fn throw_js_error(scope: &Scope<'_>, error: &CStr, error_number: u32) -> ExnThrown {
@@ -532,6 +559,15 @@ pub fn new_error<'s>(
     message: &str,
 ) -> Result<mozjs::gc::HandleValue<'s>, ExnThrown> {
     let message = crate::string::Str::from_str(scope, message)?;
+    new_error_with_message(scope, kind, message)
+}
+
+/// [`new_error`] with the JS string `message`, which can hold any UTF-16 code units.
+pub fn new_error_with_message<'s>(
+    scope: &'s Scope<'_>,
+    kind: JSExnType,
+    message: crate::string::Str<'_>,
+) -> Result<mozjs::gc::HandleValue<'s>, ExnThrown> {
     let stack = crate::stack::capture_saved_frame(scope, MAX_STACK_FRAMES)?;
     let raw = unsafe { scope.raw_cx_no_gc() };
     rooted!(in(raw) let mut file = crate::string::Str::empty(scope).as_raw());
@@ -622,5 +658,154 @@ pub fn capture_stack_from_error(scope: &Scope<'_>, obj: &Object<'_>) {
         }
         Ok(None) => {}
         Err(ExnThrown) => crate::exception::clear(scope),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binding errors
+// ---------------------------------------------------------------------------
+
+/// The kind of class member a [`BindingSite`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberKind {
+    /// The class's constructor. Its member name is `"constructor"`.
+    Constructor,
+    /// A prototype method.
+    Method,
+    /// A static method.
+    StaticMethod,
+    /// A prototype getter.
+    Getter,
+    /// A prototype setter.
+    Setter,
+    /// A function on the global object, a namespace or a module. Its interface name is empty.
+    Function,
+}
+
+/// The class member that throws a [`BindingError`], with the names JavaScript sees: the class's
+/// name and the member's name.
+#[derive(Clone, Copy, Debug)]
+pub struct BindingSite {
+    /// The class's name, or `""` for a [`MemberKind::Function`].
+    pub interface: &'static str,
+    /// The member's name, or `""` for an algorithm of the class that runs outside a call of one
+    /// of its members, such as a stream's transform algorithm.
+    pub member: &'static str,
+    /// The kind of member.
+    pub kind: MemberKind,
+}
+
+/// An error that a class member throws: one of the errors its generated binding code throws
+/// before the member's own code runs, or an [`Operation`](BindingError::Operation) error of the
+/// member's own code.
+#[derive(Clone, Copy, Debug)]
+pub enum BindingError<'a> {
+    /// The call has `given` arguments, and the required argument at `index` is missing.
+    MissingArgument { index: u32, given: u32 },
+    /// Argument `index`, `value`, failed to convert. `message` describes the failure.
+    InvalidArgument {
+        index: u32,
+        value: mozjs::gc::HandleValue<'a>,
+        message: &'a CStr,
+    },
+    /// `this` isn't an initialized instance of the class. `message` describes the problem.
+    InvalidThis { message: &'a CStr },
+    /// The class has no constructor that JavaScript can call.
+    IllegalConstructor,
+    /// The class's constructor was called without `new`. `message` describes the problem.
+    CallWithoutNew { message: &'a CStr },
+    /// An error of the member's own steps: a `kind` error with `message`. `code` is the error
+    /// code Node.js gives the error, such as `ERR_ENCODING_NOT_SUPPORTED`, `args` are the strings
+    /// its message includes, and `value` is the JS value its message shows, if any.
+    Operation {
+        kind: JSExnType,
+        message: &'a CStr,
+        code: &'static str,
+        args: &'a [&'a str],
+        value: Option<mozjs::gc::HandleValue<'a>>,
+    },
+}
+
+impl BindingError<'_> {
+    /// The type and message of the error created without a [`BindingErrorHook`].
+    fn default_error(&self) -> (JSExnType, &CStr) {
+        let type_error = JSExnType::JSEXN_TYPEERR;
+        match self {
+            BindingError::MissingArgument { .. } => (type_error, c"Not enough arguments"),
+            BindingError::InvalidArgument { message, .. } => (type_error, message),
+            BindingError::InvalidThis { message } => (type_error, message),
+            BindingError::IllegalConstructor => (type_error, c"Illegal constructor"),
+            BindingError::CallWithoutNew { message } => (type_error, message),
+            BindingError::Operation { kind, message, .. } => (*kind, message),
+        }
+    }
+}
+
+/// A function that creates its own error value for a [`BindingError`] at a [`BindingSite`], or
+/// returns `None` to leave the error to the default. Installed with [`set_binding_error_hook`].
+pub type BindingErrorHook = for<'s> fn(
+    &'s Scope<'_>,
+    &BindingSite,
+    &BindingError<'_>,
+) -> Option<Result<mozjs::gc::HandleValue<'s>, ExnThrown>>;
+
+crate::instance_local! {
+    static BINDING_ERROR_HOOK: std::cell::Cell<Option<BindingErrorHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install `hook`, which [`throw_binding_error`] calls for every binding error in this runtime.
+/// `None` removes it.
+pub fn set_binding_error_hook(hook: Option<BindingErrorHook>) {
+    BINDING_ERROR_HOOK.with(|cell| cell.set(hook));
+}
+
+/// Throw the error for `error` at `site`: the error the [`BindingErrorHook`] creates, or, if no
+/// hook is installed or the hook returns `None`, an error with the type and message `error`
+/// describes. All but `Operation` errors are `TypeError`s, and the missing argument's message is
+/// "Not enough arguments".
+pub fn throw_binding_error(
+    scope: &Scope<'_>,
+    site: &BindingSite,
+    error: BindingError<'_>,
+) -> ExnThrown {
+    let hook = BINDING_ERROR_HOOK.with(std::cell::Cell::get);
+    match hook.and_then(|hook| hook(scope, site, &error)) {
+        Some(Ok(value)) => crate::exception::set_pending(
+            scope,
+            value,
+            mozjs::jsapi::ExceptionStackBehavior::Capture,
+        ),
+        Some(Err(ExnThrown)) => ExnThrown,
+        None => {
+            let (kind, message) = error.default_error();
+            throw_js_error(scope, message, kind as u32)
+        }
+    }
+}
+
+/// An [`Operation`](BindingError::Operation) error of the member at `site` with an owned message
+/// and arguments, for a member to return as its `Err` value.
+#[derive(Debug)]
+pub struct OperationError {
+    pub site: BindingSite,
+    pub kind: JSExnType,
+    pub message: String,
+    pub code: &'static str,
+    pub args: Vec<String>,
+}
+
+impl ThrowException for OperationError {
+    fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+        let message = CString::new(self.message).unwrap_or_else(|_| c"operation failed".into());
+        let args: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        let error = BindingError::Operation {
+            kind: self.kind,
+            message: &message,
+            code: self.code,
+            args: &args,
+            value: None,
+        };
+        throw_binding_error(scope, &self.site, error)
     }
 }

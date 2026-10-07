@@ -143,6 +143,13 @@ pub fn get_script_private<'s>(
     rval.handle()
 }
 
+/// Set the private value of `script`, which the script's source object holds for every function
+/// compiled with it, and which [`get_script_private`] returns.
+pub fn set_script_private(script: Handle<'_, *mut JSScript>, value: HandleValue<'_>) {
+    // SAFETY: `script` and `value` are rooted by their handles.
+    unsafe { mozjs::jsapi::JS::SetScriptPrivate(script.get(), &*value) };
+}
+
 /// Get the `JSScript` associated with a module record.
 pub fn get_module_script(module_record: Object) -> Option<NonNull<JSScript>> {
     NonNull::new(unsafe { wrappers2::GetModuleScript(module_record.handle()) })

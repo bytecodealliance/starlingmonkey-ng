@@ -166,8 +166,9 @@ pub(crate) fn flatten_more_options<'s>(
 /// Read the `signal` member of an `addEventListener` options dictionary.
 ///
 /// An absent or `undefined` member yields `None`; any present value is
-/// converted to `AbortSignal`, throwing a `TypeError` for `null` or any other
-/// non-`AbortSignal` value.
+/// converted to `AbortSignal`. `null` and any other non-`AbortSignal` value
+/// throw the binding error of an invalid third argument of `addEventListener`,
+/// with the member's value.
 fn read_signal_option<'s>(
     scope: &'s Scope<'_>,
     options: &Object<'_>,
@@ -179,7 +180,16 @@ fn read_signal_option<'s>(
     match AbortSignal::from_jsval(scope, val, ()) {
         Ok(signal) => Ok(Some(signal)),
         Err(ConversionError::Failure(_)) => {
-            Err(throw_type_error(scope, c"signal must be an AbortSignal"))
+            let error = js::error::BindingError::InvalidArgument {
+                index: 2,
+                value: val,
+                message: c"signal must be an AbortSignal",
+            };
+            let site = js::class::member_site::<EventTargetImpl>(
+                "addEventListener",
+                js::error::MemberKind::Method,
+            );
+            Err(js::error::throw_binding_error(scope, &site, error))
         }
         Err(ConversionError::ExnPending) => {
             // Propagate any exception thrown by the conversion (e.g. from a proxy trap).

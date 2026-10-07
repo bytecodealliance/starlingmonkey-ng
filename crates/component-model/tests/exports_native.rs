@@ -57,6 +57,11 @@ const MAIN: &str = r#"
         static label() { return "Counter"; }
     }
 
+    // A class whose method is a getter that throws.
+    export class Flaky {
+        get bump() { throw new Error("getter boom"); }
+    }
+
     // Items in the package layer, the interface layer and the versioned layer,
     // and one provided in two shapes.
     export const demoApp = { api: { greet() { return "package layer"; } } };
@@ -545,6 +550,18 @@ fn missing_export_message_names_the_js_export() {
             .expect("a missing class fails the build");
         assert!(
             err.contains("a class `Missing` with a constructor"),
+            "{err}"
+        );
+        assert!(!js::exception::is_pending(scope));
+
+        // A getter that throws while the export is resolved is reported as the
+        // exception, not as a missing export.
+        let err = ExportTable::build(scope, ns, [spec(None, "[method]flaky.bump")])
+            .err()
+            .expect("a throwing getter fails the build");
+        assert!(
+            err.contains("resolving the WIT export `[method]flaky.bump` threw")
+                && err.contains("getter boom"),
             "{err}"
         );
         assert!(!js::exception::is_pending(scope));

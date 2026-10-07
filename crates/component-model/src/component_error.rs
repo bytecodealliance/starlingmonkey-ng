@@ -207,22 +207,20 @@ impl ErrorClass {
 }
 
 js::instance_local! {
-    /// The function [`error_class`] creates classes with, created on first use.
-    static CLASS_FACTORY: RefCell<Option<Heap<Value>>> = const { RefCell::new(None) };
-}
-
-js::instance_local! {
     /// Every class [`error_class`] created, by the type it was created for.
     static ERROR_CLASSES: RefCell<HashMap<ErrorClass, Heap<js::object::Object>>> =
         RefCell::new(HashMap::new());
 }
 
-/// The source of the function creating an error class. It takes the prototype
-/// of `ComponentError` and the class name, and returns a class extending
-/// `ComponentError` with that name, whose instances' `name` is also that name.
+/// The marker type of the realm object [`install_class_factory`] registers.
+struct ClassFactory;
+
+/// The source of a function that takes the `ComponentError` constructor and
+/// returns the function creating an error class. That function takes the class
+/// name, and returns a class extending `ComponentError` with that name, whose
+/// instances' `name` is also that name.
 const CLASS_FACTORY_SOURCE: &str = r#"
-(proto, name) => {
-    const Base = proto.constructor;
+(Base) => (name) => {
     const Class = ({ [name]: class extends Base {} })[name];
     Object.defineProperty(Class.prototype, "name", {
         value: name,
@@ -233,29 +231,32 @@ const CLASS_FACTORY_SOURCE: &str = r#"
 }
 "#;
 
-/// The class for payloads of `class`'s type, created on first use and shared by
-/// every later use in the same instance.
+/// Create the function [`error_class`] creates classes with, and register it as
+/// a realm object. Must run when the global is set up, after `ComponentError` is
+/// registered.
+pub(crate) fn install_class_factory(scope: &Scope<'_>) -> Result<(), ExnThrown> {
+    let make = js::compile::evaluate(scope, CLASS_FACTORY_SOURCE)?;
+    let base = js::class::class_constructor::<ComponentErrorImpl>(scope)?;
+    let factory = Function::call(scope, HandleValue::undefined(), make, &[base])?;
+    let factory = Object::from_value(scope, factory).map_err(|e| e.throw(scope))?;
+    js::class::register_realm_object::<ClassFactory>(scope, factory);
+    Ok(())
+}
+
+/// The class for payloads of `class`'s type, created by the first call and
+/// returned by every later call in the same instance.
+/// [`synthesize_import_modules`](crate::imports::synthesize_import_modules)
+/// makes the first call for the class of every type in the world.
 pub fn error_class<'s>(scope: &'s Scope<'_>, class: &ErrorClass) -> Result<Object<'s>, ExnThrown> {
     let existing = ERROR_CLASSES.with(|cell| cell.borrow().get(class).map(|heap| heap.get(scope)));
     if let Some(existing) = existing {
         return Ok(existing);
     }
-    let factory = CLASS_FACTORY.with(|cell| cell.borrow().as_ref().map(|heap| heap.get(scope)));
-    let factory = match factory {
-        Some(factory) => factory,
-        None => {
-            let factory = js::compile::evaluate(scope, CLASS_FACTORY_SOURCE)?;
-            CLASS_FACTORY.with(|cell| *cell.borrow_mut() = Some(Heap::from(factory.get())));
-            factory
-        }
-    };
-    let proto =
-        js::class::get_prototype_object_for::<ComponentErrorImpl>(scope).ok_or_else(|| {
-            js::error::throw_type_error(scope, c"ComponentError is not installed on this global")
-        })?;
-    let name = scope.root_value(js::JSString::from_str(scope, &class.js_name())?.as_value());
-    let proto = scope.root_value(proto.as_value());
-    let created = Function::call(scope, HandleValue::undefined(), factory, &[proto, name])?;
+    let factory = js::class::realm_object::<ClassFactory>(scope).ok_or_else(|| {
+        js::error::throw_type_error(scope, c"the error class factory is not installed")
+    })?;
+    let name = js::JSString::from_str(scope, &class.js_name())?;
+    let created = Function::call(scope, HandleValue::undefined(), factory, &[name])?;
     let created = Object::from_value(scope, created).map_err(|_| {
         js::error::throw_type_error(scope, c"the error class factory returned no class")
     })?;
@@ -299,18 +300,13 @@ pub(crate) fn throw_err(
     }
 }
 
-/// Trace the error-class factory and every error class.
+/// Trace every error class.
 ///
 /// # Safety
 ///
 /// `trc` must be a valid `JSTracer` provided by SpiderMonkey's GC, and this must
 /// run from the crate tracer, with JS execution paused.
 pub(crate) unsafe fn trace_error_classes(trc: *mut JSTracer) {
-    CLASS_FACTORY.with(|cell| {
-        if let Some(factory) = &*cell.as_ptr() {
-            factory.trace(trc);
-        }
-    });
     ERROR_CLASSES.with(|cell| {
         for class in (*cell.as_ptr()).values() {
             class.trace(trc);
@@ -318,9 +314,8 @@ pub(crate) unsafe fn trace_error_classes(trc: *mut JSTracer) {
     });
 }
 
-/// Drop the error-class factory and every error class. See
+/// Drop every error class. See
 /// [`crate::tracing::clear_traced_roots`].
 pub(crate) fn clear_traced_roots() {
-    CLASS_FACTORY.with(|cell| *cell.borrow_mut() = None);
     ERROR_CLASSES.with(|cell| cell.borrow_mut().clear());
 }

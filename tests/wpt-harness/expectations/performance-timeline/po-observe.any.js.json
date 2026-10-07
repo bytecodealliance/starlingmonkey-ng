@@ -1,0 +1,20 @@
+{
+  "entryTypes must be a sequence or throw a TypeError": {
+    "status": "PASS"
+  },
+  "Empty sequence entryTypes does not throw an exception.": {
+    "status": "PASS"
+  },
+  "Unknown entryTypes do not throw an exception.": {
+    "status": "PASS"
+  },
+  "Filter unsupported entryType entryType names within the entryTypes sequence": {
+    "status": "PASS"
+  },
+  "Check observer callback parameter and this values": {
+    "status": "PASS"
+  },
+  "replace observer if already present": {
+    "status": "PASS"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "Calling observe() without 'type' or 'entryTypes' throws a TypeError": {
+    "status": "PASS"
+  },
+  "Calling observe() with entryTypes and then type should throw an InvalidModificationError": {
+    "status": "PASS"
+  },
+  "Calling observe() with type and then entryTypes should throw an InvalidModificationError": {
+    "status": "PASS"
+  },
+  "Calling observe() with type and entryTypes should throw a TypeError": {
+    "status": "PASS"
+  },
+  "Passing in unknown values to type does throw an exception.": {
+    "status": "PASS"
+  },
+  "observe() with different type values stacks.": {
+    "status": "PASS"
+  }
+}

@@ -20,6 +20,7 @@ url.workspace = true
 getrandom.workspace = true
 libc = "0.2"
 reqwest.workspace = true
+socket2 = { version = "0.6", features = ["all"] }
 tokio.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

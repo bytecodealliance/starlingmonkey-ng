@@ -77,7 +77,7 @@ pub fn run(
 /// fresh global, which needs the script run in it to register a handler.
 pub fn content_script(config: &config::RuntimeConfig) -> Result<(String, String), String> {
     if let Some(ref eval) = config.eval_script {
-        return Ok((eval.clone(), "<eval>".to_string()));
+        return Ok((eval.clone(), module::EVAL_FILENAME.to_string()));
     }
     let path = &config.script_path;
     let source =

@@ -18,6 +18,41 @@ pub fn random_uuid() -> String {
     platform::random::uuid_v4()
 }
 
+/// The message of the `TypeMismatchError` that [`get_random_values`] throws, Node.js's message.
+pub const TYPE_MISMATCH_MESSAGE: &str = "The data argument must be an integer-type TypedArray";
+
+/// <https://w3c.github.io/webcrypto/#Crypto-method-getRandomValues>, with Node.js's error
+/// messages.
+pub fn get_random_values(
+    array: js::ArrayBufferView<'_>,
+) -> Result<js::ArrayBufferView<'_>, DOMExceptionError> {
+    // Step 1: If array is not an Int8Array, Uint8Array, Uint8ClampedArray, Int16Array,
+    // Uint16Array, Int32Array, Uint32Array, BigInt64Array, or BigUint64Array, then throw a
+    // TypeMismatchError and terminate the algorithm.
+    if !array.view_kind().is_integer_array() {
+        return Err(DOMExceptionError::new(
+            "TypeMismatchError",
+            TYPE_MISMATCH_MESSAGE,
+        ));
+    }
+    // Step 2: Let byteLength be array's byte length.
+    // Step 3: If byteLength is greater than 65536, throw a QuotaExceededError and terminate
+    // the algorithm.
+    if array.byte_length() > 65536 {
+        return Err(DOMExceptionError::new(
+            "QuotaExceededError",
+            "The requested length exceeds 65,536 bytes",
+        ));
+    }
+    // Step 4: Let byteList be a byte sequence containing the result of generating byteLength
+    // random bytes.
+    // Step 5: Write byteList to array, starting at array's byte offset.
+    // SAFETY: filling the bytes runs no JS, so nothing can GC or detach the buffer.
+    platform::random::fill(unsafe { array.bytes_mut() });
+    // Step 6: Return array.
+    Ok(array)
+}
+
 #[webidl_methods]
 impl Crypto {
     /// <https://w3c.github.io/webcrypto/#Crypto-method-getRandomValues>
@@ -26,31 +61,7 @@ impl Crypto {
         &self,
         array: js::ArrayBufferView<'s>,
     ) -> Result<js::ArrayBufferView<'s>, DOMExceptionError> {
-        // Step 1: If array is not an Int8Array, Uint8Array, Uint8ClampedArray, Int16Array,
-        // Uint16Array, Int32Array, Uint32Array, BigInt64Array, or BigUint64Array, then throw a
-        // TypeMismatchError and terminate the algorithm.
-        if !array.view_kind().is_integer_array() {
-            return Err(DOMExceptionError::new(
-                "TypeMismatchError",
-                "The array must be an integer typed array",
-            ));
-        }
-        // Step 2: Let byteLength be array's byte length.
-        // Step 3: If byteLength is greater than 65536, throw a QuotaExceededError and terminate
-        // the algorithm.
-        if array.byte_length() > 65536 {
-            return Err(DOMExceptionError::new(
-                "QuotaExceededError",
-                "The array's byte length exceeds 65536",
-            ));
-        }
-        // Step 4: Let byteList be a byte sequence containing the result of generating byteLength
-        // random bytes.
-        // Step 5: Write byteList to array, starting at array's byte offset.
-        // SAFETY: filling the bytes runs no JS, so nothing can GC or detach the buffer.
-        platform::random::fill(unsafe { array.bytes_mut() });
-        // Step 6: Return array.
-        Ok(array)
+        get_random_values(array)
     }
 
     /// <https://w3c.github.io/webcrypto/#Crypto-method-randomUUID>

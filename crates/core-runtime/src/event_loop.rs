@@ -369,8 +369,6 @@ pub struct PendingWork {
 /// The kinds of [`PendingWork`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
-    /// A task waiting for its deadline, labelled with its [`Task::kind`].
-    Timer(&'static str),
     /// A task waiting to be signalled ready or to run, labelled with its [`Task::kind`].
     Task(&'static str),
     /// External interest held through an [`InterestHandle`], such as a stream being read.
@@ -384,7 +382,6 @@ pub enum PendingKind {
 impl std::fmt::Display for PendingKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PendingKind::Timer(kind) => write!(f, "a pending `{kind}` timer"),
             PendingKind::Task(kind) => write!(f, "a queued `{kind}` task"),
             PendingKind::Interest => f.write_str("an operation that keeps the event loop alive"),
             PendingKind::Future => f.write_str("a host operation in flight"),
@@ -435,8 +432,9 @@ struct TaskEntry {
     /// For timer tasks: the `Instant` at which this task becomes ready.
     /// `None` for non-timer tasks.
     ///
-    /// The reading comes from `platform::clock`, not `std::time`, so a deadline
-    /// taken before a Wizer snapshot is already past when the instance resumes.
+    /// The reading comes from `platform::clock`, not `std::time`, so a timer
+    /// pending when a Wizer snapshot is taken has the time it had left then
+    /// when an instance resumes from the snapshot.
     deadline: Option<Instant>,
     /// Where the task was queued, if origins were being recorded then. See
     /// [`js::stack::record_origins`].
@@ -688,6 +686,11 @@ pub struct EventLoop {
     /// for the loop's driver to take, each with the JS call stack that
     /// registered it, if origins recording was active during registration.
     pending_sends: RefCell<Vec<(PendingSend, Option<Rc<str>>)>>,
+    /// The [`platform::clock::monotonic_ns`] reading at the loop's first [`step`](Self::step).
+    started_ns: Cell<Option<u64>>,
+    /// The nanoseconds the loop's driver spent waiting for work, as [`idle_ns`](Self::idle_ns)
+    /// reports them.
+    idle_ns: Cell<u64>,
 }
 
 /// A send, such as a response body's, that the loop's work can feed. The loop's
@@ -716,7 +719,21 @@ impl EventLoop {
             interest: InterestTracker::new(Rc::clone(&notify)),
             notify,
             pending_sends: RefCell::new(Vec::new()),
+            started_ns: Cell::new(None),
+            idle_ns: Cell::new(0),
         }
+    }
+
+    /// The [`platform::clock::monotonic_ns`] reading at the loop's first [`step`](Self::step), or
+    /// `None` before it.
+    pub fn started_ns(&self) -> Option<u64> {
+        self.started_ns.get()
+    }
+
+    /// The nanoseconds the loop's driver spent waiting for a timer, a task or I/O, between steps
+    /// that found nothing to run.
+    pub fn idle_ns(&self) -> u64 {
+        self.idle_ns.get()
     }
 
     /// Queue a task for later execution.
@@ -1068,9 +1085,14 @@ impl EventLoop {
         js::promise::has_pending_futures(self.loop_id)
     }
 
-    /// `Ok` if this loop holds no work, and otherwise `Err` describing each piece of work it holds
-    /// and where it was created, for a caller about to take a Wizer snapshot, which cannot capture
-    /// pending work.
+    /// `Ok` if this loop holds no [`pending_work`](Self::pending_work), and otherwise `Err`
+    /// describing each piece of it and where it was created, for a caller about to take a Wizer
+    /// snapshot, which cannot hold that work.
+    ///
+    /// Timers, referenced and unreferenced, are not reported: a snapshot holds them, and an
+    /// instance resumed from it runs each one when the time it had left has passed. The work
+    /// that is reported holds host resources, such as I/O in flight, that a resumed instance
+    /// doesn't have.
     pub fn ensure_idle_for_snapshot(&self) -> Result<(), String> {
         use std::fmt::Write as _;
 
@@ -1103,9 +1125,9 @@ impl EventLoop {
         Err(message)
     }
 
-    /// Everything that keeps this loop alive, and its unreferenced timers: its tasks, its external
-    /// interest, the async-promise futures it owns, and its pending sends. Each entry's origin is
-    /// set if origins were being recorded when the work was created (see
+    /// Everything that keeps this loop alive except its timers: its tasks without a deadline, its
+    /// external interest, the async-promise futures it owns, and its pending sends. Each entry's
+    /// origin is set if origins were being recorded when the work was created (see
     /// [`js::stack::record_origins`]).
     ///
     /// Tasks come first, in the order they were queued, then interest, then futures, then sends.
@@ -1114,16 +1136,13 @@ impl EventLoop {
         let mut entries: Vec<&TaskEntry> = tasks
             .entries
             .values()
-            .filter(|entry| entry.keeps_alive || entry.deadline.is_some())
+            .filter(|entry| entry.deadline.is_none())
             .collect();
         entries.sort_unstable_by_key(|entry| entry.id.0);
         let mut work: Vec<PendingWork> = entries
             .into_iter()
             .map(|entry| PendingWork {
-                kind: match entry.deadline {
-                    Some(_) => PendingKind::Timer(entry.task.kind()),
-                    None => PendingKind::Task(entry.task.kind()),
-                },
+                kind: PendingKind::Task(entry.task.kind()),
                 origin: entry.origin.clone(),
             })
             .collect();
@@ -1519,12 +1538,17 @@ async unsafe fn drive<S, F>(
 
                 // Immediately before the await below, so nothing of this loop's runs in between.
                 trace_idle(format_args!("loop:{}", event_loop.loop_id));
+                let wait_start = platform::clock::monotonic_ns();
                 // Race: first one to complete wins.
                 futures_lite::future::or(
                     futures_lite::future::or(timer_wait, notified),
                     drive_futures,
                 )
                 .await;
+                let waited = platform::clock::monotonic_ns().saturating_sub(wait_start);
+                event_loop
+                    .idle_ns
+                    .set(event_loop.idle_ns.get().saturating_add(waited));
 
                 if is_suspended() {
                     held.append(&mut completed);
@@ -1584,6 +1608,9 @@ impl EventLoop {
                 StepOutcome::Done
             };
         }
+        if self.started_ns.get().is_none() {
+            self.started_ns.set(Some(platform::clock::monotonic_ns()));
+        }
         self.advance_timers();
 
         // One batch per step: a task that becomes ready while the batch runs — a zero-delay
@@ -1613,13 +1640,13 @@ impl EventLoop {
             let Some(entry) = self.shared.tasks.borrow_mut().remove(id) else {
                 continue;
             };
-            let previous = entry.context.enter();
+            let previous = entry.context.enter_callback(scope);
             let result = entry.task.run(scope, id);
             // An exception the task threw is handled with the task's async context current.
             if result.is_err() {
                 handle_and_clear_exception(scope);
             }
-            previous.enter();
+            previous.leave_callback(scope);
             ran_any = true;
 
             // After each task, drain microtasks — the task may have

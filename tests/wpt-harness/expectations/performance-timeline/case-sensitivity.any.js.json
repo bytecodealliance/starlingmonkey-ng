@@ -1,0 +1,11 @@
+{
+  "getEntriesByType values are case sensitive": {
+    "status": "FAIL"
+  },
+  "getEntriesByName values are case sensitive": {
+    "status": "FAIL"
+  },
+  "observe() and case sensitivity for types/entryTypes and buffered.": {
+    "status": "PASS"
+  }
+}

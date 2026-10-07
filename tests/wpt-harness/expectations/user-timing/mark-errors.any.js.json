@@ -1,0 +1,32 @@
+{
+  "[performance.mark]: Number should be rejected as the mark-options.": {
+    "status": "PASS"
+  },
+  "[new PerformanceMark]: Number should be rejected as the mark-options.": {
+    "status": "PASS"
+  },
+  "[performance.mark]: NaN should be rejected as the mark-options.": {
+    "status": "PASS"
+  },
+  "[new PerformanceMark]: NaN should be rejected as the mark-options.": {
+    "status": "PASS"
+  },
+  "[performance.mark]: Infinity should be rejected as the mark-options.": {
+    "status": "PASS"
+  },
+  "[new PerformanceMark]: Infinity should be rejected as the mark-options.": {
+    "status": "PASS"
+  },
+  "[performance.mark]: String should be rejected as the mark-options.": {
+    "status": "PASS"
+  },
+  "[new PerformanceMark]: String should be rejected as the mark-options.": {
+    "status": "PASS"
+  },
+  "[performance.mark]: Negative startTime in mark-options should be rejected": {
+    "status": "PASS"
+  },
+  "[new PerformanceMark]: Negative startTime in mark-options should be rejected": {
+    "status": "PASS"
+  }
+}

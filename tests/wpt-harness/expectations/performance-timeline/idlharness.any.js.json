@@ -1,0 +1,176 @@
+{
+  "idl_test setup": {
+    "status": "PASS"
+  },
+  "idl_test validation": {
+    "status": "PASS"
+  },
+  "Partial interface Performance: original interface defined": {
+    "status": "PASS"
+  },
+  "Partial interface Performance: member names are unique": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: existence and properties of interface object": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface object length": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface object name": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: existence and properties of interface prototype object": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: existence and properties of interface prototype object's \"constructor\" property": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: existence and properties of interface prototype object's @@unscopables property": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: attribute id": {
+    "status": "FAIL"
+  },
+  "PerformanceEntry interface: attribute name": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: attribute entryType": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: attribute startTime": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: attribute duration": {
+    "status": "PASS"
+  },
+  "PerformanceEntry interface: attribute navigationId": {
+    "status": "FAIL"
+  },
+  "PerformanceEntry interface: operation toJSON()": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: existence and properties of interface object": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface object length": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface object name": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: existence and properties of interface prototype object": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: existence and properties of interface prototype object's \"constructor\" property": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: existence and properties of interface prototype object's @@unscopables property": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: operation observe(optional PerformanceObserverInit)": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: operation disconnect()": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: operation takeRecords()": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: attribute supportedEntryTypes": {
+    "status": "PASS"
+  },
+  "PerformanceObserver must be primary interface of observer": {
+    "status": "PASS"
+  },
+  "Stringification of observer": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: observer must inherit property \"observe(optional PerformanceObserverInit)\" with the proper type": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: calling observe(optional PerformanceObserverInit) on observer with too few arguments must throw TypeError": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: observer must inherit property \"disconnect()\" with the proper type": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: observer must inherit property \"takeRecords()\" with the proper type": {
+    "status": "PASS"
+  },
+  "PerformanceObserver interface: observer must inherit property \"supportedEntryTypes\" with the proper type": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: existence and properties of interface object": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface object length": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface object name": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: existence and properties of interface prototype object": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: existence and properties of interface prototype object's \"constructor\" property": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: existence and properties of interface prototype object's @@unscopables property": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: operation getEntries()": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: operation getEntriesByType(DOMString)": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: operation getEntriesByName(DOMString, optional DOMString)": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList must be primary interface of entryList": {
+    "status": "PASS"
+  },
+  "Stringification of entryList": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: entryList must inherit property \"getEntries()\" with the proper type": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: entryList must inherit property \"getEntriesByType(DOMString)\" with the proper type": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: calling getEntriesByType(DOMString) on entryList with too few arguments must throw TypeError": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: entryList must inherit property \"getEntriesByName(DOMString, optional DOMString)\" with the proper type": {
+    "status": "PASS"
+  },
+  "PerformanceObserverEntryList interface: calling getEntriesByName(DOMString, optional DOMString) on entryList with too few arguments must throw TypeError": {
+    "status": "PASS"
+  },
+  "Performance interface: operation getEntries()": {
+    "status": "PASS"
+  },
+  "Performance interface: operation getEntriesByType(DOMString)": {
+    "status": "PASS"
+  },
+  "Performance interface: operation getEntriesByName(DOMString, optional DOMString)": {
+    "status": "PASS"
+  },
+  "Performance interface: performance must inherit property \"getEntries()\" with the proper type": {
+    "status": "PASS"
+  },
+  "Performance interface: performance must inherit property \"getEntriesByType(DOMString)\" with the proper type": {
+    "status": "PASS"
+  },
+  "Performance interface: calling getEntriesByType(DOMString) on performance with too few arguments must throw TypeError": {
+    "status": "PASS"
+  },
+  "Performance interface: performance must inherit property \"getEntriesByName(DOMString, optional DOMString)\" with the proper type": {
+    "status": "PASS"
+  },
+  "Performance interface: calling getEntriesByName(DOMString, optional DOMString) on performance with too few arguments must throw TypeError": {
+    "status": "PASS"
+  }
+}

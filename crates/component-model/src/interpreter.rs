@@ -38,7 +38,6 @@ use crate::exports::{ExportSpec, ResultShape};
 
 use js::error::{throw_type_error, CapturedError, ExnThrown};
 use js::gc::scope::Scope;
-use js::native::Value;
 use js::prelude::HandleValue;
 use js::Object;
 
@@ -52,7 +51,7 @@ use crate::imports::{
 };
 use crate::init;
 use crate::naming::InterfaceNames;
-use crate::resources::{self, ResourceDesc, HANDLE_FIELD, TYPE_FIELD};
+use crate::resources::{self, ResourceDesc};
 use crate::stack::CallStack;
 use crate::value::{self, mangle_name, mangle_resource_name, TypeShape};
 
@@ -114,12 +113,10 @@ pub fn take_imported_handle(
     interface: &str,
     resource: &str,
 ) -> Result<Option<u32>, ExnThrown> {
-    let Ok(object) = js::Object::from_value(scope, value) else {
+    let Some(wrapper) = resources::imported_wrapper(scope, value) else {
         return Ok(None);
     };
-    let Some(type_idx) = resources::read_u32_field(scope, &object, TYPE_FIELD)? else {
-        return Ok(None);
-    };
+    let type_idx = wrapper.data().type_idx;
     let Some(ty) = wit_resource_checked(type_idx as usize) else {
         return Ok(None);
     };
@@ -527,8 +524,10 @@ impl Interpreter for StarlingInterpreter {
     /// stay pure Rust. The JS bootstrap happens later, from the dylib's
     /// `init`-world export.
     fn initialize(wit: Wit) {
-        // Stored first, since building the description reads it through `wit()`.
+        // Building the description reads `wit` through `wit()`, so it is stored
+        // first.
         WIT.with(|cell| *cell.borrow_mut() = Some(wit));
+        resources::set_imported_drop(drop_imported);
         let world = build_world_desc(wit);
         WORLD.with(|cell| *cell.borrow_mut() = Some(world));
     }
@@ -617,6 +616,11 @@ impl Interpreter for StarlingInterpreter {
             // SAFETY: `initialize_runtime` left the default global's realm entered for the
             // process, and keeps its runtime and context alive for the process.
             unsafe { debugger::before_export(&init::runtime(), init::raw_cx()) };
+            if func.interface().is_some()
+                && RAW_HTTP_HANDLER.with(|cell| cell.borrow().as_deref() == func.interface())
+            {
+                init::before_http_export();
+            }
             let mut cx = cx;
             let _ = wit;
             let index = func.index();
@@ -810,7 +814,7 @@ impl Call for CallCx<'_> {
             let adapted = self.pop(
                 |s, sc| {
                     let value = sc.root_value(s.last());
-                    if resources::is_resource_wrapper(sc, value)? {
+                    if resources::imported_wrapper(sc, value).is_some() {
                         return Ok(None);
                     }
                     let handle = adapter(sc, value)?;
@@ -999,23 +1003,14 @@ impl Call for CallCx<'_> {
     fn push_borrow(&mut self, ty: Resource, handle: u32) {
         with_resource_desc(ty, |desc| {
             self.push(
-                |s, sc| {
-                    let dispose = drop_callback_value(sc);
-                    value::push_borrow(s, sc, desc, handle, dispose)
-                },
+                |s, sc| value::push_borrow(s, sc, desc, handle),
                 "push_borrow",
             )
         });
     }
     fn push_own(&mut self, ty: Resource, handle: u32) {
         with_resource_desc(ty, |desc| {
-            self.push(
-                |s, sc| {
-                    let dispose = drop_callback_value(sc);
-                    value::push_own(s, sc, desc, handle, dispose)
-                },
-                "push_own",
-            )
+            self.push(|s, sc| value::push_own(s, sc, desc, handle), "push_own")
         });
     }
     fn push_future(&mut self, ty: Future, handle: u32) {
@@ -1068,9 +1063,18 @@ impl Call for CallCx<'_> {
         let Some(elem) = numeric_scalar_shape(ty.ty()) else {
             return false;
         };
-        let layout = elem
-            .numeric_list_layout(len)
-            .expect("a numeric scalar shape has a list layout");
+        let Some(layout) = elem.numeric_list_layout(len) else {
+            self.push(
+                |_, sc| {
+                    Err(js::error::throw_range_error(
+                        sc,
+                        c"the list is longer than memory can hold",
+                    ))
+                },
+                "push_raw_list",
+            );
+            return true;
+        };
         // Returning `true` takes ownership of the allocation: the generated code
         // skips both its element loop and its trailing `dealloc_bytes`.
         match std::ptr::NonNull::new(ptr).filter(|_| len > 0) {
@@ -1160,13 +1164,6 @@ impl ImportInvoker for WasmImportInvoker {
         Ok(())
     }
 
-    fn dispose_callback<'s>(
-        &self,
-        scope: &'s Scope<'_>,
-    ) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-        Ok(Some(drop_callback_value(scope)))
-    }
-
     fn supports_async(&self) -> bool {
         true
     }
@@ -1219,100 +1216,19 @@ pub fn synthesize(scope: &Scope<'_>) -> Result<(), ExnThrown> {
 }
 
 // ===========================================================================
-// The shared drop callback
+// Dropping imported resources
 // ===========================================================================
 
-js::instance_local! {
-    /// The one shared imported-resource drop callback, built on first use. It is
-    /// traced by [`trace_drop_callback`] rather than kept reachable through a
-    /// wrapper, since every wrapper holding it may have been collected between
-    /// calls.
-    static DROP_CALLBACK: RefCell<Option<js::gc::handle::Heap<Value>>> =
-        const { RefCell::new(None) };
-}
-
-/// The shared drop-callback value, built on first use. It derives the resource
-/// type from `this` rather than closing over one, so a single function serves
-/// every imported-resource wrapper's
-/// [`DISPOSE_FIELD`](crate::resources::DISPOSE_FIELD).
-fn drop_callback_value<'s>(scope: &'s Scope<'_>) -> HandleValue<'s> {
-    let existing = DROP_CALLBACK.with(|cell| cell.borrow().as_ref().map(|f| f.get(scope)));
-    if let Some(v) = existing {
-        return v;
-    }
-    let f = js::Function::new_callback(scope, c"_componentizeJsDrop", 0, drop_callback, ())
-        .expect("building the drop callback failed");
-    let val = f.as_value();
-    DROP_CALLBACK.with(|cell| *cell.borrow_mut() = Some(js::gc::handle::Heap::from(val)));
-    scope.root_value(val)
-}
-
-/// Drop the cached drop callback. See [`crate::tracing::clear_traced_roots`].
-pub(crate) fn clear_traced_roots() {
-    DROP_CALLBACK.with(|cell| *cell.borrow_mut() = None);
-}
-
-/// Keep the shared drop callback alive.
-///
-/// # Safety
-///
-/// `trc` must be a valid `JSTracer` provided by SpiderMonkey's GC, and this must
-/// run from the crate tracer, with JS execution paused.
-pub(crate) unsafe fn trace_drop_callback(trc: *mut js::native::JSTracer) {
-    use js::heap::Trace;
-    DROP_CALLBACK.with(|cell| {
-        if let Some(heap) = &*cell.as_ptr() {
-            heap.trace(trc);
-        }
-    });
-}
-
-/// `this[Symbol.dispose]()`, and the finalizer's `this[DISPOSE_FIELD]()`: drop
-/// the host-owned resource `this` wraps.
-///
-/// Unregisters `this` from finalization, so a later collection cannot
-/// double-drop, then calls the wit-dylib resource `drop`. A `this` whose handle
-/// was already stripped is a no-op, so a second dispose does nothing. A `this`
-/// with a handle that is not a registered wrapper throws a `TypeError`. A `this`
-/// lent to an import call that has not returned is dropped once the last such
-/// call returns (see [`resources::LENDS_FIELD`]).
-fn drop_callback(
-    scope: &Scope<'_>,
-    args: js::function::CallbackArgs<'_>,
-    _payload: HandleValue<'_>,
-) -> Result<Value, ExnThrown> {
-    let this = Object::from_value(scope, args.this()).map_err(|e| e.throw(scope))?;
-    if let (Some(type_idx), Some(handle)) = (
-        resources::read_u32_field(scope, &this, TYPE_FIELD)?,
-        resources::read_u32_field(scope, &this, HANDLE_FIELD)?,
-    ) {
-        if resources::read_u32_field(scope, &this, resources::LENDS_FIELD)?.unwrap_or(0) > 0 {
-            this.define_property(
-                scope,
-                resources::DISPOSE_DEFERRED_FIELD,
-                true,
-                resources::HIDDEN_FIELD_ATTRS,
-            )?;
-            return Ok(js::value::undefined());
-        }
-        // `this` can be any object with the hidden fields, so the type index is
-        // checked, and only an object the finalization registry holds, which
-        // every wrapper with a handle is, has its handle dropped.
-        let res = wit_resource_checked(type_idx as usize)
-            .ok_or_else(|| throw_type_error(scope, c"resource type index is out of range"))?;
-        if !resources::unregister_resource(scope, &this)? {
-            return Err(throw_type_error(
-                scope,
-                c"dispose was called on an object that is not a resource wrapper",
-            ));
-        }
-        // SAFETY: `handle` is the live canonical handle read off `this`.
-        unsafe { res.drop()(handle) };
-        // A second dispose, and a method call on the stashed wrapper, now find no
-        // handle rather than passing the released one back to the host.
-        this.delete_property(scope, HANDLE_FIELD)?;
-    }
-    Ok(js::value::undefined())
+/// Drop the canonical handle `handle` of the imported resource type `type_idx`
+/// through the type's wit-dylib `drop`. Throws a `TypeError` if `type_idx` is out
+/// of range.
+fn drop_imported(scope: &Scope<'_>, type_idx: u32, handle: u32) -> Result<(), ExnThrown> {
+    let res = wit_resource_checked(type_idx as usize)
+        .ok_or_else(|| throw_type_error(scope, c"resource type index is out of range"))?;
+    // SAFETY: `handle` is the live canonical handle a wrapper held, which the
+    // wrapper gave up before this call.
+    unsafe { res.drop()(handle) };
+    Ok(())
 }
 
 // ===========================================================================
@@ -1379,7 +1295,7 @@ fn record_field_names(r: Record) -> Rc<[&'static CStr]> {
     RECORD_NAMES.with(|cell| {
         cached(&mut cell.borrow_mut(), r.index(), || {
             r.fields()
-                .map(|(name, _)| static_name(&mangle_name(name)))
+                .map(|(name, _)| value::static_name(&mangle_name(name)))
                 .collect()
         })
     })
@@ -1391,17 +1307,10 @@ fn variant_cases(v: Variant) -> Rc<[(&'static CStr, bool)]> {
     VARIANT_CASES.with(|cell| {
         cached(&mut cell.borrow_mut(), v.index(), || {
             v.cases()
-                .map(|(name, ty)| (static_name(&mangle_name(name)), ty.is_some()))
+                .map(|(name, ty)| (value::static_name(&mangle_name(name)), ty.is_some()))
                 .collect()
         })
     })
-}
-
-/// `name` as a NUL-terminated string that lives for the rest of the process. The per-type caches
-/// hold their names for the rest of the instance anyway, and the value intrinsics key their
-/// property-key cache on the address of a `'static` name.
-fn static_name(name: &str) -> &'static CStr {
-    Box::leak(value::to_cstring(name).into_boxed_c_str())
 }
 
 /// The entry at `index` of a per-type-index cache, built with `build` on the
@@ -1620,10 +1529,12 @@ fn build_world_desc(wit: Wit) -> WorldDesc {
         .iter_export_funcs()
         .filter_map(|export| export.interface())
         .collect();
+    let mut unexported_error_classes = Vec::new();
     for class in error_classes {
         let key = class.interface.clone();
         if key.as_deref().is_some_and(|name| exported.contains(name)) && !ifaces.contains_key(&key)
         {
+            unexported_error_classes.push(class);
             continue;
         }
         if !ifaces.contains_key(&key) {
@@ -1697,7 +1608,10 @@ fn build_world_desc(wit: Wit) -> WorldDesc {
         });
     }
 
-    WorldDesc { interfaces }
+    WorldDesc {
+        interfaces,
+        unexported_error_classes,
+    }
 }
 
 /// The [`EnumDesc`] of `ty`, following aliases, named `name`, or `None` if `ty`

@@ -197,8 +197,9 @@ impl ReadableByteStreamController {
     pub fn close(&self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
         // Step 1: If `this`.`[[closeRequested]]` is true, throw a ``TypeError`` exception.
         if self.data().close_requested {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableByteStreamController",
                 c"close() called on a controller that already requested close",
             ));
         }
@@ -206,8 +207,9 @@ impl ReadableByteStreamController {
         //         exception.
         let stream = self.data().stream.get(scope);
         if stream.data().state != ReadableStreamState::Readable {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableByteStreamController",
                 c"close() called on a controller whose stream is not readable",
             ));
         }
@@ -224,23 +226,26 @@ impl ReadableByteStreamController {
     ) -> Result<(), ExnThrown> {
         // Step 1: If _chunk_.[[ByteLength]] is 0, throw a ``TypeError`` exception.
         if view.byte_length() == 0 {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableByteStreamController",
                 c"enqueue() view has a byte length of 0",
             ));
         }
         // Step 2: If _chunk_.[[ViewedArrayBuffer]].[[ByteLength]] is 0, throw a ``TypeError``
         //         exception.
         if view.viewed_buffer(scope)?.byte_length() == 0 {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableByteStreamController",
                 c"enqueue() view's buffer has a byte length of 0",
             ));
         }
         // Step 3: If `this`.`[[closeRequested]]` is true, throw a ``TypeError`` exception.
         if self.data().close_requested {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableByteStreamController",
                 c"enqueue() called on a controller that requested close",
             ));
         }
@@ -248,8 +253,9 @@ impl ReadableByteStreamController {
         //         exception.
         let stream = self.data().stream.get(scope);
         if stream.data().state != ReadableStreamState::Readable {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableByteStreamController",
                 c"enqueue() called on a controller whose stream is not readable",
             ));
         }

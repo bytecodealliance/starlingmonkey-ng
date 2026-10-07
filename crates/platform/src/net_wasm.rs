@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! TCP sockets and host name lookup over `wasi:sockets`.
+//! TCP and UDP sockets and host name lookup over `wasi:sockets`.
 
 use std::fmt;
 use std::future::{poll_fn, Future};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::pin::pin;
+use std::pin::{pin, Pin};
+use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ use wasip3::sockets::types::{
     ErrorCode, IpAddress, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress,
 };
 use wit_bindgen::StreamReader;
+
+use crate::net::Received;
 
 /// Why a socket operation failed.
 #[derive(Debug)]
@@ -69,10 +72,33 @@ pub async fn resolve(host: &str) -> Result<Vec<IpAddr>, NetError> {
     Ok(addrs.into_iter().map(from_wasi_ip).collect())
 }
 
+/// Fail: `wasi:sockets` provides no lookup of the name of an address.
+pub async fn lookup_service(_addr: SocketAddr) -> Result<(String, String), NetError> {
+    Err(unsupported())
+}
+
+/// No name servers: WASI provides no resolver configuration.
+pub fn name_servers() -> Vec<SocketAddr> {
+    Vec::new()
+}
+
 /// A TCP socket connected to `addr`. With a `timeout`, connecting fails with
 /// [`NetError::TimedOut`] once it has not finished in that time.
 pub async fn connect(addr: SocketAddr, timeout: Option<Duration>) -> Result<TcpSocket, NetError> {
+    connect_from(addr, None, timeout).await
+}
+
+/// [`connect`] from the local address `local`, which the socket is bound to before it connects,
+/// or from an address the host picks for `None`.
+pub async fn connect_from(
+    addr: SocketAddr,
+    local: Option<SocketAddr>,
+    timeout: Option<Duration>,
+) -> Result<TcpSocket, NetError> {
     let socket = TcpSocket::create(family(addr.ip()))?;
+    if let Some(local) = local {
+        socket.bind(to_wasi(local))?;
+    }
     let connected = {
         let mut connect = pin!(socket.connect(to_wasi(addr)));
         match timeout {
@@ -190,6 +216,7 @@ impl NetError {
                 ErrorCode::ConnectionBroken => "EPIPE",
                 ErrorCode::ConnectionReset => "ECONNRESET",
                 ErrorCode::ConnectionAborted => "ECONNABORTED",
+                ErrorCode::DatagramTooLarge => "EMSGSIZE",
                 _ => "EIO",
             },
             NetError::Lookup(ip_name_lookup::ErrorCode::TemporaryResolverFailure) => "EAI_AGAIN",
@@ -199,29 +226,45 @@ impl NetError {
     }
 }
 
-/// The reading half of a [`Connection`]: the socket's receive stream, and the future of its
-/// outcome.
+/// The reading half of a [`Connection`]: the reads of the socket's receive stream, and the future
+/// of its outcome.
 pub struct ConnectionReader {
-    stream: Option<StreamReader<u8>>,
+    incoming: crate::stream::ReadPump<u8>,
     outcome: Option<wit_bindgen::FutureReader<Result<(), ErrorCode>>>,
 }
 
 impl ConnectionReader {
-    /// The next bytes received, or `None` once the peer ended its side.
+    /// The next bytes received, or `None` once the peer ended its side. The bytes of a read that
+    /// was cancelled by dropping its future are returned by the next read.
     pub async fn read(&mut self) -> Result<Option<Vec<u8>>, NetError> {
-        while let Some(mut stream) = self.stream.take() {
-            let (result, bytes) = stream.read(Vec::with_capacity(64 * 1024)).await;
-            if result != wit_bindgen::StreamResult::Dropped {
-                self.stream = Some(stream);
+        loop {
+            match self.receive().await? {
+                Received::Bytes(bytes) => return Ok(Some(bytes)),
+                Received::End => return Ok(None),
+                Received::Stopped => {}
             }
-            if !bytes.is_empty() {
-                return Ok(Some(bytes));
+        }
+    }
+
+    /// The next bytes received, or [`Received::Stopped`] once the receive stream ended, and then
+    /// the outcome of the connection: [`Received::End`] or the error. The outcome is usually not
+    /// known yet when the stream ends. The bytes of a call that was cancelled by dropping its
+    /// future are returned by the next call.
+    pub async fn receive(&mut self) -> Result<Received, NetError> {
+        if !self.incoming.eof() {
+            while let Some(bytes) = poll_fn(|cx| self.incoming.poll_read(cx)).await {
+                if !bytes.is_empty() {
+                    return Ok(Received::Bytes(bytes));
+                }
+            }
+            if self.outcome.is_some() {
+                return Ok(Received::Stopped);
             }
         }
         if let Some(outcome) = self.outcome.take() {
             outcome.await?;
         }
-        Ok(None)
+        Ok(Received::End)
     }
 }
 
@@ -233,10 +276,20 @@ pub struct ConnectionWriter {
 }
 
 impl ConnectionWriter {
-    /// Send nothing, and return 0: a `wasi:sockets` stream only takes bytes through an
-    /// asynchronous write, [`ConnectionWriter::write`].
-    pub fn try_write(&mut self, _data: &[u8]) -> usize {
-        0
+    /// Send as much of `data` as the host takes without waiting, and return the bytes not sent.
+    /// The write is polled once, and cancelled if the host doesn't complete it in that poll. A
+    /// failed write sends nothing, and the next [`ConnectionWriter::write`] reports the error.
+    pub fn try_write(&mut self, data: Vec<u8>) -> Vec<u8> {
+        let Some(stream) = self.stream.as_mut() else {
+            return data;
+        };
+        let mut write = pin!(stream.write(data));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let (_, unwritten) = match write.as_mut().poll(&mut cx) {
+            Poll::Ready(outcome) => outcome,
+            Poll::Pending => write.cancel(),
+        };
+        unwritten.into_vec()
     }
 
     /// Send all of `data`.
@@ -259,11 +312,12 @@ impl ConnectionWriter {
         }
     }
 
-    /// End this side of the connection.
+    /// End this side of the connection, without waiting for the host. Fails with the error of
+    /// the send if the send already failed.
     pub async fn shutdown(&mut self) -> Result<(), NetError> {
         self.stream = None;
-        if let Some(sent) = self.sent.take() {
-            if let Ok(result) = sent.await {
+        if let Some(mut sent) = self.sent.take() {
+            if let Ok(Some(result)) = sent.try_recv() {
                 result?;
             }
         }
@@ -286,14 +340,17 @@ impl Connection {
         let (received, outcome) = socket.receive();
         let (tx, rx) = wasip3::wit_stream::new::<u8>();
         let (sent_tx, sent) = futures_channel::oneshot::channel();
-        // The host only sends the stream while the `send` call is polled, so a task of its own
-        // polls it. The task owns the socket, which must outlive its streams.
+        // The stream is passed to `send` here, so a write can complete before the task below
+        // first runs. The task awaits the outcome, and owns the socket, which must outlive its
+        // streams.
+        let sending = socket.send(rx);
         wit_bindgen::spawn_local(async move {
-            let _ = sent_tx.send(socket.send(rx).await);
+            let _ = sent_tx.send(sending.await);
+            drop(socket);
         });
         Ok(Connection {
             reader: ConnectionReader {
-                stream: Some(received),
+                incoming: crate::stream::ReadPump::new(received, 64 * 1024),
                 outcome: Some(outcome),
             },
             writer: ConnectionWriter {
@@ -315,6 +372,16 @@ pub async fn connect_stream(
     Connection::new(connect(addr, timeout).await?)
 }
 
+/// [`connect_stream`] from the local address `local`, which the socket is bound to before it
+/// connects, or from an address the host picks for `None`.
+pub async fn connect_stream_from(
+    addr: SocketAddr,
+    local: Option<SocketAddr>,
+    timeout: Option<Duration>,
+) -> Result<Connection, NetError> {
+    Connection::new(connect_from(addr, local, timeout).await?)
+}
+
 /// A TCP socket listening for connections.
 pub struct StreamListener {
     /// Reads the accepted sockets.
@@ -326,7 +393,8 @@ pub struct StreamListener {
 }
 
 impl StreamListener {
-    /// Poll for the next connection with `cx`.
+    /// Poll for the next connection with `cx`. A connection whose addresses can't be read, such
+    /// as one the peer reset before it was accepted, is skipped.
     pub fn poll_accept(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -334,8 +402,8 @@ impl StreamListener {
         loop {
             match std::task::ready!(self.incoming.poll_read(cx)) {
                 Some(sockets) => {
-                    if let Some(socket) = sockets.into_iter().next() {
-                        return Poll::Ready(Connection::new(socket));
+                    if let Some(Ok(connection)) = sockets.into_iter().next().map(Connection::new) {
+                        return Poll::Ready(Ok(connection));
                     }
                 }
                 None => return Poll::Ready(Err(NetError::Socket(ErrorCode::InvalidState))),
@@ -352,4 +420,181 @@ pub fn listen_stream(addr: SocketAddr) -> Result<StreamListener, NetError> {
         _socket: listener.socket,
         local_addr: listener.local_addr,
     })
+}
+
+/// A `wasi:sockets` receive in progress.
+type ReceiveOp = Pin<Box<dyn Future<Output = Result<(Vec<u8>, IpSocketAddress), ErrorCode>>>>;
+
+/// A `wasi:sockets` send in progress.
+type SendOp = Pin<Box<dyn Future<Output = Result<(), ErrorCode>>>>;
+
+/// A bound UDP socket, with its receive and send in progress. Dropping it cancels both before the
+/// socket closes.
+pub struct UdpSocket {
+    receiving: Option<ReceiveOp>,
+    /// The send in progress, and the number of bytes it sends.
+    sending: Option<(SendOp, usize)>,
+    socket: Rc<wasip3::sockets::types::UdpSocket>,
+}
+
+/// The error of an operation `wasi:sockets` doesn't provide.
+fn unsupported() -> NetError {
+    NetError::Socket(ErrorCode::NotSupported)
+}
+
+impl UdpSocket {
+    /// A UDP socket of the address family of `addr`, bound to `addr`. `wasi:sockets` has no
+    /// options for address reuse or IPv6-only sockets: `reuse_addr` and `ipv6_only` have no
+    /// effect, and `reuse_port` is not supported.
+    pub fn bind(addr: SocketAddr, options: crate::net::UdpBindOptions) -> Result<Self, NetError> {
+        if options.reuse_port {
+            return Err(unsupported());
+        }
+        let socket = wasip3::sockets::types::UdpSocket::create(family(addr.ip()))?;
+        socket.bind(to_wasi(addr))?;
+        Ok(UdpSocket {
+            receiving: None,
+            sending: None,
+            socket: Rc::new(socket),
+        })
+    }
+
+    /// The address the socket is bound to.
+    pub fn local_addr(&self) -> Result<SocketAddr, NetError> {
+        Ok(from_wasi(self.socket.get_local_address()?))
+    }
+
+    /// The address the socket is connected to.
+    pub fn peer_addr(&self) -> Result<SocketAddr, NetError> {
+        Ok(from_wasi(self.socket.get_remote_address()?))
+    }
+
+    /// Send to and receive from `addr` only.
+    pub fn connect(&mut self, addr: SocketAddr) -> Result<(), NetError> {
+        Ok(self.socket.connect(to_wasi(addr))?)
+    }
+
+    /// Undo [`UdpSocket::connect`].
+    pub fn disconnect(&mut self) -> Result<(), NetError> {
+        Ok(self.socket.disconnect()?)
+    }
+
+    /// Return `None`: a `wasi:sockets` socket only sends through an asynchronous send,
+    /// [`UdpSocket::poll_send`].
+    pub fn try_send(
+        &mut self,
+        _data: &[u8],
+        _addr: Option<SocketAddr>,
+    ) -> Option<Result<usize, NetError>> {
+        None
+    }
+
+    /// Poll sending `data` to `addr`, or to the connected address for `None`, with `cx`. Returns
+    /// the number of bytes sent. The first poll of a send starts it with the bytes it takes out of
+    /// `data`, and later polls of the same send ignore `data` and `addr`.
+    pub fn poll_send(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        data: &mut Vec<u8>,
+        addr: Option<SocketAddr>,
+    ) -> Poll<Result<usize, NetError>> {
+        let (op, length) = self.sending.get_or_insert_with(|| {
+            let socket = Rc::clone(&self.socket);
+            let data = std::mem::take(data);
+            let length = data.len();
+            let op: SendOp = Box::pin(async move { socket.send(data, addr.map(to_wasi)).await });
+            (op, length)
+        });
+        let result = std::task::ready!(op.as_mut().poll(cx));
+        let length = *length;
+        self.sending = None;
+        Poll::Ready(result.map(|()| length).map_err(NetError::from))
+    }
+
+    /// Poll for the next datagram with `cx`. Returns its bytes and the address it came from.
+    pub fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(Vec<u8>, SocketAddr), NetError>> {
+        let op = self.receiving.get_or_insert_with(|| {
+            let socket = Rc::clone(&self.socket);
+            Box::pin(async move { socket.receive().await })
+        });
+        let result = std::task::ready!(op.as_mut().poll(cx));
+        self.receiving = None;
+        Poll::Ready(
+            result
+                .map(|(data, from)| (data, from_wasi(from)))
+                .map_err(NetError::from),
+        )
+    }
+
+    /// Fail: `wasi:sockets` provides no broadcast option.
+    pub fn set_broadcast(&self, _on: bool) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// Set the hop limit of the unicast datagrams sent.
+    pub fn set_ttl(&self, ttl: u8) -> Result<(), NetError> {
+        Ok(self.socket.set_unicast_hop_limit(ttl)?)
+    }
+
+    /// Fail: `wasi:sockets` provides no multicast.
+    pub fn set_multicast_ttl(&self, _ttl: u8) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// Fail: `wasi:sockets` provides no multicast.
+    pub fn set_multicast_loop(&self, _on: bool) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// Fail: `wasi:sockets` provides no multicast.
+    pub fn set_multicast_interface(
+        &self,
+        _interface: crate::net::MulticastInterface,
+    ) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// Fail: `wasi:sockets` provides no multicast.
+    pub fn set_membership(
+        &self,
+        _group: IpAddr,
+        _interface: crate::net::MulticastInterface,
+        _join: bool,
+    ) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// Fail: `wasi:sockets` provides no multicast.
+    pub fn set_source_membership(
+        &self,
+        _source: Ipv4Addr,
+        _group: Ipv4Addr,
+        _interface: Ipv4Addr,
+        _join: bool,
+    ) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// The size of the receive buffer, or of the send buffer unless `receive`, after setting it to
+    /// `size` if given.
+    pub fn buffer_size(&self, receive: bool, size: Option<usize>) -> Result<usize, NetError> {
+        match (receive, size) {
+            (true, Some(size)) => self.socket.set_receive_buffer_size(size as u64)?,
+            (false, Some(size)) => self.socket.set_send_buffer_size(size as u64)?,
+            _ => {}
+        }
+        let size = match receive {
+            true => self.socket.get_receive_buffer_size()?,
+            false => self.socket.get_send_buffer_size()?,
+        };
+        Ok(usize::try_from(size).unwrap_or(usize::MAX))
+    }
+}
+
+/// Return `None`: `wasi:sockets` doesn't name network interfaces.
+pub fn interface_index(_name: &str) -> Option<u32> {
+    None
 }

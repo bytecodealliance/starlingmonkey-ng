@@ -49,6 +49,51 @@ crate::instance_local! {
     /// next job that captured the same object reuses.
     static LAST_JOB_CONTEXT: RefCell<Option<Rc<RootedHeap<crate::object::Object>>>> =
         const { RefCell::new(None) };
+
+    /// The hooks [`set_callback_hooks`] installed.
+    static CALLBACK_HOOKS: Cell<Option<CallbackHooks>> = const { Cell::new(None) };
+}
+
+/// Functions called around each callback [`Snapshot::enter_callback`] runs with the async context
+/// it captured: promise jobs, ticks, event-loop tasks and the settling of spawned futures. The
+/// hooks must not run JavaScript.
+#[derive(Clone, Copy)]
+pub struct CallbackHooks {
+    /// Called once the callback's context is current, before the callback runs.
+    pub before: fn(&Scope<'_>),
+    /// Called after the callback ran and an exception it threw was handled, once the context the
+    /// callback's context replaced is current again.
+    pub after: fn(&Scope<'_>),
+}
+
+/// Install `hooks` as the [`CallbackHooks`], replacing the hooks installed before, or remove them
+/// if `hooks` is `None`.
+pub fn set_callback_hooks(hooks: Option<CallbackHooks>) {
+    CALLBACK_HOOKS.set(hooks);
+}
+
+/// Run `f` inside a running callback with the callback's `after` hook called before `f` and its
+/// `before` hook called again after `f`.
+pub fn outside_callback<R>(scope: &Scope<'_>, f: impl FnOnce() -> R) -> R {
+    let hooks = CALLBACK_HOOKS.get();
+    if let Some(hooks) = hooks {
+        call_hook(scope, hooks.after);
+    }
+    let result = f();
+    if let Some(hooks) = hooks {
+        call_hook(scope, hooks.before);
+    }
+    result
+}
+
+/// Call `hook` with the pending exception, if there is one, cleared, and make it pending again
+/// afterwards.
+fn call_hook(scope: &Scope<'_>, hook: fn(&Scope<'_>)) {
+    let pending = crate::exception::take_pending(scope);
+    hook(scope);
+    if let Some(error) = pending {
+        crate::exception::throw_value(scope, error);
+    }
 }
 
 /// A captured async context, or the absence of one.
@@ -75,6 +120,26 @@ impl Snapshot {
     /// Entering the returned snapshot restores that context.
     pub fn enter(self) -> Snapshot {
         CURRENT.with(|current| Snapshot(current.replace(self.0)))
+    }
+
+    /// Make this snapshot's context current to run a callback that captured it, and call the
+    /// `before` hook. Returns a snapshot of the context it replaced, for
+    /// [`Snapshot::leave_callback`].
+    pub fn enter_callback(self, scope: &Scope<'_>) -> Snapshot {
+        let previous = self.enter();
+        if let Some(hooks) = CALLBACK_HOOKS.get() {
+            call_hook(scope, hooks.before);
+        }
+        previous
+    }
+
+    /// Make this snapshot's context current again, then call the `after` hook for the callback
+    /// [`Snapshot::enter_callback`] ran.
+    pub fn leave_callback(self, scope: &Scope<'_>) {
+        self.enter();
+        if let Some(hooks) = CALLBACK_HOOKS.get() {
+            call_hook(scope, hooks.after);
+        }
     }
 }
 
@@ -132,10 +197,11 @@ pub fn is_installed(scope: &Scope<'_>) -> bool {
     !queue.is_null() && queue == QUEUE.get()
 }
 
-/// Forget the current async context and the recorded contexts, and clear the flag
-/// [`crate::jobs::stop_draining`] sets. The contexts are rooted, so this must run before the
-/// context is destroyed.
+/// Forget the current async context, the recorded contexts and the [`CallbackHooks`], and clear
+/// the flag [`crate::jobs::stop_draining`] sets. The contexts are rooted, so this must run before
+/// the context is destroyed.
 pub fn clear() {
+    CALLBACK_HOOKS.set(None);
     CURRENT.with(|current| current.borrow_mut().take());
     LAST_JOB_CONTEXT.with(|last| last.borrow_mut().take());
     TAGS.with(|tags| tags.borrow_mut().clear());
@@ -344,11 +410,11 @@ unsafe fn run_next_job(cx: *mut RawJSContext) {
     } else {
         job_context(&scope, captured)
     };
-    let previous = snapshot.enter();
+    let previous = snapshot.enter_callback(&scope);
     // SAFETY: `job` is a rooted microtask, and its realm is entered.
     let ok = unsafe { jsapi::JS::RunJSMicroTask(cx, job.into()) };
-    previous.enter();
     if !ok {
         crate::exception::report_and_clear(&scope, "microtask");
     }
+    previous.leave_callback(&scope);
 }

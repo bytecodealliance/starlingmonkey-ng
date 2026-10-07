@@ -410,7 +410,9 @@ impl MessagePort {
 }
 
 /// The transfer list of the second argument of `postMessage`, which is a sequence of objects or a
-/// `StructuredSerializeOptions` dictionary. An object with an `@@iterator` method is a sequence.
+/// `StructuredSerializeOptions` dictionary. An object with an `@@iterator` method is a sequence. A
+/// value that converts to neither throws the binding error of an invalid second argument of
+/// `MessagePort.prototype.postMessage`.
 fn transfer_list<'s>(
     scope: &'s Scope<'_>,
     options: HandleValue<'_>,
@@ -424,7 +426,18 @@ fn transfer_list<'s>(
         StructuredSerializeOptions::from_jsval(scope, options, ()).map_err(
             |error| match error {
                 ConversionError::ExnPending => ExnThrown,
-                failure => failure.throw(scope),
+                ConversionError::Failure(message) => {
+                    let site = js::class::member_site::<MessagePortImpl>(
+                        "postMessage",
+                        js::error::MemberKind::Method,
+                    );
+                    let error = js::error::BindingError::InvalidArgument {
+                        index: 1,
+                        value: options,
+                        message: &message,
+                    };
+                    js::error::throw_binding_error(scope, &site, error)
+                }
             },
         )?;
     Ok(options.transfer)

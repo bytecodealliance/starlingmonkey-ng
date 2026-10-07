@@ -52,8 +52,20 @@ pub(crate) fn current<'a>() -> Option<&'a Runtime> {
     (!rt.is_null()).then(|| unsafe { &*rt })
 }
 
+/// The options of the realm of a new global of the runtime on this thread, as
+/// [`Runtime::realm_options`] returns them.
+///
+/// # Panics
+///
+/// Panics outside `Runtime::init`..`Runtime::drop`.
+pub fn realm_options() -> RealmOptions {
+    current()
+        .expect("a runtime is running on this thread")
+        .realm_options()
+}
+
 js::instance_local! {
-    static GLOBAL_INITIALIZERS: RefCell<Vec<GlobalInitFn>> = const { RefCell::new(Vec::new()) };
+    static GLOBAL_INITIALIZERS:RefCell<Vec<GlobalInitFn>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Register a function to be called whenever a new global object is created.
@@ -312,6 +324,8 @@ impl Runtime {
         let mut mozjs_rt =
             unsafe { MozJSRuntime::create_with_internal_job_queues(engine_handle(), None) };
         js::gc::init(mozjs_rt.cx());
+        js::watchdog::install(mozjs_rt.cx());
+        js::realm::install(mozjs_rt.cx());
         js::context::set_async_stack_capture(mozjs_rt.cx(), !config.async_stacks);
         #[cfg(target_arch = "wasm32")]
         if let Some(limit) = config.recursion_limit {
@@ -383,14 +397,7 @@ impl Runtime {
     /// default untouched.
     pub fn new_global(&self) -> RootScope<'_, js::gc::scope::EnteredRealm> {
         let cx = self.mozjs_rt_mut().cx();
-        // Trace any private data a global initializer stores on the
-        // global via `set_global_private_and_proto`.
-        let mut options = RealmOptions::default();
-        js::class::install_global_private_trace(&mut options);
-        if self.shared_memory {
-            options.creationOptions_.sharedMemoryAndAtomics_ = true;
-            options.creationOptions_.defineSharedArrayBufferConstructor_ = true;
-        }
+        let options = self.realm_options();
         let scope = RootScope::new_global(
             cx,
             &js::class::STARLING_GLOBAL_CLASS,
@@ -416,6 +423,20 @@ impl Runtime {
         js::class::fire_on_new_global_object(&scope, scope.global().handle());
 
         scope
+    }
+
+    /// The options of the realm of a new global: its private data is traced, and it defines
+    /// `SharedArrayBuffer` and `Atomics` if [`RuntimeConfig::shared_memory_enabled`] is set.
+    pub fn realm_options(&self) -> RealmOptions {
+        // Trace any private data a global initializer stores on the
+        // global via `set_global_private_and_proto`.
+        let mut options = RealmOptions::default();
+        js::class::install_global_private_trace(&mut options);
+        if self.shared_memory {
+            options.creationOptions_.sharedMemoryAndAtomics_ = true;
+            options.creationOptions_.defineSharedArrayBufferConstructor_ = true;
+        }
+        options
     }
 
     /// Enter the default global realm and return a rooting scope for it.

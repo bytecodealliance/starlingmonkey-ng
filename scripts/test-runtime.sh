@@ -37,7 +37,7 @@ echo "$errors"
 [[ "$errors" == *"late top-level failure"* ]] || { echo "FAIL: missing rejection message"; exit 1; }
 
 # The Node.js test scripts that use host I/O, on wasm.
-for script in crates/builtins/node/tests/js/fs.mjs crates/builtins/node/tests/js/net.mjs; do
+for script in crates/builtins/node/tests/js/fs.mjs crates/builtins/node/tests/js/net.mjs crates/builtins/node/tests/js/dns.mjs; do
     if ! output=$(run_script --node-compat "$script" 2>&1); then
         echo "$output"
         echo "FAIL: $script"

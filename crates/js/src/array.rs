@@ -81,6 +81,29 @@ impl<'s> Stack<'s, Array> {
         self.set_element(scope, 0, value)
     }
 
+    /// Remove the first element and move the others down by one, as `Array.prototype.shift`
+    /// does. Returns the element, or `undefined` for an empty array.
+    pub fn shift<'r>(&self, scope: &'r Scope<'_>) -> Result<HandleValue<'r>, ExnThrown> {
+        if self.length(scope)? == 0 {
+            return Ok(HandleValue::undefined());
+        }
+        let first = self.get_element(scope, 0)?;
+        self.remove(scope, 0, 1)?;
+        Ok(first)
+    }
+
+    /// Remove the last element, as `Array.prototype.pop` does. Returns the element, or
+    /// `undefined` for an empty array.
+    pub fn pop<'r>(&self, scope: &'r Scope<'_>) -> Result<HandleValue<'r>, ExnThrown> {
+        let length = self.length(scope)?;
+        if length == 0 {
+            return Ok(HandleValue::undefined());
+        }
+        let last = self.get_element(scope, length - 1)?;
+        self.set_length(scope, length - 1)?;
+        Ok(last)
+    }
+
     /// Remove `count` elements from `start` on and move the elements after them down, as
     /// `Array.prototype.splice(start, count)` does. A range past the end is clamped to it.
     pub fn remove(&self, scope: &Scope<'_>, start: u32, count: u32) -> Result<(), ExnThrown> {

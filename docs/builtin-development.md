@@ -33,12 +33,13 @@ These are capabilities that were reimplemented in the past, and what to use inst
 | Capability | Use |
 |---|---|
 | Interned property names | `&'static CStr` names with `get_property`, `set_property`, `define_property`, which intern through `js::class::get_or_init_property_id`. The `*_by_name` variants are for names built at runtime. |
-| The public own properties an object is created with | A `js::object::PropertyTemplate` static, registered at global setup, and `Object::property_writer`. `PropertyInit::Define` is for objects the builtin created itself, `PropertyInit::Assign` for objects a constructor was given |
+| The public own properties an object is created with | A `js::object::PropertyTemplate` static, registered at global setup, and `Object::property_writer`. `PropertyInit::Define` is for objects the builtin created itself, which no JavaScript can reach before the writer finishes: the writer adds their properties in one call. `PropertyInit::Assign` is for objects a constructor was given. A class's `templates = "..."` option gives its instances fixed slots for the templates' keys, and `Object::new_plain_with_template` creates a plain object with a template's properties |
 | Interned strings, such as event names | `js::class::get_or_init_atom` |
 | Symbols | `js::symbol::CachedSymbol` statics, unregistered unless the spec registers them |
 | Intrinsics (`Object`, `Error`, `Promise`, `RegExp`, …) | `js::class::get_class_object`, never a lookup on the global object |
 | The runtime's own builtins | Direct Rust calls, realm objects, or a class's `prototype_object`, never a lookup by name |
 | Callback state | The value itself as the payload, or a `#[jsclass(hidden)]` instance read with `js::function::cast_payload` |
+| The arguments of a native function as a list | `CallbackArgs::rest` |
 | Work for the next tick | `js::jobs::queue_native_tick` with a payload and arguments |
 | Timers | `core_runtime::event_loop::timer::start_timer` and the `EventLoop` timer methods, not the global `setTimeout` |
 | Promise reactions whose derived promise is unused | `Promise::add_reactions`, not `then` |

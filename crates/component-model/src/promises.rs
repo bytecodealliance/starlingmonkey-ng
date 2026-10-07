@@ -91,7 +91,7 @@ pub struct FutureRead {
 #[jsmethods]
 impl FutureRead {
     fn new() -> Self {
-        // Internal type, created through `create_instance_with`. This constructor
+        // Instances are created through `create_instance_with`. This constructor
         // only registers the prototype.
         FutureReadImpl::default()
     }
@@ -158,7 +158,7 @@ pub struct FutureWrite {
 #[jsmethods]
 impl FutureWrite {
     fn new() -> Self {
-        // Internal type, created through `create_instance_with`. This constructor
+        // Instances are created through `create_instance_with`. This constructor
         // only registers the prototype.
         FutureWriteImpl::default()
     }

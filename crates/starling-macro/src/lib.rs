@@ -78,6 +78,20 @@ struct AttrOpts {
     /// `#[jsclass(invalid_this = "path::to::fn")]` makes a method or accessor called on a `this`
     /// that isn't an instance throw by calling `fn(scope, class_name) -> ExnThrown`.
     invalid_this: Option<syn::Path>,
+    /// `#[jsclass(templates = "A, B")]` makes `ClassDef::property_count` the number of keys of
+    /// the `PropertyTemplate`s `A` and `B`.
+    templates: Vec<syn::Path>,
+}
+
+/// The comma-separated paths of `PropertyTemplate`s in a `templates = "..."` option.
+fn parse_template_paths(list: &LitStr) -> syn::Result<Vec<syn::Path>> {
+    list.parse_with(syn::punctuated::Punctuated::<syn::Path, Token![,]>::parse_terminated)
+        .map(|paths| paths.into_iter().collect())
+}
+
+/// The total number of keys of the `PropertyTemplate`s `templates`.
+fn template_property_count(templates: &[syn::Path]) -> proc_macro2::TokenStream {
+    quote! { 0usize #(+ #templates.len())* }
 }
 
 impl Parse for AttrOpts {
@@ -129,6 +143,7 @@ impl Parse for AttrOpts {
                 "mirror" => opts.mirror = Some(input.parse::<LitStr>()?.value()),
                 "proto_parent" => opts.proto_parent = Some(input.parse::<LitStr>()?.parse()?),
                 "invalid_this" => opts.invalid_this = Some(input.parse::<LitStr>()?.parse()?),
+                "templates" => opts.templates = parse_template_paths(&input.parse::<LitStr>()?)?,
                 _ => return Err(syn::Error::new(key.span(), "unknown option")),
             }
             if !input.is_empty() {
@@ -195,7 +210,7 @@ impl AttrOpts {
     /// the wrong shape. Listing the fields once here means a new option can't
     /// be quietly accepted by every attribute that forgot to name it.
     fn reject_all_but(&self, allowed: &[&str], span: impl quote::ToTokens) -> syn::Result<()> {
-        let set: [(bool, &str); 13] = [
+        let set: [(bool, &str); 15] = [
             (self.default.is_some(), "default"),
             (self.mirror.is_some(), "mirror"),
             (self.self_export.is_some(), "self_export"),
@@ -209,6 +224,8 @@ impl AttrOpts {
             (self.unforgeable, "unforgeable"),
             (self.node_args, "node_args"),
             (self.proto_parent.is_some(), "proto_parent"),
+            (self.invalid_this.is_some(), "invalid_this"),
+            (!self.templates.is_empty(), "templates"),
         ];
         for (present, key) in set {
             if present && !allowed.contains(&key) {
@@ -245,6 +262,9 @@ impl AttrOpts {
 /// //   MyClassImpl { data: String }    — the data struct (ClassDef)
 /// //   MyClass<'s>                     — stack newtype (Stack<FooImpl> wrapper)
 /// ```
+///
+/// `templates = "A, B"` gives new instances fixed slots for the keys of the
+/// `js::object::PropertyTemplate`s `A` and `B`.
 #[proc_macro_attribute]
 pub fn jsclass(attr: TokenStream, item: TokenStream) -> TokenStream {
     process_class_def(attr, item, ClassConfig::JSCLASS)
@@ -584,12 +604,23 @@ fn process_class_def(attr: TokenStream, item: TokenStream, config: ClassConfig) 
         Some(path) => quote! {
             fn throw_invalid_this(
                 scope: &::js::gc::scope::Scope<'_>,
+                _site: &::js::error::BindingSite,
                 _message: &'static ::core::ffi::CStr,
             ) -> ::js::error::ExnThrown {
                 #path(scope, #js_name)
             }
         },
         None => quote! {},
+    };
+    let property_count = if opts.templates.is_empty() {
+        quote! {}
+    } else {
+        let count = template_property_count(&opts.templates);
+        quote! {
+            fn property_count() -> usize {
+                #count
+            }
+        }
     };
 
     let output = quote! {
@@ -649,6 +680,7 @@ fn process_class_def(attr: TokenStream, item: TokenStream, config: ClassConfig) 
             const PROTOTYPE_CALL_ERROR: &'static ::core::ffi::CStr = #prototype_call_error_lit;
             #no_new_error
             #throw_invalid_this
+            #property_count
 
             fn class() -> &'static ::js::class_spec::JSClass {
                 &#class_static
@@ -1563,7 +1595,11 @@ fn process_methods(attr: TokenStream, item: TokenStream, config: ClassConfig) ->
                     scope: &::js::gc::scope::Scope<'_>,
                     _args: &::js::native::CallArgs,
                 ) -> ::std::result::Result<#inner_name, ::js::error::ExnThrown> {
-                    Err(::js::error::throw_type_error(scope, c"Illegal constructor"))
+                    Err(::js::error::throw_binding_error(
+                        scope,
+                        &::js::class::constructor_site::<#inner_name>(),
+                        ::js::error::BindingError::IllegalConstructor,
+                    ))
                 }
                 #ctor_nargs_method
                 #ctor_defined_method
@@ -1653,6 +1689,7 @@ fn process_methods(attr: TokenStream, item: TokenStream, config: ClassConfig) ->
         } else {
             quote! { #type_name::#setup_fn_name(&__typed, #(#arg_names),*) }
         };
+        let site = binding_site(class_interface(&inner_name), "constructor", "Constructor");
         quote! {
             #[allow(clippy::not_unsafe_ptr_arg_deref)]
             impl ::js::class::__PostInitRegistrar<#inner_name> for ::js::class::__PostInitReg<#inner_name> {
@@ -1662,6 +1699,7 @@ fn process_methods(attr: TokenStream, item: TokenStream, config: ClassConfig) ->
                     obj: ::js::Object<'_>,
                     args: &::js::native::CallArgs,
                 ) -> ::std::result::Result<(), ::js::error::ExnThrown> {
+                    #site
                     let __typed = obj.cast::<#type_name>().unwrap();
                     #(#arg_extractions)*
                     #call.map_err(|__e| ::js::error::ThrowException::throw(__e, scope))
@@ -2208,7 +2246,15 @@ fn gen_rest_setup(
                     Ok(__v) => __rest_vec.push(__v),
                     Err(e) => {
                         if let ::js::conversion::ConversionError::Failure(reason) = e {
-                            ::js::error::throw_type_error(#scope_expr, &*reason);
+                            ::js::error::throw_binding_error(
+                                #scope_expr,
+                                &__SITE,
+                                ::js::error::BindingError::InvalidArgument {
+                                    index: __i,
+                                    value: __handle,
+                                    message: &*reason,
+                                },
+                            );
                         }
                         #fail
                     },
@@ -2507,18 +2553,6 @@ fn required_arg_count(params: &[(Ident, Type)]) -> u32 {
     params.iter().filter(|(_, ty)| !is_option_type(ty)).count() as u32
 }
 
-/// Detect the WebIDL `any` type, represented in signatures as `Value` or
-/// `HandleValue`. For `any`, `null` is an ordinary value (distinct from a
-/// missing argument), unlike object/dictionary types where `null` means absent.
-fn is_any_value_type(ty: &Type) -> bool {
-    if let Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            return seg.ident == "Value" || seg.ident == "HandleValue";
-        }
-    }
-    false
-}
-
 /// Check whether a type is a none-optional `Heap<T>`.
 fn is_bare_heap_type(ty: &Type) -> bool {
     if let Type::Path(tp) = ty {
@@ -2714,18 +2748,46 @@ fn cstr_literal(s: &str) -> proc_macro2::Literal {
     proc_macro2::Literal::c_string(&cstr)
 }
 
+/// The `__SITE` constant that the binding code of a member passes to the argument extractors and
+/// brand checks: a `::js::error::BindingSite` with the class name `interface` (an expression),
+/// the member name `member` and the `::js::error::MemberKind` variant `kind`. Every block that
+/// uses [`gen_arg_extractions`], [`gen_rest_setup`] or a `get_this*` call starts with one.
+fn binding_site(
+    interface: proc_macro2::TokenStream,
+    member: &str,
+    kind: &str,
+) -> proc_macro2::TokenStream {
+    let kind = format_ident!("{kind}");
+    quote! {
+        #[allow(dead_code)]
+        const __SITE: ::js::error::BindingSite = ::js::error::BindingSite {
+            interface: #interface,
+            member: #member,
+            kind: ::js::error::MemberKind::#kind,
+        };
+    }
+}
+
+/// The interface expression of [`binding_site`] for the class whose private data is `type_name`.
+fn class_interface(type_name: &Ident) -> proc_macro2::TokenStream {
+    quote! { <#type_name as ::js::class::ClassDef>::NAME }
+}
+
 /// Generate argument extraction code for a list of typed parameters.
 ///
 /// When `use_question_mark` is true, extraction errors propagate via `?`;
 /// otherwise they `return false` (for use inside JSNative wrappers).
 ///
 /// `required` is the number of leading parameters a call must pass: the method's argument count
-/// (its JS `.length`) for WebIDL members, and 0 for Node.js functions. An `any`-typed parameter
-/// (`HandleValue`/`Value`), or one converted by plain `FromJSVal`, at or beyond that index is
-/// extracted as optional: a missing argument converts as `undefined` instead of throwing "Not
-/// enough arguments". This lets `#[method(length = N)]` make trailing `any`
+/// (its JS `.length`) for WebIDL members, and 0 for Node.js functions. A parameter at or beyond
+/// that index is extracted as optional: a missing argument converts as `undefined` instead of
+/// throwing "Not enough arguments". This lets `#[method(length = N)]` make trailing `any`
 /// params optional without wrapping them in `Option<…>`, matching how WebIDL
 /// `optional any` defaults to `undefined`.
+///
+/// A call without one of the leading parameters that must be passed throws the missing argument's
+/// error before any argument is converted, as WebIDL's overload resolution checks the number of
+/// arguments first.
 fn gen_arg_extractions(
     params: &[(Ident, Type)],
     args_expr: proc_macro2::TokenStream,
@@ -2733,75 +2795,87 @@ fn gen_arg_extractions(
     scope_expr: proc_macro2::TokenStream,
     required: u32,
 ) -> Vec<proc_macro2::TokenStream> {
-    params
-        .iter()
-        .enumerate()
-        .map(|(i, (name, ty))| {
-            let idx = i as u32;
-
-            let optional = is_option_type(ty);
-            let inner =
-                optional.then(|| extract_option_inner_type(ty).expect("Option<T> has an inner type"));
-            let declared = inner.as_ref().unwrap_or(ty);
-            let borrow = BorrowedParam::of(declared);
-            let convert_ty = borrow.as_ref().map_or(declared, |b| &b.convert_ty);
-            let hidden = format_ident!("__arg_owned_{}", idx);
-            let value = if borrow.is_some() { &hidden } else { name };
-            let annotation = borrow.as_ref().map(|b| b.annotation(optional));
-            let rebind = borrow.as_ref().map(|b| b.rebind(name, value, optional));
-
-            if optional {
-                let inner_extract = gen_typed_arg_getter(convert_ty, &scope_expr, &args_expr, idx);
-                let fail = if use_question_mark {
-                    quote! { return Err(::js::error::ExnThrown); }
-                } else {
-                    quote! { return false; }
-                };
-
-                // Per WebIDL, only a missing argument or `undefined` maps to `None` for an
-                // `optional` argument without a default; `null` is a present value and is converted
-                // through the normal path. For primitives that means e.g. `null` → "null" / `0`, for a
-                // dictionary the conversion itself treats `null` as an empty dictionary, and for
-                // a union or sequence (e.g. `HeadersInit`) converting `null` throws.
-                return quote! {
-                    let __val = #args_expr.get(#idx);
-                    let #value #annotation = if __val.is_undefined() {
-                        None
-                    } else {
-                        match #inner_extract {
-                            Ok(__v) => Some(__v),
-                            Err(::js::error::ExnThrown) => { #fail }
-                        }
-                    };
-                    #rebind
-                };
+    let must_pass =
+        |(i, (_, ty)): &(usize, &(Ident, Type))| !is_option_type(ty) && (*i as u32) < required;
+    let leading = params.iter().enumerate().take_while(must_pass).count() as u32;
+    let arity_check = (leading > 0).then(|| {
+        let fail = if use_question_mark {
+            quote! { return Err(__e); }
+        } else {
+            quote! { let ::js::error::ExnThrown = __e; return false; }
+        };
+        quote! {
+            if (#args_expr).argc_ < #leading {
+                let __argc = (#args_expr).argc_;
+                let __e = ::js::error::throw_binding_error(
+                    #scope_expr,
+                    &__SITE,
+                    ::js::error::BindingError::MissingArgument { index: __argc, given: __argc },
+                );
+                #fail
             }
+        }
+    });
+    let extractions = params.iter().enumerate().map(|(i, (name, ty))| {
+        let idx = i as u32;
 
-            let lenient = is_any_value_type(convert_ty)
-                || matches!(InputConversion::of(convert_ty), InputConversion::Plain);
-            let extract = if lenient && idx >= required {
-                // An `any` or plainly converted param past the required count: a missing
-                // argument converts as `undefined`, so don't throw.
-                quote! { unsafe { ::js::class::get_arg_or_undefined(#scope_expr, #args_expr, #idx) } }
+        let optional = is_option_type(ty);
+        let inner =
+            optional.then(|| extract_option_inner_type(ty).expect("Option<T> has an inner type"));
+        let declared = inner.as_ref().unwrap_or(ty);
+        let borrow = BorrowedParam::of(declared);
+        let convert_ty = borrow.as_ref().map_or(declared, |b| &b.convert_ty);
+        let hidden = format_ident!("__arg_owned_{}", idx);
+        let value = if borrow.is_some() { &hidden } else { name };
+        let annotation = borrow.as_ref().map(|b| b.annotation(optional));
+        let rebind = borrow.as_ref().map(|b| b.rebind(name, value, optional));
+
+        if optional {
+            let inner_extract =
+                gen_typed_arg_getter(convert_ty, &scope_expr, &args_expr, idx, true);
+            let fail = if use_question_mark {
+                quote! { return Err(::js::error::ExnThrown); }
             } else {
-                gen_typed_arg_getter(convert_ty, &scope_expr, &args_expr, idx)
+                quote! { return false; }
             };
-            if use_question_mark {
-                quote! {
-                    let #value #annotation = #extract?;
-                    #rebind
-                }
-            } else {
-                quote! {
-                    let #value #annotation = match #extract {
-                        Ok(v) => v,
-                        Err(::js::error::ExnThrown) => return false,
-                    };
-                    #rebind
-                }
+
+            // Per WebIDL, only a missing argument or `undefined` maps to `None` for an
+            // `optional` argument without a default; `null` is a present value and is converted
+            // through the normal path. For primitives that means e.g. `null` → "null" / `0`, for a
+            // dictionary the conversion itself treats `null` as an empty dictionary, and for
+            // a union or sequence (e.g. `HeadersInit`) converting `null` throws.
+            return quote! {
+                let __val = #args_expr.get(#idx);
+                let #value #annotation = if __val.is_undefined() {
+                    None
+                } else {
+                    match #inner_extract {
+                        Ok(__v) => Some(__v),
+                        Err(::js::error::ExnThrown) => { #fail }
+                    }
+                };
+                #rebind
+            };
+        }
+
+        let extract =
+            gen_typed_arg_getter(convert_ty, &scope_expr, &args_expr, idx, idx < required);
+        if use_question_mark {
+            quote! {
+                let #value #annotation = #extract?;
+                #rebind
             }
-        })
-        .collect()
+        } else {
+            quote! {
+                let #value #annotation = match #extract {
+                    Ok(v) => v,
+                    Err(::js::error::ExnThrown) => return false,
+                };
+                #rebind
+            }
+        }
+    });
+    arity_check.into_iter().chain(extractions).collect()
 }
 
 /// How an input of a given type is converted from JS.
@@ -2838,35 +2912,39 @@ impl<'a> InputConversion<'a> {
 }
 
 /// Build the `get_*` extraction expression for a single typed argument, one per
-/// [`InputConversion`]; each yields a `Result<T, ExnThrown>`. The `any`-optional
-/// case (a trailing `any` param past the required count) is handled by the
-/// caller, since it depends on the arg index.
+/// [`InputConversion`]. Each yields a `Result<T, ExnThrown>`. A missing argument
+/// throws "Not enough arguments" if `required` is set, and converts as
+/// `undefined` otherwise.
 fn gen_typed_arg_getter(
     ty: &Type,
     scope_expr: &proc_macro2::TokenStream,
     args_expr: &proc_macro2::TokenStream,
     idx: u32,
+    required: bool,
 ) -> proc_macro2::TokenStream {
     match InputConversion::of(ty) {
         InputConversion::CheckedPromise(value_ty) => {
             let check = promise_value_check(value_ty);
             quote! {
-                unsafe { ::js::class::get_checked_promise_arg(#scope_expr, #args_expr, #idx, #check) }
+                unsafe { ::js::class::get_checked_promise_arg(#scope_expr, &__SITE, #args_expr, #idx, #required, #check) }
             }
         }
         InputConversion::UncheckedPromise => quote! {
-            unsafe { ::js::class::get_unchecked_promise_arg(#scope_expr, #args_expr, #idx) }
+            unsafe { ::js::class::get_unchecked_promise_arg(#scope_expr, &__SITE, #args_expr, #idx, #required) }
         },
         InputConversion::Integer => quote! {
-            unsafe { ::js::class::get_int_arg(#scope_expr, #args_expr, #idx,
+            unsafe { ::js::class::get_int_arg(#scope_expr, &__SITE, #args_expr, #idx, #required,
                 ::js::conversion::ConversionBehavior::Default) }
         },
         InputConversion::IntegerContainer => quote! {
-            unsafe { ::js::class::get_arg_with_config::<#ty>(#scope_expr, #args_expr, #idx,
-                ::js::conversion::ConversionBehavior::Default) }
+            unsafe { ::js::class::get_arg_with_config::<#ty>(#scope_expr, &__SITE, #args_expr, #idx,
+                #required, ::js::conversion::ConversionBehavior::Default) }
         },
+        InputConversion::Plain if required => {
+            quote! { unsafe { ::js::class::get_arg(#scope_expr, &__SITE, #args_expr, #idx) } }
+        }
         InputConversion::Plain => {
-            quote! { unsafe { ::js::class::get_arg(#scope_expr, #args_expr, #idx) } }
+            quote! { unsafe { ::js::class::get_arg_or_undefined(#scope_expr, &__SITE, #args_expr, #idx) } }
         }
     }
 }
@@ -3077,7 +3155,9 @@ fn gen_constructor_body(info: &MethodInfo, type_name: &Ident) -> proc_macro2::To
         _ => quote! { Ok(#call) },
     };
 
+    let site = binding_site(class_interface(type_name), "constructor", "Constructor");
     quote! {
+        #site
         #(#arg_extractions)*
         #rest_setup
         #wrapped
@@ -3110,10 +3190,12 @@ fn gen_constructor_body(info: &MethodInfo, type_name: &Ident) -> proc_macro2::To
 ///   functions, which `classify_return_style` never classifies as `InstanceValue`.
 /// - `required` is the number of leading `any` parameters whose absence throws
 ///   "Not enough arguments". A missing `any` argument past them is `undefined`.
+/// - `site` is the [`binding_site`] constant of the callable.
 #[allow(clippy::too_many_arguments)]
 fn emit_native_fn(
     native_name: &Ident,
     name_str: &str,
+    site: &proc_macro2::TokenStream,
     return_style: &ReturnStyle,
     params: &[(Ident, Type)],
     required: u32,
@@ -3272,6 +3354,7 @@ fn emit_native_fn(
             argc: u32,
             vp: *mut ::js::native::Value,
         ) -> bool {
+            #site
             let scope = unsafe { ::js::gc::scope::RootScope::from_current_realm(raw_cx) };
             let __args = ::js::native::CallArgs::from_vp(vp, argc);
             #this_extraction
@@ -3313,14 +3396,19 @@ fn gen_method_native(
         quote! {}
     };
     let this_getter_expr = if on_newtype && has_this {
-        quote! { ::js::class::get_this::<#struct_name<'_>>(&scope, &__args) }
+        quote! { ::js::class::get_this::<#struct_name<'_>>(&scope, &__SITE, &__args) }
     } else if info.has_self {
-        quote! { ::js::class::get_this_data::<#type_name>(&scope, &__args) }
+        quote! { ::js::class::get_this_data::<#type_name>(&scope, &__SITE, &__args) }
     } else if info.has_mut_self {
-        quote! { ::js::class::get_this_data_mut::<#type_name>(&scope, &__args) }
+        quote! { ::js::class::get_this_data_mut::<#type_name>(&scope, &__SITE, &__args) }
     } else {
         quote! {}
     };
+    let site = binding_site(
+        class_interface(type_name),
+        js_name,
+        if has_this { "Method" } else { "StaticMethod" },
+    );
     let is_result_promise = matches!(info.return_style, ReturnStyle::ResultPromise);
     let this_extraction = if !has_this || is_result_promise {
         quote! {}
@@ -3394,6 +3482,7 @@ fn gen_method_native(
     let native_fn = emit_native_fn(
         &native_name,
         &name_str,
+        &site,
         &info.return_style,
         &info.params,
         info.required,
@@ -3429,7 +3518,7 @@ fn gen_accessor_native(
     info: &MethodInfo,
     type_name: &Ident,
     struct_name: &Ident,
-    _js_name: &str,
+    js_name: &str,
     is_getter: bool,
     on_newtype: bool,
 ) -> proc_macro2::TokenStream {
@@ -3464,12 +3553,17 @@ fn gen_accessor_native(
         quote! { return ::js::exception::check_fn_return(&scope, false, #name_str); }
     };
     let this_getter_expr = if on_newtype {
-        quote! { ::js::class::get_this::<#struct_name<'_>>(&scope, &__args) }
+        quote! { ::js::class::get_this::<#struct_name<'_>>(&scope, &__SITE, &__args) }
     } else if is_getter {
-        quote! { ::js::class::get_this_data::<#type_name>(&scope, &__args) }
+        quote! { ::js::class::get_this_data::<#type_name>(&scope, &__SITE, &__args) }
     } else {
-        quote! { ::js::class::get_this_data_mut::<#type_name>(&scope, &__args) }
+        quote! { ::js::class::get_this_data_mut::<#type_name>(&scope, &__SITE, &__args) }
     };
+    let site = binding_site(
+        class_interface(type_name),
+        js_name,
+        if is_getter { "Getter" } else { "Setter" },
+    );
     // Getters take `&self`; setters take `&mut self`.
     let self_mut = if is_getter {
         quote! {}
@@ -3644,6 +3738,7 @@ fn gen_accessor_native(
             argc: u32,
             vp: *mut ::js::native::Value,
         ) -> bool {
+            #site
             let scope = unsafe { ::js::gc::scope::RootScope::from_current_realm(raw_cx) };
             let __args = ::js::native::CallArgs::from_vp(vp, argc);
             #this_extraction
@@ -4372,9 +4467,11 @@ fn gen_free_fn_native(
         quote! { #call_path::#fn_name(#(#call_args),*) }
     };
 
+    let site = binding_site(quote! { "" }, &exp.js_name, "Function");
     emit_native_fn(
         native_name,
         &name_str,
+        &site,
         &exp.return_style,
         &exp.params,
         required,
@@ -4649,6 +4746,8 @@ struct FunctionClassOpts {
     /// The function `fn(&Scope, &str) -> ExnThrown` that throws the error for a `this` without
     /// state.
     invalid_this: Option<syn::Path>,
+    /// The `PropertyTemplate`s whose keys instances get when they are created.
+    templates: Vec<syn::Path>,
 }
 
 impl Parse for FunctionClassOpts {
@@ -4673,6 +4772,7 @@ impl Parse for FunctionClassOpts {
                 "extends" => opts.extends = Some(input.parse::<LitStr>()?.parse()?),
                 "state" => opts.state = Some(input.parse::<LitStr>()?.parse()?),
                 "invalid_this" => opts.invalid_this = Some(input.parse::<LitStr>()?.parse()?),
+                "templates" => opts.templates = parse_template_paths(&input.parse::<LitStr>()?)?,
                 _ => return Err(syn::Error::new(key.span(), "unknown option")),
             }
             if !input.is_empty() {
@@ -4804,6 +4904,9 @@ fn take_function_class_marker(
 /// With the `self_construct` option, a call without `new` whose `this` isn't an instance of the
 /// class initializes and returns a new instance, as Node.js's
 /// `if (!(this instanceof C)) return new C(...)` does.
+/// With `templates = "A, B"`, the instances `new_instance` creates get fixed slots for the keys of
+/// the `js::object::PropertyTemplate`s `A` and `B`, and so do those `new` creates if they are
+/// plain objects.
 ///
 /// ```rust,ignore
 /// #[jsfunction_class(name = "Counter")]
@@ -4834,6 +4937,7 @@ fn gen_function_class(
     let mod_vis = &input.vis;
     let self_construct = opts.self_construct;
     let class_syntax = opts.class_syntax;
+    let property_count = template_property_count(&opts.templates);
     let member_attrs = if opts.class_syntax {
         quote! { 0 }
     } else {
@@ -4919,6 +5023,7 @@ fn gen_function_class(
             natives.push(emit_native_fn(
                 &native_name,
                 &fn_name.to_string(),
+                &binding_site(quote! { #js_name }, "constructor", "Constructor"),
                 &export.return_style,
                 &export.params,
                 0,
@@ -4942,6 +5047,7 @@ fn gen_function_class(
                 false,
                 &quote!(&scope),
             );
+            let site = binding_site(quote! { #js_name }, "constructor", "Constructor");
             natives.push(quote! {
                 #[allow(non_snake_case)]
                 unsafe extern "C" fn #native_name(
@@ -4949,6 +5055,7 @@ fn gen_function_class(
                     argc: u32,
                     vp: *mut ::js::native::Value,
                 ) -> bool {
+                    #site
                     let scope = unsafe { ::js::gc::scope::RootScope::from_current_realm(raw_cx) };
                     let __args = ::js::native::CallArgs::from_vp(vp, argc);
                     let mut __constructing = __args.is_constructing();
@@ -4957,7 +5064,7 @@ fn gen_function_class(
                         return false;
                     }
                     let this = if __constructing {
-                        match __new_for_constructor(&scope, &__args) {
+                        match __new_for_constructor(&scope, &__args, #property_count) {
                             Ok(__o) => __o,
                             Err(_) => return false,
                         }
@@ -5028,9 +5135,15 @@ fn gen_function_class(
             .rest_arg_name
             .as_ref()
             .map(|name| (name, export.rest_inner_type.as_ref()));
+        let kind = if member == FunctionClassMember::StaticMethod {
+            "StaticMethod"
+        } else {
+            "Method"
+        };
         natives.push(emit_native_fn(
             &native_name,
             &fn_name.to_string(),
+            &binding_site(quote! { #js_name }, &export.js_name, kind),
             &export.return_style,
             &export.params,
             0,
@@ -5079,13 +5192,13 @@ fn gen_function_class(
             quote! {
                 let __state = ::js::class::create_instance_for_constructor::<
                     <#state<'s> as ::js::class::InstanceState<'s>>::Class,
-                >(scope, args, ::std::default::Default::default())?;
+                >(scope, args, ::std::default::Default::default(), property_count)?;
                 Ok(__state.as_object())
             },
             quote! {
                 let __state = ::js::class::create_instance_with_proto::<
                     <#state<'s> as ::js::class::InstanceState<'s>>::Class,
-                >(scope, proto, ::std::default::Default::default())?;
+                >(scope, proto, ::std::default::Default::default(), property_count)?;
                 Ok(__state.as_object())
             },
             quote! {
@@ -5099,13 +5212,19 @@ fn gen_function_class(
             },
         ),
         (None, Some(parent)) => (
-            quote! { #parent::__new_for_constructor(scope, args) },
-            quote! { #parent::__new_with_proto(scope, proto) },
+            quote! { #parent::__new_for_constructor(scope, args, property_count) },
+            quote! { #parent::__new_with_proto(scope, proto, property_count) },
             quote! { #parent::__ensure_state(scope, this) },
         ),
         (None, None) => (
-            quote! { ::js::Object::new_plain_for_constructor(scope, args) },
-            quote! { ::js::Object::new_plain_with_proto(scope, proto.handle()) },
+            quote! { ::js::Object::new_plain_for_constructor(scope, args, property_count) },
+            quote! {
+                if property_count == 0 {
+                    ::js::Object::new_plain_with_proto(scope, proto.handle())
+                } else {
+                    ::js::Object::new_with_property_capacity(scope, None, Some(proto), property_count)
+                }
+            },
             quote! { Ok(()) },
         ),
     };
@@ -5158,19 +5277,23 @@ fn gen_function_class(
             #state_items
 
             /// A new instance for the constructor call `args`, whose prototype is `new.target`'s.
+            /// A plain object gets fixed slots for `property_count` properties.
             #[doc(hidden)]
             pub fn __new_for_constructor<'s>(
                 scope: &'s ::js::gc::scope::Scope<'_>,
                 args: &::js::native::CallArgs,
+                property_count: usize,
             ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
                 #new_for_constructor
             }
 
-            /// A new instance whose prototype is `proto`.
+            /// A new instance whose prototype is `proto`, with fixed slots for `property_count`
+            /// properties.
             #[doc(hidden)]
             pub fn __new_with_proto<'s>(
                 scope: &'s ::js::gc::scope::Scope<'_>,
                 proto: ::js::Object<'s>,
+                property_count: usize,
             ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
                 #new_with_proto
             }
@@ -5228,7 +5351,7 @@ fn gen_function_class(
             pub fn new_instance<'s>(
                 scope: &'s ::js::gc::scope::Scope<'_>,
             ) -> ::std::result::Result<::js::Object<'s>, ::js::error::ExnThrown> {
-                __new_with_proto(scope, prototype_object(scope)?)
+                __new_with_proto(scope, prototype_object(scope)?, #property_count)
             }
 
             /// The class's constructor in the current realm, or a `TypeError` if the class isn't

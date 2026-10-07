@@ -5,7 +5,7 @@
 use crate::url_search_params_iterator::URLSearchParamsIterator;
 use core_runtime::{webidl_interface, webidl_methods, webidl_union};
 use js::conversion::{Record, ToJSVal};
-use js::error::{ExnThrown, TypeError};
+use js::error::{ExnThrown, OperationError};
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::iteration::IterationKind;
@@ -34,7 +34,7 @@ pub struct URLSearchParams {
 impl URLSearchParams<'_> {
     /// <https://url.spec.whatwg.org/#dom-urlsearchparams-urlsearchparams>
     #[constructor]
-    fn new(&self, init: Option<URLSearchParamsInit>) -> Result<(), TypeError> {
+    fn new(&self, init: Option<URLSearchParamsInit>) -> Result<(), OperationError> {
         // Step 1 (for a string _init_) is below.
         // Step 2: `Initialize` `this` with _init_.
         // (inlined) <https://url.spec.whatwg.org/#urlsearchparams-initialize>
@@ -48,10 +48,15 @@ impl URLSearchParams<'_> {
                     // [inlined] Step 1.1: If _innerSequence_'s `size` is not 2, then `throw` a
                     //                     ``TypeError``.
                     if pair.len() != 2 {
-                        return Err(TypeError(
-                            "Each URLSearchParams sequence element must contain exactly two items"
+                        return Err(OperationError {
+                            site: js::class::constructor_site::<URLSearchParamsImpl>(),
+                            kind: js::error::JSExnType::JSEXN_TYPEERR,
+                            message: "Each URLSearchParams sequence element must contain exactly \
+                                      two items"
                                 .into(),
-                        ));
+                            code: "ERR_INVALID_TUPLE",
+                            args: vec!["Each query pair".into(), "[name, value]".into()],
+                        });
                     }
                     // [inlined] Step 1.2: `Append` (_innerSequence_[0], _innerSequence_[1]) to
                     //                     _query_'s `list`.

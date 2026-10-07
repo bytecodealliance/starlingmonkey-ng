@@ -1,0 +1,110 @@
+{
+  "idl_test setup": {
+    "status": "PASS"
+  },
+  "idl_test validation": {
+    "status": "PASS"
+  },
+  "Partial interface Performance: original interface defined": {
+    "status": "PASS"
+  },
+  "Partial interface Performance: member names are unique": {
+    "status": "PASS"
+  },
+  "PerformanceMark interface: existence and properties of interface object": {
+    "status": "PASS"
+  },
+  "PerformanceMark interface object length": {
+    "status": "PASS"
+  },
+  "PerformanceMark interface object name": {
+    "status": "PASS"
+  },
+  "PerformanceMark interface: existence and properties of interface prototype object": {
+    "status": "PASS"
+  },
+  "PerformanceMark interface: existence and properties of interface prototype object's \"constructor\" property": {
+    "status": "PASS"
+  },
+  "PerformanceMark interface: existence and properties of interface prototype object's @@unscopables property": {
+    "status": "PASS"
+  },
+  "PerformanceMark interface: attribute detail": {
+    "status": "PASS"
+  },
+  "PerformanceMark must be primary interface of mark": {
+    "status": "PASS"
+  },
+  "Stringification of mark": {
+    "status": "PASS"
+  },
+  "PerformanceMark interface: mark must inherit property \"detail\" with the proper type": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure interface: existence and properties of interface object": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure interface object length": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure interface object name": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure interface: existence and properties of interface prototype object": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure interface: existence and properties of interface prototype object's \"constructor\" property": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure interface: existence and properties of interface prototype object's @@unscopables property": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure interface: attribute detail": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure must be primary interface of measure": {
+    "status": "PASS"
+  },
+  "Stringification of measure": {
+    "status": "PASS"
+  },
+  "PerformanceMeasure interface: measure must inherit property \"detail\" with the proper type": {
+    "status": "PASS"
+  },
+  "Performance interface: operation mark(DOMString, optional PerformanceMarkOptions)": {
+    "status": "PASS"
+  },
+  "Performance interface: operation clearMarks(optional DOMString)": {
+    "status": "PASS"
+  },
+  "Performance interface: operation measure(DOMString, optional (DOMString or PerformanceMeasureOptions), optional DOMString)": {
+    "status": "PASS"
+  },
+  "Performance interface: operation clearMeasures(optional DOMString)": {
+    "status": "PASS"
+  },
+  "Performance interface: performance must inherit property \"mark(DOMString, optional PerformanceMarkOptions)\" with the proper type": {
+    "status": "PASS"
+  },
+  "Performance interface: calling mark(DOMString, optional PerformanceMarkOptions) on performance with too few arguments must throw TypeError": {
+    "status": "PASS"
+  },
+  "Performance interface: performance must inherit property \"clearMarks(optional DOMString)\" with the proper type": {
+    "status": "PASS"
+  },
+  "Performance interface: calling clearMarks(optional DOMString) on performance with too few arguments must throw TypeError": {
+    "status": "PASS"
+  },
+  "Performance interface: performance must inherit property \"measure(DOMString, optional (DOMString or PerformanceMeasureOptions), optional DOMString)\" with the proper type": {
+    "status": "PASS"
+  },
+  "Performance interface: calling measure(DOMString, optional (DOMString or PerformanceMeasureOptions), optional DOMString) on performance with too few arguments must throw TypeError": {
+    "status": "PASS"
+  },
+  "Performance interface: performance must inherit property \"clearMeasures(optional DOMString)\" with the proper type": {
+    "status": "PASS"
+  },
+  "Performance interface: calling clearMeasures(optional DOMString) on performance with too few arguments must throw TypeError": {
+    "status": "PASS"
+  }
+}

@@ -186,29 +186,23 @@ fn run_ticks(scope: &Scope<'_>) {
         return;
     }
     RUNNING_TICKS.with(|running| running.set(true));
-    loop {
-        let scope = scope.inner_scope();
-        match run_next_tick(&scope) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(ExnThrown) => handle_tick_exception(&scope),
-        }
-    }
+    while run_next_tick(&scope.inner_scope()) {}
     RUNNING_TICKS.with(|running| running.set(false));
 }
 
-/// Take the first tick out of the tick queue and run it with its async context current. Returns
-/// whether there was a tick.
-fn run_next_tick(scope: &Scope<'_>) -> Result<bool, ExnThrown> {
+/// Take the first tick out of the tick queue and run it as a callback with its async context
+/// current, which is also current while the exception it throws is handled. Returns whether
+/// there was a tick.
+fn run_next_tick(scope: &Scope<'_>) -> bool {
     let Some(queue) = tick_queue(scope) else {
-        return Ok(false);
+        return false;
     };
     // The tick's values are rooted while the traced queue still holds them, and the tick is
     // dropped before anything can GC again.
     let (callback, native, args, context) = {
         let data = queue.data();
         let Some(tick) = data.ticks.front() else {
-            return Ok(false);
+            return false;
         };
         let args: Vec<_> = tick.args.iter().map(|arg| arg.get(scope)).collect();
         (
@@ -220,13 +214,16 @@ fn run_next_tick(scope: &Scope<'_>) -> Result<bool, ExnThrown> {
     };
     drop(queue.data_mut().ticks.pop_front());
     QUEUED_TICKS.set(QUEUED_TICKS.get().saturating_sub(1));
-    let previous = context.enter();
+    let previous = context.enter_callback(scope);
     let result = match native {
         Some(native) => native(scope, CallbackArgs::from_values(&args), callback).map(|_| ()),
         None => crate::Function::call(scope, HandleValue::undefined(), callback, &args).map(|_| ()),
     };
-    previous.enter();
-    result.map(|()| true)
+    if result.is_err() {
+        handle_tick_exception(scope);
+    }
+    previous.leave_callback(scope);
+    true
 }
 
 /// Pass the pending exception to the tick exception handler, or report and clear it.

@@ -64,11 +64,8 @@ fn collect_arguments(
     args: crate::function::CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<crate::native::Value, ExnThrown> {
-    let values = crate::Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
-    let length = values
-        .cast::<crate::Array>()
-        .map_err(|_| ExnThrown)?
-        .length(scope)?;
+    let values = crate::function::cast_payload::<crate::Array>(scope, payload);
+    let length = values.length(scope)?;
     let attrs = crate::class_spec::JSPROP_ENUMERATE as u32;
     let count = args.this().to_int32() as u32;
     for (offset, index) in (0..count).rev().enumerate() {

@@ -2038,6 +2038,7 @@ dependencies = [
  "http",
  "libc",
  "reqwest",
+ "socket2",
  "tokio",
  "url",
  "wasip3",

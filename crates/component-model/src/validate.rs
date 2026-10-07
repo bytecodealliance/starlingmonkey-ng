@@ -24,6 +24,7 @@
 //! Exports check a result only after lowering it failed, to name the part that
 //! failed in the trap message.
 
+use std::ffi::CStr;
 use std::fmt::Write as _;
 
 use js::conversion::FromJSVal;
@@ -33,9 +34,7 @@ use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Map, Object};
 
-use crate::resources::{
-    BORROW_FIELD, DISPOSE_DEFERRED_FIELD, DISPOSE_FIELD, HANDLE_FIELD, LENDS_FIELD, TYPE_FIELD,
-};
+use crate::resources::ImportedResource;
 use crate::stack::CallStack;
 use crate::value::{self, TypeShape};
 
@@ -201,12 +200,14 @@ struct Walker<'s, 'cx> {
     /// visits the first one.
     seen: Option<Map<'s>>,
     wrappers: Vec<Wrapper<'s>>,
+    /// The stack the walk checks scalars on.
+    stack: CallStack,
 }
 
 /// An imported resource wrapper a walk visited, where it first visited it, and
 /// whether that use was an `own`.
 struct Wrapper<'s> {
-    object: Object<'s>,
+    object: ImportedResource<'s>,
     argument: usize,
     path: String,
     own: bool,
@@ -220,6 +221,31 @@ impl<'s, 'cx> Walker<'s, 'cx> {
             argument: 0,
             seen: None,
             wrappers: Vec::new(),
+            stack: CallStack::new(),
+        }
+    }
+
+    /// Check `value` with the scalar `pop_*` conversion `pop`, and return it as
+    /// its copy unless the walk is in [`Mode::Check`].
+    fn scalar<T>(
+        &mut self,
+        value: HandleValue<'_>,
+        path: &str,
+        pop: impl FnOnce(&mut CallStack, &Scope<'_>) -> Result<T, ExnThrown>,
+    ) -> Result<Option<Value>, Mismatch> {
+        let scope = self.scope;
+        self.stack.push_value(value.get());
+        match pop(&mut self.stack, scope) {
+            Ok(_) => Ok((self.mode != Mode::Check).then(|| value.get())),
+            Err(ExnThrown) => {
+                let reason = js::error::ExnThrown::capture(scope)
+                    .message
+                    .unwrap_or_else(|| "the value does not lower".to_string());
+                Err(mismatch(
+                    path,
+                    format!("{reason}, got {}", describe(scope, value)),
+                ))
+            }
         }
     }
 
@@ -272,7 +298,12 @@ impl<'s, 'cx> Walker<'s, 'cx> {
     /// Record a use of the imported resource wrapper `object` at `path`, which
     /// is an `own` if `own` is set. A wrapper used more than once with an `own`
     /// among its uses is a mismatch.
-    fn record(&mut self, object: &Object<'_>, own: bool, path: &str) -> Result<(), Mismatch> {
+    fn record(
+        &mut self,
+        object: ImportedResource<'_>,
+        own: bool,
+        path: &str,
+    ) -> Result<(), Mismatch> {
         let scope = self.scope;
         let key = scope.root_value(object.as_value());
         let next = js::value::from_i32(self.wrappers.len() as i32);
@@ -292,7 +323,7 @@ impl<'s, 'cx> Walker<'s, 'cx> {
         }
         seen.insert(scope, key, scope.root_value(next))
             .map_err(|_| thrown(scope, path))?;
-        let object = Object::from_value(scope, key.get()).expect("the key is an object");
+        let object = crate::resources::imported_wrapper(scope, key).expect("the key is a wrapper");
         self.wrappers.push(Wrapper {
             object,
             argument: self.argument,
@@ -307,20 +338,18 @@ impl<'s, 'cx> Walker<'s, 'cx> {
     /// in the walk can dispose of a wrapper, or pass it to an `async` import.
     /// Returns the argument and the mismatch of the first that fails.
     fn check_wrappers(&self) -> Result<(), (usize, Mismatch)> {
-        let scope = self.scope;
         for wrapper in &self.wrappers {
-            let failed = |_| (wrapper.argument, thrown(scope, &wrapper.path));
-            let handle = crate::resources::read_u32_field(scope, &wrapper.object, HANDLE_FIELD)
-                .map_err(failed)?;
+            let (handle, lends) = {
+                let data = wrapper.object.data();
+                (data.handle, data.lends)
+            };
             if handle.is_none() {
                 return Err((
                     wrapper.argument,
                     mismatch(&wrapper.path, DISPOSED.to_string()),
                 ));
             }
-            let lends = crate::resources::read_u32_field(scope, &wrapper.object, LENDS_FIELD)
-                .map_err(failed)?;
-            if wrapper.own && lends.is_some_and(|lends| lends > 0) {
+            if wrapper.own && lends > 0 {
                 return Err((wrapper.argument, mismatch(&wrapper.path, LENT.to_string())));
             }
         }
@@ -349,37 +378,42 @@ fn walk(
     // themselves.
     let itself = || (mode != Mode::Check).then(|| value.get());
     match shape {
-        TypeShape::Bool => scalar(scope, value, path, value::pop_bool).map(|()| itself()),
-        TypeShape::U8 => scalar(scope, value, path, value::pop_u8).map(|()| itself()),
-        TypeShape::U16 => scalar(scope, value, path, value::pop_u16).map(|()| itself()),
-        TypeShape::U32 => scalar(scope, value, path, value::pop_u32).map(|()| itself()),
-        TypeShape::U64 => scalar(scope, value, path, value::pop_u64).map(|()| itself()),
-        TypeShape::S8 => scalar(scope, value, path, value::pop_s8).map(|()| itself()),
-        TypeShape::S16 => scalar(scope, value, path, value::pop_s16).map(|()| itself()),
-        TypeShape::S32 => scalar(scope, value, path, value::pop_s32).map(|()| itself()),
-        TypeShape::S64 => scalar(scope, value, path, value::pop_s64).map(|()| itself()),
-        TypeShape::F32 => scalar(scope, value, path, value::pop_f32).map(|()| itself()),
-        TypeShape::F64 => scalar(scope, value, path, value::pop_f64).map(|()| itself()),
-        TypeShape::Char => scalar(scope, value, path, value::pop_char).map(|()| itself()),
-        TypeShape::String => scalar(scope, value, path, value::pop_string).map(|()| itself()),
+        TypeShape::Bool => walker.scalar(value, path, value::pop_bool),
+        TypeShape::U8 => walker.scalar(value, path, value::pop_u8),
+        TypeShape::U16 => walker.scalar(value, path, value::pop_u16),
+        TypeShape::U32 => walker.scalar(value, path, value::pop_u32),
+        TypeShape::U64 => walker.scalar(value, path, value::pop_u64),
+        TypeShape::S8 => walker.scalar(value, path, value::pop_s8),
+        TypeShape::S16 => walker.scalar(value, path, value::pop_s16),
+        TypeShape::S32 => walker.scalar(value, path, value::pop_s32),
+        TypeShape::S64 => walker.scalar(value, path, value::pop_s64),
+        TypeShape::F32 => walker.scalar(value, path, value::pop_f32),
+        TypeShape::F64 => walker.scalar(value, path, value::pop_f64),
+        TypeShape::Char => walker.scalar(value, path, value::pop_char),
+        TypeShape::String if value.is_string() => Ok(itself()),
+        TypeShape::String => Err(mismatch(
+            path,
+            format!("expected a string, got {}", describe(scope, value)),
+        )),
         TypeShape::Enum(names) => {
             let count = names.len() as u32;
-            scalar(scope, value, path, |s, sc| value::pop_enum(s, sc, count)).map(|()| itself())
+            walker.scalar(value, path, |s, sc| value::pop_enum(s, sc, count))
         }
         TypeShape::Flags(names) => {
             let count = names.len() as u32;
-            scalar(scope, value, path, |s, sc| value::pop_flags(s, sc, count)).map(|()| itself())
+            walker.scalar(value, path, |s, sc| value::pop_flags(s, sc, count))
         }
         TypeShape::Record(fields) => {
             let obj = object(scope, value, path, "a record (object)")?;
             let copy = new_object(scope, mode, path)?;
             for (name, field) in fields {
                 let inner = scope.inner_scope();
-                let item = property(&inner, &obj, name, path)?;
+                let key = value::static_name(name);
+                let item = property(&inner, &obj, key, path)?;
                 let item = nested(path, &format!(".{name}"), |path| {
                     walk(&inner, item, field, path, walker)
                 })?;
-                define(&inner, copy.as_ref(), name, item, path)?;
+                define(&inner, copy.as_ref(), key, item, path)?;
             }
             Ok(copy.map(|copy| copy.as_value()))
         }
@@ -421,9 +455,9 @@ fn walk(
             if matches!(**inner, TypeShape::Option(_)) {
                 let obj = object(scope, value, path, "a nested option (object with `val`)")?;
                 let copy = new_object(scope, mode, path)?;
-                let item = property(scope, &obj, "val", path)?;
+                let item = property(scope, &obj, c"val", path)?;
                 let item = nested(path, ".val", |path| walk(scope, item, inner, path, walker))?;
-                define(scope, copy.as_ref(), "val", item, path)?;
+                define(scope, copy.as_ref(), c"val", item, path)?;
                 Ok(copy.map(|copy| copy.as_value()))
             } else {
                 walk(scope, value, inner, path, walker)
@@ -493,61 +527,49 @@ fn walk(
         TypeShape::OwnResource { index, imported }
         | TypeShape::BorrowResource { index, imported } => {
             let obj = object(scope, value, path, "a resource (object)")?;
-            let recorded = if *imported {
-                crate::resources::read_u32_field(scope, &obj, TYPE_FIELD)
-            } else {
-                crate::resources::exported_type(scope, &obj)
+            // An object backing an exported resource gets a new handle per use, so
+            // any object lowers as one.
+            if !*imported {
+                return Ok(itself());
             }
-            .map_err(|_| thrown(scope, path))?;
-            match recorded {
-                Some(recorded) if recorded != *index => Err(mismatch(
-                    path,
-                    "expected a resource of another type".to_string(),
-                )),
-                // Only an imported resource's wrapper has a drop callback, and it
-                // loses its handle once disposed of or moved to the host.
-                Some(_)
-                    if crate::resources::read_u32_field(scope, &obj, HANDLE_FIELD)
-                        .map_err(|_| thrown(scope, path))?
-                        .is_none()
-                        && obj
-                            .has_own_property(scope, DISPOSE_FIELD)
-                            .map_err(|_| thrown(scope, path))? =>
-                {
-                    Err(mismatch(path, DISPOSED.to_string()))
-                }
-                // Only an imported resource's wrappers are recorded: an object
-                // backing an exported resource gets a new handle per use.
-                Some(_) if *imported => {
+            match crate::resources::imported_wrapper(scope, value) {
+                Some(wrapper) => {
                     let own = matches!(shape, TypeShape::OwnResource { .. });
-                    if obj
-                        .has_own_property(scope, DISPOSE_DEFERRED_FIELD)
-                        .map_err(|_| thrown(scope, path))?
-                    {
+                    let (type_idx, handle, borrowed, lends, dispose_deferred) = {
+                        let data = wrapper.data();
+                        (
+                            data.type_idx,
+                            data.handle,
+                            data.borrowed,
+                            data.lends,
+                            data.dispose_deferred,
+                        )
+                    };
+                    if type_idx != *index {
+                        return Err(mismatch(
+                            path,
+                            "expected a resource of another type".to_string(),
+                        ));
+                    }
+                    // A wrapper loses its handle once disposed of or moved to the
+                    // host.
+                    if handle.is_none() || dispose_deferred {
                         return Err(mismatch(path, DISPOSED.to_string()));
                     }
-                    if own
-                        && crate::resources::read_u32_field(scope, &obj, LENDS_FIELD)
-                            .map_err(|_| thrown(scope, path))?
-                            .is_some_and(|lends| lends > 0)
-                    {
+                    if own && lends > 0 {
                         return Err(mismatch(path, LENT.to_string()));
                     }
-                    if own
-                        && obj
-                            .has_own_property(scope, BORROW_FIELD)
-                            .map_err(|_| thrown(scope, path))?
-                    {
+                    if own && borrowed {
                         return Err(mismatch(
                             path,
                             "expected an owned resource, got a borrowed one".to_string(),
                         ));
                     }
-                    walker.record(&obj, own, path)?;
+                    walker.record(wrapper, own, path)?;
                     Ok(itself())
                 }
                 // A value an own adapter converts moves to the host too.
-                None if *imported => {
+                None => {
                     let check = match shape {
                         TypeShape::OwnResource { .. } => adapter_check(*index),
                         _ => None,
@@ -567,7 +589,6 @@ fn walk(
                         )),
                     }
                 }
-                _ => Ok(itself()),
             }
         }
         TypeShape::Stream(_) | TypeShape::Future(_) if !has_event_loop() => {
@@ -645,11 +666,11 @@ fn tagged(
             .map_err(|_| thrown(scope, path))?;
     }
     if let Some(payload) = payload {
-        let item = property(scope, obj, "val", path)?;
+        let item = property(scope, obj, c"val", path)?;
         let item = nested(path, ".val", |path| {
             walk(scope, item, payload, path, walker)
         })?;
-        define(scope, copy.as_ref(), "val", item, path)?;
+        define(scope, copy.as_ref(), c"val", item, path)?;
     }
     Ok(copy.map(|copy| copy.as_value()))
 }
@@ -693,7 +714,7 @@ fn new_array<'s>(
 fn define(
     scope: &Scope<'_>,
     copy: Option<&Object<'_>>,
-    name: &str,
+    name: &'static CStr,
     item: Option<Value>,
     path: &str,
 ) -> Result<(), Mismatch> {
@@ -701,8 +722,7 @@ fn define(
         return Ok(());
     };
     let item = scope.root_value(item);
-    copy.define_property_by_name(scope, value::to_cstring(name).as_c_str(), item, ENUMERATE)
-        .map_err(|_| thrown(scope, path))
+    value::define_field(copy, scope, name, item).map_err(|_| thrown(scope, path))
 }
 
 /// Define `copy`'s element `index` as `item`, when both are present.
@@ -769,29 +789,6 @@ fn nested<T>(path: &mut String, segment: &str, f: impl FnOnce(&mut String) -> T)
     result
 }
 
-/// Check a value with a scalar `pop_*` conversion, on a scratch stack.
-fn scalar<T>(
-    scope: &Scope<'_>,
-    value: HandleValue<'_>,
-    path: &str,
-    pop: impl FnOnce(&mut CallStack, &Scope<'_>) -> Result<T, ExnThrown>,
-) -> Result<(), Mismatch> {
-    let mut stack = CallStack::new();
-    stack.push_value(value.get());
-    match pop(&mut stack, scope) {
-        Ok(_) => Ok(()),
-        Err(ExnThrown) => {
-            let reason = js::error::ExnThrown::capture(scope)
-                .message
-                .unwrap_or_else(|| "the value does not lower".to_string());
-            Err(mismatch(
-                path,
-                format!("{reason}, got {}", describe(scope, value)),
-            ))
-        }
-    }
-}
-
 /// `value` as an object, or a mismatch expecting `expected`.
 fn object<'s>(
     scope: &'s Scope<'_>,
@@ -811,16 +808,15 @@ fn object<'s>(
 fn property<'s>(
     scope: &'s Scope<'_>,
     obj: &Object<'_>,
-    name: &str,
+    name: &'static CStr,
     path: &str,
 ) -> Result<HandleValue<'s>, Mismatch> {
-    obj.get_property_by_name(scope, value::to_cstring(name).as_c_str())
-        .map_err(|_| thrown(scope, path))
+    value::get_field(obj, scope, name).map_err(|_| thrown(scope, path))
 }
 
 /// The `tag` property of `obj`, which must be a string.
 fn tag(scope: &Scope<'_>, obj: &Object<'_>, path: &str) -> Result<String, Mismatch> {
-    let tag = property(scope, obj, "tag", path)?;
+    let tag = property(scope, obj, c"tag", path)?;
     if !tag.is_string() {
         return Err(mismatch(
             path,

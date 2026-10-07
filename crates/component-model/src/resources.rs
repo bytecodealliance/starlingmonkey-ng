@@ -6,10 +6,10 @@
 //! The Component Model has two kinds of resource a JS guest deals with:
 //!
 //! - Imported resources are owned by the host. The guest holds an opaque
-//!   canonical handle, a `u32`, and JS sees a wrapper object holding the handle
-//!   in a hidden field plus a drop callback. [`wrap_imported`] creates a wrapper
-//!   from a handle on lift, and [`unwrap_to_canon`] reads the handle back out on
-//!   lower.
+//!   canonical handle, a `u32`, and JS sees a wrapper object, an
+//!   [`ImportedResource`] whose private data holds the handle. [`wrap_imported`]
+//!   creates a wrapper from a handle on lift, and [`unwrap_to_canon`] reads the
+//!   handle back out on lower.
 //!
 //! - Exported resources are owned by the guest. Their backing JS object lives in
 //!   the [`ExportedResources`] slab, the slab index is the resource's rep, and
@@ -26,38 +26,72 @@
 //! [`ResourceDesc`] per operation instead, whose `new`, `rep` and `drop` are
 //! `&dyn Fn` borrowed for the call.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
-use js::conversion::ToJSVal;
+use core_runtime::{jsclass, jsmethods};
+use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{throw_type_error, ExnThrown};
-use js::function::EmptyArgs;
-use js::gc::handle::{Heap, OptionHeapExt};
+use js::function::{CallbackArgs, EmptyArgs};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::heap::Trace;
-use js::native::JSTracer;
+use js::native::{JSTracer, Value};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::stack::CallStack;
 
-/// Hidden field holding the canonical resource handle (`u32`) on a wrapper.
-pub const HANDLE_FIELD: &std::ffi::CStr = c"_componentizeJsHandle";
-/// Hidden field holding the resource type index on a wrapper.
-pub const TYPE_FIELD: &std::ffi::CStr = c"_componentizeJsType";
-/// Hidden field holding the drop callback, a JS function, which the
-/// finalization registry reads. The guest-facing way to run it is
-/// `[Symbol.dispose]()`, installed on the wrapper's class prototype (see
-/// [`define_dispose`]).
-pub const DISPOSE_FIELD: &std::ffi::CStr = c"_componentizeJsDispose";
-/// Hidden field present on a wrapper of a handle the guest received as a
-/// `borrow`.
-pub const BORROW_FIELD: &std::ffi::CStr = c"_componentizeJsBorrow";
-/// Hidden field counting the import calls a wrapper is lent to that have not
-/// returned. The handle cannot be dropped or moved while the count is not 0.
-pub const LENDS_FIELD: &std::ffi::CStr = c"_componentizeJsLends";
-/// Hidden field present on a wrapper disposed of while lent. The handle is
-/// dropped once the last lend ends.
-pub const DISPOSE_DEFERRED_FIELD: &std::ffi::CStr = c"_componentizeJsDisposeDeferred";
+/// Drops a canonical handle of an imported resource type. The arguments after
+/// the scope are the type index and the handle.
+pub type ImportedDrop = fn(&Scope<'_>, u32, u32) -> Result<(), ExnThrown>;
+
+js::instance_local! {
+    /// The function [`set_imported_drop`] set.
+    static IMPORTED_DROP: Cell<Option<ImportedDrop>> = const { Cell::new(None) };
+}
+
+/// Set the function that drops the canonical handle of a wrapper of an imported
+/// resource when the wrapper is disposed of, released at the end of the call it
+/// was lifted for, or collected. Must run before any wrapper is disposed of.
+pub fn set_imported_drop(drop: ImportedDrop) {
+    IMPORTED_DROP.with(|cell| cell.set(Some(drop)));
+}
+
+/// The state of a wrapper of a host-owned resource handle. The wrapper's
+/// prototype is the `prototype` of its resource type's class.
+#[jsclass(hidden)]
+pub struct ImportedResource {
+    /// The resource type index.
+    #[no_trace]
+    pub(crate) type_idx: u32,
+    /// The canonical handle, or `None` once the wrapper was disposed of, released
+    /// at the end of the call it was lifted for, or moved to the host.
+    #[no_trace]
+    pub(crate) handle: Option<u32>,
+    /// Whether the guest received the handle as a `borrow`.
+    #[no_trace]
+    pub(crate) borrowed: bool,
+    /// The number of import calls the wrapper is lent to that have not returned.
+    /// The handle cannot be dropped or moved while it is not 0.
+    #[no_trace]
+    pub(crate) lends: u32,
+    /// Whether the wrapper was disposed of while lent. The handle is dropped once
+    /// the last lend ends.
+    #[no_trace]
+    pub(crate) dispose_deferred: bool,
+    /// Whether the wrapper is registered with the finalization registry.
+    #[no_trace]
+    registered: bool,
+}
+
+#[jsmethods]
+impl ImportedResource {
+    fn new() -> Self {
+        // This constructor only registers the prototype. Wrappers are created by
+        // `new_wrapper`, with their resource class's prototype.
+        ImportedResourceImpl::default()
+    }
+}
 
 /// Converts a value lowered as an owned handle of an imported resource type into
 /// such a handle, for a value that is not one of the type's wrappers. Returns
@@ -112,17 +146,20 @@ pub(crate) fn own_adapter(
     })
 }
 
-/// Whether `value` is an object carrying a resource type index, as every
-/// resource wrapper does.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn is_resource_wrapper(
-    scope: &Scope<'_>,
+/// `value` as a wrapper of an imported resource, or `None` if it is not one.
+pub(crate) fn imported_wrapper<'s>(
+    scope: &'s Scope<'_>,
     value: HandleValue<'_>,
-) -> Result<bool, ExnThrown> {
-    match Object::from_value(scope, value) {
-        Ok(obj) => Ok(read_u32_field(scope, &obj, TYPE_FIELD)?.is_some()),
-        Err(_) => Ok(false),
-    }
+) -> Option<ImportedResource<'s>> {
+    ImportedResource::from_jsval(scope, value, ()).ok()
+}
+
+/// The canonical handle the wrapper of an imported resource `value` holds, or
+/// `None` if `value` is not such a wrapper or holds no handle.
+pub fn imported_handle(scope: &Scope<'_>, value: HandleValue<'_>) -> Option<u32> {
+    let wrapper = imported_wrapper(scope, value)?;
+    let handle = wrapper.data().handle;
+    handle
 }
 
 /// Install `callback`, non-enumerable and
@@ -154,29 +191,16 @@ fn dispose_method<'s>(
     Ok(value.get().is_object().then_some(value))
 }
 
-/// Attribute flags for a runtime-stamped resource field: non-enumerable, and
-/// non-writable so a guest cannot forge it by assignment. Fields using this stay
-/// configurable, so the ownership-transfer strip's `delete_property` keeps
-/// working, at the cost of a guest being able to redefine them via
-/// `Object.defineProperty`.
-pub(crate) const HIDDEN_FIELD_ATTRS: std::ffi::c_uint =
-    js::class_spec::JSPROP_READONLY as std::ffi::c_uint;
-/// As [`HIDDEN_FIELD_ATTRS`], plus non-configurable. Used for fields the runtime
-/// never deletes (`TYPE_FIELD`, `DISPOSE_FIELD`), making them fully unforgeable.
-pub(crate) const HIDDEN_PERMANENT_FIELD_ATTRS: std::ffi::c_uint =
-    (js::class_spec::JSPROP_READONLY | js::class_spec::JSPROP_PERMANENT) as std::ffi::c_uint;
-
 /// A resource type, resolved by the caller from wit-dylib metadata (or built by
 /// hand in native tests). `Imported` needs no operations, since its drop is the
-/// JS function passed to [`wrap_imported`] and lowering only reads the handle
-/// back.
+/// function [`set_imported_drop`] set and lowering only reads the handle back.
 pub enum ResourceDesc<'a> {
-    /// A host-owned resource type, identified by its type index, stored on the
-    /// wrapper for diagnostics.
+    /// A host-owned resource type, identified by its type index, stored in the
+    /// wrapper's private data.
     Imported { type_idx: u32 },
     /// A guest-owned resource type backed by the slab.
     Exported {
-        /// The resource type index, stored on the slab-backed object.
+        /// The resource type index, stored in the slab entry.
         type_idx: u32,
         /// `[resource-new]`: create a canonical handle for a slab rep.
         new: &'a dyn Fn(u32) -> u32,
@@ -197,8 +221,8 @@ js::instance_local! {
 }
 
 /// Record the prototype object for imported resource type `type_idx`, so wrappers
-/// created for that type are re-parented to it. A later registration for the same
-/// index replaces the previous prototype.
+/// created for that type get it as their prototype. A later registration for the
+/// same index replaces the previous prototype.
 pub fn register_resource_prototype(type_idx: u32, proto: &Object<'_>) {
     RESOURCE_PROTOTYPES.with(|cell| {
         let mut protos = cell.borrow_mut();
@@ -210,108 +234,196 @@ pub fn register_resource_prototype(type_idx: u32, proto: &Object<'_>) {
     });
 }
 
-/// Run `f` with the registered prototype for `type_idx`, if any. The prototype is
-/// rooted on `scope` before `f` runs, so a moving GC during wrapping cannot
-/// invalidate it.
-fn with_resource_prototype<R>(
-    scope: &Scope<'_>,
-    type_idx: u32,
-    f: impl FnOnce(Option<&Object<'_>>) -> R,
-) -> R {
-    let proto = RESOURCE_PROTOTYPES.with(|cell| {
+/// The registered prototype for `type_idx`, rooted on `scope`, if any.
+fn resource_prototype<'s>(scope: &'s Scope<'_>, type_idx: u32) -> Option<Object<'s>> {
+    RESOURCE_PROTOTYPES.with(|cell| {
         cell.borrow()
             .get(type_idx as usize)
             .and_then(Option::as_ref)
             .map(|heap| heap.get(scope))
-    });
-    f(proto.as_ref())
+    })
+}
+
+/// Create a wrapper with `data` as its state and `proto` as its prototype, or
+/// the prototype of [`ImportedResource`] if `proto` is `None`.
+fn new_wrapper<'s>(
+    scope: &'s Scope<'_>,
+    proto: Option<Object<'s>>,
+    data: ImportedResourceImpl,
+) -> Result<ImportedResource<'s>, ExnThrown> {
+    match proto {
+        Some(proto) => js::class::create_instance_with_proto(scope, proto, data, 0),
+        None => js::class::create_instance_with(scope, |_| data),
+    }
 }
 
 /// Lift a host-owned resource handle into its JS wrapper object.
 ///
 /// `proto`, when given, becomes the wrapper's prototype, so the class's methods
-/// resolve. `dispose_fn`, the JS function that drops the handle, is stored under
-/// [`DISPOSE_FIELD`] and registered with the finalization registry, so the
-/// resource is dropped if the wrapper is collected without an explicit drop.
+/// resolve. The wrapper is registered with the finalization registry, so the
+/// handle is dropped if the wrapper is collected without an explicit drop.
 pub fn wrap_imported<'s>(
     scope: &'s Scope<'_>,
     handle: u32,
     type_idx: u32,
-    proto: Option<&Object<'_>>,
-    dispose_fn: HandleValue<'_>,
+    proto: Option<Object<'s>>,
 ) -> Result<Object<'s>, ExnThrown> {
-    let wrapper = Object::new_plain(scope)?;
-    if let Some(proto) = proto {
-        wrapper.set_prototype(scope, proto.handle())?;
-    }
-
-    wrapper.define_property(scope, TYPE_FIELD, type_idx, HIDDEN_PERMANENT_FIELD_ATTRS)?;
-
-    wrapper.define_property(
-        scope,
-        DISPOSE_FIELD,
-        dispose_fn,
-        HIDDEN_PERMANENT_FIELD_ATTRS,
-    )?;
-
-    register_resource(scope, &wrapper, handle)?;
-
-    Ok(wrapper)
+    let data = ImportedResourceImpl {
+        type_idx,
+        handle: Some(handle),
+        ..Default::default()
+    };
+    let wrapper = new_wrapper(scope, proto, data)?;
+    register_resource(scope, wrapper)?;
+    Ok(*wrapper)
 }
 
 /// Lower a JS wrapper of the imported resource type `type_idx` to its canonical
 /// handle.
 ///
-/// Reads [`HANDLE_FIELD`]. A wrapper of another resource type is rejected with a
-/// TypeError. When `owned`, ownership transfers out of JS: the finalizer is
-/// unregistered and the handle field stripped, so neither the finalizer nor a
-/// later explicit drop double-drops the now-transferred handle. A wrapper the
-/// guest received as a `borrow`, one lent to an import call that has not
-/// returned, and one whose disposal waits for such a call cannot be owned, and
-/// throw a TypeError too.
+/// A value that is not a wrapper of that type, and a wrapper that holds no
+/// handle, are rejected with a TypeError. When `owned`, ownership transfers out
+/// of JS: the wrapper is unregistered from finalization and loses its handle, so
+/// neither the finalizer nor a later explicit drop double-drops the transferred
+/// handle. A wrapper the guest received as a `borrow`, one lent to an import call
+/// that has not returned, and one whose disposal waits for such a call cannot be
+/// owned, and throw a TypeError too.
 pub fn unwrap_to_canon(
     scope: &Scope<'_>,
     value: HandleValue<'_>,
     type_idx: u32,
     owned: bool,
 ) -> Result<u32, ExnThrown> {
-    let obj = Object::from_value(scope, value)
-        .map_err(|_| throw_type_error(scope, c"resource value is not an object"))?;
-    if read_u32_field(scope, &obj, TYPE_FIELD)? != Some(type_idx) {
-        return Err(throw_type_error(
-            scope,
-            c"resource value is not a wrapper of the expected resource type",
-        ));
+    if !value.is_object() {
+        return Err(throw_type_error(scope, c"resource value is not an object"));
     }
-    let handle = read_handle(scope, &obj)?;
+    let wrapper = imported_wrapper(scope, value)
+        .filter(|wrapper| wrapper.data().type_idx == type_idx)
+        .ok_or_else(|| {
+            throw_type_error(
+                scope,
+                c"resource value is not a wrapper of the expected resource type",
+            )
+        })?;
+    let checked = {
+        let data = wrapper.data();
+        match data.handle {
+            None => Err(c"resource wrapper has no live handle (already disposed?)"),
+            Some(_) if owned && data.borrowed => {
+                Err(c"a borrowed resource cannot be passed as an owned one")
+            }
+            Some(_) if owned && (data.lends > 0 || data.dispose_deferred) => {
+                Err(c"the resource is lent to an import call that has not returned")
+            }
+            Some(handle) => Ok((handle, data.registered)),
+        }
+    };
+    let (handle, registered) = checked.map_err(|message| throw_type_error(scope, message))?;
 
     if owned {
-        if obj.has_own_property(scope, BORROW_FIELD)? {
-            return Err(throw_type_error(
-                scope,
-                c"a borrowed resource cannot be passed as an owned one",
-            ));
+        if registered {
+            unregister_resource(scope, &wrapper)?;
         }
-        if read_u32_field(scope, &obj, LENDS_FIELD)?.is_some_and(|lends| lends > 0)
-            || obj.has_own_property(scope, DISPOSE_DEFERRED_FIELD)?
-        {
-            return Err(throw_type_error(
-                scope,
-                c"the resource is lent to an import call that has not returned",
-            ));
-        }
-        unregister_resource(scope, &obj)?;
-        obj.delete_property(scope, HANDLE_FIELD)?;
+        let mut data = wrapper.data_mut();
+        data.handle = None;
+        data.registered = false;
     }
 
     Ok(handle)
 }
 
+/// Drop the handle `wrapper` holds, through the function [`set_imported_drop`]
+/// set, and unregister `wrapper` from finalization.
+///
+/// A wrapper without a handle is left alone, so a second dispose does nothing. A
+/// wrapper lent to an import call that has not returned keeps its handle, which
+/// is dropped once the last such call returns.
+fn dispose_wrapper(scope: &Scope<'_>, wrapper: ImportedResource<'_>) -> Result<(), ExnThrown> {
+    let taken = {
+        let mut data = wrapper.data_mut();
+        match data.handle {
+            None => None,
+            Some(_) if data.lends > 0 => {
+                data.dispose_deferred = true;
+                None
+            }
+            Some(handle) => {
+                data.handle = None;
+                Some((data.type_idx, handle, std::mem::take(&mut data.registered)))
+            }
+        }
+    };
+    let Some((type_idx, handle, registered)) = taken else {
+        return Ok(());
+    };
+    if registered {
+        unregister_resource(scope, &wrapper)?;
+    }
+    let drop = IMPORTED_DROP.with(Cell::get).ok_or_else(|| {
+        throw_type_error(scope, c"no drop function is set for imported resources")
+    })?;
+    drop(scope, type_idx, handle)
+}
+
+/// `[Symbol.dispose]` of every imported resource class: drop the handle the
+/// wrapper `this` holds. Throws a `TypeError` if `this` is not a wrapper.
+fn dispose_callback(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue<'_>,
+) -> Result<Value, ExnThrown> {
+    let this = scope.root_value(args.this());
+    let wrapper = imported_wrapper(scope, this).ok_or_else(|| {
+        throw_type_error(
+            scope,
+            c"dispose was called on an object that is not a resource wrapper",
+        )
+    })?;
+    dispose_wrapper(scope, wrapper)?;
+    Ok(js::value::undefined())
+}
+
+/// The function installed as `[Symbol.dispose]` on the prototype of every
+/// imported resource class.
+pub fn dispose_function<'s>(scope: &'s Scope<'_>) -> Result<Function<'s>, ExnThrown> {
+    js::class::get_or_init_shared_function(scope, dispose_callback as *const () as usize, |scope| {
+        Function::new_callback(scope, c"[Symbol.dispose]", 0, dispose_callback, ())
+    })
+}
+
+/// Move the handle `from` holds to `to`, a wrapper of the same type without one,
+/// and register `to` with the finalization registry. `from` keeps no handle and
+/// is unregistered. Does nothing if `from` holds no handle.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn move_handle(
+    scope: &Scope<'_>,
+    from: ImportedResource<'_>,
+    to: ImportedResource<'_>,
+) -> Result<(), ExnThrown> {
+    let (handle, registered) = {
+        let mut data = from.data_mut();
+        let Some(handle) = data.handle.take() else {
+            return Ok(());
+        };
+        (handle, std::mem::take(&mut data.registered))
+    };
+    if registered {
+        unregister_resource(scope, &from)?;
+    }
+    to.data_mut().handle = Some(handle);
+    register_resource(scope, to)
+}
+
 /// Release every borrow recorded on `stack` during the just-finished call.
 ///
-/// An imported borrow is unregistered from finalization, its [`DISPOSE_FIELD`]
-/// callback is invoked, and its [`HANDLE_FIELD`] is stripped, so a wrapper the
-/// guest stashed cannot pass the released handle back to the host.
+/// An imported borrow's handle is dropped through the function
+/// [`set_imported_drop`] set, and the wrapper keeps no handle, so a wrapper the
+/// guest stashed cannot pass the released handle back to the host. A borrow
+/// lent to an import call that has not returned is dropped once the last such
+/// call returns.
+///
+/// A wrapper lent to an import call has its lend count decremented. Once the
+/// last lend ends, a dispose that waited for it drops the handle.
 ///
 /// An exported borrow gives its slab entry back and its handle to
 /// `drop_exported_handle`, which is called with the resource's type index and
@@ -326,39 +438,35 @@ pub fn release_borrows(
     scope: &Scope<'_>,
     drop_exported_handle: &dyn Fn(u32, u32),
 ) -> Result<(), ExnThrown> {
-    // Every borrow is drained even if one's unregister or dispose throws, so a
-    // single throwing drop cannot leak the rest. The first failure's exception is
-    // captured, cleared so the next dispose runs with none pending, and re-raised
-    // once the list is drained.
+    // Every borrow is drained even if one's drop throws, so a single throwing
+    // drop cannot leak the rest. The first failure's exception is captured,
+    // cleared so the next drop runs with none pending, and re-raised once the
+    // list is drained.
     let mut first_exn: Option<HandleValue> = None;
     while let Some(borrow) = stack.pop_borrow() {
         let object = borrow.heap().get(scope);
         let result = match &borrow {
-            crate::stack::Borrow::Imported { .. } => (|| -> Result<(), ExnThrown> {
-                // The callback unregisters the wrapper and reads the handle off
-                // `this`, so the field is stripped only after it has run.
-                let dispose = object.get_property(scope, DISPOSE_FIELD)?;
-                if dispose.get().is_object() {
-                    Function::call(scope, object, dispose, EmptyArgs)?;
+            crate::stack::Borrow::Imported { .. } => {
+                let wrapper = object
+                    .cast::<ImportedResource>()
+                    .expect("an imported borrow holds a wrapper");
+                dispose_wrapper(scope, wrapper)
+            }
+            crate::stack::Borrow::Lent { .. } => {
+                let wrapper = object
+                    .cast::<ImportedResource>()
+                    .expect("a lent borrow holds a wrapper");
+                let deferred = {
+                    let mut data = wrapper.data_mut();
+                    data.lends = data.lends.saturating_sub(1);
+                    data.lends == 0 && std::mem::take(&mut data.dispose_deferred)
+                };
+                if deferred {
+                    dispose_wrapper(scope, wrapper)
                 } else {
-                    unregister_resource(scope, &object)?;
+                    Ok(())
                 }
-                object.delete_property(scope, HANDLE_FIELD)?;
-                Ok(())
-            })(),
-            crate::stack::Borrow::Lent { .. } => (|| -> Result<(), ExnThrown> {
-                let lends = read_u32_field(scope, &object, LENDS_FIELD)?
-                    .unwrap_or(1)
-                    .saturating_sub(1);
-                object.define_property(scope, LENDS_FIELD, lends, HIDDEN_FIELD_ATTRS)?;
-                // A dispose while the wrapper was lent waits for its last lend.
-                if lends == 0 && object.has_own_property(scope, DISPOSE_DEFERRED_FIELD)? {
-                    object.delete_property(scope, DISPOSE_DEFERRED_FIELD)?;
-                    let dispose = object.get_property(scope, DISPOSE_FIELD)?;
-                    Function::call(scope, object, dispose, EmptyArgs)?;
-                }
-                Ok(())
-            })(),
+            }
             crate::stack::Borrow::Exported {
                 type_idx,
                 rep,
@@ -389,35 +497,6 @@ pub fn release_borrows(
     Ok(())
 }
 
-/// Read a `u32` field off `obj`, or `None` if the field does not hold a number.
-pub(crate) fn read_u32_field(
-    scope: &Scope<'_>,
-    obj: &Object<'_>,
-    name: &std::ffi::CStr,
-) -> Result<Option<u32>, ExnThrown> {
-    let v = obj.get_property_by_name(scope, name)?;
-    // A `u32` past `i32::MAX` is stored as a double, so the field is read back
-    // through the number path for the full `u32` range to round-trip.
-    Ok(v.is_number().then(|| v.to_number() as u32))
-}
-
-/// Read the canonical handle off a wrapper, or `None` if the field is absent, as
-/// on a wrapper whose handle was stripped when ownership left JS.
-fn peek_handle(scope: &Scope<'_>, obj: &Object<'_>) -> Result<Option<u32>, ExnThrown> {
-    read_u32_field(scope, obj, HANDLE_FIELD)
-}
-
-/// Read the canonical handle off a wrapper, erroring if it is missing, as on an
-/// already-disposed wrapper whose handle was stripped.
-fn read_handle(scope: &Scope<'_>, obj: &Object<'_>) -> Result<u32, ExnThrown> {
-    peek_handle(scope, obj)?.ok_or_else(|| {
-        throw_type_error(
-            scope,
-            c"resource wrapper has no live handle (already disposed?)",
-        )
-    })
-}
-
 /// Lift an owned resource handle onto the stack.
 ///
 /// For an exported resource the handle is resolved to its slab rep via `rep`,
@@ -428,7 +507,6 @@ pub fn push_own(
     scope: &Scope<'_>,
     desc: &ResourceDesc<'_>,
     handle: u32,
-    dispose_fn: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
     match desc {
         ResourceDesc::Exported { rep, drop, .. } => {
@@ -445,9 +523,8 @@ pub fn push_own(
             drop(handle);
         }
         ResourceDesc::Imported { type_idx } => {
-            let wrapper = with_resource_prototype(scope, *type_idx, |proto| {
-                wrap_imported(scope, handle, *type_idx, proto, dispose_fn)
-            })?;
+            let proto = resource_prototype(scope, *type_idx);
+            let wrapper = wrap_imported(scope, handle, *type_idx, proto)?;
             stack.push_object(&wrapper);
         }
     }
@@ -459,13 +536,13 @@ pub fn push_own(
 /// For an exported resource the handle is the slab rep directly, and the slab
 /// object is looked up and pushed, with the host keeping ownership. For an
 /// imported resource a fresh wrapper is created and recorded as a per-call borrow
-/// so it is dropped at call end.
+/// so its handle is dropped at call end. The wrapper is not registered with the
+/// finalization registry, since the borrow record keeps it reachable until then.
 pub fn push_borrow(
     stack: &mut CallStack,
     scope: &Scope<'_>,
     desc: &ResourceDesc<'_>,
     handle: u32,
-    dispose_fn: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
     match desc {
         ResourceDesc::Exported { .. } => {
@@ -477,10 +554,13 @@ pub fn push_borrow(
             stack.push_object(&obj);
         }
         ResourceDesc::Imported { type_idx } => {
-            let wrapper = with_resource_prototype(scope, *type_idx, |proto| {
-                wrap_imported(scope, handle, *type_idx, proto, dispose_fn)
-            })?;
-            wrapper.define_property(scope, BORROW_FIELD, true, HIDDEN_PERMANENT_FIELD_ATTRS)?;
+            let data = ImportedResourceImpl {
+                type_idx: *type_idx,
+                handle: Some(handle),
+                borrowed: true,
+                ..Default::default()
+            };
+            let wrapper = new_wrapper(scope, resource_prototype(scope, *type_idx), data)?;
             stack.push_imported_borrow(&wrapper);
             stack.push_object(&wrapper);
         }
@@ -492,8 +572,8 @@ pub fn push_borrow(
 ///
 /// Ownership transfers out of JS in both directions. A guest-owned object gets
 /// a handle minted for this lowering, which the host then owns. An imported
-/// wrapper's [`HANDLE_FIELD`] is stripped, since the generated code removes the
-/// handle from the guest's table right after this returns.
+/// wrapper loses its handle, since the generated code removes the handle from
+/// the guest's table right after this returns.
 pub fn pop_own(
     stack: &mut CallStack,
     scope: &Scope<'_>,
@@ -529,9 +609,8 @@ pub fn pop_borrow(
         ResourceDesc::Imported { type_idx } => {
             let handle = unwrap_to_canon(scope, value, *type_idx, false)?;
             let wrapper =
-                Object::from_value(scope, value.get()).expect("unwrap_to_canon accepted an object");
-            let lends = read_u32_field(scope, &wrapper, LENDS_FIELD)?.unwrap_or(0);
-            wrapper.define_property(scope, LENDS_FIELD, lends + 1, HIDDEN_FIELD_ATTRS)?;
+                imported_wrapper(scope, value).expect("unwrap_to_canon accepted a wrapper");
+            wrapper.data_mut().lends += 1;
             stack.push_lent_wrapper(&wrapper);
             Ok(handle)
         }
@@ -539,26 +618,28 @@ pub fn pop_borrow(
 }
 
 /// A free-list-backed table of guest-owned resource objects, keyed by rep, which
-/// is the slab index.
+/// is the slab index, each with the type index of the resource it backs.
 ///
 /// Stored objects are traced by [`trace_resources`], so a slab-held resource
 /// survives GC while the host owns its handle.
 #[js::allow_unrooted_interior]
 #[derive(Default)]
 pub struct ExportedResources {
-    entries: Vec<Option<Heap<js::object::Object>>>,
+    entries: Vec<Option<(Heap<js::object::Object>, u32)>>,
     free: Vec<u32>,
 }
 
 impl ExportedResources {
-    /// Insert an object, returning its rep (slab index).
-    pub fn insert(&mut self, obj: &Object<'_>) -> u32 {
+    /// Insert an object backing a resource of type `type_idx`, returning its rep
+    /// (slab index).
+    pub fn insert(&mut self, obj: &Object<'_>, type_idx: u32) -> u32 {
+        let entry = Some((Heap::from(*obj), type_idx));
         if let Some(index) = self.free.pop() {
-            self.entries[index as usize] = Some(Heap::from(*obj));
+            self.entries[index as usize] = entry;
             index
         } else {
             let index = self.entries.len() as u32;
-            self.entries.push(Some(Heap::from(*obj)));
+            self.entries.push(entry);
             index
         }
     }
@@ -566,17 +647,28 @@ impl ExportedResources {
     /// Look up the object at `rep`, or `None` if the slot is free or out of
     /// range.
     pub fn lookup(&self, rep: u32) -> Option<&Heap<js::object::Object>> {
-        self.entries.get(rep as usize).and_then(Option::as_ref)
+        self.entries
+            .get(rep as usize)
+            .and_then(Option::as_ref)
+            .map(|(object, _)| object)
     }
 
     /// Remove the object at `rep`, freeing the slot, and root it into `scope`.
     /// Returns `None` if the slot was already free or out of range.
     pub fn remove<'s>(&mut self, scope: &'s Scope<'_>, rep: u32) -> Option<Object<'s>> {
-        let slot = self.entries.get_mut(rep as usize)?;
-        if slot.is_some() {
-            self.free.push(rep);
-        }
-        slot.take_rooted(scope)
+        self.remove_with_type(scope, rep).map(|(object, _)| object)
+    }
+
+    /// [`remove`](Self::remove), also returning the type index the object was
+    /// inserted with.
+    fn remove_with_type<'s>(
+        &mut self,
+        scope: &'s Scope<'_>,
+        rep: u32,
+    ) -> Option<(Object<'s>, u32)> {
+        let (object, type_idx) = self.entries.get_mut(rep as usize)?.take()?;
+        self.free.push(rep);
+        Some((object.get(scope), type_idx))
     }
 }
 
@@ -623,21 +715,8 @@ fn lower_exported<'s>(
     let object = Object::from_value(scope, value.get())
         .map_err(|_| throw_type_error(scope, c"exported resource value is not an object"))?;
 
-    // One JS object backs one resource type for its whole life.
-    let recorded_type = exported_type(scope, &object)?;
-    if recorded_type.is_some_and(|recorded| recorded != type_idx) {
-        return Err(throw_type_error(
-            scope,
-            c"this object was already lowered as a different exported resource type",
-        ));
-    }
-
-    let rep = EXPORTED_RESOURCES.with(|slab| slab.borrow_mut().insert(&object));
+    let rep = EXPORTED_RESOURCES.with(|slab| slab.borrow_mut().insert(&object, type_idx));
     let handle = new(rep);
-
-    if recorded_type.is_none() {
-        set_exported_type(scope, &object, type_idx)?;
-    }
 
     Ok(LoweredExport {
         object,
@@ -662,27 +741,24 @@ pub fn with_exported_resources<R>(f: impl FnOnce(&mut ExportedResources) -> R) -
 /// from the slab at `rep`, check the recorded type index in debug builds, and
 /// run the guest's drop hook if it set one.
 ///
-/// `expected_type_idx` is checked against the type index recorded for the slab
-/// object when its handle was created. A mismatch means a rep collided across
-/// resource types.
+/// `expected_type_idx` is checked against the type index the slab entry was
+/// inserted with. A mismatch means a rep collided across resource types.
 ///
 /// The object's `[Symbol.dispose]` method, if it has one, is called with the
-/// removed object as `this`. Exported objects are not registered under
-/// [`DISPOSE_FIELD`], so the imported-resource finalizer never races this path.
+/// removed object as `this`.
 pub fn drop_exported(scope: &Scope<'_>, rep: u32, expected_type_idx: u32) -> Result<(), ExnThrown> {
-    let Some(obj) = with_exported_resources(|slab| slab.remove(scope, rep)) else {
+    let Some((obj, type_idx)) = with_exported_resources(|slab| slab.remove_with_type(scope, rep))
+    else {
         // An unknown rep, from a double drop or a handle that never entered the
         // slab, is a no-op.
         return Ok(());
     };
 
     // The type index is validated before running any guest code.
-    if let Some(type_idx) = exported_type(scope, &obj)? {
-        debug_assert_eq!(
-            type_idx, expected_type_idx,
-            "resource_dtor type index mismatch"
-        );
-    }
+    debug_assert_eq!(
+        type_idx, expected_type_idx,
+        "resource_dtor type index mismatch"
+    );
 
     if let Some(dispose) = dispose_method(scope, &obj)? {
         Function::call(scope, obj, dispose, EmptyArgs)?;
@@ -691,119 +767,55 @@ pub fn drop_exported(scope: &Scope<'_>, rep: u32, expected_type_idx: u32) -> Res
 }
 
 js::instance_local! {
-    /// The resource type index of each object backing an exported resource,
-    /// keyed by the object. A side table rather than a property, so a frozen or
-    /// sealed object can back a resource too. Traced by [`trace_resources`].
-    static EXPORTED_TYPES: RefCell<Option<Heap<js::collections::weak_map::WeakMap>>> =
-        const { RefCell::new(None) };
-}
-
-/// The resource type index `object` backs an exported resource of, or `None` if
-/// it backs none yet.
-pub(crate) fn exported_type(
-    scope: &Scope<'_>,
-    object: &Object<'_>,
-) -> Result<Option<u32>, ExnThrown> {
-    let Some(types) =
-        EXPORTED_TYPES.with(|cell| cell.borrow().as_ref().map(|heap| heap.get(scope)))
-    else {
-        return Ok(None);
-    };
-    let types: js::WeakMap<'_> = types;
-    let index = types.lookup(scope, scope.root_value(object.as_value()))?;
-    Ok(index.is_number().then(|| index.to_number() as u32))
-}
-
-/// Record that `object` backs an exported resource of type `type_idx`.
-fn set_exported_type(
-    scope: &Scope<'_>,
-    object: &Object<'_>,
-    type_idx: u32,
-) -> Result<(), ExnThrown> {
-    let existing = EXPORTED_TYPES.with(|cell| cell.borrow().as_ref().map(|heap| heap.get(scope)));
-    let types: js::WeakMap<'_> = match existing {
-        Some(types) => types,
-        None => {
-            let types = js::WeakMap::new(scope)?;
-            EXPORTED_TYPES.with(|cell| *cell.borrow_mut() = Some(Heap::from(types)));
-            types
-        }
-    };
-    let index = scope.root_value(js::value::from_u32(type_idx));
-    types.insert(scope, scope.root_value(object.as_value()), index)
-}
-
-js::instance_local! {
-    /// The finalization registry's `register` and `unregister` JS functions, set
-    /// once by [`init_finalization`] and traced by [`trace_resources`].
+    /// The finalization registry and its `register` and `unregister` methods,
+    /// set once by [`init_finalization`] and traced by [`trace_resources`].
     static FINALIZATION: RefCell<Option<Finalization>> = const { RefCell::new(None) };
 }
 
-/// The two JS functions that drive the `FinalizationRegistry` created at init.
+/// The `FinalizationRegistry` created at init, and the intrinsic
+/// `FinalizationRegistry.prototype.register` and `unregister`.
 #[js::allow_unrooted_interior]
 struct Finalization {
-    register: Heap<js::native::Value>,
-    unregister: Heap<js::native::Value>,
+    registry: Heap<js::object::Object>,
+    register: Heap<Value>,
+    unregister: Heap<Value>,
 }
 
-/// The JS bootstrap creating the finalization registry and its `register` and
-/// `unregister` helpers. The drop callback is read from the hidden
-/// [`DISPOSE_FIELD`] own-property.
-///
-/// `register` clones the handle, type and dispose into a detached object, so the
-/// held value does not strongly reference the wrapper. The unregister token is the
-/// wrapper itself.
-///
-/// The finalizer does nothing for a value registered without a `dispose`, and
-/// otherwise calls `dispose` on the clone. `unregister` returns whether its
-/// argument was registered or is a clone the finalizer passed to `dispose`, which
-/// only the first call for either does.
-fn finalization_bootstrap() -> String {
-    let [handle, ty, dispose] = [HANDLE_FIELD, TYPE_FIELD, DISPOSE_FIELD]
-        .map(|field| field.to_str().expect("field names are ASCII"));
-    format!(
-        r#"
-(() => {{
-    const registry = new FinalizationRegistry((v) => v());
-    const finalizing = new WeakSet();
-    const register = function (value) {{
-        const clone = {{
-            {handle}: value.{handle},
-            {ty}: value.{ty},
-        }};
-        const dispose = value.{dispose};
-        registry.register(value, () => {{
-            if (dispose) {{
-                finalizing.add(clone);
-                dispose.call(clone);
-            }}
-        }}, value);
-    }};
-    const unregister = function (value) {{
-        return registry.unregister(value) || finalizing.delete(value);
-    }};
-    return {{ register, unregister }};
-}})()
-"#
-    )
+/// The registry's cleanup callback: drop the handle of a collected wrapper. The
+/// held value is a wrapper that [`register_resource`] created with the
+/// collected wrapper's type and handle.
+fn finalize_callback(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue<'_>,
+) -> Result<Value, ExnThrown> {
+    if let Some(held) = imported_wrapper(scope, args.get(0)) {
+        dispose_wrapper(scope, held)?;
+    }
+    Ok(js::value::undefined())
 }
 
-/// Create the finalization registry and store its helpers. Idempotent, and must
-/// run after [`crate::tracing::install_tracer`] and before any resource is
-/// wrapped.
+/// Create the finalization registry and store it with its methods. Idempotent,
+/// and must run after [`crate::tracing::install_tracer`] and before any resource
+/// is wrapped.
 pub fn init_finalization(scope: &Scope<'_>) -> Result<(), ExnThrown> {
     if FINALIZATION.with(|cell| cell.borrow().is_some()) {
         return Ok(());
     }
 
-    let result = js::compile::evaluate(scope, &finalization_bootstrap())?;
-    let obj = Object::from_value(scope, result)
-        .map_err(|_| throw_type_error(scope, c"finalization bootstrap did not return an object"))?;
-    let register = obj.get_property(scope, c"register")?;
-    let unregister = obj.get_property(scope, c"unregister")?;
+    use js::class_spec::JSProtoKey::JSProto_FinalizationRegistry;
+    let constructor = js::class::get_class_object(scope, JSProto_FinalizationRegistry)?;
+    let constructor = Object::from_handle(constructor).ok_or(ExnThrown)?;
+    let cleanup = Function::new_callback(scope, c"", 1, finalize_callback, ())?;
+    let registry = Function::construct(scope, constructor, &[cleanup])?;
+    let proto = js::class::get_class_prototype(scope, JSProto_FinalizationRegistry)?;
+    let proto = Object::from_handle(proto).ok_or(ExnThrown)?;
+    let register = proto.get_property(scope, c"register")?;
+    let unregister = proto.get_property(scope, c"unregister")?;
 
     FINALIZATION.with(|cell| {
         *cell.borrow_mut() = Some(Finalization {
+            registry: Heap::from(registry),
             register: Heap::from(register.get()),
             unregister: Heap::from(unregister.get()),
         });
@@ -811,41 +823,14 @@ pub fn init_finalization(scope: &Scope<'_>) -> Result<(), ExnThrown> {
     Ok(())
 }
 
-/// Register `wrapper` with the finalization registry, so its [`DISPOSE_FIELD`]
-/// callback runs if the wrapper is collected without an explicit drop. Also
-/// stamps the canonical handle into [`HANDLE_FIELD`].
-pub fn register_resource(
-    scope: &Scope<'_>,
-    wrapper: &Object<'_>,
-    handle: u32,
-) -> Result<(), ExnThrown> {
-    wrapper.define_property(scope, HANDLE_FIELD, handle, HIDDEN_FIELD_ATTRS)?;
-    call_finalization(scope, wrapper, FinalizationOp::Register).map(|_| ())
-}
-
-/// Unregister `wrapper` from the finalization registry, so a subsequent
-/// collection does not fire its drop. Returns whether `wrapper` was registered.
-/// The handle field is left alone, since the owned-lower path deletes it
-/// itself.
-pub fn unregister_resource(scope: &Scope<'_>, wrapper: &Object<'_>) -> Result<bool, ExnThrown> {
-    call_finalization(scope, wrapper, FinalizationOp::Unregister)
-}
-
-enum FinalizationOp {
-    Register,
-    Unregister,
-}
-
-/// Call the registry helper for `op` with `wrapper`, returning whether the
-/// helper returned a truthy value.
-fn call_finalization(
-    scope: &Scope<'_>,
-    wrapper: &Object<'_>,
+/// The registry and the method for `op`. Throws rather than panicking if
+/// [`init_finalization`] has not run, since this is reached next to the FFI
+/// boundary and the interpreter turns a thrown error into a clean trap.
+fn finalization<'s>(
+    scope: &'s Scope<'_>,
     op: FinalizationOp,
-) -> Result<bool, ExnThrown> {
-    // This throws rather than panicking, since it is reached next to the FFI
-    // boundary and the interpreter turns a thrown error into a clean trap.
-    let fval = FINALIZATION.with(|cell| {
+) -> Result<(Object<'s>, HandleValue<'s>), ExnThrown> {
+    FINALIZATION.with(|cell| {
         let borrow = cell.borrow();
         let fin = borrow.as_ref().ok_or_else(|| {
             throw_type_error(
@@ -853,27 +838,56 @@ fn call_finalization(
                 c"finalization not initialized (call init_finalization)",
             )
         })?;
-        let heap = match op {
+        let method = match op {
             FinalizationOp::Register => &fin.register,
             FinalizationOp::Unregister => &fin.unregister,
         };
-        Ok(heap.get(scope))
-    })?;
-    let result = Function::call(scope, HandleValue::undefined(), fval, &[wrapper])?;
-    <bool as js::conversion::FromJSVal>::from_jsval(scope, result, ()).map_err(|e| e.throw(scope))
+        Ok((fin.registry.get(scope), method.get(scope)))
+    })
 }
 
-/// Drop the slab, the finalization helpers and the registered prototypes. See
+enum FinalizationOp {
+    Register,
+    Unregister,
+}
+
+/// Register `wrapper` with the finalization registry, so its handle is dropped if
+/// the wrapper is collected without an explicit drop. The held value is a new
+/// wrapper with the same type and handle, so it does not reference `wrapper`.
+/// The unregister token is `wrapper` itself.
+fn register_resource(scope: &Scope<'_>, wrapper: ImportedResource<'_>) -> Result<(), ExnThrown> {
+    let held = {
+        let data = wrapper.data();
+        ImportedResourceImpl {
+            type_idx: data.type_idx,
+            handle: data.handle,
+            ..Default::default()
+        }
+    };
+    let held = new_wrapper(scope, None, held)?;
+    let (registry, register) = finalization(scope, FinalizationOp::Register)?;
+    Function::call(scope, registry, register, &[*wrapper, *held, *wrapper])?;
+    wrapper.data_mut().registered = true;
+    Ok(())
+}
+
+/// Unregister `wrapper` from the finalization registry, so a later collection
+/// does not drop its handle.
+fn unregister_resource(scope: &Scope<'_>, wrapper: &Object<'_>) -> Result<(), ExnThrown> {
+    let (registry, unregister) = finalization(scope, FinalizationOp::Unregister)?;
+    Function::call(scope, registry, unregister, &[*wrapper]).map(|_| ())
+}
+
+/// Drop the slab, the finalization registry and the registered prototypes. See
 /// [`crate::tracing::clear_traced_roots`].
 pub(crate) fn clear_traced_roots() {
     EXPORTED_RESOURCES.with(|slab| *slab.borrow_mut() = ExportedResources::default());
     FINALIZATION.with(|cell| *cell.borrow_mut() = None);
     RESOURCE_PROTOTYPES.with(|cell| cell.borrow_mut().clear());
-    EXPORTED_TYPES.with(|cell| *cell.borrow_mut() = None);
 }
 
-/// Trace every slab-held resource, the finalization helper functions, the
-/// registered resource prototypes, and the exported-type side table.
+/// Trace every slab-held resource, the finalization registry and its methods,
+/// and the registered resource prototypes.
 ///
 /// # Safety
 ///
@@ -882,23 +896,19 @@ pub(crate) fn clear_traced_roots() {
 pub(crate) unsafe fn trace_resources(trc: *mut JSTracer) {
     EXPORTED_RESOURCES.with(|slab| {
         let slab = &*slab.as_ptr();
-        for heap in slab.entries.iter().flatten() {
+        for (heap, _) in slab.entries.iter().flatten() {
             heap.trace(trc);
         }
     });
     FINALIZATION.with(|cell| {
         if let Some(fin) = &*cell.as_ptr() {
+            fin.registry.trace(trc);
             fin.register.trace(trc);
             fin.unregister.trace(trc);
         }
     });
     RESOURCE_PROTOTYPES.with(|cell| {
         for heap in (*cell.as_ptr()).iter().flatten() {
-            heap.trace(trc);
-        }
-    });
-    EXPORTED_TYPES.with(|cell| {
-        if let Some(heap) = &*cell.as_ptr() {
             heap.trace(trc);
         }
     });

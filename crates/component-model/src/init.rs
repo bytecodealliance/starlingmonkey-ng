@@ -44,6 +44,10 @@ js::instance_local! {
 
     /// Run at the start of every export call, set by [`set_before_export`].
     static BEFORE_EXPORT: Cell<Option<fn()>> = const { Cell::new(None) };
+
+    /// Run at the start of every call of the application's own `wasi:http/handler`
+    /// export, set by [`set_before_http_export`].
+    static BEFORE_HTTP_EXPORT: Cell<Option<fn()>> = const { Cell::new(None) };
 }
 
 /// Run `hook` at the start of every export call, before any JS runs.
@@ -55,6 +59,22 @@ pub fn set_before_export(hook: fn()) {
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn before_export() {
     if let Some(hook) = BEFORE_EXPORT.with(Cell::get) {
+        hook();
+    }
+}
+
+/// Run `hook` at the start of every call of the export the application
+/// implements `wasi:http/handler` through (see `interpreter::install_exports`),
+/// after the [`set_before_export`] hook and before any JS runs. The export is
+/// async, so `hook` may spawn a task onto the call's executor.
+pub fn set_before_http_export(hook: fn()) {
+    BEFORE_HTTP_EXPORT.with(|cell| cell.set(Some(hook)));
+}
+
+/// Run the hook [`set_before_http_export`] set, if any.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn before_http_export() {
+    if let Some(hook) = BEFORE_HTTP_EXPORT.with(Cell::get) {
         hook();
     }
 }
@@ -104,7 +124,8 @@ pub fn initialize_runtime(
 
     let runtime = Runtime::init(config)?;
 
-    // Entered here and kept entered for the process by leaking `scope` below.
+    // `scope` enters the default global's realm, which stays entered for the
+    // process because `scope` is leaked below.
     let scope = runtime.default_global();
     // SAFETY: the raw context is only stored, and every later read of it goes
     // through `bootstrap_cx`, which is reachable only once `BOOTSTRAP` is set at

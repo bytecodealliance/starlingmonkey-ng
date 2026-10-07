@@ -30,8 +30,8 @@ use super::readable_stream::{ReadableStream, ReadableStreamImpl, ReadableStreamS
 use super::underlying_source::UnderlyingSource;
 use super::unions::{HeapReadableStreamController, HeapReadableStreamReader, ReadableStreamReader};
 use crate::algorithms::{
-    composite_reason, dequeue_value, enqueue_value_with_size, is_non_negative_number,
-    make_type_error, pair_parts, pair_payload, reset_queue, resolved_undefined_promise,
+    composite_reason, dequeue_value, enqueue_value_with_size, invalid_state_error,
+    is_non_negative_number, pair_parts, pair_payload, reset_queue, resolved_undefined_promise,
 };
 use crate::readable::default_reader::DefaultReaderImpl;
 use crate::support;
@@ -1304,8 +1304,9 @@ fn pipe_setup_propagation_and_start(
     if writable_stream_close_queued_or_in_flight(&dest)
         || dest.data().state == WritableStreamState::Closed
     {
-        let dest_closed = make_type_error(
+        let dest_closed = invalid_state_error(
             scope,
+            "ReadableStream",
             c"the destination writable stream closed before all data could be piped to it",
         );
         if !prevent_cancel {
@@ -3173,8 +3174,9 @@ pub(crate) fn readable_stream_reader_generic_release(
     // Step 2: Assert: _stream_ is not undefined.
     let stream = reader.generic_stream(scope).expect("reader has a stream");
     // Step 3: Assert: _stream_.`[[reader]]` is _reader_.
-    let type_error = make_type_error(
+    let type_error = invalid_state_error(
         scope,
+        "ReadableStream",
         c"Reader was released and can no longer be used to monitor the stream's closedness",
     );
     let state = stream.data().state;
@@ -3292,7 +3294,7 @@ pub(crate) fn readable_stream_byob_reader_release(
     // Step 1: Perform ! `ReadableStreamReaderGenericRelease`(_reader_).
     readable_stream_reader_generic_release(scope, reader)?;
     // Step 2: Let _e_ be a new ``TypeError`` exception.
-    let e = make_type_error(scope, c"Reader was released");
+    let e = invalid_state_error(scope, "ReadableStream", c"Reader was released");
     // Step 3: Perform ! `BYOBReaderErrorReadIntoRequests`(_reader_, _e_).
     readable_stream_byob_reader_error_read_into_requests(scope, reader, e);
     Ok(())
@@ -3389,7 +3391,7 @@ pub(crate) fn readable_stream_default_reader_release(
     // Step 1: Perform ! `ReadableStreamReaderGenericRelease`(_reader_).
     readable_stream_reader_generic_release(scope, reader)?;
     // Step 2: Let _e_ be a new ``TypeError`` exception.
-    let e = make_type_error(scope, c"Reader was released");
+    let e = invalid_state_error(scope, "ReadableStream", c"Reader was released");
     // Step 3: Perform ! `DefaultReaderErrorReadRequests`(_reader_, _e_).
     readable_stream_default_reader_error_read_requests(scope, reader, e);
     Ok(())
@@ -3404,8 +3406,9 @@ pub(crate) fn set_up_readable_stream_byob_reader(
 ) -> Result<(), ExnThrown> {
     // Step 1: If ! `IsReadableStreamLocked`(_stream_) is true, throw a ``TypeError`` exception.
     if stream.is_locked() {
-        return Err(js::error::throw_type_error(
+        return Err(crate::algorithms::throw_invalid_state(
             scope,
+            "ReadableStream",
             c"This stream has already been locked for exclusive reading by another reader",
         ));
     }
@@ -3433,8 +3436,9 @@ pub(crate) fn set_up_readable_stream_default_reader(
 ) -> Result<(), ExnThrown> {
     // Step 1: If ! `IsReadableStreamLocked`(_stream_) is true, throw a ``TypeError`` exception.
     if stream.is_locked() {
-        return Err(js::error::throw_type_error(
+        return Err(crate::algorithms::throw_invalid_state(
             scope,
+            "ReadableStream",
             c"This stream has already been locked for exclusive reading by another reader",
         ));
     }
@@ -3939,7 +3943,11 @@ pub(crate) fn readable_byte_stream_controller_close(
             (first.bytes_filled, first.element_size)
         };
         if bytes_filled % element_size != 0 {
-            let e = make_type_error(scope, c"Insufficient bytes to fill the pending pull-into");
+            let e = invalid_state_error(
+                scope,
+                "ReadableStream",
+                c"Insufficient bytes to fill the pending pull-into",
+            );
             readable_byte_stream_controller_error(scope, controller, e);
             return Err(js::exception::set_pending(
                 scope,
@@ -4045,8 +4053,9 @@ pub(crate) fn readable_byte_stream_controller_enqueue(
     let byte_length = chunk.byte_length();
     // Step 6: If ! `IsDetachedBuffer`(_buffer_) is true, throw a ``TypeError`` exception.
     if buffer.is_detached() {
-        return Err(js::error::throw_type_error(
+        return Err(crate::algorithms::throw_invalid_state(
             scope,
+            "ReadableByteStreamController",
             c"enqueue() view's buffer is detached",
         ));
     }
@@ -4809,7 +4818,11 @@ pub(crate) fn readable_byte_stream_controller_pull_into(
             return;
         }
         if controller.data().close_requested {
-            let e = make_type_error(scope, c"Insufficient bytes to fill the requested view");
+            let e = invalid_state_error(
+                scope,
+                "ReadableStream",
+                c"Insufficient bytes to fill the requested view",
+            );
             readable_byte_stream_controller_error(scope, controller, e);
             read_into_request
                 .take()
@@ -5153,36 +5166,50 @@ pub(crate) fn readable_byte_stream_controller_respond_with_new_view(
     let view_byte_length = view.byte_length();
     if state == ReadableStreamState::Closed {
         if view_byte_length != 0 {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBRequest",
                 c"view byte length must be 0 for a closed stream",
             ));
         }
     } else {
         debug_assert_eq!(state, ReadableStreamState::Readable);
         if view_byte_length == 0 {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBRequest",
                 c"view byte length must not be 0 for a readable stream",
             ));
         }
     }
     if first_byte_offset + first_bytes_filled != view.byte_offset() {
-        return Err(js::error::throw_range_error(
+        return Err(crate::algorithms::throw_invalid_value(
             scope,
+            "ReadableStreamBYOBRequest",
+            js::error::JSExnType::JSEXN_RANGEERR,
             c"the view's byte offset does not match the pending pull-into",
+            "view",
+            scope.root_value(view.as_value()),
         ));
     }
     if first_buffer_byte_length != view_buffer.byte_length() {
-        return Err(js::error::throw_range_error(
+        return Err(crate::algorithms::throw_invalid_value(
             scope,
+            "ReadableStreamBYOBRequest",
+            js::error::JSExnType::JSEXN_RANGEERR,
             c"the view's buffer byte length does not match the pending pull-into",
+            "view",
+            scope.root_value(view.as_value()),
         ));
     }
     if first_bytes_filled + view_byte_length > first_byte_length {
-        return Err(js::error::throw_range_error(
+        return Err(crate::algorithms::throw_invalid_value(
             scope,
+            "ReadableStreamBYOBRequest",
+            js::error::JSExnType::JSEXN_RANGEERR,
             c"the view's byte length exceeds the pending pull-into",
+            "view",
+            scope.root_value(view.as_value()),
         ));
     }
     let transferred = view_buffer.transfer(scope)?;

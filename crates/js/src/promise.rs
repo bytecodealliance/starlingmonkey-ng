@@ -369,11 +369,23 @@ impl<'s> Stack<'s, Promise> {
     /// Stores the `Promise` in a `RootedHeap<Promise>` for GC safety
     /// and queues the future for [`poll_pending_futures`] to drive.
     pub fn spawn(&self, js_promise: PromiseFuture) {
+        self.spawn_pending(js_promise, None);
+    }
+
+    /// [`Promise::spawn`], with the future keeping its event loop alive only while `referenced`
+    /// is set.
+    pub fn spawn_with_ref(&self, js_promise: PromiseFuture, referenced: FutureRef) {
+        self.spawn_pending(js_promise, Some(referenced));
+    }
+
+    fn spawn_pending(&self, js_promise: PromiseFuture, referenced: Option<FutureRef>) {
         let pending = PendingPromise {
             owner: current_future_owner(|owner_cell| owner_cell.get()),
             promise: RootedHeap::new(*self),
             future: js_promise.future,
             origin: crate::stack::current_origin(),
+            referenced,
+            context: crate::async_context::Snapshot::capture(),
         };
         pending_futures(|f| f.borrow_mut().push(pending));
     }
@@ -532,11 +544,46 @@ pub(crate) struct PendingPromise {
     /// Where the future was spawned, if origins were being recorded then. See
     /// [`crate::stack::record_origins`].
     origin: Option<std::rc::Rc<str>>,
+    /// Whether the future keeps its event loop alive, for a future spawned with
+    /// [`Promise::spawn_with_ref`]. Other futures always do.
+    referenced: Option<FutureRef>,
+    /// The async context current when the future was spawned.
+    context: crate::async_context::Snapshot,
 }
 
 impl PendingPromise {
     fn owned_by(&self, owner: u64) -> bool {
         self.owner == owner || self.owner == 0
+    }
+
+    fn keeps_alive(&self) -> bool {
+        self.referenced
+            .as_ref()
+            .is_none_or(FutureRef::is_referenced)
+    }
+}
+
+/// Whether the futures [`Promise::spawn_with_ref`] spawned with it keep their event loop alive.
+/// Clones share the setting, which starts out referenced. An unreferenced future is still polled
+/// while other work keeps the loop alive.
+#[derive(Clone, Debug)]
+pub struct FutureRef(std::rc::Rc<Cell<bool>>);
+
+impl Default for FutureRef {
+    fn default() -> Self {
+        FutureRef(std::rc::Rc::new(Cell::new(true)))
+    }
+}
+
+impl FutureRef {
+    /// Whether the futures keep their event loop alive.
+    pub fn is_referenced(&self) -> bool {
+        self.0.get()
+    }
+
+    /// Set whether the futures keep their event loop alive.
+    pub fn set_referenced(&self, referenced: bool) {
+        self.0.set(referenced);
     }
 }
 
@@ -731,13 +778,13 @@ pub fn cancel_all_pending_futures() {
     active_futures(|a| a.borrow_mut().clear());
 }
 
-/// Whether any async-promise future owned by `owner` (or unowned) is pending (spawned but not yet
-/// settled).
+/// Whether any async-promise future owned by `owner` (or unowned) that keeps its loop alive is
+/// pending (spawned but not yet settled). Futures whose [`FutureRef`] is unreferenced don't count.
 ///
 /// An event loop uses this to stay alive while *its own* async I/O (e.g. a `fetch`) is in flight,
 /// even with no tasks or timers — without being held alive by another request's loop's futures.
 pub fn has_pending_futures(owner: u64) -> bool {
-    let owned_by_caller = |future: &PendingPromise| future.owned_by(owner);
+    let owned_by_caller = |future: &PendingPromise| future.owned_by(owner) && future.keeps_alive();
     active_futures(|a| a.borrow().iter().any(owned_by_caller))
         || pending_futures(|f| f.borrow().iter().any(owned_by_caller))
 }
@@ -761,9 +808,14 @@ pub fn pending_future_origins(owner: u64) -> Vec<Option<std::rc::Rc<str>>> {
     origins
 }
 
-/// A promise object whose future completed, paired with its outcome — returned by
-/// [`poll_pending_futures`] for [`settle_completed_futures`] to settle.
-pub type CompletedFuture = (RootedHeap<Promise>, PromiseOutcome);
+/// A promise object whose future completed, its outcome, and the async context current when the
+/// future was spawned, as [`poll_pending_futures`] returns them for [`settle_completed_futures`]
+/// to settle.
+pub type CompletedFuture = (
+    RootedHeap<Promise>,
+    PromiseOutcome,
+    crate::async_context::Snapshot,
+);
 
 /// Poll the async-promise futures owned by `owner` (or unowned, id 0) one turn: adopt any newly
 /// spawned futures, poll the matching ones with `task_cx`, and return those that completed. Futures
@@ -794,7 +846,9 @@ pub fn poll_pending_futures(
             continue;
         }
         match pending.future.as_mut().poll(task_cx) {
-            std::task::Poll::Ready(outcome) => completed.push((pending.promise, outcome)),
+            std::task::Poll::Ready(outcome) => {
+                completed.push((pending.promise, outcome, pending.context))
+            }
             std::task::Poll::Pending => still_pending.push(pending),
         }
     }
@@ -810,14 +864,17 @@ pub fn poll_pending_futures(
 
 /// Settle promises whose futures completed (from [`poll_pending_futures`]): resolve/reject each and
 /// drain the reactions they queue. Must be called with the owning event loop active so a reaction
-/// that touches the loop (a timer, releasing interest) reaches the right loop.
+/// that touches the loop (a timer, releasing interest) reaches the right loop. Each promise is
+/// settled as a callback with the async context its future was spawned in current.
 pub fn settle_completed_futures(scope: &Scope<'_>, completed: Vec<CompletedFuture>) {
     if completed.is_empty() {
         return;
     }
     // Each `boxed` keeps its promise rooted until settled.
-    for (boxed, outcome) in completed {
+    for (boxed, outcome, context) in completed {
+        let previous = context.enter_callback(scope);
         settle_promise(scope, boxed.get(scope), outcome);
+        previous.leave_callback(scope);
     }
     // Settling queues the promises' reactions as microtasks; drain them here so the event loop's
     // next `step` sees an empty job queue (mirroring how `step` drains after each task). An

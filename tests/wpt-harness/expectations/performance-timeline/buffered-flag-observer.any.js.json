@@ -1,0 +1,5 @@
+{
+  "PerformanceObserver with buffered flag should see past and future entries.": {
+    "status": "PASS"
+  }
+}

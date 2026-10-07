@@ -46,6 +46,10 @@ pub struct WorldDesc {
     /// (whose [`InterfaceDesc::wit_name`] is `None`) for imports defined
     /// directly on the world.
     pub interfaces: Vec<InterfaceDesc>,
+    /// The error classes of types that interfaces the world only exports
+    /// define. No module exports them, and [`synthesize_import_modules`] creates
+    /// them with the others.
+    pub unexported_error_classes: Vec<ErrorClass>,
 }
 
 /// One imported interface (or the world-level import group).
@@ -135,16 +139,6 @@ pub trait ImportInvoker {
         stack: &mut CallStack,
         func: &ImportFuncDesc,
     ) -> Result<(), ExnThrown>;
-
-    /// The JS function that drops the host-owned resource `this` wraps,
-    /// installed as `[Symbol.dispose]` on every synthesized resource class's
-    /// prototype, or `None` to install nothing.
-    fn dispose_callback<'s>(
-        &self,
-        _scope: &'s Scope<'_>,
-    ) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-        Ok(None)
-    }
 
     /// Whether this invoker implements [`invoke_async`](Self::invoke_async).
     /// [`call_import_from_js_async`] checks this before dispatching, so a
@@ -310,12 +304,12 @@ fn push_import_args(
 ) -> Result<CallStack, ExnThrown> {
     let is_method = func.name.starts_with("[method]");
     if args.len() != func.params.len() {
-        let expected = func.params.len() - usize::from(is_method);
+        let expected = func.params.len().saturating_sub(usize::from(is_method));
         return Err(js::error::TypeError(format!(
             "`{}` takes {expected} argument{}, got {}",
             js_import_name(&func.name),
             if expected == 1 { "" } else { "s" },
-            args.len() - usize::from(is_method),
+            args.len().saturating_sub(usize::from(is_method)),
         ))
         .throw(scope));
     }
@@ -483,9 +477,9 @@ fn call_import_async(
 
 /// Settle an async import's promise from the lifted result.
 ///
-/// Split out so the lifted [`Value`] is consumed inline into `rval` rather than
-/// bound to an unrooted local, with no GC possible between
-/// [`handle_import_result`] producing it and `rval.set` taking it.
+/// The lifted [`Value`] is rooted in the expression that produces it, so no GC
+/// can run between [`handle_import_result`] returning it and `root_value` taking
+/// it.
 #[js::allow_unrooted]
 fn settle_import_result<'s>(
     scope: &'s Scope<'_>,
@@ -609,11 +603,13 @@ pub unsafe fn synthesize_import_modules(
             }
         }
     }
-    let dispose = invoker.dispose_callback(scope)?;
     set_import_registry(funcs, invoker);
 
     for iface in &world.interfaces {
-        synthesize_interface_module(scope, iface, dispose)?;
+        synthesize_interface_module(scope, iface)?;
+    }
+    for class in &world.unexported_error_classes {
+        crate::component_error::error_class(scope, class)?;
     }
     Ok(())
 }
@@ -626,7 +622,6 @@ const WORLD_MODULE_NAME: &str = "external";
 unsafe fn synthesize_interface_module(
     scope: &Scope<'_>,
     iface: &InterfaceDesc,
-    dispose: Option<HandleValue<'_>>,
 ) -> Result<(), ExnThrown> {
     let mut names: Vec<String> = Vec::new();
     let mut values: Vec<HandleValue<'_>> = Vec::new();
@@ -639,7 +634,7 @@ unsafe fn synthesize_interface_module(
     }
 
     for res in &iface.resources {
-        let class = synthesize_resource_class(scope, res, dispose)?;
+        let class = synthesize_resource_class(scope, res)?;
         names.push(mangle_resource_name(&res.name));
         values.push(scope.root_value(class.as_value()));
     }
@@ -702,9 +697,8 @@ fn synthesize_import_function<'s>(
     )
 }
 
-/// Build a resource class: a constructor function with its method callbacks and,
-/// when `dispose` is given, `[Symbol.dispose]` on its prototype, and its static
-/// callbacks on itself.
+/// Build a resource class: a constructor function with its method callbacks and
+/// `[Symbol.dispose]` on its prototype, and its static callbacks on itself.
 ///
 /// The constructor callback returns the wrapper object `push_own` lifts, which
 /// `new R(...)` adopts as the instance. Methods forward the receiver as the first
@@ -712,7 +706,6 @@ fn synthesize_import_function<'s>(
 fn synthesize_resource_class<'s>(
     scope: &'s Scope<'_>,
     res: &ResourceTypeDesc,
-    dispose: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, ExnThrown> {
     let class_name = mangle_resource_name(&res.name);
     let c_class_name = to_cstring(&class_name);
@@ -744,9 +737,8 @@ fn synthesize_resource_class<'s>(
         proto.set_property_by_name(scope, &c_method, f)?;
     }
 
-    if let Some(dispose) = dispose {
-        crate::resources::define_dispose(scope, &proto, dispose)?;
-    }
+    let dispose = crate::resources::dispose_function(scope)?;
+    crate::resources::define_dispose(scope, &proto, dispose)?;
 
     let ctor_obj = *ctor;
 

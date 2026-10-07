@@ -1,0 +1,14 @@
+{
+  "self.performance.mark is defined.": {
+    "status": "PASS"
+  },
+  "self.performance.clearMarks is defined.": {
+    "status": "PASS"
+  },
+  "self.performance.measure is defined.": {
+    "status": "PASS"
+  },
+  "self.performance.clearMeasures is defined.": {
+    "status": "PASS"
+  }
+}

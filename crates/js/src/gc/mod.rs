@@ -335,3 +335,61 @@ pub unsafe fn remove_extra_gc_roots_tracer(
 ) {
     wrappers2::JS_RemoveExtraGCRootsTracer(cx, trace_op, data);
 }
+
+// ---------------------------------------------------------------------------
+// Collection callbacks
+// ---------------------------------------------------------------------------
+
+pub use mozjs::jsapi::{GCDescription, GCNurseryProgress, GCProgress};
+
+/// The callback SpiderMonkey calls at the start and end of each major collection and of each of
+/// its slices: `(cx, progress, description)`.
+pub type GCSliceCallback = mozjs::jsapi::GCSliceCallback;
+
+/// The callback SpiderMonkey calls at the start and end of each nursery collection:
+/// `(cx, progress, reason, data)`.
+pub type GCNurseryCollectionCallback = mozjs::jsapi::GCNurseryCollectionCallback;
+
+/// Set the slice callback of the runtime of `scope`, or clear it with `None`, and return the
+/// callback it replaces. A runtime has one slice callback.
+///
+/// The callback runs inside a collection, so it must not allocate on the JS heap, run JS or
+/// trigger a GC.
+///
+/// # Safety
+///
+/// `cb` must be a valid function pointer or `None`.
+pub unsafe fn set_gc_slice_callback(scope: &Scope<'_>, cb: GCSliceCallback) -> GCSliceCallback {
+    wrappers2::SetGCSliceCallback(scope.cx(), cb)
+}
+
+/// Add a nursery collection callback to the runtime of `scope`. Returns `false` if it couldn't
+/// be added because memory ran out.
+///
+/// The callback runs inside a collection, so it must not allocate on the JS heap, run JS or
+/// trigger a GC.
+///
+/// # Safety
+///
+/// `cb` must be a valid function pointer, and `data` must stay valid until the callback is
+/// removed with [`remove_gc_nursery_collection_callback`].
+pub unsafe fn add_gc_nursery_collection_callback(
+    scope: &Scope<'_>,
+    cb: GCNurseryCollectionCallback,
+    data: *mut std::os::raw::c_void,
+) -> bool {
+    wrappers2::AddGCNurseryCollectionCallback(scope.cx(), cb, data)
+}
+
+/// Remove a callback [`add_gc_nursery_collection_callback`] added with the same `cb` and `data`.
+///
+/// # Safety
+///
+/// `cb` and `data` must match a prior registration.
+pub unsafe fn remove_gc_nursery_collection_callback(
+    scope: &Scope<'_>,
+    cb: GCNurseryCollectionCallback,
+    data: *mut std::os::raw::c_void,
+) {
+    wrappers2::RemoveGCNurseryCollectionCallback(scope.cx(), cb, data);
+}

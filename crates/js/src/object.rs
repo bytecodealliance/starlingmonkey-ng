@@ -163,7 +163,7 @@ impl<'s> Stack<'s, Object> {
         values: &[impl ToJSVal<'s>],
     ) -> Result<Self, ExnThrown> {
         assert_eq!(keys.len(), values.len());
-        let mut rooter = crate::value::ValueArrayRooter::new(values.len());
+        let mut rooter = PropertyValueRooter::with_capacity(values.len());
         let values = rooter.root(scope, values)?;
         // SAFETY: the caller keeps the keys alive. Atoms and symbols are never moved by the GC.
         let obj = unsafe {
@@ -174,6 +174,30 @@ impl<'s> Stack<'s, Object> {
             )
         };
         unsafe { Self::from_mozjs_rval(scope, obj) }
+    }
+
+    /// Create a new plain object whose prototype is `Object.prototype`, with an enumerable,
+    /// writable and configurable data property for each key of `template`, in order, with the
+    /// value at the same index of `values`, as
+    /// [`new_plain_with_unique_names`](Self::new_plain_with_unique_names) creates it. `values` has
+    /// a value for every key. Debug builds check that the global registered the template.
+    pub fn new_plain_with_template(
+        scope: &'s Scope<'_>,
+        template: &'static PropertyTemplate,
+        values: &[impl ToJSVal<'s>],
+    ) -> Result<Self, ExnThrown> {
+        assert_eq!(template.len(), values.len());
+        let (cells, registered) = crate::class::get_or_init_template_keys(scope, template)?;
+        debug_assert!(
+            registered,
+            "property templates are registered at global setup"
+        );
+        // SAFETY: the cells are traced, and live as long as the global.
+        let keys: smallvec::SmallVec<[mozjs::jsapi::jsid; INLINE_PROPERTIES]> =
+            unsafe { (*cells).iter().map(|cell| **cell).collect() };
+        // SAFETY: a template's keys are distinct names, which aren't array indices, and symbols,
+        // which the global keeps alive.
+        unsafe { Self::new_plain_with_unique_names(scope, &keys, values) }
     }
 
     /// Add an enumerable, writable and configurable data property for each of `keys` to this
@@ -196,7 +220,7 @@ impl<'s> Stack<'s, Object> {
         values: &[impl ToJSVal<'v>],
     ) -> Result<(), ExnThrown> {
         assert_eq!(keys.len(), values.len());
-        let mut rooter = crate::value::ValueArrayRooter::new(values.len());
+        let mut rooter = PropertyValueRooter::with_capacity(values.len());
         let values = rooter.root(scope, values)?;
         // SAFETY: the object is rooted, and the caller keeps the keys alive. Atoms and symbols
         // are never moved by the GC.
@@ -221,18 +245,41 @@ impl<'s> Stack<'s, Object> {
         unsafe { Self::from_mozjs_rval(scope, obj) }
     }
 
-    /// Create a new plain object for a constructor call, whose prototype is `new.target`'s
-    /// `prototype` property, or else the `Object.prototype` of `new.target`'s realm, as
-    /// `OrdinaryCreateFromConstructor` creates it.
+    /// Create a new plain object for a constructor call, as
+    /// [`new_with_capacity_for_constructor`](Self::new_with_capacity_for_constructor) does with a
+    /// `clasp` of `None`.
     pub fn new_plain_for_constructor(
         scope: &'s Scope<'_>,
         args: &mozjs::jsapi::CallArgs,
+        property_count: usize,
     ) -> Result<Self, ExnThrown> {
+        Self::new_with_capacity_for_constructor(scope, None, args, property_count)
+    }
+
+    /// Create a new object of class `clasp`, or a plain object for `None`, for a constructor
+    /// call, whose prototype is `new.target`'s `prototype` property, or else the
+    /// `Object.prototype` of `new.target`'s realm, as `OrdinaryCreateFromConstructor` creates it.
+    /// A `property_count` other than 0 gives it fixed slots for that many properties, as
+    /// [`new_with_property_capacity`](Self::new_with_property_capacity) does, whose requirements
+    /// on `clasp` apply.
+    pub fn new_with_capacity_for_constructor(
+        scope: &'s Scope<'_>,
+        clasp: Option<&'static JSClass>,
+        args: &mozjs::jsapi::CallArgs,
+        property_count: usize,
+    ) -> Result<Self, ExnThrown> {
+        let create = |proto: Stack<'_, Object>| {
+            if clasp.is_none() && property_count == 0 {
+                Self::new_plain_with_proto(scope, proto.handle())
+            } else {
+                Self::new_with_property_capacity(scope, clasp, Some(proto), property_count)
+            }
+        };
         let new_target =
             Self::from_value(scope, args.new_target().get()).map_err(|e| e.throw(scope))?;
         let proto = new_target.get_property(scope, c"prototype")?;
         if let Ok(proto) = Self::from_value(scope, proto) {
-            return Self::new_plain_with_proto(scope, proto.handle());
+            return create(proto);
         }
         // SAFETY: `new_target` is a rooted object.
         let realm = unsafe { wrappers2::GetFunctionRealm(scope.cx_mut(), new_target.handle()) };
@@ -251,7 +298,9 @@ impl<'s> Stack<'s, Object> {
         let mut wrapped = scope.root_object_mut(proto.handle().get());
         // SAFETY: `wrapped` is a rooted location.
         ExnThrown::check(unsafe { wrappers2::JS_WrapObject(scope.cx_mut(), wrapped.reborrow()) })?;
-        Self::new_plain_with_proto(scope, wrapped.handle())
+        // SAFETY: `wrapped` holds a live object.
+        let proto = unsafe { Self::from_raw(scope, wrapped.handle().get()) }.ok_or(ExnThrown)?;
+        create(proto)
     }
 
     // ---------------------------------------------------------------------------
@@ -845,12 +894,25 @@ impl<'s> Stack<'s, Object> {
     /// Start creating the properties of `template` on this object, as `init` creates them. The
     /// template's keys are looked up once, here. Debug builds check that the global registered
     /// the template.
-    pub fn property_writer(
+    ///
+    /// # Safety
+    ///
+    /// With [`PropertyInit::Define`], the object is native and extensible, and its class has no
+    /// `addProperty` or `resolve` hook and no custom property operations, as for plain objects
+    /// and instances of `#[jsclass]` classes. It has none of the keys the writer creates, and gets
+    /// none of them in another way before [`PropertyWriter::flush`] or
+    /// [`PropertyWriter::finish`]. So no JavaScript that can reach the object runs before then,
+    /// apart from what [`PropertyWriter::get`] runs. With [`PropertyInit::Assign`], there are no
+    /// requirements.
+    pub unsafe fn property_writer<'w>(
         self,
-        scope: &Scope<'_>,
+        scope: &'w Scope<'_>,
         template: &'static PropertyTemplate,
         init: PropertyInit,
-    ) -> Result<PropertyWriter<'s>, ExnThrown> {
+    ) -> Result<PropertyWriter<'w>, ExnThrown>
+    where
+        's: 'w,
+    {
         let (keys, registered) = crate::class::get_or_init_template_keys(scope, template)?;
         debug_assert!(
             registered,
@@ -861,7 +923,12 @@ impl<'s> Stack<'s, Object> {
             template,
             keys,
             next: 0,
-            init,
+            mode: match init {
+                PropertyInit::Define => WriteMode::Collect,
+                PropertyInit::Assign => WriteMode::Assign,
+            },
+            collected_keys: smallvec::SmallVec::new(),
+            collected_values: smallvec::SmallVec::new(),
         })
     }
 
@@ -1330,6 +1397,16 @@ impl PropertyTemplate {
         self.keys
     }
 
+    /// The number of keys.
+    pub const fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the template has no keys.
+    pub const fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Intern the template's keys in the current global.
     pub fn register(&'static self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
         crate::class::get_or_init_template_keys(scope, self).map(|_| ())
@@ -1339,53 +1416,175 @@ impl PropertyTemplate {
 /// How a [`PropertyWriter`] creates properties.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PropertyInit {
-    /// Define each property as `Object.defineProperty` does, enumerable, writable and
+    /// Create each property as `Object.defineProperty` does, enumerable, writable and
     /// configurable, without consulting the prototype chain. Setters on the prototype chain are
-    /// not called.
+    /// not called. The writer collects the properties and adds them to the object in one call.
     Define,
     /// Assign each property as `object[key] = value` does, which calls a setter that the
     /// prototype chain has for the key.
     Assign,
 }
 
-/// Creates the properties of a [`PropertyTemplate`] on an object, in the template's order, from
+/// How many properties [`PropertyWriter`] collects, and [`Object::add_new_data_properties`] and
+/// [`Object::new_plain_with_unique_names`] create, without allocating.
+const INLINE_PROPERTIES: usize = 36;
+
+/// The rooter of the values of properties that are created in one call.
+type PropertyValueRooter = crate::value::ValueArrayRooter<[mozjs::jsval::JSVal; INLINE_PROPERTIES]>;
+
+/// How a [`PropertyWriter`] creates the properties written to it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// Collect them, and add them in one call.
+    Collect,
+    /// Define each one as it is written.
+    Define,
+    /// Assign each one as it is written.
+    Assign,
+}
+
+/// Creates the properties of [`PropertyTemplate`]s on an object, in the templates' order, from
 /// [`Object::property_writer`].
 ///
 /// Each call names the key it creates, which must be the template's next key. Debug builds check
 /// it. A writer can stop before the template's last key, and [`skip`](Self::skip) leaves out a
 /// key, so a template can hold keys that only some objects get.
+/// [`continue_with`](Self::continue_with) continues with the keys of another template, and the
+/// keys of all of a writer's templates are distinct.
+///
+/// With [`PropertyInit::Define`], the properties exist only after [`finish`](Self::finish) or
+/// [`flush`](Self::flush). Every writer ends with `finish`.
 pub struct PropertyWriter<'s> {
     object: Stack<'s, Object>,
     template: &'static PropertyTemplate,
     /// The addresses of the global's traced cells that hold the template's keys.
     keys: *const [*const mozjs::jsapi::jsid],
     next: usize,
-    init: PropertyInit,
+    mode: WriteMode,
+    /// The keys of the collected properties. The global's cells keep them alive.
+    collected_keys: smallvec::SmallVec<[mozjs::jsapi::jsid; INLINE_PROPERTIES]>,
+    /// The values of the collected properties, rooted in the writer's scope.
+    collected_values: smallvec::SmallVec<[HandleValue<'s>; INLINE_PROPERTIES]>,
 }
 
 impl<'s> PropertyWriter<'s> {
     /// Create the property `key`, the template's next key, with `value`.
-    pub fn write<'v>(
+    pub fn write(
         &mut self,
-        scope: &'v Scope<'_>,
+        scope: &'s Scope<'_>,
         key: impl Into<TemplateKey>,
-        value: impl ToJSVal<'v>,
+        value: impl ToJSVal<'s>,
     ) -> Result<(), ExnThrown> {
         let id = self.take(key.into());
-        match self.init {
-            PropertyInit::Define => self.object.define_value_by_id(
+        match self.mode {
+            WriteMode::Collect => {
+                let value = value.to_jsval_throwing(scope)?;
+                self.collected_keys.push(id.get());
+                self.collected_values.push(value);
+                Ok(())
+            }
+            WriteMode::Define => self.object.define_value_by_id(
                 scope,
                 id,
                 value,
                 crate::class_spec::JSPROP_ENUMERATE as c_uint,
             ),
-            PropertyInit::Assign => self.object.set_property_by_id(scope, id, value),
+            WriteMode::Assign => self.object.set_property_by_id(scope, id, value),
         }
     }
 
     /// Leave out the property `key`, the template's next key.
     pub fn skip(&mut self, key: impl Into<TemplateKey>) {
         self.take(key.into());
+    }
+
+    /// Continue with the keys of `template`, from its first key. The keys of the previous
+    /// template that weren't written or skipped are left out. Debug builds check that the global
+    /// registered the template.
+    pub fn continue_with(
+        &mut self,
+        scope: &Scope<'_>,
+        template: &'static PropertyTemplate,
+    ) -> Result<(), ExnThrown> {
+        let (keys, registered) = crate::class::get_or_init_template_keys(scope, template)?;
+        debug_assert!(
+            registered,
+            "property templates are registered at global setup"
+        );
+        self.template = template;
+        self.keys = keys;
+        self.next = 0;
+        Ok(())
+    }
+
+    /// The property `name` of the object, as `object[name]` reads it, including a property the
+    /// writer collected. Before a read that runs JavaScript, through an accessor or a `Proxy` on
+    /// the prototype chain, it adds the collected properties as [`flush`](Self::flush) does.
+    pub fn get(
+        &mut self,
+        scope: &'s Scope<'_>,
+        name: &'static CStr,
+    ) -> Result<HandleValue<'s>, ExnThrown> {
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        if self.mode == WriteMode::Collect {
+            let bits = id.get().asBits_;
+            if let Some(index) = self
+                .collected_keys
+                .iter()
+                .position(|key| key.asBits_ == bits)
+            {
+                return Ok(self.collected_values[index]);
+            }
+            let mut holder = Some(self.object);
+            while let Some(object) = holder {
+                if object.is_proxy() {
+                    break;
+                }
+                match object.own_property_descriptor(scope, id)? {
+                    Some(OwnProperty {
+                        value: Some(value), ..
+                    }) => return Ok(value),
+                    Some(_) => break,
+                    None => holder = object.get_prototype(scope)?,
+                }
+            }
+            if holder.is_none() {
+                return Ok(HandleValue::undefined());
+            }
+            self.flush(scope)?;
+        }
+        self.object.get_property_by_id(scope, id)
+    }
+
+    /// Add the properties the writer collected to the object, and define each later property as
+    /// it is written. The object can be passed to JavaScript after this call.
+    pub fn flush(&mut self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
+        if self.mode == WriteMode::Collect {
+            self.mode = WriteMode::Define;
+        }
+        self.add_collected(scope)
+    }
+
+    /// Add the properties the writer collected to the object.
+    pub fn finish(mut self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
+        self.add_collected(scope)
+    }
+
+    /// Add the properties the writer collected to the object in one call.
+    fn add_collected(&mut self, scope: &Scope<'_>) -> Result<(), ExnThrown> {
+        if self.collected_keys.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: the creator of the writer guarantees that the object can get the properties
+        // added in one call, and the template's keys are distinct, interned keys that the
+        // global keeps alive.
+        let result = unsafe {
+            self.object
+                .add_new_data_properties(scope, &self.collected_keys, &self.collected_values)
+        };
+        self.collected_keys.clear();
+        self.collected_values.clear();
+        result
     }
 
     /// Return the template's next key, which must be `key`, and advance past it.

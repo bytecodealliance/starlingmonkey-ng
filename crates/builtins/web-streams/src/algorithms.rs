@@ -2,8 +2,10 @@
 
 //! Standalone algorithms from <https://streams.spec.whatwg.org/>
 
+use std::ffi::CStr;
+
 use js::{
-    error::ExnThrown,
+    error::{throw_binding_error, BindingError, BindingSite, ExnThrown, JSExnType, MemberKind},
     gc::{handle::Heap, scope::Scope},
     heap::RootedTraceableBox,
     prelude::{HandleValue, ToJSVal},
@@ -12,13 +14,66 @@ use js::{
 
 use crate::queuing::{QueueWithSizes, QueuingStrategy, ValueWithSize};
 
-/// Materialize a `TypeError` as a value without making it the pending exception.
+/// The [`BindingSite`] of the errors of the stream algorithms of the class `interface`, whose
+/// member name is empty.
+fn stream_site(interface: &'static str) -> BindingSite {
+    BindingSite {
+        interface,
+        member: "",
+        kind: MemberKind::Method,
+    }
+}
+
+/// Throw the `TypeError` with `message` of an operation of the class `interface` on a stream,
+/// reader, writer or controller whose state doesn't permit it. Node.js gives the error the code
+/// `ERR_INVALID_STATE`.
+pub fn throw_invalid_state(
+    scope: &Scope<'_>,
+    interface: &'static str,
+    message: &CStr,
+) -> ExnThrown {
+    let error = BindingError::Operation {
+        kind: JSExnType::JSEXN_TYPEERR,
+        message,
+        code: "ERR_INVALID_STATE",
+        args: &[],
+        value: None,
+    };
+    throw_binding_error(scope, &stream_site(interface), error)
+}
+
+/// The error of [`throw_invalid_state`] as a value, without making it the pending exception.
 ///
 /// Note: this temporarily throws the error and then immediately clears the pending
 /// exception. It doesn't preserve a potential preexisting exception.
-pub fn make_type_error<'r>(scope: &'r Scope<'_>, message: &std::ffi::CStr) -> HandleValue<'r> {
-    js::error::throw_type_error(scope, message);
-    js::exception::take_pending(scope).expect("a TypeError was just thrown")
+pub fn invalid_state_error<'r>(
+    scope: &'r Scope<'_>,
+    interface: &'static str,
+    message: &CStr,
+) -> HandleValue<'r> {
+    throw_invalid_state(scope, interface, message);
+    js::exception::take_pending(scope).expect("an error was just thrown")
+}
+
+/// Throw the `kind` error with `message` of an operation of the class `interface` for `value`,
+/// the invalid value of the argument or member `name`. Node.js gives the error the code
+/// `ERR_INVALID_ARG_VALUE`.
+pub fn throw_invalid_value(
+    scope: &Scope<'_>,
+    interface: &'static str,
+    kind: JSExnType,
+    message: &CStr,
+    name: &str,
+    value: HandleValue<'_>,
+) -> ExnThrown {
+    let error = BindingError::Operation {
+        kind,
+        message,
+        code: "ERR_INVALID_ARG_VALUE",
+        args: &[name],
+        value: Some(value),
+    };
+    throw_binding_error(scope, &stream_site(interface), error)
 }
 
 /// Pack two values into a JS object for a two-state reaction payload.
@@ -71,9 +126,13 @@ pub(crate) fn extract_high_water_mark(
     };
     // Step 3: If _highWaterMark_ is NaN or _highWaterMark_ < 0, throw a ``RangeError`` exception.
     if high_water_mark.is_nan() || high_water_mark < 0.0 {
-        return Err(js::error::throw_range_error(
+        return Err(throw_invalid_value(
             scope,
+            "",
+            JSExnType::JSEXN_RANGEERR,
             c"highWaterMark must be a non-negative number",
+            "strategy.highWaterMark",
+            scope.root_value(js::value::from_f64(high_water_mark)),
         ));
     }
     // Step 4: Return _highWaterMark_.

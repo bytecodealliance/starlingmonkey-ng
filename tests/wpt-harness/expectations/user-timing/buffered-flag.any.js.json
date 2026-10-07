@@ -1,0 +1,8 @@
+{
+  "PerformanceObserver with buffered flag sees previous marks": {
+    "status": "PASS"
+  },
+  "PerformanceObserver with buffered flag sees previous measures": {
+    "status": "PASS"
+  }
+}

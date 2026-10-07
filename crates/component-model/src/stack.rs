@@ -467,7 +467,7 @@ impl Drop for CallStack {
     fn drop(&mut self) {
         self.inner_mut().clear();
         let inner = self.0;
-        // `try_with`, since a stack can drop during thread-local teardown.
+        // A stack can drop during thread-local teardown, so this uses `try_with`.
         let kept = FREE_STACKS
             .try_with(|free| {
                 let mut free = free.borrow_mut();
@@ -505,7 +505,7 @@ impl Drop for CallStackInner {
 /// `trc` must be a valid `JSTracer` provided by SpiderMonkey's GC, and this must
 /// run with JS execution paused.
 pub(crate) unsafe fn trace_stack_values(trc: *mut JSTracer) {
-    // `try_with`, since a collection can run during thread-local teardown.
+    // A collection can run during thread-local teardown, so this uses `try_with`.
     let _ = LIVE_STACKS.try_with(|stacks| {
         // SAFETY: GC runs with JS execution paused, so no code mutates the registry or the
         // stacks while they are traced, and every registered interior is alive.
@@ -529,7 +529,7 @@ pub(crate) unsafe fn trace_stack_values(trc: *mut JSTracer) {
 /// `trc` must be a valid `JSTracer` provided by SpiderMonkey's GC, and this must
 /// run from the crate tracer, with JS execution paused.
 pub(crate) unsafe fn trace_live_stacks(trc: *mut JSTracer) {
-    // `try_with`, since a collection can run during thread-local teardown.
+    // A collection can run during thread-local teardown, so this uses `try_with`.
     let _ = LIVE_STACKS.try_with(|stacks| {
         let stacks = &*stacks.as_ptr();
         for &inner in stacks {

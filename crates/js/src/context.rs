@@ -97,6 +97,26 @@ pub unsafe fn set_native_stack_quota(
 #[cfg(target_family = "wasm")]
 const WASM_STACK_MARGIN: usize = 128 * 1024;
 
+/// The bytes of native stack left above the native stack limit for untrusted script, the limit at
+/// which SpiderMonkey reports "too much recursion" for JavaScript. On wasm, the limit is raised by
+/// [`WASM_STACK_MARGIN`].
+#[inline]
+pub fn stack_available(scope: &Scope<'_>) -> usize {
+    let marker = 0u8;
+    let sp = std::ptr::addr_of!(marker) as usize;
+    // SAFETY: a `JSContext` starts with its `JS::RootingContext` base, as in
+    // `JS::RootingContext::get`, and `nativeStackLimit` is only written by
+    // `JS_SetNativeStackQuota`.
+    let limit = unsafe {
+        let rooting = scope.raw_cx_no_gc() as *const mozjs::jsapi::JS::RootingContext;
+        (*rooting).nativeStackLimit[mozjs::jsapi::JS::StackKind::StackForUntrustedScript as usize]
+    };
+    #[cfg(target_family = "wasm")]
+    let limit = limit + WASM_STACK_MARGIN;
+    // The stack grows downward on every target the runtime supports.
+    sp.saturating_sub(limit)
+}
+
 /// One level of native recursion over a structure from content code, from
 /// [`enter`](Self::enter) until the guard is dropped. Native code that recurses over such a
 /// structure enters a level at each step and throws when it can't.
@@ -120,23 +140,12 @@ impl<'s> RecursionGuard<'s> {
     /// Guards are dropped in the reverse order of entering them.
     #[inline]
     pub fn enter(scope: &'s Scope<'_>) -> Option<Self> {
-        let marker = 0u8;
-        let sp = std::ptr::addr_of!(marker) as usize;
-        // SAFETY: reading the context pointer performs no GC.
-        let rooting = unsafe { scope.raw_cx_no_gc() } as *mut mozjs::jsapi::JS::RootingContext;
-        // SAFETY: a `JSContext` starts with its `JS::RootingContext` base, as in
-        // `JS::RootingContext::get`, and `nativeStackLimit` is only written by
-        // `JS_SetNativeStackQuota`.
-        let limit = unsafe {
-            (*rooting).nativeStackLimit
-                [mozjs::jsapi::JS::StackKind::StackForUntrustedScript as usize]
-        };
-        #[cfg(target_family = "wasm")]
-        let limit = limit + WASM_STACK_MARGIN;
-        // The stack grows downward on every target the runtime supports.
-        if sp <= limit {
+        if stack_available(scope) == 0 {
             return None;
         }
+        #[cfg(target_family = "wasm")]
+        // SAFETY: reading the context pointer performs no GC.
+        let rooting = unsafe { scope.raw_cx_no_gc() } as *mut mozjs::jsapi::JS::RootingContext;
         #[cfg(target_family = "wasm")]
         // SAFETY: as above. The engine reads and writes the depth only on this thread, in
         // properly nested scopes, as the guard does.
@@ -201,6 +210,16 @@ pub fn check_for_interrupt(scope: &Scope<'_>) -> Result<(), ExnThrown> {
 /// Request an interrupt callback (thread-safe).
 pub fn request_interrupt_callback(scope: &Scope<'_>) {
     unsafe { wrappers2::JS_RequestInterruptCallback(scope.cx()) }
+}
+
+/// Request an interrupt callback of the context `cx`, for callers without a scope, such as GC
+/// callbacks.
+///
+/// # Safety
+///
+/// `cx` must be a valid context.
+pub unsafe fn request_interrupt_callback_raw(cx: *mut crate::native::RawJSContext) {
+    unsafe { mozjs::jsapi::JS_RequestInterruptCallback(cx) }
 }
 
 /// Allocate memory tracked by the GC.

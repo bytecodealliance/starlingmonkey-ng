@@ -72,9 +72,14 @@ impl TransformStream {
             None => HandleValue::undefined(),
             Some(v) => {
                 if !v.is_object() {
-                    return Err(js::error::throw_type_error(
+                    return Err(js::error::throw_binding_error(
                         scope,
-                        c"TransformStream constructor: transformer must be an object",
+                        &js::class::constructor_site::<TransformStreamImpl>(),
+                        js::error::BindingError::InvalidArgument {
+                            index: 0,
+                            value: v,
+                            message: c"TransformStream constructor: transformer must be an object",
+                        },
                     ));
                 }
                 v
@@ -83,18 +88,26 @@ impl TransformStream {
         let transformer_dict = Transformer::from_jsval_throwing(scope, transformer_value, ())?;
         // Step 3: If _transformerDict_["``readableType``"] `exists`, throw a ``RangeError``
         //         exception.
-        if transformer_dict.readable_type.is_some() {
-            return Err(js::error::throw_range_error(
+        if let Some(readable_type) = transformer_dict.readable_type {
+            return Err(crate::algorithms::throw_invalid_value(
                 scope,
+                "TransformStream",
+                js::error::JSExnType::JSEXN_RANGEERR,
                 c"Invalid readableType specified",
+                "transformer.readableType",
+                readable_type,
             ));
         }
         // Step 4: If _transformerDict_["``writableType``"] `exists`, throw a ``RangeError``
         //         exception.
-        if transformer_dict.writable_type.is_some() {
-            return Err(js::error::throw_range_error(
+        if let Some(writable_type) = transformer_dict.writable_type {
+            return Err(crate::algorithms::throw_invalid_value(
                 scope,
+                "TransformStream",
+                js::error::JSExnType::JSEXN_RANGEERR,
                 c"Invalid writableType specified",
+                "transformer.writableType",
+                writable_type,
             ));
         }
         // Step 5: Let _readableHighWaterMark_ be ? `ExtractHighWaterMark`(_readableStrategy_, 0).

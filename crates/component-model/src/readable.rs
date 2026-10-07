@@ -150,7 +150,7 @@ pub struct IncomingStream {
 #[jsmethods]
 impl IncomingStream {
     fn new() -> Self {
-        // Internal type, created through `create_instance_with`. This constructor
+        // Instances are created through `create_instance_with`. This constructor
         // only registers the prototype.
         IncomingStreamImpl::default()
     }
@@ -550,7 +550,7 @@ pub struct StreamPump {
 #[jsmethods]
 impl StreamPump {
     fn new() -> Self {
-        // Internal type, created through `create_instance_with`. This constructor
+        // Instances are created through `create_instance_with`. This constructor
         // only registers the prototype.
         StreamPumpImpl::default()
     }

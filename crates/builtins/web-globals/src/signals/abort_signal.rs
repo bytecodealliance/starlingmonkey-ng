@@ -6,8 +6,8 @@
 //! should be aborted. It extends EventTarget so it can fire "abort" events.
 
 use core_runtime::{webidl_interface, webidl_methods};
-use js::conversion::FromJSVal;
-use js::error::ExnThrown;
+use js::conversion::{ConversionError, FromJSVal};
+use js::error::{throw_binding_error, BindingError, ExnThrown, MemberKind};
 use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::{ExceptionStackBehavior, Value};
@@ -224,7 +224,19 @@ impl AbortSignal {
         // TODO: use a WebIDL sequence for this, after making that usable outside of unions.
         signals: HandleValue<'_>,
     ) -> Result<AbortSignal<'r>, ExnThrown> {
-        let signals = Vec::<AbortSignal>::from_jsval_throwing(scope, signals, ())?;
+        let signals = Vec::<AbortSignal>::from_jsval(scope, signals, ()).map_err(|e| match e {
+            ConversionError::ExnPending => ExnThrown,
+            ConversionError::Failure(message) => {
+                let site =
+                    js::class::member_site::<AbortSignalImpl>("any", MemberKind::StaticMethod);
+                let error = BindingError::InvalidArgument {
+                    index: 0,
+                    value: signals,
+                    message: &message,
+                };
+                throw_binding_error(scope, &site, error)
+            }
+        })?;
 
         // Step 1: Return the result of creating a dependent abort signal from signals using
         //         AbortSignal and the current realm.

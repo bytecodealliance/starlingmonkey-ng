@@ -16,8 +16,8 @@ use web_globals::events::algorithms::ScriptStackState;
 use web_globals::signals::abort_controller::AbortController;
 
 use crate::algorithms::{
-    dequeue_value, enqueue_value_with_size, is_non_negative_number, make_type_error, pair_parts,
-    pair_payload, reset_queue, resolved_undefined_promise,
+    dequeue_value, enqueue_value_with_size, invalid_state_error, is_non_negative_number,
+    pair_parts, pair_payload, reset_queue, resolved_undefined_promise,
 };
 use crate::queuing::{QueueWithSizes, ValueWithSize};
 use crate::support;
@@ -319,8 +319,9 @@ pub(crate) fn set_up_writable_stream_default_writer(
 ) -> Result<(), ExnThrown> {
     // Step 1: If ! `IsWritableStreamLocked`(_stream_) is true, throw a ``TypeError`` exception.
     if is_writable_stream_locked(stream) {
-        return Err(js::error::throw_type_error(
+        return Err(crate::algorithms::throw_invalid_state(
             scope,
+            "WritableStream",
             c"This stream has already been locked for exclusive writing by another writer",
         ));
     }
@@ -498,10 +499,7 @@ pub(crate) fn writable_stream_close<'r>(
         state,
         WritableStreamState::Closed | WritableStreamState::Errored
     ) {
-        js::error::throw_type_error(
-            scope,
-            c"The stream (in closed or errored state) is not in the writable state and cannot be closed",
-        );
+        crate::algorithms::throw_invalid_state(scope, "WritableStream", c"The stream (in closed or errored state) is not in the writable state and cannot be closed");
         return Promise::new_rejected_with_pending_error(scope).expect("rejected promise");
     }
     // Step 3: Assert: _state_ is "`writable`" or "`erroring`".
@@ -1114,8 +1112,9 @@ pub(crate) fn writable_stream_default_writer_release(
     let stream = writer_stream(scope, writer).expect("writer has a stream");
     // Step 3: Assert: _stream_.`[[writer]]` is _writer_.
     // Step 4: Let _releasedError_ be a new ``TypeError``.
-    let released_error = make_type_error(
+    let released_error = invalid_state_error(
         scope,
+        "WritableStreamDefaultWriter",
         c"Writer was released and can no longer be used to monitor the stream's closedness",
     );
     // Step 5: Perform ! `DefaultWriterEnsureReadyPromiseRejected`(_writer_,
@@ -1153,7 +1152,11 @@ pub(crate) fn writable_stream_default_writer_write<'r>(
         .as_ref()
         .is_some_and(|s| stream.eq_heap(s));
     if !still_owned {
-        js::error::throw_type_error(scope, c"Cannot write to a stream using a released writer");
+        crate::algorithms::throw_invalid_state(
+            scope,
+            "WritableStreamDefaultWriter",
+            c"Cannot write to a stream using a released writer",
+        );
         return Promise::new_rejected_with_pending_error(scope).expect("rejected promise");
     }
     // Step 6: Let _state_ be _stream_.`[[state]]`.
@@ -1168,8 +1171,9 @@ pub(crate) fn writable_stream_default_writer_write<'r>(
     //         "`closed`", return `a promise rejected with` a ``TypeError`` exception indicating
     //         that the stream is closing or closed.
     if writable_stream_close_queued_or_in_flight(&stream) || state == WritableStreamState::Closed {
-        js::error::throw_type_error(
+        crate::algorithms::throw_invalid_state(
             scope,
+            "WritableStreamDefaultWriter",
             c"The stream is closing or closed and cannot be written to",
         );
         return Promise::new_rejected_with_pending_error(scope).expect("rejected promise");

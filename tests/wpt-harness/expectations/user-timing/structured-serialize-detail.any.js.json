@@ -1,0 +1,29 @@
+{
+  "The detail property in the mark constructor should be structured-clone.": {
+    "status": "PASS"
+  },
+  "The detail property in the mark method should be structured-clone.": {
+    "status": "PASS"
+  },
+  "When accessing detail from a mark entry and the detail is not provided, just return a null value.": {
+    "status": "PASS"
+  },
+  "Mark: Throw an exception when the detail property cannot be structured-serialized.": {
+    "status": "PASS"
+  },
+  "The detail property in the measure method should be structured-clone.": {
+    "status": "PASS"
+  },
+  "The detail property in the measure method should be the same reference.": {
+    "status": "PASS"
+  },
+  "When accessing detail from a measure entry and the detail is not provided, just return a null value.": {
+    "status": "PASS"
+  },
+  "Measure: Throw an exception when the detail property cannot be structured-serialized.": {
+    "status": "PASS"
+  },
+  "The detail object is cloned when passed to mark API.": {
+    "status": "PASS"
+  }
+}

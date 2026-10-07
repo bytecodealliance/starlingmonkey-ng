@@ -48,8 +48,9 @@ impl WritableStreamDefaultWriter {
     fn desired_size(&self, scope: &Scope<'_>) -> Result<Option<f64>, ExnThrown> {
         // Step 1: If `this`.`[[stream]]` is undefined, throw a ``TypeError`` exception.
         if self.data().stream.is_none() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "WritableStreamDefaultWriter",
                 c"Cannot read desiredSize of a writer that does not have an owner stream",
             ));
         }
@@ -76,8 +77,9 @@ impl WritableStreamDefaultWriter {
         // Step 1: If `this`.`[[stream]]` is undefined, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if self.data().stream.is_none() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "WritableStreamDefaultWriter",
                 c"Cannot abort a stream using a released writer",
             ));
         }
@@ -99,8 +101,9 @@ impl WritableStreamDefaultWriter {
         let stream = match algorithms::writer_stream(scope, self) {
             Some(stream) => stream,
             None => {
-                return Err(js::error::throw_type_error(
+                return Err(crate::algorithms::throw_invalid_state(
                     scope,
+                    "WritableStreamDefaultWriter",
                     c"Cannot close a stream using a released writer",
                 ));
             }
@@ -108,8 +111,9 @@ impl WritableStreamDefaultWriter {
         // Step 3: If ! `WritableStreamCloseQueuedOrInFlight`(_stream_) is true, return `a promise
         //         rejected with` a ``TypeError`` exception.
         if algorithms::writable_stream_close_queued_or_in_flight(&stream) {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "WritableStreamDefaultWriter",
                 c"Cannot close an already-closing stream",
             ));
         }
@@ -143,8 +147,9 @@ impl WritableStreamDefaultWriter {
         // Step 1: If `this`.`[[stream]]` is undefined, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if self.data().stream.is_none() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "WritableStreamDefaultWriter",
                 c"Cannot write to a stream using a released writer",
             ));
         }

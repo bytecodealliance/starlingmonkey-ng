@@ -110,12 +110,20 @@ pub async fn sleep(duration: std::time::Duration) {
     wasip3::clocks::monotonic_clock::wait_for(nanos).await;
 }
 
+/// Wait for `duration` with tokio's timer, which must be polled inside a tokio runtime.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn sleep(duration: std::time::Duration) {
+    tokio::time::sleep(duration).await;
+}
+
 /// A monotonic clock reading, for deadlines that outlive a Wizer snapshot.
 ///
 /// `std::time::Instant` reads the host clock directly, so a deadline taken before a snapshot sits
 /// in the resumed instance's future by however long the wizened instance ran. This reads
 /// [`monotonic_ns`] instead, whose offset makes a resumed instance continue the timeline the
-/// snapshot ended on, so such a deadline is already past when the instance resumes.
+/// snapshot ended on. A deadline that was `d` ahead of the reading [`record_snapshot_reading`]
+/// took is `d` ahead of the origin of the resumed instance's host clock, and one that had passed
+/// then has passed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 

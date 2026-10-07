@@ -1,0 +1,5 @@
+{
+  "Clearing a non-existent mark doesn't affect existing marks": {
+    "status": "PASS"
+  }
+}

@@ -6,10 +6,26 @@ use super::url_search_params::URLSearchParams;
 use crate::algorithms;
 use core_runtime::{webidl_interface, webidl_methods};
 use js::class::Ref;
-use js::error::{throw_type_error, ExnThrown};
+use js::error::{ExnThrown, JSExnType, MemberKind, OperationError, ThrowException};
 use js::exception;
 use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
+
+/// The `TypeError` "Invalid URL" of the member at `site` for the URL `input` and the base URL
+/// `base`, whose code is `ERR_INVALID_URL`.
+fn invalid_url(
+    site: js::error::BindingSite,
+    input: String,
+    base: Option<String>,
+) -> OperationError {
+    OperationError {
+        site,
+        kind: JSExnType::JSEXN_TYPEERR,
+        message: "Invalid URL".into(),
+        code: "ERR_INVALID_URL",
+        args: std::iter::once(input).chain(base).collect(),
+    }
+}
 
 /// <https://url.spec.whatwg.org/#url-class>
 #[webidl_interface]
@@ -27,8 +43,10 @@ impl URL<'_> {
         // Step 1: Let _parsedURL_ be the result of running the `API URL parser` on _url_ with
         //         _base_, if given.
         // Step 2: If _parsedURL_ is failure, then `throw` a ``TypeError``.
-        let parsed_url = algorithms::api_url_parser(&url, base.as_deref())
-            .ok_or_else(|| throw_type_error(scope, c"Invalid URL"))?;
+        let parsed_url = algorithms::api_url_parser(&url, base.as_deref()).ok_or_else(|| {
+            let site = js::class::constructor_site::<URLImpl>();
+            invalid_url(site, url.clone(), base.clone()).throw(scope)
+        })?;
 
         // Step 3: `Initialize` `this` with _parsedURL_.
         self.initialize_with_url_record(scope, parsed_url)
@@ -49,8 +67,10 @@ impl URL<'_> {
         // Step 1: Let _parsedURL_ be the result of running the `basic URL parser` on the given
         //         value.
         // Step 2: If _parsedURL_ is failure, then `throw` a ``TypeError``.
-        let parsed_url = algorithms::basic_url_parser(&value, None)
-            .ok_or_else(|| throw_type_error(scope, c"Invalid URL"))?;
+        let parsed_url = algorithms::basic_url_parser(&value, None).ok_or_else(|| {
+            let site = js::class::member_site::<URLImpl>("href", MemberKind::Setter);
+            invalid_url(site, value.clone(), None).throw(scope)
+        })?;
 
         // Step 3: Set `this`’s `URL` to _parsedURL_.
         self.data_mut().url = Some(parsed_url.clone());

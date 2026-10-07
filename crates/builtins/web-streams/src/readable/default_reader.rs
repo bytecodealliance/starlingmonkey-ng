@@ -55,8 +55,9 @@ impl DefaultReader {
         // Step 1: If `this`.`[[stream]]` is undefined, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if self.data().stream.is_none() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamDefaultReader",
                 c"Cannot read from a reader that does not have an owner stream",
             ));
         }
@@ -100,8 +101,9 @@ impl DefaultReader {
         // Step 1: If `this`.`[[stream]]` is undefined, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if self.data().stream.is_none() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamDefaultReader",
                 c"Cannot cancel a reader that does not have an owner stream",
             ));
         }

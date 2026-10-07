@@ -1,0 +1,5 @@
+{
+  "PerformanceObserver with buffered flag sees entry after timeout": {
+    "status": "PASS"
+  }
+}

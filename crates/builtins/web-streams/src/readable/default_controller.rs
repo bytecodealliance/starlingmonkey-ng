@@ -93,8 +93,9 @@ impl ReadableStreamDefaultController {
         // Step 1: If ! `DefaultControllerCanCloseOrEnqueue`(`this`) is false, throw a
         //         ``TypeError`` exception.
         if !algorithms::readable_stream_default_controller_can_close_or_enqueue(scope, self) {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamDefaultController",
                 c"The stream is not in a state that permits close",
             ));
         }
@@ -109,8 +110,9 @@ impl ReadableStreamDefaultController {
         // Step 1: If ! `DefaultControllerCanCloseOrEnqueue`(`this`) is false, throw a
         //         ``TypeError`` exception.
         if !algorithms::readable_stream_default_controller_can_close_or_enqueue(scope, self) {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamDefaultController",
                 c"The stream is not in a state that permits enqueue",
             ));
         }

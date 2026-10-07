@@ -11,7 +11,8 @@
 #   ./scripts/test-wizer.sh            # build the component, then run every case
 #   ./scripts/test-wizer.sh --no-build # reuse the component already in target/
 #
-# `WASM_TARGET` selects the target, as `p2`, `p3` or a full triple. It defaults to `p2`.
+# `WASM_TARGET` selects the target, as `p2`, `p3` or a full triple. It defaults to `p3`. The timer
+# case needs one instance to serve several requests, which only p3 components do.
 #
 # Requires `wasmtime` on PATH (for both the `wizer` subcommand and `serve`).
 
@@ -19,7 +20,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-case "${WASM_TARGET:-p2}" in
+case "${WASM_TARGET:-p3}" in
     p2) TARGET=wasm32-wasip2 ;;
     p3) TARGET=wasm32-wasip3 ;;
     *) TARGET="${WASM_TARGET}" ;;
@@ -98,6 +99,32 @@ serve_and_get() {
     printf '%s' "$body"
 }
 
+# Serve $1 and GET / $4 times, a second apart, from one instance. Prints each response body on a
+# line of its own, or a marker for a request that got none.
+serve_and_get_spaced() {
+    local component="$1" config="$2" port="$3" count="$4"
+    STARLINGMONKEY_CONFIG="$config" wasmtime serve --dir=.::/cwd --dir=. "${WASI_FLAGS[@]}" \
+        --idle-instance-timeout 60s --addr "127.0.0.1:$port" "$component" \
+        >"serve-$port.log" 2>&1 &
+    local server=$!
+    local body="<no response>"
+    for _ in $(seq 1 100); do
+        if body="$(curl -sf --max-time 5 "http://127.0.0.1:$port/" 2>/dev/null)"; then
+            break
+        fi
+        body="<no response>"
+        sleep 0.2
+    done
+    printf '%s\n' "$body"
+    for _ in $(seq 2 "$count"); do
+        sleep 1
+        curl -sf --max-time 5 "http://127.0.0.1:$port/" 2>/dev/null || printf '<no response>'
+        printf '\n'
+    done
+    kill "$server" 2>/dev/null || true
+    wait "$server" 2>/dev/null || true
+}
+
 echo "# wizer snapshots"
 
 # A snapshot has to produce a component that still loads. It did not always: dropping the init
@@ -141,21 +168,66 @@ check "a listener-less script is refused even when it awaits first" \
     "no \`fetch\` listener added during evaluation" \
     "$gate_output"
 
-# A snapshot holds memory, not a running event loop, so work the top level leaves behind once it
-# has finished evaluating is refused, with the stack that created it.
+# Work other than timers that the top level leaves behind once it has finished evaluating is
+# refused, with the stack that created it. With `--node-compat`, a port with a `message` listener
+# is such work. The timer next to it is not listed.
 cat >leftover.mjs <<'JS'
-globalThis.ticks = 0;
-setInterval(() => { globalThis.ticks++; }, 10);
+const { port1, port2 } = new MessageChannel();
+port1.onmessage = () => {};
+setInterval(() => {}, 10);
 await new Promise((resolve) => setTimeout(resolve, 50));
 addEventListener('fetch', (event) => event.respondWith(new Response('ok')));
 JS
-leftover_output="$(snapshot snap-leftover.wasm "leftover.mjs" || true)"
+leftover_output="$(snapshot snap-leftover.wasm "--node-compat leftover.mjs" || true)"
 check "background work left by the top level fails the snapshot" \
-    "a pending \`interval\` timer, created at:" \
+    "a queued \`MessagePort\` task, created at:" \
     "$leftover_output"
 check "the refusal names where the work was created" \
     "leftover.mjs:2:" \
     "$leftover_output"
+if [[ "$leftover_output" == *"timer"* ]]; then
+    echo "FAIL - the refusal doesn't list timers"
+    echo "         got: $leftover_output"
+    failures=$((failures + 1))
+else
+    echo "ok   - the refusal doesn't list timers"
+fi
+
+# A snapshot holds the timers the top level left pending, and the resumed instance runs each one
+# once the time it had left has passed: an unreferenced interval keeps firing between requests,
+# and a timeout due 1.5 s after the snapshot fires once, after the first request and by the last.
+cat >timers.mjs <<'JS'
+globalThis.ticks = 0;
+globalThis.fired = 0;
+setInterval(() => { globalThis.ticks++; }, 50).unref();
+setTimeout(() => { globalThis.fired++; }, 1500);
+addEventListener('fetch', (event) => {
+  event.respondWith(new Response(`ticks=${globalThis.ticks} fired=${globalThis.fired}`));
+});
+JS
+snapshot snap-timers.wasm "--node-compat timers.mjs" >/dev/null
+timer_bodies="$(serve_and_get_spaced snap-timers.wasm "--node-compat timers.mjs" 18357 4)"
+ticks=($(sed -n 's/^ticks=\([0-9]*\) .*/\1/p' <<<"$timer_bodies"))
+fired=($(sed -n 's/.* fired=\([0-9]*\)$/\1/p' <<<"$timer_bodies"))
+ticking=yes
+once=yes
+if (( ${#ticks[@]} != 4 || ${#fired[@]} != 4 )); then
+    ticking=no
+    once=no
+else
+    for i in 1 2 3; do
+        (( ticks[i] >= ticks[i - 1] + 10 )) || ticking=no
+        (( fired[i] >= fired[i - 1] )) || once=no
+    done
+    (( fired[0] == 0 && fired[3] == 1 )) || once=no
+fi
+summary="$(tr '\n' ',' <<<"$timer_bodies")"
+check "an unreferenced interval in a snapshot fires between requests" \
+    "ticking=yes" \
+    "ticking=$ticking $summary"
+check "a timeout in a snapshot fires once, when its time has passed" \
+    "once=yes" \
+    "once=$once $summary"
 
 # The snapshot holds no host handles: libc's stdio streams, opened by a top-level write, are closed
 # before it is taken, and the resumed instance opens them again on its first write.
@@ -252,6 +324,20 @@ snapshot snap-tool.wasm "tool.mjs" >/dev/null
 check "a snapshot's wasi:cli/run calls the main module's run export" \
     "run called after 1 evaluation(s)" \
     "$(wasmtime run --dir=. "${WASI_FLAGS[@]}" snap-tool.wasm 2>&1)"
+
+# A timer the top level left pending runs while `run` does.
+cat >timer-tool.mjs <<'JS'
+setTimeout(() => console.log('top-level timer fired'), 20);
+export async function run() {
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  console.log('run finished');
+}
+JS
+snapshot snap-timer-tool.wasm "timer-tool.mjs" >/dev/null
+check "a snapshot's run export runs the timers the top level left pending" \
+    "top-level timer fired
+run finished" \
+    "$(wasmtime run --dir=. "${WASI_FLAGS[@]}" snap-timer-tool.wasm 2>&1)"
 
 # The same holds for an `-e` module, which has no file.
 snapshot snap-eval-tool.wasm "-e 'export function run() { console.log(\"eval run called\"); }'" >/dev/null

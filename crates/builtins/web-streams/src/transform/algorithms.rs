@@ -15,7 +15,7 @@ use js::Promise;
 use super::transform_stream::TransformStream;
 use super::transform_stream_default_controller::TransformStreamDefaultController;
 use super::transformer::Transformer;
-use crate::algorithms::{make_type_error, pair_parts, pair_payload};
+use crate::algorithms::{invalid_state_error, pair_parts, pair_payload};
 use crate::readable::algorithms::{
     create_readable_stream, readable_stream_default_controller_can_close_or_enqueue,
     readable_stream_default_controller_close, readable_stream_default_controller_enqueue,
@@ -604,8 +604,9 @@ pub(crate) fn transform_stream_default_controller_enqueue(
     // Step 3: If ! `DefaultControllerCanCloseOrEnqueue`(_readableController_) is
     //         false, throw a ``TypeError`` exception.
     if !readable_stream_default_controller_can_close_or_enqueue(scope, &readable_controller) {
-        return Err(js::error::throw_type_error(
+        return Err(crate::algorithms::throw_invalid_state(
             scope,
+            "TransformStreamDefaultController",
             c"Readable side is not in a state that permits enqueue",
         ));
     }
@@ -705,7 +706,11 @@ pub(crate) fn transform_stream_default_controller_terminate(
     readable_stream_default_controller_close(scope, &readable_controller);
     // Step 4: Let _error_ be a ``TypeError`` exception indicating that the stream has been
     //         terminated.
-    let error = make_type_error(scope, c"The stream has been terminated");
+    let error = invalid_state_error(
+        scope,
+        "TransformStreamDefaultController",
+        c"The stream has been terminated",
+    );
     // Step 5: Perform ! `TransformStreamErrorWritableAndUnblockWrite`(_stream_, _error_).
     transform_stream_error_writable_and_unblock_write(scope, &stream, error);
 }

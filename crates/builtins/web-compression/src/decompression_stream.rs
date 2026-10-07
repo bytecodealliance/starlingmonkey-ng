@@ -90,7 +90,7 @@ impl DecompressionStream {
         chunk: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
         // Step 1: If _chunk_ is not a ``BufferSource`` type, then throw a ``TypeError``.
-        let input = buffer_source_bytes(scope, chunk)?;
+        let input = buffer_source_bytes(scope, chunk, "DecompressionStream")?;
         // Step 2: Let _buffer_ be the result of decompressing _chunk_ with _ds_'s `format` and
         //         `context`. If this results in an error, then throw a ``TypeError``.
         // Step 3: If _buffer_ is empty, return.

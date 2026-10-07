@@ -4,7 +4,7 @@
 
 use core_runtime::{webidl_interface, webidl_methods, webidl_union};
 use js::conversion::{ConversionError, FromJSVal};
-use js::error::{ExnThrown, ThrowException};
+use js::error::{BindingSite, ExnThrown, MemberKind, ThrowException};
 use js::function::{cast_payload, CallbackArgs};
 use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
@@ -58,7 +58,8 @@ impl TextDecoderStream {
         let options = options.unwrap_or_default();
         // Step 1: Let _encoding_ be the result of `getting an encoding` from _label_.
         // Step 2: If _encoding_ is failure or `replacement`, then `throw` a ``RangeError``.
-        let encoding = encoding_for_label(label).map_err(|error| error.throw(scope))?;
+        let site = js::class::constructor_site::<TextDecoderStreamImpl>();
+        let encoding = encoding_for_label(label, site).map_err(|error| error.throw(scope))?;
         // Step 3: Let _errorMode_ be "`fatal`" if _options_["``fatal``"] is true; otherwise
         //         "`replacement`".
         // Step 4: `Set up a text decoder stream` with `this`, _encoding_, _errorMode_, and
@@ -158,13 +159,19 @@ impl TextDecoderStream {
         bytes: &[u8],
         last: bool,
     ) -> Result<(), ExnThrown> {
-        let output = {
+        let (output, encoding) = {
             let mut data = self.data_mut();
             let fatal = data.fatal;
+            let encoding = data.encoding.expect("set by the constructor");
             let decoder = data.decoder.as_mut().expect("set by the constructor");
-            decode_to_utf16(decoder, bytes, last, fatal)
+            (decode_to_utf16(decoder, bytes, last, fatal), encoding)
         };
-        let output = output.map_err(|error| error.throw(scope))?;
+        let site = BindingSite {
+            interface: <TextDecoderStreamImpl as js::class::ClassDef>::NAME,
+            member: "",
+            kind: MemberKind::Method,
+        };
+        let output = output.map_err(|error| error.throw(scope, site, encoding))?;
         if output.is_empty() {
             return Ok(());
         }

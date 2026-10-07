@@ -41,12 +41,14 @@ js::instance_local! {
 
     /// The content script's startup event loop, holding its top-level async work. [`runtime`]
     /// creates it undriven, since it never yields to another request (see [`runtime`]). The first
-    /// request drives it to completion via [`ensure_started`] before dispatching.
+    /// request drives it to completion via [`ensure_started`] before dispatching. In an instance
+    /// resumed from a snapshot, it holds the timers the top level left pending (see
+    /// [`Startup::Snapshotted`]).
     static STARTUP: RefCell<Startup> = const { RefCell::new(Startup::Done) };
 
     /// Signalled on every [`STARTUP`] transition a waiting request cares about: driven to
-    /// completion, or handed back by a driver that was cancelled. Every write of `Startup` other
-    /// than `Driving` must notify, or a waiter in [`ensure_started`] sleeps through it.
+    /// completion, or handed back by a driver that was cancelled. Every transition out of
+    /// `Driving` must notify, or a waiter in [`ensure_started`] sleeps through it.
     static STARTUP_CHANGED: event_listener::Event = const { event_listener::Event::new() };
 
     /// Set while a Wizer snapshot is being taken, so it is set in the snapshot and the resumed
@@ -60,6 +62,11 @@ enum Startup {
     Pending(OwnedInvocation, core_runtime::ScriptEvaluation),
     /// A request is currently driving it. Concurrent requests wait.
     Driving,
+    /// The loop of a snapshot whose top level finished evaluating, holding the timers it left
+    /// pending. The first request of an instance resumed from the snapshot hands it to
+    /// [`keep_startup_loop_running`], and `wasi:cli/run` runs the main module's `run` export on
+    /// it (see [`take_snapshotted_startup_loop`]).
+    Snapshotted(OwnedInvocation),
     /// Driven to completion, failed (see [`STARTUP_FAILURE`]), or there never was one.
     Done,
 }
@@ -170,7 +177,8 @@ fn start_runtime(
 ///
 /// `raw_cx` must be a context whose default global's realm is entered for the process lifetime,
 /// and `runtime` must outlive the process's requests. The application's top level must have
-/// finished evaluating and left no work on its event loop. `config` supplies the serve timeouts.
+/// finished evaluating, and its event loop goes to [`keep_startup_loop_for_snapshot`]. `config`
+/// supplies the serve timeouts.
 ///
 /// A component that exports `wasi:http/handler` checks its application with
 /// [`select_http_handler`] first.
@@ -183,6 +191,46 @@ pub fn adopt_runtime(
     let timeouts = ServeTimeouts::from_config(config);
     install_runtime((runtime, raw_cx, timeouts));
     Ok(())
+}
+
+/// Keep `startup`, the event loop of a top level that finished evaluating, in the snapshot about
+/// to be taken, for the instance resumed from it to drive the timers it holds (see
+/// [`Startup::Snapshotted`]). `startup` must hold no work other than timers (see
+/// [`EventLoop::ensure_idle_for_snapshot`]). An empty `startup` is dropped.
+pub fn keep_startup_loop_for_snapshot(startup: OwnedInvocation) {
+    let state = match startup.state().event_loop().is_empty() {
+        true => Startup::Done,
+        false => Startup::Snapshotted(startup),
+    };
+    STARTUP.with(|cell| *cell.borrow_mut() = state);
+}
+
+/// Hand the event loop [`keep_startup_loop_for_snapshot`] kept in the snapshot this instance
+/// resumed from to [`keep_startup_loop_running`], if nothing has taken it yet. Called by an
+/// application's own `wasi:http/handler` export, which [`ensure_started`] doesn't run for. Must be
+/// called from an async export, whose executor polls the task this spawns.
+pub fn keep_snapshotted_startup_loop_running() {
+    let Some((_, raw_cx)) = installed_runtime() else {
+        return;
+    };
+    if let Some(invocation) = take_snapshotted_startup_loop() {
+        keep_startup_loop_running(raw_cx, invocation);
+    }
+}
+
+/// The event loop [`keep_startup_loop_for_snapshot`] kept in the snapshot this instance resumed
+/// from, if nothing has taken it yet.
+pub fn take_snapshotted_startup_loop() -> Option<OwnedInvocation> {
+    STARTUP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        match std::mem::replace(&mut *state, Startup::Done) {
+            Startup::Snapshotted(invocation) => Some(invocation),
+            other => {
+                *state = other;
+                None
+            }
+        }
+    })
 }
 
 /// The implementation that serves a componentized application's `wasi:http/handler` export.
@@ -399,20 +447,30 @@ pub fn prepare_for_snapshot() {
 /// This entails initializing the JS runtime, registering builtins, running the top-level script to
 /// completion, including a top-level `await`, and checking whether the result is a valid snapshot
 /// input state. The script must register a `fetch` listener or have its main module export a `run`
-/// function, and must leave no asynchronous work behind once its top level has finished.
+/// function, and must leave no asynchronous work other than timers behind once its top level has
+/// finished. The snapshot holds those timers (see [`keep_startup_loop_for_snapshot`]).
 pub async fn pre_initialize() -> Result<(), String> {
     let (_runtime, raw_cx, _) = runtime_for(true)?;
-    let Startup::Pending(invocation, evaluation) =
-        STARTUP.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), Startup::Driving))
-    else {
+    let pending = STARTUP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        match std::mem::replace(&mut *state, Startup::Driving) {
+            Startup::Pending(invocation, evaluation) => Some((invocation, evaluation)),
+            other => {
+                *state = other;
+                None
+            }
+        }
+    });
+    let Some((invocation, evaluation)) = pending else {
         // Nothing to evaluate: `runtime` was already stood up, so this is a second call.
         prepare_for_snapshot();
         return Ok(());
     };
     // SAFETY: `runtime` entered the default global's realm for the process lifetime.
     let scope = unsafe { js::gc::scope::RootScope::from_current_realm(raw_cx) };
-    // The loop is driven only while the top level is unfinished, so work it merely queued, such
-    // as a timer, is refused below rather than run under Wizer.
+    // The loop is driven only while the top level is unfinished, so a timer that is due only
+    // after the top level finished doesn't run under Wizer. The snapshot holds it instead, and
+    // other work the top level merely queued is refused below.
     if !evaluation.is_finished(&scope) {
         // SAFETY: `runtime` entered the default global's realm for the process lifetime, and keeps
         // the context alive in a process-lifetime thread-local.
@@ -432,7 +490,7 @@ pub async fn pre_initialize() -> Result<(), String> {
     // all and an instance restored from it defines none of them on first use.
     js::class::enumerate_standard_classes(&scope, scope.global().handle())
         .map_err(|_| "defining the standard classes failed".to_string())?;
-    STARTUP.with(|cell| *cell.borrow_mut() = Startup::Done);
+    keep_startup_loop_for_snapshot(invocation);
     Ok(())
 }
 
@@ -475,7 +533,9 @@ struct StartupFailed;
 
 /// Let the content script finish evaluating before dispatching, so a handler registered after a
 /// top-level `await` is in place for the first request. Returns immediately once startup is done.
-/// A request arriving while another is still driving the loop waits for it.
+/// A request arriving while another is still driving the loop waits for it. The first request of
+/// an instance resumed from a snapshot hands the loop the snapshot holds to
+/// [`keep_startup_loop_running`].
 ///
 /// `Err` means the content script's top-level `await` rejected. The failure is logged once, when
 /// it happens, the debug session, if any, ends with it, and the work the script left behind is
@@ -500,6 +560,7 @@ async fn ensure_started(raw_cx: *mut js::native::RawJSContext) -> Result<(), Sta
     loop {
         enum Action {
             Drive(OwnedInvocation, core_runtime::ScriptEvaluation),
+            Resume(OwnedInvocation),
             Wait,
             Ready,
         }
@@ -510,6 +571,7 @@ async fn ensure_started(raw_cx: *mut js::native::RawJSContext) -> Result<(), Sta
                     *state = Startup::Driving;
                     Action::Drive(invocation, evaluation)
                 }
+                Startup::Snapshotted(invocation) => Action::Resume(invocation),
                 Startup::Driving => {
                     *state = Startup::Driving;
                     Action::Wait
@@ -518,6 +580,10 @@ async fn ensure_started(raw_cx: *mut js::native::RawJSContext) -> Result<(), Sta
             }
         });
         match action {
+            Action::Resume(invocation) => {
+                keep_startup_loop_running(raw_cx, invocation);
+                return Ok(());
+            }
             Action::Ready => {
                 return match STARTUP_FAILURE.with(|cell| cell.borrow().is_some()) {
                     true => Err(StartupFailed),

@@ -32,6 +32,9 @@
 //     `internal-error` naming them.
 //   - AFTER AWAIT (`fixtures/serve_after_await.js`): a listener registered after
 //     a top-level `await` on a timer serves the first request.
+//   - TIMERS (`fixtures/serve_timers.js`, `fixtures/serve_raw_timers.js`): the
+//     timers a top level leaves pending fire in the resumed instance between
+//     requests, with either handler.
 //   - Componentizing fails for an application that does both
 //     (`fixtures/serve_raw_and_listener.js`) or neither
 //     (`fixtures/serve_no_listener.js`).
@@ -393,6 +396,50 @@ async fn one_instance_serves_several_requests() -> anyhow::Result<()> {
         .await?
         .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
     assert_eq!(response, (200, "GET /hello".to_string()));
+    Ok(())
+}
+
+/// The timers the top level leaves pending are in the snapshot, and an instance
+/// resumed from it runs them while it serves: requests a second apart see an
+/// interval's count grow and a timeout fire once, whether the runtime's handler
+/// or the application's own serves them.
+#[tokio::test]
+async fn timers_left_by_the_top_level_run_while_serving() -> anyhow::Result<()> {
+    for fixture in [
+        include_str!("fixtures/serve_timers.js"),
+        include_str!("fixtures/serve_raw_timers.js"),
+    ] {
+        let component = componentize_serve(fixture).await;
+        let mut store = store();
+        let service = Service::instantiate_async(
+            &mut store,
+            &component,
+            &shared::http_linker(&ENGINE, &component),
+        )
+        .await?;
+        let mut samples: Vec<(u32, u32)> = Vec::new();
+        for request in 0..3 {
+            if request > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let (status, body) = shared::handle_on(&mut store, &service, "GET", "/", "")
+                .await?
+                .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
+            assert_eq!(status, 200, "{body}");
+            let (ticks, fired) = body.split_once(' ').expect("two counts");
+            samples.push((ticks.parse()?, fired.parse()?));
+        }
+        assert!(
+            samples.windows(2).all(|pair| pair[1].0 > pair[0].0),
+            "the interval fires between requests: {samples:?}"
+        );
+        assert!(
+            samples[0].1 == 0
+                && samples[2].1 == 1
+                && samples.windows(2).all(|pair| pair[1].1 >= pair[0].1),
+            "the timeout fires once, after the first request: {samples:?}"
+        );
+    }
     Ok(())
 }
 

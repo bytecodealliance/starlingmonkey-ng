@@ -160,9 +160,15 @@ impl WritableStream {
             None => HandleValue::undefined(),
             Some(v) => {
                 if !v.is_object() {
-                    return Err(js::error::throw_type_error(
+                    return Err(js::error::throw_binding_error(
                         scope,
-                        c"WritableStream constructor: underlyingSink must be an object",
+                        &js::class::constructor_site::<WritableStreamImpl>(),
+                        js::error::BindingError::InvalidArgument {
+                            index: 0,
+                            value: v,
+                            message:
+                                c"WritableStream constructor: underlyingSink must be an object",
+                        },
                     ));
                 }
                 v
@@ -173,10 +179,14 @@ impl WritableStream {
         // Step 3: If _underlyingSinkDict_["``type``"] `exists`, throw a ``RangeError`` exception.
         //         This is to allow us to add new potential types in the future, without
         //         backward-compatibility concerns.
-        if underlying_sink_dict.r#type.is_some() {
-            return Err(js::error::throw_range_error(
+        if let Some(sink_type) = underlying_sink_dict.r#type {
+            return Err(crate::algorithms::throw_invalid_value(
                 scope,
+                "WritableStream",
+                js::error::JSExnType::JSEXN_RANGEERR,
                 c"Invalid type is specified",
+                "type",
+                sink_type,
             ));
         }
         // Step 4: Perform ! `InitializeWritableStream`(`this`).
@@ -214,8 +224,9 @@ impl WritableStream {
         // Step 1: If ! `IsWritableStreamLocked`(`this`) is true, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if algorithms::is_writable_stream_locked(self) {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "WritableStream",
                 c"Cannot abort a stream that already has a writer",
             ));
         }
@@ -234,16 +245,18 @@ impl WritableStream {
         // Step 1: If ! `IsWritableStreamLocked`(`this`) is true, return `a promise rejected with` a
         //         ``TypeError`` exception.
         if algorithms::is_writable_stream_locked(self) {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "WritableStream",
                 c"Cannot close a stream that already has a writer",
             ));
         }
         // Step 2: If ! `WritableStreamCloseQueuedOrInFlight`(`this`) is true, return `a promise
         //         rejected with` a ``TypeError`` exception.
         if algorithms::writable_stream_close_queued_or_in_flight(self) {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "WritableStream",
                 c"Cannot close an already-closing stream",
             ));
         }

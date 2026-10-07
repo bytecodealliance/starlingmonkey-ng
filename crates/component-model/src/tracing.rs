@@ -62,7 +62,6 @@ unsafe extern "C" fn trace_all(trc: *mut JSTracer, _data: *mut std::os::raw::c_v
         #[cfg(target_arch = "wasm32")]
         {
             crate::streams::trace_live_elems(trc);
-            crate::interpreter::trace_drop_callback(trc);
         }
     }
 }
@@ -80,8 +79,5 @@ pub(crate) fn clear_traced_roots() {
     crate::exports::clear_traced_roots();
     crate::component_error::clear_traced_roots();
     #[cfg(target_arch = "wasm32")]
-    {
-        crate::interpreter::clear_traced_roots();
-        crate::streams::clear_traced_roots();
-    }
+    crate::streams::clear_traced_roots();
 }

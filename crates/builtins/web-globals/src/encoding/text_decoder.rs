@@ -3,7 +3,8 @@
 //! <https://encoding.spec.whatwg.org/#textdecoder>
 
 use core_runtime::{webidl_dictionary, webidl_interface, webidl_methods, webidl_union};
-use js::error::{ExnThrown, RangeError};
+use js::class::{constructor_site, member_site};
+use js::error::{BindingSite, ExnThrown, JSExnType, MemberKind, OperationError, ThrowException};
 use js::gc::scope::Scope;
 use js::{ArrayBuffer, ArrayBufferView, JSString};
 
@@ -34,13 +35,13 @@ impl TextDecoder<'_> {
         &self,
         label: Option<String>,
         options: Option<TextDecoderOptions>,
-    ) -> Result<(), RangeError> {
+    ) -> Result<(), OperationError> {
         let label = label.as_deref().unwrap_or("utf-8");
         let options = options.unwrap_or_default();
 
         // Step 1: Let _encoding_ be the result of `getting an encoding` from _label_.
         // Step 2: If _encoding_ is failure or `replacement`, then `throw` a ``RangeError``.
-        let encoding = encoding_for_label(label)?;
+        let encoding = encoding_for_label(label, constructor_site::<TextDecoderImpl>())?;
 
         let mut data = self.data_mut();
         // Step 3: Set `this`'s `encoding` to _encoding_.
@@ -146,7 +147,9 @@ impl TextDecoder<'_> {
         // as is, or narrows to Latin-1 if every code unit fits.)
         let output = decode_to_utf16(decoder, bytes, last, fatal);
         drop(data);
-        JSString::from_utf16(scope, &output.map_err(|error| error.throw(scope))?)
+        let site = member_site::<TextDecoderImpl>("decode", MemberKind::Method);
+        let output = output.map_err(|error| error.throw(scope, site, encoding))?;
+        JSString::from_utf16(scope, &output)
     }
 }
 
@@ -155,18 +158,27 @@ impl TextDecoder<'_> {
 fn latin1_string<'r>(scope: &'r Scope<'_>, bytes: &[u8]) -> Result<JSString<'r>, ExnThrown> {
     let mut copy = Vec::new();
     if copy.try_reserve_exact(bytes.len()).is_err() {
-        return Err(DecodeError::OutOfMemory.throw(scope));
+        js::exception::report_out_of_memory(scope);
+        return Err(ExnThrown);
     }
     copy.extend_from_slice(bytes);
     JSString::from_latin1(scope, &copy)
 }
 
-/// The encoding `label` names, or a `RangeError` if it names none or `replacement`.
-pub fn encoding_for_label(label: &str) -> Result<&'static encoding_rs::Encoding, RangeError> {
+/// The encoding `label` names, or, if it names none or `replacement`, the `RangeError` of the
+/// member at `site`, whose code is `ERR_ENCODING_NOT_SUPPORTED`.
+pub fn encoding_for_label(
+    label: &str,
+    site: BindingSite,
+) -> Result<&'static encoding_rs::Encoding, OperationError> {
     encoding_rs::Encoding::for_label_no_replacement(label.as_bytes()).ok_or_else(|| {
-        RangeError(format!(
-            "The encoding label provided ('{label}') is invalid."
-        ))
+        OperationError {
+            site,
+            kind: JSExnType::JSEXN_RANGEERR,
+            message: format!("The encoding label provided ('{label}') is invalid."),
+            code: "ERR_ENCODING_NOT_SUPPORTED",
+            args: vec![label.to_string()],
+        }
     })
 }
 
@@ -192,12 +204,23 @@ pub enum DecodeError {
 }
 
 impl DecodeError {
-    /// Throw the `TypeError` of malformed input, or report the failed allocation.
-    pub fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+    /// Throw the `TypeError` of malformed input of `encoding` at `site`, whose code is
+    /// `ERR_ENCODING_INVALID_ENCODED_DATA`, or report the failed allocation.
+    pub fn throw(
+        self,
+        scope: &Scope<'_>,
+        site: BindingSite,
+        encoding: &'static encoding_rs::Encoding,
+    ) -> ExnThrown {
         match self {
-            DecodeError::Malformed => {
-                js::error::throw_type_error(scope, c"The encoded data was not valid.")
+            DecodeError::Malformed => OperationError {
+                site,
+                kind: JSExnType::JSEXN_TYPEERR,
+                message: "The encoded data was not valid.".into(),
+                code: "ERR_ENCODING_INVALID_ENCODED_DATA",
+                args: vec![encoding.name().to_ascii_lowercase()],
             }
+            .throw(scope),
             DecodeError::OutOfMemory => {
                 js::exception::report_out_of_memory(scope);
                 ExnThrown

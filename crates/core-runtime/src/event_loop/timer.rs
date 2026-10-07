@@ -270,28 +270,30 @@ mod timer_globals {
     }
 }
 
-/// Report `error` as uncaught in a microtask, as an exception a `queueMicrotask` callback throws is
-/// reported.
+/// Report `error` as uncaught in a microtask that runs with the current async context.
 pub fn rethrow_in_microtask(
     scope: &Scope<'_>,
     error: js::prelude::HandleValue<'_>,
 ) -> Result<(), js::error::ExnThrown> {
-    let thrower = js::Function::new_callback(scope, c"", 0, rethrow, error)?;
-    let job = js::Function::new_callback(scope, c"", 0, invoke_microtask, *thrower)?;
+    let job = js::Function::new_callback(scope, c"", 0, rethrow, error)?;
     js::jobs::queue_microtask(scope, &job)
 }
 
-/// The body of the function [`rethrow_in_microtask`] queues, whose payload is the error it throws.
+/// The body of the microtask [`rethrow_in_microtask`] queues, whose payload is the error it
+/// reports.
 fn rethrow(
     scope: &Scope<'_>,
     _args: js::function::CallbackArgs<'_>,
     payload: js::prelude::HandleValue,
 ) -> Result<js::native::Value, js::error::ExnThrown> {
-    Err(js::exception::throw_value(scope, payload))
+    js::exception::throw_value(scope, payload);
+    super::handle_and_clear_exception(scope);
+    Ok(js::value::undefined())
 }
 
 /// The body of a microtask `queueMicrotask` queued, whose payload is its callback: invoke the
-/// callback with no arguments, and report an exception it throws.
+/// callback with no arguments, and report an exception it throws outside the callback's
+/// [`js::async_context::CallbackHooks`].
 fn invoke_microtask(
     scope: &Scope<'_>,
     _args: js::function::CallbackArgs<'_>,
@@ -299,7 +301,7 @@ fn invoke_microtask(
 ) -> Result<js::native::Value, js::error::ExnThrown> {
     let undefined = scope.root_value(js::value::undefined());
     if js::Function::call(scope, undefined, payload, js::function::EmptyArgs).is_err() {
-        super::handle_and_clear_exception(scope);
+        js::async_context::outside_callback(scope, || super::handle_and_clear_exception(scope));
     }
     Ok(js::value::undefined())
 }

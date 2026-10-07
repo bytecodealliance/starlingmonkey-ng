@@ -47,12 +47,13 @@
 //! | [`date`] | Date object creation and queries |
 //! | [`compile`] | Script compilation and evaluation |
 //! | [`module`] | ES module compilation, linking, evaluation |
-//! | [`realm`] | Realm context trait, utilities, and built-in prototypes |
+//! | [`realm`] | New globals in the current compartment, and contextified globals |
 //! | [`gc`] | Garbage collection control |
 //! | [`exception`] | Pending exception management |
 //! | [`class`] | JSClass definition and standard classes |
 //! | [`stack`] | Stack capture and saved frame inspection |
 //! | [`context`] | Context options, callbacks, memory |
+//! | [`watchdog`] | Time limits for running JavaScript |
 //! | [`compartment`] | Cross-compartment wrappers |
 //! | [`id`] | Property key (jsid) operations |
 //! | [`jobs`] | Job queue (microtask) management |
@@ -123,6 +124,7 @@ pub mod module;
 pub mod object;
 pub mod prelude;
 pub mod promise;
+pub mod realm;
 pub mod regexp;
 pub mod stack;
 pub mod string;
@@ -132,6 +134,7 @@ mod tls;
 pub mod try_catch;
 pub mod typedarray;
 pub mod value;
+pub mod watchdog;
 pub mod webidl_enum;
 
 // ---------------------------------------------------------------------------

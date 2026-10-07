@@ -33,6 +33,7 @@ fn sync_native() {
     let scope = rt.default_global();
     install_tracer(&scope);
     resources::init_finalization(&scope).unwrap();
+    resources::set_imported_drop(record_imported_drop);
 
     stack_survives_gc(&scope);
     deferred_deallocations_run_on_drop(&scope);
@@ -56,9 +57,13 @@ fn sync_native() {
     list_round_trips(&scope);
     numeric_list_kind_mismatch_throws(&scope);
     type_mismatch_throws(&scope);
+    out_of_range_discriminants_throw(&scope);
+    list_that_changes_while_lowered(&scope);
+    numeric_list_copies_and_layouts(&scope);
 
     // Resources and `ComponentError`.
     component_error_basics(&scope);
+    error_class_extends_component_error(&scope);
     component_error_export_paths(&scope);
     imported_resource_round_trip(&scope);
     imported_resource_dispose(&scope);
@@ -74,6 +79,8 @@ fn sync_native() {
     exported_borrow_release(&scope);
     imported_dispose_strips_handle(&scope);
     abandoned_wrapper_is_dropped_by_gc(&scope);
+    wrapper_uses_in_one_lowering(&scope);
+    deferred_dispose_runs_when_the_lend_ends(&scope);
 }
 
 // ===========================================================================
@@ -1173,47 +1180,116 @@ fn type_mismatch_throws(scope: &Scope<'_>) {
     js::exception::clear(scope);
 }
 
+/// A variant or enum discriminant from the host past the last case fails to
+/// lift instead of naming a case that does not exist.
+fn out_of_range_discriminants_throw(scope: &Scope<'_>) {
+    let mut stack = CallStack::new();
+    let cases = [(c"a", false), (c"b", true)];
+    assert!(value::push_variant(&mut stack, scope, &cases, 2).is_err());
+    js::exception::clear(scope);
+    assert!(value::push_variant(&mut stack, scope, &cases, u32::MAX).is_err());
+    js::exception::clear(scope);
+    assert!(value::push_enum(&mut stack, scope, 3, 3).is_err());
+    js::exception::clear(scope);
+    assert!(stack.is_empty());
+}
+
+/// A list whose elements change it while it is lowered, and a proxy of an
+/// array, fail to lower or lower what they hold, without a panic.
+fn list_that_changes_while_lowered(scope: &Scope<'_>) {
+    let mut stack = CallStack::new();
+    let list = js::compile::evaluate(
+        scope,
+        "const shrinking = [1, 2, 3];
+         Object.defineProperty(shrinking, 0, { get() { shrinking.length = 1; return 1; } });
+         shrinking",
+    )
+    .unwrap();
+    stack.push_value(list.get());
+    assert_eq!(stack.lower_list_begin(scope).unwrap(), 3);
+    stack.lower_list_next(scope).unwrap();
+    assert_eq!(value::pop_u32(&mut stack, scope).unwrap(), 1);
+    stack.lower_list_next(scope).unwrap();
+    assert!(value::pop_u32(&mut stack, scope).is_err());
+    js::exception::clear(scope);
+    stack.lower_list_end();
+    assert!(stack.is_empty());
+
+    let proxy = js::compile::evaluate(scope, "new Proxy([1, 2], {})").unwrap();
+    stack.push_value(proxy.get());
+    assert!(stack.lower_list_begin(scope).is_err());
+    js::exception::clear(scope);
+
+    let check =
+        component_model::validate::check(scope, proxy, &TypeShape::List(Box::new(TypeShape::U32)));
+    assert!(check.is_err());
+    assert!(!js::exception::is_pending(scope));
+}
+
+/// A numeric list's snapshot is a new typed array of the element type holding
+/// the viewed bytes, and a list layout whose size overflows is `None`.
+fn numeric_list_copies_and_layouts(scope: &Scope<'_>) {
+    use component_model::validate::snapshot;
+
+    let bytes = TypeShape::List(Box::new(TypeShape::U8));
+    let clamped = js::compile::evaluate(scope, "new Uint8ClampedArray([1, 255])").unwrap();
+    let copy = snapshot(scope, clamped, &bytes).unwrap();
+    let check = js::compile::evaluate(
+        scope,
+        "(copy, original) => `${copy instanceof Uint8Array} ${copy !== original} ${[...copy]}`",
+    )
+    .unwrap();
+    let described =
+        js::Function::call(scope, HandleValue::undefined(), check, &[copy, clamped]).unwrap();
+    assert_eq!(as_string(scope, described), "true true 1,255");
+
+    let words = TypeShape::List(Box::new(TypeShape::U16));
+    let offset = js::compile::evaluate(
+        scope,
+        "new Uint16Array(new Uint16Array([9, 7, 8, 9]).buffer, 2, 2)",
+    )
+    .unwrap();
+    let copy = snapshot(scope, offset, &words).unwrap();
+    let described =
+        js::Function::call(scope, HandleValue::undefined(), check, &[copy, offset]).unwrap();
+    assert_eq!(as_string(scope, described), "false true 7,8");
+
+    assert_eq!(
+        TypeShape::U64
+            .numeric_list_layout(3)
+            .map(|layout| layout.size()),
+        Some(24)
+    );
+    assert!(TypeShape::U64.numeric_list_layout(usize::MAX / 4).is_none());
+}
+
 // ===========================================================================
 // ComponentError and resources
 // ===========================================================================
 
 use std::cell::RefCell;
 
+/// The handle [`record_imported_drop`] throws for.
+const THROWING_HANDLE: u32 = 666;
+
 thread_local! {
-    /// Handles passed to drop callbacks during a test, in call order. The
-    /// recording drop callback (built by `recording_dispose_fn`) appends the
-    /// handle it reads off `this`.
+    /// Handles [`record_imported_drop`] dropped during a test, in call order.
     static DROPPED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Build a JS drop callback that records the handle it is invoked with.
-///
-/// This has the shape the dylib wraps around wit-dylib's `drop`: the callback
-/// reads `this._componentizeJsHandle` and, if present, records it as dropped.
-/// Reading the handle off `this` rather than a captured value means a stripped
-/// handle makes the drop a no-op, which is the idempotency guarantee.
-fn recording_dispose_fn<'s>(scope: &'s Scope<'_>) -> HandleValue<'s> {
-    let f = js::Function::new_callback(
-        scope,
-        c"recordingDispose",
-        0,
-        |scope, args, _payload| {
-            let this = js::Object::from_value(scope, args.this()).map_err(|_| {
-                js::error::throw_type_error(scope, c"dispose this is not an object")
-            })?;
-            let handle = this.get_property(scope, resources::HANDLE_FIELD)?.get();
-            // Like the runtime's drop callback, only a registered wrapper, or the
-            // finalizer's clone of one, drops its handle.
-            if handle.is_int32() && resources::unregister_resource(scope, &this)? {
-                let h = handle.to_int32() as u32;
-                DROPPED.with(|d| d.borrow_mut().push(h));
-            }
-            Ok(js::value::undefined())
-        },
-        (),
-    )
-    .unwrap();
-    scope.root_value(f.as_value())
+/// The drop function of imported resources the suite sets. It records the
+/// handle it drops, and throws for [`THROWING_HANDLE`] instead, to exercise
+/// `release_borrows`' drain past a throwing drop.
+fn record_imported_drop(
+    scope: &Scope<'_>,
+    _type_idx: u32,
+    handle: u32,
+) -> Result<(), js::error::ExnThrown> {
+    if handle == THROWING_HANDLE {
+        return Err(js::error::throw_type_error(scope, c"dispose boom"));
+    }
+    DROPPED.with(|d| d.borrow_mut().push(handle));
+    Ok(())
 }
 
 fn take_dropped() -> Vec<u32> {
@@ -1243,10 +1319,10 @@ fn take_dropped_exported() -> Vec<u32> {
 
 /// An imported wrapper the guest abandons is dropped by the collector.
 ///
-/// `wrap_imported` registers the wrapper with the `FinalizationRegistry` the
-/// bootstrap creates. SpiderMonkey queues that registry's cleanup with the host
-/// hook `core_runtime::finalization` installs, and the microtask checkpoint runs
-/// it, which calls the wrapper's dispose.
+/// `wrap_imported` registers the wrapper with the `FinalizationRegistry`
+/// `init_finalization` creates. SpiderMonkey queues that registry's cleanup with
+/// the host hook `core_runtime::finalization` installs, and the microtask
+/// checkpoint runs it, which drops the handle.
 fn abandoned_wrapper_is_dropped_by_gc(scope: &Scope<'_>) {
     take_dropped();
 
@@ -1254,8 +1330,7 @@ fn abandoned_wrapper_is_dropped_by_gc(scope: &Scope<'_>) {
         // An inner scope, so the wrapper's root slot is released when it ends.
         // The outer scope holds its slots for the whole test.
         let inner = scope.inner_scope();
-        let dispose = recording_dispose_fn(&inner);
-        let wrapper = resources::wrap_imported(&inner, 4242, 5, None, dispose).unwrap();
+        let wrapper = resources::wrap_imported(&inner, 4242, 5, None).unwrap();
         assert_eq!(wrapper_handle(&inner, &wrapper), Some(4242));
     }
 
@@ -1282,8 +1357,7 @@ fn lent_wrapper_is_kept_for_the_call(scope: &Scope<'_>) {
     {
         // An inner scope, so the wrapper's root slot is released when it ends.
         let inner = scope.inner_scope();
-        let dispose = recording_dispose_fn(&inner);
-        let wrapper = resources::wrap_imported(&inner, 4343, 6, None, dispose).unwrap();
+        let wrapper = resources::wrap_imported(&inner, 4343, 6, None).unwrap();
         stack.push_object(&wrapper);
         let desc = ResourceDesc::Imported { type_idx: 6 };
         assert_eq!(value::pop_borrow(&mut stack, &inner, &desc).unwrap(), 4343);
@@ -1320,27 +1394,10 @@ fn lent_wrapper_is_kept_for_the_call(scope: &Scope<'_>) {
     assert_eq!(take_dropped(), vec![4343]);
 }
 
-/// A dispose callback that always throws, to exercise `release_borrows`' drain
-/// past a throwing drop.
-fn throwing_dispose_fn<'s>(scope: &'s Scope<'_>) -> HandleValue<'s> {
-    let f = js::Function::new_callback(
-        scope,
-        c"throwingDispose",
-        0,
-        |scope, _args, _payload| Err(js::error::throw_type_error(scope, c"dispose boom")),
-        (),
-    )
-    .unwrap();
-    scope.root_value(f.as_value())
-}
-
-/// Read a wrapper's `_componentizeJsHandle`, or `None` if absent/stripped.
+/// The handle the wrapper `obj` holds, or `None` if it holds none or is not a
+/// wrapper.
 fn wrapper_handle(scope: &Scope<'_>, obj: &Object<'_>) -> Option<u32> {
-    let v = obj
-        .get_property(scope, resources::HANDLE_FIELD)
-        .unwrap()
-        .get();
-    v.is_int32().then(|| v.to_int32() as u32)
+    resources::imported_handle(scope, scope.root_value(obj.as_value()))
 }
 
 /// `ComponentError`: construct from JS, extract its payload, and confirm the
@@ -1437,6 +1494,40 @@ fn component_error_basics(scope: &Scope<'_>) {
     force_gc(scope);
 }
 
+/// An error class extends `ComponentError` after the application replaced
+/// `ComponentError.prototype.constructor`.
+fn error_class_extends_component_error(scope: &Scope<'_>) {
+    js::compile::evaluate(
+        scope,
+        "globalThis.savedConstructor = ComponentError.prototype.constructor; \
+         ComponentError.prototype.constructor = class Other {};",
+    )
+    .unwrap();
+    let class = component_model::ErrorClass {
+        interface: None,
+        name: "late-error".to_string(),
+        enum_cases: Vec::new(),
+    };
+    let created = component_model::error_class(scope, &class).unwrap();
+    let check = js::compile::evaluate(
+        scope,
+        "(C) => { \
+             ComponentError.prototype.constructor = globalThis.savedConstructor; \
+             const e = new C('x'); \
+             return `${C.name} ${e instanceof ComponentError} ${e.name}`; \
+         }",
+    )
+    .unwrap();
+    let result = js::Function::call(
+        scope,
+        js::prelude::HandleValue::undefined(),
+        check,
+        &[created],
+    )
+    .unwrap();
+    assert_eq!(as_string(scope, result), "LateError true LateError");
+}
+
 /// `call_export` result-typed path, for a `result<_, u32>`: a thrown
 /// `ComponentError` yields `Threw(payload)`, and a thrown plain `Error`, which a
 /// `u32` cannot hold, traps.
@@ -1491,32 +1582,29 @@ fn component_error_export_paths(scope: &Scope<'_>) {
     force_gc(scope);
 }
 
-/// An imported owned resource: `wrap_imported` mints a wrapper with the hidden
-/// fields and a drop callback. `unwrap_to_canon(owned=false)` reads the handle
-/// back, `unwrap_to_canon(owned=true)` unregisters and strips it, and either
-/// rejects a wrapper of another resource type.
+/// An imported owned resource: `wrap_imported` mints a wrapper holding the
+/// handle. `unwrap_to_canon(owned=false)` reads the handle back,
+/// `unwrap_to_canon(owned=true)` unregisters the wrapper and takes the handle,
+/// and either rejects a wrapper of another resource type.
 fn imported_resource_round_trip(scope: &Scope<'_>) {
-    let dispose = recording_dispose_fn(scope);
-    let wrapper = resources::wrap_imported(scope, 42, 3, None, dispose).unwrap();
-
-    // Hidden fields are present.
+    let wrapper = resources::wrap_imported(scope, 42, 3, None).unwrap();
     assert_eq!(wrapper_handle(scope, &wrapper), Some(42));
-    let ty = wrapper
-        .get_property(scope, resources::TYPE_FIELD)
-        .unwrap()
-        .get();
-    assert!(ty.is_int32() && ty.to_int32() == 3);
 
-    // The hidden fields are non-writable: a guest cannot forge the handle by
-    // assignment (`wrapper._componentizeJsHandle = 9999`), which would otherwise
-    // confuse the host resource table.
-    let _ = wrapper.set_property(scope, resources::HANDLE_FIELD, 9999u32);
-    js::exception::clear(scope);
-    assert_eq!(
-        wrapper_handle(scope, &wrapper),
-        Some(42),
-        "a guest must not be able to forge the resource handle by assignment"
-    );
+    // No property a guest defines changes the handle the wrapper lowers to.
+    let define = js::compile::evaluate(
+        scope,
+        "(w) => { w._componentizeJsHandle = 7; \
+                  Object.defineProperty(w, '_componentizeJsType', { value: 4 }); }",
+    )
+    .unwrap();
+    js::Function::call(
+        scope,
+        js::prelude::HandleValue::undefined(),
+        define,
+        &[wrapper],
+    )
+    .unwrap();
+    assert_eq!(wrapper_handle(scope, &wrapper), Some(42));
 
     force_gc(scope);
 
@@ -1532,43 +1620,75 @@ fn imported_resource_round_trip(scope: &Scope<'_>) {
     js::exception::clear(scope);
     assert_eq!(wrapper_handle(scope, &wrapper), Some(42));
 
-    // Owned lower: handle read back, then stripped + unregistered.
+    // A plain object with the wrapper's prototype is not a wrapper.
+    let forged =
+        js::compile::evaluate(scope, "(w) => Object.create(Object.getPrototypeOf(w))").unwrap();
+    let forged = js::Function::call(
+        scope,
+        js::prelude::HandleValue::undefined(),
+        forged,
+        &[wrapper],
+    )
+    .unwrap();
+    assert!(resources::unwrap_to_canon(scope, forged, 3, false).is_err());
+    js::exception::clear(scope);
+
+    // Owned lower of a frozen wrapper: the handle is read back and taken.
+    let freeze = js::compile::evaluate(scope, "Object.freeze").unwrap();
+    js::Function::call(
+        scope,
+        js::prelude::HandleValue::undefined(),
+        freeze,
+        &[wrapper],
+    )
+    .unwrap();
     let owned = resources::unwrap_to_canon(scope, wrapper_v, 3, true).unwrap();
     assert_eq!(owned, 42);
     assert_eq!(wrapper_handle(scope, &wrapper), None);
 
-    // A second owned lower now fails, because the handle is gone (idempotency: a
-    // transferred handle cannot be lowered/dropped twice).
+    // A second owned lower now fails, because the handle is gone, so a
+    // transferred handle cannot be lowered or dropped twice.
     assert!(resources::unwrap_to_canon(scope, wrapper_v, 3, true).is_err());
     js::exception::clear(scope);
 
     force_gc(scope);
 }
 
-/// The drop callback fires when invoked through the wrapper's dispose property,
-/// and is a no-op once the handle has been stripped (idempotency).
+/// `[Symbol.dispose]` of the imported resource classes drops a wrapper's handle
+/// once, and does nothing for a wrapper whose handle moved to the host. Called
+/// on an object that is not a wrapper, it throws a `TypeError`.
 fn imported_resource_dispose(scope: &Scope<'_>) {
     let _ = take_dropped();
-    let dispose = recording_dispose_fn(scope);
-    let wrapper = resources::wrap_imported(scope, 99, 1, None, dispose).unwrap();
+    let dispose = resources::dispose_function(scope).unwrap();
 
-    // Invoke the drop callback the way JS would: `wrapper[disposeField]()`.
-    let dispose_v = wrapper
-        .get_property(scope, resources::DISPOSE_FIELD)
-        .unwrap();
-    js::Function::call(scope, wrapper, dispose_v, js::function::EmptyArgs).unwrap();
+    let wrapper = resources::wrap_imported(scope, 99, 1, None).unwrap();
+    js::Function::call(scope, wrapper, dispose, js::function::EmptyArgs).unwrap();
     assert_eq!(take_dropped(), vec![99]);
-
-    // After an owned lower strips the handle, the dispose callback no-ops.
-    let wrapper_v = scope.root_value(wrapper.as_value());
-    resources::unwrap_to_canon(scope, wrapper_v, 1, true).unwrap();
-    let dispose_v = wrapper
-        .get_property(scope, resources::DISPOSE_FIELD)
-        .unwrap();
-    js::Function::call(scope, wrapper, dispose_v, js::function::EmptyArgs).unwrap();
+    assert_eq!(wrapper_handle(scope, &wrapper), None);
+    js::Function::call(scope, wrapper, dispose, js::function::EmptyArgs).unwrap();
     assert!(
         take_dropped().is_empty(),
-        "dropping a stripped wrapper must no-op"
+        "a second dispose must do nothing"
+    );
+
+    // After an owned lower takes the handle, dispose does nothing.
+    let moved = resources::wrap_imported(scope, 98, 1, None).unwrap();
+    let moved_v = scope.root_value(moved.as_value());
+    resources::unwrap_to_canon(scope, moved_v, 1, true).unwrap();
+    js::Function::call(scope, moved, dispose, js::function::EmptyArgs).unwrap();
+    assert!(
+        take_dropped().is_empty(),
+        "disposing of a moved wrapper must do nothing"
+    );
+
+    let plain = Object::new_plain(scope).unwrap();
+    assert!(js::Function::call(scope, plain, dispose, js::function::EmptyArgs).is_err());
+    let message = js::error::ExnThrown::capture(scope).message;
+    assert!(
+        message
+            .as_deref()
+            .is_some_and(|m| m.contains("not a resource wrapper")),
+        "{message:?}"
     );
 
     force_gc(scope);
@@ -1583,7 +1703,7 @@ fn exported_slab(scope: &Scope<'_>) {
     let b = Object::from_value(scope, b).unwrap();
 
     let (rep_a, rep_b) =
-        resources::with_exported_resources(|slab| (slab.insert(&a), slab.insert(&b)));
+        resources::with_exported_resources(|slab| (slab.insert(&a, 0), slab.insert(&b, 0)));
     assert_ne!(rep_a, rep_b);
 
     force_gc(scope);
@@ -1601,7 +1721,7 @@ fn exported_slab(scope: &Scope<'_>) {
     resources::with_exported_resources(|slab| assert!(slab.lookup(rep_a).is_none()));
     let c = js::compile::evaluate(scope, "({ tag: 'c' })").unwrap();
     let c = Object::from_value(scope, c).unwrap();
-    let rep_c = resources::with_exported_resources(|slab| slab.insert(&c));
+    let rep_c = resources::with_exported_resources(|slab| slab.insert(&c, 0));
     assert_eq!(rep_c, rep_a, "a freed rep is reused");
 
     // Clean up so later tests start from an empty-ish slab.
@@ -1684,8 +1804,7 @@ fn exported_resource_lift_lower(scope: &Scope<'_>) {
 
     // Lift the handle back as an owned resource: the slab entry is removed and
     // the original object surfaces again.
-    let dispose = recording_dispose_fn(scope);
-    value::push_own(&mut stack, scope, &desc, handle, dispose).unwrap();
+    value::push_own(&mut stack, scope, &desc, handle).unwrap();
     let back = Object::from_value(scope, stack.pop_value()).unwrap();
     let marker = back.get_property(scope, c"marker").unwrap();
     assert_eq!(as_string(scope, marker), "exp-rt");
@@ -1738,8 +1857,7 @@ fn exported_resource_reexport_round_trip(scope: &Scope<'_>) {
 
     // In: lift the handle back owned. The slab entry is removed and the handle
     // is released back to the guest's table.
-    let dispose = recording_dispose_fn(scope);
-    value::push_own(&mut stack, scope, &desc, handle1, dispose).unwrap();
+    value::push_own(&mut stack, scope, &desc, handle1).unwrap();
     let back = Object::from_value(scope, stack.pop_value()).unwrap();
     assert_eq!(
         take_dropped_exported(),
@@ -1759,8 +1877,7 @@ fn exported_resource_reexport_round_trip(scope: &Scope<'_>) {
 
     // The fresh rep is genuinely in the slab: a host `push_borrow` on it (the
     // rep, which push_borrow looks up directly) surfaces the same object.
-    let dispose = recording_dispose_fn(scope);
-    value::push_borrow(&mut stack, scope, &desc, rep(handle2), dispose).unwrap();
+    value::push_borrow(&mut stack, scope, &desc, rep(handle2)).unwrap();
     let borrowed = Object::from_value(scope, stack.pop_value()).unwrap();
     let marker = borrowed.get_property(scope, c"marker").unwrap();
     assert_eq!(
@@ -1785,8 +1902,8 @@ thread_local! {
 }
 
 /// Build a JS function that records each time it is invoked, for installing as
-/// an exported object's `[Symbol.dispose]`. It ignores `this`, standing in for
-/// the guest's module-level drop hook.
+/// an exported object's `[Symbol.dispose]`, the guest's drop hook. It ignores
+/// `this`.
 fn recording_exported_dtor<'s>(scope: &'s Scope<'_>) -> HandleValue<'s> {
     let f = js::Function::new_callback(
         scope,
@@ -1917,11 +2034,10 @@ fn borrow_release_ordering(scope: &Scope<'_>) {
     let mut stack = CallStack::new();
 
     // Lift three imported borrows onto the stack (handles 10, 20, 30). Each is
-    // recorded as a per-call borrow with the recording drop callback.
+    // recorded as a per-call borrow.
     for handle in [10u32, 20, 30] {
-        let dispose = recording_dispose_fn(scope);
         let desc = ResourceDesc::Imported { type_idx: 0 };
-        value::push_borrow(&mut stack, scope, &desc, handle, dispose).unwrap();
+        value::push_borrow(&mut stack, scope, &desc, handle).unwrap();
         // Pop the wrapper back off the value stack, as the export call would
         // have consumed it as an argument. The borrow record stays on the
         // stack.
@@ -2018,18 +2134,14 @@ fn exported_borrow_release(scope: &Scope<'_>) {
     force_gc(scope);
 }
 
-/// Disposing an imported wrapper strips its handle, so a second dispose is a
-/// no-op and a stashed wrapper cannot pass the released handle back to the host.
-///
-/// The drop callback the dylib installs reads the handle off `this` and strips
-/// it after dropping. This exercises the same contract with the test's recording
-/// callback plus `release_borrows`' own strip.
+/// Releasing an imported borrow drops its handle and leaves the wrapper without
+/// one, so a stashed wrapper cannot pass the released handle back to the host.
 fn imported_dispose_strips_handle(scope: &Scope<'_>) {
     let _ = take_dropped();
     let mut stack = CallStack::new();
 
     let desc = ResourceDesc::Imported { type_idx: 0 };
-    value::push_borrow(&mut stack, scope, &desc, 55, recording_dispose_fn(scope)).unwrap();
+    value::push_borrow(&mut stack, scope, &desc, 55).unwrap();
     let wrapper = Object::from_value(scope, stack.pop_value()).unwrap();
     assert_eq!(wrapper_handle(scope, &wrapper), Some(55));
 
@@ -2051,22 +2163,19 @@ fn imported_dispose_strips_handle(scope: &Scope<'_>) {
     force_gc(scope);
 }
 
-/// A throwing borrow dispose must not abort the drain: every other borrow still
-/// drops (its host handle is released, finalizer disarmed), and the failure
-/// surfaces as `Err` with a pending exception.
+/// A throwing borrow drop must not abort the drain: every other borrow still
+/// drops its handle, and the failure surfaces as `Err` with a pending exception.
 fn borrow_release_drains_through_throw(scope: &Scope<'_>) {
     let _ = take_dropped();
     let mut stack = CallStack::new();
 
-    // Push borrows 10, 20, 30. Drain order is LIFO (30, 20, 10), so make the
-    // middle-drained borrow (handle 20) throw on dispose.
+    // Push borrows 10, THROWING_HANDLE, 30. Drain order is LIFO, so the
+    // middle-drained borrow throws on drop.
     let desc = ResourceDesc::Imported { type_idx: 0 };
-    value::push_borrow(&mut stack, scope, &desc, 10, recording_dispose_fn(scope)).unwrap();
-    stack.pop_value();
-    value::push_borrow(&mut stack, scope, &desc, 20, throwing_dispose_fn(scope)).unwrap();
-    stack.pop_value();
-    value::push_borrow(&mut stack, scope, &desc, 30, recording_dispose_fn(scope)).unwrap();
-    stack.pop_value();
+    for handle in [10, THROWING_HANDLE, 30] {
+        value::push_borrow(&mut stack, scope, &desc, handle).unwrap();
+        stack.pop_value();
+    }
 
     let result = resources::release_borrows(&mut stack, scope, &record_exported_borrow_drop);
     assert!(
@@ -2078,14 +2187,96 @@ fn borrow_release_drains_through_throw(scope: &Scope<'_>) {
         "the captured exception must be re-raised"
     );
     js::exception::clear(scope);
-    // 30 drained first, then 20 threw, then 10 still drained: the throw did not
-    // abort the loop.
+    // 30 drained first, then THROWING_HANDLE threw, then 10 still drained: the
+    // throw did not abort the loop.
     assert_eq!(
         take_dropped(),
         vec![30, 10],
         "every non-throwing borrow must still drop"
     );
 
+    drop(stack);
+    force_gc(scope);
+}
+
+/// A wrapper of an imported resource used twice in one lowering, with an `own`
+/// among its uses, and one used as an `own` while it is lent to an import call,
+/// fail validation.
+fn wrapper_uses_in_one_lowering(scope: &Scope<'_>) {
+    use component_model::validate::check_each;
+
+    let own = TypeShape::OwnResource {
+        index: 7,
+        imported: true,
+    };
+    let borrow = TypeShape::BorrowResource {
+        index: 7,
+        imported: true,
+    };
+    let wrapper = resources::wrap_imported(scope, 70, 7, None).unwrap();
+    let wrapper_v = scope.root_value(wrapper.as_value());
+
+    assert!(check_each(scope, [wrapper_v, wrapper_v], &borrow).is_ok());
+    let (index, mismatch) = check_each(scope, [wrapper_v, wrapper_v], &own).unwrap_err();
+    assert_eq!(index, 1);
+    assert!(
+        mismatch
+            .reason
+            .contains("an `own` use must be its only use"),
+        "{}",
+        mismatch.reason
+    );
+
+    let mut stack = CallStack::new();
+    stack.push_object(&wrapper);
+    let desc = ResourceDesc::Imported { type_idx: 7 };
+    assert_eq!(value::pop_borrow(&mut stack, scope, &desc).unwrap(), 70);
+    let mismatch = component_model::validate::check(scope, wrapper_v, &own).unwrap_err();
+    assert!(mismatch.reason.contains("lent"), "{}", mismatch.reason);
+    assert!(component_model::validate::check(scope, wrapper_v, &borrow).is_ok());
+
+    resources::release_borrows(&mut stack, scope, &record_exported_borrow_drop).unwrap();
+    assert!(component_model::validate::check(scope, wrapper_v, &own).is_ok());
+    let _ = resources::unwrap_to_canon(scope, wrapper_v, 7, true).unwrap();
+    let _ = take_dropped();
+}
+
+/// A wrapper disposed of while lent to an import call, and a borrow released
+/// while lent, keep their handles until the call ends, and the end of the call
+/// drops them.
+fn deferred_dispose_runs_when_the_lend_ends(scope: &Scope<'_>) {
+    let _ = take_dropped();
+    let wrapper = resources::wrap_imported(scope, 71, 7, None).unwrap();
+    let mut stack = CallStack::new();
+    stack.push_object(&wrapper);
+    let desc = ResourceDesc::Imported { type_idx: 7 };
+    value::pop_borrow(&mut stack, scope, &desc).unwrap();
+
+    let dispose = resources::dispose_function(scope).unwrap();
+    js::Function::call(scope, wrapper, dispose, js::function::EmptyArgs).unwrap();
+    assert!(take_dropped().is_empty(), "a lent wrapper keeps its handle");
+    assert_eq!(wrapper_handle(scope, &wrapper), Some(71));
+
+    resources::release_borrows(&mut stack, scope, &record_exported_borrow_drop).unwrap();
+    assert_eq!(take_dropped(), vec![71]);
+    assert_eq!(wrapper_handle(scope, &wrapper), None);
+
+    // A borrow lifted for a call and lent to an import call that outlives it is
+    // dropped once, when the lend ends.
+    let mut call = CallStack::new();
+    value::push_borrow(&mut call, scope, &desc, 72).unwrap();
+    let borrowed = Object::from_value(scope, call.pop_value()).unwrap();
+    let mut lend = CallStack::new();
+    lend.push_object(&borrowed);
+    value::pop_borrow(&mut lend, scope, &desc).unwrap();
+    resources::release_borrows(&mut call, scope, &record_exported_borrow_drop).unwrap();
+    assert!(take_dropped().is_empty(), "a lent borrow keeps its handle");
+    resources::release_borrows(&mut lend, scope, &record_exported_borrow_drop).unwrap();
+    assert_eq!(take_dropped(), vec![72]);
+    assert_eq!(wrapper_handle(scope, &borrowed), None);
+
+    drop(call);
+    drop(lend);
     drop(stack);
     force_gc(scope);
 }

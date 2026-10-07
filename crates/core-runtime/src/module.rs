@@ -382,14 +382,28 @@ fn builtin_module_object<'s>(
 pub type CommonJsLoader =
     for<'s> fn(&'s Scope<'_>, &Path, SourceFormat) -> Result<Option<HandleValue<'s>>, ExnThrown>;
 
+/// Runs the `-e` entry script's source as Node.js runs `-e` code. Returns `false`, having run
+/// nothing, if the source has ES module syntax, which is then evaluated as an ES module.
+pub type CommonJsEval = for<'s> fn(&'s Scope<'_>, &str) -> Result<bool, ExnThrown>;
+
+/// The filename of the `-e` entry script.
+pub const EVAL_FILENAME: &str = "<eval>";
+
 js::instance_local! {
     static COMMONJS_LOADER: Cell<Option<CommonJsLoader>> = const { Cell::new(None) };
+    static COMMONJS_EVAL: Cell<Option<CommonJsEval>> = const { Cell::new(None) };
 }
 
 /// Install the loader that runs CommonJS modules ES modules import, in runtimes with Node.js
 /// compatibility. Without one, every module is an ES module.
 pub fn set_commonjs_loader(loader: Option<CommonJsLoader>) {
     COMMONJS_LOADER.with(|cell| cell.set(loader));
+}
+
+/// Install the function that runs the `-e` entry script, in runtimes with Node.js compatibility.
+/// Without one, the `-e` entry script is an ES module.
+pub fn set_commonjs_eval(eval: Option<CommonJsEval>) {
+    COMMONJS_EVAL.with(|cell| cell.set(eval));
 }
 
 /// The module an ES module gets for importing the CommonJS module at `path`, cached under
@@ -463,7 +477,7 @@ fn commonjs_facade<'s>(
 pub fn resolve_require(
     specifier: &str,
     base_dir: &Path,
-) -> Result<(PathBuf, SourceFormat), String> {
+) -> Result<(PathBuf, SourceFormat), ResolveError> {
     let (path, format) = resolve_path_with(specifier, Some(base_dir.to_path_buf()), true)?;
     Ok((canonical_path(path), format))
 }
@@ -483,10 +497,7 @@ pub fn builtin_namespace<'s>(
     let Some(builtin) = builtin_module(specifier) else {
         return Ok(None);
     };
-    let module = builtin_module_object(scope, builtin).map_err(|error| match error {
-        ModuleLoadError::Failed(message) => js::error::TypeError(message).throw(scope),
-        ModuleLoadError::CompileThrew => ExnThrown,
-    })?;
+    let module = builtin_module_object(scope, builtin).map_err(|error| error.throw(scope))?;
     let namespace = js::module::get_namespace(scope, module.handle())?;
     Ok(Object::from_handle(namespace))
 }
@@ -519,12 +530,8 @@ pub fn require_module<'s>(scope: &'s Scope<'_>, path: &Path) -> Result<Object<'s
             return Err(ExnThrown);
         }
     }
-    let module = resolve_file_module(scope, &specifier, base_dir, ModuleKind::JavaScript).map_err(
-        |error| match error {
-            ModuleLoadError::Failed(message) => js::error::TypeError(message).throw(scope),
-            ModuleLoadError::CompileThrew => ExnThrown,
-        },
-    )?;
+    let module = resolve_file_module(scope, &specifier, base_dir, ModuleKind::JavaScript)
+        .map_err(|error| error.throw(scope))?;
     js::module::load_requested_modules(scope, module)?;
     js::module::link(scope, module)?;
     let evaluation = js::module::evaluate(scope, module)?;
@@ -587,6 +594,16 @@ unsafe extern "C" fn module_load_hook(
     // calls with the referrer's realm entered.
     let scope = unsafe { RootScope::from_current_realm(cx) };
 
+    if !referrer.get().is_null() {
+        // SAFETY: `referrer` is the load hook's rooted `referrer` argument.
+        let private =
+            js::module::get_script_private(&scope, unsafe { GCHandle::from_raw(referrer) });
+        if let Some(refusal) = DynamicImportRefusal::from_private(private) {
+            throw_dynamic_import_refused(&scope, refusal);
+            return false;
+        }
+    }
+
     // Extract the specifier string from the ModuleRequest object
     // SAFETY: SpiderMonkey passes the hook a rooted `module_request` handle.
     let request = unsafe { GCHandle::from_raw(module_request) };
@@ -628,23 +645,28 @@ unsafe extern "C" fn module_load_hook(
     };
 
     // 2. Resolve via filesystem using oxc_resolver, relative to the referrer.
+    let referrer_path = referrer_path(&scope, referrer);
     let loaded = match (builtin, cached) {
         (Some(builtin), _) => builtin_module_object(&scope, builtin),
         (None, Some(obj)) => Ok(obj),
         (None, None) => {
-            let base_dir = referrer_base_dir(&scope, referrer);
+            let base_dir = match referrer_path
+                .as_deref()
+                .map(Path::new)
+                .and_then(Path::parent)
+            {
+                Some(parent) if !parent.as_os_str().is_empty() => Some(parent.to_path_buf()),
+                _ => base_path(|bp| bp.borrow().clone()),
+            };
             resolve_file_module(&scope, &specifier, base_dir, kind)
         }
     };
     let module = match loaded {
         Ok(obj) => obj,
-        Err(ModuleLoadError::Failed(msg)) => {
-            let c_msg = CString::new(msg).unwrap_or_else(|_| c"Module resolution failed".into());
-            js::error::report_error_ascii(&scope, &c_msg);
+        Err(error) => {
+            error.throw_for_import(&scope, referrer_path.as_deref());
             return false;
         }
-        // The compile error, with its location, is already pending.
-        Err(ModuleLoadError::CompileThrew) => return false,
     };
 
     // SAFETY: SpiderMonkey passes the hook a rooted `payload` handle.
@@ -668,29 +690,87 @@ unsafe extern "C" fn module_load_hook(
     .is_ok()
 }
 
-/// The directory to resolve a relative specifier against: the parent of the
-/// referencing module's path if the referrer carries one in its module
-/// private, the loader's base path otherwise (eval-script entries and native
-/// modules have no path).
-fn referrer_base_dir(
-    scope: &Scope<'_>,
-    referrer: js::native::RawHandle<*mut js::native::JSScript>,
-) -> Option<PathBuf> {
-    if !referrer.get().is_null() {
-        // SAFETY: `referrer` is the load hook's rooted `referrer` argument.
-        let private =
-            js::module::get_script_private(scope, unsafe { GCHandle::from_raw(referrer) });
-        if private.is_string() {
-            if let Some(path) = jsstring_to_string(scope, private.to_string()) {
-                if let Some(parent) = Path::new(&path).parent() {
-                    if !parent.as_os_str().is_empty() {
-                        return Some(parent.to_path_buf());
-                    }
-                }
-            }
+/// Why a dynamic `import()` in a Node.js `vm` script fails, and the `TypeError` it fails with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DynamicImportRefusal {
+    /// The script was compiled without `importModuleDynamically`:
+    /// `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`.
+    CallbackMissing,
+    /// The script was compiled with an `importModuleDynamically` function, which Node.js only
+    /// calls with `--experimental-vm-modules`: `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG`.
+    CallbackMissingFlag,
+}
+
+impl DynamicImportRefusal {
+    /// The script private value that marks a script whose `import()` fails for this reason.
+    fn private(self) -> i32 {
+        match self {
+            DynamicImportRefusal::CallbackMissing => 0,
+            DynamicImportRefusal::CallbackMissingFlag => 1,
         }
     }
-    base_path(|bp| bp.borrow().clone())
+
+    /// The reason the script private value `private` marks, if it marks one.
+    fn from_private(private: HandleValue<'_>) -> Option<Self> {
+        if !private.is_int32() {
+            return None;
+        }
+        match private.to_int32() {
+            0 => Some(DynamicImportRefusal::CallbackMissing),
+            1 => Some(DynamicImportRefusal::CallbackMissingFlag),
+            _ => None,
+        }
+    }
+}
+
+/// Make a dynamic `import()` in `script`, or in a function compiled with it, fail with the error
+/// of `refusal`, as an `import()` in a Node.js `vm` script does. Sets the script's private value
+/// to an integer.
+pub fn refuse_dynamic_import(
+    scope: &Scope<'_>,
+    script: GCHandle<'_, *mut js::native::JSScript>,
+    refusal: DynamicImportRefusal,
+) {
+    let refused = scope.root_value(js::value::from_i32(refusal.private()));
+    js::module::set_script_private(script, refused);
+}
+
+/// Throw the error of an `import()` that [`refuse_dynamic_import`] refused for `refusal`.
+fn throw_dynamic_import_refused(scope: &Scope<'_>, refusal: DynamicImportRefusal) {
+    let (code, message) = match refusal {
+        DynamicImportRefusal::CallbackMissing => (
+            "ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING",
+            "A dynamic import callback was not specified.",
+        ),
+        DynamicImportRefusal::CallbackMissingFlag => (
+            "ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG",
+            "A dynamic import callback was invoked without --experimental-vm-modules",
+        ),
+    };
+    let _ = throw_coded_error(
+        scope,
+        js::error::JSExnType::JSEXN_TYPEERR,
+        Some(code),
+        message,
+    );
+}
+
+/// The path of the referencing module, if its module private holds one. The load hook resolves
+/// a relative specifier against its parent directory, or against the loader's base path for a
+/// referrer without a path (eval-script entries and native modules).
+fn referrer_path(
+    scope: &Scope<'_>,
+    referrer: js::native::RawHandle<*mut js::native::JSScript>,
+) -> Option<String> {
+    if referrer.get().is_null() {
+        return None;
+    }
+    // SAFETY: `referrer` is the load hook's rooted `referrer` argument.
+    let private = js::module::get_script_private(scope, unsafe { GCHandle::from_raw(referrer) });
+    if !private.is_string() {
+        return None;
+    }
+    jsstring_to_string(scope, private.to_string())
 }
 
 /// The format of a module file, from its extension and the `type` of the nearest
@@ -730,16 +810,27 @@ fn resolve_path_with(
     specifier: &str,
     base_dir: Option<PathBuf>,
     for_require: bool,
-) -> Result<(PathBuf, SourceFormat), String> {
-    let base_dir = base_dir
-        .ok_or_else(|| format!("Module '{}' not found (no base path configured)", specifier))?;
+) -> Result<(PathBuf, SourceFormat), ResolveError> {
+    if specifier.starts_with("node:") {
+        return Err(ResolveError {
+            kind: ResolveErrorKind::UnknownBuiltin,
+            message: format!("No such built-in module: {specifier}"),
+        });
+    }
+    let base_dir = base_dir.ok_or_else(|| ResolveError {
+        kind: ResolveErrorKind::NotFound,
+        message: format!("Cannot find module '{specifier}': no base path is configured"),
+    })?;
     // `oxc_resolver` converts `file:` URLs to paths only when it isn't compiled for wasm32.
     let file_path;
     let target = if specifier.starts_with("file:") {
         file_path = url::Url::parse(specifier)
             .ok()
             .and_then(|url| url.to_file_path().ok())
-            .ok_or_else(|| format!("Cannot resolve module '{specifier}': invalid file URL"))?;
+            .ok_or_else(|| ResolveError {
+                kind: ResolveErrorKind::Other,
+                message: format!("Cannot resolve module '{specifier}': invalid file URL"),
+            })?;
         file_path.to_str().unwrap_or(specifier)
     } else {
         specifier
@@ -759,13 +850,118 @@ fn resolve_path_with(
                 let format = SourceFormat::from_resolution(res.module_type(), res.path());
                 (res.path().to_path_buf(), format)
             })
-            .map_err(|e| format!("Cannot resolve module '{}': {}", specifier, e))
+            .map_err(|error| ResolveError::from_resolver(specifier, error))
     })
 }
 
-/// Resolve `specifier` for an `import`, relative to `base_dir`.
-fn resolve_path(specifier: &str, base_dir: Option<PathBuf>) -> Result<PathBuf, String> {
-    resolve_path_with(specifier, base_dir, false).map(|(path, _)| path)
+/// Why resolving a module specifier failed.
+#[derive(Debug)]
+pub struct ResolveError {
+    pub kind: ResolveErrorKind,
+    /// The message of the error, without the referrer an `import`'s error names.
+    pub message: String,
+}
+
+/// The kinds of [`ResolveError`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveErrorKind {
+    /// No file or package matches the specifier.
+    NotFound,
+    /// The `exports` of the package the specifier names defines no entry for its subpath.
+    PackagePathNotExported,
+    /// A `node:` specifier names no builtin module.
+    UnknownBuiltin,
+    /// Any other failure, such as an invalid `package.json`.
+    Other,
+}
+
+impl ResolveErrorKind {
+    /// The `code` of the error an `import` throws for this failure, or `None` for
+    /// [`ResolveErrorKind::Other`].
+    pub fn import_code(self) -> Option<&'static str> {
+        match self {
+            ResolveErrorKind::NotFound => Some("ERR_MODULE_NOT_FOUND"),
+            ResolveErrorKind::PackagePathNotExported => Some("ERR_PACKAGE_PATH_NOT_EXPORTED"),
+            ResolveErrorKind::UnknownBuiltin => Some("ERR_UNKNOWN_BUILTIN_MODULE"),
+            ResolveErrorKind::Other => None,
+        }
+    }
+
+    /// The `code` of the error a `require` throws for this failure.
+    pub fn require_code(self) -> &'static str {
+        match self {
+            ResolveErrorKind::NotFound | ResolveErrorKind::Other => "MODULE_NOT_FOUND",
+            ResolveErrorKind::PackagePathNotExported => "ERR_PACKAGE_PATH_NOT_EXPORTED",
+            ResolveErrorKind::UnknownBuiltin => "ERR_UNKNOWN_BUILTIN_MODULE",
+        }
+    }
+}
+
+impl ResolveError {
+    /// The failure `error` of `oxc_resolver` to resolve `specifier`.
+    fn from_resolver(specifier: &str, error: oxc_resolver::ResolveError) -> Self {
+        use oxc_resolver::ResolveError as Failure;
+        match error {
+            Failure::NotFound(_) | Failure::MatchedAliasNotFound(..) => ResolveError {
+                kind: ResolveErrorKind::NotFound,
+                message: format!("Cannot find module '{specifier}'"),
+            },
+            Failure::PackagePathNotExported {
+                subpath,
+                package_json_path,
+                ..
+            } => ResolveError {
+                kind: ResolveErrorKind::PackagePathNotExported,
+                message: format!(
+                    "Package subpath '{subpath}' is not defined by \"exports\" in {}",
+                    package_json_path.display()
+                ),
+            },
+            error => ResolveError {
+                kind: ResolveErrorKind::Other,
+                message: format!("Cannot resolve module '{specifier}': {error}"),
+            },
+        }
+    }
+
+    /// Throw the error of an `import` that failed this way, from the module at `referrer` if it
+    /// has a path. The message of a `NotFound` or `PackagePathNotExported` failure names the
+    /// referrer.
+    fn throw_for_import(self, scope: &Scope<'_>, referrer: Option<&str>) -> ExnThrown {
+        let mut message = self.message;
+        if let (
+            ResolveErrorKind::NotFound | ResolveErrorKind::PackagePathNotExported,
+            Some(referrer),
+        ) = (self.kind, referrer)
+        {
+            message = format!("{message} imported from {referrer}");
+        }
+        throw_coded_error(
+            scope,
+            js::error::JSExnType::JSEXN_ERR,
+            self.kind.import_code(),
+            &message,
+        )
+    }
+}
+
+/// Throw a new `kind` error with `message` and, if `code` is set, a `code` property.
+fn throw_coded_error(
+    scope: &Scope<'_>,
+    kind: js::error::JSExnType,
+    code: Option<&str>,
+    message: &str,
+) -> ExnThrown {
+    let Ok(error) = js::error::new_error(scope, kind, message) else {
+        return ExnThrown;
+    };
+    if let (Some(code), Ok(object)) = (code, Object::from_value(scope, error)) {
+        if object.set_property(scope, c"code", code).is_err() {
+            return ExnThrown;
+        }
+    }
+    js::exception::throw_value(scope, error);
+    ExnThrown
 }
 
 /// The absolute path a file-backed module was compiled from, which [`resolve_file_module`] and
@@ -865,10 +1061,24 @@ fn import_meta_resolve(
     } else {
         base_path(|bp| bp.borrow().clone())
     };
-    match resolve_path(&specifier, base_dir) {
-        Ok(path) => file_url(&path.to_string_lossy()).to_jsval_raw_throwing(scope),
-        Err(message) => Err(js::error::TypeError(message).throw(scope)),
+    let referrer = payload
+        .is_string()
+        .then(|| jsstring_to_string(scope, payload.to_string()))
+        .flatten();
+    match resolve_path_with(&specifier, base_dir.clone(), false) {
+        Ok((path, _)) => file_url(&path.to_string_lossy()).to_jsval_raw_throwing(scope),
+        // A relative or absolute specifier resolves to its path whether a file exists there.
+        Err(error) if error.kind == ResolveErrorKind::NotFound && is_path_specifier(&specifier) => {
+            let path = lexically_normalize(base_dir.unwrap_or_default().join(&specifier));
+            file_url(&path.to_string_lossy()).to_jsval_raw_throwing(scope)
+        }
+        Err(error) => Err(error.throw_for_import(scope, referrer.as_deref())),
     }
+}
+
+/// Whether `specifier` is a relative or absolute path: it starts with `/`, `./` or `../`.
+fn is_path_specifier(specifier: &str) -> bool {
+    specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../")
 }
 
 /// The kinds of module the loader compiles from a file.
@@ -897,8 +1107,7 @@ fn resolve_file_module<'r>(
     // wasm32-wasip2; fall back to a lexical normalization so `.`/`..`-equivalent
     // paths still dedup there (only symlink aliasing, which needs the filesystem,
     // remains best-effort when canonicalize is unavailable).
-    let canonical_path = std::fs::canonicalize(&resolved_path)
-        .unwrap_or_else(|_| lexically_normalize(resolved_path));
+    let canonical_path = canonical_path(resolved_path);
     let canonical_key = canonical_path.to_string_lossy().to_string();
     // A `.json` file imported as JavaScript is refused rather than compiled as a
     // script, which would fail on its syntax or silently evaluate it.
@@ -995,7 +1204,7 @@ pub fn register_entry_module(
     } else {
         std::env::current_dir().unwrap_or_default().join(path)
     };
-    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| lexically_normalize(path));
+    let canonical = canonical_path(path);
     let key = canonical.to_string_lossy().to_string();
     let path_str = js::JSString::from_str(scope, &key).map_err(|_| ExnThrown)?;
     // SAFETY: `module` is a rooted module object, and `path_str` is rooted.
@@ -1060,15 +1269,51 @@ pub fn entry_namespace<'s>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
 
 /// Why [`resolve_file_module`] could not produce a module.
 enum ModuleLoadError {
-    /// Resolving or reading the module failed. The message describes why.
+    /// Resolving the specifier failed.
+    Resolve(ResolveError),
+    /// Reading or registering the module failed. The message describes why.
     Failed(String),
     /// Compiling the module threw, and its exception is pending.
     CompileThrew,
 }
 
+impl ModuleLoadError {
+    /// Throw the error the load hook throws for an `import` from the module at `referrer` that
+    /// failed this way, unless its exception is pending: the [`ResolveError`] of a resolution
+    /// failure, or an `Error` with the message of another failure.
+    fn throw_for_import(self, scope: &Scope<'_>, referrer: Option<&str>) -> ExnThrown {
+        match self {
+            ModuleLoadError::Resolve(error) => error.throw_for_import(scope, referrer),
+            ModuleLoadError::Failed(message) => {
+                let message =
+                    CString::new(message).unwrap_or_else(|_| c"Module resolution failed".into());
+                js::error::report_error_ascii(scope, &message)
+            }
+            ModuleLoadError::CompileThrew => ExnThrown,
+        }
+    }
+
+    /// Throw the error of a module that failed to load this way outside the load hook, unless
+    /// its exception is pending: the [`ResolveError`] of a resolution failure, or a `TypeError`
+    /// with the message of another failure.
+    fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+        match self {
+            ModuleLoadError::Resolve(error) => error.throw_for_import(scope, None),
+            ModuleLoadError::Failed(message) => js::error::TypeError(message).throw(scope),
+            ModuleLoadError::CompileThrew => ExnThrown,
+        }
+    }
+}
+
 impl From<String> for ModuleLoadError {
     fn from(message: String) -> Self {
         ModuleLoadError::Failed(message)
+    }
+}
+
+impl From<ResolveError> for ModuleLoadError {
+    fn from(error: ResolveError) -> Self {
+        ModuleLoadError::Resolve(error)
     }
 }
 
@@ -1617,6 +1862,13 @@ pub unsafe fn evaluate_module<'s>(
     // current directory, register the entry as that file's module. Other entries
     // (eval scripts, synthetic filenames) are recorded as the entry only, and
     // resolve their relative imports against the loader's base path.
+    if filename == EVAL_FILENAME && with_state(|state| state.node_compat.get()) {
+        if let Some(eval) = COMMONJS_EVAL.with(Cell::get) {
+            if eval(scope, source)? {
+                return Ok(HandleValue::undefined());
+            }
+        }
+    }
     let path = Path::new(filename);
     let is_path = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.exists(),
@@ -2277,7 +2529,7 @@ mod tests {
             assert!(result.is_ok(), "module evaluation failed");
             crate::event_loop::run_microtasks(&scope);
             assert!(read_global_string(&scope, "globalThis._error")
-                .contains("Cannot resolve module './missing.js'"));
+                .contains("Cannot find module './missing.js'"));
         }
     }
 
@@ -2300,7 +2552,7 @@ mod tests {
             assert!(result.is_ok(), "module evaluation failed");
             crate::event_loop::run_microtasks(&scope);
             assert!(read_global_string(&scope, "globalThis._error")
-                .contains("Cannot resolve module './missing.js'"));
+                .contains("Cannot find module './missing.js'"));
         }
     }
 
@@ -2390,7 +2642,8 @@ mod tests {
                 &scope,
                 "import './sub/meta.js';\n\
                  globalThis._entryMain = import.meta.main;\n\
-                 try { import.meta.resolve('./missing.js'); } catch (e) { globalThis._error = e.name; }",
+                 globalThis._missing = import.meta.resolve('./missing.js');\n\
+                 try { import.meta.resolve('missing-package'); } catch (e) { globalThis._error = e.code; }",
                 entry.to_str().unwrap(),
             )
             .expect("module evaluation failed");
@@ -2414,8 +2667,9 @@ mod tests {
         );
         assert_eq!(
             read_global_string(&scope, "`${_meta.main} ${_entryMain} ${_error}`"),
-            "false true TypeError"
+            "false true ERR_MODULE_NOT_FOUND"
         );
+        assert!(read_global_string(&scope, "_missing").ends_with("/missing.js"));
     }
 
     /// A builtin module is created on its first import, by name or alias, and every later import

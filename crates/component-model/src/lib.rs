@@ -51,11 +51,17 @@ pub use value::{mangle_name, TypeShape};
 /// Install the component-model globals on `global`.
 ///
 /// [`ComponentError`] holds the `err` arm of a WIT `result<_, err>` on the JS
-/// side. On wasm, this also registers the internal classes backing
-/// `stream<T>` and `future<T>` values (see [`readable`] and [`promises`]).
+/// side. This also registers the internal class backing the wrappers of
+/// imported resources (see [`resources`]) and, on wasm, the internal classes
+/// backing `stream<T>` and `future<T>` values (see [`readable`] and
+/// [`promises`]).
 pub fn add_to_global(scope: &js::gc::scope::Scope<'_>, global: js::Object<'_>) {
     ComponentError::add_to_global(scope, global);
     component_error::name_prototype(scope);
+    if component_error::install_class_factory(scope).is_err() {
+        js::exception::clear(scope);
+    }
+    resources::ImportedResource::add_to_global(scope, global);
     #[cfg(target_arch = "wasm32")]
     {
         readable::IncomingStream::add_to_global(scope, global);

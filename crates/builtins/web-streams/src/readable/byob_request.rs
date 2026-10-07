@@ -51,8 +51,9 @@ impl ReadableStreamBYOBRequest {
         let controller = match self.data().controller.get(scope) {
             Some(c) => c,
             None => {
-                return Err(js::error::throw_type_error(
+                return Err(crate::algorithms::throw_invalid_state(
                     scope,
+                    "ReadableStreamBYOBRequest",
                     c"respond() called on an invalidated BYOB request",
                 ));
             }
@@ -65,8 +66,9 @@ impl ReadableStreamBYOBRequest {
             .get(scope)
             .expect("BYOB request view is set while its controller is");
         if view.viewed_buffer(scope)?.is_detached() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBRequest",
                 c"respond() called with a detached view buffer",
             ));
         }
@@ -94,8 +96,9 @@ impl ReadableStreamBYOBRequest {
         let controller = match self.data().controller.get(scope) {
             Some(c) => c,
             None => {
-                return Err(js::error::throw_type_error(
+                return Err(crate::algorithms::throw_invalid_state(
                     scope,
+                    "ReadableStreamBYOBRequest",
                     c"respondWithNewView() called on an invalidated BYOB request",
                 ));
             }
@@ -103,8 +106,9 @@ impl ReadableStreamBYOBRequest {
         // Step 2: If ! `IsDetachedBuffer`(_view_.[[ViewedArrayBuffer]]) is true, throw a
         //         ``TypeError`` exception.
         if view.viewed_buffer(scope)?.is_detached() {
-            return Err(js::error::throw_type_error(
+            return Err(crate::algorithms::throw_invalid_state(
                 scope,
+                "ReadableStreamBYOBRequest",
                 c"respondWithNewView() called with a detached view buffer",
             ));
         }

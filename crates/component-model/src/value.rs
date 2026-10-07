@@ -147,10 +147,11 @@ impl TypeShape {
     }
 
     /// The canonical-ABI memory layout of a `count`-element list of this numeric
-    /// scalar, or `None` for every other shape.
+    /// scalar, or `None` for every other shape and for a list whose size in
+    /// bytes exceeds `isize::MAX`.
     pub fn numeric_list_layout(&self, count: usize) -> Option<std::alloc::Layout> {
         let (size, _) = self.numeric_layout()?;
-        Some(std::alloc::Layout::from_size_align(size * count, size).expect("list layout overflow"))
+        std::alloc::Layout::from_size_align(size.checked_mul(count)?, size).ok()
     }
 }
 
@@ -641,12 +642,11 @@ pub fn pop_flags(
 // The resource-handle conversions delegate to `src/resources.rs`. The
 // imported-versus-exported distinction and the exported `new` and `rep`
 // operations are wit-dylib metadata the interpreter resolves per call, so each
-// arm takes a resolved [`ResourceDesc`] rather than a bare type index. A lift
-// arm additionally takes the JS drop callback to store on a freshly created
-// imported wrapper, and a lower arm returns the handle.
+// arm takes a resolved [`ResourceDesc`] rather than a bare type index. A lower
+// arm returns the handle.
 //
-// All four are fallible, because reading the handle field or building a wrapper
-// can throw.
+// All four are fallible, because rejecting a value or building a wrapper
+// throws.
 
 /// Lift an owned resource handle to its JavaScript wrapper (or slab object).
 pub fn push_own(
@@ -654,9 +654,8 @@ pub fn push_own(
     scope: &Scope<'_>,
     desc: &ResourceDesc<'_>,
     handle: u32,
-    dispose_fn: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    resources::push_own(stack, scope, desc, handle, dispose_fn)
+    resources::push_own(stack, scope, desc, handle)
 }
 
 /// Lift a borrowed resource handle to its JavaScript wrapper (or slab object).
@@ -665,9 +664,8 @@ pub fn push_borrow(
     scope: &Scope<'_>,
     desc: &ResourceDesc<'_>,
     handle: u32,
-    dispose_fn: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    resources::push_borrow(stack, scope, desc, handle, dispose_fn)
+    resources::push_borrow(stack, scope, desc, handle)
 }
 
 /// Lower a JavaScript resource wrapper to an owned canonical handle.
@@ -917,7 +915,7 @@ fn property_id<'s>(
 }
 
 /// Define `name` as an enumerable data property of the fresh object `obj`.
-fn define_field<'v>(
+pub(crate) fn define_field<'v>(
     obj: &js::Object<'_>,
     scope: &'v Scope<'_>,
     name: &'static CStr,
@@ -940,6 +938,25 @@ pub(crate) fn get_field<'s>(
 ) -> Result<js::prelude::HandleValue<'s>, ExnThrown> {
     let id = property_id(scope, name)?;
     obj.get_property_by_id(scope, id)
+}
+
+js::instance_local! {
+    /// The names [`static_name`] returned, by their text.
+    static STATIC_NAMES: std::cell::RefCell<std::collections::HashMap<Box<str>, &'static CStr>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `name` as a NUL-terminated string that lives for the rest of the process, the
+/// same one for every call with the same `name`. The property keys of
+/// [`get_field`] and [`define_field`] are cached by the address of a `'static`
+/// name.
+pub(crate) fn static_name(name: &str) -> &'static CStr {
+    if let Some(interned) = STATIC_NAMES.with(|names| names.borrow().get(name).copied()) {
+        return interned;
+    }
+    let interned: &'static CStr = Box::leak(to_cstring(name).into_boxed_c_str());
+    STATIC_NAMES.with(|names| names.borrow_mut().insert(name.into(), interned));
+    interned
 }
 
 /// A mangled identifier as the NUL-terminated string the property accessors take.

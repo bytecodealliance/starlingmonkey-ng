@@ -12,9 +12,10 @@
 // must hold all four results. The other cases componentize inline guests whose
 // top level cannot be wizened: a relative import of a missing module, a
 // top-level `await` that rejects after a timer, one that never settles, one
-// that leaves work pending, and one that calls an import. Each must fail
-// componentization with a message naming the cause. Further cases check that
-// the clock a resumed instance's exports read continues past the snapshot, that
+// that leaves work other than timers pending, and one that calls an import.
+// Each must fail componentization with a message naming the cause. Further
+// cases check that timers the top level leaves pending are wizened, that the
+// clock a resumed instance's exports read continues past the snapshot, that
 // a module importing the main module's file gets the main module, that what
 // the top level prints is returned with the component, and that the top level
 // reads the location it is given, and the environment variables and read-write directories of
@@ -169,36 +170,71 @@ async fn unsettled_top_level_await_fails_componentization() {
 }
 
 /// Work the top level leaves pending once it has finished fails componentization
-/// with a message listing each piece of work and the stack that created it.
+/// with a message listing each piece of work and the stack that created it. The
+/// timers it leaves pending are not listed, since the snapshot holds them.
 #[tokio::test]
 async fn pending_work_fails_componentization_naming_its_origin() {
-    let text = "function poll() {\n\
-                  setInterval(() => {}, 1000);\n\
+    let text = "function listen() {\n\
+                  const { port1, port2 } = new MessageChannel();\n\
+                  port1.onmessage = () => {};\n\
+                  return [port1, port2];\n\
                 }\n\
-                poll();\n\
+                globalThis.ports = listen();\n\
+                setInterval(() => {}, 1000);\n\
                 setTimeout(() => {}, 50);\n\
                 export const greeting = () => '';";
-    let err = build(componentize::JsSource {
-        name: "pending.js",
-        text,
-    })
+    let runtime = shared::runtime().expect("reading the runtime build");
+    // With Node.js compatibility, a port with a `message` listener keeps the
+    // event loop alive.
+    let err = componentize::componentize_with_output(
+        componentize::Wit::<PathBuf>::String(include_str!("fixtures/top_level.wit")),
+        Some("top-level"),
+        &[],
+        false,
+        componentize::JsSource {
+            name: "pending.js",
+            text,
+        },
+        Some(base_directory()),
+        &runtime,
+        &[],
+        None,
+        false,
+        true,
+        None,
+        false,
+        None,
+        true,
+        &componentize::InitEnvironment::default(),
+    )
     .await
-    .expect_err("a guest that leaves work pending must not componentize");
+    .err()
+    .expect("a guest that leaves work pending must not componentize");
     let message = format!("{err:#}");
     assert!(
         message.contains("finished evaluating with asynchronous work still pending"),
         "{message}"
     );
-    let interval = message
-        .find("a pending `interval` timer, created at:\n      poll@pending.js:2:")
-        .unwrap_or_else(|| panic!("the interval and its stack are listed: {message}"));
-    let timeout = message
-        .find("a pending `timeout` timer, created at:\n      @pending.js:5:")
-        .unwrap_or_else(|| panic!("the timeout and its stack are listed: {message}"));
     assert!(
-        interval < timeout,
-        "work is listed in creation order: {message}"
+        message.contains(
+            "a queued `MessagePort` task, created at:\n      \
+             listen@pending.js:3:"
+        ),
+        "the port and its stack are listed: {message}"
     );
+    assert!(!message.contains("timer"), "{message}");
+}
+
+/// Timers the top level leaves pending don't fail componentization.
+#[tokio::test]
+async fn pending_timers_are_wizened() -> anyhow::Result<()> {
+    build(
+        "setInterval(() => {}, 1000);\n\
+         setTimeout(() => {}, 50);\n\
+         export const greeting = () => '';",
+    )
+    .await?;
+    Ok(())
 }
 
 /// A top-level call of an import fails componentization, naming the import.

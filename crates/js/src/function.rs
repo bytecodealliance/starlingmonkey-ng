@@ -315,6 +315,19 @@ impl<'s> Stack<'s, Function> {
         Ok(length)
     }
 
+    /// The script of this function, or `None` for a native function.
+    pub fn script<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+    ) -> Option<mozjs::gc::Handle<'r, *mut mozjs::jsapi::JSScript>> {
+        let fun_nn =
+            NonNull::new(self.as_function_ptr()).expect("function object has no JSFunction");
+        let fun_handle = scope.root_function(fun_nn);
+        // SAFETY: the function is rooted.
+        let script = unsafe { wrappers2::JS_GetFunctionScript(scope.cx_mut(), fun_handle) };
+        NonNull::new(script).map(|script| scope.root_script(script))
+    }
+
     // ---------------------------------------------------------------------------
     // Rust-native callbacks
     // ---------------------------------------------------------------------------
@@ -509,6 +522,12 @@ impl<'a> CallbackArgs<'a> {
         }
     }
 
+    /// The arguments from index `start` on, in order. Empty if `start` is at least
+    /// [`len`](Self::len).
+    pub fn rest(&'a self, start: u32) -> Vec<HandleValue<'a>> {
+        (start..self.len()).map(|i| self.get(i)).collect()
+    }
+
     /// Argument `i` without rooting it, for an immediate type check.
     #[inline]
     fn raw(&self, i: u32) -> Value {
@@ -607,17 +626,6 @@ where
         .expect("callback payload is an object")
         .cast::<T>()
         .unwrap_or_else(|e| panic!("callback payload: {e}"))
-}
-
-/// The object a [`Callback`]'s `payload` is, for a callback created with a plain object as its
-/// payload.
-///
-/// # Panics
-///
-/// Panics if `payload` is not an object. The code that creates a callback also sets its
-/// payload, so a mismatch is a bug in that code.
-pub fn object_payload<'r>(scope: &'r Scope<'_>, payload: HandleValue<'_>) -> Object<'r> {
-    Object::from_value(scope, *payload).expect("callback payload is an object")
 }
 
 /// The extern "C" trampoline that bridges JSNative to the stored callback.

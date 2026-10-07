@@ -47,6 +47,45 @@ impl AsyncTest {
     }
 }
 
+/// A test builtin whose promises' futures keep the event loop alive only while it is referenced.
+#[core_runtime::jsclass]
+struct RefTest {
+    #[no_trace]
+    referenced: js::promise::FutureRef,
+}
+
+#[core_runtime::jsmethods]
+impl RefTest {
+    #[constructor]
+    fn new() -> Self {
+        RefTestImpl {
+            referenced: js::promise::FutureRef::default(),
+        }
+    }
+
+    /// Resolve with `value` after `ms` milliseconds.
+    #[method]
+    fn later<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+        value: i32,
+        ms: i32,
+    ) -> Result<js::Promise<'r>, js::error::ExnThrown> {
+        let promise = js::Promise::new_pending(scope)?;
+        let future = PromiseFuture::from_value(async move {
+            tokio::time::sleep(Duration::from_millis(ms as u64)).await;
+            Ok::<i32, String>(value)
+        });
+        promise.spawn_with_ref(future, self.data().referenced.clone());
+        Ok(promise)
+    }
+
+    #[method]
+    fn set_referenced(&self, referenced: bool) {
+        self.data().referenced.set_referenced(referenced);
+    }
+}
+
 fn block_on_event_loop(scope: &Scope<'_>, el: &mut EventLoop) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -211,4 +250,49 @@ fn cancelling_one_loop_keeps_unowned_futures_for_the_others() {
 
     let v = js::compile::evaluate_with_filename(&scope, "globalThis.__out", "<check>", 1).unwrap();
     assert_eq!(String::from_jsval(&scope, v, ()).unwrap(), "7");
+}
+
+/// An unreferenced future doesn't keep the loop alive, and is still settled while a timer does.
+/// Referencing it again from a task keeps the loop running until it settles.
+#[test]
+fn unreferenced_futures_keep_the_loop_alive_only_once_referenced() {
+    clear_global_initializers();
+    register_global_initializer(RefTest::add_to_global);
+    let rt = Runtime::init(&core_runtime::config::RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let read = |expr: &str| -> String {
+        let v = js::compile::evaluate_with_filename(&scope, expr, "<check>", 1).unwrap();
+        String::from_jsval(&scope, v, ()).unwrap()
+    };
+    let run = |source: &str| {
+        let mut el = EventLoop::new();
+        with_event_loop(&el, |_| {
+            js::compile::evaluate_with_filename(&scope, source, "<test>", 1)
+                .expect("evaluation failed");
+        });
+        block_on_event_loop(&scope, &mut el);
+    };
+
+    run(r#"
+        globalThis.__alone = "pending";
+        globalThis.__timed = "pending";
+        const alone = new RefTest();
+        alone.setReferenced(false);
+        alone.later(1, 200).then(v => { globalThis.__alone = String(v); });
+        const timed = new RefTest();
+        timed.setReferenced(false);
+        timed.later(2, 1).then(v => { globalThis.__timed = String(v); });
+        setTimeout(() => {}, 50);
+        "#);
+    assert_eq!(read("globalThis.__alone"), "pending");
+    assert_eq!(read("globalThis.__timed"), "2");
+
+    run(r#"
+        globalThis.__out = "pending";
+        const t = new RefTest();
+        t.setReferenced(false);
+        t.later(3, 30).then(v => { globalThis.__out = String(v); });
+        setTimeout(() => t.setReferenced(true), 1);
+        "#);
+    assert_eq!(read("globalThis.__out"), "3");
 }

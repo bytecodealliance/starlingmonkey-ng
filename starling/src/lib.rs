@@ -158,12 +158,15 @@ mod wasm_entry {
                     eprintln!("{e}");
                 });
             };
-            // The snapshot's top level left no work behind, since both kinds of snapshot refuse
-            // any, so `run` starts on a fresh loop, after the resume fixups have repaired the
-            // clocks.
+            // The snapshot's top level left no work behind other than timers, since both kinds
+            // of snapshot refuse any other. `run` runs on the loop holding those timers, or on a
+            // fresh one if there are none, after the resume fixups have repaired the clocks. The
+            // timers run while `run` does, and are dropped with the loop once it has finished, as
+            // the timers `run` itself leaves behind are.
             libstarling::serve_wasm::fix_up_after_resume();
             debugger::start_after_resume(&runtime);
-            let invocation = OwnedInvocation::new(runtime, InvocationState::new());
+            let invocation = libstarling::serve_wasm::take_snapshotted_startup_loop()
+                .unwrap_or_else(|| OwnedInvocation::new(runtime, InvocationState::new()));
             let outcome = run_main_export(&invocation, main).await.into_result();
             debugger::finish(&outcome);
             outcome.map_err(|message| eprintln!("{message}"))
@@ -338,6 +341,9 @@ mod init_export {
             // The host's imports are not linked while the snapshot is taken.
             component_model::imports::set_imports_unavailable(true);
             component_model::init::set_before_export(libstarling::serve_wasm::fix_up_after_resume);
+            component_model::init::set_before_http_export(
+                libstarling::serve_wasm::keep_snapshotted_startup_loop_running,
+            );
             let initialized = component_model::initialize_runtime(
                 &config,
                 &main,
@@ -352,8 +358,10 @@ mod init_export {
             // A top-level `await` settles only once the loop runs the timers and
             // I/O it waits on, and the application's exports are in their
             // temporal dead zone until it does. We drive the loop only while the
-            // top level is unfinished, so work it merely queued, such as a timer,
-            // is refused below rather than run under Wizer.
+            // top level is unfinished, so a timer that is due only after the top
+            // level finished doesn't run under Wizer. The snapshot holds it
+            // instead, and other work the top level merely queued is refused
+            // below.
             if !component_model::init::with_scope(|scope| initialized.evaluation.is_finished(scope))
             {
                 // SAFETY: `initialize_runtime` left the default global's realm
@@ -392,10 +400,9 @@ mod init_export {
                 )
             })?;
 
-            // A snapshot cannot hold a timer, a host operation in flight, or any
-            // other work the top level left on its loop.
+            // A snapshot cannot hold a host operation in flight, or any other
+            // work the top level left on its loop except timers.
             invocation.state().event_loop().ensure_idle_for_snapshot()?;
-            drop(invocation);
 
             let http_handler = raw_export
                 .map(|raw| {
@@ -417,6 +424,9 @@ mod init_export {
                 raw_cx,
                 &config,
             )?;
+            // The timers the top level left pending run in the resumed instance,
+            // from its first `wasi:http/handler` or `wasi:cli/run` call on.
+            libstarling::serve_wasm::keep_startup_loop_for_snapshot(invocation);
 
             // The instance is wizened as soon as this returns, so everything
             // above is state a resumed instance inherits. Last, since this

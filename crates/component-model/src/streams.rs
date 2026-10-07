@@ -43,7 +43,7 @@ use wit_dylib_ffi::{Future as WitFuture, Stream as WitStream, Type};
 
 use crate::init;
 use crate::interpreter::{trap, CallCx};
-use crate::resources::{read_u32_field, DISPOSE_FIELD, HANDLE_FIELD};
+use crate::resources::{imported_wrapper, ImportedResource};
 use crate::stack::CallStack;
 
 js::instance_local! {
@@ -75,9 +75,9 @@ impl JsElem {
     pub(crate) fn new(value: Value) -> JsElem {
         let boxed = Box::new(Heap::from(value));
         let ptr: *const Heap<Value> = &*boxed;
-        // `try_with`, since at thread-local teardown wit-bindgen's
-        // `FutureWriter::Drop` can construct the placeholder default after
-        // `LIVE_ELEMS` is destroyed. Tracing is moot then.
+        // At thread-local teardown, wit-bindgen's `FutureWriter::Drop` can
+        // construct the placeholder default after `LIVE_ELEMS` is destroyed, so
+        // this uses `try_with`. Tracing is moot then.
         let _ = LIVE_ELEMS.try_with(|elems| elems.borrow_mut().insert(ptr));
         JsElem { value: boxed }
     }
@@ -100,8 +100,8 @@ impl Drop for JsElem {
         // `self.value` is the boxed interior at the address registered in
         // `JsElem::new`, and this runs before the box is freed.
         let ptr: *const Heap<Value> = &*self.value;
-        // `try_with` so a drop during thread-local teardown cannot touch a
-        // destroyed `LIVE_ELEMS`.
+        // This uses `try_with`, so a drop during thread-local teardown cannot
+        // touch a destroyed `LIVE_ELEMS`.
         let _ = LIVE_ELEMS.try_with(|elems| elems.borrow_mut().remove(&ptr));
     }
 }
@@ -146,14 +146,13 @@ js::instance_local! {
         RefCell::new(HashMap::new());
 }
 
-/// Whether `value` is a live imported-resource wrapper: an object with the
-/// drop callback and a handle. An exported (guest-owned) resource object has no
-/// drop callback, and `push_own` hands that same object back on a re-lift.
-fn imported_wrapper<'s>(scope: &'s Scope<'_>, value: Value) -> Option<Object<'s>> {
-    let obj = Object::from_value(scope, value).ok()?;
-    let dispose = obj.get_property(scope, DISPOSE_FIELD).ok()?;
-    let handle = obj.get_property(scope, HANDLE_FIELD).ok()?;
-    (dispose.get().is_object() && handle.get().is_number()).then_some(obj)
+/// `value` if it is a live imported-resource wrapper, one that holds a handle.
+/// An exported (guest-owned) resource object is not one, and `push_own` hands
+/// that same object back on a re-lift.
+fn live_wrapper<'s>(scope: &'s Scope<'_>, value: Value) -> Option<Object<'s>> {
+    let wrapper = imported_wrapper(scope, scope.root_value(value))?;
+    let live = wrapper.data().handle.is_some();
+    live.then_some(*wrapper)
 }
 
 /// Move the canonical handle a re-lift minted `fresh` for back onto `original`,
@@ -164,12 +163,13 @@ fn hand_handle_back(
     original: &Object<'_>,
     fresh: &Object<'_>,
 ) -> Result<(), ExnThrown> {
-    let Some(handle) = read_u32_field(scope, fresh, HANDLE_FIELD)? else {
+    let (Ok(original), Ok(fresh)) = (
+        original.cast::<ImportedResource>(),
+        fresh.cast::<ImportedResource>(),
+    ) else {
         return Ok(());
     };
-    crate::resources::unregister_resource(scope, fresh)?;
-    fresh.delete_property(scope, HANDLE_FIELD)?;
-    crate::resources::register_resource(scope, original, handle)
+    crate::resources::move_handle(scope, fresh, original)
 }
 
 js::instance_local! {
@@ -296,8 +296,8 @@ pub(crate) fn with_elem_type_future<F: std::future::Future>(
 /// the default value wit-bindgen writes when a `FutureWriter` is dropped
 /// unwritten, which [`FUTURE_WRITERS`] prevents while the instance runs.
 fn active_elem_type() -> Option<ElemType> {
-    // `try_with`, since at thread-local teardown wit-bindgen's drop-default
-    // lowering can run after `ELEM_TYPE` is destroyed.
+    // At thread-local teardown, wit-bindgen's drop-default lowering can run
+    // after `ELEM_TYPE` is destroyed, so this uses `try_with`.
     ELEM_TYPE
         .try_with(|cell| cell.borrow().last().copied())
         .ok()
@@ -354,7 +354,7 @@ unsafe fn elem_lower(value: JsElem, dst: *mut u8) {
     // option or list comes back from the re-lift as a new wrapper.
     if ty.owns_resources() {
         init::with_scope(|scope| {
-            if let Some(original) = imported_wrapper(scope, stack.last()) {
+            if let Some(original) = live_wrapper(scope, stack.last()) {
                 LOWERED_ELEM_ORIGINALS
                     .with(|cell| cell.borrow_mut().insert(dst, Heap::from(original)));
             }

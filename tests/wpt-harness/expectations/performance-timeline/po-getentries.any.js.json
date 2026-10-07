@@ -1,0 +1,5 @@
+{
+  "getEntries, getEntriesByType and getEntriesByName work": {
+    "status": "PASS"
+  }
+}

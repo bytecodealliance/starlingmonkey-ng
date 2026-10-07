@@ -153,11 +153,18 @@ impl ExportTable {
                 });
                 continue;
             };
-            // The item is there, so a failure is a missing class member.
-            let resolved = resolve_export(scope, &container, &spec.name).map_err(|_| {
-                js::exception::clear(scope);
-                missing_export_message(&spec)
-            })?;
+            // The item is there, so a missing member is a missing class member.
+            let resolved =
+                resolve_member(scope, &container, &spec.name).map_err(|error| match error {
+                    ResolveError::Missing(_) => missing_export_message(&spec),
+                    ResolveError::Threw(_) => {
+                        let message = ExnThrown::capture(scope).message.unwrap_or_default();
+                        format!(
+                            "resolving the WIT export `{}` threw: {message}",
+                            wit_name(&spec)
+                        )
+                    }
+                })?;
             let (kind, function, this) = match resolved {
                 Resolved::Plain { function, this } => {
                     (EntryKind::Plain, function.get(), this.as_value())
@@ -479,23 +486,50 @@ fn method_on<'s>(
 /// which may carry a `[constructor]`/`[method]`/`[static]` prefix.
 ///
 /// Returns `Err(ExnThrown)` with a pending `TypeError` if the named member is
-/// missing or, for the prefixed forms, the named class is missing.
+/// missing or, for the prefixed forms, the named class is missing, and with the
+/// pending exception of a getter that throws while the export is read.
 pub fn resolve_export<'s>(
     scope: &'s Scope<'_>,
     container: &Object<'s>,
     name: &str,
 ) -> Result<Resolved<'s>, ExnThrown> {
+    resolve_member(scope, container, name).map_err(|error| match error {
+        ResolveError::Missing(message) => throw_type_error(scope, message),
+        ResolveError::Threw(exn) => exn,
+    })
+}
+
+/// Why [`resolve_member`] failed.
+enum ResolveError {
+    /// The export is not there, for the reason given.
+    Missing(&'static std::ffi::CStr),
+    /// Reading the export threw the pending exception.
+    Threw(ExnThrown),
+}
+
+impl From<ExnThrown> for ResolveError {
+    fn from(exn: ExnThrown) -> Self {
+        ResolveError::Threw(exn)
+    }
+}
+
+/// [`resolve_export`], reporting a missing export without throwing.
+fn resolve_member<'s>(
+    scope: &'s Scope<'_>,
+    container: &Object<'s>,
+    name: &str,
+) -> Result<Resolved<'s>, ResolveError> {
     let container = *container;
 
     if let Some(ty) = name.strip_prefix("[constructor]") {
         let class = lookup_class(scope, &container, ty)?;
         Ok(Resolved::Constructor { class })
     } else if let Some(rest) = name.strip_prefix("[method]") {
-        let (ty, method) = split_resource_member(scope, rest)?;
+        let (ty, method) = split_resource_member(rest)?;
         let class_obj = lookup_class_object(scope, &container, ty)?;
         let proto = class_obj.get_property(scope, c"prototype")?;
         let proto_obj = Object::from_value(scope, proto)
-            .map_err(|_| throw_type_error(scope, c"resource class has no prototype object"))?;
+            .map_err(|_| ResolveError::Missing(c"resource class has no prototype object"))?;
         let member = mangle_name(method);
         lookup_member(scope, &proto_obj, &member)?;
         let name = js::JSString::from_str(scope, &member)?;
@@ -503,7 +537,7 @@ pub fn resolve_export<'s>(
             name: scope.root_value(name.as_value()),
         })
     } else if let Some(rest) = name.strip_prefix("[static]") {
-        let (ty, method) = split_resource_member(scope, rest)?;
+        let (ty, method) = split_resource_member(rest)?;
         let class_obj = lookup_class_object(scope, &container, ty)?;
         let function = lookup_member(scope, &class_obj, &mangle_name(method))?;
         Ok(Resolved::Static {
@@ -659,12 +693,11 @@ fn lookup_class<'s>(
     scope: &'s Scope<'_>,
     container: &Object<'s>,
     ty: &str,
-) -> Result<HandleValue<'s>, ExnThrown> {
+) -> Result<HandleValue<'s>, ResolveError> {
     let key = to_cstring(&mangle_resource_name(ty));
     let value = container.get_property_by_name(scope, &key)?;
     if value.is_undefined() {
-        return Err(throw_type_error(
-            scope,
+        return Err(ResolveError::Missing(
             c"exported resource class is not defined",
         ));
     }
@@ -676,10 +709,10 @@ fn lookup_class_object<'s>(
     scope: &'s Scope<'_>,
     container: &Object<'s>,
     ty: &str,
-) -> Result<Object<'s>, ExnThrown> {
+) -> Result<Object<'s>, ResolveError> {
     let class = lookup_class(scope, container, ty)?;
     Object::from_value(scope, class)
-        .map_err(|_| throw_type_error(scope, c"resource class is not an object"))
+        .map_err(|_| ResolveError::Missing(c"resource class is not an object"))
 }
 
 /// Look up a member function on `container` by its already-mangled name,
@@ -688,21 +721,19 @@ fn lookup_member<'s>(
     scope: &'s Scope<'_>,
     container: &Object<'s>,
     mangled: &str,
-) -> Result<HandleValue<'s>, ExnThrown> {
+) -> Result<HandleValue<'s>, ResolveError> {
     let key = to_cstring(mangled);
     let value = container.get_property_by_name(scope, &key)?;
     if value.is_undefined() {
-        return Err(throw_type_error(scope, c"exported member is not defined"));
+        return Err(ResolveError::Missing(c"exported member is not defined"));
     }
     Ok(value)
 }
 
 /// Split a `[method]`/`[static]` payload `TYPE.MEMBER` into its parts, erroring
 /// on a malformed name (no `.`).
-fn split_resource_member<'a>(
-    scope: &Scope<'_>,
-    rest: &'a str,
-) -> Result<(&'a str, &'a str), ExnThrown> {
-    rest.split_once('.')
-        .ok_or_else(|| throw_type_error(scope, c"resource member name must be `type.member`"))
+fn split_resource_member(rest: &str) -> Result<(&str, &str), ResolveError> {
+    rest.split_once('.').ok_or(ResolveError::Missing(
+        c"resource member name must be `type.member`",
+    ))
 }

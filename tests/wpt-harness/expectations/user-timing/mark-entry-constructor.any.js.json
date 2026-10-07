@@ -1,0 +1,20 @@
+{
+  "Mark entry can be created by 'new PerformanceMark(string)'.": {
+    "status": "PASS"
+  },
+  "Mark entry can be created by 'new PerformanceMark(string, {})'.": {
+    "status": "PASS"
+  },
+  "Mark entry can be created by 'new PerformanceMark(string, {startTime})'.": {
+    "status": "PASS"
+  },
+  "Mark entry can be created by 'new PerformanceMark(string, {detail})'.": {
+    "status": "PASS"
+  },
+  "Mark entry can be created by 'new PerformanceMark(string, {startTime, detail})'.": {
+    "status": "PASS"
+  },
+  "Using new PerformanceMark() shouldn't add the entry to performance timeline.": {
+    "status": "PASS"
+  }
+}
