@@ -4,14 +4,14 @@
 //! <https://nodejs.org/api/util.html#utilinspectobject-options>.
 //!
 //! The formatting follows Node.js's `lib/internal/util/inspect.js` and the comparison its
-//! `lib/internal/util/comparisons.js`. Colors are not supported, `sorted` comparator functions sort
-//! like `sorted: true`, and the entries of `Map` and `Set` iterators and of weak collections are
-//! not shown. Proxies are inspected as their targets without running their traps, or as their
-//! target and handler with `showProxy`. Builtin types are recognized by the engine's brand checks,
+//! `lib/internal/util/comparisons.js`. Colors are not supported, and the entries of `Map` and `Set`
+//! iterators and of weak collections are not shown. Proxies are inspected as their targets without
+//! running their traps, or as their target and handler with `showProxy`. Builtin types are recognized by the engine's brand checks,
 //! and generators, async functions and module namespaces by the realm's original
 //! `Object.prototype.toString`.
 
 use std::ffi::CStr;
+use std::rc::Rc;
 
 use js::class_spec::JSProtoKey;
 use js::conversion::{FromJSVal, ToJSVal};
@@ -35,6 +35,28 @@ pub(crate) static INSPECT_CUSTOM: js::symbol::CachedSymbol =
 pub enum Compact {
     Bool(bool),
     Number(f64),
+}
+
+/// The `sorted` option.
+#[derive(Clone, Default)]
+pub enum Sorted {
+    /// A falsy value: entries are shown in property order.
+    #[default]
+    No,
+    /// `true`: entries are sorted by their UTF-16 code units.
+    Yes,
+    /// Any other truthy value, which `Array.prototype.sort` gets as its comparator.
+    By(Rc<js::heap::RootedTraceableBox<Heap<Value>>>),
+}
+
+impl std::fmt::Debug for Sorted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Sorted::No => "No",
+            Sorted::Yes => "Yes",
+            Sorted::By(_) => "By",
+        })
+    }
 }
 
 /// The `getters` option: which getters are called to show their values.
@@ -61,7 +83,7 @@ pub struct InspectOptions {
     pub max_string_length: f64,
     pub break_length: f64,
     pub compact: Compact,
-    pub sorted: bool,
+    pub sorted: Sorted,
     pub getters: Getters,
     pub numeric_separator: bool,
 }
@@ -78,7 +100,7 @@ impl Default for InspectOptions {
             max_string_length: 10000.0,
             break_length: 80.0,
             compact: Compact::Number(3.0),
-            sorted: false,
+            sorted: Sorted::No,
             getters: Getters::None,
             numeric_separator: false,
         }
@@ -121,10 +143,23 @@ impl InspectOptions {
             c"numericSeparator",
         ];
         for name in names {
-            if options.has_own_property(scope, name)? {
-                let value = options.get_property(scope, name)?;
-                self.set(scope, name, value)?;
+            if options.is_proxy() {
+                if options.has_own_property(scope, name)? {
+                    let value = options.get_property(scope, name)?;
+                    self.set(scope, name, value)?;
+                }
+                continue;
             }
+            // The value of a data property comes with its descriptor.
+            let id = js::class::get_or_init_property_id(scope, name)?;
+            let Some(property) = options.own_property_descriptor(scope, id)? else {
+                continue;
+            };
+            let value = match property.value {
+                Some(value) => value,
+                None => options.get_property(scope, name)?,
+            };
+            self.set(scope, name, value)?;
         }
         Ok(self)
     }
@@ -174,7 +209,17 @@ impl InspectOptions {
                     Compact::Bool(false)
                 }
             }
-            b"sorted" => self.sorted = truthy(),
+            b"sorted" => {
+                self.sorted = if !truthy() {
+                    Sorted::No
+                } else if value.is_boolean() {
+                    Sorted::Yes
+                } else {
+                    Sorted::By(Rc::new(js::heap::RootedTraceableBox::new(Heap::from(
+                        value.get(),
+                    ))))
+                }
+            }
             b"getters" => {
                 self.getters = if value.is_boolean() && value.to_boolean() {
                     Getters::All
@@ -213,6 +258,11 @@ impl InspectOptions {
             Compact::Bool(compact) => compact.to_jsval_throwing(scope)?,
             Compact::Number(compact) => compact.to_jsval_throwing(scope)?,
         };
+        let sorted = match &self.sorted {
+            Sorted::No => false.to_jsval_throwing(scope)?,
+            Sorted::Yes => true.to_jsval_throwing(scope)?,
+            Sorted::By(comparator) => comparator.to_jsval_throwing(scope)?,
+        };
         let getters = match self.getters {
             Getters::None => false.to_jsval_throwing(scope)?,
             Getters::All => true.to_jsval_throwing(scope)?,
@@ -233,7 +283,7 @@ impl InspectOptions {
                 self.max_string_length.to_jsval_throwing(scope)?,
                 self.break_length.to_jsval_throwing(scope)?,
                 compact,
-                self.sorted.to_jsval_throwing(scope)?,
+                sorted,
                 getters,
                 self.numeric_separator.to_jsval_throwing(scope)?,
             ],
@@ -288,7 +338,14 @@ struct Descriptor<'r> {
 pub(crate) struct InspectIntrinsics {
     /// `Object.prototype.toString`.
     object_to_string: Heap<Value>,
-    /// The constructors [`WELL_KNOWN_CONSTRUCTORS`] names.
+    /// `Error.prototype.toString`.
+    error_to_string: Heap<Value>,
+    /// `RegExp.prototype.exec`.
+    regexp_exec: Heap<Value>,
+    /// `Array.prototype.sort`.
+    array_sort: Heap<Value>,
+    /// The constructors of Node.js's `wellKnownConstructors`: those of [`WELL_KNOWN_CONSTRUCTORS`]
+    /// and `Buffer`.
     well_known: Vec<Heap<Value>>,
 }
 
@@ -301,20 +358,30 @@ struct IntrinsicsMarker;
 /// Register the classes of `util.inspect`, and capture the realm's [`InspectIntrinsics`].
 pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     InspectIntrinsics::add_to_global(scope, global);
-    let object = crate::support::class_object(scope, JSProtoKey::JSProto_Object)?;
-    let proto = Object::from_value(scope, *object.get_property(scope, c"prototype")?)
-        .map_err(|e| e.throw(scope))?;
-    let object_to_string = proto.get_property(scope, c"toString")?;
-    let mut well_known: Vec<HandleValue<'_>> = Vec::with_capacity(WELL_KNOWN_CONSTRUCTORS.len());
-    for name in WELL_KNOWN_CONSTRUCTORS {
-        well_known.push(global.get_property(scope, name)?);
+    let prototype_method = |key: JSProtoKey, name: &'static CStr| {
+        let proto = js::class::get_class_prototype(scope, key)?;
+        Object::from_handle(proto)
+            .ok_or(ExnThrown)?
+            .get_property(scope, name)
+    };
+    let object_to_string = prototype_method(JSProtoKey::JSProto_Object, c"toString")?;
+    let error_to_string = prototype_method(JSProtoKey::JSProto_Error, c"toString")?;
+    let regexp_exec = prototype_method(JSProtoKey::JSProto_RegExp, c"exec")?;
+    let array_sort = prototype_method(JSProtoKey::JSProto_Array, c"sort")?;
+    let mut well_known = Vec::with_capacity(WELL_KNOWN_CONSTRUCTORS.len() + 1);
+    for &key in WELL_KNOWN_CONSTRUCTORS {
+        well_known.push(crate::support::class_object(scope, key)?);
     }
+    well_known.push(crate::buffer::buffer::class_constructor(scope)?);
     let intrinsics = js::class::create_instance_with::<InspectIntrinsicsImpl>(scope, |_| {
         InspectIntrinsicsImpl {
             object_to_string: Heap::from(object_to_string.get()),
+            error_to_string: Heap::from(error_to_string.get()),
+            regexp_exec: Heap::from(regexp_exec.get()),
+            array_sort: Heap::from(array_sort.get()),
             well_known: well_known
                 .iter()
-                .map(|value| Heap::from(value.get()))
+                .map(|ctor| Heap::from(ctor.as_value()))
                 .collect(),
         }
     })?;
@@ -369,6 +436,16 @@ impl<'s> Intrinsics<'s> {
         key: HandleValue<'_>,
     ) -> Result<Option<Descriptor<'r>>, ExnThrown> {
         let id = scope.root_id(js::id::value_to_id(scope, key)?);
+        self.descriptor_by_id(scope, object, id)
+    }
+
+    /// The own property `id` of `object`, as [`Self::descriptor`] describes it.
+    fn descriptor_by_id<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+        object: Object<'_>,
+        id: js::native::HandleId<'_>,
+    ) -> Result<Option<Descriptor<'r>>, ExnThrown> {
         let Some(property) = object.own_property_descriptor(scope, id)? else {
             return Ok(None);
         };
@@ -392,10 +469,10 @@ impl<'s> Intrinsics<'s> {
         &self,
         scope: &'r Scope<'_>,
         object: Object<'_>,
-        name: &str,
+        name: &'static CStr,
     ) -> Result<Option<Descriptor<'r>>, ExnThrown> {
-        let key = scope.root_value(js::JSString::from_str(scope, name)?.as_value());
-        self.descriptor(scope, object, key)
+        let id = js::class::get_or_init_property_id(scope, name)?;
+        self.descriptor_by_id(scope, object, id)
     }
 
     /// `Object.prototype.toString.call(object)`.
@@ -425,7 +502,7 @@ impl<'s> Intrinsics<'s> {
 }
 
 /// Whether `value` is an object whose `typeof` is `'object'`: not `null` and not callable.
-fn is_typeof_object(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
+pub(crate) fn is_typeof_object(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
     Object::from_value(scope, *value).is_ok_and(|object| !object.is_callable())
 }
 
@@ -567,6 +644,17 @@ pub(crate) fn is_regexp(scope: &Scope<'_>, object: Object<'_>) -> Result<bool, E
     js::RegExp::is_regexp(scope, object.handle())
 }
 
+/// Node.js's `RegExpPrototypeExec(regexp, text) !== null`: whether `RegExp.prototype.exec`, as it
+/// was when the global was set up, finds a match of `regexp` in `text`.
+pub(crate) fn regexp_exec_matches(
+    scope: &Scope<'_>,
+    regexp: HandleValue<'_>,
+    text: HandleValue<'_>,
+) -> Result<bool, ExnThrown> {
+    let exec = realm_intrinsics(scope)?.data().regexp_exec.get(scope);
+    Ok(!Function::call(scope, regexp, exec, &[text])?.is_null())
+}
+
 /// Whether `object` is a `Map`.
 pub(crate) fn is_map(scope: &Scope<'_>, object: Object<'_>) -> Result<bool, ExnThrown> {
     js::Map::is_map(scope, object.handle())
@@ -577,61 +665,56 @@ pub(crate) fn is_set(scope: &Scope<'_>, object: Object<'_>) -> Result<bool, ExnT
     js::Set::is_set(scope, object.handle())
 }
 
-/// Whether `object` is an `Error`.
+/// Node.js's `isError`: whether `object` is a native error or an `instanceof Error`.
 pub(crate) fn is_error(scope: &Scope<'_>, object: Object<'_>) -> Result<bool, ExnThrown> {
     Ok(js::exception::is_error_object(
         scope,
         scope.root_value(object.to_jsval_raw_throwing(scope)?),
-    ))
+    ) || is_error_instance(scope, object)?)
 }
 
-/// The entries of the `Map` or `Set` `object`, as `[key, value]` pairs, with each value of a
-/// `Set` as both. `forEach`'s builtin implementation reads them.
+/// The entries of the `Map` (`map`) or `Set` `object`, as `[key, value]` pairs, with each value of
+/// a `Set` as both, read without running code the script can change.
 fn collection_entries<'r>(
     scope: &'r Scope<'_>,
     object: Object<'_>,
     map: bool,
 ) -> Result<Vec<(HandleValue<'r>, HandleValue<'r>)>, ExnThrown> {
-    let store = js::Array::with_contents(scope, EmptyArgs)?;
-    let callback = Function::new_callback(scope, c"", 2, collect_entry, *store)?;
-    let callback = callback.to_jsval_throwing(scope)?;
+    first_collection_entries(scope, object, map, u32::MAX)
+}
+
+/// The first `limit` entries of the `Map` (`map`) or `Set` `object`, as [`collection_entries`]
+/// reads them.
+fn first_collection_entries<'r>(
+    scope: &'r Scope<'_>,
+    object: Object<'_>,
+    map: bool,
+    limit: u32,
+) -> Result<Vec<(HandleValue<'r>, HandleValue<'r>)>, ExnThrown> {
     if map {
-        let map = object
+        object
             .cast::<js::Map>()
-            .map_err(|_| js::error::TypeError("not a Map".into()).throw(scope))?;
-        map.for_each(scope, callback, HandleValue::undefined())?;
+            .map_err(|_| js::error::TypeError("not a Map".into()).throw(scope))?
+            .first_entries(scope, limit)
     } else {
         let set = object
             .cast::<js::Set>()
             .map_err(|_| js::error::TypeError("not a Set".into()).throw(scope))?;
-        set.for_each(scope, callback, HandleValue::undefined())?;
+        Ok(set
+            .first_values(scope, limit)?
+            .into_iter()
+            .map(|value| (value, value))
+            .collect())
     }
-    let length = store.length(scope)?;
-    let mut entries = Vec::with_capacity(length as usize / 2);
-    for index in (0..length).step_by(2) {
-        entries.push((
-            store.get_element(scope, index)?,
-            store.get_element(scope, index + 1)?,
-        ));
-    }
-    Ok(entries)
 }
 
-/// The `forEach` callback of [`collection_entries`], whose payload is the array it appends the
-/// key and the value to.
-fn collect_entry(
-    scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let store = Object::from_value(scope, *payload)
-        .map_err(|e| e.throw(scope))?
-        .cast::<js::Array>()
-        .map_err(|_| js::error::TypeError("the payload is not an array".into()).throw(scope))?;
-    let length = store.length(scope)?;
-    store.define_element(scope, length, args.get(1), 0)?;
-    store.define_element(scope, length + 1, args.get(0), 0)?;
-    Ok(js::value::undefined())
+/// The number of entries of the `Map` (`map`) or `Set` `object`.
+fn collection_size(object: Object<'_>, map: bool, scope: &Scope<'_>) -> usize {
+    if map {
+        object.cast::<js::Map>().map_or(0, |map| map.size(scope)) as usize
+    } else {
+        object.cast::<js::Set>().map_or(0, |set| set.size(scope)) as usize
+    }
 }
 
 /// The UTF-16 code units of the JS string `value`.
@@ -645,7 +728,7 @@ fn to_string(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<String, ExnThr
 }
 
 /// The length of `text` in UTF-16 code units, as JS's `length` counts it.
-fn js_len(text: &str) -> usize {
+pub(crate) fn js_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
@@ -655,12 +738,6 @@ fn key_text(scope: &Scope<'_>, key: HandleValue<'_>) -> Result<Option<String>, E
         return Ok(None);
     }
     Ok(Some(to_string(scope, key)?))
-}
-
-/// Whether `key` is an array index: the canonical form of an integer below 2**32 - 1.
-fn is_index(key: &str) -> bool {
-    key.parse::<u32>()
-        .is_ok_and(|index| index != u32::MAX && index.to_string() == key)
 }
 
 /// The id of the property `key`.
@@ -916,14 +993,43 @@ fn remaining_text(remaining: f64) -> String {
     )
 }
 
-/// The number of entries out of `length` shown with `max_array_length`.
-fn shown_entries(max_array_length: f64, length: usize) -> usize {
-    let max = max_array_length.max(0.0);
-    if max >= length as f64 {
-        length
-    } else {
-        max as usize
+/// Node.js's `MathMin(MathMax(0, maxArrayLength), length)` for a collection of `length` entries:
+/// the limit, which is fractional for a fractional `max_array_length` and `NaN` for `NaN`. The
+/// entries below it are shown, and `length` minus it is the number of entries the output reports
+/// as remaining.
+fn entry_limit(max_array_length: f64, length: usize) -> f64 {
+    if max_array_length.is_nan() {
+        return f64::NAN;
     }
+    max_array_length.max(0.0).min(length as f64)
+}
+
+/// The number of entries below `limit`, none for `NaN`.
+fn shown_entries(limit: f64) -> usize {
+    limit.ceil() as usize
+}
+
+/// `bytes` as two hex digits each, separated by spaces, or `None` if the text can't be allocated.
+fn hex_bytes(bytes: &[u8]) -> Option<String> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::new();
+    text.try_reserve_exact(bytes.len().checked_mul(3)?).ok()?;
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        text.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+    }
+    Some(text)
+}
+
+/// The text of [`hex_bytes`], or an out-of-memory error for `None`.
+fn hex_text(scope: &Scope<'_>, text: Option<String>) -> Result<String, ExnThrown> {
+    text.ok_or_else(|| {
+        js::exception::report_out_of_memory(scope);
+        ExnThrown
+    })
 }
 
 /// `ms` since the epoch as `Date.prototype.toISOString` writes it.
@@ -1023,17 +1129,27 @@ impl<'s> Inspector<'s> {
     ) -> Result<String, ExnThrown> {
         let options = &self.options;
         if value.is_string() {
-            let mut units = string_units(scope, value)?;
+            let string = js::JSString::from_value(scope, value)?;
+            let length = string.len();
             let mut trailer = String::new();
-            if units.len() as f64 > options.max_string_length {
-                let max = options.max_string_length.max(0.0) as usize;
-                let remaining = units.len() - max;
-                units.truncate(max);
+            let mut shown = length;
+            let max = options.max_string_length;
+            if length as f64 > max {
+                // `value.slice(0, maxStringLength)`, where a negative end counts from the end.
+                let end = max.trunc();
+                shown = if end < 0.0 {
+                    (length as f64 + end).max(0.0) as usize
+                } else {
+                    end as usize
+                };
+                let remaining = length as f64 - max;
                 trailer = format!(
-                    "... {remaining} more character{}",
-                    if remaining > 1 { "s" } else { "" }
+                    "... {} more character{}",
+                    number_to_string(remaining),
+                    if remaining > 1.0 { "s" } else { "" }
                 );
             }
+            let units = string.to_utf16_prefix(scope, shown)?;
             let length = units.len() as f64;
             if options.compact != Compact::Bool(true)
                 && length > 16.0
@@ -1117,7 +1233,7 @@ impl<'s> Inspector<'s> {
                         self.intrinsics.inspect,
                     ],
                 )?;
-                if !same_object(result, object) {
+                if !same_object(result, context) {
                     if !result.is_string() {
                         return self.format_value(scope, result, recurse, false);
                     }
@@ -1183,7 +1299,7 @@ impl<'s> Inspector<'s> {
     ) -> Result<bool, ExnThrown> {
         let Some(descriptor) = self
             .intrinsics
-            .named_descriptor(scope, object, "constructor")?
+            .named_descriptor(scope, object, c"constructor")?
         else {
             return Ok(false);
         };
@@ -1209,15 +1325,16 @@ impl<'s> Inspector<'s> {
         scope: &Scope<'_>,
         object: Object<'_>,
     ) -> Result<String, ExnThrown> {
-        let bytes = js::ArrayBufferView::from_object(object)
-            .map(|view| view.copy_bytes(scope))
-            .transpose()?
-            .unwrap_or_default();
         let max = crate::buffer::inspect_max_bytes() as usize;
-        let mut text: Vec<String> = bytes.iter().take(max).map(|b| format!("{b:02x}")).collect();
-        let mut text = std::mem::take(&mut text).join(" ");
-        if bytes.len() > max {
-            let remaining = bytes.len() - max;
+        let (text, length) = match js::ArrayBufferView::from_object(object) {
+            Some(view) => {
+                view.with_bytes(|bytes| (hex_bytes(&bytes[..bytes.len().min(max)]), bytes.len()))
+            }
+            None => (Some(String::new()), 0),
+        };
+        let mut text = hex_text(scope, text)?;
+        if length > max {
+            let remaining = length - max;
             text.push_str(&format!(
                 " ... {remaining} more byte{}",
                 if remaining > 1 { "s" } else { "" }
@@ -1239,7 +1356,7 @@ impl<'s> Inspector<'s> {
                 scope.root_value(extras.to_jsval_raw_throwing(scope)?),
                 options,
             )?;
-            if !bytes.is_empty() {
+            if length != 0 {
                 text.push_str(", ");
             }
             let units: Vec<u16> = shown.encode_utf16().collect();
@@ -1256,25 +1373,44 @@ impl<'s> Inspector<'s> {
     }
 
     /// Node.js's `getConstructorName`, or `None` for an object with a null prototype.
+    ///
+    /// With `proto_props`, the properties [`Self::add_prototype_properties`] finds are added to
+    /// it.
     fn constructor_name(
         &mut self,
         scope: &Scope<'_>,
         object: Object<'_>,
         recurse: f64,
+        proto_props: Option<&mut Vec<String>>,
     ) -> Result<Option<String>, ExnThrown> {
         let mut current = Some(object);
         let mut first_proto: Option<Option<Object<'_>>> = None;
         while let Some(candidate) = current {
             if let Some(descriptor) =
                 self.intrinsics
-                    .named_descriptor(scope, candidate, "constructor")?
+                    .named_descriptor(scope, candidate, c"constructor")?
             {
                 if let Ok(ctor) = Object::from_value(scope, *descriptor.value) {
                     if ctor.is_callable() {
                         let name = ctor.get_property(scope, c"name")?;
                         let empty = name.is_string() && to_string(scope, name)?.is_empty();
                         if !empty && instance_of(scope, object, ctor)? {
-                            return Ok(Some(crate::errors::js_string(scope, name)?));
+                            let name = crate::errors::js_string(scope, name)?;
+                            if let Some(output) = proto_props {
+                                let first = match first_proto {
+                                    Some(Some(first)) => Some(first),
+                                    _ => None,
+                                };
+                                let below_first =
+                                    first.is_none_or(|first| first.as_raw() != candidate.as_raw());
+                                if below_first || !BUILTIN_OBJECTS.contains(&name.as_str()) {
+                                    let start = first.unwrap_or(object);
+                                    self.add_prototype_properties(
+                                        scope, object, start, recurse, output,
+                                    )?;
+                                }
+                            }
+                            return Ok(Some(name));
                         }
                     }
                 }
@@ -1298,7 +1434,7 @@ impl<'s> Inspector<'s> {
             return Ok(Some(format!("{internal} <Complex prototype>")));
         }
         let _guard = crate::errors::check_stack(scope)?;
-        match self.constructor_name(scope, first_proto, recurse + 1.0)? {
+        match self.constructor_name(scope, first_proto, recurse + 1.0, proto_props)? {
             Some(proto) => Ok(Some(format!("{internal} <{proto}>"))),
             None => {
                 let mut options = self.options.clone();
@@ -1311,6 +1447,103 @@ impl<'s> Inspector<'s> {
                 )))
             }
         }
+    }
+
+    /// Node.js's `addPrototypeProperties`: add to `output` the own properties that aren't
+    /// functions of up to three prototypes of `main`, starting at `object`, or at its prototype if
+    /// `object` is `main`. It stops at a null prototype and at a prototype whose `constructor` is
+    /// a builtin. Properties that `main` has, `constructor` and the keys of the prototypes before
+    /// are left out. Getters are called on `main`.
+    fn add_prototype_properties(
+        &mut self,
+        scope: &Scope<'_>,
+        main: Object<'_>,
+        object: Object<'_>,
+        recurse: f64,
+        output: &mut Vec<String>,
+    ) -> Result<(), ExnThrown> {
+        let mut object = object;
+        let mut above_names = std::collections::HashSet::new();
+        let mut above_symbols: Vec<HandleValue<'_>> = Vec::new();
+        let mut keys: Vec<HandleValue<'_>> = Vec::new();
+        for depth in 0..3 {
+            if depth != 0 || object.as_raw() == main.as_raw() {
+                let Some(proto) = object.get_prototype(scope)? else {
+                    return Ok(());
+                };
+                object = proto;
+                if has_builtin_constructor(scope, &self.intrinsics, object)? {
+                    return Ok(());
+                }
+            }
+            if depth != 0 {
+                for key in keys.drain(..) {
+                    if key.is_symbol() {
+                        above_symbols.push(key);
+                    } else {
+                        above_names.insert(to_string(scope, key)?);
+                    }
+                }
+            }
+            keys = object.own_keys(scope)?;
+            self.seen.push(RootedHeap::new(main));
+            let added = self.add_layer_properties(
+                scope,
+                main,
+                object,
+                recurse,
+                &keys,
+                (&above_names, &above_symbols),
+                output,
+            );
+            self.seen.pop();
+            added?;
+        }
+        Ok(())
+    }
+
+    /// The properties of one prototype layer for [`Self::add_prototype_properties`]. `above`
+    /// holds the string and symbol keys of the layers before.
+    #[allow(clippy::too_many_arguments)]
+    fn add_layer_properties(
+        &mut self,
+        scope: &Scope<'_>,
+        main: Object<'_>,
+        object: Object<'_>,
+        recurse: f64,
+        keys: &[HandleValue<'_>],
+        above: (&std::collections::HashSet<String>, &[HandleValue<'_>]),
+        output: &mut Vec<String>,
+    ) -> Result<(), ExnThrown> {
+        for &key in keys {
+            let id = key_id(scope, key)?;
+            if main.has_own_property_by_id(scope, id)? {
+                continue;
+            }
+            if key.is_symbol() {
+                let mut above_symbol = false;
+                for seen in above.1 {
+                    above_symbol |= js::comparison::strictly_equal(scope, *seen, key)?;
+                }
+                if above_symbol {
+                    continue;
+                }
+            } else {
+                let name = to_string(scope, key)?;
+                if name == "constructor" || above.0.contains(&name) {
+                    continue;
+                }
+            }
+            let Some(descriptor) = self.intrinsics.descriptor_by_id(scope, object, id)? else {
+                continue;
+            };
+            if Object::from_value(scope, *descriptor.value).is_ok_and(|value| value.is_callable()) {
+                continue;
+            }
+            let key = Key { key, descriptor };
+            output.push(self.format_property(scope, main, recurse, &key, Extras::Object)?);
+        }
+        Ok(())
     }
 
     /// The tag `inspect` shows for `object`: its `Symbol.toStringTag` if that is a string that
@@ -1361,10 +1594,12 @@ impl<'s> Inspector<'s> {
         skip_indices: bool,
     ) -> Result<Vec<Key<'r>>, ExnThrown> {
         let mut keys = Vec::new();
-        for key in object.own_keys(scope)? {
-            if skip_indices && key_text(scope, key)?.is_some_and(|text| is_index(&text)) {
-                continue;
-            }
+        let own = if skip_indices {
+            object.own_non_index_keys(scope)?
+        } else {
+            object.own_keys(scope)?
+        };
+        for key in own {
             let Some(descriptor) = self.intrinsics.descriptor(scope, object, key)? else {
                 continue;
             };
@@ -1400,8 +1635,17 @@ impl<'s> Inspector<'s> {
         typed_array: bool,
     ) -> Result<String, ExnThrown> {
         let mut typed_array = typed_array;
-        let constructor = self.constructor_name(scope, value, recurse)?;
+        let mut proto_props = Vec::new();
+        let collect_proto_props =
+            self.options.show_hidden && self.options.depth.is_none_or(|depth| recurse <= depth);
+        let constructor = self.constructor_name(
+            scope,
+            value,
+            recurse,
+            collect_proto_props.then_some(&mut proto_props),
+        )?;
         let constructor = constructor.as_deref();
+        let no_proto_props = proto_props.is_empty();
         let tag = self.tag(scope, value)?;
         let mut base = String::new();
         let mut formatter = Formatter::None;
@@ -1425,7 +1669,7 @@ impl<'s> Inspector<'s> {
                 };
                 keys = self.non_index_keys(scope, value)?;
                 braces = (format!("{prefix}["), "]".into());
-                if length == 0 && keys.is_empty() {
+                if length == 0 && keys.is_empty() && no_proto_props {
                     return Ok(format!("{}]", braces.0));
                 }
                 extras = Extras::ArrayAndKeys;
@@ -1441,7 +1685,7 @@ impl<'s> Inspector<'s> {
                 let prefix = get_prefix(constructor, &tag, kind, &format!("({size})"));
                 keys = self.keys(scope, value)?;
                 formatter = if map { Formatter::Map } else { Formatter::Set };
-                if size == 0 && keys.is_empty() {
+                if size == 0 && keys.is_empty() && no_proto_props {
                     return Ok(format!("{prefix}{{}}"));
                 }
                 braces = (format!("{prefix}{{"), "}".into());
@@ -1487,7 +1731,7 @@ impl<'s> Inspector<'s> {
             braces = ("{".into(), "}".into());
             if value.is_callable() {
                 base = self.function_base(scope, value, constructor, &tag)?;
-                if keys.is_empty() {
+                if keys.is_empty() && no_proto_props {
                     return Ok(base);
                 }
             } else if constructor == Some("Object") {
@@ -1496,7 +1740,7 @@ impl<'s> Inspector<'s> {
                 } else if !tag.is_empty() {
                     braces.0 = format!("{}{{", get_prefix(constructor, &tag, "Object", ""));
                 }
-                if keys.is_empty() {
+                if keys.is_empty() && no_proto_props {
                     return Ok(format!("{}}}", braces.0));
                 }
             } else if is_regexp(scope, value)? {
@@ -1507,7 +1751,7 @@ impl<'s> Inspector<'s> {
                 if prefix != "RegExp " {
                     base = format!("{prefix}{base}");
                 }
-                if keys.is_empty() || self.depth_exceeded(recurse) {
+                if (keys.is_empty() && no_proto_props) || self.depth_exceeded(recurse) {
                     return Ok(base);
                 }
             } else if is_date(scope, value)? {
@@ -1524,12 +1768,12 @@ impl<'s> Inspector<'s> {
                 if prefix != "Date " {
                     base = format!("{prefix}{base}");
                 }
-                if keys.is_empty() {
+                if keys.is_empty() && no_proto_props {
                     return Ok(base);
                 }
             } else if is_error(scope, value)? {
                 base = self.format_error(scope, value, constructor, &tag, &mut keys)?;
-                if keys.is_empty() {
+                if keys.is_empty() && no_proto_props {
                     return Ok(base);
                 }
             } else if is_array_buffer(value) || is_shared_array_buffer(scope, value)? {
@@ -1541,7 +1785,7 @@ impl<'s> Inspector<'s> {
                 let prefix = get_prefix(constructor, &tag, kind, "");
                 if !typed_array {
                     formatter = Formatter::ArrayBuffer;
-                } else if keys.is_empty() {
+                } else if keys.is_empty() && no_proto_props {
                     let length = value.get_property(scope, c"byteLength")?;
                     let length = if length.is_number() {
                         self.format_primitive(scope, length)?
@@ -1566,12 +1810,12 @@ impl<'s> Inspector<'s> {
                 formatter = Formatter::WeakCollection;
             } else if let Some(kind) = boxed_kind(scope, value)? {
                 base = self.boxed_base(scope, value, kind, &mut keys, constructor, &tag)?;
-                if keys.is_empty() {
+                if keys.is_empty() && no_proto_props {
                     return Ok(base);
                 }
             } else {
                 let style = self.ctx_style(constructor, &tag, value);
-                if keys.is_empty() {
+                if keys.is_empty() && no_proto_props {
                     return Ok(format!("{style}{{}}"));
                 }
                 braces.0 = format!("{style}{{");
@@ -1616,6 +1860,7 @@ impl<'s> Inspector<'s> {
             }
             Err(error) => return Err(error),
         };
+        output.extend(proto_props);
         if let Some(index) = self.circular.iter().position(|seen| *seen == value) {
             let reference = format!("<ref *{}>", index + 1);
             if self.options.compact != Compact::Bool(true) {
@@ -1628,16 +1873,36 @@ impl<'s> Inspector<'s> {
                 braces.0 = format!("{reference} {}", braces.0);
             }
         }
-        if self.options.sorted {
-            let by_units = |a: &String, b: &String| a.encode_utf16().cmp(b.encode_utf16());
+        if !matches!(self.options.sorted, Sorted::No) {
             if extras == Extras::Object {
-                output.sort_by(by_units);
+                self.sort_entries(scope, &mut output)?;
             } else if keys.len() > 1 {
                 let start = output.len() - keys.len();
-                output[start..].sort_by(by_units);
+                self.sort_entries(scope, &mut output[start..])?;
             }
         }
         self.reduce_to_single_string(scope, output, &base, &braces, extras, recurse, Some(value))
+    }
+
+    /// Sort `entries` as the `sorted` option asks: by UTF-16 code units for `true`, and with
+    /// `Array.prototype.sort` and the option's value as the comparator otherwise.
+    fn sort_entries(&self, scope: &Scope<'_>, entries: &mut [String]) -> Result<(), ExnThrown> {
+        let comparator = match &self.options.sorted {
+            Sorted::No => return Ok(()),
+            Sorted::Yes => {
+                entries.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+                return Ok(());
+            }
+            Sorted::By(comparator) => comparator.get(scope),
+        };
+        let texts: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let array = js::Array::with_contents(scope, &texts)?;
+        let sort = self.intrinsics.realm.data().array_sort.get(scope);
+        Function::call(scope, array.as_value(), sort, &[comparator])?;
+        for (entry, value) in entries.iter_mut().zip(array.to_vec(scope)?) {
+            *entry = to_string(scope, value)?;
+        }
+        Ok(())
     }
 
     /// The output of `formatRaw`'s formatter, extra keys and properties.
@@ -1661,7 +1926,7 @@ impl<'s> Inspector<'s> {
                 let map = matches!(formatter, Formatter::Map);
                 self.format_collection(scope, value, recurse, map)?
             }
-            Formatter::ArrayBuffer => self.format_array_buffer(value),
+            Formatter::ArrayBuffer => self.format_array_buffer(scope, value)?,
             Formatter::Promise => self.format_promise(scope, value, recurse)?,
             Formatter::WeakCollection => vec!["<items unknown>".into()],
             Formatter::Iterator => Vec::new(),
@@ -1788,7 +2053,7 @@ impl<'s> Inspector<'s> {
     ) -> Result<String, ExnThrown> {
         let primitive = unbox(scope, value)?.unwrap_or(HandleValue::undefined());
         if kind == Boxed::String {
-            let length = string_units(scope, primitive)?.len();
+            let length = js::JSString::from_value(scope, primitive)?.len();
             keys.drain(..length.min(keys.len()));
         }
         let name = kind.name();
@@ -1874,12 +2139,7 @@ impl<'s> Inspector<'s> {
             Some(name) if !name.is_undefined() && !name.is_null() => Some(name),
             _ => None,
         };
-        for field in ["cause", "errors"] {
-            let field_c = if field == "cause" {
-                c"cause"
-            } else {
-                c"errors"
-            };
+        for (field, field_c) in [("cause", c"cause"), ("errors", c"errors")] {
             if !error.has_own_property(scope, field_c)?
                 || position(scope, keys, |scope, key| key_is(scope, key, field))?.is_some()
             {
@@ -1903,7 +2163,7 @@ impl<'s> Inspector<'s> {
                     }
                 }
             }
-            if let Some(descriptor) = self.intrinsics.named_descriptor(scope, error, field)? {
+            if let Some(descriptor) = self.intrinsics.named_descriptor(scope, error, field_c)? {
                 let key = scope.root_value(js::JSString::from_str(scope, field)?.as_value());
                 keys.push(Key { key, descriptor });
             }
@@ -1953,10 +2213,7 @@ impl<'s> Inspector<'s> {
         if bool::from_jsval(scope, stack, ()).unwrap_or(false) {
             if stack.is_string() {
                 let stack = to_string(scope, stack)?;
-                return match spidermonkey_frames(&stack) {
-                    Some(frames) => Ok(format!("{}{}", error_to_string(scope, error)?, frames)),
-                    None => Ok(stack),
-                };
+                return v8_stack(scope, error, stack);
             }
             self.seen.push(RootedHeap::new(error));
             self.indentation += 4;
@@ -2178,18 +2435,19 @@ impl<'s> Inspector<'s> {
         recurse: f64,
     ) -> Result<Vec<String>, ExnThrown> {
         let length = array_length(scope, array)? as usize;
-        let max = shown_entries(self.options.max_array_length, length);
+        let limit = entry_limit(self.options.max_array_length, length);
         let mut output = Vec::new();
-        for index in 0..max {
+        for index in 0..shown_entries(limit) {
             let key = scope.root_value(js::value::from_f64(index as f64));
             let Some(descriptor) = self.intrinsics.descriptor(scope, array, key)? else {
-                return self.format_special_array(scope, array, recurse, max, output, index);
+                return self.format_special_array(scope, array, recurse, limit, output, index);
             };
             let key = Key { key, descriptor };
             output.push(self.format_property(scope, array, recurse, &key, Extras::Array)?);
         }
-        if length > max {
-            output.push(remaining_text((length - max) as f64));
+        let remaining = length as f64 - limit;
+        if remaining > 0.0 {
+            output.push(remaining_text(remaining));
         }
         Ok(output)
     }
@@ -2199,7 +2457,7 @@ impl<'s> Inspector<'s> {
         scope: &Scope<'_>,
         array: Object<'_>,
         recurse: f64,
-        max: usize,
+        limit: f64,
         mut output: Vec<String>,
         start: usize,
     ) -> Result<Vec<String>, ExnThrown> {
@@ -2214,7 +2472,7 @@ impl<'s> Inspector<'s> {
         }
         let mut index = start;
         let mut position = start;
-        while position < keys.len() && output.len() < max {
+        while position < keys.len() && (output.len() as f64) < limit {
             let key = &keys[position];
             let text = to_string(scope, key.key)?;
             let number: f64 = text.parse().unwrap_or(f64::NAN);
@@ -2231,7 +2489,7 @@ impl<'s> Inspector<'s> {
                     if empty > 1 { "s" } else { "" }
                 ));
                 index = number as usize;
-                if output.len() == max {
+                if output.len() as f64 == limit {
                     break;
                 }
             }
@@ -2241,7 +2499,7 @@ impl<'s> Inspector<'s> {
         }
         let length = array_length(scope, array)? as usize;
         let remaining = length.saturating_sub(index);
-        if output.len() != max {
+        if output.len() as f64 != limit {
             if remaining > 0 {
                 output.push(format!(
                     "<{remaining} empty item{}>",
@@ -2263,14 +2521,20 @@ impl<'s> Inspector<'s> {
         let length = js::ArrayBufferView::from_object(array)
             .map(|view| view.array_length())
             .unwrap_or(0);
-        let max = shown_entries(self.options.max_array_length, length);
+        let limit = entry_limit(self.options.max_array_length, length);
+        // Node.js creates its output with `new Array(limit)`, which throws for a fractional limit.
+        if limit.fract() != 0.0 || limit.is_nan() {
+            return Err(js::error::throw_range_error(scope, c"Invalid array length"));
+        }
+        let max = shown_entries(limit);
         let mut output = Vec::with_capacity(max + 1);
         for index in 0..max {
             let element = array.get_element(scope, index as u32)?;
             output.push(self.format_primitive(scope, element)?);
         }
-        if length > max {
-            output.push(remaining_text((length - max) as f64));
+        let remaining = length as f64 - limit;
+        if remaining > 0.0 {
+            output.push(remaining_text(remaining));
         }
         Ok(output)
     }
@@ -2283,8 +2547,16 @@ impl<'s> Inspector<'s> {
         recurse: f64,
         map: bool,
     ) -> Result<Vec<String>, ExnThrown> {
-        let entries = collection_entries(scope, object, map)?;
-        let max = shown_entries(self.options.max_array_length, entries.len());
+        let size = collection_size(object, map, scope);
+        let limit = entry_limit(self.options.max_array_length, size);
+        // Node.js's loop stops at the first index `>= limit`, which is none for `NaN`.
+        let max = if limit.is_nan() {
+            size
+        } else {
+            shown_entries(limit)
+        };
+        let entries =
+            first_collection_entries(scope, object, map, u32::try_from(max).unwrap_or(u32::MAX))?;
         let mut output = Vec::with_capacity(max + 1);
         self.indentation += 2;
         let result = (|| -> Result<(), ExnThrown> {
@@ -2301,28 +2573,34 @@ impl<'s> Inspector<'s> {
         })();
         self.indentation -= 2;
         result?;
-        if entries.len() > max {
-            output.push(remaining_text((entries.len() - max) as f64));
+        let remaining = size as f64 - limit;
+        if remaining > 0.0 {
+            output.push(remaining_text(remaining));
         }
         Ok(output)
     }
 
     /// Node.js's `formatArrayBuffer`.
-    fn format_array_buffer(&self, buffer: Object<'_>) -> Vec<String> {
+    fn format_array_buffer(
+        &self,
+        scope: &Scope<'_>,
+        buffer: Object<'_>,
+    ) -> Result<Vec<String>, ExnThrown> {
         if buffer
             .cast::<js::ArrayBuffer>()
             .is_ok_and(|buffer| buffer.is_detached())
         {
-            return vec!["(detached)".into()];
+            return Ok(vec!["(detached)".into()]);
         }
         let max_array_length = self.options.max_array_length;
-        let (mut text, length) = js::typedarray::with_buffer_source_bytes(buffer, |bytes| {
-            let max = shown_entries(max_array_length, bytes.len());
-            let text: Vec<String> = bytes[..max].iter().map(|b| format!("{b:02x}")).collect();
-            (text.join(" "), bytes.len())
+        let (text, length) = js::typedarray::with_buffer_source_bytes(buffer, |bytes| {
+            // Node.js shows the bytes below the integer part of the limit.
+            let max = entry_limit(max_array_length, bytes.len()) as usize;
+            (hex_bytes(&bytes[..max]), bytes.len())
         })
-        .unwrap_or_default();
-        let remaining = length as f64 - max_array_length;
+        .unwrap_or((Some(String::new()), 0));
+        let mut text = hex_text(scope, text)?;
+        let remaining = length as f64 - self.options.max_array_length;
         if remaining > 0.0 {
             text.push_str(&format!(
                 " ... {} more byte{}",
@@ -2330,7 +2608,7 @@ impl<'s> Inspector<'s> {
                 if remaining > 1.0 { "s" } else { "" }
             ));
         }
-        vec![format!("[Uint8Contents]: <{text}>")]
+        Ok(vec![format!("[Uint8Contents]: <{text}>")])
     }
 
     /// Node.js's `formatPromise`.
@@ -2675,17 +2953,58 @@ pub(crate) fn spidermonkey_frames(stack: &str) -> Option<String> {
 }
 
 /// `stack`, the `stack` of `error`, in V8's form: a stack in SpiderMonkey's form becomes the first
-/// line [`error_to_string`] writes followed by its frames, and other stacks are returned as they
-/// are.
+/// line [`stack_header`] writes followed by its frames, and other stacks are returned as they are.
+/// In a realm without the Node.js classes, such as a `vm` context's, where [`stack_header`]
+/// throws, the first line is [`error_to_string`]'s.
 pub(crate) fn v8_stack(
     scope: &Scope<'_>,
     error: Object<'_>,
     stack: String,
 ) -> Result<String, ExnThrown> {
-    match spidermonkey_frames(&stack) {
-        Some(frames) => Ok(format!("{}{frames}", error_to_string(scope, error)?)),
-        None => Ok(stack),
+    let Some(frames) = spidermonkey_frames(&stack) else {
+        return Ok(stack);
+    };
+    let header = match stack_header(scope, error) {
+        Ok(header) => header,
+        Err(ExnThrown) => {
+            js::exception::clear(scope);
+            error_to_string(scope, error)?
+        }
+    };
+    Ok(format!("{header}{frames}"))
+}
+
+/// The first line of the stack Node gives `error`, as `defaultPrepareStackTrace` writes it:
+/// `` `${name} [${code}]: ${message}` `` for the errors of Node's `ERR_` codes, the name
+/// `AssertionError [ERR_ASSERTION]` for an `AssertionError`, and [`error_to_string`] for other
+/// errors.
+fn stack_header(scope: &Scope<'_>, error: Object<'_>) -> Result<String, ExnThrown> {
+    if crate::errors::is_node_error(scope, error)? {
+        let name = error.get_property(scope, c"name")?;
+        let code = error.get_property(scope, c"code")?;
+        let message = error.get_property(scope, c"message")?;
+        return Ok(format!(
+            "{} [{}]: {}",
+            to_string(scope, name)?,
+            to_string(scope, code)?,
+            to_string(scope, message)?
+        ));
     }
+    let assertion_error = crate::assert::assertion_error::class_constructor(scope)?;
+    if instance_of(scope, error, assertion_error)? {
+        let message = error.get_property(scope, c"message")?;
+        let message = if message.is_undefined() {
+            String::new()
+        } else {
+            to_string(scope, message)?
+        };
+        return Ok(if message.is_empty() {
+            "AssertionError [ERR_ASSERTION]".into()
+        } else {
+            format!("AssertionError [ERR_ASSERTION]: {message}")
+        });
+    }
+    error_to_string(scope, error)
 }
 
 /// `Error.prototype.toString` applied to `error`.
@@ -2767,6 +3086,152 @@ fn identical_sequence_range(a: &[String], b: &[&str]) -> (usize, usize) {
     (0, 0)
 }
 
+/// `value` as V8's `Object::NoSideEffectsToString` converts it for Node.js's
+/// `noSideEffectsToString`, without calling into JavaScript:
+///
+/// - A string is itself, a symbol is converted by `Symbol.prototype.toString`, and other
+///   primitives are converted by `String`.
+/// - A function is its source text.
+/// - An error object, or an object whose `toString` is the realm's `Error.prototype.toString`, is
+///   its `name` and `message` joined by `: `, or the one of them that isn't empty. They default to
+///   `Error` and the empty string.
+/// - An object whose `toString` is the realm's `Object.prototype.toString` and whose `constructor`
+///   is a function with a `name` that isn't empty is `#<name>`.
+/// - Any other object is `[object tag]`, where the tag is its `Symbol.toStringTag` if that is a
+///   string, and the name of its builtin class, such as `Array`, or `Object` otherwise.
+///
+/// The properties are read as [`data_property`] reads them.
+pub(crate) fn no_side_effects_to_string(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+) -> Result<String, ExnThrown> {
+    if value.is_symbol() {
+        return Ok(symbol_to_string(scope, value));
+    }
+    let Ok(object) = Object::from_value(scope, value) else {
+        return js::JSString::from_value(scope, value)?.to_utf8(scope);
+    };
+    if let Ok(function) = object.cast::<js::Function>() {
+        if let Some(raw) = std::ptr::NonNull::new(function.as_function_ptr()) {
+            let source = js::compile::decompile_function(scope, scope.root_function(raw))?;
+            if let Some(source) = std::ptr::NonNull::new(source.get()) {
+                return Ok(js::conversion::jsstr_to_string(scope, source));
+            }
+        }
+    }
+    let intrinsics = realm_intrinsics(scope)?;
+    let to_string = data_property(scope, object, c"toString")?;
+    let same = |intrinsic: &Heap<Value>| {
+        let intrinsic = intrinsic.get(scope);
+        to_string.is_object()
+            && intrinsic.is_object()
+            && to_string.to_object() == intrinsic.to_object()
+    };
+    let error_to_string = same(&intrinsics.data().error_to_string);
+    if error_to_string || js::exception::is_error_object(scope, value) {
+        let text = |name: &'static CStr, default: &str| -> Result<String, ExnThrown> {
+            let value = data_property(scope, object, name)?;
+            if value.is_string() {
+                return js::JSString::from_value(scope, value)?.to_utf8(scope);
+            }
+            Ok(default.to_string())
+        };
+        let name = text(c"name", "Error")?;
+        let message = text(c"message", "")?;
+        return Ok(match (name.is_empty(), message.is_empty()) {
+            (true, _) => message,
+            (_, true) => name,
+            _ => format!("{name}: {message}"),
+        });
+    }
+    if same(&intrinsics.data().object_to_string) {
+        let constructor = data_property(scope, object, c"constructor")?;
+        if let Ok(constructor) = Object::from_value(scope, constructor) {
+            let name = data_property(scope, constructor, c"name")?;
+            if constructor.is_callable() && name.is_string() {
+                let name = js::JSString::from_value(scope, name)?.to_utf8(scope)?;
+                if !name.is_empty() {
+                    return Ok(format!("#<{name}>"));
+                }
+            }
+        }
+    }
+    let tag_key = js::symbol::get_well_known_key(scope, SymbolCode::toStringTag);
+    let tag = data_property_by_key(scope, object, tag_key)?;
+    let tag = if tag.is_string() {
+        js::JSString::from_value(scope, tag)?.to_utf8(scope)?
+    } else {
+        let tag = match es_class(scope, object) {
+            ESClass::Array => "Array",
+            ESClass::Number => "Number",
+            ESClass::String => "String",
+            ESClass::Boolean => "Boolean",
+            ESClass::RegExp => "RegExp",
+            ESClass::ArrayBuffer => "ArrayBuffer",
+            ESClass::SharedArrayBuffer => "SharedArrayBuffer",
+            ESClass::Date => "Date",
+            ESClass::Set => "Set",
+            ESClass::Map => "Map",
+            ESClass::Promise => "Promise",
+            ESClass::Arguments => "Arguments",
+            ESClass::Error => "Error",
+            ESClass::BigInt => "BigInt",
+            ESClass::Function => "Function",
+            _ => "Object",
+        };
+        tag.to_string()
+    };
+    Ok(format!("[object {tag}]"))
+}
+
+/// The value of the data property `name` of `object` or of the first object on its prototype
+/// chain that has an own property `name`, as V8's `JSReceiver::GetDataProperty` reads it:
+/// `undefined` for an accessor, for no such property, and if the chain reaches a proxy.
+fn data_property<'s>(
+    scope: &'s Scope<'_>,
+    object: Object<'_>,
+    name: &'static CStr,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let id = js::class::get_or_init_property_id(scope, name)?;
+    data_property_by_id(scope, object, id)
+}
+
+/// [`data_property`] with the property key `key`.
+fn data_property_by_key<'s>(
+    scope: &'s Scope<'_>,
+    object: Object<'_>,
+    key: js::native::PropertyKey,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let id = scope.root_id(key);
+    data_property_by_id(scope, object, id)
+}
+
+/// [`data_property`] with the property ID `id`.
+fn data_property_by_id<'s>(
+    scope: &'s Scope<'_>,
+    object: Object<'_>,
+    id: js::native::HandleId<'_>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let mut current = Some(scope.root_object(object.as_non_null().ok_or(ExnThrown)?));
+    while let Some(raw) = current {
+        let holder = Object::from_handle(raw).ok_or(ExnThrown)?;
+        if holder.is_proxy() {
+            break;
+        }
+        if let Some(own) = holder.own_property_descriptor(scope, id)? {
+            return Ok(match own.value {
+                Some(value) => value,
+                None => HandleValue::undefined(),
+            });
+        }
+        current = holder
+            .get_prototype(scope)?
+            .and_then(|proto| proto.as_non_null())
+            .map(|proto| scope.root_object(proto));
+    }
+    Ok(HandleValue::undefined())
+}
+
 /// `Symbol.prototype.toString` applied to the symbol `value`.
 pub(crate) fn symbol_to_string(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
     let Some(symbol) = std::ptr::NonNull::new(value.to_symbol()) else {
@@ -2787,36 +3252,13 @@ pub(crate) fn instance_of(
     object: Object<'_>,
     ctor: Object<'_>,
 ) -> Result<bool, ExnThrown> {
-    let proto = match ctor.get_property(scope, c"prototype") {
-        Ok(proto) => proto,
-        Err(ExnThrown) => {
+    let object = object.to_jsval_throwing(scope)?;
+    Ok(ctor
+        .ordinary_has_instance(scope, object)
+        .unwrap_or_else(|ExnThrown| {
             js::exception::clear(scope);
-            return Ok(false);
-        }
-    };
-    let Ok(proto) = Object::from_value(scope, *proto) else {
-        return Ok(false);
-    };
-    let mut current = match object.get_prototype(scope) {
-        Ok(current) => current,
-        Err(ExnThrown) => {
-            js::exception::clear(scope);
-            return Ok(false);
-        }
-    };
-    while let Some(candidate) = current {
-        if candidate.as_raw() == proto.as_raw() {
-            return Ok(true);
-        }
-        current = match candidate.get_prototype(scope) {
-            Ok(next) => next,
-            Err(ExnThrown) => {
-                js::exception::clear(scope);
-                return Ok(false);
-            }
-        };
-    }
-    Ok(false)
+            false
+        }))
 }
 
 /// `Buffer.prototype[inspect.custom]()` for the buffer `object`: `<Buffer` and its first
@@ -2940,7 +3382,16 @@ fn has_builtin_to_string(
             break;
         }
     }
-    let Some(descriptor) = intrinsics.named_descriptor(scope, pointer, "constructor")? else {
+    has_builtin_constructor(scope, intrinsics, pointer)
+}
+
+/// Whether `object`'s own `constructor` is a function whose `name` is in [`BUILTIN_OBJECTS`].
+fn has_builtin_constructor(
+    scope: &Scope<'_>,
+    intrinsics: &Intrinsics<'_>,
+    object: Object<'_>,
+) -> Result<bool, ExnThrown> {
+    let Some(descriptor) = intrinsics.named_descriptor(scope, object, c"constructor")? else {
         return Ok(false);
     };
     let Ok(ctor) = Object::from_value(scope, *descriptor.value) else {
@@ -3109,12 +3560,16 @@ fn try_stringify(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<String, Ex
 /// for are joined with spaces without reading them.
 pub fn format_current(scope: &Scope<'_>, args: &[HandleValue<'_>]) -> Result<String, ExnThrown> {
     if args.iter().all(|arg| arg.is_string()) {
-        let strings = args
-            .iter()
-            .map(|arg| to_string(scope, *arg))
-            .collect::<Result<Vec<_>, _>>()?;
-        if strings.len() <= 1 || !strings[0].contains('%') {
-            return Ok(strings.join(" "));
+        let Some((first, rest)) = args.split_first() else {
+            return Ok(String::new());
+        };
+        let mut out = to_string(scope, *first)?;
+        if rest.is_empty() || !out.contains('%') {
+            for arg in rest {
+                out.push(' ');
+                out.push_str(&to_string(scope, *arg)?);
+            }
+            return Ok(out);
         }
     }
     format(scope, args, &InspectOptions::current(scope)?)
@@ -3307,37 +3762,38 @@ enum Iteration {
     Map,
 }
 
-/// The names of the constructors Node.js's `wellKnownConstructors` holds.
-const WELL_KNOWN_CONSTRUCTORS: &[&CStr] = &[
-    c"Array",
-    c"ArrayBuffer",
-    c"BigInt",
-    c"BigInt64Array",
-    c"BigUint64Array",
-    c"Boolean",
-    c"DataView",
-    c"Date",
-    c"Error",
-    c"Float32Array",
-    c"Float64Array",
-    c"Function",
-    c"Int16Array",
-    c"Int32Array",
-    c"Int8Array",
-    c"Map",
-    c"Number",
-    c"Object",
-    c"Promise",
-    c"RegExp",
-    c"Set",
-    c"String",
-    c"Symbol",
-    c"Uint16Array",
-    c"Uint32Array",
-    c"Uint8Array",
-    c"Uint8ClampedArray",
-    c"WeakMap",
-    c"WeakSet",
+/// The standard classes whose constructors Node.js's `wellKnownConstructors` holds.
+const WELL_KNOWN_CONSTRUCTORS: &[JSProtoKey] = &[
+    JSProtoKey::JSProto_Array,
+    JSProtoKey::JSProto_ArrayBuffer,
+    JSProtoKey::JSProto_BigInt,
+    JSProtoKey::JSProto_BigInt64Array,
+    JSProtoKey::JSProto_BigUint64Array,
+    JSProtoKey::JSProto_Boolean,
+    JSProtoKey::JSProto_DataView,
+    JSProtoKey::JSProto_Date,
+    JSProtoKey::JSProto_Error,
+    JSProtoKey::JSProto_Float32Array,
+    JSProtoKey::JSProto_Float64Array,
+    JSProtoKey::JSProto_Function,
+    JSProtoKey::JSProto_Int16Array,
+    JSProtoKey::JSProto_Int32Array,
+    JSProtoKey::JSProto_Int8Array,
+    JSProtoKey::JSProto_Map,
+    JSProtoKey::JSProto_Number,
+    JSProtoKey::JSProto_Object,
+    JSProtoKey::JSProto_Promise,
+    JSProtoKey::JSProto_RegExp,
+    JSProtoKey::JSProto_Set,
+    JSProtoKey::JSProto_String,
+    JSProtoKey::JSProto_Symbol,
+    JSProtoKey::JSProto_Uint16Array,
+    JSProtoKey::JSProto_Uint32Array,
+    JSProtoKey::JSProto_Uint8Array,
+    JSProtoKey::JSProto_Uint8ClampedArray,
+    JSProtoKey::JSProto_WeakMap,
+    JSProtoKey::JSProto_WeakSet,
+    JSProtoKey::JSProto_Float16Array,
 ];
 
 /// A deep comparison in progress, for `isDeepStrictEqual` and `assert`'s deep assertions.
@@ -3443,7 +3899,7 @@ impl Comparer<'_> {
         &self,
         scope: &Scope<'_>,
         object: Object<'_>,
-        name: &str,
+        name: &'static CStr,
     ) -> Result<bool, ExnThrown> {
         Ok(self
             .intrinsics
@@ -3459,7 +3915,7 @@ impl Comparer<'_> {
         y: Object<'_>,
         name: &'static CStr,
     ) -> Result<bool, ExnThrown> {
-        if self.has_enumerable(scope, y, &name.to_string_lossy())? {
+        if self.has_enumerable(scope, y, name)? {
             return Ok(true);
         }
         let a = x.get_property(scope, name)?;
@@ -3477,11 +3933,13 @@ impl Comparer<'_> {
         skip_indices: bool,
     ) -> Result<Vec<HandleValue<'r>>, ExnThrown> {
         let mut keys = Vec::new();
-        for key in object.own_keys(scope)? {
+        let own = if skip_indices {
+            object.own_non_index_keys(scope)?
+        } else {
+            object.own_keys(scope)?
+        };
+        for key in own {
             if key.is_symbol() && !symbols {
-                continue;
-            }
-            if skip_indices && key_text(scope, key)?.is_some_and(|text| is_index(&text)) {
                 continue;
             }
             if self
@@ -3532,8 +3990,8 @@ impl Comparer<'_> {
             }
         }
 
-        if js::Array::is_array(scope, x.handle())? {
-            if !js::Array::is_array(scope, y.handle())?
+        if js::Array::is_array_or_array_proxy(scope, x.handle())? {
+            if !js::Array::is_array_or_array_proxy(scope, y.handle())?
                 || array_length(scope, x)? != array_length(scope, y)?
                 || Self::unequal_tag(scope, x, y)?
             {
@@ -3657,7 +4115,7 @@ impl Comparer<'_> {
                 None => self.intrinsics.object_to_string(scope, x)?,
             };
             if self.slow_unequal_tag(scope, &x_tag, x, y)?
-                || js::Array::is_array(scope, y.handle())?
+                || js::Array::is_array_or_array_proxy(scope, y.handle())?
                 || js::ArrayBufferView::from_object(y).is_some()
                 || is_set(scope, y)?
                 || is_map(scope, y)?
@@ -4237,7 +4695,7 @@ impl Comparer<'_> {
 }
 
 /// `object instanceof Error`.
-fn is_error_instance(scope: &Scope<'_>, object: Object<'_>) -> Result<bool, ExnThrown> {
+pub(crate) fn is_error_instance(scope: &Scope<'_>, object: Object<'_>) -> Result<bool, ExnThrown> {
     let error = crate::support::class_object(scope, JSProtoKey::JSProto_Error)?;
     instance_of(scope, object, error)
 }

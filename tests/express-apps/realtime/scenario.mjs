@@ -35,6 +35,17 @@ function connect(t, path, cookie) {
   return { ws, events, until };
 }
 
+// Requests `/stats` without recording the response until `predicate` holds for its body.
+async function untilStats(t, predicate) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const stats = await fetch(t.base + '/stats').then((r) => r.json());
+    if (predicate(stats)) return;
+    if (Date.now() > deadline) throw new Error(`timed out waiting on /stats: ${JSON.stringify(stats)}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 export default async function (t) {
   await t.get('/me');
   const anon = connect(t, '/ws/lobby');
@@ -70,7 +81,7 @@ export default async function (t) {
   await t.post('/rooms/lobby/messages', { json: { text: 'x' }, jar: false, name: 'anonymous' });
 
   const poll = t.get('/rooms/other/poll?timeout=3000');
-  await new Promise((r) => setTimeout(r, 100));
+  await untilStats(t, (stats) => stats.polling === 1);
   c.ws.send(JSON.stringify({ type: 'say', text: 'polled' }));
   await poll;
   await t.get('/rooms/other/poll?timeout=50', { name: 'timeout' });
@@ -85,6 +96,7 @@ export default async function (t) {
   t.note('a', a.events);
   t.note('b', b.events);
   t.note('c', c.events);
-  await new Promise((r) => setTimeout(r, 100));
+  // We wait until the server removed the closed clients.
+  await untilStats(t, (stats) => stats.clients === 0);
   await t.get('/stats', { name: 'after close' });
 }

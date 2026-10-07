@@ -5,37 +5,103 @@
 //!
 //! See <https://nodejs.org/api/errors.html#nodejs-error-codes>.
 
-use js::conversion::FromJSVal;
+use std::ffi::CStr;
+
+use js::class_spec::JSProtoKey;
+use js::conversion::{FromJSVal, ToJSVal};
 use js::error::JSExnType;
 use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::Object;
 
+mod web;
+
 /// `Number.MAX_SAFE_INTEGER`.
 pub(crate) const MAX_SAFE_INTEGER: f64 = 9007199254740991.0;
 
 /// A `SystemError` with the code `key` and the message `message`: an `Error` named `SystemError`
-/// with a `toString` that includes the code, the `info` object `fill_info` fills, and that
-/// object's `errno`, `syscall` and `path`.
+/// with an own `kIsNodeError` property, a `toString` that includes the code, and the `info` object
+/// `fill_info` fills as a read-only enumerable property. `errno` and `syscall` are accessors over
+/// `info`'s properties of the same names, as are `path` and `dest` if `info` has them.
 pub(crate) fn system_error<'s>(
     scope: &'s Scope<'_>,
     key: &'static str,
     message: String,
     fill_info: impl FnOnce(Object<'_>) -> Result<(), ExnThrown>,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let error = NodeError::new(ErrorKind::Error, key, message).to_value(scope)?;
+    let error = NodeError::new(ErrorKind::Error, key, message).to_native_value(scope)?;
     let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
+    let readonly = js::class_spec::JSPROP_READONLY as u32;
+    object.define_value_by_id(scope, K_IS_NODE_ERROR.id(scope)?, true, readonly)?;
     object.define_property(scope, c"name", "SystemError", 0)?;
     let to_string = js::Function::new_callback(scope, c"toString", 0, system_error_to_string, ())?;
     object.define_property(scope, c"toString", to_string, 0)?;
     let info = Object::new_plain(scope)?;
     fill_info(info)?;
-    object.set_property(scope, c"info", info)?;
-    for name in [c"errno", c"syscall", c"path"] {
-        object.set_property(scope, name, info.get_property(scope, name)?)?;
+    let enumerable = js::class_spec::JSPROP_ENUMERATE as u32;
+    object.define_property(scope, c"info", info, enumerable | readonly)?;
+    let accessors: [(&CStr, js::function::Callback, js::function::Callback, bool); 4] = [
+        (c"errno", get_info::<0>, set_info::<0>, true),
+        (c"syscall", get_info::<1>, set_info::<1>, true),
+        (c"path", get_info::<2>, set_info::<2>, false),
+        (c"dest", get_info::<3>, set_info::<3>, false),
+    ];
+    for (name, getter, setter, always) in accessors {
+        if !always && info.get_property(scope, name)?.is_undefined() {
+            continue;
+        }
+        let getter = js::Function::new_callback(scope, name, 0, getter, info)?;
+        let setter = js::Function::new_callback(scope, name, 1, setter, info)?;
+        object.define_accessor(scope, name, Some(*getter), Some(*setter), enumerable)?;
     }
     Ok(error)
+}
+
+/// The `info` property a `SystemError` accessor reads and writes: `errno`, `syscall`, `path` and
+/// `dest` for `KEY` 0 to 3.
+fn info_key(key: u8) -> &'static CStr {
+    [c"errno", c"syscall", c"path", c"dest"][usize::from(key)]
+}
+
+/// The getter of a `SystemError`'s accessor over its `info`, which is the payload. `path` and
+/// `dest` are converted with `toString` unless they are `null` or `undefined`.
+fn get_info<const KEY: u8>(
+    scope: &Scope<'_>,
+    _args: js::function::CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<js::native::Value, ExnThrown> {
+    let info = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
+    let value = info.get_property(scope, info_key(KEY))?;
+    if KEY < 2 || value.is_null_or_undefined() {
+        return Ok(value.get());
+    }
+    let object = Object::from_value_coerce(scope, value)?;
+    Ok(
+        js::Function::call_by_name(scope, object.handle(), c"toString", js::function::EmptyArgs)?
+            .get(),
+    )
+}
+
+/// The setter of a `SystemError`'s accessor over its `info`, which is the payload. `path` and
+/// `dest` are stored as a `Buffer` of the value's string, or `undefined` for a falsy value.
+fn set_info<const KEY: u8>(
+    scope: &Scope<'_>,
+    args: js::function::CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<js::native::Value, ExnThrown> {
+    let info = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
+    let value = args.get(0);
+    if KEY < 2 {
+        info.set_property(scope, info_key(KEY), value)?;
+    } else if js::conversion::to_boolean(value) {
+        let text = js::JSString::from_value(scope, value)?.to_utf8(scope)?;
+        let buffer = crate::buffer::new_buffer(scope, text.as_bytes())?;
+        info.set_property(scope, info_key(KEY), buffer)?;
+    } else {
+        info.set_property(scope, info_key(KEY), js::value::undefined())?;
+    }
+    Ok(js::value::undefined())
 }
 
 /// The `toString` of a `SystemError`: `${name} [${code}]: ${message}`.
@@ -75,6 +141,28 @@ pub enum ErrorKind {
     TypeError,
     RangeError,
     UriError,
+}
+
+impl ErrorKind {
+    /// The exception type of errors of this kind.
+    fn exception_type(self) -> JSExnType {
+        match self {
+            ErrorKind::Error => JSExnType::JSEXN_ERR,
+            ErrorKind::TypeError => JSExnType::JSEXN_TYPEERR,
+            ErrorKind::RangeError => JSExnType::JSEXN_RANGEERR,
+            ErrorKind::UriError => JSExnType::JSEXN_URIERR,
+        }
+    }
+
+    /// The key of this kind's constructor and prototype.
+    fn proto_key(self) -> JSProtoKey {
+        match self {
+            ErrorKind::Error => JSProtoKey::JSProto_Error,
+            ErrorKind::TypeError => JSProtoKey::JSProto_TypeError,
+            ErrorKind::RangeError => JSProtoKey::JSProto_RangeError,
+            ErrorKind::UriError => JSProtoKey::JSProto_URIError,
+        }
+    }
 }
 
 /// A Node.js error: an `Error`, `TypeError`, `RangeError` or `URIError` with a `code` property.
@@ -263,21 +351,33 @@ pub(crate) fn invalid_this(scope: &Scope<'_>, class: &str) -> ExnThrown {
 }
 
 impl NodeError {
-    /// The error as a JS error object, with its `code`, without throwing it.
+    /// The error as a JS error object, with its `code`, without throwing it. The errors of Node's
+    /// `ERR_` codes inherit from [`node_error_prototype`]'s prototype for their kind and code.
+    /// Errors with other codes, such as zlib's `Z_DATA_ERROR` and Brotli's `ERR__ERROR_` codes,
+    /// inherit from their kind's prototype, as in Node.
     pub fn to_value<'s>(self, scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
-        let kind = match self.kind {
-            ErrorKind::Error => JSExnType::JSEXN_ERR,
-            ErrorKind::TypeError => JSExnType::JSEXN_TYPEERR,
-            ErrorKind::RangeError => JSExnType::JSEXN_RANGEERR,
-            ErrorKind::UriError => JSExnType::JSEXN_URIERR,
-        };
-        let error = js::error::new_error(scope, kind, &self.message)?;
+        self.create(scope, true)
+    }
+
+    /// The error as [`to_value`](Self::to_value) creates it, but with its kind's prototype for
+    /// every code, as Node's C++ code creates errors.
+    pub fn to_native_value<'s>(self, scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+        self.create(scope, false)
+    }
+
+    fn create<'s>(
+        self,
+        scope: &'s Scope<'_>,
+        node_prototype: bool,
+    ) -> Result<HandleValue<'s>, ExnThrown> {
+        let error = js::error::new_error(scope, self.kind.exception_type(), &self.message)?;
         let object = Object::from_value(scope, error).map_err(|e| e.throw(scope))?;
-        object.set_property(scope, c"code", self.code)?;
         let internal = self.code.starts_with("ERR_") && !self.code.starts_with("ERR__");
-        if internal {
-            define_to_string(scope, object)?;
+        if internal && node_prototype {
+            let prototype = node_error_prototype(scope, self.kind, self.code)?;
+            object.set_prototype(scope, prototype.handle())?;
         }
+        object.set_property(scope, c"code", self.code)?;
         Ok(error)
     }
 }
@@ -292,36 +392,107 @@ impl ThrowException for NodeError {
     }
 }
 
-/// Define `error.toString` as a non-enumerable function returning `` `${this.name}
-/// [${this.code}]: ${this.message}` ``, the `toString` of the errors of Node's `ERR_` codes.
-/// Errors with other codes, such as zlib's `Z_DATA_ERROR` and Brotli's `ERR__ERROR_` codes, keep
-/// `Error.prototype.toString`, as in Node.
-fn define_to_string(scope: &Scope<'_>, error: Object<'_>) -> Result<(), ExnThrown> {
-    let function = js::class::get_or_init_shared_function(
-        scope,
-        node_error_to_string as *const () as usize,
-        |scope| js::Function::new_callback(scope, c"toString", 0, node_error_to_string, ()),
-    )?;
-    error.define_property(scope, c"toString", *function, 0)
+/// `kIsNodeError`, the symbol of the property that marks the errors of Node's `ERR_` codes and
+/// `SystemError`s.
+static K_IS_NODE_ERROR: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"kIsNodeError");
+
+/// The keys of the per-global caches of [`node_error_prototype`], one for each [`ErrorKind`].
+static NODE_ERROR_PROTOTYPE_KEYS: [u8; 4] = [0; 4];
+
+/// The prototype of the errors of kind `kind` with the `ERR_` code `code`, the prototype of the
+/// `NodeError` class that Node's `makeNodeErrorWithCode` creates for them. It inherits from
+/// `kind`'s prototype, and has a `constructor` getter returning `kind`'s constructor, a `toString`
+/// returning `` `${this.name} [${code}]: ${this.message}` ``, and a `kIsNodeError` getter returning
+/// `true`, all non-enumerable. Each global creates one for each kind and code, on first use.
+fn node_error_prototype<'s>(
+    scope: &'s Scope<'_>,
+    kind: ErrorKind,
+    code: &'static str,
+) -> Result<Object<'s>, ExnThrown> {
+    let key = std::ptr::from_ref(&NODE_ERROR_PROTOTYPE_KEYS[kind as usize]).addr();
+    js::class::get_or_init_named_shared_object(scope, key, code, |scope| {
+        let base = js::class::get_class_prototype(scope, kind.proto_key())?;
+        let prototype = Object::new_plain_with_proto(scope, base)?;
+        let constructor = crate::support::class_object(scope, kind.proto_key())?;
+        let getter = js::Function::new_callback(
+            scope,
+            c"get constructor",
+            0,
+            base_constructor,
+            constructor,
+        )?;
+        prototype.define_accessor(scope, c"constructor", Some(*getter), None, 0)?;
+        let to_string =
+            js::Function::new_callback(scope, c"toString", 0, node_error_to_string, code)?;
+        prototype.define_property(scope, c"toString", *to_string, 0)?;
+        let marker = crate::support::shared_named_function(
+            scope,
+            is_node_error_getter,
+            c"get [kIsNodeError]",
+            0,
+        )?;
+        prototype.define_accessor_by_id(
+            scope,
+            K_IS_NODE_ERROR.id(scope)?,
+            Some(marker),
+            None,
+            0,
+        )?;
+        Ok(prototype)
+    })
 }
 
+/// The `constructor` getter of a [`node_error_prototype`], whose payload is the constructor it
+/// returns.
+fn base_constructor(
+    _scope: &Scope<'_>,
+    _args: js::function::CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<js::native::Value, ExnThrown> {
+    Ok(*payload)
+}
+
+/// The `kIsNodeError` getter of a [`node_error_prototype`].
+fn is_node_error_getter(
+    _scope: &Scope<'_>,
+    _args: js::function::CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<js::native::Value, ExnThrown> {
+    Ok(js::value::from_bool(true))
+}
+
+/// The `kIsNodeError` symbol, `internal/errors.kIsNodeError`.
+pub(crate) fn is_node_error_symbol<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
+    K_IS_NODE_ERROR.value(scope)
+}
+
+/// Whether `error` has a `kIsNodeError` property, own or inherited, as the errors of Node's `ERR_`
+/// codes that [`NodeError::to_value`] creates and [`system_error`]'s errors have. Runs the traps
+/// of a proxy in `error`'s prototype chain.
+pub(crate) fn is_node_error(scope: &Scope<'_>, error: Object<'_>) -> Result<bool, ExnThrown> {
+    error.has_property_by_id(scope, K_IS_NODE_ERROR.id(scope)?)
+}
+
+/// The `toString` of a [`node_error_prototype`], whose payload is the error code:
+/// `` `${this.name} [${code}]: ${this.message}` ``.
 fn node_error_to_string(
     scope: &Scope<'_>,
     args: js::function::CallbackArgs<'_>,
-    _payload: HandleValue,
+    payload: HandleValue,
 ) -> Result<js::native::Value, ExnThrown> {
     let this = Object::from_value_coerce(scope, scope.root_value(args.this()))?;
-    let mut parts = Vec::with_capacity(3);
-    for name in [c"name", c"code", c"message"] {
-        let value = this.get_property(scope, name)?;
-        parts.push(String::from_jsval(scope, value, ()).map_err(|_| ExnThrown)?);
-    }
-    let text = format!("{} [{}]: {}", parts[0], parts[1], parts[2]);
+    let name = this.get_property(scope, c"name")?;
+    let name = String::from_jsval(scope, name, ()).map_err(|_| ExnThrown)?;
+    let code = String::from_jsval(scope, payload, ()).map_err(|_| ExnThrown)?;
+    let message = this.get_property(scope, c"message")?;
+    let message = String::from_jsval(scope, message, ()).map_err(|_| ExnThrown)?;
+    let text = format!("{name} [{code}]: {message}");
     js::conversion::ToJSVal::to_jsval_raw_throwing(&js::JSString::from_str(scope, &text)?, scope)
 }
 
 /// The end of an `ERR_INVALID_ARG_TYPE` message describing `value`, such as "Received type number
-/// (42)" or "Received an instance of Object".
+/// (42)" or "Received an instance of Object". An exception thrown while an object is described is
+/// cleared, and the object is described as `[object Object]`.
 fn describe_received(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
     if value.is_undefined() {
         return "Received undefined".into();
@@ -330,27 +501,42 @@ fn describe_received(scope: &Scope<'_>, value: HandleValue<'_>) -> String {
         return "Received null".into();
     }
     if let Ok(object) = Object::from_value(scope, value) {
-        if object.is_callable() {
-            let name = object
-                .get_property(scope, c"name")
-                .ok()
-                .and_then(|name| String::from_jsval(scope, name, ()).ok())
-                .unwrap_or_default();
-            return format!("Received function {name}");
-        }
-        let constructor = object
-            .get_property(scope, c"constructor")
-            .ok()
-            .and_then(|ctor| Object::from_value(scope, ctor).ok())
-            .and_then(|ctor| ctor.get_property(scope, c"name").ok())
-            .and_then(|name| String::from_jsval(scope, name, ()).ok())
-            .filter(|name| !name.is_empty());
-        return match constructor {
-            Some(name) => format!("Received an instance of {name}"),
-            None => "Received [object Object]".into(),
+        return match describe_object(scope, object) {
+            Ok(text) => format!("Received {text}"),
+            Err(ExnThrown) => {
+                js::exception::clear(scope);
+                "Received [object Object]".into()
+            }
         };
     }
     format!("Received {}", describe_primitive(scope, value))
+}
+
+/// The object `object` as Node.js's `determineSpecificType` describes it: `function ${name}` for
+/// a function, `an instance of ${name}` for an object whose `constructor` has a `name` property,
+/// and `util.inspect(object, { depth: -1 })` otherwise. Errors from reading those properties are
+/// returned with the exception pending.
+fn describe_object(scope: &Scope<'_>, object: Object<'_>) -> Result<String, ExnThrown> {
+    if object.is_callable() {
+        let name = object.get_property(scope, c"name")?;
+        return Ok(format!(
+            "function {}",
+            js::JSString::from_value(scope, name)?.to_utf8(scope)?
+        ));
+    }
+    let constructor = object.get_property(scope, c"constructor")?;
+    if let Ok(constructor) = Object::from_value(scope, constructor) {
+        if constructor.has_property(scope, c"name")? {
+            let name = constructor.get_property(scope, c"name")?;
+            let name = js::JSString::from_value(scope, name)?.to_utf8(scope)?;
+            return Ok(format!("an instance of {name}"));
+        }
+    }
+    let options = crate::inspect::InspectOptions {
+        depth: Some(-1.0),
+        ..Default::default()
+    };
+    crate::inspect::inspect(scope, object.to_jsval_throwing(scope)?, options)
 }
 
 /// The primitive `value`, which is neither `null` nor `undefined`, as Node.js's
@@ -633,8 +819,8 @@ pub fn validate_object<'s>(
         .map_err(|_| NodeError::invalid_arg_type(scope, name, "of type object", value))
 }
 
-/// `ERR_INVALID_ARG_TYPE` naming the argument `name` unless `value` is `undefined` or an object with
-/// an `aborted` property, as an `AbortSignal` has.
+/// `ERR_INVALID_ARG_TYPE` naming the argument `name` unless `value` is `undefined` or a
+/// non-callable object with an `aborted` property, as an `AbortSignal` has.
 pub fn validate_abort_signal(
     scope: &Scope<'_>,
     value: HandleValue<'_>,
@@ -644,8 +830,8 @@ pub fn validate_abort_signal(
         return Ok(());
     }
     let has_aborted = match Object::from_value(scope, *value) {
-        Ok(object) => object.has_property(scope, c"aborted")?,
-        Err(_) => false,
+        Ok(object) if !object.is_callable() => object.has_property(scope, c"aborted")?,
+        _ => false,
     };
     if !has_aborted {
         return Err(
@@ -797,4 +983,9 @@ pub fn io_error_code(error: &std::io::Error) -> &'static str {
         Unsupported => "ENOSYS",
         _ => "EIO",
     }
+}
+
+/// Make the web classes throw Node's errors in this runtime, as `--node-compat` mode does.
+pub(crate) fn install_web_errors() {
+    js::error::set_binding_error_hook(Some(web::binding_error));
 }

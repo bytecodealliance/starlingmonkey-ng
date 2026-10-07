@@ -256,40 +256,46 @@ pub mod module {
     /// `net._normalizeArgs(args)`: the arguments `args` of `connect` or `listen` as
     /// `[options, listener]`, where `options` is the first argument if it is an object, and is
     /// made of a path, or of a port and a host, otherwise. `listener` is the last argument if it
-    /// is a function, and `null` otherwise. The array is marked as normalized, which
-    /// `socket.connect` recognizes.
+    /// is a function, and `null` otherwise. `args` with a `length` of 0 gives `[{}, null]`. The
+    /// array is marked as normalized, which `socket.connect` recognizes.
     #[function(name = "_normalizeArgs")]
     pub fn normalize_args<'s>(
         scope: &'s Scope<'_>,
         args: HandleValue<'_>,
     ) -> Result<Object<'s>, Thrown> {
         let args = Object::from_value(scope, args)?;
-        let length = args.get_property(scope, c"length")?.to_number() as u32;
-        let first = args.get_element(scope, 0)?;
-        let options = if length > 0 && first.is_object() && !js::function::is_callable(first) {
-            Object::from_value(scope, first)?
+        let length = args.get_property(scope, c"length")?;
+        let (options, listener) = if length.is_number() && length.to_number() == 0.0 {
+            (Object::new_plain(scope)?, HandleValue::null())
         } else {
-            let options = Object::new_plain(scope)?;
-            if length > 0 && super::is_pipe_name(scope, first)? {
-                options.set_property(scope, c"path", first)?;
-            } else if length > 0 {
-                options.set_property(scope, c"port", first)?;
-                let host = args.get_element(scope, 1)?;
-                if length > 1 && host.is_string() {
-                    options.set_property(scope, c"host", host)?;
+            let length = f64::from_jsval_throwing(scope, length, ())?;
+            let first = args.get_element(scope, 0)?;
+            let options = if first.is_object() && !js::function::is_callable(first) {
+                Object::from_value(scope, first)?
+            } else {
+                let options = Object::new_plain(scope)?;
+                if super::is_pipe_name(scope, first)? {
+                    options.set_property(scope, c"path", first)?;
+                } else {
+                    options.set_property(scope, c"port", first)?;
+                    if length > 1.0 {
+                        let host = args.get_element(scope, 1)?;
+                        if host.is_string() {
+                            options.set_property(scope, c"host", host)?;
+                        }
+                    }
                 }
-            }
-            options
-        };
-        let last = if length > 0 {
-            args.get_element(scope, length - 1)?
-        } else {
-            HandleValue::undefined()
-        };
-        let listener = if Object::from_value(scope, last).is_ok_and(|last| last.is_callable()) {
-            last
-        } else {
-            HandleValue::null()
+                options
+            };
+            let last_index = scope.root_value(js::value::from_f64(length - 1.0));
+            let last_id = scope.root_id(js::id::value_to_id(scope, last_index)?);
+            let last = args.get_property_by_id(scope, last_id)?;
+            let listener = if Object::from_value(scope, last).is_ok_and(|last| last.is_callable()) {
+                last
+            } else {
+                HandleValue::null()
+            };
+            (options, listener)
         };
         let normalized =
             js::Array::with_contents(scope, &[options.to_jsval_throwing(scope)?, listener])?;

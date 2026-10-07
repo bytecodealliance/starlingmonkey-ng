@@ -13,7 +13,7 @@ use js::{Function, Object};
 
 use super::readable::{is_buffer, readable};
 use crate::errors::{ErrorKind, NodeError, Thrown};
-use crate::support::has_method;
+use crate::support::{has_method, is_thenable};
 
 /// `ERR_STREAM_NULL_VALUES`.
 fn null_values() -> NodeError {
@@ -200,14 +200,6 @@ fn push_value(
         state.data_mut().reading = false;
     }
     Ok(Some(pushed))
-}
-
-/// Whether `value` is a thenable.
-fn is_thenable(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
-    Ok(match Object::from_value(scope, value).ok() {
-        Some(object) => has_method(scope, object, c"then")?,
-        None => false,
-    })
 }
 
 /// `const { value, done } = result`, where `expression` names `result` in the `TypeError` for

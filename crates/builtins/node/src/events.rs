@@ -21,6 +21,7 @@ use js::symbol::CachedSymbol;
 use js::{Function, Object};
 
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
+use crate::support::as_array;
 
 js::instance_local! {
     /// `EventEmitter.defaultMaxListeners`: the number of listeners per event above which adding
@@ -45,13 +46,18 @@ pub(crate) static EMITTER_PROPERTIES: PropertyTemplate = PropertyTemplate::new(&
     TemplateKey::Symbol(&K_CAPTURE),
 ]);
 
-/// Initialize the emitter `properties` writes to, which this crate created without `_events`, as
+/// Initialize `emitter`, which `properties` writes to and this crate created without `_events`, as
 /// `EventEmitter.init()` does without options: with no listeners. It reads `_maxListeners`
-/// through the prototype chain, and `kCapture` from `EventEmitter.prototype`.
+/// through the prototype chain, and `kCapture` from `EventEmitter.prototype`. Once `node:domain`
+/// is loaded, `emitter.domain` is defined first.
 pub(crate) fn init_new_emitter<'w>(
     scope: &'w Scope<'_>,
+    emitter: Object<'_>,
     properties: &mut PropertyWriter<'w>,
 ) -> Result<(), ExnThrown> {
+    if crate::domain::in_use() {
+        crate::domain::init_emitter(scope, emitter)?;
+    }
     properties.continue_with(scope, &EMITTER_PROPERTIES)?;
     properties.write(scope, c"_events", Object::new_with_null_prototype(scope)?)?;
     properties.write(scope, c"_eventsCount", 0)?;
@@ -298,18 +304,13 @@ fn listener_values<'s>(
     if stored.is_undefined() {
         return Ok(Vec::new());
     }
-    let Ok(object) = Object::from_value(scope, stored) else {
+    if !stored.is_object() {
         return Ok(Vec::new());
-    };
-    match as_array(object) {
+    }
+    match as_array(scope, stored) {
         Some(array) => array.to_vec(scope),
         None => Ok(vec![stored]),
     }
-}
-
-/// `object` as an array, if it is one.
-fn as_array(object: Object<'_>) -> Option<js::Array<'_>> {
-    object.cast::<js::Array>().ok()
 }
 
 /// The listener a `once` wrapper calls: `wrapper`'s `listener` property if it is a `once` wrapper, and
@@ -410,7 +411,7 @@ pub fn add_listener<'s>(
         return Ok(emitter);
     }
     // A second listener turns the stored function into an array, which later ones are added to.
-    let array = match Object::from_value(scope, existing).ok().and_then(as_array) {
+    let array = match as_array(scope, existing) {
         Some(array) => {
             if prepend {
                 array.unshift(scope, listener)?;
@@ -510,7 +511,7 @@ pub fn remove_listener<'s>(
     if stored.is_undefined() {
         return Ok(emitter);
     }
-    let array = Object::from_value(scope, stored).ok().and_then(as_array);
+    let array = as_array(scope, stored);
     let matches = |candidate: HandleValue<'_>| {
         same_value(scope, candidate, listener)
             || unwrap_listener(scope, candidate)
@@ -698,7 +699,7 @@ fn once_wrap<'s>(
         wrapper: None,
         fired: false,
     })?;
-    let wrapper = Function::new_callback(scope, c"bound onceWrapper", 0, once_wrapper, state)?;
+    let wrapper = Function::new_callback(scope, c"wrapper", 0, once_wrapper, state)?;
     state.data_mut().wrapper = Some(Heap::from(*wrapper));
     wrapper.set_property(scope, c"listener", listener)?;
     (*wrapper).to_jsval_throwing(scope)
@@ -731,13 +732,17 @@ pub mod event_emitter {
 
     /// <https://nodejs.org/api/events.html#class-eventemitter>: initialize `this` as an emitter
     /// with no listeners, unless it already has its own `_events`. `options.captureRejections`
-    /// makes it emit rejections of the promises its listeners return as `error` events.
+    /// makes it emit rejections of the promises its listeners return as `error` events. Once
+    /// `node:domain` is loaded, `this.domain` is defined first.
     #[constructor(length = 1)]
     pub fn init(
         scope: &Scope<'_>,
         this: Object<'_>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
+        if crate::domain::in_use() {
+            crate::domain::init_emitter(scope, this)?;
+        }
         let events = this.get_property(scope, c"_events")?;
         let inherited = this
             .get_prototype(scope)?
@@ -897,9 +902,7 @@ pub mod event_emitter {
         let Some(name) = name else {
             // Remove `removeListener` last, so its listeners see every other removal.
             for key in events.own_keys(scope)? {
-                if key.is_string()
-                    && String::from_jsval(scope, key, ()).is_ok_and(|key| key == "removeListener")
-                {
+                if crate::support::is_str(scope, key, c"removeListener")? {
                     continue;
                 }
                 Function::call_by_name(scope, this.handle(), c"removeAllListeners", &[key])?;
@@ -924,14 +927,21 @@ pub mod event_emitter {
         Ok(this)
     }
 
-    /// <https://nodejs.org/api/events.html#emitteremiteventname-args>
-    #[method(length = 0)]
+    /// <https://nodejs.org/api/events.html#emitteremiteventname-args>: once `node:domain` is
+    /// loaded, the emitter's domain handles the event as in
+    /// <https://nodejs.org/api/domain.html#explicit-binding>.
+    #[method(length = 1)]
     pub fn emit(
         scope: &Scope<'_>,
         this: Object<'_>,
         name: HandleValue<'_>,
         args: RestArgs<HandleValue<'_>>,
     ) -> Result<bool, Thrown> {
+        if crate::domain::in_use() {
+            if let Some(emitted) = crate::domain::emit(scope, this, name, &args)? {
+                return Ok(emitted);
+            }
+        }
         emit_event(scope, this, name, &args)
     }
 
@@ -992,15 +1002,23 @@ pub mod event_emitter {
         })
     }
 
-    /// <https://nodejs.org/api/events.html#emitter-eventnames>
+    /// <https://nodejs.org/api/events.html#emitter-eventnames>: keys whose value is `undefined`,
+    /// which `removeListener` leaves on an emitter in shape mode, are skipped.
     pub fn event_names<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
     ) -> Result<js::Array<'s>, Thrown> {
-        let names = match events_object(scope, this)? {
-            Some(events) if events_count(scope, this)? > 0.0 => events.own_keys(scope)?,
-            _ => Vec::new(),
-        };
+        let mut names = Vec::new();
+        if let Some(events) = events_object(scope, this)? {
+            if events_count(scope, this)? > 0.0 {
+                for key in events.own_keys(scope)? {
+                    let id = event_key(scope, key)?;
+                    if !events.get_property_by_id(scope, id)?.is_undefined() {
+                        names.push(key);
+                    }
+                }
+            }
+        }
         Ok(js::Array::with_contents(scope, &names)?)
     }
 

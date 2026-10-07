@@ -5,4 +5,5 @@ if (typeof module !== "object" || module.exports !== exports) throw new Error("m
 if (path.basename(__filename) !== "commonjs-entry.cjs") throw new Error(`__filename: ${__filename}`);
 const { add } = require("./commonjs/math.cjs");
 if (add(1, 1) !== 2) throw new Error("required module");
+if (module.id !== "." || require.main !== module) throw new Error(`the main module's id: ${module.id}`);
 return;

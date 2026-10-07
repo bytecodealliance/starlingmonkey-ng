@@ -209,6 +209,10 @@ fn module_value<'s>(scope: &'s Scope<'_>, name: &str) -> Result<Object<'s>, ExnT
             let species = buffer.get_property_by_id(scope, scope.root_id(species))?;
             value.set_property(scope, c"FastBuffer", species)?;
         }
+        "node:internal/errors" => {
+            let symbol = crate::errors::is_node_error_symbol(scope)?;
+            value.set_property(scope, c"kIsNodeError", symbol)?;
+        }
         "node:internal/net" => {
             let symbol = crate::net::normalized_args_symbol(scope)?;
             value.set_property(scope, c"normalizedArgsSymbol", symbol)?;

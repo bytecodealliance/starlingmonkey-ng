@@ -7,6 +7,7 @@
 //                                     [--routes=substring] [--duration=5] [--warmup=1]
 //                                     [--concurrency=1,32] [--repeat=3] [--startup-runs=5]
 //                                     [--runtime=path] [--spin-app=path] [--reuse=N]
+//                                     [--client-threads=N]
 //                                     [--out=target/express-bench/results.json]
 //   node tests/express-apps/bench.mjs --report=target/express-bench/results.json
 //
@@ -20,30 +21,35 @@
 // - `spin`: the whole Spin application under `spin up`, with Spin's default instance reuse.
 // - `node`, `deno` and `bun`.
 //
-// `--runtime` names the `starlingmonkey` binary (`target/release/starlingmonkey` by default), and
-// `--spin-app` the directory `scripts/build-spin-app.sh` builds (`target/spin-app`). `--reuse=N`
-// passes `--max-instance-reuse-count N` to `wasmtime` and `spin`.
+// `--runtime` names the `starlingmonkey` binary (`release/starlingmonkey` in `CARGO_TARGET_DIR` or
+// `target` by default), and `--spin-app` the directory `scripts/build-spin-app.sh` builds
+// (`target/spin-app`). `--reuse=N` passes `--max-instance-reuse-count N` to `wasmtime` and `spin`.
+// `--client-threads=N` sets the number of threads `oha` runs (the number of CPUs by default). `oha`
+// runs on the same machine as the server.
 //
 // Each repeat starts every (app, config) pair once, in turn, so that background load affects the
 // configs alike. A run measures startup, then runs each route for `--warmup` seconds at the
 // highest concurrency and then for `--duration` seconds at each concurrency. The routes that add
-// state to the app run last. Startup is measured `--startup-runs` times in separate processes:
-// the time from spawning the server until it accepts a TCP connection, and the latency of the
-// first request after that. RSS is the sum over the server's process tree: after the first
-// request, and the maximum sampled during the run.
+// state to the app run last. A route's requests per second count the responses with the route's
+// expected status, and its latencies are those of the responses with a 2xx status. Startup is
+// measured `--startup-runs` times in separate processes: the time from spawning the server until
+// it accepts a TCP connection, and the latency of the first request after that. RSS is the sum
+// over the server's process tree: after the first request, and the maximum sampled during the run.
 //
 // `--report` prints the Markdown tables of a results file: the median of the repeats, with half
 // the range between the smallest and largest repeat as `±`.
 
 import { spawn, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
-import { createServer, connect } from 'node:net';
-import { tmpdir, cpus, totalmem } from 'node:os';
+import { tmpdir, cpus, totalmem, loadavg } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { freePort, processTree, waitForListener } from './servers.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '../..');
+// The directory Cargo builds into: `CARGO_TARGET_DIR`, or the repository's `target`.
+const TARGET_DIR = process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_DIR) : join(ROOT, 'target');
 
 const args = process.argv.slice(2);
 const opt = (name, fallback) => {
@@ -52,9 +58,10 @@ const opt = (name, fallback) => {
 };
 const list = (name, fallback) => opt(name, fallback).split(',').filter(Boolean);
 const SPIN_APP = resolve(opt('spin-app', join(ROOT, 'target/spin-app')));
+const clientThreads = Number(opt('client-threads', String(cpus().length)));
 
 const BIN = {
-  starling: resolve(opt('runtime', join(ROOT, 'target/release/starlingmonkey'))),
+  starling: resolve(opt('runtime', join(TARGET_DIR, 'release/starlingmonkey'))),
   wasmtime: 'wasmtime',
   spin: join(ROOT, 'deps/spin-bin/spin'),
   node: join(ROOT, 'deps/node-bin/bin/node'),
@@ -87,9 +94,17 @@ const json = (value) => ({ body: JSON.stringify(value), headers: { 'content-type
 const IDENTITY = { 'accept-encoding': 'identity' };
 const GZIP = { 'accept-encoding': 'gzip' };
 
+/** `fetch(url, init)`, which throws unless the response has the status `expected`. */
+async function fetchExpecting(expected, url, init) {
+  const res = await fetch(url, init);
+  if (res.status !== expected) throw new Error(`${init?.method ?? 'GET'} ${url} got ${res.status}, not ${expected}`);
+  return res;
+}
+
 // Each app's routes. `prepare(base)` runs once per process, before the routes, and returns
-// headers every route sends. `mutates` routes add state to the app, and run after the others.
-// Startup requests `probe`, or else the first route, with `GET`.
+// headers every route sends, and throws if a response has another status than it expects.
+// `mutates` routes add state to the app, and run after the others. Startup requests `probe`, or
+// else the first route, with `GET`.
 const APPS = {
   'koa-portal': {
     entry: 'app.mjs',
@@ -162,11 +177,11 @@ const APPS = {
     prefix: '/auth',
     probe: '/welcome?email=bench%40example.com',
     async prepare(base) {
-      await fetch(`${base}/register`, {
+      await fetchExpecting(201, `${base}/register`, {
         method: 'POST',
         ...json({ email: 'bench@example.com', password: 'benchmark1' }),
       });
-      const res = await fetch(`${base}/login`, {
+      const res = await fetchExpecting(200, `${base}/login`, {
         method: 'POST',
         ...json({ email: 'bench@example.com', password: 'benchmark1' }),
       });
@@ -184,7 +199,7 @@ const APPS = {
     env: { UPSTREAM_URL: 'http://127.0.0.1:9' },
     async prepare(base) {
       for (let i = 0; i < 3; i++) {
-        await fetch(`${base}/posts`, { method: 'POST', ...json({ title: `Post ${i}`, body: 'x'.repeat(100) }) });
+        await fetchExpecting(201, `${base}/posts`, { method: 'POST', ...json({ title: `Post ${i}`, body: 'x'.repeat(100) }) });
       }
       return {};
     },
@@ -199,13 +214,13 @@ const APPS = {
     prefix: '',
     configs: ['listen', 'node', 'deno', 'bun'],
     async prepare(base) {
-      const login = await fetch(`${base}/login`, { method: 'POST', ...json({ user: 'bench' }) });
+      const login = await fetchExpecting(200, `${base}/login`, { method: 'POST', ...json({ user: 'bench' }) });
       const cookie = login.headers
         .getSetCookie()
         .map((c) => c.split(';')[0])
         .join('; ');
       for (let i = 0; i < 20; i++) {
-        await fetch(`${base}/rooms/lobby/messages`, {
+        await fetchExpecting(201, `${base}/rooms/lobby/messages`, {
           method: 'POST',
           body: JSON.stringify({ text: `message ${i}` }),
           headers: { 'content-type': 'application/json', cookie },
@@ -219,52 +234,9 @@ const APPS = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function freePort() {
-  return new Promise((res, rej) => {
-    const s = createServer();
-    s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address();
-      s.close(() => res(port));
-    });
-    s.on('error', rej);
-  });
-}
-
-function canConnect(port) {
-  return new Promise((res) => {
-    const s = connect(port, '127.0.0.1');
-    s.on('connect', () => {
-      s.destroy();
-      res(true);
-    });
-    s.on('error', () => res(false));
-  });
-}
-
 // The summed RSS in KiB of `pid` and its descendants.
 function treeRss(pid) {
-  let out;
-  try {
-    out = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,rss='], { encoding: 'utf8' });
-  } catch {
-    return 0;
-  }
-  const rows = out
-    .trim()
-    .split('\n')
-    .map((l) => l.trim().split(/\s+/).map(Number));
-  const pids = new Set([pid]);
-  let grew = true;
-  while (grew) {
-    grew = false;
-    for (const [p, pp] of rows) {
-      if (pids.has(pp) && !pids.has(p)) {
-        pids.add(p);
-        grew = true;
-      }
-    }
-  }
-  return rows.filter(([p]) => pids.has(p)).reduce((sum, [, , rss]) => sum + rss, 0);
+  return processTree(pid).reduce((sum, [, , rss]) => sum + rss, 0);
 }
 
 function startServer(config, appName, port, dataDir) {
@@ -340,10 +312,31 @@ function startServer(config, appName, port, dataDir) {
       throw new Error(`unknown config ${config}`);
   }
   const child = spawn(cmd, argv, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  servers.add(child);
+  child.once('exit', () => servers.delete(child));
   child.output = '';
   child.stdout.on('data', (d) => (child.output = (child.output + d).slice(-4000)));
   child.stderr.on('data', (d) => (child.output = (child.output + d).slice(-4000)));
   return child;
+}
+
+/** The servers that are running, which are killed when this script exits. */
+const servers = new Set();
+
+/** Kill the process groups of the servers that are running. */
+function killServers() {
+  for (const child of servers) {
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+    } catch {}
+  }
+}
+process.on('exit', killServers);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    killServers();
+    process.exit(130);
+  });
 }
 
 function stopServer(child) {
@@ -366,13 +359,13 @@ async function launch(config, appName) {
     await shutdown({ child, dataDir });
     throw new Error(`${config} ${appName}: ${message}:\n${child.output}`);
   };
-  const deadline = t0 + 300_000;
-  while (!(await canConnect(port))) {
-    if (child.exitCode !== null) await fail(`exited with ${child.exitCode}`);
-    if (performance.now() > deadline) await fail("didn't listen");
-    await sleep(5);
+  let connectedAt;
+  try {
+    connectedAt = await waitForListener(child, port, { timeoutMs: 300_000, pollMs: 5 });
+  } catch (e) {
+    await fail(e.message);
   }
-  const listening = performance.now() - t0;
+  const listening = connectedAt - t0;
   const t1 = performance.now();
   let res;
   try {
@@ -393,6 +386,7 @@ async function shutdown({ child, dataDir }) {
 
 function oha(url, route, extraHeaders, concurrency, seconds) {
   const argv = ['-z', `${seconds}s`, '-c', String(concurrency), '--no-tui', '--output-format', 'json'];
+  argv.push('--worker-threads', String(clientThreads), '--stats-success-breakdown');
   if (route.method) argv.push('-m', route.method);
   for (const [k, v] of Object.entries({ ...extraHeaders, ...(route.headers ?? {}) })) argv.push('-H', `${k}: ${v}`);
   if (route.body !== undefined) argv.push('-d', route.body);
@@ -424,16 +418,18 @@ function summarize(result, expected) {
     .reduce((a, [, n]) => a + n, 0);
   return {
     rps: ok / result.summary.total,
-    p50: result.latencyPercentiles.p50 * 1000,
-    p99: result.latencyPercentiles.p99 * 1000,
+    // `oha` counts the responses with a 2xx status as successful.
+    p50: (result.latencyPercentilesSuccessful?.p50 ?? NaN) * 1000,
+    p99: (result.latencyPercentilesSuccessful?.p99 ?? NaN) * 1000,
     requests: total,
     errors: total - ok + transport,
     statuses,
   };
 }
 
+/** The 1, 5 and 15 minute load averages, as `{ 1.23 2.34 3.45 }`. */
 function load() {
-  return execFileSync('sysctl', ['-n', 'vm.loadavg'], { encoding: 'utf8' }).trim();
+  return `{ ${loadavg().map((n) => n.toFixed(2)).join(' ')} }`;
 }
 
 async function benchApp(config, appName, settings, log) {
@@ -530,7 +526,7 @@ async function main() {
   }
   const results = {
     date: new Date().toISOString(),
-    settings: { ...settings, repeat, startupRuns: startupN, reuse: opt('reuse') ?? 'default' },
+    settings: { ...settings, repeat, startupRuns: startupN, reuse: opt('reuse') ?? 'default', clientThreads },
     versions: versions(),
     runs: [],
     startup: {},

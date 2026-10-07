@@ -342,54 +342,6 @@ async fn init_output_is_returned() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The top level reads the location it is given as `globalThis.location`, and
-/// reading it without one throws.
-#[tokio::test]
-async fn top_level_reads_the_init_location() -> anyhow::Result<()> {
-    const MAIN: &str = "\
-        let href;\n\
-        try { href = location.href; } catch (e) { href = `${e.name}`; }\n\
-        export const greeting = () => href;";
-    let runtime = shared::runtime().expect("reading the runtime build");
-    for (init_location, expected) in [
-        (
-            Some("http://example.localhost/app/"),
-            "http://example.localhost/app/",
-        ),
-        (None, "TypeError"),
-    ] {
-        let componentized = componentize::componentize_with_output(
-            componentize::Wit::<PathBuf>::String(include_str!("fixtures/top_level.wit")),
-            Some("top-level"),
-            &[],
-            false,
-            MAIN,
-            Some(base_directory()),
-            &runtime,
-            &[],
-            None,
-            false,
-            false,
-            None,
-            false,
-            init_location,
-            true,
-            &componentize::InitEnvironment::default(),
-        )
-        .await?;
-        let component = Component::new(&ENGINE, componentized.component)?;
-        let mut linker = Linker::new(&ENGINE);
-        componentize::add_wasi(&mut linker)?;
-        componentize::trap_unsatisfied_imports(&ENGINE, &component, &mut linker, &[])?;
-        let mut store = shared::store(&ENGINE);
-        let instance = TopLevelPre::new(linker.instantiate_pre(&component)?)?
-            .instantiate_async(&mut store)
-            .await?;
-        assert_eq!(instance.call_greeting(&mut store).await?, expected);
-    }
-    Ok(())
-}
-
 /// The top level reads the init environment's variables and writes to its read-write
 /// directories, and what it wrote stays in the host directory.
 #[tokio::test]
@@ -440,6 +392,54 @@ async fn top_level_gets_the_init_environment() -> anyhow::Result<()> {
         .instantiate_async(&mut store)
         .await?;
     assert_eq!(instance.call_greeting(&mut store).await?, "hello from init");
+    Ok(())
+}
+
+/// The top level reads the location it is given as `globalThis.location`, and
+/// reading it without one throws.
+#[tokio::test]
+async fn top_level_reads_the_init_location() -> anyhow::Result<()> {
+    const MAIN: &str = "\
+        let href;\n\
+        try { href = location.href; } catch (e) { href = `${e.name}`; }\n\
+        export const greeting = () => href;";
+    let runtime = shared::runtime().expect("reading the runtime build");
+    for (init_location, expected) in [
+        (
+            Some("http://example.localhost/app/"),
+            "http://example.localhost/app/",
+        ),
+        (None, "TypeError"),
+    ] {
+        let componentized = componentize::componentize_with_output(
+            componentize::Wit::<PathBuf>::String(include_str!("fixtures/top_level.wit")),
+            Some("top-level"),
+            &[],
+            false,
+            MAIN,
+            Some(base_directory()),
+            &runtime,
+            &[],
+            None,
+            false,
+            false,
+            None,
+            false,
+            init_location,
+            true,
+            &componentize::InitEnvironment::default(),
+        )
+        .await?;
+        let component = Component::new(&ENGINE, componentized.component)?;
+        let mut linker = Linker::new(&ENGINE);
+        componentize::add_wasi(&mut linker)?;
+        componentize::trap_unsatisfied_imports(&ENGINE, &component, &mut linker, &[])?;
+        let mut store = shared::store(&ENGINE);
+        let instance = TopLevelPre::new(linker.instantiate_pre(&component)?)?
+            .instantiate_async(&mut store)
+            .await?;
+        assert_eq!(instance.call_greeting(&mut store).await?, expected);
+    }
     Ok(())
 }
 

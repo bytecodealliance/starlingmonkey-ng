@@ -283,7 +283,7 @@ pub(super) fn set_unref_timeout(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let call_args = crate::callback_args(&args);
+    let call_args = args.rest(0);
     let result = (|| -> Result<HandleValue<'_>, Thrown> {
         validate_function(scope, args.get(0), "callback")?;
         let rest = call_args.get(2..).unwrap_or_default();
@@ -341,20 +341,31 @@ pub(super) fn myers_diff(
             )
             .into());
         }
-        let lines = |array: Object<'_>, length: f64| -> Result<Vec<String>, ExnThrown> {
-            (0..length as u32)
-                .map(|index| {
-                    let value = array.get_element(scope, index)?;
-                    js::JSString::from_value(scope, value)?.to_utf8(scope)
-                })
-                .collect()
+        let out_of_memory = || {
+            js::exception::report_out_of_memory(scope);
+            Thrown::Pending
+        };
+        let lines = |array: Object<'_>, length: f64| -> Result<Vec<String>, Thrown> {
+            let mut lines = Vec::new();
+            lines
+                .try_reserve_exact(length as usize)
+                .map_err(|_| out_of_memory())?;
+            for index in 0..length as u32 {
+                let value = array.get_element(scope, index)?;
+                lines.push(js::JSString::from_value(scope, value)?.to_utf8(scope)?);
+            }
+            Ok(lines)
         };
         let diff = crate::assert::myers_diff(
             &lines(actual, actual_length)?,
             &lines(expected, expected_length)?,
             comma,
-        );
-        let mut pairs = Vec::with_capacity(diff.len());
+        )
+        .ok_or_else(out_of_memory)?;
+        let mut pairs = Vec::new();
+        pairs
+            .try_reserve_exact(diff.len())
+            .map_err(|_| out_of_memory())?;
         for (operation, value) in diff {
             let operation = scope.root_value(js::value::from_i32(operation.sign()));
             let pair = js::Array::with_contents(

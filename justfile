@@ -103,6 +103,40 @@ wpt-update-permissive *PATTERN:
     @just build
     node tests/wpt-harness/run-wpt.mjs --permissive --update-expectations {{PATTERN}}
 
+# Clone Node.js's own tests into `deps/node` for the Node.js test harness.
+[group('node')]
+clone-node-tests *ARGS:
+    ./scripts/clone-node-tests.sh {{ARGS}}
+
+# Download the Node.js release the tests come from into `deps/node-bin`, the fuzzer's oracle.
+[group('node')]
+fetch-node-oracle:
+    ./scripts/fetch-node-oracle.sh
+
+# Run Node.js's tests against the debug build, optionally filtered by substrings of test names.
+[group('node')]
+node-test *PATTERN:
+    @just build
+    node tests/node-harness/run-node-tests.mjs {{PATTERN}}
+
+# Run Node.js's tests against the release wasm32-wasip3 `starling.wasm`, built first.
+[group('node')]
+node-test-wasm *PATTERN:
+    WASM_TARGET=p3 ./scripts/build-runtime.sh
+    node tests/node-harness/run-node-tests.mjs --target=wasm {{PATTERN}}
+
+# Run the differential fuzzer against the release build, with Node.js as the oracle.
+[group('node')]
+node-fuzz *ARGS:
+    @just build-release
+    node tests/node-diff/fuzz.mjs --runtime="${CARGO_TARGET_DIR:-target}/release/starlingmonkey" {{ARGS}}
+
+# Compare the Express and Koa apps under the release build with Node.js (`--mode=` for others).
+[group('node')]
+express-test *ARGS:
+    @just build-release
+    node tests/express-apps/run.mjs --runtime="${CARGO_TARGET_DIR:-target}/release/starlingmonkey" {{ARGS}}
+
 # Format all code.
 fmt:
     cargo fmt

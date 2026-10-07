@@ -17,7 +17,7 @@
 use std::cell::RefCell;
 
 use js::conversion::{FromJSVal, ToJSVal};
-use js::error::{ExnThrown, ThrowException};
+use js::error::ExnThrown;
 use js::function::CallbackArgs;
 use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
@@ -30,7 +30,7 @@ use super::outgoing::{
     OutgoingState, Queued,
 };
 use super::status_text;
-use crate::buffer::new_buffer;
+use crate::buffer::buffer_from_vec;
 use crate::errors::{number_to_string, ErrorKind, NodeError, Thrown};
 use crate::support::{chunk_bytes, next_tick_call};
 
@@ -185,15 +185,22 @@ impl Framing {
     }
 }
 
+/// The number the `Content-Length` header value `value` gives, as `+value` converts it.
+pub(super) fn content_length_number(scope: &Scope<'_>, value: &str) -> Result<f64, ExnThrown> {
+    let value = js::JSString::from_str(scope, value)?.to_jsval_throwing(scope)?;
+    f64::from_jsval(scope, value, ()).map_err(|_| ExnThrown)
+}
+
 /// Append the header line `name: value` to `header`, and record what it means for the framing
 /// in `framing`, as Node.js's `matchHeader` does.
 fn add_line(
+    scope: &Scope<'_>,
     framing: &mut Framing,
     state: &mut HeaderState,
     header: &mut String,
     name: &str,
     value: &str,
-) {
+) -> Result<(), ExnThrown> {
     header.push_str(name);
     header.push_str(": ");
     header.push_str(value);
@@ -217,12 +224,7 @@ fn add_line(
         }
         "content-length" => {
             state.content_length = true;
-            let trimmed = value.trim();
-            framing.content_length = Some(if trimmed.is_empty() {
-                0.0
-            } else {
-                trimmed.parse::<f64>().unwrap_or(f64::NAN)
-            });
+            framing.content_length = Some(content_length_number(scope, value)?);
             framing.removed_content_length = false;
         }
         "date" => state.date = true,
@@ -231,6 +233,7 @@ fn add_line(
         "keep-alive" => framing.default_keep_alive = false,
         _ => {}
     }
+    Ok(())
 }
 
 /// Store the header block of `message`, starting with `first_line`, as Node.js's `_storeHeader`
@@ -270,10 +273,10 @@ pub(super) fn store_header(
             || (is_array && super::outgoing::is_unique(state, &name))
         {
             let joined = texts.join("; ");
-            add_line(&mut framing, &mut lines, &mut header, &name, &joined);
+            add_line(scope, &mut framing, &mut lines, &mut header, &name, &joined)?;
         } else {
             for value in &texts {
-                add_line(&mut framing, &mut lines, &mut header, &name, value);
+                add_line(scope, &mut framing, &mut lines, &mut header, &name, value)?;
             }
         }
     }
@@ -422,6 +425,10 @@ pub(super) fn send(
         queue_output(scope, message, state, bytes, None, true)?;
         return write_raw(scope, message, state, data, callback);
     }
+    if bytes.try_reserve_exact(data.len()).is_err() {
+        js::exception::report_out_of_memory(scope);
+        return Err(ExnThrown);
+    }
     bytes.extend_from_slice(&data);
     write_raw(scope, message, state, bytes, callback)
 }
@@ -504,7 +511,7 @@ pub(super) fn write_raw(
         if !state.data().output.is_empty() {
             flush_output(scope, message, state, socket)?;
         }
-        let buffer = new_buffer(scope, &data)?.to_jsval_throwing(scope)?;
+        let buffer = buffer_from_vec(scope, data)?.to_jsval_throwing(scope)?;
         let callback = callback.unwrap_or(HandleValue::undefined());
         let result = Function::call_by_name(scope, socket.handle(), c"write", &[buffer, callback])?;
         return Ok(js::conversion::to_boolean(result));
@@ -583,7 +590,7 @@ pub(super) fn flush_output(
     let writes: Vec<(HandleValue<'_>, HandleValue<'_>)> = queued
         .into_iter()
         .map(|(bytes, callback)| {
-            let buffer = new_buffer(scope, bytes.as_slice())?.to_jsval_throwing(scope)?;
+            let buffer = buffer_from_vec(scope, bytes)?.to_jsval_throwing(scope)?;
             Ok((buffer, callback))
         })
         .collect::<Result<_, ExnThrown>>()?;
@@ -639,7 +646,7 @@ fn writable_length(scope: &Scope<'_>, state: &OutgoingState<'_>) -> Result<f64, 
 }
 
 /// `ERR_HTTP_CONTENT_LENGTH_MISMATCH` for a body of `actual` bytes where `expected` were declared.
-fn length_mismatch(actual: f64, expected: f64) -> NodeError {
+pub(super) fn length_mismatch(actual: f64, expected: f64) -> NodeError {
     NodeError::new(
         ErrorKind::Error,
         "ERR_HTTP_CONTENT_LENGTH_MISMATCH",
@@ -653,7 +660,7 @@ fn length_mismatch(actual: f64, expected: f64) -> NodeError {
 
 /// The declared `Content-Length` of `message` if it checks its body against it, as Node.js's
 /// `strictContentLength` checks.
-fn strict_content_length(
+pub(super) fn strict_content_length(
     scope: &Scope<'_>,
     message: Object<'_>,
     state: &OutgoingState<'_>,
@@ -698,25 +705,22 @@ pub(super) fn written_bytes(
     })?)
 }
 
-/// Write `chunk` in `encoding` to `message`, as Node.js's `write_` does: the header block is
-/// stored first if it wasn't, a message without a body drops the chunk, and a chunked message
-/// frames it. `encoded` is the chunk's bytes and length, if they were computed before. `from_end`
-/// marks the chunk `end` was given, whose length becomes the `Content-Length` of a header block
-/// stored now. Returns whether more can be written without waiting for `drain`.
-pub(super) fn write(
+/// The steps of Node.js's `write_` before a chunk of `length` bytes is sent. They store the header
+/// block if it wasn't stored, and return the result of the write if the chunk isn't sent: `false`
+/// for an ended or destroyed message, after reporting the error to `callback`, and `true` for a
+/// message without a body, after calling `callback` in the tick queue. A message without a body
+/// that rejects body writes throws `ERR_HTTP_BODY_NOT_ALLOWED` instead. With
+/// `strictContentLength`, a chunk that makes the body longer than its `Content-Length` throws
+/// `ERR_HTTP_CONTENT_LENGTH_MISMATCH`, as does a chunk from `end` (`from_end`) that makes it
+/// shorter. `from_end` also makes `length` the `Content-Length` of a header block stored now.
+pub(super) fn check_write(
     scope: &Scope<'_>,
     message: Object<'_>,
     state: &OutgoingState<'_>,
-    chunk: HandleValue<'_>,
-    encoding: Option<HandleValue<'_>>,
+    length: f64,
     callback: Option<HandleValue<'_>>,
     from_end: bool,
-    encoded: Option<(Vec<u8>, f64)>,
-) -> Result<bool, Thrown> {
-    let (bytes, length) = match encoded {
-        Some(encoded) => encoded,
-        None => written_bytes(scope, chunk, encoding)?,
-    };
+) -> Result<Option<bool>, Thrown> {
     let (ended, destroyed) = {
         let data = state.data();
         (data.ended, data.destroyed)
@@ -734,7 +738,7 @@ pub(super) fn write(
     };
     if let Some(error) = failure {
         on_error(scope, message, state, error, callback)?;
-        return Ok(false);
+        return Ok(Some(false));
     }
     if js::conversion::to_boolean(message.get_property(scope, c"strictContentLength")?) {
         let written = state.data().bytes_written + length;
@@ -768,7 +772,32 @@ pub(super) fn write(
         if let Some(callback) = callback {
             next_tick_call(scope, callback, &[])?;
         }
-        return Ok(true);
+        return Ok(Some(true));
+    }
+    Ok(None)
+}
+
+/// Write `chunk` in `encoding` to `message`, as Node.js's `write_` does: the header block is
+/// stored first if it wasn't, a message without a body drops the chunk, and a chunked message
+/// frames it. `encoded` is the chunk's bytes and length, if they were computed before. `from_end`
+/// marks the chunk `end` was given, whose length becomes the `Content-Length` of a header block
+/// stored now. Returns whether more can be written without waiting for `drain`.
+pub(super) fn write(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    state: &OutgoingState<'_>,
+    chunk: HandleValue<'_>,
+    encoding: Option<HandleValue<'_>>,
+    callback: Option<HandleValue<'_>>,
+    from_end: bool,
+    encoded: Option<(Vec<u8>, f64)>,
+) -> Result<bool, Thrown> {
+    let (bytes, length) = match encoded {
+        Some(encoded) => encoded,
+        None => written_bytes(scope, chunk, encoding)?,
+    };
+    if let Some(result) = check_write(scope, message, state, length, callback, from_end)? {
+        return Ok(result);
     }
     if !from_end {
         cork_until_next_tick(scope, state)?;
@@ -781,7 +810,16 @@ pub(super) fn write(
         !bytes.is_empty()
     };
     if nonempty && js::conversion::to_boolean(message.get_property(scope, c"chunkedEncoding")?) {
-        let mut data = format!("{:x}\r\n", length as u64).into_bytes();
+        let size = format!("{:x}\r\n", length as u64);
+        let mut data = Vec::new();
+        if data
+            .try_reserve_exact(size.len() + bytes.len() + 2)
+            .is_err()
+        {
+            js::exception::report_out_of_memory(scope);
+            return Err(ExnThrown.into());
+        }
+        data.extend_from_slice(size.as_bytes());
         data.extend_from_slice(&bytes);
         data.extend_from_slice(b"\r\n");
         return Ok(send(
@@ -857,22 +895,84 @@ fn uncork_fully(scope: &Scope<'_>, state: &OutgoingState<'_>) -> Result<(), ExnT
 }
 
 /// The callback of the last write of a message, whose `this` is the socket and whose payload is
-/// the message: emit `finish`, unless the write failed or the message emitted it.
+/// the message, as Node.js's `onFinish`: if the write failed, or the message or its socket has an
+/// error, call the end callbacks with the write's error, the message's, the socket's `errored`,
+/// or `ERR_STREAM_DESTROYED`, in that order of preference. Otherwise call them with `null` and emit
+/// `finish`, unless the message emitted it.
 fn on_finish(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let message = js::function::cast_payload::<js::Object>(scope, payload);
-    if js::conversion::to_boolean(args.get(0)) {
+    let state = super::outgoing::state_of(scope, message)?;
+    let (errored, socket) = {
+        let data = state.data();
+        (
+            data.errored.as_ref().map(|errored| errored.get(scope)),
+            data.socket.get(scope),
+        )
+    };
+    let socket_errored = match socket {
+        Some(socket) => socket.get_property(scope, c"errored")?,
+        None => HandleValue::undefined(),
+    };
+    let socket_had_error = match socket {
+        Some(socket) => js::conversion::to_boolean(socket.get_property(scope, c"_hadError")?),
+        None => false,
+    };
+    let error = args.get(0);
+    if js::conversion::to_boolean(error)
+        || errored.is_some_and(js::conversion::to_boolean)
+        || js::conversion::to_boolean(socket_errored)
+        || socket_had_error
+    {
+        let error = if !error.is_null_or_undefined() {
+            error
+        } else if let Some(errored) = errored.filter(|errored| !errored.is_null_or_undefined()) {
+            errored
+        } else if !socket_errored.is_null_or_undefined() {
+            socket_errored
+        } else {
+            NodeError::new(
+                ErrorKind::Error,
+                "ERR_STREAM_DESTROYED",
+                "Cannot call end after a stream was destroyed",
+            )
+            .to_value(scope)?
+        };
+        state.data_mut().flush_error = Some(Heap::from(error.get()));
+        flush_end_callbacks(scope, &state, error)?;
         return Ok(js::value::undefined());
     }
-    let state = super::outgoing::state_of(scope, message)?;
     let emitted = std::mem::replace(&mut state.data_mut().finish_emitted, true);
+    flush_end_callbacks(scope, &state, HandleValue::null())?;
     if !emitted {
         crate::events::emit(scope, message, c"finish", &[])?;
     }
     Ok(js::value::undefined())
+}
+
+/// Call the end callbacks of the message of `state` with `error`, and clear the list.
+pub(super) fn flush_end_callbacks(
+    scope: &Scope<'_>,
+    state: &OutgoingState<'_>,
+    error: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
+    let callbacks: Vec<HandleValue<'_>> = {
+        let mut data = state.data_mut();
+        let callbacks = data
+            .end_callbacks
+            .iter()
+            .map(|callback| callback.get(scope))
+            .collect();
+        data.end_callbacks.clear();
+        callbacks
+    };
+    for callback in callbacks {
+        Function::call(scope, HandleValue::undefined(), callback, &[error])?;
+    }
+    Ok(())
 }
 
 /// A new callback that emits `finish` on `message` once the last write succeeds.
@@ -884,11 +984,11 @@ fn finish_callback<'s>(
     (*finish).to_jsval_throwing(scope)
 }
 
-/// Add `callback` as a `finish` listener of `message`, or call it with
-/// `ERR_STREAM_ALREADY_FINISHED` if `message` finished.
-fn queue_end_callback(
+/// Add `callback` to the end callbacks of the message of `state`, as Node.js's `queueEndCallback`:
+/// call it with `ERR_STREAM_ALREADY_FINISHED` if the message finished, and with the error of the
+/// failed last write in the tick queue if there was one.
+pub(super) fn queue_end_callback(
     scope: &Scope<'_>,
-    message: Object<'_>,
     state: &OutgoingState<'_>,
     callback: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
@@ -902,8 +1002,19 @@ fn queue_end_callback(
         Function::call(scope, HandleValue::undefined(), callback, &[error])?;
         return Ok(());
     }
-    let callback = Object::from_value(scope, *callback).map_err(|e| e.throw(scope))?;
-    crate::events::listen(scope, message, c"once", c"finish", callback)
+    let flush_error = state
+        .data()
+        .flush_error
+        .as_ref()
+        .map(|error| error.get(scope));
+    if let Some(error) = flush_error {
+        return crate::support::next_tick_call(scope, callback, &[error]);
+    }
+    state
+        .data_mut()
+        .end_callbacks
+        .push(Heap::from(callback.get()));
+    Ok(())
 }
 
 /// End `message` with `chunk`, as Node.js's `OutgoingMessage.prototype.end` does: a message that
@@ -945,7 +1056,7 @@ pub(super) fn end(
         };
         if final_chunk {
             if let Some(callback) = callback.take() {
-                queue_end_callback(scope, message, state, callback)?;
+                queue_end_callback(scope, state, callback)?;
             }
             finish = Some(finish_callback(scope, message)?);
         }
@@ -954,7 +1065,7 @@ pub(super) fn end(
         )?;
     } else if state.data().ended {
         if let Some(callback) = callback {
-            queue_end_callback(scope, message, state, callback)?;
+            queue_end_callback(scope, state, callback)?;
         }
         return Ok(());
     } else if !state.data().header_stored {
@@ -963,7 +1074,7 @@ pub(super) fn end(
         implicit_header(scope, message, state)?;
     }
     if let Some(callback) = callback {
-        queue_end_callback(scope, message, state, callback)?;
+        queue_end_callback(scope, state, callback)?;
     }
     if let Some(expected) = strict_content_length(scope, message, state)? {
         let written = state.data().bytes_written;
@@ -1032,15 +1143,16 @@ pub(super) fn flush_headers(
     Ok(())
 }
 
-/// The header line `name: value` of an informational response, after checking `name` and
-/// `value` as `setHeader` does.
+/// The header line `name: value` of an informational response of `message`, after checking `name`
+/// and `value` as `setHeader` does.
 fn information_line(
     scope: &Scope<'_>,
+    message: Object<'_>,
     name: HandleValue<'_>,
     value: HandleValue<'_>,
 ) -> Result<String, Thrown> {
     let name = super::validate_name(scope, name)?;
-    super::module::validate_header_value(scope, name.clone(), value)?;
+    super::check_header_value(scope, message, &name, value)?;
     let value = String::from_jsval(scope, value, ())?;
     Ok(format!("{name}: {value}\r\n"))
 }
@@ -1081,7 +1193,7 @@ pub(super) fn write_information(
         }
         let pairs = super::outgoing::header_args(scope, headers, false)?;
         for (name, value) in pairs {
-            head.push_str(&information_line(scope, name, value)?);
+            head.push_str(&information_line(scope, message, name, value)?);
         }
     }
     head.push_str("\r\n");

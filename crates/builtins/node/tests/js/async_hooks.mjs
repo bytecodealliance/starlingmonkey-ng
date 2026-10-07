@@ -161,4 +161,8 @@ deepEq(Object.getOwnPropertyNames(new AsyncResource("x")), [], "no own propertie
 const { createHook } = await import("node:async_hooks");
 const hook = createHook({ init() {} });
 eq(hook.enable(), hook, "createHook's enable returns the hook");
+deepEq(Object.keys(hook), [], "a hook has no own properties");
+eq(hook.constructor.name, "AsyncHook", "a hook is an AsyncHook");
+eq(new AsyncResource("t", "abc").triggerAsyncId(), new AsyncResource("t").triggerAsyncId(), "options that aren't an object or a number");
+throws(() => new AsyncResource("t", null), TypeError, "null options");
 throws(() => createHook({ init: 1 }), "ERR_ASYNC_CALLBACK", "createHook validates callbacks");

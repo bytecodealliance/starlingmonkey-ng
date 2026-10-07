@@ -83,6 +83,13 @@ throws(() => randomInt(10, 5), "ERR_OUT_OF_RANGE", "randomInt needs max > min");
 eq(timingSafeEqual(Buffer.from("abc"), Buffer.from("abc")), true, "timingSafeEqual");
 eq(timingSafeEqual(Buffer.from("abc"), Buffer.from("abd")), false, "timingSafeEqual detects differences");
 throws(() => timingSafeEqual(Buffer.from("a"), Buffer.from("ab")), "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH", "timingSafeEqual lengths");
+eq(timingSafeEqual(new ArrayBuffer(2), new DataView(new ArrayBuffer(2))), true, "timingSafeEqual of other buffer sources");
+throws(() => timingSafeEqual(Buffer.from("a"), "a"), "ERR_INVALID_ARG_TYPE", "timingSafeEqual checks buf2");
+eq(
+  (() => { try { timingSafeEqual(1, Buffer.from("a")); } catch (error) { return error.message; } })(),
+  'The "buf1" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.',
+  "timingSafeEqual's argument error has Node.js's C++ message",
+);
 eq(getRandomValues(new Uint32Array(4)).length, 4, "getRandomValues");
 eq(webcrypto, globalThis.crypto, "webcrypto is the global crypto");
 
@@ -171,3 +178,27 @@ throws(() => hkdfSync("sha256", "key", "salt", "info", 255 * 32 + 1), "ERR_CRYPT
 throws(() => hkdfSync("sha256", "key", "salt", Buffer.alloc(1025), 16), "ERR_OUT_OF_RANGE", "hkdfSync limits the info");
 const hkdfResult = await new Promise((resolve) => hkdf("sha512", "key", "salt", "info", 16, (error, key) => resolve([error, Buffer.from(key).toString("hex")])));
 deepEq(hkdfResult, [null, "24156e2c35525baaf3d0fbb92b734c80"], "hkdf with a callback");
+
+// `getHashes` sorts its names in byte order.
+const hashes = getHashes();
+deepEq(hashes, [...hashes].sort(), "getHashes is sorted");
+
+// `KeyObject.export` rejects array options.
+throws(() => createSecretKey(Buffer.from("ab")).export([]), "ERR_INVALID_ARG_TYPE", "export with array options");
+
+// Out-of-range numbers above 2 ** 32 are shown with `_` separators.
+eq(throws(() => crypto.randomFillSync(Buffer.alloc(4), 2 ** 40), "ERR_OUT_OF_RANGE").message.endsWith("Received 1_099_511_627_776"), true, "randomFillSync offset");
+eq(throws(() => crypto.randomInt(0, 2 ** 48), "ERR_OUT_OF_RANGE").message.endsWith("Received 281_474_976_710_656"), true, "randomInt range");
+
+// The callback forms validate the callback before deriving.
+throws(() => pbkdf2("p", "s", 1e9, 64, "sha512", "notfn"), "ERR_INVALID_ARG_TYPE", "pbkdf2 checks the callback first");
+
+// `outputLength` must be a uint32, and the digest's own length for a digest without extendable output.
+throws(() => createHash("sha256", { outputLength: -1 }), "ERR_OUT_OF_RANGE", "a negative outputLength");
+throws(() => createHash("sha256", { outputLength: 4 }), "ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH", "outputLength of a fixed-length digest");
+eq(createHash("sha256", { outputLength: 32 }).update("a").digest("hex").length, 64, "outputLength equal to the digest's length");
+throws(() => createHash("sha256").copy({ outputLength: 4 }), "ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH", "copy checks outputLength");
+
+// `randomFill` checks `buf` before the callback, and both fill a `SharedArrayBuffer`.
+eq(throws(() => crypto.randomFill(5), "ERR_INVALID_ARG_TYPE").message.startsWith('The "buf" argument'), true, "randomFill checks buf first");
+eq(crypto.randomFillSync(new SharedArrayBuffer(4)).byteLength, 4, "randomFillSync of a SharedArrayBuffer");

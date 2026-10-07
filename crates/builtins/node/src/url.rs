@@ -6,17 +6,20 @@
 //! `format`, `resolve`, `resolveObject`) is a port of Node.js v24's `lib/url.js`. Hostnames are
 //! converted with the `idna` crate's UTS #46 processing.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
+use js::native::CallArgs;
 use js::object::{PropertyInit, PropertyTemplate, PropertyWriter, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{validate_string, ErrorKind, NodeError, Thrown};
 use crate::process::{called_from_node_modules, deprecation_warning};
+use crate::support::{try_collect, DecodeUriError};
 
 /// The protocols whose URLs always have `//` before the host.
 const SLASHED_PROTOCOLS: &[&str] = &[
@@ -57,21 +60,11 @@ pub(crate) fn url_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, Ex
     js::class::class_constructor::<web_url::url::URLImpl>(scope)
 }
 
-/// `decodeURIComponent(text)`, or `None` for a `%` that doesn't start two hex digits or a result
-/// that isn't UTF-8, for which `decodeURIComponent` throws.
-pub(crate) fn decode_uri_component(text: &str) -> Option<String> {
-    let mut bytes = Vec::with_capacity(text.len());
-    let mut input = text.bytes();
-    while let Some(byte) = input.next() {
-        if byte != b'%' {
-            bytes.push(byte);
-            continue;
-        }
-        let high = (input.next()? as char).to_digit(16)?;
-        let low = (input.next()? as char).to_digit(16)?;
-        bytes.push((high * 16 + low) as u8);
-    }
-    String::from_utf8(bytes).ok()
+/// `decodeURIComponent(text)`.
+fn decode_uri_component(text: &str) -> Result<String, DecodeUriError> {
+    let units = try_collect(text.encode_utf16()).ok_or(DecodeUriError::OutOfMemory)?;
+    let decoded = crate::support::decode_uri_component(&units)?;
+    String::from_utf16(&decoded).map_err(|_| DecodeUriError::Malformed)
 }
 
 /// Whether `value` passes Node's `isURL` check: an object with a truthy `href` and `protocol`, and
@@ -89,17 +82,37 @@ pub(crate) fn is_url(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, 
 
 /// `decodeURIComponent(input)`, which throws a `URIError` for a malformed escape or invalid UTF-8.
 fn decode_uri_component_throwing(scope: &Scope<'_>, input: &str) -> Result<String, Thrown> {
-    decode_uri_component(input).ok_or_else(|| {
-        js::error::throw_uri_error(scope, c"URI malformed");
+    decode_uri_component(input).map_err(|error| {
+        match error {
+            DecodeUriError::Malformed => js::error::throw_uri_error(scope, c"URI malformed"),
+            DecodeUriError::OutOfMemory => {
+                js::exception::report_out_of_memory(scope);
+                ExnThrown
+            }
+        };
         Thrown::Pending
     })
 }
 
-/// The path of the `file:` URL `href`, as `fileURLToPath` returns it.
-pub fn file_url_to_path(scope: &Scope<'_>, href: &str) -> Result<String, Thrown> {
-    let url = url::Url::parse(href)
-        .map_err(|_| NodeError::new(ErrorKind::TypeError, "ERR_INVALID_URL", "Invalid URL"))?;
-    if url.scheme() != "file" {
+/// Throw `error` with an own `input` property set to `input`.
+fn throw_with_input<'v>(scope: &'v Scope<'_>, error: NodeError, input: impl ToJSVal<'v>) -> Thrown {
+    let throw = || -> Result<(), ExnThrown> {
+        let value = error.to_value(scope)?;
+        let object = Object::from_value(scope, value).map_err(|e| e.throw(scope))?;
+        object.set_property(scope, c"input", input)?;
+        js::exception::set_pending(scope, value, js::native::ExceptionStackBehavior::Capture);
+        Ok(())
+    };
+    // An error creating the error leaves its own exception pending.
+    let _ = throw();
+    Thrown::Pending
+}
+
+/// The path of the `file:` URL `url`, an object that passes [`is_url`], as `fileURLToPath`
+/// returns it from the URL's `protocol`, `hostname` and `pathname`.
+pub fn file_url_to_path(scope: &Scope<'_>, url_object: Object<'_>) -> Result<String, Thrown> {
+    let protocol = url_object.get_property(scope, c"protocol")?;
+    if !crate::support::is_str(scope, protocol, c"file:")? {
         return Err(NodeError::new(
             ErrorKind::TypeError,
             "ERR_INVALID_URL_SCHEME",
@@ -107,7 +120,8 @@ pub fn file_url_to_path(scope: &Scope<'_>, href: &str) -> Result<String, Thrown>
         )
         .into());
     }
-    if url.host_str().is_some_and(|host| !host.is_empty()) {
+    let hostname = url_object.get_property(scope, c"hostname")?;
+    if !crate::support::is_str(scope, hostname, c"")? {
         return Err(NodeError::new(
             ErrorKind::TypeError,
             "ERR_INVALID_FILE_URL_HOST",
@@ -118,20 +132,22 @@ pub fn file_url_to_path(scope: &Scope<'_>, href: &str) -> Result<String, Thrown>
         )
         .into());
     }
-    let path = url.path();
+    let pathname = url_object.get_property(scope, c"pathname")?;
+    let path = js::JSString::from_value(scope, pathname)?.to_utf8(scope)?;
     if path.to_ascii_lowercase().contains("%2f") {
-        return Err(NodeError::new(
+        let error = NodeError::new(
             ErrorKind::TypeError,
             "ERR_INVALID_FILE_URL_PATH",
             "File URL path must not include encoded / characters",
-        )
-        .into());
+        );
+        return Err(throw_with_input(scope, error, url_object));
     }
-    decode_uri_component_throwing(scope, path)
+    decode_uri_component_throwing(scope, &path)
 }
 
 /// The `file:` URL of `path`, resolved against the working directory, as `pathToFileURL` builds
-/// it: `%`, `?`, `#`, `\`, and control characters are percent-encoded, and a trailing `/` is kept.
+/// it: NUL, tab, LF, CR, space, `"`, `#`, `%`, `?`, `[`, `\`, `]`, `^`, `|` and `~` are
+/// percent-encoded (Node's `EncodePathChars`), and a trailing `/` is kept.
 fn path_to_file_href(path: &str) -> String {
     let mut resolved = crate::path::resolve_paths(&[path.to_string()]);
     if path.ends_with('/') && !resolved.ends_with('/') {
@@ -140,14 +156,21 @@ fn path_to_file_href(path: &str) -> String {
     let mut href = String::from("file://");
     for c in resolved.chars() {
         match c {
-            '%' => href.push_str("%25"),
-            '?' => href.push_str("%3F"),
-            '#' => href.push_str("%23"),
-            '\\' => href.push_str("%5C"),
+            '\0' => href.push_str("%00"),
+            '\t' => href.push_str("%09"),
             '\n' => href.push_str("%0A"),
             '\r' => href.push_str("%0D"),
-            '\t' => href.push_str("%09"),
             ' ' => href.push_str("%20"),
+            '"' => href.push_str("%22"),
+            '#' => href.push_str("%23"),
+            '%' => href.push_str("%25"),
+            '?' => href.push_str("%3F"),
+            '[' => href.push_str("%5B"),
+            '\\' => href.push_str("%5C"),
+            ']' => href.push_str("%5D"),
+            '^' => href.push_str("%5E"),
+            '|' => href.push_str("%7C"),
+            '~' => href.push_str("%7E"),
             c => href.push(c),
         }
     }
@@ -162,7 +185,7 @@ enum Origin {
 }
 
 /// The `query` of a legacy URL.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum Query {
     #[default]
     Null,
@@ -179,6 +202,17 @@ enum LegacyError {
     InvalidUrl,
     /// The `URIError` of `decodeURIComponent`.
     UriMalformed,
+    /// A failed allocation.
+    OutOfMemory,
+}
+
+impl From<DecodeUriError> for LegacyError {
+    fn from(error: DecodeUriError) -> Self {
+        match error {
+            DecodeUriError::Malformed => LegacyError::UriMalformed,
+            DecodeUriError::OutOfMemory => LegacyError::OutOfMemory,
+        }
+    }
 }
 
 /// The fields of a `url.Url`. `None` stands for `null`, and for the falsy values of a URL object
@@ -198,6 +232,9 @@ struct LegacyUrl {
     path: Option<String>,
     href: Option<String>,
 }
+
+/// Whether a URL object has each field of [`URL_PROPERTIES`] as an own property, in that order.
+type OwnFields = [bool; 12];
 
 /// The properties of the relative URL object that [`LegacyUrl::resolve_object`] copies to the
 /// result.
@@ -257,29 +294,86 @@ fn simple_path(rest: &str) -> Option<(&str, Option<&str>)> {
     Some((&rest[..end], Some(&rest[end..])))
 }
 
-/// `rest` with the characters Node's `autoEscapeStr` escapes percent-encoded.
-fn auto_escape(rest: &str) -> String {
-    let mut escaped = String::with_capacity(rest.len());
-    for c in rest.chars() {
-        match c {
-            '\t' => escaped.push_str("%09"),
-            '\n' => escaped.push_str("%0A"),
-            '\r' => escaped.push_str("%0D"),
-            ' ' => escaped.push_str("%20"),
-            '"' => escaped.push_str("%22"),
-            '\'' => escaped.push_str("%27"),
-            '<' => escaped.push_str("%3C"),
-            '>' => escaped.push_str("%3E"),
-            '\\' => escaped.push_str("%5C"),
-            '^' => escaped.push_str("%5E"),
-            '`' => escaped.push_str("%60"),
-            '{' => escaped.push_str("%7B"),
-            '|' => escaped.push_str("%7C"),
-            '}' => escaped.push_str("%7D"),
-            c => escaped.push(c),
+/// The characters Node's `autoEscapeStr` escapes, with their escapes.
+const AUTO_ESCAPES: &[(char, &str)] = &[
+    ('\t', "%09"),
+    ('\n', "%0A"),
+    ('\r', "%0D"),
+    (' ', "%20"),
+    ('"', "%22"),
+    ('\'', "%27"),
+    ('<', "%3C"),
+    ('>', "%3E"),
+    ('\\', "%5C"),
+    ('^', "%5E"),
+    ('`', "%60"),
+    ('{', "%7B"),
+    ('|', "%7C"),
+    ('}', "%7D"),
+];
+
+/// `text` with each character `replacements` lists replaced by its replacement, or
+/// [`LegacyError::OutOfMemory`] if allocating the result fails.
+fn replace_chars<'t>(
+    text: &'t str,
+    replacements: &[(char, &str)],
+) -> Result<Cow<'t, str>, LegacyError> {
+    let replacement = |c: char| {
+        replacements
+            .iter()
+            .find(|(from, _)| *from == c)
+            .map(|(_, to)| *to)
+    };
+    let mut length = 0usize;
+    let mut replaced = false;
+    for c in text.chars() {
+        let size = match replacement(c) {
+            Some(to) => {
+                replaced = true;
+                to.len()
+            }
+            None => c.len_utf8(),
+        };
+        length = length.checked_add(size).ok_or(LegacyError::OutOfMemory)?;
+    }
+    if !replaced {
+        return Ok(Cow::Borrowed(text));
+    }
+    let mut out = String::new();
+    out.try_reserve_exact(length)
+        .map_err(|_| LegacyError::OutOfMemory)?;
+    for c in text.chars() {
+        match replacement(c) {
+            Some(to) => out.push_str(to),
+            None => out.push(c),
         }
     }
-    escaped
+    Ok(Cow::Owned(out))
+}
+
+/// The concatenation of `parts`, or [`LegacyError::OutOfMemory`] if allocating it fails.
+fn concat(parts: &[&str]) -> Result<String, LegacyError> {
+    let length = parts
+        .iter()
+        .try_fold(0usize, |length, part| length.checked_add(part.len()))
+        .ok_or(LegacyError::OutOfMemory)?;
+    let mut out = String::new();
+    out.try_reserve_exact(length)
+        .map_err(|_| LegacyError::OutOfMemory)?;
+    for part in parts {
+        out.push_str(part);
+    }
+    Ok(out)
+}
+
+/// The characters of `chars` as a string, or [`LegacyError::OutOfMemory`] if allocating it fails.
+fn string_of(chars: &[char]) -> Result<String, LegacyError> {
+    let length = chars.iter().map(|c| c.len_utf8()).sum();
+    let mut out = String::new();
+    out.try_reserve_exact(length)
+        .map_err(|_| LegacyError::OutOfMemory)?;
+    out.extend(chars);
+    Ok(out)
 }
 
 /// `text` split at `/`, or no parts if it is empty or `None`.
@@ -299,15 +393,17 @@ fn prepend_host(path: &mut Vec<String>, host: String) {
 }
 
 impl LegacyUrl {
-    /// `Url.prototype.parse` of `url`, and whether its host held an invalid port, for which
-    /// Node.js emits DEP0170.
+    /// `Url.prototype.parse` of `url` with `self` as `this`: the fields the parse assigns are
+    /// replaced, and the others are kept. `invalid_port` is set if the host held an invalid port,
+    /// for which Node.js emits DEP0170, also when the parse fails after that.
     fn parse(
+        mut self,
         url: &str,
         parse_query_string: bool,
         slashes_denote_host: bool,
-    ) -> Result<(Self, bool), LegacyError> {
-        let mut result = LegacyUrl::default();
-        let mut invalid_port = false;
+        invalid_port: &mut bool,
+    ) -> Result<Self, LegacyError> {
+        let result = &mut self;
 
         // Trim whitespace, and turn backslashes before the query or hash into slashes.
         let mut has_hash = false;
@@ -378,9 +474,10 @@ impl LegacyUrl {
                         Query::Text(query)
                     };
                 } else if parse_query_string {
+                    result.search = None;
                     result.query = Query::Parsed(String::new());
                 }
-                return Ok((result, false));
+                return Ok(self);
             }
         }
 
@@ -415,7 +512,7 @@ impl LegacyUrl {
         {
             // The first `/`, `?` or `#` ends the host. A character a host can't hold ends it
             // too, unless an `@` follows.
-            let mut chars: Vec<char> = rest.chars().collect();
+            let mut chars: Vec<char> = try_collect(rest.chars()).ok_or(LegacyError::OutOfMemory)?;
             let mut host_end = None;
             let mut at_sign = None;
             let mut non_host = None;
@@ -447,21 +544,21 @@ impl LegacyUrl {
             }
             let mut host_start = 0;
             if let Some(at_sign) = at_sign {
-                let auth: String = chars[..at_sign].iter().collect();
-                result.auth = Some(decode_uri_component(&auth).ok_or(LegacyError::UriMalformed)?);
+                let auth = string_of(&chars[..at_sign])?;
+                result.auth = Some(decode_uri_component(&auth).map_err(LegacyError::from)?);
                 host_start = at_sign + 1;
             }
             let host_end = non_host.unwrap_or(chars.len());
-            result.host = Some(chars[host_start.min(host_end)..host_end].iter().collect());
-            rest = chars[host_end..].iter().collect();
+            result.host = Some(string_of(&chars[host_start.min(host_end)..host_end])?);
+            rest = string_of(&chars[host_end..])?;
             result.parse_host();
 
             let hostname = result.hostname.clone().unwrap_or_default();
             let ipv6_hostname = is_ipv6_hostname(&hostname);
             let mut hostname = match hostname.find(['/', '\\', '#', '?', ':']) {
                 Some(i) if !ipv6_hostname => {
-                    invalid_port = hostname.as_bytes()[i] == b':';
-                    rest = format!("/{}{rest}", &hostname[i..]);
+                    *invalid_port = hostname.as_bytes()[i] == b':';
+                    rest = concat(&["/", &hostname[i..], &rest])?;
                     hostname[..i].to_string()
                 }
                 _ => hostname,
@@ -502,7 +599,9 @@ impl LegacyUrl {
         }
 
         if !is_hostless(lower_proto) {
-            rest = auto_escape(&rest);
+            if let Cow::Owned(escaped) = replace_chars(&rest, AUTO_ESCAPES)? {
+                rest = escaped;
+            }
         }
 
         let hash_index = rest.find('#');
@@ -535,10 +634,10 @@ impl LegacyUrl {
             result.pathname = Some("/".into());
         }
         if truthy(&result.pathname) || truthy(&result.search) {
-            result.update_path();
+            result.update_path()?;
         }
-        result.href = Some(result.format());
-        Ok((result, invalid_port))
+        result.href = Some(result.format()?);
+        Ok(self)
     }
 
     /// `Url.prototype.parseHost`: move a trailing `:` and digits from `host` to `port`, and set
@@ -559,91 +658,163 @@ impl LegacyUrl {
     }
 
     /// Set `path` to `pathname` followed by `search`.
-    fn update_path(&mut self) {
-        self.path = Some(format!(
-            "{}{}",
+    fn update_path(&mut self) -> Result<(), LegacyError> {
+        self.path = Some(concat(&[
             self.pathname.as_deref().unwrap_or_default(),
-            self.search.as_deref().unwrap_or_default()
-        ));
+            self.search.as_deref().unwrap_or_default(),
+        ])?);
+        Ok(())
     }
 
-    /// `Url.prototype.format`.
-    fn format(&self) -> String {
-        let mut auth = self.auth.clone().unwrap_or_default();
-        if !auth.is_empty() {
-            auth = crate::querystring::escape_str(&auth).replace("%3A", ":");
-            auth.push('@');
+    /// `Url.prototype.format`, or [`LegacyError::OutOfMemory`] if allocating the text fails.
+    fn format(&self) -> Result<String, LegacyError> {
+        fn nonempty(field: &Option<String>) -> Option<&str> {
+            field.as_deref().filter(|text| !text.is_empty())
         }
-        let mut protocol = self.protocol.clone().unwrap_or_default();
-        if !protocol.is_empty() && !protocol.ends_with(':') {
-            protocol.push(':');
-        }
-        let mut host = String::new();
-        if let Some(own_host) = self.host.as_deref().filter(|host| !host.is_empty()) {
-            host = format!("{auth}{own_host}");
-        } else if let Some(hostname) = self.hostname.as_deref().filter(|h| !h.is_empty()) {
-            host = if hostname.contains(':') && !is_ipv6_hostname(hostname) {
-                format!("{auth}[{hostname}]")
-            } else {
-                format!("{auth}{hostname}")
-            };
-            if let Some(port) = self.port.as_deref().filter(|port| !port.is_empty()) {
-                host.push(':');
-                host.push_str(port);
+        let auth = match nonempty(&self.auth) {
+            Some(auth) => {
+                crate::querystring::escape_str(auth, true).ok_or(LegacyError::OutOfMemory)?
+            }
+            None => String::new(),
+        };
+        let at = if auth.is_empty() { "" } else { "@" };
+        let protocol = self.protocol.as_deref().unwrap_or_default();
+        let colon = if !protocol.is_empty() && !protocol.ends_with(':') {
+            ":"
+        } else {
+            ""
+        };
+        let mut host: [&str; 7] = [""; 7];
+        if let Some(own_host) = nonempty(&self.host) {
+            host[..3].copy_from_slice(&[&auth, at, own_host]);
+        } else if let Some(hostname) = nonempty(&self.hostname) {
+            let bracket = hostname.contains(':') && !is_ipv6_hostname(hostname);
+            let (open, close) = if bracket { ("[", "]") } else { ("", "") };
+            host[..5].copy_from_slice(&[&auth, at, open, hostname, close]);
+            if let Some(port) = nonempty(&self.port) {
+                host[5..].copy_from_slice(&[":", port]);
             }
         }
+        let has_host = host.iter().any(|part| !part.is_empty());
         let query = match &self.query {
             Query::Parsed(text) | Query::Object(_, text) => text.as_str(),
             Query::Null | Query::Text(_) => "",
         };
-        let mut search = match self.search.as_deref().filter(|search| !search.is_empty()) {
-            Some(search) => search.to_string(),
-            None if !query.is_empty() => format!("?{query}"),
-            None => String::new(),
+        let (search_mark, search) = match nonempty(&self.search) {
+            Some(search) => ("", search),
+            None if !query.is_empty() => ("?", query),
+            None => ("", ""),
         };
-        let mut pathname = self
-            .pathname
-            .as_deref()
-            .unwrap_or_default()
-            .replace('#', "%23")
-            .replace('?', "%3F");
-        if self.slashes || SLASHED_PROTOCOLS.contains(&protocol.as_str()) {
-            if self.slashes || !host.is_empty() {
+        let pathname = self.pathname.as_deref().unwrap_or_default();
+        let pathname = replace_chars(pathname, &[('#', "%23"), ('?', "%3F")])?;
+        let mut slashes = "";
+        let mut path_slash = "";
+        if self.slashes || SLASHED_PROTOCOLS.contains(&protocol) {
+            if self.slashes || has_host {
                 if !pathname.is_empty() && !pathname.starts_with('/') {
-                    pathname.insert(0, '/');
+                    path_slash = "/";
                 }
-                host.insert_str(0, "//");
+                slashes = "//";
             } else if protocol.starts_with("file") {
-                host = "//".into();
+                slashes = "//";
             }
         }
-        search = search.replace('#', "%23");
-        let mut hash = self.hash.clone().unwrap_or_default();
-        if !hash.is_empty() && !hash.starts_with('#') {
-            hash.insert(0, '#');
+        let search = replace_chars(search, &[('#', "%23")])?;
+        let search_mark =
+            if search_mark.is_empty() && !search.is_empty() && !search.starts_with('?') {
+                "?"
+            } else {
+                search_mark
+            };
+        let hash = self.hash.as_deref().unwrap_or_default();
+        let hash_mark = if !hash.is_empty() && !hash.starts_with('#') {
+            "#"
+        } else {
+            ""
+        };
+        let [auth, at, open, hostname, close, port_colon, port] = host;
+        concat(&[
+            protocol,
+            colon,
+            slashes,
+            auth,
+            at,
+            open,
+            hostname,
+            close,
+            port_colon,
+            port,
+            path_slash,
+            &pathname,
+            search_mark,
+            &search,
+            hash_mark,
+            hash,
+        ])
+    }
+
+    /// `self` with the fields that `relative`'s object has as own properties (`own`) replaced by
+    /// those of `relative`, as `Object.assign` copies them. `protocol` is kept if `keep_protocol`.
+    fn assigned(self, mut relative: LegacyUrl, own: &OwnFields, keep_protocol: bool) -> Self {
+        let [protocol, slashes, auth, host, port, hostname, hash, search, query, pathname, path, href] =
+            *own;
+        if !protocol || keep_protocol {
+            relative.protocol = self.protocol;
         }
-        if !search.is_empty() && !search.starts_with('?') {
-            search.insert(0, '?');
+        if !slashes {
+            relative.slashes = self.slashes;
         }
-        format!("{protocol}{host}{pathname}{search}{hash}")
+        if !auth {
+            relative.auth = self.auth;
+        }
+        if !host {
+            relative.host = self.host;
+        }
+        if !port {
+            relative.port = self.port;
+        }
+        if !hostname {
+            relative.hostname = self.hostname;
+        }
+        if !hash {
+            relative.hash = self.hash;
+        }
+        if !search {
+            relative.search = self.search;
+        }
+        if !query {
+            relative.query = self.query;
+        }
+        if !pathname {
+            relative.pathname = self.pathname;
+        }
+        if !path {
+            relative.path = self.path;
+        }
+        if !href {
+            relative.href = self.href;
+        }
+        relative
     }
 
     /// `Url.prototype.resolveObject`, with `self` as `this`, and the properties of `relative`'s
-    /// object to copy to the result object before setting the fields.
-    fn resolve_object(&self, mut relative: LegacyUrl) -> (LegacyUrl, Copy) {
+    /// object to copy to the result object before setting the fields. `own` lists the fields that
+    /// `relative`'s object has as own properties.
+    fn resolve_object(
+        &self,
+        mut relative: LegacyUrl,
+        own: &OwnFields,
+    ) -> Result<(LegacyUrl, Copy), LegacyError> {
         let mut result = self.clone();
         result.hash = relative.hash.clone();
 
         if relative.href.as_deref() == Some("") {
-            result.href = Some(result.format());
-            return (result, Copy::Nothing);
+            result.href = Some(result.format()?);
+            return Ok((result, Copy::Nothing));
         }
 
         if relative.slashes && !truthy(&relative.protocol) {
-            result = LegacyUrl {
-                protocol: result.protocol,
-                ..relative
-            };
+            result = result.assigned(relative, own, true);
             if is_slashed(result.protocol.as_deref())
                 && truthy(&result.hostname)
                 && !truthy(&result.pathname)
@@ -651,15 +822,15 @@ impl LegacyUrl {
                 result.pathname = Some("/".into());
                 result.path = Some("/".into());
             }
-            result.href = Some(result.format());
-            return (result, Copy::AllButProtocol);
+            result.href = Some(result.format()?);
+            return Ok((result, Copy::AllButProtocol));
         }
 
         if truthy(&relative.protocol) && relative.protocol != result.protocol {
             if !is_slashed(relative.protocol.as_deref()) {
-                result = relative;
-                result.href = Some(result.format());
-                return (result, Copy::All);
+                result = result.assigned(relative, own, false);
+                result.href = Some(result.format()?);
+                return Ok((result, Copy::All));
             }
             result.protocol = relative.protocol.clone();
             let protocol = relative.protocol.as_deref().unwrap_or_default();
@@ -705,11 +876,11 @@ impl LegacyUrl {
             };
             result.port = relative.port.clone();
             if truthy(&result.pathname) || truthy(&result.search) {
-                result.update_path();
+                result.update_path()?;
             }
             result.slashes |= relative.slashes;
-            result.href = Some(result.format());
-            return (result, Copy::Nothing);
+            result.href = Some(result.format()?);
+            return Ok((result, Copy::Nothing));
         }
 
         let starts_with_slash =
@@ -777,10 +948,10 @@ impl LegacyUrl {
             result.search = relative.search.clone();
             result.query = relative.query.clone();
             if result.pathname.is_some() || result.search.is_some() {
-                result.update_path();
+                result.update_path()?;
             }
-            result.href = Some(result.format());
-            return (result, Copy::Nothing);
+            result.href = Some(result.format()?);
+            return Ok((result, Copy::Nothing));
         }
 
         if src_path.is_empty() {
@@ -790,8 +961,8 @@ impl LegacyUrl {
                 .as_deref()
                 .filter(|search| !search.is_empty())
                 .map(|search| format!("/{search}"));
-            result.href = Some(result.format());
-            return (result, Copy::Nothing);
+            result.href = Some(result.format()?);
+            return Ok((result, Copy::Nothing));
         }
 
         // A path that ends in `.` or `..` gets a trailing slash.
@@ -855,14 +1026,14 @@ impl LegacyUrl {
             result.pathname = Some(src_path.join("/"));
         }
         if result.pathname.is_some() || result.search.is_some() {
-            result.update_path();
+            result.update_path()?;
         }
         if truthy(&relative.auth) {
             result.auth = relative.auth.clone();
         }
         result.slashes |= relative.slashes;
-        result.href = Some(result.format());
-        (result, Copy::Nothing)
+        result.href = Some(result.format()?);
+        Ok((result, Copy::Nothing))
     }
 
     /// For a `host` of the form `user@host`, set `auth` to `user`, and `host` and `hostname` to
@@ -881,29 +1052,52 @@ impl LegacyUrl {
     }
 }
 
-/// `Url.prototype.parse` of `input`. DEP0170 is emitted once per instance for an invalid port.
+/// Throw the error of the legacy parser for `input`, or report out of memory.
+fn throw_legacy(scope: &Scope<'_>, error: LegacyError, input: &str) -> Thrown {
+    match error {
+        LegacyError::InvalidUrl => throw_with_input(
+            scope,
+            NodeError::new(ErrorKind::TypeError, "ERR_INVALID_URL", "Invalid URL"),
+            input,
+        ),
+        LegacyError::UriMalformed => {
+            js::error::throw_uri_error(scope, c"URI malformed");
+            Thrown::Pending
+        }
+        LegacyError::OutOfMemory => {
+            js::exception::report_out_of_memory(scope);
+            Thrown::Pending
+        }
+    }
+}
+
+/// `Url.prototype.format` of `url`.
+fn format_url(scope: &Scope<'_>, url: &LegacyUrl) -> Result<String, Thrown> {
+    url.format().map_err(|error| throw_legacy(scope, error, ""))
+}
+
+/// `Url.prototype.parse` of `input` with `base` as `this`. DEP0170 is emitted once per instance
+/// for an invalid port, also if the parse fails after finding it.
 fn parse_legacy(
     scope: &Scope<'_>,
     input: &str,
     parse_query_string: bool,
     slashes_denote_host: bool,
+    base: LegacyUrl,
 ) -> Result<LegacyUrl, Thrown> {
-    let (url, invalid_port) = LegacyUrl::parse(input, parse_query_string, slashes_denote_host)
-        .map_err(|error| match error {
-            LegacyError::InvalidUrl => {
-                NodeError::new(ErrorKind::TypeError, "ERR_INVALID_URL", "Invalid URL").into()
-            }
-            LegacyError::UriMalformed => {
-                js::error::throw_uri_error(scope, c"URI malformed");
-                Thrown::Pending
-            }
-        })?;
+    let mut invalid_port = false;
+    let url = base.parse(
+        input,
+        parse_query_string,
+        slashes_denote_host,
+        &mut invalid_port,
+    );
     if invalid_port && !PORT_WARNED.with(|warned| warned.replace(true)) {
         let message =
             format!("The URL {input} is invalid. Future versions of Node.js will throw an error.");
         deprecation_warning(scope, &message, "DEP0170")?;
     }
-    Ok(url)
+    url.map_err(|error| throw_legacy(scope, error, input))
 }
 
 /// Emit DEP0169 for `url.parse`, once per instance and only if the caller isn't in
@@ -1008,13 +1202,30 @@ fn write_field<'w>(
     }
 }
 
+/// Write the field `name` of a `url.Url`, which `get` reads from the first of `fields`, unless it
+/// equals the field of the second.
+fn write_changed<'w>(
+    scope: &'w Scope<'_>,
+    properties: &mut PropertyWriter<'w>,
+    name: &'static std::ffi::CStr,
+    (url, unchanged): (&LegacyUrl, Option<&LegacyUrl>),
+    get: fn(&LegacyUrl) -> &Option<String>,
+) -> Result<(), ExnThrown> {
+    if unchanged.is_some_and(|unchanged| get(unchanged) == get(url)) {
+        properties.skip(name);
+        return Ok(());
+    }
+    write_field(scope, properties, name, get(url))
+}
+
 /// Set the fields of `target` to those of `url`, creating them as `init` creates properties. A
-/// `query` object is the `query` of `this` or `relative`, by its origin.
+/// `query` object is the `query` of `this` or `relative`, by its origin. The fields that equal
+/// those of `unchanged` are left as they are.
 ///
 /// # Safety
 ///
 /// With [`PropertyInit::Define`], `target` is a `url.Url` this module just created, which nothing
-/// else references, and `this` and `relative` don't reference it.
+/// else references, `this` and `relative` don't reference it, and `unchanged` is `None`.
 unsafe fn write_legacy_url<'w>(
     scope: &'w Scope<'_>,
     target: Object<'w>,
@@ -1022,23 +1233,33 @@ unsafe fn write_legacy_url<'w>(
     this: Option<Object<'_>>,
     relative: Option<Object<'_>>,
     init: PropertyInit,
+    unchanged: Option<&LegacyUrl>,
 ) -> Result<(), Thrown> {
     // SAFETY: the caller guarantees the requirements of `Define`. The JavaScript that runs before
     // the writer finishes can't reach `target`.
     let mut properties = unsafe { target.property_writer(scope, &URL_PROPERTIES, init) }?;
-    write_field(scope, &mut properties, c"protocol", &url.protocol)?;
-    if url.slashes {
+    let fields = (url, unchanged);
+    write_changed(scope, &mut properties, c"protocol", fields, |url| {
+        &url.protocol
+    })?;
+    if unchanged.is_some_and(|unchanged| unchanged.slashes == url.slashes) {
+        properties.skip(c"slashes");
+    } else if url.slashes {
         properties.write(scope, c"slashes", true)?;
     } else {
         properties.write(scope, c"slashes", HandleValue::null())?;
     }
-    write_field(scope, &mut properties, c"auth", &url.auth)?;
-    write_field(scope, &mut properties, c"host", &url.host)?;
-    write_field(scope, &mut properties, c"port", &url.port)?;
-    write_field(scope, &mut properties, c"hostname", &url.hostname)?;
-    write_field(scope, &mut properties, c"hash", &url.hash)?;
-    write_field(scope, &mut properties, c"search", &url.search)?;
+    write_changed(scope, &mut properties, c"auth", fields, |url| &url.auth)?;
+    write_changed(scope, &mut properties, c"host", fields, |url| &url.host)?;
+    write_changed(scope, &mut properties, c"port", fields, |url| &url.port)?;
+    write_changed(scope, &mut properties, c"hostname", fields, |url| {
+        &url.hostname
+    })?;
+    write_changed(scope, &mut properties, c"hash", fields, |url| &url.hash)?;
+    write_changed(scope, &mut properties, c"search", fields, |url| &url.search)?;
+    let query_unchanged = unchanged.is_some_and(|unchanged| unchanged.query == url.query);
     match &url.query {
+        _ if query_unchanged => properties.skip(c"query"),
         Query::Null => properties.write(scope, c"query", HandleValue::null())?,
         Query::Text(text) => properties.write(scope, c"query", text.as_str())?,
         Query::Parsed(text) => {
@@ -1059,9 +1280,11 @@ unsafe fn write_legacy_url<'w>(
             }
         }
     }
-    write_field(scope, &mut properties, c"pathname", &url.pathname)?;
-    write_field(scope, &mut properties, c"path", &url.path)?;
-    write_field(scope, &mut properties, c"href", &url.href)?;
+    write_changed(scope, &mut properties, c"pathname", fields, |url| {
+        &url.pathname
+    })?;
+    write_changed(scope, &mut properties, c"path", fields, |url| &url.path)?;
+    write_changed(scope, &mut properties, c"href", fields, |url| &url.href)?;
     Ok(properties.finish(scope)?)
 }
 
@@ -1070,7 +1293,7 @@ unsafe fn write_legacy_url<'w>(
 fn new_url<'s>(scope: &'s Scope<'_>, url: &LegacyUrl) -> Result<Object<'s>, Thrown> {
     let object = url_class::new_instance(scope)?;
     // SAFETY: `object` was just created, and nothing else references it.
-    unsafe { write_legacy_url(scope, object, url, None, None, PropertyInit::Define) }?;
+    unsafe { write_legacy_url(scope, object, url, None, None, PropertyInit::Define, None) }?;
     Ok(object)
 }
 
@@ -1089,7 +1312,13 @@ fn url_parse<'s>(
         }
     }
     let input = validate_string(scope, input, "url")?;
-    let parsed = parse_legacy(scope, &input, parse_query_string, slashes_denote_host)?;
+    let parsed = parse_legacy(
+        scope,
+        &input,
+        parse_query_string,
+        slashes_denote_host,
+        LegacyUrl::default(),
+    )?;
     new_url(scope, &parsed)
 }
 
@@ -1100,11 +1329,21 @@ fn resolve_object_of<'s>(
     relative: Option<Object<'_>>,
 ) -> Result<Object<'s>, Thrown> {
     let source = read_legacy_url(scope, this, Origin::This)?;
+    let mut own = [false; 12];
     let relative_fields = match relative {
-        Some(relative) => read_legacy_url(scope, relative, Origin::Relative)?,
+        Some(relative) => {
+            for (own, key) in own.iter_mut().zip(URL_PROPERTIES.keys()) {
+                if let TemplateKey::Name(name) = key {
+                    *own = relative.has_own_property(scope, name)?;
+                }
+            }
+            read_legacy_url(scope, relative, Origin::Relative)?
+        }
         None => LegacyUrl::default(),
     };
-    let (resolved, copy) = source.resolve_object(relative_fields);
+    let (resolved, copy) = source
+        .resolve_object(relative_fields, &own)
+        .map_err(|error| throw_legacy(scope, error, ""))?;
     let result = new_url(scope, &LegacyUrl::default())?;
     result.assign(scope, this)?;
     if let Some(relative) = relative.filter(|_| copy != Copy::Nothing) {
@@ -1119,13 +1358,15 @@ fn resolve_object_of<'s>(
             Some(this),
             relative,
             PropertyInit::Assign,
+            None,
         )
     }?;
     Ok(result)
 }
 
 /// `Url.prototype.resolveObject` with `this` and `relative`, a URL string, which is parsed with
-/// `slashesDenoteHost`, or a URL object.
+/// `slashesDenoteHost`, or a URL object. A `null` or `undefined` `relative` throws the
+/// `TypeError` of reading its `hash`, and another primitive is resolved as an empty URL object.
 fn resolve_object_value<'s>(
     scope: &'s Scope<'_>,
     this: Object<'_>,
@@ -1133,8 +1374,18 @@ fn resolve_object_value<'s>(
 ) -> Result<Object<'s>, Thrown> {
     if relative.is_string() {
         let input = String::from_jsval(scope, relative, ())?;
-        let relative = new_url(scope, &parse_legacy(scope, &input, false, true)?)?;
+        let parsed = parse_legacy(scope, &input, false, true, LegacyUrl::default())?;
+        let relative = new_url(scope, &parsed)?;
         return resolve_object_of(scope, this, Some(relative));
+    }
+    if relative.is_null() || relative.is_undefined() {
+        let kind = if relative.is_null() {
+            "null"
+        } else {
+            "undefined"
+        };
+        let message = format!("Cannot read properties of {kind} (reading 'hash')");
+        return Err(js::error::TypeError(message).throw(scope).into());
     }
     resolve_object_of(scope, this, Object::from_value(scope, *relative).ok())
 }
@@ -1147,7 +1398,7 @@ fn resolve_of(
 ) -> Result<String, Thrown> {
     let relative = url_parse(scope, relative, false, true)?;
     let resolved = resolve_object_of(scope, this, Some(relative))?;
-    Ok(read_legacy_url(scope, resolved, Origin::This)?.format())
+    format_url(scope, &read_legacy_url(scope, resolved, Origin::This)?)
 }
 
 /// Whether `value` is present and truthy.
@@ -1184,6 +1435,7 @@ pub mod url_class {
                     None,
                     None,
                     PropertyInit::Define,
+                    None,
                 )
             }
             .map_err(|thrown| thrown.throw(scope))?;
@@ -1192,7 +1444,8 @@ pub mod url_class {
         Ok(())
     }
 
-    /// Set the fields of this object to those of the URL `url`.
+    /// Parse the URL `url` into this object. The fields the parse doesn't assign keep their
+    /// values, which the parse reads where Node.js's parse reads them.
     #[method(length = 3)]
     pub fn parse<'s>(
         scope: &'s Scope<'_>,
@@ -1202,20 +1455,32 @@ pub mod url_class {
         slashes_denote_host: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
         let input = validate_string(scope, url, "url")?;
+        let base = read_legacy_url(scope, this, Origin::This)?;
         let parsed = parse_legacy(
             scope,
             &input,
             flag(parse_query_string),
             flag(slashes_denote_host),
+            base.clone(),
         )?;
         // SAFETY: `Assign` has no requirements.
-        unsafe { write_legacy_url(scope, this, &parsed, None, None, PropertyInit::Assign) }?;
+        unsafe {
+            write_legacy_url(
+                scope,
+                this,
+                &parsed,
+                Some(this),
+                None,
+                PropertyInit::Assign,
+                Some(&base),
+            )
+        }?;
         Ok(this)
     }
 
     /// The URL string of this object's fields.
     pub fn format(scope: &Scope<'_>, this: Object<'_>) -> Result<String, Thrown> {
-        Ok(read_legacy_url(scope, this, Origin::This)?.format())
+        format_url(scope, &read_legacy_url(scope, this, Origin::This)?)
     }
 
     /// The URL string of `relative` resolved against this URL.
@@ -1254,6 +1519,15 @@ pub mod url_class {
     }
 }
 
+/// The first argument of `domainToASCII` and `domainToUnicode`, or `ERR_MISSING_ARGS` if they
+/// got none.
+fn domain_arg<'s>(scope: &'s Scope<'_>, args: &CallArgs) -> Result<HandleValue<'s>, NodeError> {
+    if args.argc_ == 0 {
+        return Err(NodeError::missing_args(&["domain"]));
+    }
+    Ok(scope.root_value(args.get(0).get()))
+}
+
 /// The hostname of the `ws:` URL whose hostname is set to `domain`, or `None` if that fails or
 /// `domain` is empty.
 fn ascii_hostname(scope: &Scope<'_>, domain: HandleValue<'_>) -> Result<Option<String>, Thrown> {
@@ -1276,13 +1550,13 @@ pub mod module {
 
     /// <https://nodejs.org/api/url.html#urlfileurltopathurl-options>
     #[function(name = "fileURLToPath")]
+    ///
+    /// A string is parsed with the `URL` constructor, which throws its own `ERR_INVALID_URL`.
     pub fn file_url_to_path(scope: &Scope<'_>, url: HandleValue<'_>) -> Result<String, Thrown> {
-        let href = if url.is_string() {
-            String::from_jsval(scope, url, ())?
+        let object = if url.is_string() {
+            Function::construct(scope, url_constructor(scope)?, &[url])?
         } else if is_url(scope, url)? {
-            let object =
-                Object::from_value(scope, *url).map_err(|e| Thrown::from(e.throw(scope)))?;
-            js::JSString::from_value(scope, object.get_property(scope, c"href")?)?.to_utf8(scope)?
+            Object::from_value(scope, *url).map_err(|e| Thrown::from(e.throw(scope)))?
         } else {
             return Err(NodeError::invalid_arg_type(
                 scope,
@@ -1292,7 +1566,7 @@ pub mod module {
             )
             .into());
         };
-        super::file_url_to_path(scope, &href)
+        super::file_url_to_path(scope, object)
     }
 
     /// <https://nodejs.org/api/url.html#urlpathtofileurlpath-options>
@@ -1349,7 +1623,6 @@ pub mod module {
         options.set_property(scope, c"href", url.get_property(scope, c"href")?)?;
         let port = url.get_property(scope, c"port")?;
         if !port.is_string() || !string(port)?.is_empty() {
-            let port = js::JSString::from_value(scope, port)?.to_jsval_throwing(scope)?;
             options.set_property(scope, c"port", f64::from_jsval(scope, port, ())?)?;
         }
         let username = url.get_property(scope, c"username")?;
@@ -1365,26 +1638,34 @@ pub mod module {
         Ok(options)
     }
 
-    /// <https://nodejs.org/api/url.html#urldomaintoasciidomain>: empty if it's invalid.
+    /// <https://nodejs.org/api/url.html#urldomaintoasciidomain>: empty if it's invalid. Throws
+    /// `ERR_MISSING_ARGS` without arguments, and converts `undefined` to a string.
     #[function(name = "domainToASCII", length = 1)]
-    pub fn domain_to_ascii(
-        scope: &Scope<'_>,
-        domain: Option<HandleValue<'_>>,
-    ) -> Result<String, Thrown> {
-        let domain = domain.ok_or_else(|| NodeError::missing_args(&["domain"]))?;
-        Ok(ascii_hostname(scope, domain)?.unwrap_or_default())
+    pub fn domain_to_ascii(scope: &Scope<'_>, args: &CallArgs) -> Result<(), ExnThrown> {
+        let run = || -> Result<String, Thrown> {
+            let domain = domain_arg(scope, args)?;
+            Ok(ascii_hostname(scope, domain)?.unwrap_or_default())
+        };
+        let domain = run().map_err(|error| error.throw(scope))?;
+        args.rval()
+            .set(domain.as_str().to_jsval_raw_throwing(scope)?);
+        Ok(())
     }
 
-    /// <https://nodejs.org/api/url.html#urldomaintounicodedomain>: empty if it's invalid.
+    /// <https://nodejs.org/api/url.html#urldomaintounicodedomain>: empty if it's invalid. Throws
+    /// `ERR_MISSING_ARGS` without arguments, and converts `undefined` to a string.
     #[function(length = 1)]
-    pub fn domain_to_unicode(
-        scope: &Scope<'_>,
-        domain: Option<HandleValue<'_>>,
-    ) -> Result<String, Thrown> {
-        let domain = domain.ok_or_else(|| NodeError::missing_args(&["domain"]))?;
-        Ok(ascii_hostname(scope, domain)?
-            .map(|host| idna::domain_to_unicode(&host).0)
-            .unwrap_or_default())
+    pub fn domain_to_unicode(scope: &Scope<'_>, args: &CallArgs) -> Result<(), ExnThrown> {
+        let run = || -> Result<String, Thrown> {
+            let domain = domain_arg(scope, args)?;
+            Ok(ascii_hostname(scope, domain)?
+                .map(|host| idna::domain_to_unicode(&host).0)
+                .unwrap_or_default())
+        };
+        let domain = run().map_err(|error| error.throw(scope))?;
+        args.rval()
+            .set(domain.as_str().to_jsval_raw_throwing(scope)?);
+        Ok(())
     }
 
     /// <https://nodejs.org/api/url.html#urlparseurlstring-parsequerystring-slashesdenotehost>:
@@ -1415,26 +1696,29 @@ pub mod module {
     ) -> Result<String, Thrown> {
         if url.is_string() {
             let parsed = url_parse(scope, url, false, false)?;
-            return Ok(read_legacy_url(scope, parsed, Origin::This)?.format());
+            return format_url(scope, &read_legacy_url(scope, parsed, Origin::This)?);
         }
-        let Ok(object) = Object::from_value(scope, *url) else {
-            return Err(NodeError::invalid_arg_type(
-                scope,
-                "urlObject",
-                "one of type object or string",
-                url,
-            )
-            .into());
+        let object = match Object::from_value(scope, *url) {
+            Ok(object) if !object.is_callable() => object,
+            _ => {
+                return Err(NodeError::invalid_arg_type(
+                    scope,
+                    "urlObject",
+                    "one of type object or string",
+                    url,
+                )
+                .into())
+            }
         };
-        if !is_url(scope, url)? {
-            return Ok(read_legacy_url(scope, object, Origin::This)?.format());
+        if !url_constructor(scope)?.ordinary_has_instance(scope, url)? {
+            return format_url(scope, &read_legacy_url(scope, object, Origin::This)?);
         }
         let mut fragment = true;
         let mut unicode = false;
         let mut search = true;
         let mut auth = true;
         if let Some(options) = options.filter(|options| js::conversion::to_boolean(*options)) {
-            let options = crate::errors::validate_object(scope, options, "options")?;
+            let options = crate::errors::validate_plain_object(scope, options, "options", false)?;
             for (name, flag) in [
                 (c"fragment", &mut fragment),
                 (c"unicode", &mut unicode),
@@ -1498,7 +1782,8 @@ pub mod module {
     }
 }
 
-/// Register `node:url`, whose `URL` and `URLSearchParams` are the global's.
+/// Register `node:url`, whose `URL` and `URLSearchParams` are the global's, with Node.js's property
+/// order on the `default` export and Node.js's names for the legacy functions.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let globals = || -> Result<Vec<(&'static str, HandleValue<'_>)>, ExnThrown> {
         Ok(vec![
@@ -1520,5 +1805,42 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let Ok(overrides) = globals() else {
         return false;
     };
-    crate::stub::register_implemented_with::<module::js_module>(scope, name, &overrides)
+    if !crate::stub::register_implemented_with::<module::js_module>(scope, name, &overrides) {
+        return false;
+    }
+    let order = || -> Result<(), ExnThrown> {
+        let default = crate::stub::order_default_export(
+            scope,
+            name,
+            &[
+                c"Url",
+                c"parse",
+                c"resolve",
+                c"resolveObject",
+                c"format",
+                c"URL",
+                c"URLPattern",
+                c"URLSearchParams",
+                c"domainToASCII",
+                c"domainToUnicode",
+                c"pathToFileURL",
+                c"fileURLToPath",
+                c"fileURLToPathBuffer",
+                c"urlToHttpOptions",
+            ],
+        )?;
+        let readonly = js::class_spec::JSPROP_READONLY as u32;
+        for (export, function_name) in [
+            (c"parse", "urlParse"),
+            (c"resolve", "urlResolve"),
+            (c"resolveObject", "urlResolveObject"),
+            (c"format", "urlFormat"),
+        ] {
+            let function = default.get_property(scope, export)?;
+            let function = Object::from_value(scope, *function).map_err(|e| e.throw(scope))?;
+            function.define_property(scope, c"name", function_name, readonly)?;
+        }
+        Ok(())
+    };
+    order().is_ok()
 }

@@ -1,7 +1,7 @@
 // The `process` global and `node:process`.
 
 import processModule, { cwd, env, nextTick, platform } from "node:process";
-import { eq, throws } from "./harness.mjs";
+import { deepEq, eq, throws } from "./harness.mjs";
 
 eq(processModule, process, "the default export is the global");
 eq(cwd, process.cwd, "named exports are process's properties");
@@ -57,3 +57,13 @@ eq(process.getBuiltinModule("node:path"), (await import("node:path")).default, "
 eq(process.getBuiltinModule("not-a-builtin"), undefined, "getBuiltinModule of a non-builtin");
 eq(typeof process.dlopen, "function", "unimplemented members are stubs");
 eq(process.domain, null, "domain is null without an active domain");
+
+// `process.features` has Node.js's keys, and `stdout.write` names the chunk types Node.js does.
+deepEq(Object.keys(process.features), ["inspector", "debug", "uv", "ipv6", "tls_alpn", "tls_sni", "tls_ocsp", "tls", "openssl_is_boringssl", "cached_builtins", "require_module", "quic", "typescript"], "process.features keys");
+eq(process.features.require_module, true, "require loads ES modules");
+eq(typeof process.ppid, "number", "process.ppid");
+eq(throws(() => process.stdout.write(5), "ERR_INVALID_ARG_TYPE").message.startsWith('The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView.'), true, "stdout.write of a number");
+
+// The global `process` is an accessor, as in Node.js.
+const processProperty = Object.getOwnPropertyDescriptor(globalThis, "process");
+eq(typeof processProperty.get === "function" && !processProperty.enumerable, true, "the global process accessor");

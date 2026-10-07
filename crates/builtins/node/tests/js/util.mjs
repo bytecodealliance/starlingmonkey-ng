@@ -2,7 +2,8 @@
 
 import util, { format, inspect, promisify, callbackify, inherits, types, isDeepStrictEqual } from "node:util";
 import typesModule from "node:util/types";
-import { eq, throws } from "./harness.mjs";
+import assert from "node:assert";
+import { deepEq, eq, throws } from "./harness.mjs";
 
 eq(types, typesModule, "util.types is node:util/types");
 eq(util.TextEncoder, TextEncoder, "TextEncoder");
@@ -45,6 +46,47 @@ eq(inspect.custom, Symbol.for("nodejs.util.inspect.custom"), "inspect.custom sym
 const long = inspect({ alpha: "a".repeat(30), beta: "b".repeat(30), gamma: "c".repeat(30) });
 eq(long, `{\n  alpha: '${"a".repeat(30)}',\n  beta: '${"b".repeat(30)}',\n  gamma: '${"c".repeat(30)}'\n}`, "line breaking");
 eq(inspect(new Error("boom")).startsWith("Error: boom\n"), true, "error with stack");
+function Es5Error(message) {
+  this.message = message;
+}
+Es5Error.prototype = Object.create(Error.prototype);
+Es5Error.prototype.constructor = Es5Error;
+eq(inspect(new Es5Error("x")), "[Es5Error: x]", "an instanceof Error is formatted as an error");
+eq(inspect(Object.create(Error.prototype, { cause: { get() { return 1; } } })), "[Error] { [cause]: [Getter] }", "Object.create(Error.prototype)");
+{
+  let error;
+  try { util.styleText(1, "x"); } catch (e) { error = e; }
+  eq(inspect(error).startsWith("TypeError [ERR_INVALID_ARG_VALUE]: "), true, "the stack header of an ERR_ error has its code");
+  error = new assert.AssertionError({ actual: 1, expected: 2, operator: "strictEqual" });
+  eq(inspect(error).startsWith("AssertionError [ERR_ASSERTION]: Expected"), true, "the stack header of an AssertionError has its code");
+  eq(inspect(new TypeError("plain")).startsWith("TypeError: plain\n"), true, "an error without a code keeps the plain header");
+}
+// The errors of `ERR_` codes inherit `toString` and `kIsNodeError` from a prototype for their kind
+// and code, as Node's `makeNodeErrorWithCode` classes do.
+{
+  const first = throws(() => Buffer.alloc("x"), "ERR_INVALID_ARG_TYPE");
+  const second = throws(() => Buffer.alloc("y"), "ERR_INVALID_ARG_TYPE");
+  const range = throws(() => Buffer.alloc(-1), "ERR_OUT_OF_RANGE");
+  eq(Object.hasOwn(first, "toString"), false, "an ERR_ error has no own toString");
+  eq(Object.getOwnPropertyNames(first).includes("code"), true, "an ERR_ error has an own code");
+  eq(Object.getPrototypeOf(second), Object.getPrototypeOf(first), "errors of one code share a prototype");
+  eq(Object.getPrototypeOf(range) === Object.getPrototypeOf(first), false, "errors of different codes have different prototypes");
+  eq(first instanceof TypeError && range instanceof RangeError, true, "instanceof the kind");
+  deepEq([first.constructor.name, range.constructor.name], ["TypeError", "RangeError"], "constructor is the kind's");
+  first.code = "CHANGED";
+  eq(String(first).startsWith("TypeError [ERR_INVALID_ARG_TYPE]: "), true, "toString uses the code the error was created with");
+  eq(inspect(first).startsWith("TypeError [CHANGED]: "), true, "the stack header uses the current code");
+  const decoder = throws(() => new TextDecoder("nope"), "ERR_ENCODING_NOT_SUPPORTED");
+  const prototype = Object.getPrototypeOf(decoder);
+  eq(Object.getPrototypeOf(prototype), RangeError.prototype, "the prototype inherits from the kind's prototype");
+  deepEq(Reflect.ownKeys(prototype).map(String), ["constructor", "toString", "Symbol(kIsNodeError)"], "the prototype's own keys");
+  eq(Object.getOwnPropertyDescriptor(prototype, "constructor").get.call(null), RangeError, "the constructor getter");
+  eq(Object.hasOwn(decoder, "toString"), false, "an ERR_ error of a web class has no own toString");
+  eq(String(decoder).startsWith("RangeError [ERR_ENCODING_NOT_SUPPORTED]: "), true, "an ERR_ error of a web class has the code in toString");
+  const url = throws(() => new URL("x"), "ERR_INVALID_URL");
+  eq(Object.getPrototypeOf(url), TypeError.prototype, "an error Node creates natively has its kind's prototype");
+  eq(inspect(url).startsWith("TypeError: Invalid URL\n"), true, "an error Node creates natively has the plain header");
+}
 
 // format
 eq(format("%s:%d:%i:%f", "a", 1.5, 2.9, "3.5"), "a:1.5:2:3.5", "format placeholders");
@@ -102,6 +144,9 @@ eq(isDeepStrictEqual({ a: 1 }, { a: "1" }), false, "strict types");
 eq(isDeepStrictEqual(new Set([{ a: 1 }]), new Set([{ a: 1 }])), true, "sets of objects");
 eq(isDeepStrictEqual(new Map([[1, "a"]]), new Map([[1, "b"]])), false, "map values");
 eq(isDeepStrictEqual([1, 2], { 0: 1, 1: 2, length: 2 }), false, "arrays vs objects");
+eq(isDeepStrictEqual(new Proxy([1], {}), [1]), true, "a proxied array equals an array");
+eq(isDeepStrictEqual([], new Proxy([], {})), true, "an array equals a proxied array");
+eq(util.isArray(new Proxy([], {})), true, "util.isArray sees through a proxy");
 eq(isDeepStrictEqual(NaN, NaN), true, "NaN");
 eq(isDeepStrictEqual(new Date(1), new Date(1)), true, "dates");
 const a = { x: 1 };
@@ -129,6 +174,30 @@ eq(inspect({ [Symbol("k")]: 1 }), "{ Symbol(k): 1 }", "symbol keys");
 eq(inspect({ $x: 1 }), "{ '$x': 1 }", "key quoting");
 eq(inspect("\x85\ud800"), "'\\x85\\ud800'", "C1 and lone surrogate escapes");
 eq(inspect("\u{1F389}\u{1F389}", { maxStringLength: 1 }), "'\\ud83c'... 3 more characters", "maxStringLength counts code units");
+eq(inspect("abc", { maxStringLength: -1 }), "'ab'... 4 more characters", "a negative maxStringLength counts from the end");
+eq(inspect("x".repeat(1e6)).length, 10028, "a long string is cut at maxStringLength");
+eq(inspect(Buffer.from([0, 15, 16, 171, 255])), "<Buffer 00 0f 10 ab ff>", "Buffer hex digits");
+{
+  const array = [1];
+  array["01"] = "a";
+  array[4294967295] = "max";
+  eq(inspect(array), "[ 1, '01': 'a', '4294967295': 'max' ]", "an array's keys that aren't indices");
+  eq(inspect(Object.assign(new Uint8Array(3), { x: 1 })), "Uint8Array(3) [ 0, 0, 0, x: 1 ]", "a typed array's keys that aren't indices");
+}
+{
+  class Foo {
+    get x() { return 1; }
+    method() {}
+  }
+  class Bar extends Foo {
+    y = 2;
+  }
+  eq(inspect(new Foo(), { showHidden: true }), "Foo { [x]: [Getter] }", "showHidden shows the prototype's properties");
+  eq(inspect(new Bar(), { showHidden: true }), "Bar { y: 2, [x]: [Getter] }", "showHidden shows the properties of the prototypes below");
+  eq(format("%o", new Bar()), "Bar { y: 2, [x]: [Getter] }", "%o shows the prototype's properties");
+  eq(inspect(new Bar(), { showHidden: true, getters: true }), "Bar { y: 2, [x]: [Getter: 1] }", "prototype getters are called on the object");
+  eq(inspect(new Bar()), "Bar { y: 2 }", "without showHidden the prototype's properties are left out");
+}
 eq(inspect(new Array(1000)), "[ <1000 empty items> ]", "sparse arrays");
 eq(inspect(new Error("boom", { cause: "c" })).endsWith("[cause]: 'c'\n}"), true, "error cause");
 eq(inspect(new (class Foo extends Map {})([[1, 2]])), "Foo(1) [Map] { 1 => 2 }", "Map subclass");
@@ -235,3 +304,80 @@ eq(inspect(new SymbolNamed()), "Symbol(s) {}", "class named by a symbol");
 // `parseArgs` rejects `options` and option configurations that are arrays or functions.
 throws(() => util.parseArgs({ args: [], options: [] }), "ERR_INVALID_ARG_TYPE", "parseArgs rejects array options");
 throws(() => util.parseArgs({ args: [], options: { a: () => {} } }), "ERR_INVALID_ARG_TYPE", "parseArgs rejects a function option");
+
+// A custom inspection method of a proxied object that returns the proxy falls back to the target.
+{
+  const proxy = new Proxy({ a: 1, [inspect.custom]() { return proxy; } }, {});
+  eq(inspect(proxy, { breakLength: Infinity }), "{ a: 1, Symbol(nodejs.util.inspect.custom): [Function: [nodejs.util.inspect.custom]] }", "custom inspect returning the proxy");
+}
+// A `sorted` function is `Array.prototype.sort`'s comparator.
+eq(inspect({ b: 1, a: 2, c: 0 }, { sorted: (x, y) => y.localeCompare(x) }), "{ c: 0, b: 1, a: 2 }", "sorted comparator");
+throws(() => inspect({ b: 1, a: 2 }, { sorted() { throw new RangeError("x"); } }), RangeError, "sorted comparator exceptions propagate");
+throws(() => inspect({ b: 1, a: 2 }, { sorted: "yes" }), TypeError, "sorted that isn't a function");
+eq(inspect({ [inspect.custom](depth, options) { return typeof options.sorted; } }, { sorted: () => 0 }), "function", "custom inspection gets the comparator");
+// A fractional `maxArrayLength` shows the entries below it and reports the fractional remainder.
+eq(inspect([1, 2, 3], { maxArrayLength: 1.5 }), "[ 1, 2, ... 1.5 more items ]", "fractional maxArrayLength");
+eq(inspect(new Set([1, 2, 3]), { maxArrayLength: 1.5 }), "Set(3) { 1, 2, ... 1.5 more items }", "fractional maxArrayLength of a set");
+eq(inspect([1, , 3, 4], { maxArrayLength: 1.5 }), "[ 1, <1 empty item>, 3, <1 empty item> ]", "fractional maxArrayLength of a sparse array");
+eq(inspect([1, 2, 3], { maxArrayLength: NaN }), "[  ]", "NaN maxArrayLength");
+throws(() => inspect(new Uint8Array(3), { maxArrayLength: 1.5 }), RangeError, "fractional maxArrayLength of a typed array");
+eq(inspect(new ArrayBuffer(3), { maxArrayLength: 1.5, breakLength: Infinity }), "ArrayBuffer { [Uint8Contents]: <00 ... 1.5 more bytes>, [byteLength]: 3 }", "fractional maxArrayLength of an ArrayBuffer");
+{
+  const text = "x";
+  eq(format(text), text, "format of one string");
+}
+
+// `inspect.defaultOptions` is sealed, and assigning an array or a function throws.
+eq(Object.isSealed(inspect.defaultOptions), true, "defaultOptions is sealed");
+throws(() => { inspect.defaultOptions = []; }, "ERR_INVALID_ARG_TYPE", "defaultOptions rejects arrays");
+throws(() => { inspect.defaultOptions = () => {}; }, "ERR_INVALID_ARG_TYPE", "defaultOptions rejects functions");
+throws(() => { inspect.defaultOptions = { bogus: 1 }; }, TypeError, "defaultOptions rejects unknown keys");
+
+// `types.isGeneratorObject` is a brand check.
+eq(types.isGeneratorObject(Object.create((function* () {}).prototype)), false, "an object inheriting from a generator");
+eq(types.isGeneratorObject((function* () {})()), true, "a generator");
+eq(types.isGeneratorObject((async function* () {})()), true, "an async generator");
+
+// `deprecate`'s wrapper has a `prototype` of its own when the function has none.
+{
+  const wrapped = util.deprecate(() => {}, "m");
+  eq("prototype" in wrapped, true, "deprecate wrapper has a prototype");
+  eq(wrapped.prototype.constructor, wrapped, "deprecate wrapper prototype's constructor");
+}
+
+// `getCallSites` validates its arguments.
+throws(() => util.getCallSites("1"), "ERR_INVALID_ARG_TYPE", "getCallSites frameCount type");
+eq(throws(() => util.getCallSites(1.5), "ERR_OUT_OF_RANGE").message.includes("an integer"), true, "getCallSites frameCount integer");
+throws(() => util.getCallSites({ sourceMap: 1 }), "ERR_INVALID_ARG_TYPE", "getCallSites options.sourceMap");
+throws(() => util.getCallSites(2, { sourceMap: 1 }), "ERR_INVALID_ARG_TYPE", "getCallSites options.sourceMap after frameCount");
+throws(() => util.getCallSites(null), "ERR_INVALID_ARG_TYPE", "getCallSites null options");
+eq(util.getCallSites({}).length > 0, true, "getCallSites options only");
+
+// `debuglog` calls its callback with the logging function on the first call.
+{
+  let got;
+  const logger = util.debuglog("starling-test-disabled", (debug) => { got = debug; });
+  eq(logger.name, "logger", "logger name");
+  logger("x");
+  eq(typeof got, "function", "debuglog callback");
+  eq(got.enabled, false, "debuglog callback gets a disabled logger");
+}
+
+// `parseArgs` follows Node's `parseArgs` for its configuration and its stored values.
+{
+  const values = (result) => ({ ...result.values });
+  deepEq(values(util.parseArgs({ args: ["--b=true"], options: { b: { type: "boolean" } }, strict: false })), { b: "true" }, "parseArgs keeps a boolean option's inline value");
+  deepEq(Object.getOwnPropertyNames(util.parseArgs({ args: ["--__proto__", "x"], strict: false }).values), [], "parseArgs ignores __proto__");
+  eq(throws(() => util.parseArgs({ args: ["--no-b=1"], options: { b: { type: "boolean", short: "b" } }, allowNegative: true }), "ERR_PARSE_ARGS_INVALID_OPTION_VALUE").message, "Option '-b, --b' does not take an argument", "parseArgs negated option with a value");
+  eq(throws(() => util.parseArgs({ args: ["-f", "-x"], options: { f: { type: "string", short: "f" } } }), "ERR_PARSE_ARGS_INVALID_OPTION_VALUE").message.split("\n")[0], "Option '-f' argument is ambiguous.", "parseArgs ambiguous short option");
+  deepEq(values(util.parseArgs(1)), {}, "parseArgs of a primitive config");
+  throws(() => util.parseArgs(null), TypeError, "parseArgs of null");
+  eq(Array.isArray(util.parseArgs({ args: null, strict: false }).positionals), true, "parseArgs args null");
+  for (const name of ["strict", "allowPositionals", "allowNegative", "tokens"]) {
+    throws(() => util.parseArgs({ args: [], [name]: 1 }), "ERR_INVALID_ARG_TYPE", `parseArgs validates ${name}`);
+  }
+  throws(() => util.parseArgs({ args: [], options: { x: { type: "string", multiple: 1 } } }), "ERR_INVALID_ARG_TYPE", "parseArgs validates multiple");
+  throws(() => util.parseArgs({ args: [], options: { x: { type: "string", short: 1 } } }), "ERR_INVALID_ARG_TYPE", "parseArgs validates short");
+  throws(() => util.parseArgs({ args: [], options: { x: { type: "string", short: "😀" } } }), "ERR_INVALID_ARG_VALUE", "parseArgs short is one UTF-16 unit");
+  eq(throws(() => util.parseArgs({ args: [], options: { x: { type: "string", multiple: true, default: [1] } } }), "ERR_INVALID_ARG_TYPE").message.startsWith('The "options.x.default[0]" property must be of type string'), true, "parseArgs default element");
+}

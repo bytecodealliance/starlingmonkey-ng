@@ -22,10 +22,13 @@ use web_streams::readable::default_controller::ReadableStreamDefaultControllerIm
 use web_streams::readable::ReadableStreamDefaultController;
 
 use super::connection::ConnectionStateImpl;
-use super::{has_invalid_header_char, status_text, validate_name, validate_value};
+use super::{
+    has_invalid_header_char, has_invalid_header_char_with, status_text, validate_name,
+    validate_value,
+};
 use crate::errors::{validate_string, ErrorKind, NodeError, Thrown};
 use crate::events::EMITTER_PROPERTIES;
-use crate::support::{array_elements, chunk_bytes, next_tick_call, Canceller};
+use crate::support::{array_elements, as_array, next_tick_call, Canceller};
 
 /// The number of bytes a response body stream queues before `write` returns `false`.
 pub(super) const HIGH_WATER_MARK: f64 = 16384.0;
@@ -64,13 +67,24 @@ pub(crate) struct Served {
     /// The interest the streamed body holds in its request's event loop.
     #[no_trace]
     interest: Option<core_runtime::event_loop::InterestHandle>,
+    /// Whether the request is a `HEAD` request.
+    #[no_trace]
+    head: bool,
+    /// The status and reason phrase `writeHead` stored.
+    #[no_trace]
+    status: Option<(u16, String)>,
+    /// The headers `writeHead` stored, as (name, value) pairs with array values expanded.
+    #[no_trace]
+    headers: Option<Vec<(String, String)>>,
 }
 
 impl Served {
-    /// The state of a served response whose web `Response` resolves `respond`.
-    pub(super) fn new(respond: js::Promise<'_>) -> Self {
+    /// The state of a served response whose web `Response` resolves `respond`, to a `HEAD`
+    /// request if `head`.
+    pub(super) fn new(respond: js::Promise<'_>, head: bool) -> Self {
         Served {
             respond: Some(Heap::from(respond)),
+            head,
             ..Default::default()
         }
     }
@@ -144,11 +158,14 @@ pub(crate) struct OutgoingState {
     /// Whether the header block was stored, which `headersSent` returns.
     #[no_trace]
     pub(super) header_stored: bool,
+    /// Whether a message that doesn't write to a socket set `_headerSent`.
+    #[no_trace]
+    header_sent: bool,
     /// The number of `cork` calls not undone.
     #[no_trace]
     pub(super) corked: f64,
     /// The error the message was destroyed with.
-    errored: Option<Heap<Value>>,
+    pub(super) errored: Option<Heap<Value>>,
     /// The body bytes written, which `strictContentLength` checks.
     #[no_trace]
     pub(super) bytes_written: f64,
@@ -166,6 +183,11 @@ pub(crate) struct OutgoingState {
     /// Whether `finish` was emitted.
     #[no_trace]
     pub(super) finish_emitted: bool,
+    /// The callbacks of `end` calls, waiting for `finish` or for the last write to fail.
+    pub(super) end_callbacks: Vec<Heap<Value>>,
+    /// The error the end callbacks got when the last write failed, which the callbacks of later
+    /// `end` calls get in the tick queue.
+    pub(super) flush_error: Option<Heap<Value>>,
     /// Whether `close` was emitted, which `_closed` and `closed` return.
     #[no_trace]
     pub(super) closed: bool,
@@ -227,19 +249,6 @@ pub(super) fn values<'s>(
     value: HandleValue<'s>,
 ) -> Result<Vec<HandleValue<'s>>, ExnThrown> {
     Ok(array_elements(scope, value)?.unwrap_or_else(|| vec![value]))
-}
-
-/// `value` as an array, if it is one.
-pub(super) fn as_array<'s>(
-    scope: &'s Scope<'_>,
-    value: HandleValue<'_>,
-) -> Result<Option<js::Array<'s>>, ExnThrown> {
-    if !js::Array::is_array_value(scope, value)? {
-        return Ok(None);
-    }
-    Ok(Object::from_value(scope, *value)
-        .ok()
-        .and_then(|object| object.cast::<js::Array>().ok()))
 }
 
 /// The pairs of a headers argument: the `[name, value]` pairs of an array of pairs, the names and
@@ -338,9 +347,11 @@ pub(super) fn is_unique(state: &OutgoingState<'_>, name: &str) -> bool {
     })
 }
 
-/// The index of the header set as `lower` in `headers`.
-fn find(headers: &[Header], lower: &str) -> Option<usize> {
-    headers.iter().position(|header| header.lower == lower)
+/// The index of the header `name`, in any case, in `headers`.
+fn find(headers: &[Header], name: &str) -> Option<usize> {
+    headers
+        .iter()
+        .position(|header| header.lower.eq_ignore_ascii_case(name))
 }
 
 /// The value of the header `name` of the message of `state`, if it is set.
@@ -349,24 +360,22 @@ pub(super) fn header_value<'s>(
     state: &OutgoingState<'_>,
     name: &str,
 ) -> Option<HandleValue<'s>> {
-    let lower = name.to_ascii_lowercase();
     let data = state.data();
     let headers = data.headers.as_ref()?;
-    find(headers, &lower).map(|index| headers[index].value.get(scope))
+    find(headers, name).map(|index| headers[index].value.get(scope))
 }
 
 /// Set the header `name`, a valid token, to `value` on the message of `state`.
 fn store_header_value(state: &OutgoingState<'_>, name: String, value: HandleValue<'_>) {
-    let lower = name.to_ascii_lowercase();
     let mut data = state.data_mut();
     let headers = data.headers.get_or_insert_with(Vec::new);
-    match find(headers, &lower) {
+    match find(headers, &name) {
         Some(index) => {
             headers[index].name = name;
             headers[index].value.set(value.get());
         }
         None => headers.push(Header {
-            lower,
+            lower: name.to_ascii_lowercase(),
             name,
             value: Heap::from(value.get()),
         }),
@@ -410,7 +419,7 @@ fn apply_headers(
     message: Object<'_>,
     headers: HandleValue<'_>,
 ) -> Result<(), Thrown> {
-    if as_array(scope, headers)?.is_some() {
+    if as_array(scope, headers).is_some() {
         let pairs = header_args(scope, headers, true)?;
         for (name, _) in &pairs {
             outgoing_message_class::remove_header(scope, message, *name)?;
@@ -435,13 +444,14 @@ fn apply_headers(
 /// values, or an array of pairs.
 pub(super) fn store_head_headers(
     scope: &Scope<'_>,
+    message: Object<'_>,
     state: &OutgoingState<'_>,
     headers: HandleValue<'_>,
 ) -> Result<(), Thrown> {
     let mut entries = Vec::new();
     for (name, value) in header_args(scope, headers, false)? {
         let name = validate_name(scope, name)?;
-        validate_value(scope, &name, value)?;
+        validate_value(scope, message, &name, value)?;
         entries.push((name, value));
     }
     state.data_mut().head_headers = entries
@@ -567,6 +577,7 @@ fn finish_tick(
             data.request.get(scope),
         )
     };
+    super::wire::flush_end_callbacks(scope, &state, HandleValue::null())?;
     crate::events::emit(scope, message, c"finish", &[])?;
     if let Some(request) = request.filter(|_| served) {
         emit_close(scope, message)?;
@@ -575,6 +586,18 @@ fn finish_tick(
         }
     }
     Ok(js::value::undefined())
+}
+
+/// Set `_headerSent` on `message`, a message that doesn't write to a socket, unless it was set.
+fn mark_header_sent(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    state: &OutgoingState<'_>,
+) -> Result<(), ExnThrown> {
+    if !std::mem::replace(&mut state.data_mut().header_sent, true) {
+        message.set_property(scope, c"_headerSent", true)?;
+    }
+    Ok(())
 }
 
 /// Write `bytes` of a message that doesn't write to a socket, as the last chunk if `last`, and
@@ -665,7 +688,7 @@ pub(super) fn init_outgoing<'w>(
     init: PropertyInit,
 ) -> Result<(), Thrown> {
     match init {
-        PropertyInit::Define => crate::events::init_new_emitter(scope, properties)?,
+        PropertyInit::Define => crate::events::init_new_emitter(scope, message, properties)?,
         PropertyInit::Assign => crate::stream::stream_class::init(scope, message, None)?,
     }
     properties.continue_with(scope, &OUTGOING_PROPERTIES)?;
@@ -701,11 +724,7 @@ pub(super) fn init_outgoing<'w>(
     }
     match fields.on_pending_data {
         Some(function) => properties.write(scope, c"_onPendingData", function)?,
-        None => properties.write(
-            scope,
-            c"_onPendingData",
-            crate::support::noop_function(scope)?,
-        )?,
+        None => properties.write(scope, c"_onPendingData", crate::support::nop(scope)?)?,
     }
     Ok(())
 }
@@ -783,7 +802,7 @@ pub mod outgoing_message_class {
             return Err(headers_sent("set").into());
         }
         let name = validate_name(scope, name)?;
-        validate_value(scope, &name, value)?;
+        validate_value(scope, this, &name, value)?;
         store_header_value(&state, name, value);
         Ok(this)
     }
@@ -856,12 +875,12 @@ pub mod outgoing_message_class {
             return Err(headers_sent("append").into());
         }
         let text = validate_name(scope, name)?;
-        validate_value(scope, &text, value)?;
+        validate_value(scope, this, &text, value)?;
         let Some(previous) = header_value(scope, &state, &text) else {
             store_header_value(&state, text, value);
             return Ok(this);
         };
-        let existing = match as_array(scope, previous)? {
+        let existing = match as_array(scope, previous) {
             Some(array) => array,
             None => {
                 let array = js::Array::with_contents(scope, &[previous])?;
@@ -986,7 +1005,7 @@ pub mod outgoing_message_class {
             return super::super::wire::flush_headers(scope, this, &state);
         }
         implicit_header(scope, this, &state)?;
-        this.set_property(scope, c"_headerSent", true)?;
+        mark_header_sent(scope, this, &state)?;
         send(scope, this, &state, Vec::new(), false)?;
         Ok(())
     }
@@ -1017,20 +1036,13 @@ pub mod outgoing_message_class {
             }
             return Ok(room);
         }
-        if state.data().ended {
-            on_error(scope, this, &state, write_after_end(), callback)?;
-            return Ok(false);
+        let (bytes, length) = super::super::wire::written_bytes(scope, chunk, encoding)?;
+        if let Some(result) =
+            super::super::wire::check_write(scope, this, &state, length, callback, false)?
+        {
+            return Ok(result);
         }
-        let (bytes, _) = chunk_bytes(scope, chunk, encoding)?.ok_or_else(|| {
-            NodeError::invalid_arg_type(
-                scope,
-                "chunk",
-                "of type string or an instance of Buffer or Uint8Array",
-                chunk,
-            )
-        })?;
-        implicit_header(scope, this, &state)?;
-        this.set_property(scope, c"_headerSent", true)?;
+        mark_header_sent(scope, this, &state)?;
         let room = send(scope, this, &state, bytes, false)?;
         if let Some(callback) = callback {
             next_tick_call(scope, callback, &[])?;
@@ -1061,55 +1073,36 @@ pub mod outgoing_message_class {
             super::super::wire::end(scope, this, &state, chunk, encoding, callback)?;
             return Ok(this);
         }
-        let (ended, finished) = {
-            let data = state.data();
-            (data.ended, data.finish_emitted)
-        };
+        let ended = state.data().ended;
         if ended {
             if chunk.is_some() {
                 on_error(scope, this, &state, write_after_end(), callback)?;
             } else if let Some(callback) = callback {
-                if finished {
-                    next_tick_call(scope, callback, &[])?;
-                } else {
-                    crate::events::listen(
-                        scope,
-                        this,
-                        c"once",
-                        c"finish",
-                        Object::from_value(scope, *callback)?,
-                    )?;
-                }
+                super::super::wire::queue_end_callback(scope, &state, callback)?;
             }
             return Ok(this);
         }
-        let bytes = match chunk {
-            Some(chunk) => {
-                chunk_bytes(scope, chunk, encoding)?
-                    .ok_or_else(|| {
-                        NodeError::invalid_arg_type(
-                            scope,
-                            "chunk",
-                            "of type string or an instance of Buffer or Uint8Array",
-                            chunk,
-                        )
-                    })?
-                    .0
+        let mut bytes = Vec::new();
+        if let Some(chunk) = chunk {
+            let (encoded, length) = super::super::wire::written_bytes(scope, chunk, encoding)?;
+            if super::super::wire::check_write(scope, this, &state, length, None, true)?.is_none() {
+                bytes = encoded;
             }
-            None => Vec::new(),
-        };
-        implicit_header(scope, this, &state)?;
+        } else if !state.data().header_stored {
+            this.set_property(scope, c"_contentLength", 0)?;
+            implicit_header(scope, this, &state)?;
+        }
         if let Some(callback) = callback {
-            crate::events::listen(
-                scope,
-                this,
-                c"once",
-                c"finish",
-                Object::from_value(scope, *callback)?,
-            )?;
+            super::super::wire::queue_end_callback(scope, &state, callback)?;
+        }
+        if let Some(expected) = super::super::wire::strict_content_length(scope, this, &state)? {
+            let written = state.data().bytes_written;
+            if written != expected {
+                return Err(super::super::wire::length_mismatch(written, expected).into());
+            }
         }
         state.data_mut().ended = true;
-        this.set_property(scope, c"_headerSent", true)?;
+        mark_header_sent(scope, this, &state)?;
         this.set_property(scope, c"finished", true)?;
         send(scope, this, &state, bytes, true)?;
         js::jobs::queue_native_tick(scope, finish_tick, this, &[])?;
@@ -1127,14 +1120,9 @@ pub mod outgoing_message_class {
         callback: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, ExnThrown> {
         let msecs = msecs.unwrap_or(HandleValue::undefined());
-        if let Some(callback) = callback.filter(|callback| js::function::is_callable(*callback)) {
-            crate::events::listen(
-                scope,
-                this,
-                c"on",
-                c"timeout",
-                Object::from_value(scope, *callback).map_err(|e| e.throw(scope))?,
-            )?;
+        if let Some(callback) = callback.filter(|callback| js::conversion::to_boolean(*callback)) {
+            let timeout = js::class::get_or_init_atom(scope, c"timeout")?;
+            Function::call_by_name(scope, this.handle(), c"on", &[timeout, callback])?;
         }
         let state = state_of(scope, this)?;
         let (socket, wire) = {
@@ -1165,6 +1153,7 @@ pub mod outgoing_message_class {
         this: Object<'_>,
         headers: HandleValue<'_>,
     ) -> Result<(), Thrown> {
+        this.set_property(scope, c"_trailer", "")?;
         let mut trailer = String::new();
         let headers = Object::from_value_coerce(scope, headers)?;
         let pairs = if js::Array::is_array(scope, headers.handle())? {
@@ -1184,38 +1173,51 @@ pub mod outgoing_message_class {
             pairs
         };
         let state = state_of(scope, this)?;
-        for (field, value) in pairs {
-            super::super::module::validate_header_name(scope, field, Some("Trailer name".into()))?;
-            let field = String::from_jsval(scope, field, ())?;
-            let lines = match array_elements(scope, value)? {
-                Some(items) if items.len() > 1 && !is_unique(&state, &field) => items,
-                Some(_) => {
-                    let array = Object::from_value(scope, *value).map_err(|e| e.throw(scope))?;
-                    let joined = Function::call_by_name(
-                        scope,
-                        array.handle(),
-                        c"join",
-                        &[js::class::get_or_init_atom(scope, c"; ")?],
-                    )?;
-                    vec![joined]
+        // The lines before an invalid name or value stay in `_trailer`, as Node.js appends each.
+        let add = |trailer: &mut String| -> Result<(), Thrown> {
+            for (field, value) in pairs {
+                super::super::module::validate_header_name(
+                    scope,
+                    field,
+                    Some("Trailer name".into()),
+                )?;
+                let field = String::from_jsval(scope, field, ())?;
+                let lines = match array_elements(scope, value)? {
+                    Some(items) if items.len() > 1 && !is_unique(&state, &field) => items,
+                    Some(_) => {
+                        let array =
+                            Object::from_value(scope, *value).map_err(|e| e.throw(scope))?;
+                        let joined = Function::call_by_name(
+                            scope,
+                            array.handle(),
+                            c"join",
+                            &[js::class::get_or_init_atom(scope, c"; ")?],
+                        )?;
+                        vec![joined]
+                    }
+                    None => vec![value],
+                };
+                for value in lines {
+                    let value = String::from_jsval(scope, value, ())?;
+                    if has_invalid_header_char(&value)
+                        && (!super::super::lenient_headers(scope, this)?
+                            || has_invalid_header_char_with(&value, true))
+                    {
+                        return Err(NodeError::new(
+                            ErrorKind::TypeError,
+                            "ERR_INVALID_CHAR",
+                            format!("Invalid character in trailer content [\"{field}\"]"),
+                        )
+                        .into());
+                    }
+                    trailer.push_str(&format!("{field}: {value}\r\n"));
                 }
-                None => vec![value],
-            };
-            for value in lines {
-                let value = String::from_jsval(scope, value, ())?;
-                if has_invalid_header_char(&value) {
-                    return Err(NodeError::new(
-                        ErrorKind::TypeError,
-                        "ERR_INVALID_CHAR",
-                        format!("Invalid character in trailer content [\"{field}\"]"),
-                    )
-                    .into());
-                }
-                trailer.push_str(&format!("{field}: {value}\r\n"));
             }
-        }
+            Ok(())
+        };
+        let added = add(&mut trailer);
         this.set_property(scope, c"_trailer", trailer.as_str())?;
-        Ok(())
+        added
     }
 
     /// <https://nodejs.org/api/http.html#outgoingmessagedestroyerror>: a response that writes
@@ -1445,8 +1447,8 @@ fn get_socket(
     Ok(socket.map_or(js::value::null(), |socket| socket.as_value()))
 }
 
-/// The setter of `socket` and `connection`: corks the new socket as many times as the message is
-/// corked, as Node.js's does.
+/// The setter of `socket` and `connection`: corks the new socket and uncorks the old one as many
+/// times as the message is corked, as Node.js's does.
 fn set_socket(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -1457,16 +1459,19 @@ fn set_socket(
         return Ok(js::value::undefined());
     };
     let socket = Object::from_value(scope, args.get(0)).ok();
-    let corked = {
-        let mut data = state.data_mut();
-        data.socket = socket.map(Heap::from);
-        data.corked
+    let (old, corked) = {
+        let data = state.data();
+        (data.socket.get(scope), data.corked)
     };
-    if let Some(socket) = socket {
-        for _ in 0..corked as u32 {
+    for _ in 0..corked as u32 {
+        if let Some(socket) = socket {
             Function::call_by_name(scope, socket.handle(), c"cork", js::function::EmptyArgs)?;
         }
+        if let Some(old) = old {
+            Function::call_by_name(scope, old.handle(), c"uncork", js::function::EmptyArgs)?;
+        }
     }
+    state.data_mut().socket = socket.map(Heap::from);
     Ok(js::value::undefined())
 }
 
@@ -1482,21 +1487,13 @@ fn set_socket_timeout(
     Ok(js::value::undefined())
 }
 
-/// Whether the response of `state` has no body: a `HEAD` request's, or one with status 1xx, 204
-/// or 304.
-fn without_body(
-    scope: &Scope<'_>,
-    status: u16,
-    state: &OutgoingState<'_>,
-) -> Result<bool, ExnThrown> {
+/// Whether the served response of `state` has no body: a `HEAD` request's, or one with status
+/// 1xx, 204 or 304.
+fn without_body(status: u16, state: &OutgoingState<'_>) -> bool {
     if (100..200).contains(&status) || status == 204 || status == 304 {
-        return Ok(true);
+        return true;
     }
-    let Some(request) = state.data().request.get(scope) else {
-        return Ok(false);
-    };
-    let method = request.get_property(scope, c"method")?;
-    crate::support::is_str(scope, method, c"HEAD")
+    matches!(&state.data().transport, Transport::Served(served) if served.head)
 }
 
 /// The status of `response`, from its `statusCode` truncated to an integer, and its reason
@@ -1530,7 +1527,14 @@ fn respond(
     let Some(promise) = promise else {
         return Ok(());
     };
-    let headers = header_pairs(scope, state)?;
+    let stored = match &mut state.data_mut().transport {
+        Transport::Served(served) => served.headers.take(),
+        _ => None,
+    };
+    let headers = match stored {
+        Some(headers) => headers,
+        None => header_pairs(scope, state)?,
+    };
     let record = web_fetch::response::ResponseRecord {
         status,
         status_message: message,
@@ -1560,6 +1564,109 @@ fn respond(
     promise.resolve(scope, web_response.to_jsval_throwing(scope)?)
 }
 
+/// Store the head of the served response `response`, with status `status` and reason phrase
+/// `message`, as `writeHead` does: convert each header value to a string, keep the status and the
+/// (name, value) pairs for the web `Response`, and set `_header` to the status line, the header
+/// lines, joined as in a header block, and `Date` if `sendDate` is set and no `Date` header is.
+/// The host frames the response, so `_header` has no `Connection`, `Keep-Alive`,
+/// `Content-Length` or `Transfer-Encoding` lines but those set, and the properties that frame a
+/// message keep their values, except `_contentLength`, which a `Content-Length` header sets. A
+/// `Trailer` header throws `ERR_HTTP_TRAILER_INVALID` unless the
+/// response would be chunked on the wire.
+pub(super) fn store_served_header(
+    scope: &Scope<'_>,
+    response: Object<'_>,
+    state: &OutgoingState<'_>,
+    status: u16,
+    message: &str,
+) -> Result<(), Thrown> {
+    let mut header = super::wire::status_line(i32::from(status), message);
+    let mut pairs = Vec::new();
+    let (mut date, mut trailer) = (false, false);
+    for (name, value) in header_entries(scope, state) {
+        let is_array = js::Array::is_array_value(scope, value)?;
+        let first = pairs.len();
+        for value in values(scope, value)? {
+            pairs.push((name.clone(), String::from_jsval_throwing(scope, value, ())?));
+        }
+        date |= name.eq_ignore_ascii_case("date");
+        trailer |= name.eq_ignore_ascii_case("trailer");
+        let texts = &pairs[first..];
+        if (texts.len() >= 2 && name.eq_ignore_ascii_case("cookie"))
+            || (is_array && is_unique(state, &name))
+        {
+            let joined = texts
+                .iter()
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            header.push_str(&format!("{name}: {joined}\r\n"));
+        } else {
+            for (_, value) in texts {
+                header.push_str(&format!("{name}: {value}\r\n"));
+            }
+        }
+    }
+    if let Some((_, length)) = pairs
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        let length = super::wire::content_length_number(scope, length)?;
+        response.set_property(scope, c"_contentLength", length)?;
+    }
+    if trailer && !served_chunked(scope, response, &pairs, status)? {
+        return Err(NodeError::new(
+            ErrorKind::Error,
+            "ERR_HTTP_TRAILER_INVALID",
+            "Trailers are invalid with this transfer encoding",
+        )
+        .into());
+    }
+    if !date && js::conversion::to_boolean(response.get_property(scope, c"sendDate")?) {
+        header.push_str("Date: ");
+        header.push_str(&super::wire::utc_date());
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
+    response.set_property(scope, c"_header", header.as_str())?;
+    let mut data = state.data_mut();
+    data.header_stored = true;
+    if let Transport::Served(served) = &mut data.transport {
+        served.status = Some((status, message.to_string()));
+        served.headers = Some(pairs);
+    }
+    Ok(())
+}
+
+/// Whether the served response `response` with status `status` and the headers `pairs` would use
+/// chunked transfer coding on the wire: with a `Transfer-Encoding` header that names `chunked`,
+/// or without `Content-Length` and `Transfer-Encoding` headers if it has a body, uses chunked
+/// encoding by default and `Transfer-Encoding` wasn't removed.
+fn served_chunked(
+    scope: &Scope<'_>,
+    response: Object<'_>,
+    pairs: &[(String, String)],
+    status: u16,
+) -> Result<bool, ExnThrown> {
+    let named = |header: &'static str| {
+        pairs
+            .iter()
+            .filter(move |(name, _)| name.eq_ignore_ascii_case(header))
+    };
+    if named("content-length").next().is_some() {
+        return Ok(false);
+    }
+    if named("transfer-encoding").next().is_some() {
+        return Ok(status != 204
+            && status != 304
+            && named("transfer-encoding")
+                .any(|(_, value)| super::wire::has_word(value, "chunked")));
+    }
+    let flag = |name| crate::support::truthy(scope, response, name);
+    Ok(flag(c"_hasBody")? && flag(c"useChunkedEncodingByDefault")? && !flag(c"_removedTE")?)
+}
+
 /// Write `bytes` of the served response `response`: as its whole body if `last` and nothing was
 /// sent before, and otherwise to a stream of the chunks, starting with these. Returns whether
 /// the stream has room for more.
@@ -1581,8 +1688,15 @@ fn send_served(
         // Already responded to without a stream.
         return Ok(true);
     }
-    let (status, message) = status_of(scope, response)?;
-    if without_body(scope, status, state)? {
+    let stored = match &mut state.data_mut().transport {
+        Transport::Served(served) => served.status.take(),
+        _ => None,
+    };
+    let (status, message) = match stored {
+        Some(status) => status,
+        None => status_of(scope, response)?,
+    };
+    if without_body(status, state) {
         respond(scope, state, status, message, None)?;
         return Ok(true);
     }
@@ -1627,7 +1741,7 @@ fn enqueue(
         }
     } else {
         let length = bytes.len() as f64;
-        let chunk = js::Uint8Array::with_data(scope, &bytes)?;
+        let chunk = crate::buffer::uint8_array_from_vec(scope, bytes)?;
         controller.enqueue(scope, scope.root_value(chunk.as_value()))?;
         match &mut state.data_mut().transport {
             Transport::Served(served) => {
@@ -1822,21 +1936,37 @@ pub(super) struct ConnectionFields<'a> {
     pub on_pending_data: Option<Object<'a>>,
 }
 
+/// The method and HTTP version of the request a response responds to.
+pub(super) struct RequestLine<'a> {
+    pub method: &'a str,
+    pub version: (u32, u32),
+}
+
 /// A new `ServerResponse` to `req`, as `new ServerResponse(req, options)` creates it with the
 /// module's own constructor, and the assignments of a listening server's `connection` fields that
-/// follow it. `high_water_mark` and `reject_body_writes` are the options' `highWaterMark` and
+/// follow it. `line` is the method and version of `req`, which are read from `req` without it.
+/// `high_water_mark` and `reject_body_writes` are the options' `highWaterMark` and
 /// `rejectNonStandardBodyWrites`.
 pub(super) fn new_response<'s>(
     scope: &'s Scope<'_>,
     req: Object<'_>,
+    line: Option<RequestLine<'_>>,
     connection: Option<ConnectionFields<'_>>,
     high_water_mark: f64,
     reject_body_writes: bool,
 ) -> Result<Object<'s>, ExnThrown> {
     let response = server_response_class::new_instance(scope)?;
     // SAFETY: `response` was just created, and nothing else references it.
-    unsafe { init_response(scope, response, Some(req), connection, PropertyInit::Define) }
-        .map_err(|thrown| thrown.throw(scope))?;
+    unsafe {
+        init_response(
+            scope,
+            response,
+            Some((req, line)),
+            connection,
+            PropertyInit::Define,
+        )
+    }
+    .map_err(|thrown| thrown.throw(scope))?;
     let state = state_of(scope, response)?;
     let mut data = state.data_mut();
     data.high_water_mark = high_water_mark;
@@ -1846,10 +1976,10 @@ pub(super) fn new_response<'s>(
 }
 
 /// Initialize `response` as the `ServerResponse` constructor does for `req`, with the fields of
-/// `connection`, creating its properties as `init` creates them. The response to a `HEAD` request
-/// has no body, and the response to an HTTP/1.0 request closes the connection, unless
-/// `connection` keeps it alive, and uses chunked encoding only if the request's `TE` header
-/// names it.
+/// `connection`, creating its properties as `init` creates them. The method and version of `req`
+/// are read from it unless they are given. The response to a `HEAD` request has no body, and the
+/// response to an HTTP/1.0 request closes the connection, unless `connection` keeps it alive, and
+/// uses chunked encoding only if the request's `TE` header names it.
 ///
 /// # Safety
 ///
@@ -1858,7 +1988,7 @@ pub(super) fn new_response<'s>(
 unsafe fn init_response<'w>(
     scope: &'w Scope<'_>,
     response: Object<'w>,
-    req: Option<Object<'_>>,
+    req: Option<(Object<'_>, Option<RequestLine<'_>>)>,
     connection: Option<ConnectionFields<'_>>,
     init: PropertyInit,
 ) -> Result<(), Thrown> {
@@ -1866,17 +1996,27 @@ unsafe fn init_response<'w>(
         send_date: true,
         ..OutgoingFields::default()
     };
-    if let Some(req) = req {
-        let method = req.get_property(scope, c"method")?;
-        if crate::support::is_str(scope, method, c"HEAD")? {
+    if let Some((req, line)) = &req {
+        let (head, before_1_1) = match line {
+            Some(line) => (
+                line.method == "HEAD",
+                line.version.0 < 1 || line.version.1 < 1,
+            ),
+            None => {
+                let method = req.get_property(scope, c"method")?;
+                let head = crate::support::is_str(scope, method, c"HEAD")?;
+                let major = req.get_property(scope, c"httpVersionMajor")?;
+                let minor = req.get_property(scope, c"httpVersionMinor")?;
+                let before_1_1 = (major.is_number() && major.to_number() < 1.0)
+                    || (minor.is_number() && minor.to_number() < 1.0);
+                (head, before_1_1)
+            }
+        };
+        if head {
             fields.has_body = false;
         }
-        let major = req.get_property(scope, c"httpVersionMajor")?;
-        let minor = req.get_property(scope, c"httpVersionMinor")?;
-        if (major.is_number() && major.to_number() < 1.0)
-            || (minor.is_number() && minor.to_number() < 1.0)
-        {
-            let te = super::incoming::header_text(scope, req, "te")?.unwrap_or_default();
+        if before_1_1 {
+            let te = super::incoming::header_text(scope, *req, "te")?.unwrap_or_default();
             fields.use_chunked_encoding_by_default = super::wire::has_word(&te, "chunked");
             fields.should_keep_alive = false;
         }
@@ -1892,7 +2032,7 @@ unsafe fn init_response<'w>(
     init_outgoing(scope, response, &mut properties, &fields, init)?;
     properties.continue_with(scope, &RESPONSE_PROPERTIES)?;
     match req {
-        Some(req) => {
+        Some((req, _)) => {
             state_of(scope, response)?.data_mut().request = Some(Heap::from(req));
             properties.write(scope, c"req", req)?;
         }
@@ -1931,6 +2071,7 @@ pub mod server_response_class {
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
         let req = req.and_then(|req| Object::from_value(scope, *req).ok());
+        let req = req.map(|req| (req, None));
         // SAFETY: `Assign` has no requirements.
         unsafe { init_response(scope, this, req, None, PropertyInit::Assign) }?;
         store_options(scope, this, options)
@@ -2085,10 +2226,16 @@ pub mod server_response_class {
         if let Some(headers) =
             headers.filter(|headers| !progressive && js::conversion::to_boolean(*headers))
         {
-            super::store_head_headers(scope, &state, headers)?;
+            super::store_head_headers(scope, this, &state, headers)?;
         }
-        let line = super::super::wire::status_line(code, &status_message);
-        if let Err(thrown) = super::super::wire::store_header(scope, this, &state, &line) {
+        let served = matches!(state.data().transport, Transport::Served(_));
+        let stored = if served {
+            super::store_served_header(scope, this, &state, code as u16, &status_message)
+        } else {
+            let line = super::super::wire::status_line(code, &status_message);
+            super::super::wire::store_header(scope, this, &state, &line)
+        };
+        if let Err(thrown) = stored {
             state.data_mut().head_headers.clear();
             return Err(thrown);
         }

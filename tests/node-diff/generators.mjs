@@ -1144,7 +1144,8 @@ const util = {
         "isGeneratorFunction", "isGeneratorObject", "isMapIterator", "isSetIterator", "isWeakMap", "isArrayBufferView", "isDataView", "isProxy",
       ]);
       const value = g.pick([() => valueExpr(g), () => g.pick(["new Error(\"e\")", "new TypeError()", "new Map().keys()", "new Set().values()", "(function* () {})()", "new Proxy({}, {})", "new DataView(new ArrayBuffer(2))", "new SharedArrayBuffer(2)", "(function () { return arguments; })()"])])();
-      return `return require("node:util").types.${check}(${value});`;
+      // The result is keyed by the predicate, so that a difference's signature names it.
+      return `return { ${check}: require("node:util").types.${check}(${value}) };`;
     },
     misc: (g) =>
       g.pick([
@@ -1275,7 +1276,10 @@ const url = {
         () => `return require("node:url").fileURLToPath(new URL(${g.lit(g.pick(["file:///x/y", "file:///%00"]))}));`,
         () => `return require("node:url").urlToHttpOptions(new URL(${g.lit(g.pick(["http://u:p@a.com:81/p?q=1#h", "https://[::1]/", "http://a.com"]))}));`,
       ])(),
-    domain: (g) => `return require("node:url").${g.pick(["domainToASCII", "domainToUnicode"])}(${g.lit(g.pick(["español.com", "xn--espaol-zwa.com", "xn--iñvalid.com", "EXAMPLE.com", "", "a..b", "中文.中国", "xn--", g.string(6)]))});`,
+    domain: (g) => {
+      const name = g.pick(["domainToASCII", "domainToUnicode"]);
+      return `return { ${name}: require("node:url").${name}(${g.lit(g.pick(["español.com", "xn--espaol-zwa.com", "xn--iñvalid.com", "EXAMPLE.com", "", "a..b", "中文.中国", "xn--", g.string(6)]))}) };`;
+    },
   },
 };
 
@@ -1594,7 +1598,8 @@ const hostRequire = createRequire(import.meta.url);
  * and for a member Node.js enumerates on an export, or on its prototype, the member's type and
  * whether it is enumerable where the prototype chain defines it. Exports the runtime only stubs
  * throw `ERR_METHOD_NOT_IMPLEMENTED`. One variant per module, and a log label per member, so
- * signatures name both.
+ * signatures name both. The names come from the modules of the Node.js that runs the generator,
+ * which fuzz.mjs makes the oracle.
  */
 const shape = {
   name: "shape",
@@ -2060,8 +2065,12 @@ function dgramAddress(g) {
   return g.lit(g.pick(["127.0.0.1", "::1", "localhost", "", undefined, null, 1, "256.1.1.1", "not an address", "0.0.0.0", "::"]));
 }
 
-/** The code and name of the error `f` throws, or `ok`. */
-const DGRAM_RECORD = `const errors = [];\nconst record = (f) => { try { const value = f(); errors.push(typeof value === "object" && value !== null ? "object" : value); } catch (e) { errors.push([e.name, e.code, e.syscall]); } };`;
+/**
+ * Source that records the result of `f`, or the name, code and system call of its error, in
+ * `errors`, under the name of the socket method `f` calls, so that a difference's signature names
+ * the method.
+ */
+const DGRAM_RECORD = `const errors = {};\nconst record = (f) => { const results = (errors[/\\bs\\.(\\w+)\\(/.exec(String(f))?.[1] ?? "?"] ??= []); try { const value = f(); results.push(typeof value === "object" && value !== null ? "object" : value); } catch (e) { results.push([e.name, e.code, e.syscall]); } };`;
 
 const dgramGenerator = {
   name: "dgram",
@@ -2278,9 +2287,221 @@ const dnsGenerator = {
   },
 };
 
+/** Argument values for the web classes' argument validation. */
+const WEB_VALUES = [
+  "undefined", "null", "1", "-1", "1.5", "\"a\"", "\"\"", "{}", "[]", "[1]", "[[1]]", "() => {}", "true",
+  "new Uint8Array(2)", "new ArrayBuffer(2)",
+];
+
+/** A call of `callee` with zero to `max` arguments drawn from `WEB_VALUES`. */
+function webCall(g, callee, max = 3) {
+  return `${callee}(${g.many(g.range(0, max), () => g.pick(WEB_VALUES)).join(", ")})`;
+}
+
+/** The web classes, with the prototype members `web/brand` calls on another object. */
+const WEB_CLASSES = {
+  AbortSignal: ["throwIfAborted", "aborted", "reason"],
+  Blob: ["slice", "stream", "text", "arrayBuffer", "size", "type"],
+  CustomEvent: ["detail"],
+  Event: ["preventDefault", "stopPropagation", "composedPath", "type", "target", "cancelBubble"],
+  EventTarget: ["addEventListener", "removeEventListener", "dispatchEvent"],
+  File: ["name", "lastModified"],
+  Performance: ["now", "mark", "measure", "getEntries", "toJSON", "timeOrigin"],
+  PerformanceEntry: ["name", "entryType", "startTime", "duration", "toJSON"],
+  ReadableStream: ["getReader", "cancel", "tee", "locked", "pipeTo"],
+  TextDecoder: ["decode", "encoding", "fatal", "ignoreBOM"],
+  TextEncoder: ["encode", "encodeInto", "encoding"],
+  TransformStream: ["readable", "writable"],
+  URLSearchParams: ["append", "get", "has", "set", "sort", "toString", "forEach", "size", "entries"],
+  WritableStream: ["getWriter", "abort", "close", "locked"],
+  WritableStreamDefaultWriter: ["write", "close", "ready", "desiredSize"],
+  ReadableStreamDefaultReader: ["read", "cancel", "releaseLock", "closed"],
+};
+
+/**
+ * The argument validation of the web classes Node.js implements on its own validators: calls
+ * with missing and invalid arguments, constructors only the runtime calls, and members called on
+ * an object that isn't an instance. Errors compare by code, and with `--messages` by message.
+ */
+const web = {
+  name: "web",
+  variants: {
+    url: (g) =>
+      g.pick([
+        () => `return String(${webCall(g, "new URL", 2)});`,
+        () => `return ${webCall(g, "URL.canParse", 2)};`,
+        () => `return String(${webCall(g, "URL.parse", 2)});`,
+        () => `return String(${webCall(g, "new URLSearchParams", 1)});`,
+        () => `return String(${webCall(g, `new URLSearchParams("a=1").${g.pick(["append", "set", "get", "getAll", "has", "delete", "forEach"])}`, 2)});`,
+        () => `const u = new URL("http://a/"); u.href = ${g.pick(["\"x\"", "\"http://b/\"", "\"\""])}; return u.href;`,
+      ])(),
+    events: (g) =>
+      g.pick([
+        () => `return ${webCall(g, "new Event", 2)}.type;`,
+        () => `return ${webCall(g, "new CustomEvent", 2)}.type;`,
+        () => `return ${webCall(g, `new EventTarget().${g.pick(["addEventListener", "removeEventListener", "dispatchEvent"])}`, 3)};`,
+        () => `return new EventTarget().addEventListener("a", () => {}, { signal: ${g.pick(WEB_VALUES)} });`,
+        () => `return ${webCall(g, "new Event(\"a\").initEvent", 1)};`,
+      ])(),
+    abort: (g) =>
+      g.pick([
+        () => `return ${webCall(g, "AbortSignal.any", 1)}.aborted;`,
+        () => `return ${webCall(g, "AbortSignal.abort", 1)}.aborted;`,
+        () => `return new AbortSignal();`,
+      ])(),
+    encoding: (g) =>
+      g.pick([
+        () => `return ${webCall(g, "new TextDecoder", 2)}.encoding;`,
+        () => `return ${webCall(g, "new TextDecoder().decode", 2)};`,
+        () => `return new TextDecoder(${g.pick(["\"utf-8\"", "\"utf-16le\""])}, { fatal: true }).decode(new Uint8Array([${g.pick(["0xff", "0x61", "0, 0xd8"])}]));`,
+        () => `return ${webCall(g, "new TextEncoder().encodeInto", 2)};`,
+        () => `return ${webCall(g, "new TextDecoderStream", 2)}.encoding;`,
+      ])(),
+    performance: (g) =>
+      g.pick([
+        () => `return ${webCall(g, `performance.${g.pick(["mark", "measure", "getEntriesByName", "getEntriesByType", "clearMarks"])}`, 2)} === undefined;`,
+        () => `return ${webCall(g, "new PerformanceMark", 2)}.name;`,
+        () => `return performance.mark("a", { startTime: ${g.pick(["-1", "1", "-0.5"])} }).startTime;`,
+        () => `return typeof ${webCall(g, "new PerformanceObserver", 1)};`,
+        () => `const o = new PerformanceObserver(() => {}); try { return ${webCall(g, "o.observe", 1)}; } finally { o.disconnect(); }`,
+        () => `return new ${g.pick(["PerformanceEntry", "PerformanceMeasure", "PerformanceObserverEntryList", "Performance"])}();`,
+      ])(),
+    messaging: (g) =>
+      g.pick([
+        () => `const c = new MessageChannel(); try { ${webCall(g, "c.port1.postMessage", 2)}; return null; } finally { c.port1.close(); }`,
+        () => `const b = ${webCall(g, "new BroadcastChannel", 1)}; b.close(); return b.name;`,
+        () => `return typeof ${webCall(g, "structuredClone", 2)};`,
+        () => `return new MessagePort();`,
+      ])(),
+    blob: (g) =>
+      g.pick([
+        () => `return ${webCall(g, "new Blob", 2)}.size;`,
+        () => `return ${webCall(g, "new File", 3)}.name;`,
+        () => `return new Blob([], { endings: ${g.pick(["\"native\"", "\"x\"", "1"])} }).size;`,
+      ])(),
+    streams: (g) =>
+      g.pick([
+        () => `return typeof ${webCall(g, "new ReadableStream", 2)};`,
+        () => `return typeof ${webCall(g, "new WritableStream", 2)};`,
+        () => `return typeof ${webCall(g, "new TransformStream", 3)};`,
+        () => `return typeof ${webCall(g, `new ${g.pick(["ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ByteLengthQueuingStrategy", "CountQueuingStrategy"])}`, 1)};`,
+        () => `return typeof ${webCall(g, "new ReadableStream().getReader", 1)};`,
+        () => `return typeof ${webCall(g, "new ReadableStream().pipeThrough", 1)};`,
+        () => `return typeof ${webCall(g, `new ${g.pick(["CompressionStream", "DecompressionStream"])}`, 1)};`,
+        () => `return new ${g.pick(["ReadableStreamDefaultController", "ReadableByteStreamController", "WritableStreamDefaultController", "TransformStreamDefaultController", "ReadableStreamBYOBRequest"])}();`,
+      ])(),
+    brand: (g) => {
+      const name = g.pick(Object.keys(WEB_CLASSES));
+      const member = g.pick(WEB_CLASSES[name]);
+      return [
+        `const d = Object.getOwnPropertyDescriptor(${name}.prototype, ${g.lit(member)}) ?? Object.getOwnPropertyDescriptor(Object.getPrototypeOf(${name}.prototype), ${g.lit(member)});`,
+        `const receiver = ${g.pick(["{}", "1", "Object.create(null)"])};`,
+        `const result = d.value ? d.value.call(receiver) : d.get.call(receiver);`,
+        `return typeof (await result);`,
+      ].join("\n");
+    },
+  },
+};
+
+/**
+ * A statement that runs `fn`, an expression, as a callback of a kind `g` picks. With `throws`, `fn`
+ * throws, and the kinds are those whose exceptions go to the domain the callback was scheduled in.
+ * With `entered`, `fn` throws while a domain it entered is still entered, and the kinds leave out
+ * promise reactions, whose exceptions would leave that domain entered for the following operations.
+ */
+function domainSchedule(g, fn, throws = false, entered = false) {
+  const kinds = [
+    () => `setTimeout(${fn}, ${g.pick([0, 1])});`,
+    () => `setImmediate(${fn});`,
+    () => `process.nextTick(${fn});`,
+    () => `require("node:fs").stat(".", ${fn});`,
+  ];
+  if (!entered) {
+    kinds.push(
+      () => `Promise.resolve().then(${fn});`,
+      () => `setTimeout(() => Promise.resolve().then(${fn}), 0);`,
+    );
+  }
+  if (!throws) {
+    kinds.push(
+      () => `queueMicrotask(${fn});`,
+      () => `new (require("node:async_hooks").AsyncResource)("op").runInAsyncScope(${fn});`,
+    );
+  }
+  return g.pick(kinds)();
+}
+
+const domainGenerator = {
+  name: "domain",
+  variants: {
+    routing: (g) => {
+      const bound = g.chance(1 / 6);
+      const failure = bound ? `d.bind(() => { throw new Error("bound"); })` : g.pick([
+        () => `() => { throw ${g.pick(["new Error(\"thrown\")", "\"str\"", "42", "null", "{ message: \"obj\" }"])}; }`,
+        () => `() => new EventEmitter().emit("error", ${g.pick(["new Error(\"emitted\")", "undefined", "\"str\""])})`,
+        () => `() => { Promise.reject(new Error("rejected")); }`,
+        () => `() => d.intercept(() => __log("not called"))(new Error("intercepted"))`,
+        () => `() => { const e = new EventEmitter(); ${g.chance(0.5) ? "d.add(e);" : ""} e.emit("error", new Error("member")); }`,
+      ])();
+      return [
+        `const domain = require("node:domain");`,
+        `const { EventEmitter } = require("node:events");`,
+        `const d = domain.create();`,
+        `const seen = new Promise((resolve) => d.on("error", (e) => resolve([typeof e === "object" && e !== null ? [e.message, e.domain === d, e.domainThrown, e.domainEmitter instanceof EventEmitter, typeof e.domainBound] : e, process.domain === d, domain._stack.length])));`,
+        `d.run(() => { ${domainSchedule(g, failure, true, bound)} });`,
+        `return [await __settle(seen), process.domain === d, domain._stack.length];`,
+      ].join("\n");
+    },
+    context: (g) => {
+      const probe = `() => __log("probe", process.domain === d, process.domain === d2, domain._stack.length, domain.active === process.domain)`;
+      const lines = [
+        `const domain = require("node:domain");`,
+        `const d = domain.create();`,
+        `const d2 = domain.create();`,
+        `let finish;`,
+        `const done = new Promise((resolve) => (finish = resolve));`,
+      ];
+      lines.push(g.pick([
+        () => `d.run(() => { ${domainSchedule(g, probe)} });`,
+        () => `d.run(() => d2.run(() => { ${domainSchedule(g, probe)} }));`,
+        () => `d.run(() => { ${domainSchedule(g, `() => d2.run(() => { ${domainSchedule(g, probe)} })`)} });`,
+        () => `${domainSchedule(g, probe)}`,
+        () => `d.run(() => { ${domainSchedule(g, `d2.bind(${probe})`)} });`,
+      ])());
+      lines.push(`setTimeout(finish, 20);`, `await done;`, `return [process.domain === null || process.domain === undefined, domain._stack.length];`);
+      return lines.join("\n");
+    },
+    stack: (g) => {
+      const lines = [`const domain = require("node:domain");`, `const ds = [0, 1, 2].map(() => domain.create());`];
+      for (let index = g.range(2, 8); index > 0; index--) {
+        const which = `ds[${g.int(3)}]`;
+        lines.push(g.pick([
+          () => `${which}.enter();`,
+          () => `${which}.exit();`,
+          () => `__log("run", ${which}.run((...a) => [domain._stack.map((x) => ds.indexOf(x)), a], 1, 2));`,
+        ])());
+        lines.push(`__log("stack", domain._stack.map((x) => ds.indexOf(x)), ds.indexOf(process.domain), ds.indexOf(domain.active));`);
+      }
+      lines.push(`for (const x of ds) while (domain._stack.includes(x)) x.exit();`, `return [domain._stack.length, process.domain];`);
+      return lines.join("\n");
+    },
+    api: (g) =>
+      g.pick([
+        () => `const domain = require("node:domain");\nconst { EventEmitter } = require("node:events");\nconst d = domain.create();\nlet e;\nd.run(() => (e = new EventEmitter()));\nreturn [e.domain === d, new EventEmitter().domain, d.domain, Object.keys(d), d.eventNames(), EventEmitter.usingDomains];`,
+        () => `const domain = require("node:domain");\nconst { EventEmitter } = require("node:events");\nconst d = domain.create();\nconst e = new EventEmitter();\nd.add(e);\nd.add(e);\nconst counts = [d.members.length, e.domain === d];\nd.remove(e);\nreturn [counts, d.members.length, e.domain];`,
+        () => `const domain = require("node:domain");\nconst d = domain.create();\nconst b = d.bind(function (x) { return [this === d, process.domain === d, x]; });\nconst i = d.intercept((x) => x);\nreturn [b.name, b.length, b.domain === d, b(1), i.name, i(null, 2), Object.keys(domain.Domain.prototype)];`,
+        () => `const domain = require("node:domain");\ntry { process.setUncaughtExceptionCaptureCallback(${g.pick(["null", "() => {}"])}); return "set"; } catch (e) { return [e.code, e.stack.includes("-".repeat(40))]; }`,
+        () => `const domain = require("node:domain");\nconst d = domain.create();\n${g.chance(0.5) ? `d.on("error", () => {});\n` : ""}return [process.hasUncaughtExceptionCaptureCallback(), d.run(() => process.hasUncaughtExceptionCaptureCallback())];`,
+        () => `const domain = require("node:domain");\nconst d = domain.create();\ntry { return d.run(${g.pick(["null", "1", "\"x\""])}); } finally { d.exit(); }`,
+        () => `const domain = require("node:domain");\nconst d = domain.create();\nreturn d.add(${g.pick(["null", "1", "\"x\"", "undefined"])});`,
+      ])(),
+  },
+};
+
 export const GENERATORS = [
   buffer, stringDecoder, path, querystring, crypto, events, stream, fsGenerator, zlib, util, assert, url, timers, punycode, os,
-  processGenerator, shape, stackTrace, testRunner, netGenerator, httpGenerator, vmGenerator, dgramGenerator, dnsGenerator,
+  processGenerator, shape, stackTrace, testRunner, netGenerator, httpGenerator, vmGenerator, dgramGenerator, dnsGenerator, web,
+  domainGenerator,
 ];
 
 /** An operation drawn from a random variant of `generator` with `g`. */

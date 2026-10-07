@@ -2,7 +2,7 @@
 
 import assert, { AssertionError, strictEqual, deepStrictEqual, throws as assertThrows } from "node:assert";
 import strict from "node:assert/strict";
-import { eq, throws } from "./harness.mjs";
+import { deepEq, eq, throws } from "./harness.mjs";
 
 eq(typeof assert, "function", "assert is callable");
 eq(assert.ok, assert, "assert.ok is assert");
@@ -114,6 +114,13 @@ eq(new SubError({ message: "q" }) instanceof SubError, true, "subclass");
 throws(() => new AssertionError(), "ERR_INVALID_ARG_TYPE", "options required");
 eq(throws(() => deepStrictEqual({ a: 1, b: [1, 2] }, { a: 1, b: [1, 3] })).message, "Expected values to be strictly deep-equal:\n+ actual - expected\n\n  {\n    a: 1,\n    b: [\n      1,\n+     2\n-     3\n    ]\n  }\n", "deepStrictEqual diff");
 eq(throws(() => strictEqual(1, 2, "custom")).message, "custom\n\n1 !== 2\n", "custom message keeps the diff");
+{
+  const actual = new Error("a");
+  const error = throws(() => deepStrictEqual(actual, new Error("b")));
+  eq(error.message, "Expected values to be strictly deep-equal:\n+ actual - expected\n\n+ [Error: a]\n- [Error: b]\n", "errors are diffed without their stacks");
+  eq(error.actual !== actual && error.actual instanceof Error && error.actual.message, "a", "the error's actual is a copy without a stack");
+  eq(throws(() => deepStrictEqual(new AggregateError([1]), new AggregateError([2]))).message, "Values have same structure but are not reference-equal:\n\n[AggregateError]\n", "copied errors of the same structure");
+}
 eq(assert.strict.strict, assert.strict, "strict.strict");
 eq(throws(() => assert.fail()).message, "Failed", "fail");
 eq(throws(() => assert.fail("boom")).message, "boom", "fail message");
@@ -130,3 +137,39 @@ try {
   thrownByTrap = error;
 }
 eq(thrownByTrap, 1, "deepStrictEqual passes on a primitive thrown by a proxy trap");
+
+// The `^` indicator under a single-line diff is shown for values of every type.
+{
+  const caret = (fn) => throws(fn, "ERR_ASSERTION").message.endsWith("^\n");
+  eq(caret(() => strictEqual(function a() {}, function b() {})), true, "indicator for functions");
+  eq(caret(() => strictEqual(Symbol("a"), Symbol("b"))), true, "indicator for symbols");
+}
+// The deprecated `assert.fail(actual, expected, message, operator)` form.
+{
+  const failure = (...args) => {
+    const error = throws(() => assert.fail(...args), "ERR_ASSERTION");
+    return [error.message, error.operator, error.actual, error.expected, error.generatedMessage];
+  };
+  deepEq(failure(1, 2), ["1 != 2", "!=", 1, 2, true], "fail(actual, expected)");
+  deepEq(failure(1, 2, undefined), ["1 fail 2", "fail", 1, 2, true], "fail with three arguments");
+  deepEq(failure(1, 2, "msg", ">"), ["msg", ">", 1, 2, false], "fail with a message and an operator");
+  deepEq(failure(1, 2, undefined, ">"), ["1 > 2", ">", 1, 2, true], "fail with an operator");
+  deepEq(failure("x"), ["x", "fail", undefined, undefined, false], "fail(message)");
+  deepEq(failure(), ["Failed", "fail", undefined, undefined, true], "fail()");
+  throws(() => assert.fail(new TypeError("boom")), TypeError, "fail(error)");
+  throws(() => strict.fail(1, 2, new RangeError("boom")), RangeError, "fail with an error message");
+}
+
+// A CallTracker without a function tracks `Function.prototype`, whose empty name reports as
+// `calls`.
+{
+  process.removeAllListeners("warning");
+  process.on("warning", () => {});
+  const tracker = new assert.CallTracker();
+  const tracked = tracker.calls(2);
+  eq(tracked.name, "", "a tracked default function has an empty name");
+  tracked();
+  eq(tracker.report()[0].message,
+    "Expected the calls function to be executed 2 time(s) but was executed 1 time(s).",
+    "the report names the default function calls");
+}

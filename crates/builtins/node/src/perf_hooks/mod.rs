@@ -678,7 +678,7 @@ fn call_timerified(
                 .map(|histogram| histogram.get(scope)),
         )
     };
-    let call_args = crate::callback_args(&args);
+    let call_args = args.rest(0);
     let constructing = args.is_constructing();
     let start = web_globals::performance::now();
     let result = if constructing {

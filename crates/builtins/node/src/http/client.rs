@@ -404,7 +404,7 @@ fn free_sockets<'s>(
     };
     let key = name.to_jsval_throwing(scope)?;
     let sockets = crate::http::get_by_key(scope, pool, key)?;
-    if let Some(sockets) = super::outgoing::as_array(scope, sockets)? {
+    if let Some(sockets) = crate::support::as_array(scope, sockets) {
         return Ok(Some(sockets));
     }
     if !create {
@@ -417,9 +417,7 @@ fn free_sockets<'s>(
 
 /// Whether `agent` keeps connections alive.
 fn keeps_alive(scope: &Scope<'_>, agent: Object<'_>) -> Result<bool, ExnThrown> {
-    Ok(js::conversion::to_boolean(
-        agent.get_property(scope, c"keepAlive")?,
-    ))
+    crate::support::truthy(scope, agent, c"keepAlive")
 }
 
 /// Assign `request`, which goes through `platform::http`, a socket for a connection to `host` and
@@ -916,8 +914,8 @@ unsafe fn init_request<'w>(
     }
     let headers = options.get_property(scope, c"headers")?;
     let request_line = format!("{method} {path} HTTP/1.1\r\n");
-    if super::outgoing::as_array(scope, headers)?.is_some() {
-        super::outgoing::store_head_headers(scope, &state, headers)?;
+    if crate::support::as_array(scope, headers).is_some() {
+        super::outgoing::store_head_headers(scope, this, &state, headers)?;
         if over_socket {
             super::wire::store_header(scope, this, &state, &request_line)?;
         } else {

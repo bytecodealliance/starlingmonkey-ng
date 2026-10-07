@@ -164,7 +164,8 @@ pub mod stats_class {
                 date_setter,
                 js::value::from_f64(index as f64),
             )?;
-            proto.define_accessor(scope, name, Some(*getter), Some(*setter), 0)?;
+            let attrs = js::class_spec::JSPROP_ENUMERATE as u32;
+            proto.define_accessor(scope, name, Some(*getter), Some(*setter), attrs)?;
         }
         Ok(())
     }
@@ -275,16 +276,12 @@ pub mod dirent_class {
         unsafe { init_dirent(scope, this, name, r#type, path, PropertyInit::Assign) }
     }
 
-    pub fn is_file(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
-        is_kind(scope, this, FileKind::File)
-    }
-
     pub fn is_directory(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
         is_kind(scope, this, FileKind::Directory)
     }
 
-    pub fn is_symbolic_link(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
-        is_kind(scope, this, FileKind::Symlink)
+    pub fn is_file(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
+        is_kind(scope, this, FileKind::File)
     }
 
     pub fn is_block_device(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
@@ -293,6 +290,10 @@ pub mod dirent_class {
 
     pub fn is_character_device(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
         is_kind(scope, this, FileKind::CharDevice)
+    }
+
+    pub fn is_symbolic_link(scope: &Scope<'_>, this: Object<'_>) -> Result<bool, ExnThrown> {
+        is_kind(scope, this, FileKind::Symlink)
     }
 
     #[method(name = "isFIFO")]

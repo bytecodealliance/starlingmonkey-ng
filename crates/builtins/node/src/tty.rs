@@ -9,7 +9,7 @@
 
 use std::io::IsTerminal;
 
-use js::conversion::ToJSVal;
+use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
 use js::gc::scope::Scope;
@@ -17,7 +17,7 @@ use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
-use crate::errors::{NodeError, Thrown};
+use crate::errors::{ErrorKind, NodeError, Thrown};
 use crate::net::socket::{Link, SocketState};
 use crate::support::{spawn_cancellable, until_cancelled, Canceller};
 
@@ -200,10 +200,15 @@ pub mod read_stream_class {
     use super::*;
 
     /// <https://nodejs.org/api/tty.html#class-ttyreadstream>: a socket that reads the
-    /// descriptor `fd`. Only descriptor 0, standard input, can be read.
+    /// descriptor `fd`. A value that isn't an integer from 0 to 2**31 - 1 is `ERR_INVALID_FD`.
+    /// Only descriptor 0, standard input, can be read.
     #[constructor(length = 2)]
-    pub fn init(scope: &Scope<'_>, this: Object<'_>, fd: Option<f64>) -> Result<(), Thrown> {
-        let fd = fd.unwrap_or(0.0);
+    pub fn init(
+        scope: &Scope<'_>,
+        this: Object<'_>,
+        fd: Option<HandleValue<'_>>,
+    ) -> Result<(), Thrown> {
+        let fd = super::fd_arg(scope, fd.unwrap_or(HandleValue::undefined()))?;
         if fd != 0.0 {
             return Err(
                 NodeError::not_implemented("ReadStream for descriptors other than 0").into(),
@@ -278,6 +283,27 @@ pub mod read_stream_class {
     }
 }
 
+/// Node.js's check `fd >> 0 !== fd || fd < 0` of the `fd` argument of `tty.ReadStream`: `value` if
+/// it is an integer from 0 to 2**31 - 1, and `ERR_INVALID_FD` otherwise. A value that isn't a
+/// number is converted to a number and to a string, as the check and the message convert it.
+fn fd_arg(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<f64, Thrown> {
+    if value.is_number() {
+        let fd = value.to_number();
+        if fd.fract() == 0.0 && (0.0..=f64::from(i32::MAX)).contains(&fd) {
+            return Ok(fd);
+        }
+    } else {
+        f64::from_jsval(scope, value, ()).map_err(|_| ExnThrown)?;
+    }
+    let received = js::JSString::from_value(scope, value)?.to_utf8(scope)?;
+    Err(NodeError::new(
+        ErrorKind::RangeError,
+        "ERR_INVALID_FD",
+        format!("\"fd\" must be a positive integer: {received}"),
+    )
+    .into())
+}
+
 /// The getter of `process.stdin`: create the `ReadStream` of standard input, and replace the
 /// accessor with a data property holding it.
 fn stdin_getter(
@@ -288,7 +314,8 @@ fn stdin_getter(
     let process =
         Object::from_value(scope, scope.root_value(args.this())).map_err(|e| e.throw(scope))?;
     let stdin = read_stream_class::new_instance(scope)?;
-    read_stream_class::init(scope, stdin, Some(0.0)).map_err(|thrown| thrown.throw(scope))?;
+    let fd = scope.root_value(js::value::from_f64(0.0));
+    read_stream_class::init(scope, stdin, Some(fd)).map_err(|thrown| thrown.throw(scope))?;
     process.define_property(
         scope,
         c"stdin",
@@ -315,9 +342,11 @@ pub mod module {
     pub use super::read_stream_class as ReadStream;
 
     /// <https://nodejs.org/api/tty.html#ttyisattyfd>: whether `fd` is a standard stream connected
-    /// to a terminal. Other file descriptors are never terminals.
+    /// to a terminal. Other file descriptors are never terminals, and values that aren't numbers
+    /// are `false` without being converted.
     #[function(length = 1)]
-    pub fn isatty(fd: Option<f64>) -> bool {
-        fd.is_some_and(super::is_terminal)
+    pub fn isatty(fd: Option<js::prelude::HandleValue<'_>>) -> bool {
+        fd.filter(|fd| fd.is_number())
+            .is_some_and(|fd| super::is_terminal(fd.to_number()))
     }
 }

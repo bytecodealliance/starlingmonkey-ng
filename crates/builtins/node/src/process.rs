@@ -27,6 +27,7 @@ use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{validate_function, validate_string, ErrorKind, NodeError, Thrown};
+use crate::runtime_flags::UnhandledRejections;
 
 /// The Node.js version whose API the runtime targets, which `process.version` reports.
 pub const NODE_VERSION: &str = "24.21.0";
@@ -72,6 +73,18 @@ fn pid() -> u32 {
     }
 }
 
+/// The ID of the parent process, or 0 where there is none to report, as on wasm.
+fn ppid() -> u32 {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::parent_id()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 js::instance_local! {
     /// Incremented each time an instance resumes from a snapshot, which makes `process.env` and
     /// `process.argv` read the host's values again.
@@ -108,16 +121,29 @@ pub(crate) fn uptime_ms() -> f64 {
 /// Emit a process warning with `message` and the warning name `kind`, through
 /// `process.emitWarning` if the global has a `process`, and to stderr otherwise.
 pub fn emit_warning(scope: &Scope<'_>, message: &str, kind: &str) -> Result<(), ExnThrown> {
-    let process = process_value(scope)?;
-    if let Ok(process) = Object::from_value(scope, process) {
-        let emit = process.get_property(scope, c"emitWarning")?;
-        if Object::from_value(scope, emit).is_ok_and(|emit| emit.is_callable()) {
-            Function::call(scope, process, emit, &[message, kind])?;
-            return Ok(());
-        }
+    let args = [
+        message.to_jsval_throwing(scope)?,
+        kind.to_jsval_throwing(scope)?,
+    ];
+    if !call_emit_warning(scope, &args)? {
+        eprintln!("({kind}) {message}");
     }
-    eprintln!("({kind}) {message}");
     Ok(())
+}
+
+/// Call `process.emitWarning` with `args` if the global has a `process` whose `emitWarning` is a
+/// function. Returns whether it does.
+fn call_emit_warning(scope: &Scope<'_>, args: &[HandleValue<'_>]) -> Result<bool, ExnThrown> {
+    let process = process_value(scope)?;
+    let Ok(process) = Object::from_value(scope, process) else {
+        return Ok(false);
+    };
+    let emit = process.get_property(scope, c"emitWarning")?;
+    if !Object::from_value(scope, emit).is_ok_and(|emit| emit.is_callable()) {
+        return Ok(false);
+    }
+    Function::call(scope, process, emit, args)?;
+    Ok(true)
 }
 
 js::instance_local! {
@@ -140,7 +166,7 @@ pub(crate) fn deprecate_once(
     let Ok(process) = Object::from_value(scope, process) else {
         return Ok(());
     };
-    if js::conversion::to_boolean(process.get_property(scope, c"noDeprecation")?) {
+    if crate::support::truthy(scope, process, c"noDeprecation")? {
         return Ok(());
     }
     mark_code_warned(code);
@@ -185,7 +211,7 @@ struct ProcessObject;
 
 /// The realm's `process` object. It stays the modules' `process` whatever the global's `process`
 /// property holds, as in Node.js.
-fn global_process<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+pub(crate) fn global_process<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
     js::class::realm_object::<ProcessObject>(scope)
         .ok_or_else(|| js::error::TypeError("process is not installed".into()).throw(scope))
 }
@@ -370,59 +396,310 @@ fn emit(
     emitted.is_err()
 }
 
-/// The `rejection_handled` lifecycle hook, which does nothing.
-fn rejection_handled(_scope: &Scope<'_>, _promise: js::Promise<'_>, _id: u64) {}
-
-/// The `uncaught` lifecycle hook: emit `unhandledRejection` for a rejection if something listens,
-/// or else call the `process.setUncaughtExceptionCaptureCallback` callback if one is set, or else
-/// emit `uncaughtException` if something listens, and return `true`. If that listener or callback
-/// throws, print its exception and exit with code 7. If nothing listens and the runtime runs a script as a
-/// command, emit `exit` with code 1, print the error and exit, as Node.js does. In other runs,
-/// return `false`, and the runtime reports the error.
-///
-/// With `--abort-on-uncaught-exception` and no capture callback, an exception aborts the process
-/// after its message and stack frames are printed, without emitting `uncaughtException`, and a
-/// rejection nothing handles aborts it after it is printed.
+/// The `uncaught` lifecycle hook: handle a rejection as [`unhandled_rejection`] describes, and an
+/// exception as [`trigger_uncaught`] does.
 fn uncaught(
     scope: &Scope<'_>,
     error: HandleValue<'_>,
     rejection: Option<core_runtime::lifecycle::Rejection<'_>>,
 ) -> bool {
-    let promise = rejection.map(|rejection| rejection.promise);
+    match rejection {
+        Some(rejection) => unhandled_rejection(scope, error, rejection),
+        None => trigger_uncaught(scope, error, false),
+    }
+}
+
+/// Handle the rejection of `rejection.promise` with `reason`, which has no handler attached, in
+/// the mode `--unhandled-rejections` sets
+/// (<https://nodejs.org/api/cli.html#--unhandled-rejectionsmode>), as Node.js's
+/// `processPromiseRejections` does. [`emit_unhandled_rejection`] emits the rejection, and
+/// [`warn_unhandled_rejection`] warns about it. The error a rejection is handled as uncaught with
+/// is [`rejection_error`]. In each mode:
+///
+/// - `throw`: emit the rejection. If nothing listens, handle the error as uncaught.
+/// - `strict`: handle the error as uncaught, then emit the rejection, and warn if nothing listens.
+/// - `warn`: emit the rejection, and warn.
+/// - `none`: emit the rejection.
+/// - `warn-with-error-code`: emit the rejection. If nothing listens, warn and set
+///   `process.exitCode` to 1.
+///
+/// An exception a listener throws is handled as uncaught. Returns whether the rejection was
+/// handled, which it is unless [`trigger_uncaught`] returns `false` for it.
+fn unhandled_rejection(
+    scope: &Scope<'_>,
+    reason: HandleValue<'_>,
+    rejection: core_runtime::lifecycle::Rejection<'_>,
+) -> bool {
     let Ok(process) = global_process(scope) else {
         return false;
     };
+    let promise = rejection.promise;
+    let handled = (|| -> Result<bool, ExnThrown> {
+        Ok(match crate::runtime_flags::get().unhandled_rejections {
+            UnhandledRejections::Throw => {
+                emit_unhandled_rejection(scope, process, reason, promise)?
+                    || trigger_uncaught(scope, rejection_error(scope, reason)?, true)
+            }
+            UnhandledRejections::Strict => {
+                if !trigger_uncaught(scope, rejection_error(scope, reason)?, true) {
+                    return Ok(false);
+                }
+                if !emit_unhandled_rejection(scope, process, reason, promise)? {
+                    warn_unhandled_rejection(scope, reason, rejection.id)?;
+                }
+                true
+            }
+            UnhandledRejections::Warn => {
+                emit_unhandled_rejection(scope, process, reason, promise)?;
+                warn_unhandled_rejection(scope, reason, rejection.id)?;
+                true
+            }
+            UnhandledRejections::None => {
+                emit_unhandled_rejection(scope, process, reason, promise)?;
+                true
+            }
+            UnhandledRejections::WarnWithErrorCode => {
+                if !emit_unhandled_rejection(scope, process, reason, promise)? {
+                    warn_unhandled_rejection(scope, reason, rejection.id)?;
+                    process.set_property(scope, c"exitCode", 1)?;
+                }
+                true
+            }
+        })
+    })();
+    handled.unwrap_or_else(|ExnThrown| {
+        let thrown = js::exception::take_pending_or_undefined(scope);
+        trigger_uncaught(scope, thrown, false)
+    })
+}
+
+/// Emit the rejection of `promise` with `reason` as an `error` event on the `node:domain` domain
+/// it was rejected in, if there is one, and otherwise, or if the domain has no `error` listener,
+/// as `unhandledRejection` on `process`. Returns whether something listened.
+fn emit_unhandled_rejection(
+    scope: &Scope<'_>,
+    process: Object<'_>,
+    reason: HandleValue<'_>,
+    promise: HandleValue<'_>,
+) -> Result<bool, ExnThrown> {
+    if let Some(domain) = crate::domain::rejection_domain(scope) {
+        if crate::events::emit(scope, domain, c"error", &[reason])? {
+            return Ok(true);
+        }
+    }
+    if !has_listeners(scope, process, c"unhandledRejection")? {
+        return Ok(false);
+    }
+    if emit(scope, process, c"unhandledRejection", &[reason, promise]) {
+        return Err(ExnThrown);
+    }
+    Ok(true)
+}
+
+/// The error a rejection with `reason` is handled as uncaught with: `reason` if it is error-like,
+/// and otherwise an `Error` with the code `ERR_UNHANDLED_REJECTION` and the name
+/// `UnhandledPromiseRejection`, as own enumerable properties.
+fn rejection_error<'s>(
+    scope: &'s Scope<'_>,
+    reason: HandleValue<'s>,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    if is_error_like(scope, reason)? {
+        return Ok(reason);
+    }
+    let message = format!(
+        "This error originated either by throwing inside of an async function without a catch \
+         block, or by rejecting a promise which was not handled with .catch(). The promise \
+         rejected with the reason \"{}\".",
+        crate::inspect::no_side_effects_to_string(scope, reason)?
+    );
+    let error = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &message)?;
+    let object = Object::from_value(scope, error).map_err(|e| e.throw(scope))?;
+    object.define_property(
+        scope,
+        c"code",
+        "ERR_UNHANDLED_REJECTION",
+        js::class_spec::JSPROP_ENUMERATE as u32,
+    )?;
+    object.define_property(
+        scope,
+        c"name",
+        "UnhandledPromiseRejection",
+        js::class_spec::JSPROP_ENUMERATE as u32,
+    )?;
+    Ok(error)
+}
+
+/// Whether `value` is an object with a stack, as Node.js's `isErrorLike` checks it: an error
+/// object, or an object with an own `stack` property.
+fn is_error_like(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
+    let Ok(object) = Object::from_value(scope, value) else {
+        return Ok(false);
+    };
+    if object.is_callable() {
+        return Ok(false);
+    }
+    Ok(js::exception::is_error_object(scope, value) || object.has_own_property(scope, c"stack")?)
+}
+
+/// The text of the warning about an unhandled rejection with the rejection ID `id`.
+fn unhandled_rejection_warning_message(id: u64) -> String {
+    format!(
+        "Unhandled promise rejection. This error originated either by throwing inside of an async \
+         function without a catch block, or by rejecting a promise which was not handled with \
+         .catch(). To terminate the node process on unhandled promise rejection, use the CLI flag \
+         `--unhandled-rejections=strict` (see \
+         https://nodejs.org/api/cli.html#cli_unhandled_rejections_mode). (rejection id: {id})"
+    )
+}
+
+/// Warn about the unhandled rejection with `reason` and the rejection ID `id`, as Node.js's
+/// `emitUnhandledRejectionWarning` does: emit a warning named `UnhandledPromiseRejectionWarning`
+/// with the `stack` of an error-like `reason`, or [`no_side_effects_to_string`] of another
+/// `reason`, then an `UnhandledPromiseRejectionWarning` error with the rejection ID and the
+/// `stack` of an error-like `reason`. An exception from the first warning is ignored.
+///
+/// [`no_side_effects_to_string`]: crate::inspect::no_side_effects_to_string
+fn warn_unhandled_rejection(
+    scope: &Scope<'_>,
+    reason: HandleValue<'_>,
+    id: u64,
+) -> Result<(), ExnThrown> {
+    let name = js::class::get_or_init_atom(scope, c"UnhandledPromiseRejectionWarning")?;
+    let message = unhandled_rejection_warning_message(id);
+    let warning = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &message)?;
+    let warning_object = Object::from_value(scope, warning).map_err(|e| e.throw(scope))?;
+    warning_object.define_property(
+        scope,
+        c"name",
+        name,
+        js::class_spec::JSPROP_ENUMERATE as u32,
+    )?;
+    let first = (|| -> Result<(), ExnThrown> {
+        if is_error_like(scope, reason)? {
+            let error = Object::from_value(scope, reason).map_err(|e| e.throw(scope))?;
+            let stack = error.get_property(scope, c"stack")?;
+            warning_object.set_property(scope, c"stack", stack)?;
+            // The message is the stack in V8's form, which Node.js's `reason.stack` has.
+            let message = if stack.is_string() {
+                let text = String::from_jsval(scope, stack, ()).map_err(|_| ExnThrown)?;
+                crate::inspect::v8_stack(scope, error, text)?.to_jsval_throwing(scope)?
+            } else {
+                stack
+            };
+            call_emit_warning(scope, &[message, name])?;
+            return Ok(());
+        }
+        let text = crate::inspect::no_side_effects_to_string(scope, reason)?;
+        call_emit_warning(scope, &[text.to_jsval_throwing(scope)?, name])?;
+        Ok(())
+    })();
+    if first.is_err() {
+        js::exception::clear(scope);
+        let _ = (|| -> Result<bool, ExnThrown> {
+            let text = crate::inspect::no_side_effects_to_string(scope, reason)?;
+            call_emit_warning(scope, &[text.to_jsval_throwing(scope)?, name])
+        })();
+        js::exception::clear(scope);
+    }
+    call_emit_warning(scope, &[warning])?;
+    Ok(())
+}
+
+/// The `rejection_handled` lifecycle hook: emit `rejectionHandled` with `promise` on `process` if
+/// something listens, and otherwise emit a `PromiseRejectionHandledWarning` with the rejection ID
+/// `id`, as Node.js's `processPromiseRejections` does. See
+/// <https://nodejs.org/api/process.html#event-rejectionhandled>. An exception a listener throws
+/// is handled as uncaught, and reported if that doesn't handle it.
+fn rejection_handled(scope: &Scope<'_>, promise: js::Promise<'_>, id: u64) {
+    let emitted = (|| -> Result<(), ExnThrown> {
+        let process = global_process(scope)?;
+        if has_listeners(scope, process, c"rejectionHandled")? {
+            let promise = promise.to_jsval_throwing(scope)?;
+            if emit(scope, process, c"rejectionHandled", &[promise]) {
+                return Err(ExnThrown);
+            }
+            return Ok(());
+        }
+        let message = format!("Promise rejection was handled asynchronously (rejection id: {id})");
+        let warning = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &message)?;
+        let object = Object::from_value(scope, warning).map_err(|e| e.throw(scope))?;
+        object.define_property(
+            scope,
+            c"name",
+            "PromiseRejectionHandledWarning",
+            js::class_spec::JSPROP_ENUMERATE as u32,
+        )?;
+        object.define_property(
+            scope,
+            c"id",
+            id as f64,
+            js::class_spec::JSPROP_ENUMERATE as u32,
+        )?;
+        call_emit_warning(scope, &[warning])?;
+        Ok(())
+    })();
+    if emitted.is_err() {
+        let thrown = js::exception::take_pending_or_undefined(scope);
+        if !trigger_uncaught(scope, thrown, false) {
+            js::exception::set_pending(scope, thrown, js::native::ExceptionStackBehavior::Capture);
+            js::exception::report_and_clear(scope, "rejectionHandled");
+        }
+    }
+}
+
+/// Handle `error` as uncaught, as Node.js's `triggerUncaughtException` does, for a rejection if
+/// `from_promise`, and an exception otherwise: emit `uncaughtExceptionMonitor` with the error and
+/// its origin, `uncaughtException` or `unhandledRejection`. Then call the `_errorHandler` of
+/// `process.domain` while an entered domain has `error` listeners, or else call the
+/// `process.setUncaughtExceptionCaptureCallback` callback if one is set, or else emit
+/// `uncaughtException` with the error and its origin if something listens, and return `true`. If
+/// the monitor, that listener or the callback throws, print its exception and exit with code 7.
+/// If nothing listens and the runtime runs a script as a command, emit `exit` with code 1, print
+/// the error and exit, as Node.js does. In other runs, return `false`, and the runtime reports the
+/// error.
+///
+/// With `--abort-on-uncaught-exception` and no capture callback or domain, an exception aborts the
+/// process after its message and stack frames are printed, without emitting `uncaughtException`,
+/// and a rejection nothing handles aborts it after it is printed.
+fn trigger_uncaught(scope: &Scope<'_>, error: HandleValue<'_>, from_promise: bool) -> bool {
+    let Ok(process) = global_process(scope) else {
+        return false;
+    };
+    let domain_capture = crate::domain::captures_exceptions(scope).unwrap_or_else(|ExnThrown| {
+        js::exception::clear(scope);
+        false
+    });
     let abort = crate::runtime_flags::get().abort_on_uncaught_exception
-        && capture_callback(scope).is_none();
-    if abort && promise.is_none() {
+        && capture_callback(scope).is_none()
+        && !domain_capture;
+    if abort && !from_promise {
         abort_uncaught(scope, error);
     }
-    let threw = match promise {
-        Some(promise) if has_listeners(scope, process, c"unhandledRejection").unwrap_or(false) => {
-            Some(emit(
-                scope,
-                process,
-                c"unhandledRejection",
-                &[error, promise],
-            ))
-        }
-        _ if capture_callback(scope).is_some() => {
-            let callback = capture_callback(scope).expect("checked above");
-            let undefined = scope.root_value(js::value::undefined());
-            Some(Function::call(scope, undefined, callback, &[error]).is_err())
-        }
-        _ if has_listeners(scope, process, c"uncaughtException").unwrap_or(false) => {
-            let origin = if promise.is_some() {
-                c"unhandledRejection"
-            } else {
-                c"uncaughtException"
-            };
-            match js::class::get_or_init_atom(scope, origin) {
-                Ok(origin) => Some(emit(scope, process, c"uncaughtException", &[error, origin])),
-                Err(_) => Some(true),
-            }
-        }
-        _ => None,
+    let origin = if from_promise {
+        c"unhandledRejection"
+    } else {
+        c"uncaughtException"
+    };
+    let Ok(origin) = js::class::get_or_init_atom(scope, origin) else {
+        print_uncaught(scope);
+        flush_and_exit(7)
+    };
+    let threw = if emit(
+        scope,
+        process,
+        c"uncaughtExceptionMonitor",
+        &[error, origin],
+    ) {
+        Some(true)
+    } else if domain_capture {
+        Some(crate::domain::handle_uncaught(scope, error).is_err())
+    } else if let Some(callback) = capture_callback(scope) {
+        let undefined = scope.root_value(js::value::undefined());
+        Some(Function::call(scope, undefined, callback, &[error]).is_err())
+    } else if has_listeners(scope, process, c"uncaughtException").unwrap_or(false) {
+        Some(emit(scope, process, c"uncaughtException", &[error, origin]))
+    } else {
+        None
     };
     match threw {
         Some(false) => true,
@@ -523,9 +800,16 @@ fn emit_warning_now(
     Ok(js::value::undefined())
 }
 
-/// Print `warning` to stderr as Node.js's default `warning` listener does.
+/// Print `warning` to stderr as Node.js's default `warning` listener does. With
+/// `process.traceProcessWarnings`, or `process.traceDeprecation` for a `DeprecationWarning`, the
+/// warning's `stack` replaces its `toString()` and no hint about the tracing flags follows.
 fn print_warning(scope: &Scope<'_>, warning: HandleValue<'_>) -> Result<(), ExnThrown> {
     let object = Object::from_value(scope, warning).map_err(|e| e.throw(scope))?;
+    let process = global_process(scope)?;
+    let name = object.get_property(scope, c"name")?;
+    let deprecation = crate::support::is_str(scope, name, c"DeprecationWarning")?;
+    let trace = crate::support::truthy(scope, process, c"traceProcessWarnings")?
+        || (deprecation && crate::support::truthy(scope, process, c"traceDeprecation")?);
     let code = object.get_property(scope, c"code")?;
     let code = if js::conversion::to_boolean(code) {
         format!(
@@ -535,16 +819,33 @@ fn print_warning(scope: &Scope<'_>, warning: HandleValue<'_>) -> Result<(), ExnT
     } else {
         String::new()
     };
-    // A warning whose `toString` isn't a function is converted by `Error.prototype.toString`.
-    let mut to_string = object.get_property(scope, c"toString")?;
-    if !js::function::is_callable(to_string) {
-        let prototype =
-            js::class::get_class_prototype(scope, js::class_spec::JSProtoKey::JSProto_Error)?;
-        let prototype = Object::from_handle(prototype).ok_or(ExnThrown)?;
-        to_string = prototype.get_property(scope, c"toString")?;
-    }
-    let text = Function::call(scope, warning, to_string, js::function::EmptyArgs)?;
-    let text = js::JSString::from_value(scope, text)?.to_utf8(scope)?;
+    let stack = if trace {
+        Some(object.get_property(scope, c"stack")?)
+            .filter(|stack| js::conversion::to_boolean(*stack))
+    } else {
+        None
+    };
+    let text = match stack {
+        Some(stack) => {
+            let stack = js::JSString::from_value(scope, stack)?.to_utf8(scope)?;
+            crate::inspect::v8_stack(scope, object, stack)?
+        }
+        None => {
+            // A warning whose `toString` isn't a function is converted by
+            // `Error.prototype.toString`.
+            let mut to_string = object.get_property(scope, c"toString")?;
+            if !js::function::is_callable(to_string) {
+                let prototype = js::class::get_class_prototype(
+                    scope,
+                    js::class_spec::JSProtoKey::JSProto_Error,
+                )?;
+                let prototype = Object::from_handle(prototype).ok_or(ExnThrown)?;
+                to_string = prototype.get_property(scope, c"toString")?;
+            }
+            let text = Function::call(scope, warning, to_string, js::function::EmptyArgs)?;
+            js::JSString::from_value(scope, text)?.to_utf8(scope)?
+        }
+    };
     let detail = object.get_property(scope, c"detail")?;
     let detail = if detail.is_string() {
         format!(
@@ -554,14 +855,11 @@ fn print_warning(scope: &Scope<'_>, warning: HandleValue<'_>) -> Result<(), ExnT
     } else {
         String::new()
     };
-    let process = global_process(scope)?;
-    // Node.js follows the first warning it prints with a hint about the tracing flags.
-    let hint = if TRACE_HINT_SHOWN.replace(true) {
+    // Node.js follows the first warning it prints without a trace with a hint about the tracing
+    // flags.
+    let hint = if trace || TRACE_HINT_SHOWN.replace(true) {
         String::new()
     } else {
-        let name = object.get_property(scope, c"name")?;
-        let deprecation = name.is_string()
-            && String::from_jsval(scope, name, ()).is_ok_and(|name| name == "DeprecationWarning");
         let flag = if deprecation {
             "--trace-deprecation"
         } else {
@@ -581,12 +879,15 @@ fn print_warning(scope: &Scope<'_>, warning: HandleValue<'_>) -> Result<(), ExnT
     Ok(())
 }
 
-/// The state of the global's `process` that Node keeps in its own module scope: `process.exitCode`
-/// and the uncaught exception capture callback.
+/// The state of the global's `process` that Node keeps in its own module scope: `process.exitCode`,
+/// the uncaught exception capture callback, and the value of the global `process`.
 #[core_runtime::jsclass(hidden)]
 pub(crate) struct ProcessState {
     exit_code: Heap<Value>,
     capture: Option<Heap<js::object::Object>>,
+    /// The value of the global `process` accessor: the `process` object until code assigns
+    /// another value.
+    global_value: Heap<Value>,
 }
 
 #[core_runtime::jsmethods]
@@ -607,6 +908,33 @@ fn capture_callback<'s>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
     let state = process_state(scope).ok()?;
     let callback = state.data().capture.as_ref()?.get(scope);
     Some(callback)
+}
+
+/// Whether `process.setUncaughtExceptionCaptureCallback` set a callback.
+pub(crate) fn has_capture_callback(scope: &Scope<'_>) -> bool {
+    capture_callback(scope).is_some()
+}
+
+/// The getter of the global `process`.
+fn get_global_process(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    Ok(process_state(scope)?.data().global_value.get(scope).get())
+}
+
+/// The setter of the global `process`, which replaces the value the getter returns.
+fn set_global_process(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    process_state(scope)?
+        .data()
+        .global_value
+        .set(args.get(0).get());
+    Ok(js::value::undefined())
 }
 
 /// The `process.exitCode` getter.
@@ -711,13 +1039,9 @@ pub mod functions {
         exit_with(scope, process)
     }
 
-    /// <https://nodejs.org/api/process.html#processabort>
+    /// <https://nodejs.org/api/process.html#processabort>: traps the instance on wasm.
     pub fn abort() {
-        let _ = std::io::stderr().flush();
-        #[cfg(target_arch = "wasm32")]
-        platform::process::exit(134);
-        #[cfg(not(target_arch = "wasm32"))]
-        std::process::abort();
+        platform::process::abort()
     }
 
     /// <https://nodejs.org/api/process.html#processnexttickcallback-args>: queued in the tick
@@ -844,10 +1168,10 @@ pub mod functions {
         let object = Object::from_value(scope, warning)?;
         let name = object.get_property(scope, c"name")?;
         if name.is_string() && String::from_jsval(scope, name, ())? == "DeprecationWarning" {
-            if js::conversion::to_boolean(process.get_property(scope, c"noDeprecation")?) {
+            if crate::support::truthy(scope, process, c"noDeprecation")? {
                 return Ok(());
             }
-            if js::conversion::to_boolean(process.get_property(scope, c"throwDeprecation")?) {
+            if crate::support::truthy(scope, process, c"throwDeprecation")? {
                 return Ok(js::jobs::queue_native_tick(
                     scope,
                     crate::support::throw_in_tick,
@@ -896,6 +1220,9 @@ pub mod functions {
         scope: &Scope<'_>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
+        if crate::domain::loaded(scope) {
+            return Err(crate::domain::cannot_set_capture_error(scope).into());
+        }
         let callback = callback.unwrap_or(HandleValue::undefined());
         let state = process_state(scope)?;
         if callback.is_null() {
@@ -927,9 +1254,10 @@ pub mod functions {
         Ok(())
     }
 
-    /// <https://nodejs.org/api/process.html#processhasuncaughtexceptioncapturecallback>
-    pub fn has_uncaught_exception_capture_callback(scope: &Scope<'_>) -> bool {
-        capture_callback(scope).is_some()
+    /// <https://nodejs.org/api/process.html#processhasuncaughtexceptioncapturecallback>: also
+    /// `true` while a `node:domain` domain with `error` listeners is entered.
+    pub fn has_uncaught_exception_capture_callback(scope: &Scope<'_>) -> Result<bool, ExnThrown> {
+        Ok(capture_callback(scope).is_some() || crate::domain::captures_exceptions(scope)?)
     }
 
     /// <https://nodejs.org/api/process.html#processgetbuiltinmoduleid>: the builtin module `id`
@@ -951,11 +1279,15 @@ pub mod functions {
         crate::internals::process_binding(scope, &name)
     }
 
-    /// <https://nodejs.org/api/process.html#processkillpid-signal>: there are no other processes
-    /// to signal.
+    /// <https://nodejs.org/api/process.html#processkillpid-signal>: see
+    /// [`crate::child_process::kill_process`].
     #[function(length = 2)]
-    pub fn kill() -> Result<(), NodeError> {
-        Err(NodeError::not_implemented("process.kill()"))
+    pub fn kill(
+        scope: &Scope<'_>,
+        pid: HandleValue<'_>,
+        signal: Option<HandleValue<'_>>,
+    ) -> Result<bool, Thrown> {
+        crate::child_process::kill_process(scope, pid, signal)
     }
 }
 
@@ -1415,7 +1747,7 @@ fn stream_write(
         return Err(NodeError::invalid_arg_type(
             scope,
             "chunk",
-            "of type string or an instance of Buffer or Uint8Array",
+            "of type string or an instance of Buffer, TypedArray, or DataView",
             chunk,
         )
         .throw(scope));
@@ -1468,6 +1800,11 @@ pub fn install(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     let process = global.get_property(scope, c"process")?;
     let process = Object::from_value(scope, process).map_err(|e| e.throw(scope))?;
     js::class::register_realm_object::<ProcessObject>(scope, process);
+    // The global `process` is a non-enumerable accessor, as Node.js defines it.
+    state.data().global_value.set(process.as_value());
+    let getter = Function::new_callback(scope, c"get", 0, get_global_process, ())?;
+    let setter = Function::new_callback(scope, c"set", 1, set_global_process, ())?;
+    global.define_accessor(scope, c"process", Some(*getter), Some(*setter), 0)?;
 
     let emitter = crate::events::emitter_constructor(scope)?;
     let proto = emitter.get_property(scope, c"prototype")?;
@@ -1494,7 +1831,7 @@ pub fn install(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     process.set_property(scope, c"platform", platform())?;
     process.set_property(scope, c"arch", arch())?;
     process.set_property(scope, c"pid", pid())?;
-    process.set_property(scope, c"ppid", 0)?;
+    process.set_property(scope, c"ppid", ppid())?;
     let flags = crate::runtime_flags::get();
     let title = flags.title.as_deref().unwrap_or("starlingmonkey");
     process.set_property(scope, c"title", title)?;
@@ -1515,6 +1852,12 @@ pub fn install(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     if flags.throw_deprecation {
         process.set_property(scope, c"throwDeprecation", true)?;
     }
+    if flags.trace_warnings {
+        process.set_property(scope, c"traceProcessWarnings", true)?;
+    }
+    if flags.trace_deprecation {
+        process.set_property(scope, c"traceDeprecation", true)?;
+    }
     let getter = Function::new_callback(scope, c"exitCode", 0, get_exit_code, ())?;
     let setter = Function::new_callback(scope, c"exitCode", 1, set_exit_code_property, ())?;
     process.define_accessor(
@@ -1527,8 +1870,24 @@ pub fn install(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     process.set_property(scope, c"_exiting", false)?;
     process.set_property(scope, c"config", config(scope)?)?;
     let features = Object::new_plain(scope)?;
-    for feature in [c"inspector", c"ipv6", c"tls", c"typescript"] {
-        features.set_property(scope, feature, false)?;
+    // Node.js's keys, in its order. Node.js always reports `uv` as `true`.
+    let feature_values = [
+        (c"inspector", false),
+        (c"debug", false),
+        (c"uv", true),
+        (c"ipv6", true),
+        (c"tls_alpn", false),
+        (c"tls_sni", false),
+        (c"tls_ocsp", false),
+        (c"tls", false),
+        (c"openssl_is_boringssl", false),
+        (c"cached_builtins", false),
+        (c"require_module", true),
+        (c"quic", false),
+        (c"typescript", false),
+    ];
+    for (feature, value) in feature_values {
+        features.set_property(scope, feature, value)?;
     }
     process.set_property(scope, c"features", features)?;
     process.set_property(scope, c"stdout", standard_stream(scope, 1)?)?;

@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 /// The settings the Node.js runtime flags make.
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeFlags {
+pub struct RuntimeFlags {
     /// `--node-http-listen`, the runtime's own flag: `http.Server.listen()` in a script run as a
     /// command accepts connections itself.
     pub http_listen: bool,
@@ -30,6 +30,10 @@ pub(crate) struct RuntimeFlags {
     pub no_deprecation: bool,
     /// `--throw-deprecation`: the initial `process.throwDeprecation`.
     pub throw_deprecation: bool,
+    /// `--trace-warnings`: the initial `process.traceProcessWarnings`.
+    pub trace_warnings: bool,
+    /// `--trace-deprecation`: the initial `process.traceDeprecation`.
+    pub trace_deprecation: bool,
     /// `--abort-on-uncaught-exception`: an uncaught exception aborts the process.
     pub abort_on_uncaught_exception: bool,
     /// `--title`: the initial `process.title`.
@@ -47,6 +51,34 @@ pub(crate) struct RuntimeFlags {
     /// `--insecure-http-parser`: HTTP messages are parsed leniently unless their server or
     /// request sets `insecureHTTPParser` or `httpValidation`.
     pub insecure_http_parser: bool,
+    /// `false` with `--no-experimental-websocket`: the globals `WebSocket` and `CloseEvent`
+    /// exist.
+    pub experimental_websocket: bool,
+    /// `--dns-result-order`: the initial `dns.getDefaultResultOrder()`, one of `verbatim`,
+    /// `ipv4first` and `ipv6first`.
+    pub dns_result_order: Option<String>,
+    /// `--unhandled-rejections`: how a promise rejected with no handler attached is handled.
+    pub unhandled_rejections: UnhandledRejections,
+}
+
+/// The modes of `--unhandled-rejections`. See
+/// <https://nodejs.org/api/cli.html#--unhandled-rejectionsmode>.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnhandledRejections {
+    /// `throw`: emit `unhandledRejection`, and handle the rejection as an uncaught exception if
+    /// nothing listens.
+    #[default]
+    Throw,
+    /// `strict`: handle the rejection as an uncaught exception, then emit `unhandledRejection`,
+    /// and warn if nothing listens.
+    Strict,
+    /// `warn`: emit `unhandledRejection`, and warn.
+    Warn,
+    /// `none`: emit `unhandledRejection`.
+    None,
+    /// `warn-with-error-code`: emit `unhandledRejection`, and warn and set `process.exitCode` to 1
+    /// if nothing listens.
+    WarnWithErrorCode,
 }
 
 impl Default for RuntimeFlags {
@@ -60,6 +92,8 @@ impl Default for RuntimeFlags {
             pending_deprecation: false,
             no_deprecation: false,
             throw_deprecation: false,
+            trace_warnings: false,
+            trace_deprecation: false,
             abort_on_uncaught_exception: false,
             title: None,
             network_family_autoselection: true,
@@ -67,6 +101,9 @@ impl Default for RuntimeFlags {
             experimental_stream_iter: false,
             test_udp_no_try_send: false,
             insecure_http_parser: false,
+            experimental_websocket: true,
+            dns_result_order: None,
+            unhandled_rejections: UnhandledRejections::Throw,
         }
     }
 }
@@ -84,8 +121,7 @@ const IGNORED: &[&str] = &[
     "experimental-vm-modules",
 ];
 
-/// The flags that are rejected, and the reason for each. `UNSUPPORTED_FLAGS` in
-/// `tests/node-harness/run-node-tests.mjs` lists the same flags.
+/// The flags that are rejected, and the reason for each.
 const REJECTED: &[(&str, &str)] = &[
     (
         "allow-natives-syntax",
@@ -111,6 +147,15 @@ const REJECTED: &[(&str, &str)] = &[
 /// and `http_listen`, from `--node-http-listen`, the ones [`get`] returns. Returns an error naming
 /// the first flag that is unknown, rejected, or malformed.
 pub fn set(flags: &[String], http_listen: bool) -> Result<(), String> {
+    let settings = parse(flags, http_listen)?;
+    FLAGS.with(|cell| *cell.borrow_mut() = Some(Rc::new(settings)));
+    Ok(())
+}
+
+/// The settings `flags`, the Node.js runtime flags as given on the command line, make, with
+/// `http_listen` from `--node-http-listen`. Returns an error naming the first flag that is unknown,
+/// rejected, or malformed.
+pub fn parse(flags: &[String], http_listen: bool) -> Result<RuntimeFlags, String> {
     let mut settings = RuntimeFlags {
         http_listen,
         exec_argv: flags.to_vec(),
@@ -119,8 +164,7 @@ pub fn set(flags: &[String], http_listen: bool) -> Result<(), String> {
     for flag in flags {
         apply(&mut settings, flag)?;
     }
-    FLAGS.with(|cell| *cell.borrow_mut() = Some(Rc::new(settings)));
-    Ok(())
+    Ok(settings)
 }
 
 /// The settings [`set`] last made, or the defaults if it wasn't called.
@@ -162,10 +206,14 @@ fn apply(settings: &mut RuntimeFlags, flag: &str) -> Result<(), String> {
         "deprecation" => switch(&mut settings.no_deprecation, false),
         "no-deprecation" => switch(&mut settings.no_deprecation, true),
         "throw-deprecation" => switch(&mut settings.throw_deprecation, true),
+        "trace-warnings" => switch(&mut settings.trace_warnings, true),
+        "trace-deprecation" => switch(&mut settings.trace_deprecation, true),
         "abort-on-uncaught-exception" => switch(&mut settings.abort_on_uncaught_exception, true),
         "experimental-stream-iter" => switch(&mut settings.experimental_stream_iter, true),
         "test-udp-no-try-send" => switch(&mut settings.test_udp_no_try_send, true),
         "insecure-http-parser" => switch(&mut settings.insecure_http_parser, true),
+        "experimental-websocket" => switch(&mut settings.experimental_websocket, true),
+        "no-experimental-websocket" => switch(&mut settings.experimental_websocket, false),
         "network-family-autoselection" => switch(&mut settings.network_family_autoselection, true),
         "no-network-family-autoselection" => {
             switch(&mut settings.network_family_autoselection, false)
@@ -182,56 +230,28 @@ fn apply(settings: &mut RuntimeFlags, flag: &str) -> Result<(), String> {
             settings.title = Some(required()?.to_string());
             Ok(())
         }
-        _ => Err(format!("Unknown Node.js runtime flag `{flag}`")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(flags: &[&str]) -> Result<RuntimeFlags, String> {
-        let mut settings = RuntimeFlags::default();
-        for flag in flags {
-            apply(&mut settings, flag)?;
+        "dns-result-order" => {
+            let value = required()?;
+            if !["verbatim", "ipv4first", "ipv6first"].contains(&value) {
+                return Err(format!(
+                    "The argument '--dns-result-order' must be one of: 'verbatim', 'ipv4first', \
+                     'ipv6first'. Received '{value}'"
+                ));
+            }
+            settings.dns_result_order = Some(value.to_string());
+            Ok(())
         }
-        Ok(settings)
-    }
-
-    #[test]
-    fn dashes_and_underscores_are_interchangeable() {
-        let settings = parse(&["--expose_gc", "--expose-internals", "--no_warnings"]).unwrap();
-        assert!(settings.expose_gc);
-        assert!(settings.expose_internals);
-        assert!(!settings.warnings);
-    }
-
-    #[test]
-    fn valued_flags_take_their_value_after_an_equals_sign() {
-        let settings = parse(&[
-            "--title=foo",
-            "--network-family-autoselection-attempt-timeout=123",
-            "--no-network-family-autoselection",
-            "--max-old-space-size=16",
-        ])
-        .unwrap();
-        assert_eq!(settings.title.as_deref(), Some("foo"));
-        assert_eq!(settings.network_family_autoselection_attempt_timeout, 123.0);
-        assert!(!settings.network_family_autoselection);
-        assert!(parse(&["--title"]).is_err());
-        assert!(parse(&["--expose-gc=1"]).is_err());
-        assert!(parse(&["--network-family-autoselection-attempt-timeout=x"]).is_err());
-    }
-
-    #[test]
-    fn unsupported_flags_are_rejected_with_a_reason() {
-        let error = parse(&["--allow-natives-syntax"]).unwrap_err();
-        assert!(error.contains("`--allow-natives-syntax`"), "{error}");
-        assert!(error.contains("intrinsics"), "{error}");
-        assert!(parse(&["--allow-fs-read=*"]).is_err());
-        assert!(parse(&["--permission"]).is_err());
-        let error = parse(&["--no-such-flag"]).unwrap_err();
-        assert_eq!(error, "Unknown Node.js runtime flag `--no-such-flag`");
-        assert!(parse(&["-r"]).is_err());
+        "unhandled-rejections" => {
+            settings.unhandled_rejections = match required()? {
+                "throw" => UnhandledRejections::Throw,
+                "strict" => UnhandledRejections::Strict,
+                "warn" => UnhandledRejections::Warn,
+                "none" => UnhandledRejections::None,
+                "warn-with-error-code" => UnhandledRejections::WarnWithErrorCode,
+                _ => return Err("invalid value for --unhandled-rejections".into()),
+            };
+            Ok(())
+        }
+        _ => Err(format!("Unknown Node.js runtime flag `{flag}`")),
     }
 }

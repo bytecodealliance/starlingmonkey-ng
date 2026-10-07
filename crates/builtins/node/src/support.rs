@@ -89,9 +89,12 @@ pub(crate) fn class_object<'s>(
     Object::from_handle(js::class::get_class_object(scope, key)?).ok_or(ExnThrown)
 }
 
+/// SpiderMonkey's `ARGS_LENGTH_MAX`, the most arguments `Reflect.apply` passes.
+const MAX_LIST_LENGTH: u32 = 500_000;
+
 /// The elements of the array-like object `value`, as `CreateListFromArrayLike` reads them for
 /// `Reflect.apply`: `value[0]` to `value[length - 1]`. Throws a `TypeError` if `value` isn't an
-/// object.
+/// object, and a `RangeError` for a `length` above SpiderMonkey's limit for `Reflect.apply`.
 pub(crate) fn list_from_array_like<'s>(
     scope: &'s Scope<'_>,
     value: HandleValue<'_>,
@@ -106,14 +109,29 @@ pub(crate) fn list_from_array_like<'s>(
     } else {
         length.min(f64::from(u32::MAX)) as u32
     };
-    (0..length)
-        .map(|index| object.get_element(scope, index))
-        .collect()
+    if length > MAX_LIST_LENGTH {
+        let message = c"too many arguments provided for a function call";
+        return Err(js::error::throw_range_error(scope, message));
+    }
+    let mut list = Vec::new();
+    if list.try_reserve_exact(length as usize).is_err() {
+        js::exception::report_out_of_memory(scope);
+        return Err(ExnThrown);
+    }
+    for index in 0..length {
+        list.push(object.get_element(scope, index)?);
+    }
+    Ok(list)
 }
 
 /// Whether `value` is `true`.
 pub(crate) fn is_true(value: HandleValue<'_>) -> bool {
     value.is_boolean() && value.to_boolean()
+}
+
+/// Whether `value` is `false`.
+pub(crate) fn is_false(value: HandleValue<'_>) -> bool {
+    value.is_boolean() && !value.to_boolean()
 }
 
 /// Whether `object[name]` is a function.
@@ -123,6 +141,14 @@ pub(crate) fn has_method(
     name: &'static CStr,
 ) -> Result<bool, ExnThrown> {
     Ok(js::function::is_callable(object.get_property(scope, name)?))
+}
+
+/// Whether `value` is an object with a `then` method.
+pub(crate) fn is_thenable(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
+    match Object::from_value(scope, value) {
+        Ok(object) => has_method(scope, object, c"then"),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Whether `object[name]` is truthy.
@@ -156,9 +182,9 @@ pub(crate) fn rust_string(scope: &Scope<'_>, value: HandleValue<'_>) -> Option<S
         .flatten()
 }
 
-/// Call `callee` with `args` and an undefined `this`, and report an exception it throws as
-/// uncaught in a microtask, as Node.js reports an exception a callback throws. Returns the result
-/// if the call completed.
+/// Call `callee` with `args` and an undefined `this`, and rethrow an exception it throws in the
+/// tick queue, as Node.js's `process.nextTick(() => { throw err; })` reports it as uncaught.
+/// Returns the result if the call completed.
 pub(crate) fn call_reporting<'s>(
     scope: &'s Scope<'_>,
     callee: impl ToJSVal<'s>,
@@ -168,19 +194,20 @@ pub(crate) fn call_reporting<'s>(
         Ok(result) => Ok(Some(result)),
         Err(ExnThrown) => {
             let error = js::exception::take_pending_or_undefined(scope);
-            core_runtime::event_loop::timer::rethrow_in_microtask(scope, error)?;
+            js::jobs::queue_native_tick(scope, throw_in_tick, error, &[])?;
             Ok(None)
         }
     }
 }
 
-/// A function that does nothing, the same one for every caller in a global.
-pub(crate) fn noop_function<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    shared_function(scope, noop, 0)
+/// A function named `nop` that does nothing, Node.js's `nop`, the same one for every caller in a
+/// global.
+pub(crate) fn nop<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+    shared_named_function(scope, nop_body, c"nop", 0)
 }
 
-/// The body of [`noop_function`].
-fn noop(
+/// The body of [`nop`].
+fn nop_body(
     _scope: &Scope<'_>,
     _args: js::function::CallbackArgs<'_>,
     _payload: HandleValue,
@@ -196,7 +223,7 @@ fn emit_tick(
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let emitter = js::function::cast_payload::<js::Object>(scope, payload);
-    let values: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+    let values: Vec<HandleValue<'_>> = args.rest(0);
     js::Function::call_by_name(scope, emitter.handle(), c"emit", &values)?;
     Ok(js::value::undefined())
 }
@@ -238,7 +265,7 @@ pub(crate) fn shared_named_function<'s>(
     Ok(*function)
 }
 
-/// `value` as an array, if it is one.
+/// `value` as an array, if it is an `Array` object.
 pub(crate) fn as_array<'s>(scope: &'s Scope<'_>, value: HandleValue<'_>) -> Option<js::Array<'s>> {
     Object::from_value(scope, *value)
         .ok()?
@@ -246,21 +273,16 @@ pub(crate) fn as_array<'s>(scope: &'s Scope<'_>, value: HandleValue<'_>) -> Opti
         .ok()
 }
 
-/// The elements of `value`, read by index up to its `length`, if `Array.isArray` accepts it.
+/// The elements of `value`, if it is an `Array` object, read as [`list_from_array_like`] reads
+/// them, which throws a `RangeError` for a length above SpiderMonkey's limit for `Reflect.apply`.
 pub(crate) fn array_elements<'s>(
     scope: &'s Scope<'_>,
     value: HandleValue<'_>,
 ) -> Result<Option<Vec<HandleValue<'s>>>, ExnThrown> {
-    if !js::Array::is_array_value(scope, value)? {
+    if as_array(scope, value).is_none() {
         return Ok(None);
     }
-    let array = Object::from_value(scope, *value).map_err(|e| e.throw(scope))?;
-    let length = array.get_property(scope, c"length")?;
-    let length = f64::from_jsval_throwing(scope, length, ())? as u32;
-    let elements = (0..length)
-        .map(|index| array.get_element(scope, index))
-        .collect::<Result<_, _>>()?;
-    Ok(Some(elements))
+    list_from_array_like(scope, value).map(Some)
 }
 
 /// The bytes of a written chunk, a string in `encoding` or an `ArrayBufferView`, and its length as
@@ -276,14 +298,9 @@ pub(crate) fn chunk_bytes(
         let encoding = encoding.filter(|encoding| encoding.is_string());
         let parsed = match encoding {
             Some(name) => {
-                let name = String::from_jsval(scope, name, ())?;
-                crate::buffer::Encoding::parse(&name).ok_or_else(|| {
-                    crate::errors::NodeError::new(
-                        crate::errors::ErrorKind::TypeError,
-                        "ERR_UNKNOWN_ENCODING",
-                        format!("Unknown encoding: {name}"),
-                    )
-                })?
+                let text = js::JSString::from_value(scope, name)?;
+                crate::buffer::Encoding::from_js(scope, text)?
+                    .ok_or_else(|| crate::buffer::unknown_encoding(scope, name))?
             }
             None => crate::buffer::Encoding::default(),
         };
@@ -295,10 +312,10 @@ pub(crate) fn chunk_bytes(
         };
         return Ok(Some((bytes, length)));
     }
-    let Some(view) = Object::from_value(scope, *chunk)
+    let view = Object::from_value(scope, *chunk)
         .ok()
-        .and_then(js::ArrayBufferView::from_object)
-    else {
+        .and_then(js::ArrayBufferView::from_object);
+    let Some(view) = view else {
         return Ok(None);
     };
     let bytes = view.copy_bytes(scope)?;
@@ -453,7 +470,8 @@ where
     Ok(canceller)
 }
 
-/// The output of `future`, or `None` once `cancelled` completes first.
+/// The output of `future`, or `None` once `cancelled` completes first. Each poll checks
+/// `cancelled` before `future`, so `future` isn't polled after the cancellation.
 pub(crate) async fn until_cancelled<O>(
     cancelled: Cancelled,
     future: impl std::future::Future<Output = O>,
@@ -462,7 +480,7 @@ pub(crate) async fn until_cancelled<O>(
         let _ = cancelled.await;
         None
     };
-    futures_lite::future::or(async { Some(future.await) }, cancel).await
+    futures_lite::future::or(cancel, async { Some(future.await) }).await
 }
 
 /// Call `callback` with `args` in the tick queue, if it is a function.
@@ -496,4 +514,92 @@ pub(crate) fn try_filled_vec<T: Clone + Default>(length: usize) -> Option<Vec<T>
     vec.try_reserve_exact(length).ok()?;
     vec.resize(length, T::default());
     Some(vec)
+}
+
+/// The items of `items` in a new `Vec`, or `None` if allocating it fails.
+pub(crate) fn try_collect<T>(items: impl IntoIterator<Item = T>) -> Option<Vec<T>> {
+    let mut vec = Vec::new();
+    try_extend(&mut vec, items)?;
+    Some(vec)
+}
+
+/// Append the items of `items` to `vec`, or return `None` if allocating room for them fails.
+/// Items appended before the failure stay in `vec`.
+pub(crate) fn try_extend<T>(vec: &mut Vec<T>, items: impl IntoIterator<Item = T>) -> Option<()> {
+    let items = items.into_iter();
+    vec.try_reserve(items.size_hint().0).ok()?;
+    for item in items {
+        if vec.len() == vec.capacity() {
+            vec.try_reserve(1).ok()?;
+        }
+        vec.push(item);
+    }
+    Some(())
+}
+
+/// The value of hex digit `unit`, if it is one.
+pub(crate) fn hex_digit(unit: u16) -> Option<u8> {
+    char::from_u32(u32::from(unit))
+        .and_then(|c| c.to_digit(16))
+        .map(|digit| digit as u8)
+}
+
+/// The errors of [`decode_uri_component`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DecodeUriError {
+    /// A malformed escape or invalid UTF-8, where `decodeURIComponent` throws a `URIError`.
+    Malformed,
+    /// Allocating the decoded code units failed.
+    OutOfMemory,
+}
+
+/// JS's `decodeURIComponent` of the UTF-16 code units `units`: each `%XX` escape sequence of a
+/// UTF-8 encoded code point replaced by the code point.
+pub(crate) fn decode_uri_component(units: &[u16]) -> Result<Vec<u16>, DecodeUriError> {
+    use DecodeUriError::Malformed;
+    let byte_at = |index: usize| -> Option<u8> {
+        if units.get(index) != Some(&u16::from(b'%')) {
+            return None;
+        }
+        Some(hex_digit(*units.get(index + 1)?)? * 16 + hex_digit(*units.get(index + 2)?)?)
+    };
+    // The decoded text is never longer than `units`, so nothing below reallocates.
+    let mut out = Vec::new();
+    out.try_reserve_exact(units.len())
+        .map_err(|_| DecodeUriError::OutOfMemory)?;
+    let mut index = 0;
+    while index < units.len() {
+        if units[index] != u16::from(b'%') {
+            out.push(units[index]);
+            index += 1;
+            continue;
+        }
+        let lead = byte_at(index).ok_or(Malformed)?;
+        index += 3;
+        if lead < 0x80 {
+            out.push(u16::from(lead));
+            continue;
+        }
+        let length = match lead {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => return Err(Malformed),
+        };
+        let mut bytes = [lead, 0, 0, 0];
+        for byte in &mut bytes[1..length] {
+            *byte = byte_at(index).ok_or(Malformed)?;
+            if *byte & 0xc0 != 0x80 {
+                return Err(Malformed);
+            }
+            index += 3;
+        }
+        let c = std::str::from_utf8(&bytes[..length])
+            .ok()
+            .and_then(|text| text.chars().next())
+            .ok_or(Malformed)?;
+        let mut buffer = [0u16; 2];
+        out.extend_from_slice(c.encode_utf16(&mut buffer));
+    }
+    Ok(out)
 }

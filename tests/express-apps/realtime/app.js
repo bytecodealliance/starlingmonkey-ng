@@ -18,6 +18,8 @@ const errors = [];
 const bus = new EventEmitter();
 bus.setMaxListeners(100);
 let seq = 0;
+// The number of long polls waiting for a message.
+let polling = 0;
 
 function post(room, from, text) {
   const message = { seq: ++seq, room, from, text };
@@ -44,6 +46,7 @@ app.get('/rooms/:room/poll', async (req, res) => {
   const timeout = Number(req.query.timeout || 1000);
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeout);
+  polling += 1;
   try {
     for (;;) {
       const [message] = await once(bus, 'message', { signal: ac.signal });
@@ -54,10 +57,12 @@ app.get('/rooms/:room/poll', async (req, res) => {
     }
   } catch {
     res.status(204).end();
+  } finally {
+    polling -= 1;
   }
 });
 app.get('/stats', (req, res) => {
-  res.json({ clients: wss.clients.size, messages: history.length, errors });
+  res.json({ clients: wss.clients.size, messages: history.length, polling, errors });
 });
 
 const server = http.createServer(app);

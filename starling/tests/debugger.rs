@@ -899,6 +899,60 @@ fn remote_root_maps_client_paths() {
     assert_eq!(dap.run_to_end().output, "mapped\n");
 }
 
+#[test]
+fn process_exit_ends_the_session_with_its_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_script(
+        dir.path(),
+        "main.js",
+        &["console.log('done');", "process.exit(3);"],
+    );
+    let mut dap = Dap::spawn_with_args(&["--node-compat", script.to_str().unwrap()]);
+    dap.start(json!({}));
+    dap.request("configurationDone", json!({}));
+    let finished = dap.run_to_end();
+    assert_eq!(finished.output, "done\n");
+    assert_eq!(finished.exit_code, Some(3));
+    assert_eq!(finished.status.code(), Some(3));
+}
+
+#[test]
+fn exited_reports_process_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_script(dir.path(), "main.js", &["process.exitCode = 4;"]);
+    let mut dap = Dap::spawn_with_args(&["--node-compat", script.to_str().unwrap()]);
+    dap.start(json!({}));
+    dap.request("configurationDone", json!({}));
+    let finished = dap.run_to_end();
+    assert_eq!(finished.exit_code, Some(4));
+    assert_eq!(finished.status.code(), Some(4));
+}
+
+#[test]
+fn a_child_process_holding_the_captured_stdio_does_not_delay_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_script(
+        dir.path(),
+        "main.js",
+        &[
+            "const { spawn } = require('node:child_process');",
+            "spawn('sh', ['-c', 'sleep 60'], { stdio: 'inherit', detached: true }).unref();",
+            "console.log('spawned');",
+        ],
+    );
+    let mut dap = Dap::spawn_with_args(&["--node-compat", script.to_str().unwrap()]);
+    dap.start(json!({}));
+    dap.request("configurationDone", json!({}));
+    let start = std::time::Instant::now();
+    let finished = dap.run_to_end();
+    assert_eq!(finished.output, "spawned\n");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
 /// The variable named `name` in the body of a `variables` response.
 fn variable<'a>(variables: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
     variables["variables"]
@@ -1105,33 +1159,4 @@ fn zero_based_lines_and_columns_are_converted() {
     assert_eq!(locations["breakpoints"][0]["line"], 1, "{locations}");
     dap.request("continue", json!({ "threadId": 1 }));
     assert_eq!(dap.run_to_end().output, "1\n");
-}
-
-#[test]
-fn process_exit_ends_the_session_with_its_exit_code() {
-    let dir = tempfile::tempdir().unwrap();
-    let script = write_script(
-        dir.path(),
-        "main.js",
-        &["console.log('done');", "process.exit(3);"],
-    );
-    let mut dap = Dap::spawn_with_args(&["--node-compat", script.to_str().unwrap()]);
-    dap.start(json!({}));
-    dap.request("configurationDone", json!({}));
-    let finished = dap.run_to_end();
-    assert_eq!(finished.output, "done\n");
-    assert_eq!(finished.exit_code, Some(3));
-    assert_eq!(finished.status.code(), Some(3));
-}
-
-#[test]
-fn exited_reports_process_exit_code() {
-    let dir = tempfile::tempdir().unwrap();
-    let script = write_script(dir.path(), "main.js", &["process.exitCode = 4;"]);
-    let mut dap = Dap::spawn_with_args(&["--node-compat", script.to_str().unwrap()]);
-    dap.start(json!({}));
-    dap.request("configurationDone", json!({}));
-    let finished = dap.run_to_end();
-    assert_eq!(finished.exit_code, Some(4));
-    assert_eq!(finished.status.code(), Some(4));
 }

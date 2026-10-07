@@ -30,9 +30,9 @@
 //
 // tests.txt lists the tests to run, as file name globs, and the tests to leave out, as globs with a
 // leading `!`. Tests whose source shows that they need something the runtime can't provide are
-// skipped without running, with the reason recorded: runtime flags the runtime rejects, child
-// processes, workers, `cluster` or `inspector`. The runtime gets the other flags of a test's
-// `// Flags:` line with `--allow-node-runtime-flags`.
+// skipped without running, with the reason recorded: runtime flags the runtime doesn't accept,
+// workers, `cluster` or `inspector`, and on wasm, which can't spawn processes, child processes. The
+// runtime gets the other flags of a test's `// Flags:` line with `--allow-node-runtime-flags`.
 //
 // `--target=deno` and `--target=bun` run the tests under Deno or Bun, as
 // scripts/fetch-other-runtimes.sh downloads them, without the tests' runtime flags. These runs are
@@ -66,28 +66,52 @@ const TEMP_ROOT = "/tmp";
 
 /** The reasons to skip a test without running it, by a pattern its source matches. */
 const SKIP_PATTERNS = [
-  [/require\(['"](node:)?child_process['"]\)/, "spawns child processes"],
   [/require\(['"](node:)?cluster['"]\)/, "uses cluster"],
   [/new Worker\(|require\(['"](node:)?worker_threads['"]\)/, "uses worker threads"],
   [/require\(['"](node:)?inspector(\/promises)?['"]\)/, "uses the inspector"],
+];
+
+/** The reasons to skip a test on wasm, where processes can't be spawned, by a pattern its source matches. */
+const WASM_SKIP_PATTERNS = [
+  [/require\(['"](node:)?child_process['"]\)/, "spawns child processes"],
   [/common\.spawnPromisified|common\.childShouldThrowAndAbort|spawnSyncAndExit/, "spawns child processes"],
 ];
 
 /**
- * The Node.js runtime flags the runtime rejects, by name with dashes. A test whose `// Flags:`
- * line has one is skipped. The runtime gets the other flags with `--allow-node-runtime-flags`.
- * `REJECTED` in `crates/builtins/node/src/runtime_flags.rs` lists the same flags.
+ * The Node.js runtime flags the runtime accepts, by name with dashes. A test whose `// Flags:` line
+ * has another flag is skipped, since the runtime would exit before running it. The runtime gets
+ * the flags with `--allow-node-runtime-flags`. `apply` and `IGNORED` in
+ * `crates/builtins/node/src/runtime_flags.rs` accept the same flags, which
+ * `crates/builtins/node/tests/runtime_flags.rs` checks.
  */
-const UNSUPPORTED_FLAGS = [
-  "allow-natives-syntax",
-  "expose-externalize-string",
-  "permission",
-  "allow-fs-read",
-  "allow-fs-write",
-  "allow-child-process",
-  "allow-worker",
-  "allow-addons",
-  "allow-wasi",
+const SUPPORTED_FLAGS = [
+  "abort-on-uncaught-exception",
+  "deprecation",
+  "dns-result-order",
+  "experimental-stream-iter",
+  "experimental-vm-modules",
+  "experimental-websocket",
+  "expose-gc",
+  "expose-internals",
+  "insecure-http-parser",
+  "max-old-space-size",
+  "max-semi-space-size",
+  "network-family-autoselection",
+  "network-family-autoselection-attempt-timeout",
+  "no-concurrent-array-buffer-sweeping",
+  "no-deprecation",
+  "no-experimental-websocket",
+  "no-network-family-autoselection",
+  "no-warnings",
+  "pending-deprecation",
+  "test-udp-no-try-send",
+  "throw-deprecation",
+  "title",
+  "trace-deprecation",
+  "trace-warnings",
+  "unhandled-rejections",
+  "warnings",
+  "zero-fill-buffers",
 ];
 
 /** The flags of the `// Flags:` line in `source`, as test/common reads them. */
@@ -199,9 +223,10 @@ function selectTests(config) {
 /** The reason to skip `file` without running it, or `null`. */
 function skipReason(config, file) {
   const source = readFileSync(path.join(config.nodeRoot, "test/parallel", file), "utf8");
-  const unsupported = testFlags(source).find((flag) => UNSUPPORTED_FLAGS.includes(flagName(flag)));
+  const unsupported = testFlags(source).find((flag) => !SUPPORTED_FLAGS.includes(flagName(flag)));
   if (unsupported) return `needs the unsupported runtime flag ${unsupported}`;
-  for (const [pattern, reason] of SKIP_PATTERNS) {
+  const patterns = config.target === "wasm" ? [...SKIP_PATTERNS, ...WASM_SKIP_PATTERNS] : SKIP_PATTERNS;
+  for (const [pattern, reason] of patterns) {
     if (pattern.test(source)) return reason;
   }
   return null;
@@ -249,6 +274,17 @@ function command(config, file, env) {
   };
 }
 
+/** The process groups of the tests running, which an interrupt of the harness ends. */
+const runningGroups = new Set();
+process.on("SIGINT", () => {
+  for (const pid of runningGroups) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {}
+  }
+  process.exit(130);
+});
+
 /** Run `file`, and resolve with its status and output. */
 function runTest(config, file) {
   const testDir = mkdtempSync(path.join(TEMP_ROOT, "starling-node-test-"));
@@ -259,16 +295,26 @@ function runTest(config, file) {
   };
   const { command: program, args, env: processEnv } = command(config, file, env);
   return new Promise((resolve) => {
-    const child = spawn(program, args, { cwd: config.nodeRoot, env: processEnv });
+    // The test leads a process group, so the processes it spawned and left running, which keep its
+    // output pipes open, end with it.
+    const child = spawn(program, args, { cwd: config.nodeRoot, env: processEnv, detached: true });
+    runningGroups.add(child.pid);
+    const killGroup = () => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    };
     let output = "";
     child.stdout.on("data", (data) => (output += data));
     child.stderr.on("data", (data) => (output += data));
+    child.on("exit", killGroup);
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killGroup();
       output += `\n[timed out after ${config.timeout} ms]`;
     }, config.timeout);
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      runningGroups.delete(child.pid);
       if (signal && !output.includes("[timed out after")) output += `\n[killed by ${signal}]`;
       rmSync(testDir, { recursive: true, force: true });
       // A test that skips exits with status 0 after printing the skip line.

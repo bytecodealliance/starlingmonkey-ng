@@ -15,13 +15,28 @@ fn assert() {
 }
 
 #[test]
+fn assert_strict() {
+    run_js("assert_strict.mjs");
+}
+
+#[test]
 fn async_hooks() {
     run_js("async_hooks.mjs");
 }
 
 #[test]
+fn domain() {
+    run_js("domain.mjs");
+}
+
+#[test]
 fn buffer() {
     run_js("buffer.mjs");
+}
+
+#[test]
+fn child_process() {
+    run_js("child_process.mjs");
 }
 
 #[test]
@@ -116,6 +131,18 @@ fn perf_hooks_gc() {
 #[test]
 fn process() {
     run_js("process.mjs");
+}
+
+#[test]
+fn unhandled_rejections() {
+    run_js_with_flags(
+        "unhandled_rejections.mjs",
+        &[
+            "--allow-node-runtime-flags",
+            "--no-warnings",
+            "--unhandled-rejections=warn",
+        ],
+    );
 }
 
 #[test]

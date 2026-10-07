@@ -203,6 +203,9 @@ for (const fn of ["join", "resolve", "normalize", "isAbsolute", "relative", "dir
 const error = throws(() => path.basename(null), "ERR_INVALID_ARG_TYPE");
 eq(error instanceof TypeError, true, "ERR_INVALID_ARG_TYPE is a TypeError");
 eq(error.message, 'The "path" argument must be of type string. Received null', "error message");
+eq(path.resolve(1, "/a"), "/a", "resolve ignores the arguments left of an absolute path");
+eq(throws(() => path.resolve(1, 2), "ERR_INVALID_ARG_TYPE").message.slice(0, 14), 'The "paths[1]"', "resolve validates from the right");
+eq(throws(() => path.join("a", 1), "ERR_INVALID_ARG_TYPE").message.slice(0, 10), 'The "path"', "join names each argument path");
 
 // Globs, matched as minimatch matches them.
 const nocase = process.platform === "darwin" || process.platform === "win32";
@@ -241,3 +244,13 @@ throws(() => path.matchesGlob(1, "a"), "ERR_INVALID_ARG_TYPE", "matchesGlob vali
 throws(() => path.matchesGlob("a"), "ERR_INVALID_ARG_TYPE", "matchesGlob validates the pattern");
 throws(() => path.matchesGlob("a", "{a,".repeat(16000) + "b" + "}".repeat(16000)), RangeError, "deep braces");
 throws(() => path.matchesGlob("a", "+(".repeat(5000) + "a" + ")".repeat(5000)), RangeError, "deep extglobs");
+
+// The module's key order and `_makeLong` follow Node's `lib/path.js`.
+eq(
+  Object.keys(path).join(),
+  "resolve,normalize,isAbsolute,join,relative,toNamespacedPath,dirname,basename,extname,format,parse,matchesGlob,sep,delimiter,win32,posix,_makeLong",
+  "key order",
+);
+eq(path._makeLong, path.toNamespacedPath, "_makeLong is toNamespacedPath");
+throws(() => path.format([]), "ERR_INVALID_ARG_TYPE", "format rejects arrays");
+throws(() => path.format(() => {}), "ERR_INVALID_ARG_TYPE", "format rejects functions");

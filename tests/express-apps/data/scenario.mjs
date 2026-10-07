@@ -16,7 +16,9 @@ export async function setup() {
   };
 }
 
-async function readEvents(res) {
+// Reads an event stream to its end, and calls `onSubscribed` once the stream has the `subscribed`
+// comment.
+async function readEvents(res, onSubscribed) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let text = '';
@@ -24,6 +26,10 @@ async function readEvents(res) {
     const { done, value } = await reader.read();
     if (done) break;
     text += decoder.decode(value, { stream: true });
+    if (onSubscribed && text.includes('\n: subscribed\n')) {
+      onSubscribed();
+      onSubscribed = null;
+    }
   }
   return text;
 }
@@ -41,9 +47,11 @@ export default async function (t) {
   await t.request('DELETE', '/posts/2', { headers: id(4), name: 'again' });
   await t.get('/db-file', { headers: id(5) });
 
-  // Server-sent events while posts are created concurrently.
-  const sse = t.get('/events?limit=6', { headers: id(30), stream: readEvents, slot: true });
-  await new Promise((r) => setTimeout(r, 100));
+  // Server-sent events while posts are created concurrently, after the server subscribed to them.
+  let subscribed;
+  const ready = new Promise((r) => (subscribed = r));
+  const sse = t.get('/events?limit=6', { headers: id(30), stream: (res) => readEvents(res, subscribed), slot: true });
+  await Promise.race([ready, sse]);
   await t.post('/posts', { json: { title: 'Live 1' }, headers: id(31) });
   await t.post('/posts', { json: { title: 'Live 2' }, headers: id(32) });
   await t.post('/posts', { json: { title: 'Live 3' }, headers: id(33) });

@@ -132,7 +132,7 @@ fn write_formatted(
     args: CallbackArgs<'_>,
     stream: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let arguments = crate::callback_args(&args);
+    let arguments = args.rest(0);
     let text = crate::inspect::format_current(scope, &arguments)?;
     write_line(scope, stream, &text)
 }
@@ -170,7 +170,7 @@ fn formatted(
     args: CallbackArgs<'_>,
     original: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let arguments = crate::callback_args(&args);
+    let arguments = args.rest(0);
     let text = crate::inspect::format_current(scope, &arguments)?;
     let this = scope.root_value(args.this());
     Function::call(
@@ -207,7 +207,7 @@ fn assert(scope: &Scope<'_>, args: CallbackArgs<'_>, _: HandleValue) -> Result<V
     if js::conversion::to_boolean(args.get(0)) {
         return Ok(js::value::undefined());
     }
-    let mut arguments = crate::callback_args(&args);
+    let mut arguments = args.rest(0);
     if !arguments.is_empty() {
         arguments.remove(0);
     }

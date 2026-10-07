@@ -400,14 +400,14 @@ fn web_chunk(
     message: Object<'_>,
     chunk: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let bytes = Object::from_value(scope, *chunk)
+    let view = Object::from_value(scope, *chunk)
         .ok()
-        .and_then(js::ArrayBufferView::from_object)
-        .map(|view| view.copy_bytes(scope))
-        .transpose()?
-        .unwrap_or_default();
-    let buffer = new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?;
-    push(scope, message, buffer)
+        .and_then(js::ArrayBufferView::from_object);
+    let buffer = match view {
+        Some(view) => crate::buffer::copy_of_view(scope, view)?,
+        None => new_buffer(scope, &[])?,
+    };
+    push(scope, message, buffer.to_jsval_throwing(scope)?)
 }
 
 /// End `message` at the end of the body stream of a served request.
@@ -425,6 +425,16 @@ fn web_error(
     Ok(())
 }
 
+/// `name` in ASCII lowercase, borrowed if it is lowercase already, as the names the host reports
+/// are.
+fn lowercase(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
 /// Build the value of `headers` or `trailers` from `lines`, as Node.js's `_addHeaderLine`
 /// does: duplicates of single-valued headers are dropped unless `join`, `set-cookie` values are
 /// collected in an array, `cookie` values are joined with `; `, and other values with `, `.
@@ -433,12 +443,12 @@ fn headers_object<'s>(
     lines: &[(String, String)],
     join: bool,
 ) -> Result<Object<'s>, ExnThrown> {
-    let mut joined: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut joined: Vec<(std::borrow::Cow<'_, str>, Vec<&str>)> = Vec::new();
     for (name, value) in lines {
-        let lower = name.to_ascii_lowercase();
+        let lower = lowercase(name);
         match joined.iter_mut().find(|(name, _)| *name == lower) {
             Some((_, values))
-                if join || lower == "set-cookie" || !SINGLE_VALUED.contains(&lower.as_str()) =>
+                if join || lower == "set-cookie" || !SINGLE_VALUED.contains(&&*lower) =>
             {
                 values.push(value)
             }
@@ -470,9 +480,9 @@ fn distinct_object<'s>(
     scope: &'s Scope<'_>,
     lines: &[(String, String)],
 ) -> Result<Object<'s>, ExnThrown> {
-    let mut grouped: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut grouped: Vec<(std::borrow::Cow<'_, str>, Vec<&str>)> = Vec::new();
     for (name, value) in lines {
-        let lower = name.to_ascii_lowercase();
+        let lower = lowercase(name);
         match grouped.iter_mut().find(|(name, _)| *name == lower) {
             Some((_, values)) => values.push(value),
             None => grouped.push((lower, vec![value])),
@@ -650,10 +660,15 @@ unsafe fn init_message<'w>(
     init: PropertyInit,
 ) -> Result<(), Thrown> {
     let socket_object = Object::from_value(scope, *socket).ok();
-    // The high water mark of a socket of this crate is read from its state.
+    // The high water mark of a socket of this crate is read from its state. A host socket has no
+    // `readableHighWaterMark`, so its messages get the default.
     let socket_mark = match (init, socket_object) {
         (PropertyInit::Define, Some(socket)) => {
-            ReadableSide::try_of(scope, socket)?.map(|side| side.high_water_mark())
+            if socket.cast::<super::host_socket::HostSocket>().is_ok() {
+                Some(crate::stream::state::default_high_water_mark(false))
+            } else {
+                ReadableSide::try_of(scope, socket)?.map(|side| side.high_water_mark())
+            }
         }
         _ => None,
     };

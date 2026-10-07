@@ -4,7 +4,8 @@
 // which runs in Node.js and in StarlingMonkey. `__op` runs one operation and writes its result or
 // error as a line of the trace, and `__log` writes a line for the running operation. The trace
 // ends with a `done` line. Values are serialized by `__serialize`, which avoids `util.inspect` so
-// that differences in inspection don't hide the behavior under test.
+// that differences in inspection don't hide the behavior under test. An object's properties are
+// serialized in `Object.keys` order.
 //
 // Each operation gets its own directory, `__dir()`, under the directory `NODE_DIFF_DIR` names.
 
@@ -64,7 +65,7 @@ function __serialize(value, depth = 0, seen = new Set()) {
     if (Array.isArray(value)) return `[${value.map((v) => __serialize(v, depth + 1, seen)).join(", ")}]`;
     const proto = Object.getPrototypeOf(value);
     const name = proto === null ? "null-proto" : proto === Object.prototype ? "" : (proto.constructor?.name ?? "?");
-    const keys = Object.keys(value).sort();
+    const keys = Object.keys(value);
     return `${name}{${keys.map((key) => `${JSON.stringify(key)}: ${__serialize(value[key], depth + 1, seen)}`).join(", ")}}`;
   } finally {
     seen.delete(value);

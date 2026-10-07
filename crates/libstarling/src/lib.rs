@@ -57,7 +57,9 @@ pub fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), Strin
     }
     if config.node_compat {
         node_builtins::runtime_flags::set(&config.node_runtime_flags, config.node_http_listen)?;
+        node_builtins::child_process::set_runtime_options_variable();
         node_builtins::process::set_script_args(&config.script_args);
+        node_builtins::set_print_eval(config.print_eval);
         node_builtins::register();
         cpp_builtins::set_console_level_prefixes(false);
         web_globals::messaging::set_node_ports(true);

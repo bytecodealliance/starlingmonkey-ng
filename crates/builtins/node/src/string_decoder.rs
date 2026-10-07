@@ -17,73 +17,31 @@ use js::native::Value;
 use js::prelude::HandleValue;
 use js::{ArrayBufferView, Object};
 
-use crate::buffer::{hex_digits, Encoding};
-use crate::errors::{ErrorKind, NodeError, Thrown};
-use web_globals::base64::encode as encode_base64;
+use crate::buffer::{decode_bytes, Encoding};
+use crate::errors::{NodeError, Thrown};
 
 /// The size of the buffer for an incomplete character or base64 group.
 const INCOMPLETE_LENGTH: usize = 4;
 
-/// `bytes` decoded as `encoding`, as UTF-16 code units. Invalid UTF-8 decodes as replacement
-/// characters.
-fn decode_units(bytes: &[u8], encoding: Encoding) -> Vec<u16> {
-    match encoding {
-        Encoding::Utf8 => String::from_utf8_lossy(bytes).encode_utf16().collect(),
-        Encoding::Utf16le => bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u16::from_le_bytes(*pair))
-            .collect(),
-        Encoding::Latin1 => bytes.iter().map(|byte| u16::from(*byte)).collect(),
-        Encoding::Ascii => bytes.iter().map(|byte| u16::from(byte & 0x7f)).collect(),
-        Encoding::Base64 | Encoding::Base64Url => {
-            encode_base64(bytes, encoding == Encoding::Base64Url)
-                .expect("allocating the base64 text succeeds")
-                .encode_utf16()
-                .collect()
-        }
-        Encoding::Hex => hex_digits(bytes).into_iter().map(u16::from).collect(),
-    }
-}
-
-/// The text of a chunk a decoder decoded: the characters completed from earlier chunks, followed
-/// by the complete characters of the chunk's bytes `body`.
-struct Decoded<'d> {
-    prepend: Vec<u16>,
+/// The text of a chunk a decoder decoded: the characters completed from earlier chunks, whose bytes
+/// are the first `completed_length` of `completed`, followed by the complete characters of the
+/// chunk's bytes `body`.
+pub(crate) struct Decoded<'d> {
+    completed: [u8; INCOMPLETE_LENGTH],
+    completed_length: usize,
     body: &'d [u8],
     encoding: Encoding,
 }
 
 impl Decoded<'_> {
-    /// The text as UTF-16 code units.
-    fn into_units(self) -> Vec<u16> {
-        let mut units = self.prepend;
-        units.extend(decode_units(self.body, self.encoding));
-        units
-    }
-
-    /// The text as a JS string. For UTF-8, Latin-1, ASCII, hex and base64, text without characters
-    /// completed from earlier chunks is created without an intermediate UTF-16 copy.
+    /// The text as a JS string, decoded as [`crate::buffer::decode_bytes`] decodes bytes.
     fn into_js_string<'s>(self, scope: &'s Scope<'_>) -> Result<js::JSString<'s>, ExnThrown> {
-        if !self.prepend.is_empty() {
-            return js::JSString::from_utf16(scope, &self.into_units());
+        let body = decode_bytes(scope, self.body, self.encoding)?;
+        if self.completed_length == 0 {
+            return Ok(body);
         }
-        match self.encoding {
-            Encoding::Utf8 => js::JSString::from_utf8_lossy(scope, self.body),
-            Encoding::Latin1 => js::JSString::from_latin1(scope, self.body),
-            Encoding::Ascii if self.body.is_ascii() => js::JSString::from_latin1(scope, self.body),
-            Encoding::Hex => js::JSString::from_latin1(scope, &hex_digits(self.body)),
-            Encoding::Base64 | Encoding::Base64Url => {
-                let url = self.encoding == Encoding::Base64Url;
-                let Some(text) = encode_base64(self.body, url) else {
-                    js::exception::report_out_of_memory(scope);
-                    return Err(ExnThrown);
-                };
-                js::JSString::from_str(scope, &text)
-            }
-            _ => js::JSString::from_utf16(scope, &decode_units(self.body, self.encoding)),
-        }
+        let completed = &self.completed[..self.completed_length];
+        decode_bytes(scope, completed, self.encoding)?.concat(scope, body)
     }
 }
 
@@ -98,6 +56,26 @@ fn encoding_name(encoding: Encoding) -> &'static str {
         Encoding::Base64Url => "base64url",
         Encoding::Hex => "hex",
     }
+}
+
+/// `StringDecoder.prototype.write(chunk)` with the decoder `decode`: a string is returned as it is,
+/// and the bytes of a `Buffer`, typed array or `DataView` are decoded with `decode`.
+pub(crate) fn write_chunk<'s, F>(
+    scope: &'s Scope<'_>,
+    chunk: HandleValue<'_>,
+    decode: F,
+) -> Result<js::JSString<'s>, Thrown>
+where
+    F: for<'d> FnOnce(&'d [u8]) -> Decoded<'d>,
+{
+    if chunk.is_string() {
+        return Ok(js::JSString::from_value(scope, *chunk)?);
+    }
+    let view = chunk_view(scope, chunk)?;
+    // Creating the string can GC and move the data of a small buffer, so the string is created
+    // from a copy.
+    let bytes = view.copy_bytes(scope)?;
+    Ok(decode(&bytes).into_js_string(scope)?)
 }
 
 /// The `write` or `end` argument `value` as a `Buffer`, a typed array or a `DataView`.
@@ -137,24 +115,20 @@ pub struct NativeDecoder {
 impl NativeDecoderImpl {
     /// Node.js's `StringDecoder::DecodeData`: decode `data`, after the bytes held back from the
     /// previous chunk, and buffer the bytes of an incomplete character or group at its end.
-    pub(crate) fn decode(&mut self, data: &[u8]) -> Vec<u16> {
-        self.decode_chunk(data).into_units()
-    }
-
-    /// [`decode`](Self::decode), as a [`Decoded`] that borrows the chunk's complete characters.
-    fn decode_chunk<'d>(&mut self, mut data: &'d [u8]) -> Decoded<'d> {
+    pub(crate) fn decode_chunk<'d>(&mut self, mut data: &'d [u8]) -> Decoded<'d> {
         let encoding = self.encoding;
         if !matches!(
             encoding,
             Encoding::Utf8 | Encoding::Utf16le | Encoding::Base64 | Encoding::Base64Url
         ) {
             return Decoded {
-                prepend: Vec::new(),
+                completed: [0; INCOMPLETE_LENGTH],
+                completed_length: 0,
                 body: data,
                 encoding,
             };
         }
-        let mut prepend = None;
+        let mut completed = ([0; INCOMPLETE_LENGTH], 0);
         if self.missing > 0 {
             if encoding == Encoding::Utf8 {
                 // A byte that isn't a continuation byte ends the incomplete character early, and
@@ -174,13 +148,14 @@ impl NativeDecoderImpl {
             self.missing -= found;
             self.buffered += found;
             if self.missing == 0 {
-                prepend = Some(decode_units(&self.incomplete[..self.buffered], encoding));
+                completed = (self.incomplete, self.buffered);
                 self.buffered = 0;
             }
         }
         if data.is_empty() {
             return Decoded {
-                prepend: prepend.unwrap_or_default(),
+                completed: completed.0,
+                completed_length: completed.1,
                 body: data,
                 encoding,
             };
@@ -237,23 +212,24 @@ impl NativeDecoderImpl {
         let complete = length - self.buffered;
         self.incomplete[..self.buffered].copy_from_slice(&data[complete..]);
         Decoded {
-            prepend: prepend.unwrap_or_default(),
+            completed: completed.0,
+            completed_length: completed.1,
             body: &data[..complete],
             encoding,
         }
     }
 
-    /// Node.js's `StringDecoder::FlushData`: decode the buffered bytes, and discard them. A single
-    /// byte of UTF-16 is dropped.
-    fn flush(&mut self) -> Vec<u16> {
+    /// Node.js's `StringDecoder::FlushData`: discard the buffered bytes, and return them and how
+    /// many there are. A single byte of UTF-16 is dropped.
+    fn flush(&mut self) -> ([u8; INCOMPLETE_LENGTH], usize) {
         if self.encoding == Encoding::Utf16le && self.buffered % 2 == 1 {
             self.missing = self.missing.saturating_sub(1);
             self.buffered -= 1;
         }
-        let units = decode_units(&self.incomplete[..self.buffered], self.encoding);
+        let flushed = (self.incomplete, self.buffered);
         self.missing = 0;
         self.buffered = 0;
-        units
+        flushed
     }
 }
 
@@ -270,22 +246,14 @@ fn parse_encoding(
     else {
         return Ok(Encoding::Utf8);
     };
-    let is_string = name.is_string();
-    let name = js::JSString::from_value(scope, name)?.to_utf8(scope)?;
-    let unknown = || {
-        NodeError::new(
-            ErrorKind::TypeError,
-            "ERR_UNKNOWN_ENCODING",
-            format!("Unknown encoding: {name}"),
-        )
-    };
-    if !is_string {
-        return Err(unknown().into());
+    if !name.is_string() {
+        return Err(crate::buffer::unknown_encoding(scope, name));
     }
-    if name.is_empty() {
+    let string = js::JSString::from_value(scope, name)?;
+    if string.is_empty() {
         return Ok(Encoding::Utf8);
     }
-    Ok(Encoding::parse(&name).ok_or_else(unknown)?)
+    Encoding::from_js(scope, string)?.ok_or_else(|| crate::buffer::unknown_encoding(scope, name))
 }
 
 /// A new `StringDecoder` for the encoding in `encoding`, as `new StringDecoder(encoding)` creates
@@ -336,13 +304,8 @@ pub mod string_decoder_class {
         if buffer.is_string() {
             return Ok(js::JSString::from_value(scope, *buffer)?);
         }
-        let view = chunk_view(scope, buffer)?;
         let native = state_of(scope, this)?;
-        // Creating the string can GC and move the data of a small buffer, so the string is
-        // created from a copy.
-        let bytes = view.copy_bytes(scope)?;
-        let decoded = native.data_mut().decode_chunk(&bytes);
-        Ok(decoded.into_js_string(scope)?)
+        write_chunk(scope, buffer, |bytes| native.data_mut().decode_chunk(bytes))
     }
 
     /// <https://nodejs.org/api/string_decoder.html#stringdecoderendbuffer>: decodes `buffer` with
@@ -364,8 +327,11 @@ pub mod string_decoder_class {
         if native.data().buffered == 0 {
             return Ok(text);
         }
-        let units = native.data_mut().flush();
-        Ok(text.concat(scope, js::JSString::from_utf16(scope, &units)?)?)
+        let ((bytes, length), encoding) = {
+            let mut data = native.data_mut();
+            (data.flush(), data.encoding)
+        };
+        Ok(text.concat(scope, decode_bytes(scope, &bytes[..length], encoding)?)?)
     }
 
     /// The legacy `text(buffer, offset)`: discard the buffered bytes, then decode `buffer` from

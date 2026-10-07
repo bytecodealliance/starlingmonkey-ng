@@ -35,11 +35,13 @@ struct FrameEntry {
 }
 
 /// An async context frame, as Node's `AsyncContextFrame`: the stores of the `AsyncLocalStorage`s
-/// that have one in an async context. Setting a store makes a new frame, and only
+/// that have one in an async context, and the `node:domain` domain that was active when the
+/// context was set. Setting a store or the domain makes a new frame, and only
 /// `asyncLocalStorage.disable()` changes a frame.
 #[core_runtime::jsclass(hidden)]
 pub(crate) struct AsyncContextFrame {
     entries: Vec<FrameEntry>,
+    domain: Option<Heap<js::object::Object>>,
 }
 
 #[core_runtime::jsmethods]
@@ -48,6 +50,63 @@ impl AsyncContextFrame {}
 /// The frame the current async context is, if there is one.
 fn current_frame<'s>(scope: &'s Scope<'_>) -> Option<AsyncContextFrame<'s>> {
     js::async_context::current(scope).and_then(|context| context.cast::<AsyncContextFrame>().ok())
+}
+
+/// The domain the current async context holds, if it holds one.
+pub(crate) fn current_domain<'s>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
+    let frame = current_frame(scope)?;
+    let domain = frame.data().domain.get(scope);
+    domain
+}
+
+/// Make a copy of the current async context's frame that holds `domain` current, unless the
+/// current context already holds it.
+pub(crate) fn enter_domain_frame(
+    scope: &Scope<'_>,
+    domain: Option<Object<'_>>,
+) -> Result<(), ExnThrown> {
+    let current = current_domain(scope);
+    if current.map(|current| current.as_raw()) == domain.map(|domain| domain.as_raw()) {
+        return Ok(());
+    }
+    let frame = new_frame(scope, current_entries(scope, None), domain)?;
+    Snapshot::of(Some(frame.as_object())).enter();
+    Ok(())
+}
+
+/// The stores of the current async context's frame, without the store of `except`.
+fn current_entries<'s>(
+    scope: &'s Scope<'_>,
+    except: Option<Object<'_>>,
+) -> Vec<(Object<'s>, HandleValue<'s>)> {
+    let mut kept = Vec::new();
+    if let Some(current) = current_frame(scope) {
+        for entry in &current.data().entries {
+            let storage = entry.storage.get(scope);
+            if except.is_none_or(|key| storage.as_raw() != key.as_raw()) {
+                kept.push((storage, entry.store.get(scope)));
+            }
+        }
+    }
+    kept
+}
+
+/// A frame holding `entries` and `domain`.
+fn new_frame<'s>(
+    scope: &'s Scope<'_>,
+    entries: Vec<(Object<'_>, HandleValue<'_>)>,
+    domain: Option<Object<'_>>,
+) -> Result<AsyncContextFrame<'s>, ExnThrown> {
+    js::class::create_instance_with::<AsyncContextFrameImpl>(scope, |_| AsyncContextFrameImpl {
+        entries: entries
+            .iter()
+            .map(|(storage, store)| FrameEntry {
+                storage: Heap::from(*storage),
+                store: Heap::from(store.get()),
+            })
+            .collect(),
+        domain: domain.map(Heap::from),
+    })
 }
 
 /// The store `key` has in the current async context, if it has one.
@@ -67,27 +126,9 @@ pub(crate) fn derived_frame<'s>(
     key: Object<'_>,
     store: Option<HandleValue<'_>>,
 ) -> Result<AsyncContextFrame<'s>, ExnThrown> {
-    let mut kept: Vec<(Object<'s>, HandleValue<'s>)> = Vec::new();
-    if let Some(current) = current_frame(scope) {
-        for entry in &current.data().entries {
-            let storage = entry.storage.get(scope);
-            if storage.as_raw() != key.as_raw() {
-                kept.push((storage, entry.store.get(scope)));
-            }
-        }
-    }
-    let added = store.map(|store| (key, store));
-    js::class::create_instance_with::<AsyncContextFrameImpl>(scope, |_| AsyncContextFrameImpl {
-        entries: kept
-            .iter()
-            .copied()
-            .chain(added)
-            .map(|(storage, store)| FrameEntry {
-                storage: Heap::from(storage),
-                store: Heap::from(store.get()),
-            })
-            .collect(),
-    })
+    let mut entries = current_entries(scope, Some(key));
+    entries.extend(store.map(|store| (key, store)));
+    new_frame(scope, entries, current_domain(scope))
 }
 
 /// Call `callback` with `this` and `args` while `context` is current, then restore the context
@@ -103,6 +144,22 @@ pub(crate) fn call_in<'s>(
     let result =
         Function::call(scope, this, callback, args).map(|result| scope.root_value(result.get()));
     previous.enter();
+    result
+}
+
+/// [`call_in`] for a callback of an async resource, which runs as a callback that captured
+/// `context`, with the [`js::async_context::CallbackHooks`] called around it.
+fn call_as_callback<'s>(
+    scope: &'s Scope<'_>,
+    context: Snapshot,
+    callback: HandleValue<'_>,
+    this: HandleValue<'_>,
+    args: &[HandleValue<'_>],
+) -> Result<HandleValue<'s>, ExnThrown> {
+    let previous = context.enter_callback(scope);
+    let result =
+        Function::call(scope, this, callback, args).map(|result| scope.root_value(result.get()));
+    previous.leave_callback(scope);
     result
 }
 
@@ -344,7 +401,7 @@ impl AsyncResource {
         let trigger = match options {
             Some(options) if options.is_number() => options,
             Some(options) if !options.is_undefined() => {
-                let options = Object::from_value(scope, options).map_err(|e| e.throw(scope))?;
+                let options = Object::from_value_coerce(scope, options)?;
                 options.get_property(scope, c"triggerAsyncId")?
             }
             _ => HandleValue::undefined(),
@@ -388,6 +445,7 @@ impl AsyncResource {
         this.set_property_by_id(scope, CONTEXT_FRAME.id(scope)?, frame)?;
         this.set_property_by_id(scope, ASYNC_ID.id(scope)?, id as f64)?;
         this.set_property_by_id(scope, TRIGGER_ASYNC_ID.id(scope)?, trigger)?;
+        crate::domain::init_resource(scope, this)?;
         Ok(())
     }
 
@@ -402,7 +460,7 @@ impl AsyncResource {
     ) -> Result<HandleValue<'r>, ExnThrown> {
         let context = self.context(scope);
         let this_arg = this_arg.unwrap_or(HandleValue::undefined());
-        call_in(scope, context, callback, this_arg, &args)
+        call_as_callback(scope, context, callback, this_arg, &args)
     }
 
     /// <https://nodejs.org/api/async_context.html#asyncresourceemitdestroy>
@@ -615,6 +673,13 @@ fn set_async_resource(
     Ok(js::value::undefined())
 }
 
+/// A hook `createHook` returns, whose `enable()` and `disable()` return it.
+#[core_runtime::jsclass(name = "AsyncHook", hidden)]
+pub(crate) struct AsyncHook {}
+
+#[core_runtime::jsmethods]
+impl AsyncHook {}
+
 /// Register the classes of `node:async_hooks` on `global`.
 pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<(), ExnThrown> {
     AsyncContextFrame::add_to_global(scope, global);
@@ -622,6 +687,13 @@ pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<
     RunScope::add_to_global(scope, global);
     AsyncResource::add_to_global(scope, global);
     Bound::add_to_global(scope, global);
+    AsyncHook::add_to_global(scope, global);
+    let hook_proto = js::class::get_prototype_object_for::<AsyncHookImpl>(scope)
+        .expect("AsyncHook was registered above");
+    for name in [c"enable", c"disable"] {
+        let method = Function::new_callback(scope, name, 0, return_this, ())?;
+        hook_proto.define_property(scope, name, *method, 0)?;
+    }
     let proto = js::class::get_prototype_object_for::<RunScopeImpl>(scope)
         .expect("RunScope was registered above");
     let dispose = Function::new_callback(scope, c"[Symbol.dispose]", 0, dispose_run_scope, ())?;
@@ -633,7 +705,7 @@ pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) -> Result<
     )
 }
 
-/// The `enable()` and `disable()` of a hook `createHook` returns: return `this`.
+/// The `enable()` and `disable()` of an `AsyncHook`: return `this`.
 fn return_this(
     _scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -687,12 +759,10 @@ pub mod module {
                 .into());
             }
         }
-        let hook = Object::new_plain(scope)?;
-        for name in [c"enable", c"disable"] {
-            let method = Function::new_callback(scope, name, 0, return_this, ())?;
-            hook.set_property(scope, name, *method)?;
-        }
-        Ok(hook)
+        Ok(
+            js::class::create_instance_with::<AsyncHookImpl>(scope, |_| AsyncHookImpl {})?
+                .as_object(),
+        )
     }
 
     /// <https://nodejs.org/api/async_hooks.html#async_hooksexecutionasyncresource>: an empty

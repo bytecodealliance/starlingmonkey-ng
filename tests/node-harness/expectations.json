@@ -9,11 +9,11 @@
     "status": "FAIL"
   },
   "test-aborted-util.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-abortsignal-any.mjs": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-abortsignal-cloneable.js": {
     "status": "FAIL"
@@ -25,10 +25,12 @@
     "status": "FAIL"
   },
   "test-als-defaultvalue-original.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --no-async-context-frame"
   },
   "test-als-defaultvalue.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --async-context-frame"
   },
   "test-arm-math-illegal-instruction.js": {
     "status": "PASS"
@@ -58,17 +60,17 @@
     "status": "FAIL"
   },
   "test-assert-deep-with-error.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-assert-deep.js": {
     "status": "FAIL"
   },
   "test-assert-esm-cjs-message-verify.js": {
-    "status": "FAIL"
+    "status": "PASS",
+    "wasm_status": "FAIL"
   },
   "test-assert-fail-deprecation.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-assert-fail.js": {
     "status": "FAIL"
@@ -141,8 +143,8 @@
     "status": "FAIL"
   },
   "test-async-hooks-fatal-error.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-async-hooks-http-agent-destroy.js": {
     "status": "FAIL"
@@ -177,16 +179,16 @@
     "status": "PASS"
   },
   "test-async-hooks-stack-overflow-nested-async.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-async-hooks-stack-overflow-try-catch.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-async-hooks-stack-overflow.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-async-hooks-top-level-clearimmediate.js": {
     "status": "SKIP",
@@ -256,8 +258,8 @@
     "status": "FAIL"
   },
   "test-async-wrap-pop-id-during-load.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-async-wrap-promise-after-enabled.js": {
     "status": "SKIP",
@@ -282,8 +284,8 @@
     "status": "PASS"
   },
   "test-bash-completion.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-beforeexit-event-exit.js": {
     "status": "PASS"
@@ -363,11 +365,12 @@
     "status": "PASS"
   },
   "test-buffer-constructor-node-modules-paths.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-buffer-constructor-node-modules.js": {
-    "status": "FAIL"
+    "status": "PASS",
+    "wasm_status": "FAIL"
   },
   "test-buffer-constructor-outside-node-modules.js": {
     "status": "PASS"
@@ -493,8 +496,7 @@
     "status": "PASS"
   },
   "test-buffer-tostring-4gb.js": {
-    "status": "FAIL",
-    "wasm_status": "SKIP"
+    "status": "SKIP"
   },
   "test-buffer-tostring-range.js": {
     "status": "PASS"
@@ -538,465 +540,464 @@
   },
   "test-child-process-advanced-serialization-host-objects.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-child-process-advanced-serialization-largebuffer.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-advanced-serialization-splitted-length-field.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-advanced-serialization.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-bad-stdio.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-can-write-to-stdout.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-constructor.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-cwd.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-default-options.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-destroy.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-detached.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-dgram-reuseport.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-child-process-disconnect.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-double-pipe.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-env.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-abortcontroller-promisified.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-any-shells-windows.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-child-process-exec-cwd.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-encoding.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-env.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-error.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-kill-throws.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-maxbuf.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-std-encoding.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-stdout-stderr-data-string.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-timeout-expire.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-timeout-kill.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exec-timeout-not-expired.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-execfile-maxbuf.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-execFile-promisified-abortController.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-execfile.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-execfilesync-maxbuf.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-execsync-maxbuf.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-exit-code.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-flush-stdio.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-abort-signal.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-advanced-header-serialization.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-and-spawn.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-args.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-close.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-closed-channel-segfault.js": {
     "status": "SKIP",
     "reason": "uses cluster"
   },
   "test-child-process-fork-detached.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-dgram.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-exec-argv.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-exec-path.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-getconnections.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-net-server.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-net-socket.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-net.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-no-shell.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-ref.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-ref2.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-stdio-string-variant.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-stdio.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-timeout-kill-signal.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork-url.mjs": {
-    "status": "FAIL"
+    "status": "PASS",
+    "wasm_status": "FAIL"
   },
   "test-child-process-fork.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-fork3.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-http-socket-leak.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-internal.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-ipc-next-tick.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-ipc.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-kill-sigwinch.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-kill.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-net-reuseport.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-no-deprecation.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-pipe-dataflow.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-promisified.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-prototype-tampering.mjs": {
     "status": "SKIP",
     "wasm_status": "FAIL"
   },
   "test-child-process-recv-handle.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-reject-null-bytes.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-send-after-close.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-send-cb.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-send-keep-open.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-send-returns-boolean.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-send-type-error.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-send-utf8.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-server-close.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-set-blocking.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-silent.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawn-args.mjs": {
-    "status": "FAIL"
+    "status": "PASS",
+    "wasm_status": "FAIL"
   },
   "test-child-process-spawn-argv0.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawn-controller.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawn-error.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawn-event.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawn-shell.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawn-timeout-kill-signal.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawn-typeerror.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawn-windows-batch-file.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-args.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-env.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-input.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-kill-signal.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-maxbuf.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-non-string-args.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-shell.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-timeout.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync-validation-errors.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-spawnsync.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdin-ipc.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdin.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdio-big-write-end.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdio-inherit.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdio-merge-stdouts-into-cat.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdio-overlapped.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-child-process-stdio-reuse-readable-stdio.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdio.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdout-flush-exit.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdout-flush.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-stdout-ipc.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-child-process-uid-gid.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-child-process-validate-stdio.js": {
     "status": "SKIP",
     "reason": "uses worker threads"
   },
   "test-child-process-windows-hide.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-bad-options.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-eval-event.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-cli-eval.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-node-cli-manpage-env-vars.mjs": {
     "status": "FAIL"
@@ -1005,57 +1006,57 @@
     "status": "FAIL"
   },
   "test-cli-node-options-disallowed.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-node-options-docs.js": {
     "status": "FAIL"
   },
   "test-cli-node-options.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-cli-node-print-help-style.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-node-print-help.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-options-as-flags.js": {
     "status": "FAIL"
   },
   "test-cli-options-negation.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-options-precedence.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-permission-deny-fs.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-permission-multiple-allow.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-print-promise.mjs": {
     "status": "FAIL"
   },
   "test-cli-syntax-eval.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-syntax-piped-bad.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cli-syntax-piped-good.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-client-request-destroy.js": {
     "status": "PASS"
@@ -1070,7 +1071,7 @@
   },
   "test-cluster-basic.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-cluster-bind-privileged-port.js": {
     "status": "SKIP",
@@ -1078,7 +1079,7 @@
   },
   "test-cluster-bind-twice.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-cluster-call-and-destroy.js": {
     "status": "SKIP",
@@ -1162,11 +1163,11 @@
   },
   "test-cluster-eaccess.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-cluster-eaddrinuse.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-cluster-fork-env.js": {
     "status": "SKIP",
@@ -1178,7 +1179,7 @@
   },
   "test-cluster-fork-windowsHide.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-cluster-http-pipe.js": {
     "status": "SKIP",
@@ -1233,8 +1234,8 @@
     "reason": "uses cluster"
   },
   "test-cluster-net-send.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-cluster-net-server-drop-connection.js": {
     "status": "SKIP",
@@ -1242,11 +1243,11 @@
   },
   "test-cluster-primary-error.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-cluster-primary-kill.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-cluster-process-disconnect.js": {
     "status": "SKIP",
@@ -1326,7 +1327,7 @@
   },
   "test-cluster-uncaught-exception.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-cluster-worker-constructor.js": {
     "status": "SKIP",
@@ -1397,12 +1398,12 @@
     "reason": "uses worker threads"
   },
   "test-common-countdown.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-common-expect-warning.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-common-gc.js": {
     "status": "FAIL"
@@ -1411,11 +1412,11 @@
     "status": "PASS"
   },
   "test-common-must-not-mutate-object-deep.mjs": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-common.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-compression-decompression-stream.js": {
     "status": "FAIL"
@@ -1555,7 +1556,8 @@
     "status": "SKIP"
   },
   "test-crypto-dh-leak.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --noconcurrent_recompilation"
   },
   "test-crypto-dh-modp2-views.js": {
     "status": "SKIP"
@@ -1600,8 +1602,7 @@
     "status": "SKIP"
   },
   "test-crypto-fips.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-crypto-from-binary.js": {
     "status": "SKIP"
@@ -1644,8 +1645,7 @@
     "status": "SKIP"
   },
   "test-crypto-key-store-pkcs11.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-crypto-key-store.js": {
     "status": "SKIP"
@@ -1776,7 +1776,7 @@
   },
   "test-crypto-no-algorithm.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-crypto-oaep-zero-length.js": {
     "status": "SKIP"
@@ -1864,12 +1864,10 @@
     "status": "SKIP"
   },
   "test-crypto-secure-heap.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-crypto-sign-verify.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-crypto-stream.js": {
     "status": "SKIP"
@@ -1905,15 +1903,15 @@
   },
   "test-cwd-enoent-preload.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-cwd-enoent-repl.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-cwd-enoent.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-data-url.js": {
     "status": "FAIL"
@@ -1923,8 +1921,7 @@
     "reason": "uses worker threads"
   },
   "test-debug-process.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-debug-v8-fast-api.js": {
     "status": "SKIP",
@@ -2055,8 +2052,8 @@
     "status": "PASS"
   },
   "test-dgram-deprecation-error.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-dgram-error-message-address.js": {
     "status": "PASS"
@@ -2200,8 +2197,8 @@
     "status": "PASS"
   },
   "test-diagnostics-channel-child-process.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-diagnostics-channel-gc-maintains-subcriptions.js": {
     "status": "PASS"
@@ -2301,7 +2298,7 @@
   },
   "test-diagnostics-channel-process.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-diagnostics-channel-pub-sub.js": {
     "status": "PASS"
@@ -2378,11 +2375,11 @@
   },
   "test-disable-proto-delete.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --disable-proto=delete"
   },
   "test-disable-proto-throw.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --disable-proto=throw"
   },
   "test-disable-sigusr1.js": {
     "status": "SKIP"
@@ -2482,17 +2479,17 @@
     "status": "PASS"
   },
   "test-domain-abort-on-uncaught.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-add-remove.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-async-id-map-leak.js": {
     "status": "FAIL"
   },
   "test-domain-bind-timeout.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-crypto.js": {
     "status": "SKIP"
@@ -2502,151 +2499,152 @@
     "reason": "uses the inspector"
   },
   "test-domain-ee-error-listener.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-ee-implicit.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-ee.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-emit-error-handler-stack.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-enter-exit.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-error-types.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --gc-interval=100"
   },
   "test-domain-from-timer.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-fs-enoent-stream.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-http-server.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-implicit-binding.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-implicit-fs.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-intercept.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-load-after-set-uncaught-exception-capture.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-multi.js": {
     "status": "FAIL"
   },
   "test-domain-multiple-errors.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-nested-throw.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-nested.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-nexttick.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-no-error-handler-abort-on-uncaught-0.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-1.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-2.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-3.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-4.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-5.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-6.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-7.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-8.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-no-error-handler-abort-on-uncaught-9.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-promise.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-run.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-safe-exit.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-set-uncaught-exception-capture-after-load.js": {
     "status": "FAIL"
   },
   "test-domain-stack-empty-in-process-uncaughtexception.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-stack.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-throw-error-then-throw-from-uncaught-exception-handler.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-thrown-error-handler-stack.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-timer.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-timers-uncaught-exception.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-timers.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-top-level-error-handler-clears-stack.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-top-level-error-handler-throw.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-uncaught-exception.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-domain-vm-promise-isolation.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-domain-with-abort-on-uncaught-exception.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-domexception-cause.js": {
     "status": "FAIL"
@@ -2655,15 +2653,18 @@
     "status": "FAIL"
   },
   "test-dotenv-edge-cases.js": {
-    "status": "SKIP",
+    "status": "FAIL",
+    "wasm_status": "SKIP",
     "reason": "spawns child processes"
   },
   "test-dotenv-node-options.js": {
-    "status": "SKIP",
+    "status": "FAIL",
+    "wasm_status": "SKIP",
     "reason": "spawns child processes"
   },
   "test-dotenv.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --env-file"
   },
   "test-double-tls-client.js": {
     "status": "SKIP"
@@ -2675,8 +2676,8 @@
     "status": "SKIP"
   },
   "test-dummy-stdio.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-duplex-error.js": {
     "status": "PASS"
@@ -2688,8 +2689,8 @@
     "status": "FAIL"
   },
   "test-env-var-no-warnings.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-err-name-deprecation.js": {
     "status": "FAIL"
@@ -2701,12 +2702,12 @@
     "status": "FAIL"
   },
   "test-error-prepare-stack-trace.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-error-reporting.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-error-value-type-detection.mjs": {
     "status": "FAIL"
@@ -2718,7 +2719,8 @@
     "status": "FAIL"
   },
   "test-errors-systemerror-frozen-intrinsics.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --frozen-intrinsics"
   },
   "test-errors-systemerror-stackTraceLimit-custom-setter.js": {
     "status": "FAIL"
@@ -2745,7 +2747,8 @@
     "status": "SKIP"
   },
   "test-eval-disallow-code-generation-from-strings.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --disallow-code-generation-from-strings"
   },
   "test-eval-strict-referenceerror.js": {
     "status": "PASS"
@@ -2805,7 +2808,7 @@
     "status": "PASS"
   },
   "test-event-emitter-no-error-provided-to-error-event.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-event-emitter-num-args.js": {
     "status": "PASS"
@@ -2862,7 +2865,7 @@
     "status": "FAIL"
   },
   "test-events-static-geteventlisteners.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-events-uncaught-exception-stack.js": {
     "status": "FAIL"
@@ -2871,7 +2874,8 @@
     "status": "PASS"
   },
   "test-eventsource.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --experimental-eventsource"
   },
   "test-eventtarget-brandcheck.js": {
     "status": "FAIL"
@@ -2969,7 +2973,7 @@
     "status": "PASS"
   },
   "test-file-validate-mode-flag.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-file-write-stream.js": {
     "status": "PASS"
@@ -3007,25 +3011,26 @@
     "status": "PASS"
   },
   "test-find-package-json.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-fixed-queue.js": {
     "status": "FAIL"
   },
   "test-force-repl-with-eval.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-force-repl.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-freelist.js": {
     "status": "FAIL"
   },
   "test-freeze-intrinsics.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --frozen-intrinsics"
   },
   "test-fs-access.js": {
     "status": "SKIP"
@@ -3061,7 +3066,7 @@
     "status": "PASS"
   },
   "test-fs-close-errors.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-close.js": {
     "status": "PASS"
@@ -3403,8 +3408,7 @@
     "wasm_status": "FAIL"
   },
   "test-fs-mkdir-recursive-eaccess.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-fs-mkdir-rmdir.js": {
     "status": "PASS"
@@ -3417,7 +3421,7 @@
     "status": "PASS"
   },
   "test-fs-mkdtemp.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-mkdtempDisposableSync.js": {
     "status": "SKIP",
@@ -3579,7 +3583,7 @@
     "status": "PASS"
   },
   "test-fs-read-empty-buffer.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-read-file-assert-encoding.js": {
     "status": "PASS"
@@ -3610,8 +3614,7 @@
     "status": "PASS"
   },
   "test-fs-read-stream-concurrent-reads.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-read-stream-double-close.js": {
     "status": "PASS"
@@ -3635,10 +3638,10 @@
     "status": "FAIL"
   },
   "test-fs-read-stream-patch-open.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-read-stream-pos.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-read-stream-resume.js": {
     "status": "PASS"
@@ -3647,8 +3650,8 @@
     "status": "FAIL"
   },
   "test-fs-read-stream.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-fs-read-type.js": {
     "status": "FAIL"
@@ -3693,12 +3696,12 @@
     "status": "PASS"
   },
   "test-fs-readfile-eof.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-readfile-error.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-readfile-fd.js": {
     "status": "PASS"
@@ -3707,12 +3710,12 @@
     "status": "PASS"
   },
   "test-fs-readfile-pipe-large.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-readfile-pipe.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-readfile-unlink.js": {
     "status": "PASS"
@@ -3727,11 +3730,12 @@
     "status": "SKIP"
   },
   "test-fs-readfilesync-pipe-large.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-readfilesync-utf8-sizes.js": {
-    "status": "PASS"
+    "status": "FLAKY",
+    "wasm_status": "PASS"
   },
   "test-fs-readlink-type-check.js": {
     "status": "PASS"
@@ -3758,8 +3762,8 @@
     "status": "PASS"
   },
   "test-fs-realpath-async-stale-stat-values.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-realpath-buffer-encoding.js": {
     "status": "PASS"
@@ -3772,16 +3776,15 @@
     "wasm_status": "FAIL"
   },
   "test-fs-realpath-on-substed-drive.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-fs-realpath-pipe.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-realpath-stale-stat-values.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-realpath.js": {
     "status": "SKIP",
@@ -3791,8 +3794,8 @@
     "status": "PASS"
   },
   "test-fs-rm.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-fs-rmdir-recursive-sync-warns-not-found.js": {
     "status": "FAIL"
@@ -3819,8 +3822,7 @@
     "status": "PASS"
   },
   "test-fs-rmSync-eperm-retries.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-fs-rmSync-special-char.js": {
     "status": "PASS"
@@ -3844,16 +3846,16 @@
     "status": "FAIL"
   },
   "test-fs-stream-construct-compat-error-read.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-stream-construct-compat-error-write.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-stream-construct-compat-graceful-fs.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-stream-construct-compat-old-node.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-fs-stream-destroy-emit-error.js": {
     "status": "PASS"
@@ -3891,14 +3893,15 @@
     "wasm_status": "FAIL"
   },
   "test-fs-symlink.js": {
-    "status": "FAIL"
+    "status": "PASS",
+    "wasm_status": "FAIL"
   },
   "test-fs-sync-fd-leak.js": {
     "status": "FAIL"
   },
   "test-fs-syncwritestream.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-fs-timestamp-parsing-error.js": {
     "status": "FAIL"
@@ -3922,8 +3925,8 @@
     "status": "PASS"
   },
   "test-fs-utimes-y2K38.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-utimes.js": {
     "status": "FAIL"
@@ -3996,8 +3999,7 @@
     "status": "PASS"
   },
   "test-fs-watch-recursive-linux-parallel-remove.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-fs-watch-recursive-prefix-sibling.js": {
     "status": "SKIP",
@@ -4087,8 +4089,8 @@
     "status": "PASS"
   },
   "test-fs-write-sigxfsz.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-fs-write-stream-autoclose-option.js": {
     "status": "FAIL"
@@ -4127,8 +4129,8 @@
     "status": "FAIL"
   },
   "test-fs-write-stream-patch-open.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-fs-write-stream-throw-type-error.js": {
     "status": "FAIL"
@@ -4211,8 +4213,8 @@
     "status": "PASS"
   },
   "test-handle-wrap-hasref.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-hash-seed.mjs": {
     "status": "FAIL"
@@ -4306,8 +4308,7 @@
     "status": "FAIL"
   },
   "test-http-agent-scheduling.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-agent-timeout-option.js": {
     "status": "PASS"
@@ -4340,8 +4341,7 @@
     "status": "PASS"
   },
   "test-http-blank-header.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-buffer-sanity.js": {
     "status": "PASS"
@@ -4356,8 +4356,7 @@
     "status": "FAIL"
   },
   "test-http-chunk-problem.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-http-chunked-304.js": {
     "status": "PASS"
@@ -4369,7 +4368,7 @@
     "status": "PASS"
   },
   "test-http-client-abort-destroy.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-http-client-abort-event.js": {
     "status": "PASS"
@@ -4414,8 +4413,7 @@
     "status": "PASS"
   },
   "test-http-client-check-http-token.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-client-close-event.js": {
     "status": "PASS"
@@ -4592,8 +4590,7 @@
     "status": "PASS"
   },
   "test-http-content-length.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-contentLength0.js": {
     "status": "PASS"
@@ -4608,22 +4605,20 @@
     "status": "PASS"
   },
   "test-http-debug.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-http-decoded-auth.js": {
     "status": "PASS"
   },
   "test-http-default-encoding.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-default-port.js": {
     "status": "SKIP"
   },
   "test-http-destroyed-socket-write2.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-dns-error.js": {
     "status": "SKIP"
@@ -4641,8 +4636,7 @@
     "status": "PASS"
   },
   "test-http-dummy-characters-smuggling.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-dump-req-when-res-ends.js": {
     "status": "PASS"
@@ -4654,8 +4648,7 @@
     "status": "PASS"
   },
   "test-http-end-throw-socket-handling.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-eof-on-connect.js": {
     "status": "PASS"
@@ -4682,8 +4675,8 @@
     "status": "PASS"
   },
   "test-http-full-response.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-http-generic-streams.js": {
     "status": "PASS"
@@ -4713,8 +4706,7 @@
     "status": "PASS"
   },
   "test-http-header-overflow.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-header-owstext.js": {
     "status": "PASS"
@@ -4738,8 +4730,7 @@
     "status": "PASS"
   },
   "test-http-host-header-ipv6-fail.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-host-headers.js": {
     "status": "PASS"
@@ -4748,7 +4739,7 @@
     "status": "PASS"
   },
   "test-http-import-websocket.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-http-incoming-matchKnownFields.js": {
     "status": "FAIL"
@@ -4775,7 +4766,8 @@
     "status": "PASS"
   },
   "test-http-insecure-parser.js": {
-    "status": "PASS"
+    "status": "PASS",
+    "wasm_status": "FLAKY"
   },
   "test-http-invalid-path-chars.js": {
     "status": "PASS"
@@ -4790,7 +4782,7 @@
     "status": "PASS"
   },
   "test-http-invalidheaderfield2.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-http-keep-alive-close-on-header.js": {
     "status": "PASS"
@@ -4853,8 +4845,8 @@
     "status": "PASS"
   },
   "test-http-max-header-size.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-http-max-headers-count-overflow.js": {
     "status": "PASS"
@@ -4872,12 +4864,10 @@
     "status": "PASS"
   },
   "test-http-missing-header-separator-cr.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-missing-header-separator-lf.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-multi-line-headers.js": {
     "status": "PASS"
@@ -4898,8 +4888,7 @@
     "status": "PASS"
   },
   "test-http-odd-hex-write.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-outgoing-buffer.js": {
     "status": "PASS"
@@ -4908,8 +4897,7 @@
     "status": "PASS"
   },
   "test-http-outgoing-destroyed.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-outgoing-drain-writable-length.js": {
     "status": "PASS"
@@ -4918,7 +4906,7 @@
     "status": "PASS"
   },
   "test-http-outgoing-end-multiple.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-http-outgoing-end-types.js": {
     "status": "PASS"
@@ -4981,8 +4969,8 @@
     "status": "PASS"
   },
   "test-http-parser-lazy-loaded.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-http-parser-max-header-pairs-cache.js": {
     "status": "FAIL"
@@ -5018,14 +5006,15 @@
     "status": "PASS"
   },
   "test-http-pipeline-flood.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-http-pipeline-outgoing-destroy.js": {
     "status": "PASS"
   },
   "test-http-pipeline-requests-connection-leak.js": {
-    "status": "PASS"
+    "status": "FLAKY",
+    "wasm_status": "PASS"
   },
   "test-http-pipeline-socket-parser-typeerror.js": {
     "status": "PASS"
@@ -5049,7 +5038,8 @@
     "status": "PASS"
   },
   "test-http-req-res-close.js": {
-    "status": "PASS"
+    "status": "FLAKY",
+    "wasm_status": "PASS"
   },
   "test-http-request-agent.js": {
     "status": "SKIP"
@@ -5064,8 +5054,7 @@
     "status": "PASS"
   },
   "test-http-request-end.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-request-host-header.js": {
     "status": "PASS"
@@ -5092,8 +5081,7 @@
     "status": "PASS"
   },
   "test-http-request-smuggling-content-length.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-res-write-after-end.js": {
     "status": "PASS"
@@ -5187,8 +5175,7 @@
     "status": "PASS"
   },
   "test-http-server-destroy-socket-on-client-error.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-server-drop-connections-in-cluster.js": {
     "status": "SKIP",
@@ -5285,26 +5272,23 @@
     "status": "PASS"
   },
   "test-http-server-stale-close.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-http-server-timeouts-validation.js": {
     "status": "PASS"
   },
   "test-http-server-unconsume-consume.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-server-unconsume.js": {
     "status": "PASS"
   },
   "test-http-server-write-after-end.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-server-write-end-after-end.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-server.js": {
     "status": "PASS"
@@ -5319,7 +5303,8 @@
     "status": "FAIL"
   },
   "test-http-set-timeout-server.js": {
-    "status": "PASS"
+    "status": "PASS",
+    "wasm_status": "FLAKY"
   },
   "test-http-set-timeout.js": {
     "status": "PASS"
@@ -5346,10 +5331,12 @@
     "status": "PASS"
   },
   "test-http-sync-write-error-during-continue.js": {
-    "status": "PASS"
+    "status": "PASS",
+    "wasm_status": "FLAKY"
   },
   "test-http-timeout-client-warning.js": {
-    "status": "PASS"
+    "status": "PASS",
+    "wasm_status": "FLAKY"
   },
   "test-http-timeout-overflow.js": {
     "status": "PASS"
@@ -5361,8 +5348,7 @@
     "status": "FAIL"
   },
   "test-http-transfer-encoding-smuggling.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-http-uncaught-from-request-callback.js": {
     "status": "PASS"
@@ -5494,8 +5480,7 @@
     "status": "SKIP"
   },
   "test-http2-clean-output.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-http2-client-connection-tunnelling.js": {
     "status": "SKIP"
@@ -6018,8 +6003,7 @@
     "status": "SKIP"
   },
   "test-http2-respond-file-error-pipe-offset.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-http2-respond-file-errors.js": {
     "status": "SKIP"
@@ -6049,8 +6033,7 @@
     "status": "SKIP"
   },
   "test-http2-respond-file-with-pipe.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-http2-respond-file.js": {
     "status": "SKIP"
@@ -6233,8 +6216,7 @@
     "status": "SKIP"
   },
   "test-http2-tls-disconnect.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-http2-too-large-headers.js": {
     "status": "SKIP"
@@ -6330,7 +6312,8 @@
     "status": "SKIP"
   },
   "test-https-agent-session-eviction.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --tls-min-v1.0"
   },
   "test-https-agent-session-injection.js": {
     "status": "SKIP"
@@ -6345,8 +6328,7 @@
     "status": "SKIP"
   },
   "test-https-agent-unref-socket.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-https-agent.js": {
     "status": "SKIP"
@@ -6397,8 +6379,7 @@
     "status": "SKIP"
   },
   "test-https-foafssl.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-https-host-headers.js": {
     "status": "SKIP"
@@ -6500,12 +6481,11 @@
     "status": "SKIP"
   },
   "test-icu-data-dir.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-icu-env.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-icu-minimum-version.js": {
     "status": "FAIL"
@@ -6525,7 +6505,7 @@
   },
   "test-inspect-publish-uid.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses the inspector"
   },
   "test-inspect-support-for-node_options.js": {
     "status": "SKIP",
@@ -6538,7 +6518,8 @@
     "status": "FAIL"
   },
   "test-internal-async-context-frame-disable.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --no-async-context-frame"
   },
   "test-internal-async-context-frame-enabled.js": {
     "status": "FAIL"
@@ -6557,10 +6538,11 @@
   },
   "test-internal-module-require.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-internal-module-wrap.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --js-source-phase-imports"
   },
   "test-internal-modules.js": {
     "status": "PASS"
@@ -6584,11 +6566,12 @@
     "status": "FAIL"
   },
   "test-internal-util-construct-sab.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --enable-sharedarraybuffer-per-context"
   },
   "test-internal-util-decorate-error-stack.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-internal-util-getCIDR.js": {
     "status": "FAIL"
@@ -6627,8 +6610,8 @@
     "status": "PASS"
   },
   "test-intl.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-is-internal-thread.mjs": {
     "status": "SKIP",
@@ -6638,45 +6621,46 @@
     "status": "FAIL"
   },
   "test-kill-segfault-freebsd.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-listen-fd-cluster.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses cluster"
   },
   "test-listen-fd-detached-inherit.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-listen-fd-detached.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-listen-fd-ebadf.js": {
     "status": "FAIL"
   },
   "test-listen-fd-server.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-macos-app-sandbox.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-math-random.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-max-old-space-size-percentage.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-memory-usage-emfile.js": {
     "status": "FAIL"
   },
   "test-memory-usage.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --predictable-gc-schedule"
   },
   "test-messagechannel.js": {
     "status": "PASS"
@@ -6716,7 +6700,7 @@
     "status": "FAIL"
   },
   "test-module-children.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-module-circular-dependency-warning.js": {
     "status": "FAIL"
@@ -6741,24 +6725,24 @@
     "status": "FAIL"
   },
   "test-module-loading-error.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-module-loading-globalpaths.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-module-main-extension-lookup.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-module-main-fail.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-module-main-preserve-symlinks-fail.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-module-multi-extensions.js": {
     "status": "FAIL"
@@ -6767,7 +6751,7 @@
     "status": "FAIL"
   },
   "test-module-nodemodulepaths.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-module-parent-deprecation.js": {
     "status": "FAIL"
@@ -6782,15 +6766,14 @@
     "status": "FAIL"
   },
   "test-module-readonly.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-module-relative-lookup.js": {
     "status": "FAIL"
   },
   "test-module-run-main-monkey-patch.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-module-setsourcemapssupport.js": {
     "status": "FAIL"
@@ -6805,26 +6788,26 @@
     "status": "SKIP"
   },
   "test-module-symlinked-peer-modules.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --preserve-symlinks"
   },
   "test-module-unreadable-package-json.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-module-version.js": {
     "status": "FAIL"
   },
   "test-module-wrap.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-module-wrapper.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-navigator.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-net-access-byteswritten.js": {
     "status": "SKIP"
@@ -6896,8 +6879,8 @@
     "status": "PASS"
   },
   "test-net-child-process-connect-reset.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-net-client-bind-twice.js": {
     "status": "PASS"
@@ -6948,8 +6931,7 @@
     "status": "FAIL"
   },
   "test-net-connect-options-invalid.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-connect-options-ipv6.js": {
     "status": "SKIP"
@@ -6958,8 +6940,7 @@
     "status": "FAIL"
   },
   "test-net-connect-options-port.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-connect-paused-connection.js": {
     "status": "PASS"
@@ -6974,7 +6955,7 @@
     "status": "FAIL"
   },
   "test-net-connect-reset.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-net-dns-custom-lookup.js": {
     "status": "PASS"
@@ -7028,12 +7009,10 @@
     "status": "PASS"
   },
   "test-net-listen-close-server-callback-is-not-function.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-listen-close-server.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-listen-error.js": {
     "status": "PASS"
@@ -7106,8 +7085,7 @@
     "status": "FAIL"
   },
   "test-net-reconnect.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-remote-address-port.js": {
     "status": "PASS"
@@ -7131,8 +7109,7 @@
     "status": "FAIL"
   },
   "test-net-server-close-before-calling-lookup-callback.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-server-close-before-ipc-response.js": {
     "status": "SKIP",
@@ -7151,8 +7128,7 @@
     "status": "FAIL"
   },
   "test-net-server-listen-options-signal.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-server-listen-options.js": {
     "status": "PASS"
@@ -7204,19 +7180,16 @@
     "status": "PASS"
   },
   "test-net-socket-connect-invalid-autoselectfamily.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-socket-connect-invalid-autoselectfamilyattempttimeout.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-socket-connect-without-cb.js": {
     "status": "PASS"
   },
   "test-net-socket-connecting.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-socket-constructor.js": {
     "status": "SKIP",
@@ -7235,8 +7208,7 @@
     "status": "PASS"
   },
   "test-net-socket-local-address.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-net-socket-no-halfopen-enforcer.js": {
     "status": "PASS"
@@ -7357,7 +7329,8 @@
     "reason": "uses worker threads"
   },
   "test-no-node-snapshot.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --no-node-snapshot"
   },
   "test-node-output-console.mjs": {
     "status": "FAIL"
@@ -7375,19 +7348,17 @@
     "status": "FAIL"
   },
   "test-node-run.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-nodeeventtarget.js": {
     "status": "FAIL"
   },
   "test-openssl-ca-options.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-openssl-unreadable-config.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-options-binding.js": {
     "status": "PASS"
@@ -7399,22 +7370,22 @@
     "status": "PASS"
   },
   "test-os-eol.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-os-fast.js": {
     "status": "SKIP",
     "reason": "needs the unsupported runtime flag --allow-natives-syntax"
   },
   "test-os-homedir-no-envvar.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-os-process-priority.js": {
     "status": "FAIL"
   },
   "test-os-userinfo-handles-getter-errors.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-os.js": {
     "status": "FAIL"
@@ -7426,14 +7397,15 @@
     "status": "FAIL"
   },
   "test-package-map-cli.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-parse-args.mjs": {
     "status": "FAIL"
   },
   "test-parse-test-envs.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --test-isolation=none"
   },
   "test-parse-test-only-envs.js": {
     "status": "FAIL"
@@ -7475,8 +7447,8 @@
     "status": "FAIL"
   },
   "test-path-resolve.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-path-win32-exists.js": {
     "status": "FAIL"
@@ -7491,8 +7463,8 @@
     "status": "FAIL"
   },
   "test-pending-deprecation.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-perf-gc-crash.js": {
     "status": "PASS"
@@ -7557,7 +7529,8 @@
     "status": "PASS"
   },
   "test-performance-gc-minor-ms.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --minor-ms"
   },
   "test-performance-gc.js": {
     "status": "PASS"
@@ -7576,7 +7549,7 @@
   },
   "test-performance-nodetiming-uvmetricsinfo.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-performance-nodetiming.js": {
     "status": "SKIP",
@@ -7589,13 +7562,13 @@
     "status": "FAIL"
   },
   "test-performance-timeline.mjs": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-performanceobserver-gc.js": {
     "status": "PASS"
   },
   "test-performanceobserver.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-permission-allow-addons-cli.js": {
     "status": "SKIP",
@@ -7619,7 +7592,7 @@
   },
   "test-permission-audit-fs-does-not-deny.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-permission-child-process-cli.js": {
     "status": "SKIP",
@@ -7662,7 +7635,7 @@
   },
   "test-permission-drop-fs-granted-path.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-permission-drop-fs-read.js": {
     "status": "SKIP",
@@ -7674,7 +7647,7 @@
   },
   "test-permission-drop-fs-specific-path.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-permission-drop-fs-write.js": {
     "status": "SKIP",
@@ -7769,7 +7742,7 @@
   },
   "test-permission-inspector-brk.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-permission-inspector.js": {
     "status": "SKIP",
@@ -7793,15 +7766,14 @@
   },
   "test-permission-processbinding.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-permission-sqlite-load-extension.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-permission-warning-flags.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-permission-wasi.js": {
     "status": "SKIP",
@@ -7826,12 +7798,11 @@
     "status": "PASS"
   },
   "test-pipe-head.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-pipe-outgoing-message-data-emitted-after-ended.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-pipe-return-val.js": {
     "status": "PASS"
@@ -7840,27 +7811,27 @@
     "status": "FAIL"
   },
   "test-pipe-unref.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-pipe-writev.js": {
     "status": "FAIL"
   },
   "test-preload-print-process-argv.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-preload-self-referential.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-preload-worker.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-preload.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-primitive-timer-leak.js": {
     "status": "FAIL"
@@ -7882,8 +7853,8 @@
     "reason": "uses worker threads"
   },
   "test-process-argv-0.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-process-available-memory.js": {
     "status": "FAIL"
@@ -7972,8 +7943,8 @@
     "status": "PASS"
   },
   "test-process-env.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-process-euid-egid.js": {
     "status": "SKIP",
@@ -7993,14 +7964,14 @@
   },
   "test-process-exec-argv.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-process-execpath.js": {
     "status": "FAIL"
   },
   "test-process-execve-abort.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-process-execve-no-args.js": {
     "status": "SKIP",
@@ -8035,16 +8006,16 @@
     "reason": "uses worker threads"
   },
   "test-process-exit-after-fetch-throw.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-process-exit-code-validation.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-process-exit-code.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-process-exit-from-before-exit.js": {
     "status": "PASS"
@@ -8060,15 +8031,15 @@
     "status": "PASS"
   },
   "test-process-external-stdio-close-spawn.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-process-external-stdio-close.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-process-features.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-process-finalization.mjs": {
     "status": "FAIL"
@@ -8101,8 +8072,7 @@
     "status": "PASS"
   },
   "test-process-getgroups.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-process-hrtime-bigint.js": {
     "status": "SKIP",
@@ -8117,8 +8087,8 @@
     "reason": "uses worker threads"
   },
   "test-process-kill-null.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-process-kill-pid.js": {
     "status": "FAIL"
@@ -8134,27 +8104,27 @@
     "status": "PASS"
   },
   "test-process-ppid.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-process-prototype.js": {
     "status": "FAIL"
   },
   "test-process-raw-debug.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-process-really-exit.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-process-redirect-warnings-env.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-process-redirect-warnings.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-process-ref-unref.js": {
     "status": "FAIL"
@@ -8163,8 +8133,8 @@
     "status": "PASS"
   },
   "test-process-remove-all-signal-listeners.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-process-setgroups.js": {
     "status": "SKIP",
@@ -8196,8 +8166,8 @@
     "reason": "uses worker threads"
   },
   "test-process-uncaught-exception-monitor.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-process-uptime.js": {
     "status": "PASS"
@@ -8206,8 +8176,7 @@
     "status": "FAIL"
   },
   "test-process-warning.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-process-warnings.mjs": {
     "status": "FAIL"
@@ -8234,57 +8203,57 @@
     "status": "FAIL"
   },
   "test-promise-reject-callback-exception.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-promise-swallowed-event.js": {
     "status": "FAIL"
   },
   "test-promise-unhandled-default.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promise-unhandled-error-with-reading-file.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promise-unhandled-error.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promise-unhandled-flag.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-promise-unhandled-issue-43655.js": {
     "status": "PASS"
   },
   "test-promise-unhandled-silent-no-hook.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promise-unhandled-silent.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promise-unhandled-throw-handler.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promise-unhandled-throw.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promise-unhandled-warn-no-hook.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promise-unhandled-warn.js": {
     "status": "FAIL"
   },
   "test-promises-unhandled-proxy-rejections.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promises-unhandled-rejections.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promises-unhandled-symbol-rejections.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-promises-warning-on-unhandled-rejection.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-punycode.js": {
     "status": "PASS"
@@ -8326,12 +8295,10 @@
     "status": "FAIL"
   },
   "test-readline-async-iterators-destroy.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-readline-async-iterators.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-readline-carriage-return-between-chunks.js": {
     "status": "PASS"
@@ -8346,7 +8313,7 @@
     "status": "PASS"
   },
   "test-readline-interface-escapecodetimeout.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-readline-interface-no-trailing-newline.js": {
     "status": "FAIL"
@@ -8361,7 +8328,7 @@
     "status": "FAIL"
   },
   "test-readline-line-separators.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-readline-position.js": {
     "status": "FAIL"
@@ -8400,12 +8367,11 @@
     "status": "FAIL"
   },
   "test-release-npm.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-repl-array-prototype-tempering.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-async-iife.js": {
     "status": "FAIL"
@@ -8417,16 +8383,16 @@
     "status": "FAIL"
   },
   "test-repl-clear-immediate-crash.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-cli-eval.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-close.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-repl-colors.js": {
     "status": "FAIL"
@@ -8450,8 +8416,8 @@
     "status": "FAIL"
   },
   "test-repl-dynamic-import.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-editor.js": {
     "status": "FAIL"
@@ -8472,8 +8438,8 @@
     "status": "FAIL"
   },
   "test-repl-harmony.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-history-dedup-multiline.js": {
     "status": "FAIL"
@@ -8488,12 +8454,12 @@
     "status": "FAIL"
   },
   "test-repl-import-referrer.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-inspect-defaults.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-inspector.js": {
     "status": "SKIP",
@@ -8536,16 +8502,16 @@
     "status": "FAIL"
   },
   "test-repl-options.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-permission-model.js": {
     "status": "SKIP",
     "reason": "needs the unsupported runtime flag --permission"
   },
   "test-repl-persistent-history.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-preprocess-top-level-await.js": {
     "status": "FAIL"
@@ -8572,30 +8538,30 @@
     "status": "SKIP"
   },
   "test-repl-programmatic-history-setup-history.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-programmatic-history.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-recoverable.js": {
     "status": "FAIL"
   },
   "test-repl-require-after-write.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-require-cache.js": {
     "status": "FAIL"
   },
   "test-repl-require-context.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-require-self-referential.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-repl-require.js": {
     "status": "SKIP",
@@ -8629,27 +8595,26 @@
     "status": "FAIL"
   },
   "test-repl-setprompt.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-sigint-nested-eval.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-repl-sigint.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-repl-stdin-push-null.js": {
     "status": "SKIP"
   },
   "test-repl-strict-mode-previews.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-repl-syntax-error-handling.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-repl-syntax-error-stack.js": {
     "status": "FAIL"
@@ -8675,8 +8640,8 @@
     "reason": "uses worker threads"
   },
   "test-repl-tab-complete-nested-repls.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-tab-complete-new-expression.js": {
     "status": "FAIL"
@@ -8716,8 +8681,8 @@
     "status": "FAIL"
   },
   "test-repl-uncaught-exception-standalone.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-uncaught-exception.js": {
     "status": "FAIL"
@@ -8726,16 +8691,16 @@
     "status": "FAIL"
   },
   "test-repl-unexpected-token-recoverable.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-unsafe-array-iteration.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-unsupported-option.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-repl-use-global.js": {
     "status": "FAIL"
@@ -8774,8 +8739,8 @@
     "status": "FAIL"
   },
   "test-require-invalid-main-no-exports.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-require-invalid-package.js": {
     "status": "PASS"
@@ -8787,7 +8752,8 @@
     "status": "SKIP"
   },
   "test-require-mjs.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --no-experimental-require-module"
   },
   "test-require-node-prefix.js": {
     "status": "FAIL"
@@ -8796,8 +8762,8 @@
     "status": "PASS"
   },
   "test-require-package-map.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-require-process.js": {
     "status": "PASS"
@@ -8814,7 +8780,7 @@
   },
   "test-require-symlink.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "needs the unsupported runtime flag --preserve-symlinks"
   },
   "test-require-unicode.js": {
     "status": "PASS"
@@ -8832,27 +8798,27 @@
     "status": "FAIL"
   },
   "test-runner-cli-concurrency.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-cli-randomize.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-cli-timeout.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-cli.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-complex-dependencies.mjs": {
     "status": "FAIL"
   },
   "test-runner-concurrency.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-coverage-default-exclusion.mjs": {
     "status": "PASS"
@@ -8861,27 +8827,25 @@
     "status": "PASS"
   },
   "test-runner-coverage-source-map.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-runner-coverage-thresholds.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-runner-coverage.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-custom-assertions.js": {
     "status": "PASS"
   },
   "test-runner-diagnostics-channel.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-enable-source-maps-issue.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-enqueue-file-syntax-error.js": {
     "status": "FAIL"
@@ -8890,15 +8854,15 @@
     "status": "FAIL"
   },
   "test-runner-error-reporter.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-execution-ordered-bypass.mjs": {
     "status": "FAIL"
   },
   "test-runner-exit-code.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-expect-error-but-pass.js": {
     "status": "FAIL"
@@ -8907,26 +8871,27 @@
     "status": "FAIL"
   },
   "test-runner-extraneous-async-activity.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-filetest-location.js": {
     "status": "FAIL"
   },
   "test-runner-filter-warning.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --test-only"
   },
   "test-runner-flag-propagation.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-force-exit-failure.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-force-exit-flush.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-get-test-context.js": {
     "status": "PASS"
@@ -8938,19 +8903,18 @@
     "status": "FAIL"
   },
   "test-runner-import-no-scheme.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-inspect.mjs": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-runner-log.mjs": {
     "status": "FAIL"
   },
   "test-runner-misc.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-runner-mock-dual-package.js": {
     "status": "SKIP",
@@ -8963,8 +8927,8 @@
     "status": "FAIL"
   },
   "test-runner-mock-timers-with-timeout.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-mock-timers.js": {
     "status": "FAIL"
@@ -8974,18 +8938,18 @@
   },
   "test-runner-module-mocking.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --experimental-test-module-mocks"
   },
   "test-runner-no-isolation-different-cwd.mjs": {
     "status": "FAIL"
   },
   "test-runner-no-isolation-filtering.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-no-isolation-hooks.mjs": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-no-isolation.mjs": {
     "status": "FAIL"
@@ -9003,8 +8967,8 @@
     "status": "FAIL"
   },
   "test-runner-reporters.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-root-after-with-refed-handles.js": {
     "status": "PASS"
@@ -9016,29 +8980,30 @@
     "status": "FAIL"
   },
   "test-runner-run-files-undefined.mjs": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-run-global-hooks.mjs": {
     "status": "FAIL"
   },
   "test-runner-run.mjs": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-seeded-generator.js": {
     "status": "FAIL"
   },
   "test-runner-snapshot-file-tests.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-snapshot-tests.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-source-maps-invalid-json.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --enable-source-maps"
   },
   "test-runner-string-to-regexp.js": {
     "status": "FAIL"
@@ -9071,15 +9036,15 @@
     "status": "FAIL"
   },
   "test-runner-test-rerun-failures.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-todo-skip-tests.js": {
     "status": "FAIL"
   },
   "test-runner-todo-suite-hook-failure.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-typechecking.js": {
     "status": "PASS"
@@ -9094,23 +9059,23 @@
     "status": "FAIL"
   },
   "test-runner-worker-id.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-runner-xfail.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-safe-get-env.js": {
     "status": "FAIL"
   },
   "test-security-revert-unknown.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-set-http-max-http-headers.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-set-incoming-message-header.js": {
     "status": "FAIL"
@@ -9121,45 +9086,53 @@
   },
   "test-setproctitle.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-shadow-realm-allowed-builtin-modules.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --experimental-shadow-realm"
   },
   "test-shadow-realm-custom-loaders.js": {
-    "status": "SKIP",
+    "status": "FAIL",
+    "wasm_status": "SKIP",
     "reason": "spawns child processes"
   },
   "test-shadow-realm-gc-module.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --experimental-shadow-realm"
   },
   "test-shadow-realm-gc.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --experimental-shadow-realm"
   },
   "test-shadow-realm-globals.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --experimental-shadow-realm"
   },
   "test-shadow-realm-import-value-resolve.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --experimental-shadow-realm"
   },
   "test-shadow-realm-module.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --experimental-shadow-realm"
   },
   "test-shadow-realm-preload-module.js": {
-    "status": "SKIP",
+    "status": "FAIL",
+    "wasm_status": "SKIP",
     "reason": "spawns child processes"
   },
   "test-shadow-realm-prepare-stack-trace.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --experimental-shadow-realm"
   },
   "test-shadow-realm.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --experimental-shadow-realm"
   },
   "test-sigint-infinite-loop.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-signal-args.js": {
     "status": "SKIP",
@@ -9176,14 +9149,14 @@
     "status": "FAIL"
   },
   "test-signal-unregister.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-socket-address.js": {
     "status": "FAIL"
   },
   "test-socket-options-invalid.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-socket-write-after-fin-error.js": {
     "status": "PASS"
@@ -9198,22 +9171,22 @@
     "status": "FAIL"
   },
   "test-source-map-api.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --enable-source-maps"
   },
   "test-source-map-cjs-require-cache.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --enable-source-maps"
   },
   "test-source-map-enable.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-source-map-invalid-url.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "needs the unsupported runtime flag --enable-source-maps"
   },
   "test-spawn-cmd-named-pipe.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-sqlite-aggregate-function.mjs": {
     "status": "SKIP"
@@ -9247,7 +9220,7 @@
   },
   "test-sqlite-session.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --experimental-sqlite"
   },
   "test-sqlite-statement-sync-columns.js": {
     "status": "SKIP"
@@ -9272,31 +9245,31 @@
     "status": "SKIP"
   },
   "test-stack-size-limit.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-startup-empty-regexp-statics.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-startup-empty-regexp-statics.mjs": {
     "status": "FAIL"
   },
   "test-startup-large-pages.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdin-child-proc.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-stdin-from-file-spawn.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-stdin-from-file.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdin-hang.js": {
     "status": "PASS"
@@ -9308,69 +9281,69 @@
     "status": "PASS"
   },
   "test-stdin-pipe-large.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-stdin-pipe-resume.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-stdin-resume-pause.js": {
     "status": "FAIL"
   },
   "test-stdin-script-child-option.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdin-script-child.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdio-closed.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-stdio-pipe-access.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-stdio-pipe-redirect.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-stdio-pipe-stderr.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdio-undestroy.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdout-cannot-be-closed-child-process-pipe.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdout-close-catch.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdout-close-unref.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stdout-pipeline-destroy.js": {
     "status": "PASS"
   },
   "test-stdout-stderr-reading.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-stdout-stderr-write.js": {
     "status": "PASS"
   },
   "test-stdout-to-file.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-stream-add-abort-signal.js": {
     "status": "PASS"
@@ -9511,7 +9484,8 @@
     "status": "FAIL"
   },
   "test-stream-iter-disabled.js": {
-    "status": "FAIL"
+    "status": "PASS",
+    "wasm_status": "FAIL"
   },
   "test-stream-iter-duplex.js": {
     "status": "FAIL"
@@ -9697,8 +9671,8 @@
     "status": "FAIL"
   },
   "test-stream-pipeline-process.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-stream-pipeline-queued-end-in-destroy.js": {
     "status": "PASS"
@@ -9734,8 +9708,7 @@
     "status": "PASS"
   },
   "test-stream-readable-async-iterators.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-stream-readable-compose.js": {
     "status": "FAIL"
@@ -9934,8 +9907,7 @@
     "status": "PASS"
   },
   "test-stream-writable-change-default-encoding.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-stream-writable-clear-buffer.js": {
     "status": "PASS"
@@ -10088,8 +10060,7 @@
     "status": "PASS"
   },
   "test-stream2-readable-wrap-proxy-methods.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-stream2-readable-wrap.js": {
     "status": "PASS"
@@ -10146,11 +10117,11 @@
     "status": "PASS"
   },
   "test-sync-io-option.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-sys.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-tcp-wrap-connect.js": {
     "status": "FAIL"
@@ -10168,8 +10139,8 @@
     "status": "FAIL"
   },
   "test-tick-processor-arguments.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-tick-processor-version-check.js": {
     "status": "FAIL"
@@ -10209,8 +10180,8 @@
     "reason": "needs the unsupported runtime flag --allow-natives-syntax"
   },
   "test-timers-immediate-promisified.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-timers-immediate-queue-throw.js": {
     "status": "FAIL"
@@ -10232,8 +10203,8 @@
     "status": "PASS"
   },
   "test-timers-interval-promisified.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-timers-interval-throw.js": {
     "status": "PASS"
@@ -10254,15 +10225,15 @@
     "status": "PASS"
   },
   "test-timers-nan-duration-warning.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-timers-negative-duration-warning-emit-once-per-process.js": {
     "status": "PASS"
   },
   "test-timers-negative-duration-warning.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-timers-nested.js": {
     "status": "PASS"
@@ -10299,7 +10270,7 @@
     "status": "PASS"
   },
   "test-timers-reset-process-domain-on-throw.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-timers-same-timeout-wrong-list-deleted.js": {
     "status": "PASS"
@@ -10317,8 +10288,8 @@
     "status": "PASS"
   },
   "test-timers-timeout-promisified.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-timers-timeout-to-interval.js": {
     "status": "FAIL"
@@ -10372,15 +10343,13 @@
     "status": "SKIP"
   },
   "test-tls-alert.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-alpn-protocols-validation.js": {
     "status": "SKIP"
   },
   "test-tls-alpn-server-client.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-async-cb-after-socket-end.js": {
     "status": "SKIP"
@@ -10416,30 +10385,34 @@
     "status": "SKIP"
   },
   "test-tls-cipher-list.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-cli-max-version-1.2.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --tls-max-v1.2"
   },
   "test-tls-cli-max-version-1.3.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --tls-max-v1.3"
   },
   "test-tls-cli-min-max-conflict.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-cli-min-version-1.0.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --tls-min-v1.0"
   },
   "test-tls-cli-min-version-1.1.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --tls-min-v1.1"
   },
   "test-tls-cli-min-version-1.2.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --tls-min-v1.2"
   },
   "test-tls-cli-min-version-1.3.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --tls-min-v1.3"
   },
   "test-tls-client-abort.js": {
     "status": "SKIP"
@@ -10505,7 +10478,8 @@
     "status": "SKIP"
   },
   "test-tls-cnnic-whitelist.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --use-bundled-ca"
   },
   "test-tls-connect-abort-controller.js": {
     "status": "SKIP"
@@ -10565,8 +10539,7 @@
     "status": "SKIP"
   },
   "test-tls-dhe.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-dhparam-auto-boringssl.js": {
     "status": "SKIP"
@@ -10575,16 +10548,13 @@
     "status": "SKIP"
   },
   "test-tls-ecdh-auto.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-ecdh-multiple.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-ecdh.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-econnreset.js": {
     "status": "SKIP"
@@ -10593,32 +10563,26 @@
     "status": "SKIP"
   },
   "test-tls-enable-keylog-cli.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-enable-trace-cli.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-enable-trace.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-env-bad-extra-ca.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-env-extra-ca-no-crypto.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-tls-env-extra-ca-with-options.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-env-extra-ca.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-error-servername.js": {
     "status": "SKIP"
@@ -10645,7 +10609,8 @@
     "status": "SKIP"
   },
   "test-tls-get-ca-certificates-bundled-subset.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --no-use-openssl-ca"
   },
   "test-tls-get-ca-certificates-bundled.js": {
     "status": "SKIP"
@@ -10657,35 +10622,32 @@
     "status": "SKIP"
   },
   "test-tls-get-ca-certificates-extra-empty.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-get-ca-certificates-extra-subset.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-get-ca-certificates-extra.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-get-ca-certificates-node-use-system-ca.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-get-ca-certificates-system-without-flag.js": {
     "status": "SKIP",
     "reason": "spawns child processes"
   },
   "test-tls-get-ca-certificates-system.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --use-system-ca"
   },
   "test-tls-get-ca-certificates-worker-no-use-system-ca.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --no-use-system-ca"
   },
   "test-tls-get-ca-certificates-worker-use-system-ca.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --no-use-system-ca"
   },
   "test-tls-getcertificate-x509.js": {
     "status": "SKIP"
@@ -10700,8 +10662,7 @@
     "status": "SKIP"
   },
   "test-tls-handshake-exception.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-hello-parser-failure.js": {
     "status": "SKIP"
@@ -10782,8 +10743,7 @@
     "status": "SKIP"
   },
   "test-tls-no-sslv3.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-ocsp-callback.js": {
     "status": "SKIP"
@@ -10837,8 +10797,7 @@
     "status": "SKIP"
   },
   "test-tls-psk-server.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-reduced-SECLEVEL-in-cipher.js": {
     "status": "SKIP"
@@ -10880,12 +10839,10 @@
     "status": "SKIP"
   },
   "test-tls-server-verify.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-session-cache.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-session-reuse-different-servername.js": {
     "status": "SKIP"
@@ -10900,13 +10857,15 @@
     "status": "SKIP"
   },
   "test-tls-set-default-ca-certificates-append-fetch.mjs": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --no-use-system-ca"
   },
   "test-tls-set-default-ca-certificates-append-https-request.js": {
     "status": "SKIP"
   },
   "test-tls-set-default-ca-certificates-array-buffer.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --no-use-system-ca"
   },
   "test-tls-set-default-ca-certificates-basic.js": {
     "status": "SKIP"
@@ -10915,8 +10874,7 @@
     "status": "SKIP"
   },
   "test-tls-set-default-ca-certificates-extra-override.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-set-default-ca-certificates-mixed-types.js": {
     "status": "SKIP"
@@ -10931,7 +10889,8 @@
     "status": "SKIP"
   },
   "test-tls-set-default-ca-certificates-reset-fetch.mjs": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --no-use-system-ca"
   },
   "test-tls-set-default-ca-certificates-reset-https-request.js": {
     "status": "SKIP"
@@ -11028,8 +10987,7 @@
     "status": "SKIP"
   },
   "test-tls-wrap-econnreset-pipe.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-tls-wrap-econnreset-socket.js": {
     "status": "SKIP"
@@ -11077,24 +11035,24 @@
     "status": "SKIP"
   },
   "test-uncaught-exception-handler-stack-overflow-on-stack-overflow.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-uncaught-exception-handler-stack-overflow.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-unhandled-exception-rethrow-error.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-unhandled-exception-with-worker-inuse.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-unicode-node-options.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-url-domain-ascii-unicode.js": {
     "status": "PASS"
@@ -11103,8 +11061,7 @@
     "status": "PASS"
   },
   "test-url-format-invalid-input.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-url-format-whatwg.js": {
     "status": "PASS"
@@ -11113,22 +11070,21 @@
     "status": "PASS"
   },
   "test-url-invalid-file-url-path-input.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-url-is-url-internal.js": {
     "status": "PASS"
   },
   "test-url-parse-deprecation.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-url-parse-format.js": {
     "status": "PASS"
   },
   "test-url-parse-invalid-input.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-url-parse-query.js": {
     "status": "PASS"
@@ -11146,7 +11102,7 @@
     "status": "PASS"
   },
   "test-urlpattern-invalidthis.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-urlpattern-types.js": {
     "status": "FAIL"
@@ -11158,8 +11114,8 @@
     "status": "PASS"
   },
   "test-util-callbackify.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-util-convert-signal-to-exit-code.mjs": {
     "status": "FAIL"
@@ -11183,19 +11139,17 @@
     "status": "PASS"
   },
   "test-util-getcallsites-sourcemap.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-util-getcallsites.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-util-inherits.js": {
     "status": "FAIL"
   },
   "test-util-inspect-getters-accessing-this.js": {
-    "status": "PASS",
-    "wasm_status": "FAIL"
+    "status": "PASS"
   },
   "test-util-inspect-long-running.js": {
     "status": "FAIL"
@@ -11276,7 +11230,8 @@
     "reason": "uses worker threads"
   },
   "test-v8-collect-gc-profile-minor-ms.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --minor-ms"
   },
   "test-v8-collect-gc-profile-using.js": {
     "status": "FAIL"
@@ -11285,8 +11240,7 @@
     "status": "FAIL"
   },
   "test-v8-coverage.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-v8-cpu-profile.js": {
     "status": "FAIL"
@@ -11295,7 +11249,8 @@
     "status": "FAIL"
   },
   "test-v8-flag-pool-size-0.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --v8-pool-size=0"
   },
   "test-v8-flag-type-check.js": {
     "status": "FAIL"
@@ -11325,19 +11280,16 @@
     "status": "FAIL"
   },
   "test-v8-stop-coverage.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-v8-string-is-one-byte-representation.js": {
     "status": "FAIL"
   },
   "test-v8-take-coverage-noop.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-v8-take-coverage.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-v8-version-tag.js": {
     "status": "FAIL"
@@ -11353,8 +11305,8 @@
     "wasm_status": "FAIL"
   },
   "test-vm-api-handles-getter-errors.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-vm-attributes-property-not-on-sandbox.js": {
     "status": "PASS"
@@ -11363,8 +11315,8 @@
     "status": "FAIL"
   },
   "test-vm-cached-data.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-vm-codegen.js": {
     "status": "FAIL"
@@ -11523,19 +11475,24 @@
     "status": "FAIL"
   },
   "test-vm-module-link.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --harmony-import-attributes"
   },
   "test-vm-module-linkmodulerequests-circular.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --js-source-phase-imports"
   },
   "test-vm-module-linkmodulerequests-deep.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --js-source-phase-imports"
   },
   "test-vm-module-linkmodulerequests.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --js-source-phase-imports"
   },
   "test-vm-module-modulerequests.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --js-source-phase-imports"
   },
   "test-vm-module-reevaluate.js": {
     "status": "FAIL"
@@ -11601,12 +11558,12 @@
     "status": "PASS"
   },
   "test-vm-sigint-existing-handler.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-vm-sigint.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-vm-source-map-url.js": {
     "status": "PASS"
@@ -11624,12 +11581,12 @@
     "status": "PASS"
   },
   "test-vm-syntax-error-message.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "PASS",
+    "wasm_status": "SKIP"
   },
   "test-vm-syntax-error-stderr.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-vm-timeout-escape-promise-2.js": {
     "status": "FAIL"
@@ -11652,7 +11609,7 @@
   },
   "test-warn-sigprof.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --inspect=0"
   },
   "test-warn-stream-wrap.js": {
     "status": "FAIL"
@@ -11813,8 +11770,7 @@
     "status": "SKIP"
   },
   "test-webcrypto-prototype-pollution.mjs": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-webcrypto-random.js": {
     "status": "SKIP"
@@ -11856,13 +11812,14 @@
     "status": "SKIP"
   },
   "test-websocket-disabled.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-websocket.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-webstorage-without-sqlite.js": {
-    "status": "FAIL"
+    "status": "SKIP",
+    "reason": "needs the unsupported runtime flag --experimental-webstorage"
   },
   "test-webstorage.js": {
     "status": "SKIP"
@@ -11889,7 +11846,7 @@
     "status": "FAIL"
   },
   "test-webstreams-adapters-writable-buffer-sources.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-webstreams-clone-unref.js": {
     "status": "FAIL"
@@ -11898,7 +11855,7 @@
     "status": "FAIL"
   },
   "test-webstreams-compression-bad-chunks.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-webstreams-compression-buffer-source.js": {
     "status": "FAIL"
@@ -11925,7 +11882,7 @@
     "status": "PASS"
   },
   "test-whatwg-encoding-custom-fatal-streaming.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-encoding-custom-internals.js": {
     "status": "FAIL"
@@ -11934,22 +11891,22 @@
     "status": "FAIL"
   },
   "test-whatwg-encoding-custom-textdecoder-api-invalid-label.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-encoding-custom-textdecoder-fatal.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-encoding-custom-textdecoder-ignorebom.js": {
     "status": "PASS"
   },
   "test-whatwg-encoding-custom-textdecoder-invalid-arg.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-encoding-custom-textdecoder-streaming.js": {
     "status": "PASS"
   },
   "test-whatwg-encoding-custom-textdecoder-utf16-surrogates.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-encoding-custom-textdecoder.js": {
     "status": "FAIL"
@@ -11976,7 +11933,7 @@
     "status": "FAIL"
   },
   "test-whatwg-readablebytestream-bad-buffers-and-views.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-readablebytestream.js": {
     "status": "FAIL"
@@ -12016,7 +11973,7 @@
     "status": "FAIL"
   },
   "test-whatwg-url-custom-parsing.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-custom-properties.js": {
     "status": "FAIL"
@@ -12031,10 +11988,10 @@
     "status": "FAIL"
   },
   "test-whatwg-url-custom-searchparams-entries.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-custom-searchparams-foreach.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-custom-searchparams-get.js": {
     "status": "FAIL"
@@ -12049,7 +12006,7 @@
     "status": "FAIL"
   },
   "test-whatwg-url-custom-searchparams-keys.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-custom-searchparams-set.js": {
     "status": "FAIL"
@@ -12058,13 +12015,13 @@
     "status": "PASS"
   },
   "test-whatwg-url-custom-searchparams-stringifier.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-custom-searchparams-values.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-custom-searchparams.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-custom-setters.js": {
     "status": "FAIL"
@@ -12073,13 +12030,13 @@
     "status": "PASS"
   },
   "test-whatwg-url-invalidthis.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-override-hostname.js": {
     "status": "PASS"
   },
   "test-whatwg-url-parse-fast-path.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-whatwg-url-properties.js": {
     "status": "FAIL"
@@ -12131,12 +12088,10 @@
     "status": "FAIL"
   },
   "test-windows-abort-exitcode.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-windows-failed-heap-allocation.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "SKIP"
   },
   "test-worker-abort-on-uncaught-exception-terminate.js": {
     "status": "SKIP",
@@ -12312,7 +12267,7 @@
   },
   "test-worker-init-failure.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-worker-internal-modules.mjs": {
     "status": "SKIP",
@@ -12459,7 +12414,7 @@
   },
   "test-worker-message-type-unknown.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-worker-messageport-hasref.js": {
     "status": "SKIP",
@@ -12491,7 +12446,7 @@
   },
   "test-worker-nearheaplimit-deadlock.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --no-node-snapshot"
   },
   "test-worker-nested-on-process-exit.js": {
     "status": "SKIP",
@@ -12507,15 +12462,15 @@
   },
   "test-worker-no-sab.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --enable-sharedarraybuffer-per-context"
   },
   "test-worker-no-stdin-stdout-interaction.js": {
     "status": "SKIP",
     "reason": "uses worker threads"
   },
   "test-worker-node-options.js": {
-    "status": "SKIP",
-    "reason": "spawns child processes"
+    "status": "FAIL",
+    "wasm_status": "SKIP"
   },
   "test-worker-non-fatal-uncaught-exception.js": {
     "status": "SKIP",
@@ -12523,7 +12478,7 @@
   },
   "test-worker-on-process-exit.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-worker-onmessage-not-a-function.js": {
     "status": "SKIP",
@@ -12551,7 +12506,7 @@
   },
   "test-worker-process-env.js": {
     "status": "SKIP",
-    "reason": "spawns child processes"
+    "reason": "uses worker threads"
   },
   "test-worker-process-exit-async-module.js": {
     "status": "SKIP",
@@ -12583,7 +12538,7 @@
   },
   "test-worker-sharedarraybuffer-from-worker-thread.js": {
     "status": "SKIP",
-    "reason": "uses worker threads"
+    "reason": "needs the unsupported runtime flag --debug-arraybuffer-allocations"
   },
   "test-worker-stack-overflow-stack-size.js": {
     "status": "SKIP",
@@ -12735,7 +12690,7 @@
     "status": "FAIL"
   },
   "test-zlib-brotli-flush-invalid-kind.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-zlib-brotli-flush.js": {
     "status": "PASS"
@@ -12753,7 +12708,7 @@
     "status": "FAIL"
   },
   "test-zlib-close-after-error.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-zlib-close-after-write.js": {
     "status": "PASS"
@@ -12774,7 +12729,7 @@
     "status": "PASS"
   },
   "test-zlib-deflate-constructors.js": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "test-zlib-deflate-raw-inherits.js": {
     "status": "PASS"

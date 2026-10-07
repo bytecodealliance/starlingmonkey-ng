@@ -242,19 +242,14 @@ pub(crate) fn register_implemented_with<T: core_runtime::module::NativeModule>(
     name: &'static str,
     overrides: &[(&'static str, HandleValue<'_>)],
 ) -> bool {
-    use core_runtime::module::{DefaultExport, ModuleExport};
+    use core_runtime::module::ModuleExport;
     let declared: Vec<&str> = T::declarations()
         .iter()
         .map(|decl| match decl {
             ModuleExport::Function { js_name, .. } | ModuleExport::Value { js_name } => *js_name,
         })
         .chain(T::MIRRORED_EXPORTS.iter().copied())
-        .chain(match T::DEFAULT_EXPORT {
-            DefaultExport::Namespace {
-                self_export: Some(name),
-            } => Some(name),
-            _ => None,
-        })
+        .chain(T::DEFAULT_EXPORT.self_export())
         .collect();
     let mut extra: Vec<(&str, HandleValue<'_>)> = overrides.to_vec();
     for &(export, kind) in exports_of(name).unwrap_or_default() {
@@ -280,6 +275,26 @@ pub(crate) fn register_implemented_with<T: core_runtime::module::NativeModule>(
         }
     };
     fixed().is_ok()
+}
+
+/// The `default` export of the registered module `name`, with the properties `order` names moved
+/// after its other properties, in that order. An `order` that lists every property gives the
+/// `default` export that order.
+pub(crate) fn order_default_export<'s>(
+    scope: &'s Scope<'_>,
+    name: &str,
+    order: &[&'static std::ffi::CStr],
+) -> Result<Object<'s>, ExnThrown> {
+    let default = core_runtime::module::builtin_namespace(scope, name)?
+        .ok_or(ExnThrown)?
+        .get_property(scope, c"default")?;
+    let default = Object::from_value(scope, *default).map_err(|error| error.throw(scope))?;
+    for &key in order {
+        let value = default.get_property(scope, key)?;
+        default.delete_property(scope, key)?;
+        default.set_property(scope, key, value)?;
+    }
+    Ok(default)
 }
 
 /// The body of every stub function: throw `ERR_METHOD_NOT_IMPLEMENTED` naming the export, which

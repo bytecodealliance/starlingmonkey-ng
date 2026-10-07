@@ -265,10 +265,14 @@ fn socket_on_data(
     else {
         return Ok(js::value::undefined());
     };
-    {
+    let fed = {
         let mut data = handle.data_mut();
         let parser = &mut data.parser;
-        view.with_bytes(|bytes| parser.feed(bytes));
+        view.with_bytes(|bytes| parser.feed(bytes))
+    };
+    if fed.is_err() {
+        js::exception::report_out_of_memory(scope);
+        return Err(ExnThrown);
     }
     let tcp = crate::net::socket::is_tcp(scope, socket)?;
     loop {
@@ -612,8 +616,14 @@ fn on_incoming(
                 on_pending_data: state.data().pending_data.get(scope),
             };
             let reject = js::conversion::to_boolean(reject);
-            let res =
-                super::outgoing::new_response(scope, req, Some(fields), high_water_mark, reject)?;
+            let res = super::outgoing::new_response(
+                scope,
+                req,
+                None,
+                Some(fields),
+                high_water_mark,
+                reject,
+            )?;
             super::outgoing::state_of(scope, res)?.data_mut().connection = Some(Heap::from(state));
             res
         }
@@ -797,13 +807,7 @@ fn res_on_finish(
     )?;
     clear_incoming(scope, state, req)?;
     js::jobs::queue_native_tick(scope, emit_close_tick, res, &[])?;
-    let (waiting, next) = {
-        let mut data = state.data_mut();
-        let waiting = !data.outgoing.is_empty();
-        let next = data.outgoing.front().map(|next| next.get(scope));
-        drop(data.outgoing.pop_front());
-        (waiting, next)
-    };
+    let waiting = !state.data().outgoing.is_empty();
     if js::conversion::to_boolean(res.get_property(scope, c"_last")?) {
         destroy_soon(scope, socket)?;
     } else if !waiting {
@@ -839,7 +843,16 @@ fn res_on_finish(
             Function::call_by_name(scope, socket.handle(), c"setTimeout", &[delay])?;
             state.data_mut().keep_alive_timeout_set = true;
         }
-    } else if let Some(next) = next {
+    } else {
+        let next = {
+            let mut data = state.data_mut();
+            let next = data.outgoing.front().map(|next| next.get(scope));
+            drop(data.outgoing.pop_front());
+            next
+        };
+        let Some(next) = next else {
+            return Ok(js::value::undefined());
+        };
         Function::call_by_name(
             scope,
             next.handle(),
@@ -1091,7 +1104,7 @@ fn socket_error(
         crate::events::listen(scope, socket, c"removeListener", c"error", listener)?;
     }
     let error_event = js::class::get_or_init_atom(scope, c"error")?;
-    let noop = crate::support::noop_function(scope)?;
+    let noop = crate::support::nop(scope)?;
     let noops = Function::call_by_name(
         scope,
         socket.handle(),

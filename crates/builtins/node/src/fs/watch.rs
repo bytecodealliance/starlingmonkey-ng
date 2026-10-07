@@ -485,7 +485,9 @@ enum Found {
 }
 
 /// The body of a poll timer, whose payload is the handle: poll, queue the next poll, and pass
-/// what changed to the handle's `onchange`, until it is closed.
+/// what changed to the handle's `onchange`, until it is closed. A stat event with status
+/// -1 that follows one with status -1 isn't passed if its two stats have the same link count, as
+/// Node's `onchange` ignores it.
 fn poll(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
@@ -577,6 +579,10 @@ fn poll(
             }
         }
         Some(Found::Stat(Some((status, current, previous)))) => {
+            let old_status = handle.data().old_status;
+            if old_status == -1 && status == -1 && current.nlink == previous.nlink {
+                return Ok(js::value::undefined());
+            }
             let status = scope.root_value(js::value::from_f64(f64::from(status)));
             let current = super::classes::stats_value(scope, &current)?;
             let previous = super::classes::stats_value(scope, &previous)?;
@@ -719,53 +725,102 @@ fn create_ignore_matcher<'s>(
     if ignore.is_null_or_undefined() {
         return Ok(scope.root_value(js::value::null()));
     }
-    let matchers = js::Array::new(scope, 0)?;
-    let object = Object::from_value(scope, *ignore).ok();
-    match object {
-        Some(array) if js::Array::is_array(scope, array.handle())? => {
+    let elements = match Object::from_value(scope, *ignore) {
+        Ok(array) if js::Array::is_array(scope, array.handle())? => {
             let length = array.num(scope, c"length")? as u32;
-            for index in 0..length {
-                matchers.set_element(scope, index, array.get_element(scope, index)?)?;
-            }
+            (0..length)
+                .map(|index| array.get_element(scope, index))
+                .collect::<Result<Vec<_>, _>>()?
         }
-        _ => matchers.set_element(scope, 0, ignore)?,
+        _ => vec![ignore],
+    };
+    let options = GlobOptions {
+        nocase: platform_nocase(),
+        nocase_magic_only: false,
+        match_base: true,
+    };
+    let matcher =
+        js::class::create_instance_with::<IgnoreMatcherImpl>(scope, |_| IgnoreMatcherImpl {
+            patterns: Vec::new(),
+        })?;
+    for element in elements {
+        if element.is_string() {
+            let pattern = String::from_jsval(scope, element, ()).map_err(|e| e.throw(scope))?;
+            matcher
+                .data_mut()
+                .patterns
+                .push(IgnorePattern::Glob(Glob::new(scope, &pattern, options)?));
+        } else if js::function::is_callable(element) {
+            matcher
+                .data_mut()
+                .patterns
+                .push(IgnorePattern::Function(Heap::from(element.get())));
+        } else {
+            matcher
+                .data_mut()
+                .patterns
+                .push(IgnorePattern::RegExp(Heap::from(element.get())));
+        }
     }
-    Function::new_callback(scope, c"", 1, ignore_matches, *matchers)?.to_jsval_throwing(scope)
+    Function::new_callback(scope, c"", 1, ignore_matches, matcher)?.to_jsval_throwing(scope)
 }
 
-/// The body of an ignore matcher, whose payload is the array of patterns: whether the filename argument
-/// matches a pattern.
+/// One pattern of an `ignore` option.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+enum IgnorePattern {
+    /// A glob pattern, compiled as minimatch compiles it with `matchBase`.
+    Glob(Glob),
+    /// A `RegExp`, which matches if `RegExp.prototype.exec` returns non-`null`.
+    RegExp(Heap<Value>),
+    /// A function, which matches if it returns a truthy value.
+    Function(Heap<Value>),
+}
+
+/// The payload of an ignore matcher: the patterns of its `ignore` option, in order.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct IgnoreMatcher {
+    patterns: Vec<IgnorePattern>,
+}
+
+#[core_runtime::jsmethods]
+impl IgnoreMatcher {}
+
+/// The body of an ignore matcher, whose payload is an [`IgnoreMatcher`]: whether the filename
+/// argument matches one of its patterns, tried in order.
 fn ignore_matches(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let matchers = cast_payload::<Object>(scope, payload);
+    let matcher = cast_payload::<IgnoreMatcher>(scope, payload);
     let filename = args.get(0);
-    let length = matchers.num(scope, c"length")? as u32;
-    for index in 0..length {
-        let matcher = matchers.get_element(scope, index)?;
-        let hit = if matcher.is_string() {
-            let pattern = String::from_jsval(scope, matcher, ()).map_err(|e| e.throw(scope))?;
-            let text = js::JSString::from_value(scope, filename)?.to_utf8(scope)?;
-            let options = GlobOptions {
-                nocase: platform_nocase(),
-                nocase_magic_only: false,
-                match_base: true,
-            };
-            Glob::new(scope, &pattern, options)?.matches(scope, &text)?
-        } else {
-            let object = Object::from_value(scope, *matcher).map_err(|e| e.throw(scope))?;
-            if object.is_callable() {
-                js::conversion::to_boolean(Function::call(
-                    scope,
-                    HandleValue::undefined(),
-                    matcher,
-                    &[filename],
-                )?)
-            } else {
-                !Function::call_by_name(scope, object.handle(), c"exec", &[filename])?.is_null()
+    let count = matcher.data().patterns.len();
+    for index in 0..count {
+        let function = {
+            let data = matcher.data();
+            match &data.patterns[index] {
+                IgnorePattern::Glob(_) => None,
+                IgnorePattern::RegExp(regexp) => Some((regexp.get(scope), true)),
+                IgnorePattern::Function(function) => Some((function.get(scope), false)),
             }
+        };
+        let hit = match function {
+            None => {
+                let text = js::JSString::from_value(scope, filename)?.to_utf8(scope)?;
+                let data = matcher.data();
+                match &data.patterns[index] {
+                    IgnorePattern::Glob(glob) => glob.matches(scope, &text)?,
+                    _ => false,
+                }
+            }
+            Some((regexp, true)) => crate::inspect::regexp_exec_matches(scope, regexp, filename)?,
+            Some((function, false)) => js::conversion::to_boolean(Function::call(
+                scope,
+                HandleValue::undefined(),
+                function,
+                &[filename],
+            )?),
         };
         if hit {
             return Ok(js::value::from_bool(true));
@@ -1496,18 +1551,12 @@ fn stat_onchange(
     let change = cast_payload::<StatChange>(scope, payload);
     let watcher = change.data().watcher.get(scope);
     let handle = change.data().handle.get(scope);
-    let status = args.get(0).to_number() as i32;
+    let status = args.get(0);
     let current = args.get(1);
     let previous = args.get(2);
-    let nlink = |stats: HandleValue<'_>| -> Result<f64, ExnThrown> {
-        Object::from_value(scope, *stats)
-            .map_err(|e| e.throw(scope))?
-            .num(scope, c"nlink")
-    };
-    if handle.data().old_status == -1 && status == -1 && nlink(current)? == nlink(previous)? {
-        return Ok(js::value::undefined());
+    if status.is_number() {
+        handle.data_mut().old_status = status.to_number() as i32;
     }
-    handle.data_mut().old_status = status;
     crate::events::emit(scope, watcher, c"change", &[current, previous])?;
     Ok(js::value::undefined())
 }

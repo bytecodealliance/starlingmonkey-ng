@@ -446,6 +446,7 @@ eq({} instanceof Writable, false, "plain objects aren't Writables");
   throws(() => new stream.Stream().pipe(5), TypeError, "legacy pipe to a primitive throws a TypeError");
   throws(() => finished(new Readable()), "ERR_INVALID_ARG_TYPE", "finished needs a callback");
   throws(() => stream.addAbortSignal(new AbortController().signal), "ERR_INVALID_ARG_TYPE", "addAbortSignal needs a stream");
+  throws(() => stream.addAbortSignal(Object.assign(() => {}, { aborted: false }), new Readable()), "ERR_INVALID_ARG_TYPE", "addAbortSignal rejects a function as the signal");
   eq(stream.destroy(), undefined, "destroy without a stream does nothing");
   const unbuffered = new Readable({ read() {} });
   unbuffered._readableState.buffer = null;

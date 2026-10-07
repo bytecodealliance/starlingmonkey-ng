@@ -14,11 +14,12 @@ use js::Object;
 use platform::fs::{FileKind, Stat};
 
 use super::{
-    data_arg, encoding_option, fd_arg, flag_option, flags_arg, mode_arg, option, path_arg,
-    remove_file, target_arg, Entry, Finish, Handle, Output, Prepared, Target, UvError, Variant,
+    boolean_option, data_arg, encoding_option, fd_arg, flag_option, flags_arg, mode_arg, option,
+    path_arg, remove_file, target_arg, Entry, Finish, Handle, Output, Prepared, Target, UvError,
+    Variant,
 };
 use crate::buffer::Encoding;
-use crate::errors::{validate_integer, NodeError, Thrown};
+use crate::errors::{validate_integer, ErrorKind, NodeError, Thrown};
 
 pub(super) const SYNC: u8 = 1;
 pub(super) const CALLBACK: u8 = 2;
@@ -174,8 +175,9 @@ fn handle_arg(
 
 /// The position the argument `value` gives: `None` for `null`, `undefined` or -1, which read or
 /// write at the current position. A read of `read_length` bytes takes an integer or a `bigint`
-/// from -1 and throws for other values, as Node's `validatePosition` does. A write takes an
-/// integer from -1, and writes at the current position for values that aren't numbers.
+/// from -1 and throws for other values, as Node's `validatePosition` does. A write takes a safe
+/// integer from 0, and writes at the current position for other values, as Node's C++
+/// `GetOffset` reads it.
 fn position_arg(
     scope: &Scope<'_>,
     value: Option<HandleValue<'_>>,
@@ -184,6 +186,13 @@ fn position_arg(
     let Some(value) = value.filter(|value| !value.is_null() && !value.is_undefined()) else {
         return Ok(None);
     };
+    if read_length.is_none() {
+        let position = value.is_number().then(|| value.to_number());
+        let safe = |position: &f64| {
+            position.fract() == 0.0 && (0.0..=crate::errors::MAX_SAFE_INTEGER).contains(position)
+        };
+        return Ok(position.filter(safe).map(|position| position as u64));
+    }
     if value.is_number() {
         let number = validate_integer(
             scope,
@@ -231,14 +240,19 @@ fn position_arg(
     }
 }
 
-/// The time the argument `value` gives, as Node's `toUnixTimestamp` reads it: seconds since the
-/// epoch as a finite number, where negative numbers give the current time, a string that converts
-/// to a number, or a `Date`. `None` leaves the time unchanged, which an invalid `Date` does.
-fn time_arg(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<Option<SystemTime>, Thrown> {
+/// The time the argument `value`, named `name`, gives, as Node's `toUnixTimestamp` reads it:
+/// seconds since the epoch as a finite number, where negative numbers give the current time, a
+/// string that converts to a number, or a `Date`. `None` leaves the time unchanged, which an
+/// invalid `Date` does.
+fn time_arg(
+    scope: &Scope<'_>,
+    value: HandleValue<'_>,
+    name: &str,
+) -> Result<Option<SystemTime>, Thrown> {
     let invalid = || -> Thrown {
         NodeError::invalid_arg_type(
             scope,
-            "time",
+            name,
             "an instance of Date or an Time in seconds",
             value,
         )
@@ -285,16 +299,36 @@ pub(super) fn time_of_seconds(seconds: f64) -> Option<SystemTime> {
     }
 }
 
+/// The `mode` argument of `access` and `copyFile`, as Node's C++ `GetValidFileMode` reads it: 0
+/// for `undefined` and `null`, and otherwise a finite number that is from 0 to 7 once truncated.
+fn file_mode_arg(value: HandleValue<'_>) -> Result<u32, Thrown> {
+    if value.is_null_or_undefined() {
+        return Ok(0);
+    }
+    let out_of_range = |message: &str| -> Thrown {
+        NodeError::new(ErrorKind::RangeError, "ERR_OUT_OF_RANGE", message).into()
+    };
+    if !value.is_number() {
+        let message = "mode must be int32 or null/undefined";
+        return Err(NodeError::new(ErrorKind::TypeError, "ERR_INVALID_ARG_TYPE", message).into());
+    }
+    let mode = value.to_number().trunc();
+    if !mode.is_finite() {
+        return Err(out_of_range("mode is out of range"));
+    }
+    if !(0.0..=7.0).contains(&mode) {
+        return Err(out_of_range("mode is out of range: >= 0 && <= 7"));
+    }
+    Ok(mode as u32)
+}
+
 fn access(
     scope: &Scope<'_>,
     args: &[HandleValue<'_>],
     variant: Variant,
 ) -> Result<Prepared, Thrown> {
     let path = path_arg(scope, arg(args, 0), "path")?;
-    let mode = match opt(args, 1) {
-        Some(mode) => validate_integer(scope, mode, "mode", 0.0, 7.0)? as u32,
-        None => 0,
-    };
+    let mode = file_mode_arg(arg(args, 1))?;
     // WASI reports no permissions, so only existence is checked, as `platform::fs::access` does.
     on_wasi!(
         variant,
@@ -507,10 +541,7 @@ fn close(
 fn copy_file(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prepared, Thrown> {
     let source = path_arg(scope, arg(args, 0), "src")?;
     let destination = path_arg(scope, arg(args, 1), "dest")?;
-    let mode = match opt(args, 2) {
-        Some(mode) => validate_integer(scope, mode, "mode", 0.0, 7.0)? as u32,
-        None => 0,
-    };
+    let mode = file_mode_arg(arg(args, 2))?;
     Ok(Prepared::new(None, move || {
         copy_file_blocking(&source, &destination, mode, "copyfile")?;
         Ok(Output::Unit)
@@ -568,23 +599,28 @@ pub(super) fn copy_file_blocking(
             };
         }
     }
-    #[cfg(not(unix))]
-    let _ = source_metadata;
-    if mode & 1 == 0 {
+    let exclusive = mode & 1 != 0;
+    if !exclusive && source_metadata.is_file() {
         std::fs::copy(source, destination).map_err(fail)?;
         return Ok(());
     }
     // `COPYFILE_EXCL` creates the destination with `O_EXCL`, so a file created
-    // concurrently makes the copy fail.
-    let mut input = std::fs::File::open(source).map_err(fail)?;
-    let permissions = input.metadata().map_err(fail)?.permissions();
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
+    // concurrently makes the copy fail. As libuv does, the copy is the size the source reports,
+    // which is 0 for a device such as `/dev/null`.
+    let input = std::fs::File::open(source).map_err(fail)?;
+    let metadata = input.metadata().map_err(fail)?;
+    let mut output = std::fs::OpenOptions::new();
+    output.write(true);
+    if exclusive {
+        output.create_new(true);
+    } else {
+        output.create(true).truncate(true);
+    }
+    let mut output = output.open(destination).map_err(fail)?;
+    std::io::copy(&mut std::io::Read::take(input, metadata.len()), &mut output).map_err(fail)?;
+    output
+        .set_permissions(metadata.permissions())
         .map_err(fail)?;
-    std::io::copy(&mut input, &mut output).map_err(fail)?;
-    output.set_permissions(permissions).map_err(fail)?;
     Ok(())
 }
 
@@ -702,7 +738,7 @@ fn length_arg(scope: &Scope<'_>, args: &[HandleValue<'_>], index: usize) -> Resu
             scope,
             length,
             "len",
-            f64::MIN,
+            -crate::errors::MAX_SAFE_INTEGER,
             crate::errors::MAX_SAFE_INTEGER,
         )?
         .max(0.0) as u64),
@@ -800,15 +836,16 @@ fn truncate(
     }))
 }
 
-/// The access and modification time arguments of `utimes` and `futimes`, from `index`. `None`
-/// leaves a time unchanged.
+/// The access and modification time arguments of `utimes` and `futimes`, from `index`, which
+/// errors name `names`. `None` leaves a time unchanged.
 fn times_args(
     scope: &Scope<'_>,
     args: &[HandleValue<'_>],
     index: usize,
+    names: [&str; 2],
 ) -> Result<(Option<SystemTime>, Option<SystemTime>), Thrown> {
-    let accessed = time_arg(scope, arg(args, index))?;
-    let modified = time_arg(scope, arg(args, index + 1))?;
+    let accessed = time_arg(scope, arg(args, index), names[0])?;
+    let modified = time_arg(scope, arg(args, index + 1), names[1])?;
     Ok((accessed, modified))
 }
 
@@ -818,7 +855,7 @@ fn futimes(
     variant: Variant,
 ) -> Result<Prepared, Thrown> {
     let handle = handle_arg(scope, args, 0, "futime")?;
-    let (accessed, modified) = times_args(scope, args, 1)?;
+    let (accessed, modified) = times_args(scope, args, 1, ["atime", "mtime"])?;
     on_wasi!(
         variant,
         suspends(&handle),
@@ -859,7 +896,8 @@ fn utimes(
     variant: Variant,
 ) -> Result<Prepared, Thrown> {
     let path = path_arg(scope, arg(args, 0), "path")?;
-    let (accessed, modified) = times_args(scope, args, 1)?;
+    // Node's `utimes` names both times `time`.
+    let (accessed, modified) = times_args(scope, args, 1, ["time", "time"])?;
     // The file is opened for reading to set the times, as `platform::fs::set_times` does on WASI.
     on_wasi!(
         variant,
@@ -894,16 +932,36 @@ fn link(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prepa
 }
 
 fn symlink(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prepared, Thrown> {
+    let kind_value = arg(args, 2);
+    let kind = crate::support::rust_string(scope, kind_value)
+        .filter(|kind| ["dir", "file", "junction"].contains(&kind.as_str()));
+    if kind.is_none() && !kind_value.is_null_or_undefined() {
+        let reason = "must be one of: 'dir', 'file', 'junction', null, undefined";
+        return Err(NodeError::invalid_arg_value(scope, "type", kind_value, reason).into());
+    }
     let target = path_arg(scope, arg(args, 0), "target")?;
     let path = path_arg(scope, arg(args, 1), "path")?;
     Ok(Prepared::new(None, move || {
         #[cfg(unix)]
         let result = std::os::unix::fs::symlink(&target, &path);
+        // Without a type, a link to a directory is a directory link, with the target resolved
+        // against the link's directory, as Node's `symlink` resolves it. A junction is created
+        // as a directory link.
         #[cfg(windows)]
-        let result = if std::path::Path::new(&target).is_dir() {
-            std::os::windows::fs::symlink_dir(&target, &path)
-        } else {
-            std::os::windows::fs::symlink_file(&target, &path)
+        let result = {
+            let is_dir = match kind.as_deref() {
+                Some(kind) => kind != "file",
+                None => std::path::Path::new(&path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(""))
+                    .join(&target)
+                    .is_dir(),
+            };
+            if is_dir {
+                std::os::windows::fs::symlink_dir(&target, &path)
+            } else {
+                std::os::windows::fs::symlink_file(&target, &path)
+            }
         };
         #[cfg(not(any(unix, windows)))]
         #[allow(deprecated)]
@@ -921,10 +979,9 @@ fn stat_path(
     follow: bool,
 ) -> Result<Prepared, Thrown> {
     let path = path_arg(scope, arg(args, 0), "path")?;
-    let throw_if_no_entry = match option(scope, opt(args, 1), c"throwIfNoEntry")? {
-        Some(value) => js::conversion::to_boolean(value),
-        None => true,
-    };
+    // Only `false` keeps a missing entry from throwing, as in Node's C++ binding.
+    let throw_if_no_entry =
+        !option(scope, opt(args, 1), c"throwIfNoEntry")?.is_some_and(crate::support::is_false);
     on_wasi!(
         variant,
         Prepared::future(None, async move {
@@ -979,72 +1036,101 @@ fn lstat(
 }
 
 /// Create the directory `path` and its missing ancestors with `builder`, as Node's `MKDirpSync`
-/// does. An existing entry that isn't a directory gives `EEXIST` for the `outermost` path, and
-/// `ENOTDIR` for an ancestor. If it can't be read, as a dangling symlink can't, its error is the
-/// `outermost` path's error.
-fn make_directories(
-    builder: &std::fs::DirBuilder,
-    path: &std::path::Path,
-    outermost: bool,
-) -> Result<(), UvError> {
+/// does, without recursion. An existing entry that isn't a directory gives `EEXIST` for the
+/// outermost path, and `ENOTDIR` for an ancestor. If it can't be read, as a dangling symlink can't,
+/// its error is the outermost path's error. Every error names `path`, as in Node.js.
+fn make_directories(builder: &std::fs::DirBuilder, path: &std::path::Path) -> Result<(), UvError> {
     let name = path.to_string_lossy();
     let fail = |error| UvError::new(error, "mkdir").path(&name);
-    match builder.create(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == IoErrorKind::AlreadyExists => match std::fs::metadata(path) {
-            Ok(metadata) if metadata.is_dir() => Ok(()),
-            Ok(_) if outermost => Err(fail(error)),
-            Err(error) if outermost => Err(fail(error)),
-            _ => Err(UvError::code("ENOTDIR", "mkdir").path(&name)),
-        },
-        Err(error) if error.kind() == IoErrorKind::NotFound => {
-            match path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                Some(parent) => make_directories(builder, parent, false)?,
-                None => return Err(fail(error)),
-            }
-            builder.create(path).map_err(fail)
+    // The directories to create, innermost last, each with whether its parent was created.
+    let mut pending = vec![(path, false)];
+    while let Some(&(current, retry)) = pending.last() {
+        let outermost = pending.len() == 1;
+        if retry {
+            builder.create(current).map_err(fail)?;
+            pending.pop();
+            continue;
         }
-        Err(error) => Err(fail(error)),
+        match builder.create(current) {
+            Ok(()) => {
+                pending.pop();
+            }
+            Err(error) if error.kind() == IoErrorKind::AlreadyExists => {
+                match std::fs::metadata(current) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        pending.pop();
+                    }
+                    Ok(_) if outermost => return Err(fail(error)),
+                    Ok(_) => return Err(UvError::code("ENOTDIR", "mkdir").path(&name)),
+                    // A dangling symbolic link exists, but its target doesn't.
+                    Err(error) => return Err(fail(error)),
+                }
+            }
+            Err(error) if error.kind() == IoErrorKind::NotFound => {
+                let parent = current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty());
+                let Some(parent) = parent else {
+                    return Err(fail(error));
+                };
+                if let Some(last) = pending.last_mut() {
+                    last.1 = true;
+                }
+                pending.push((parent, false));
+            }
+            Err(error) => return Err(fail(error)),
+        }
     }
+    Ok(())
 }
 
 /// [`make_directories`] over `platform::fs::wasi`, which creates directories without modes.
 #[cfg(target_arch = "wasm32")]
-fn make_directories_wasi(
-    path: String,
-    outermost: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), UvError>>>> {
-    Box::pin(async move {
-        let fail = |error| UvError::new(error, "mkdir").path(&path);
-        match platform::fs::wasi::create_dir(&path).await {
-            Ok(()) => Ok(()),
+async fn make_directories_wasi(path: &str) -> Result<(), UvError> {
+    let fail = |error| UvError::new(error, "mkdir").path(path);
+    // The directories to create, innermost last, each with whether its parent was created.
+    let mut pending = vec![(path.to_string(), false)];
+    while let Some((current, retry)) = pending.last().cloned() {
+        let outermost = pending.len() == 1;
+        if retry {
+            platform::fs::wasi::create_dir(&current)
+                .await
+                .map_err(fail)?;
+            pending.pop();
+            continue;
+        }
+        match platform::fs::wasi::create_dir(&current).await {
+            Ok(()) => {
+                pending.pop();
+            }
             Err(error) if error.kind() == IoErrorKind::AlreadyExists => {
-                match platform::fs::wasi::stat(&path, true).await {
-                    Ok(stat) if stat.kind == FileKind::Directory => Ok(()),
-                    Ok(_) if outermost => Err(fail(error)),
-                    Err(error) if outermost => Err(fail(error)),
-                    _ => Err(UvError::code("ENOTDIR", "mkdir").path(&path)),
+                match platform::fs::wasi::stat(&current, true).await {
+                    Ok(stat) if stat.kind == FileKind::Directory => {
+                        pending.pop();
+                    }
+                    Ok(_) if outermost => return Err(fail(error)),
+                    Ok(_) => return Err(UvError::code("ENOTDIR", "mkdir").path(path)),
+                    // A dangling symbolic link exists, but its target doesn't.
+                    Err(error) => return Err(fail(error)),
                 }
             }
             Err(error) if error.kind() == IoErrorKind::NotFound => {
-                match std::path::Path::new(&path)
+                let parent = std::path::Path::new(&current)
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
-                {
-                    Some(parent) => {
-                        let parent = parent.to_string_lossy().into_owned();
-                        make_directories_wasi(parent, false).await?;
-                    }
-                    None => return Err(fail(error)),
+                    .map(|parent| parent.to_string_lossy().into_owned());
+                let Some(parent) = parent else {
+                    return Err(fail(error));
+                };
+                if let Some(last) = pending.last_mut() {
+                    last.1 = true;
                 }
-                platform::fs::wasi::create_dir(&path).await.map_err(fail)
+                pending.push((parent, false));
             }
-            Err(error) => Err(fail(error)),
+            Err(error) => return Err(fail(error)),
         }
-    })
+    }
+    Ok(())
 }
 
 fn mkdir(
@@ -1059,7 +1145,7 @@ fn mkdir(
             (false, mode_arg(scope, Some(mode), Some(0o777))?)
         }
         _ => (
-            flag_option(scope, options, c"recursive")?,
+            boolean_option(scope, options, c"recursive", "options.recursive")?,
             mode_arg(scope, option(scope, options, c"mode")?, Some(0o777))?,
         ),
     };
@@ -1087,7 +1173,7 @@ fn mkdir(
                 }
                 candidate = directory.parent();
             }
-            make_directories_wasi(path.clone(), true).await?;
+            make_directories_wasi(&path).await?;
             Ok(Output::MaybeText(first))
         })
     });
@@ -1117,13 +1203,25 @@ fn mkdir(
             candidate = directory.parent();
         }
         builder.recursive(false);
-        make_directories(&builder, std::path::Path::new(&path), true)?;
+        make_directories(&builder, std::path::Path::new(&path))?;
         Ok(Output::MaybeText(first))
     }))
 }
 
+js::instance_local! {
+    /// Whether `mkdtemp` warned that a prefix ending with `X` isn't portable.
+    static WARNED_NON_PORTABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn mkdtemp(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<Prepared, Thrown> {
     let prefix = path_arg(scope, arg(args, 0), "prefix")?;
+    // Node's `warnOnNonPortableTemplate`, which warns once.
+    if prefix.ends_with('X') && !WARNED_NON_PORTABLE.get() {
+        WARNED_NON_PORTABLE.set(true);
+        let message = "mkdtemp() templates ending with X are not portable. For details see: \
+                       https://nodejs.org/api/fs.html";
+        crate::process::emit_warning(scope, message, "Warning")?;
+    }
     let encoding = encoding_option(scope, opt(args, 1), Some(Encoding::Utf8))?;
     Ok(Prepared::new(encoding, move || {
         const CHARACTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -1169,6 +1267,7 @@ fn buffer_args<'s>(
     args: &[HandleValue<'_>],
     index: usize,
     read: bool,
+    variant: Variant,
 ) -> Result<(Object<'s>, usize, usize, Option<u64>), Thrown> {
     let first = arg(args, index);
     let is_view = |value: HandleValue<'_>| {
@@ -1228,22 +1327,82 @@ fn buffer_args<'s>(
     };
     let size = js::ArrayBufferView::from_object(buffer).map_or(0, |view| view.byte_length());
     let offset = match offset.filter(|offset| !offset.is_null()) {
-        Some(offset) => validate_integer(scope, offset, "offset", 0.0, size as f64)? as usize,
-        None => 0,
+        Some(offset) => validate_integer(
+            scope,
+            offset,
+            "offset",
+            0.0,
+            crate::errors::MAX_SAFE_INTEGER,
+        )?,
+        None => 0.0,
     };
-    let length = match length.filter(|length| !length.is_null()) {
-        Some(length) => {
-            validate_integer(scope, length, "length", 0.0, (size - offset) as f64)? as usize
+    let out_of_range = |name: &str, range: String, received: f64| -> Thrown {
+        let received = crate::errors::out_of_range_received(received);
+        NodeError::out_of_range(name, &range, &received).into()
+    };
+    let available = size as f64 - offset;
+    let length = if read {
+        // Node.js's `length |= 0`, then `validateOffsetLengthRead`. `FileHandle.prototype.read`
+        // reads to the end of the buffer for a `null` length instead.
+        let length =
+            match length.filter(|length| !(variant == Variant::Promise && length.is_null())) {
+                Some(length) => to_int32(f64::from_jsval(scope, length, ())?),
+                None => available,
+            };
+        if length != 0.0 {
+            if size == 0 {
+                let buffer = buffer.to_jsval_throwing(scope)?;
+                let reason = "is empty and cannot be written";
+                return Err(NodeError::invalid_arg_value(scope, "buffer", buffer, reason).into());
+            }
+            if length < 0.0 {
+                return Err(out_of_range("length", ">= 0".into(), length));
+            }
+            if length > available {
+                return Err(out_of_range("length", format!("<= {available}"), length));
+            }
         }
-        None => size - offset,
+        length
+    } else {
+        // Node.js's `validateOffsetLengthWrite`, for a length that is a number.
+        if offset > size as f64 {
+            return Err(out_of_range("offset", format!("<= {size}"), offset));
+        }
+        match length.filter(|length| length.is_number()) {
+            Some(length) => {
+                let number = length.to_number();
+                if number > available {
+                    return Err(out_of_range("length", format!("<= {available}"), number));
+                }
+                if number < 0.0 {
+                    return Err(out_of_range("length", ">= 0".into(), number));
+                }
+                validate_integer(scope, length, "length", 0.0, 2147483647.0)?
+            }
+            None => available,
+        }
     };
+    let (offset, length) = (offset as usize, length as usize);
     let position = position_arg(scope, position, read.then_some(length))?;
     Ok((buffer, offset, length, position))
 }
 
+/// `number` converted to a 32-bit signed integer, as JS's `| 0` converts it.
+fn to_int32(number: f64) -> f64 {
+    if !number.is_finite() {
+        return 0.0;
+    }
+    let wrapped = number.trunc().rem_euclid(4294967296.0);
+    if wrapped >= 2147483648.0 {
+        wrapped - 4294967296.0
+    } else {
+        wrapped
+    }
+}
+
 /// The values `read` and `write` give for the variant: the byte count for a synchronous call,
-/// the count and `buffer` for a callback, and an object with the count, named `count_name`, and
-/// `buffer` for a promise.
+/// the count and `buffer` for a callback, and an object without a prototype with the count, named
+/// `count_name`, and `buffer` for a promise.
 fn count_values<'s>(
     scope: &'s Scope<'_>,
     variant: Variant,
@@ -1256,7 +1415,7 @@ fn count_values<'s>(
         Variant::Sync => vec![count],
         Variant::Callback => vec![count, buffer],
         Variant::Promise => {
-            let result = Object::new_plain(scope)?;
+            let result = Object::new_with_null_prototype(scope)?;
             result.set_property(scope, count_name, count)?;
             result.set_property(scope, c"buffer", buffer)?;
             vec![result.to_jsval_throwing(scope)?]
@@ -1266,8 +1425,26 @@ fn count_values<'s>(
 
 fn read(scope: &Scope<'_>, args: &[HandleValue<'_>], variant: Variant) -> Result<Prepared, Thrown> {
     let handle = handle_arg(scope, args, 0, "read")?;
-    let (buffer, offset, length, position) = buffer_args(scope, args, 1, true)?;
+    let (buffer, offset, length, position) = buffer_args(scope, args, 1, true, variant)?;
     let buffer = RootedHeap::<js::object::Object>::new(buffer);
+    if variant == Variant::Sync {
+        // The synchronous read runs in `finish`, and reads into the buffer itself.
+        let finish: Finish = Box::new(move |scope, _, variant| {
+            let buffer = buffer.get(scope);
+            let read = move |target: &mut [u8]| handle?.read(target, position);
+            let count = match js::ArrayBufferView::from_object(buffer) {
+                Some(view) => view.with_bytes_mut(|bytes| {
+                    let end = (offset + length).min(bytes.len());
+                    read(bytes.get_mut(offset..end).unwrap_or(&mut []))
+                }),
+                None => read(&mut []),
+            }
+            .map_err(|error| Thrown::from(js::error::ThrowException::throw(error, scope)))?;
+            let buffer = buffer.to_jsval_throwing(scope)?;
+            count_values(scope, variant, count, c"bytesRead", buffer)
+        });
+        return Ok(Prepared::custom(|| Ok(Output::Unit), finish));
+    }
     let finish: Finish = Box::new(move |scope, output, variant| {
         let Output::Bytes(bytes) = output else {
             unreachable!("read produces bytes");
@@ -1299,11 +1476,66 @@ fn read(scope: &Scope<'_>, args: &[HandleValue<'_>], variant: Variant) -> Result
             finish
         )
     );
+    let Some(mut bytes) = crate::support::try_filled_vec(length) else {
+        js::exception::report_out_of_memory(scope);
+        return Err(Thrown::Pending);
+    };
     Ok(Prepared::custom(
         move || {
-            let mut bytes = vec![0; length];
             let count = handle?.read(&mut bytes, position)?;
             bytes.truncate(count);
+            Ok(Output::Bytes(bytes))
+        },
+        finish,
+    ))
+}
+
+/// A read of up to `length` bytes from the descriptor `fd` at `position`, as `fs.read` with a new
+/// buffer of `length` bytes reads them, which gives the callback the count and a new `Buffer` of
+/// the bytes read. The memory for the bytes is allocated fallibly. The bytes of a short read are
+/// copied into memory of their size, as Node's `ReadStream` copies them, unless allocating it
+/// fails.
+pub(super) fn read_chunk(
+    scope: &Scope<'_>,
+    fd: HandleValue<'_>,
+    length: usize,
+    position: HandleValue<'_>,
+) -> Result<Prepared, Thrown> {
+    let handle = handle_arg(scope, &[fd], 0, "read")?;
+    let position = position_arg(scope, Some(position), Some(length))?;
+    let finish: Finish = Box::new(move |scope, output, _| {
+        let Output::Bytes(bytes) = output else {
+            unreachable!("read produces bytes");
+        };
+        let count = scope.root_value(js::value::from_f64(bytes.len() as f64));
+        let chunk = crate::buffer::buffer_from_vec(scope, bytes)?.to_jsval_throwing(scope)?;
+        Ok(vec![count, chunk])
+    });
+    on_wasi!(
+        Variant::Callback,
+        suspends(&handle),
+        Prepared::custom_future(
+            async move {
+                let bytes = wasi_file(handle)?
+                    .read(length, position)
+                    .await
+                    .map_err(|error| UvError::new(error, "read"))?;
+                Ok(Output::Bytes(bytes))
+            },
+            finish
+        )
+    );
+    let Some(mut bytes) = crate::support::try_filled_vec(length) else {
+        js::exception::report_out_of_memory(scope);
+        return Err(Thrown::Pending);
+    };
+    Ok(Prepared::custom(
+        move || {
+            let count = handle?.read(&mut bytes, position)?;
+            bytes.truncate(count);
+            if count < length {
+                bytes = js::typedarray::try_copy(&bytes).unwrap_or(bytes);
+            }
             Ok(Output::Bytes(bytes))
         },
         finish,
@@ -1324,6 +1556,13 @@ fn write(
             None => None,
         };
         let encoding = encoding.unwrap_or_default();
+        let length = js::JSString::from_value(scope, data)?.len();
+        if encoding == Encoding::Hex && length % 2 != 0 {
+            let reason = format!("is invalid for data of length {length}");
+            return Err(
+                NodeError::invalid_arg_value(scope, "encoding", arg(args, 3), &reason).into(),
+            );
+        }
         let bytes = data_arg(scope, data, encoding)?;
         let position = position_arg(scope, opt(args, 2), None)?;
         let text = String::from_jsval(scope, data, ())?;
@@ -1336,10 +1575,37 @@ fn write(
         });
         return Ok(write_bytes(variant, handle, bytes, position, finish));
     }
-    let (buffer, offset, length, position) = buffer_args(scope, args, 1, false)?;
-    let bytes = js::ArrayBufferView::from_object(buffer)
-        .map(|view| view.with_bytes(|bytes| bytes[offset..offset + length].to_vec()))
-        .unwrap_or_default();
+    let (buffer, offset, length, position) = buffer_args(scope, args, 1, false, variant)?;
+    if variant == Variant::Sync {
+        // The synchronous write runs in `finish`, and writes from the buffer itself.
+        let buffer = RootedHeap::<js::object::Object>::new(buffer);
+        let finish: Finish = Box::new(move |scope, _, variant| {
+            let buffer = buffer.get(scope);
+            let write = move |bytes: &[u8]| -> Result<usize, UvError> {
+                handle?.write(bytes, position)?;
+                Ok(bytes.len())
+            };
+            let count = match js::ArrayBufferView::from_object(buffer) {
+                Some(view) => view.with_bytes(|bytes| {
+                    write(bytes.get(offset..offset + length).unwrap_or_default())
+                }),
+                None => write(&[]),
+            }
+            .map_err(|error| Thrown::from(js::error::ThrowException::throw(error, scope)))?;
+            let buffer = buffer.to_jsval_throwing(scope)?;
+            count_values(scope, variant, count, c"bytesWritten", buffer)
+        });
+        return Ok(Prepared::custom(|| Ok(Output::Unit), finish));
+    }
+    let bytes = match js::ArrayBufferView::from_object(buffer) {
+        Some(view) => view
+            .with_bytes(|bytes| js::typedarray::try_copy(&bytes[offset..offset + length]))
+            .ok_or_else(|| {
+                js::exception::report_out_of_memory(scope);
+                js::error::ExnThrown
+            })?,
+        None => Vec::new(),
+    };
     let buffer = RootedHeap::<js::object::Object>::new(buffer);
     let finish: Finish = Box::new(move |scope, output, variant| {
         let Output::Count(count) = output else {
@@ -1427,8 +1693,9 @@ fn read_file(
 
 /// The entries of the directory `path`, each directory's sorted by name, and with `recursive`
 /// those of its subdirectories after them in breadth-first order, named relative to `path`.
-/// Symlinks to directories are followed.
-fn list_directory(path: &str, recursive: bool) -> Result<Vec<Entry>, UvError> {
+/// Symlinks to directories are followed. Each entry's `parent` is its directory with
+/// `with_parent`, and empty otherwise.
+fn list_directory(path: &str, recursive: bool, with_parent: bool) -> Result<Vec<Entry>, UvError> {
     let mut entries = Vec::new();
     let mut pending = vec![(path.to_string(), String::new())];
     let mut next = 0;
@@ -1458,7 +1725,11 @@ fn list_directory(path: &str, recursive: bool) -> Result<Vec<Entry>, UvError> {
                 } else {
                     name
                 },
-                parent: directory.clone(),
+                parent: if with_parent {
+                    directory.clone()
+                } else {
+                    String::new()
+                },
                 kind,
             });
         }
@@ -1468,7 +1739,11 @@ fn list_directory(path: &str, recursive: bool) -> Result<Vec<Entry>, UvError> {
 
 /// [`list_directory`] over `platform::fs::wasi`.
 #[cfg(target_arch = "wasm32")]
-async fn list_directory_wasi(path: &str, recursive: bool) -> Result<Vec<Entry>, UvError> {
+async fn list_directory_wasi(
+    path: &str,
+    recursive: bool,
+    with_parent: bool,
+) -> Result<Vec<Entry>, UvError> {
     let mut entries = Vec::new();
     let mut pending = vec![(path.to_string(), String::new())];
     let mut next = 0;
@@ -1495,7 +1770,11 @@ async fn list_directory_wasi(path: &str, recursive: bool) -> Result<Vec<Entry>, 
                 } else {
                     name
                 },
-                parent: directory.clone(),
+                parent: if with_parent {
+                    directory.clone()
+                } else {
+                    String::new()
+                },
                 kind,
             });
         }
@@ -1534,16 +1813,19 @@ fn readdir(
     let options = opt(args, 1);
     let encoding = encoding_option(scope, options, Some(Encoding::Utf8))?;
     let file_types = flag_option(scope, options, c"withFileTypes")?;
-    let recursive = flag_option(scope, options, c"recursive")?;
+    let recursive = match option(scope, options, c"recursive")?.filter(|value| !value.is_null()) {
+        Some(value) => crate::errors::validate_boolean(scope, value, "options.recursive")?,
+        None => false,
+    };
     on_wasi!(
         variant,
         Prepared::future(encoding, async move {
-            let entries = list_directory_wasi(&path, recursive).await?;
+            let entries = list_directory_wasi(&path, recursive, file_types).await?;
             Ok(readdir_output(entries, file_types))
         })
     );
     Ok(Prepared::new(encoding, move || {
-        let entries = list_directory(&path, recursive)?;
+        let entries = list_directory(&path, recursive, file_types)?;
         Ok(readdir_output(entries, file_types))
     }))
 }
@@ -1558,9 +1840,18 @@ fn readlink(scope: &Scope<'_>, args: &[HandleValue<'_>], _: Variant) -> Result<P
     }))
 }
 
-/// The canonical absolute path of `path`, with every symlink resolved.
+/// The canonical absolute path of `path`, with every symlink resolved. On Windows, the verbatim
+/// prefix `std::fs::canonicalize` adds is removed: `\\?\C:\` becomes `C:\`, and `\\?\UNC\`
+/// becomes `\\`.
 fn canonicalize(path: &str) -> std::io::Result<String> {
-    Ok(std::fs::canonicalize(path)?.to_string_lossy().into_owned())
+    let canonical = std::fs::canonicalize(path)?.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    if let Some(unc) = canonical.strip_prefix(r"\\?\UNC\") {
+        return Ok(format!(r"\\{unc}"));
+    } else if let Some(local) = canonical.strip_prefix(r"\\?\") {
+        return Ok(local.to_string());
+    }
+    Ok(canonical)
 }
 
 /// The error of Node's JS `realpath` for `path`, which `canonicalize` failed with `error`: that
@@ -1597,7 +1888,11 @@ fn realpath(
     args: &[HandleValue<'_>],
     variant: Variant,
 ) -> Result<Prepared, Thrown> {
-    let path = path_arg(scope, arg(args, 0), "path")?;
+    let mut path = path_arg(scope, arg(args, 0), "path")?;
+    // Node's JS `realpath` resolves the path first, so the empty path is the working directory.
+    if path.is_empty() && variant != Variant::Promise {
+        path.push('.');
+    }
     let encoding = encoding_option(scope, opt(args, 1), Some(Encoding::Utf8))?;
     Ok(Prepared::new(encoding, move || {
         let resolved = canonicalize(&path).map_err(|error| match variant {
@@ -1633,11 +1928,81 @@ fn rename(
     }))
 }
 
+/// The options of `rm`, validated as Node's `validateRmOptions` validates them: `recursive` and
+/// `force` are booleans, `retryDelay` an integer from 0 to 2**31 - 1, and `maxRetries` an integer
+/// from 0 to 2**32 - 1. Missing options have their defaults, `false`, `false`, 100 and 0.
+struct RmOptions {
+    recursive: bool,
+    force: bool,
+    retry_delay: f64,
+    max_retries: f64,
+}
+
+impl RmOptions {
+    fn of(scope: &Scope<'_>, options: Option<HandleValue<'_>>) -> Result<Self, Thrown> {
+        let Some(options) = options else {
+            return Ok(RmOptions {
+                recursive: false,
+                force: false,
+                retry_delay: 100.0,
+                max_retries: 0.0,
+            });
+        };
+        crate::errors::validate_plain_object(scope, options, "options", false)?;
+        let options = Some(options);
+        let recursive = boolean_option(scope, options, c"recursive", "options.recursive")?;
+        let retry_delay = match option(scope, options, c"retryDelay")? {
+            Some(delay) => validate_integer(scope, delay, "options.retryDelay", 0.0, 2147483647.0)?,
+            None => 100.0,
+        };
+        let max_retries = match option(scope, options, c"maxRetries")? {
+            Some(retries) => {
+                validate_integer(scope, retries, "options.maxRetries", 0.0, 4294967295.0)?
+            }
+            None => 0.0,
+        };
+        let force = boolean_option(scope, options, c"force", "options.force")?;
+        Ok(RmOptions {
+            recursive,
+            force,
+            retry_delay,
+            max_retries,
+        })
+    }
+}
+
+/// Run `remove` once, and again up to `max_retries` times while it fails with `EBUSY`, `EMFILE`,
+/// `ENFILE`, `ENOTEMPTY` or `EPERM`, waiting `retry_delay` milliseconds times the attempt's number
+/// before each retry, as Node's `rm` retries.
+fn retrying(
+    max_retries: f64,
+    retry_delay: f64,
+    mut remove: impl FnMut() -> Result<(), UvError>,
+) -> Result<(), UvError> {
+    let mut attempt = 0.0;
+    loop {
+        match remove() {
+            Err(error)
+                if attempt < max_retries
+                    && ["EBUSY", "EMFILE", "ENFILE", "ENOTEMPTY", "EPERM"]
+                        .contains(&error.error.code) =>
+            {
+                attempt += 1.0;
+                std::thread::sleep(Duration::from_secs_f64(attempt * retry_delay / 1000.0));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn rm(scope: &Scope<'_>, args: &[HandleValue<'_>], variant: Variant) -> Result<Prepared, Thrown> {
     let path = path_arg(scope, arg(args, 0), "path")?;
-    let options = opt(args, 1);
-    let recursive = flag_option(scope, options, c"recursive")?;
-    let force = flag_option(scope, options, c"force")?;
+    let RmOptions {
+        recursive,
+        force,
+        retry_delay,
+        max_retries,
+    } = RmOptions::of(scope, opt(args, 1))?;
     let sync = variant == Variant::Sync;
     Ok(Prepared::new(None, move || {
         // `rmSync` reports removal errors with a positive `errno` and the syscall `rm`, and skips
@@ -1660,14 +2025,13 @@ fn rm(scope: &Scope<'_>, args: &[HandleValue<'_>], variant: Variant) -> Result<P
             }
             Err(error) => return Err(UvError::new(error, "lstat").path(&path)),
         };
-        if metadata.is_dir() {
-            if !recursive {
-                return Err(UvError::rm_directory(&path));
-            }
-            std::fs::remove_dir_all(&path).map_err(|error| fail(error, "rmdir"))?;
-        } else {
-            std::fs::remove_file(&path).map_err(|error| fail(error, "unlink"))?;
+        if metadata.is_dir() && !recursive {
+            return Err(UvError::rm_directory(&path));
         }
+        retrying(max_retries, retry_delay, || match metadata.is_dir() {
+            true => std::fs::remove_dir_all(&path).map_err(|error| fail(error, "rmdir")),
+            false => std::fs::remove_file(&path).map_err(|error| fail(error, "unlink")),
+        })?;
         Ok(Output::Unit)
     }))
 }

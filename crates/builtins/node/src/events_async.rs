@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use js::conversion::{FromJSVal, ToJSVal};
+use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
 use js::function::{cast_payload, CallbackArgs};
 use js::gc::handle::{Heap, OptionHeapExt};
@@ -18,26 +18,8 @@ use js::prelude::HandleValue;
 use js::{Function, Object};
 
 use crate::errors::{
-    abort_error, validate_abort_signal, validate_object, validate_plain_object, NodeError, Thrown,
-    MAX_SAFE_INTEGER,
+    abort_error, validate_abort_signal, validate_plain_object, NodeError, Thrown, MAX_SAFE_INTEGER,
 };
-
-/// Whether `value` is `true`.
-fn flag(value: HandleValue<'_>) -> bool {
-    value.is_boolean() && value.to_boolean()
-}
-
-/// The value of `object[name]` if it is a function.
-fn method<'s>(
-    scope: &'s Scope<'_>,
-    object: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-    let value = object.get_property(scope, name)?;
-    let value = scope.root_value(value.get());
-    let callable = Object::from_value(scope, value).is_ok_and(|function| function.is_callable());
-    Ok(callable.then_some(value))
-}
 
 /// Add `listener` for `name` to `target`, with its `once` or `on` method if it has `on`, and with
 /// `addEventListener` otherwise. This ports Node's `eventTargetAgnosticAddListener`.
@@ -48,12 +30,12 @@ fn add_listener(
     listener: HandleValue<'_>,
     once: bool,
 ) -> Result<(), Thrown> {
-    if method(scope, target, c"on")?.is_some() {
+    if crate::support::has_method(scope, target, c"on")? {
         let add = if once { c"once" } else { c"on" };
         Function::call_by_name(scope, target.handle(), add, &[name, listener])?;
         return Ok(());
     }
-    if method(scope, target, c"addEventListener")?.is_some() {
+    if crate::support::has_method(scope, target, c"addEventListener")? {
         let options = Object::new_plain(scope)?;
         options.set_property(scope, c"once", once)?;
         let options = options.to_jsval_throwing(scope)?;
@@ -66,13 +48,27 @@ fn add_listener(
         return Ok(());
     }
     let target = target.to_jsval_throwing(scope)?;
-    Err(NodeError::invalid_arg_type(
-        scope,
-        "emitter",
-        "an instance of EventEmitter or EventTarget",
-        target,
-    )
-    .into())
+    Err(not_an_emitter(scope, target))
+}
+
+/// Node's `ERR_INVALID_ARG_TYPE` for an `emitter` argument that is neither an `EventEmitter` nor
+/// an `EventTarget`.
+fn not_an_emitter(scope: &Scope<'_>, emitter: HandleValue<'_>) -> Thrown {
+    NodeError::invalid_arg_type(scope, "emitter", "an instance of EventEmitter", emitter).into()
+}
+
+/// `emitter` as an object to add listeners to. `null` and `undefined` throw the `TypeError` of a
+/// property read, and other primitives `ERR_INVALID_ARG_TYPE`, as Node's
+/// `eventTargetAgnosticAddListener` reads `emitter.on` first.
+fn emitter_object<'s>(
+    scope: &'s Scope<'_>,
+    emitter: HandleValue<'_>,
+) -> Result<Object<'s>, Thrown> {
+    if emitter.is_null_or_undefined() {
+        // `from_value_coerce` throws a `TypeError` for `null` and `undefined`.
+        return Ok(Object::from_value_coerce(scope, emitter)?);
+    }
+    Object::from_value(scope, *emitter).map_err(|_| not_an_emitter(scope, emitter))
 }
 
 /// Remove `listener` for `name` from `target`, with `removeListener` or `removeEventListener`.
@@ -82,9 +78,9 @@ fn remove_listener(
     name: HandleValue<'_>,
     listener: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let remove = if method(scope, target, c"removeListener")?.is_some() {
+    let remove = if crate::support::has_method(scope, target, c"removeListener")? {
         c"removeListener"
-    } else if method(scope, target, c"removeEventListener")?.is_some() {
+    } else if crate::support::has_method(scope, target, c"removeEventListener")? {
         c"removeEventListener"
     } else {
         return Ok(());
@@ -184,7 +180,7 @@ fn once_resolver(
 ) -> Result<Value, ExnThrown> {
     let wait = cast_payload::<OnceWait>(scope, payload);
     once_cleanup(scope, wait)?;
-    let values: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+    let values: Vec<HandleValue<'_>> = args.rest(0);
     let values = js::Array::with_contents(scope, &values)?;
     once_promise(scope, wait).resolve(scope, *values)?;
     Ok(js::value::undefined())
@@ -232,7 +228,7 @@ fn read_signal<'s>(
     validate_abort_signal(scope, signal, "options.signal")?;
     let signal = Object::from_value(scope, signal).ok();
     if let Some(signal) = signal {
-        if flag(signal.get_property(scope, c"aborted")?) {
+        if crate::support::is_true(signal.get_property(scope, c"aborted")?) {
             js::exception::set_pending(
                 scope,
                 abort_error_for(scope, signal)?,
@@ -254,7 +250,7 @@ pub fn once<'s>(
     let promise = js::Promise::new_pending(scope)?;
     let started = (|| -> Result<(), Thrown> {
         let signal = read_signal(scope, options)?;
-        let emitter = validate_object(scope, emitter, "emitter")?;
+        let emitter = emitter_object(scope, emitter)?;
         let wait = js::class::create_instance_with::<OnceWaitImpl>(scope, |_| OnceWaitImpl {
             promise: Heap::from(promise),
             emitter: Heap::from(emitter),
@@ -280,9 +276,8 @@ pub fn once<'s>(
             (*resolver).to_jsval_throwing(scope)?,
             true,
         )?;
-        let is_error = name.is_string()
-            && String::from_jsval(scope, name, ()).is_ok_and(|name| name == "error");
-        if !is_error && method(scope, emitter, c"once")?.is_some() {
+        let is_error = crate::support::is_str(scope, name, c"error")?;
+        if !is_error && crate::support::has_method(scope, emitter, c"once")? {
             let error = js::class::get_or_init_atom(scope, c"error")?;
             add_listener(
                 scope,
@@ -405,25 +400,6 @@ fn on_close<'s>(
     )
 }
 
-/// The elements of `array`, an array object.
-fn elements<'s>(
-    scope: &'s Scope<'_>,
-    array: HandleValue<'_>,
-) -> Result<Vec<HandleValue<'s>>, ExnThrown> {
-    let Ok(array) = Object::from_value(scope, scope.root_value(array.get())) else {
-        return Ok(Vec::new());
-    };
-    let length = array.get_property(scope, c"length")?;
-    let length = if length.is_number() {
-        length.to_number() as u32
-    } else {
-        0
-    };
-    (0..length)
-        .map(|index| array.get_element(scope, index))
-        .collect()
-}
-
 /// Remove and return the oldest pending `next()` promise of `state`, if there is one.
 fn shift_pending<'s>(scope: &'s Scope<'_>, state: OnIteration<'_>) -> Option<js::Promise<'s>> {
     let mut data = state.data_mut();
@@ -445,7 +421,7 @@ fn on_event(
     let value = if first_event_param {
         args.get(0)
     } else {
-        let values: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+        let values: Vec<HandleValue<'_>> = args.rest(0);
         js::Array::with_contents(scope, &values)?.to_jsval_throwing(scope)?
     };
     if let Some(pending) = shift_pending(scope, state) {
@@ -466,7 +442,7 @@ fn on_event(
         )
     };
     if !paused && queued > high_water_mark {
-        if method(scope, emitter, c"pause")?.is_some() {
+        if crate::support::has_method(scope, emitter, c"pause")? {
             Function::call_by_name(scope, emitter.handle(), c"pause", js::function::EmptyArgs)?;
         }
         state.data_mut().paused = true;
@@ -555,7 +531,7 @@ fn on_next(
     };
     if let Some((values, queued, paused, low_water_mark, emitter)) = next {
         if paused && queued < low_water_mark {
-            if method(scope, emitter, c"resume")?.is_some() {
+            if crate::support::has_method(scope, emitter, c"resume")? {
                 Function::call_by_name(
                     scope,
                     emitter.handle(),
@@ -674,7 +650,6 @@ pub fn on<'s>(
     let options = options
         .filter(|options| !options.is_undefined())
         .and_then(|options| Object::from_value(scope, scope.root_value(options.get())).ok());
-    let emitter = validate_object(scope, emitter, "emitter")?;
     let high_water_mark = water_mark_option(
         scope,
         options,
@@ -683,6 +658,7 @@ pub fn on<'s>(
     )?;
     let low_water_mark =
         water_mark_option(scope, options, [c"lowWaterMark", c"lowWatermark"], 1.0)?;
+    let emitter = emitter_object(scope, emitter)?;
     let settings = OnSettings {
         high_water_mark,
         low_water_mark,
@@ -694,7 +670,10 @@ pub fn on<'s>(
             return Ok(Vec::new());
         };
         let close = options.get_property(scope, c"close")?;
-        Ok(elements(scope, close)?)
+        if !close.is_object() {
+            return Ok(Vec::new());
+        }
+        Ok(crate::support::list_from_array_like(scope, close)?)
     })
 }
 
@@ -757,9 +736,8 @@ pub(crate) fn on_iterator<'s>(
         name,
         Function::new_callback(scope, c"", 0, on_event, state)?,
     )?;
-    let is_error =
-        name.is_string() && String::from_jsval(scope, name, ()).is_ok_and(|name| name == "error");
-    if !is_error && method(scope, emitter, c"on")?.is_some() {
+    let is_error = crate::support::is_str(scope, name, c"error")?;
+    if !is_error && crate::support::has_method(scope, emitter, c"on")? {
         let error = js::class::get_or_init_atom(scope, c"error")?;
         on_add(
             scope,

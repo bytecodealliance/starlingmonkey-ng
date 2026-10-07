@@ -952,7 +952,7 @@ fn trace_callback_wrapper(
             .part(scope, 4)
             .publish(scope, context.to_jsval_throwing(scope)?)?;
     }
-    let call_args: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+    let call_args: Vec<HandleValue<'_>> = args.rest(0);
     let context_value = context.to_jsval_throwing(scope)?;
     let this = scope.root_value(args.this());
     let result =

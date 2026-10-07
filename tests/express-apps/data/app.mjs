@@ -152,8 +152,11 @@ app.get('/events', async (req, res) => {
   for (const p of db.data.posts) send('post', p);
   const ac = new AbortController();
   req.on('close', () => ac.abort());
+  const posts = on(bus, 'post', { signal: ac.signal });
+  // Posts created after this comment is written are sent to the client.
+  res.write(': subscribed\n\n');
   try {
-    for await (const [post] of on(bus, 'post', { signal: ac.signal })) {
+    for await (const [post] of posts) {
       send('post', post);
       if (sent >= limit) break;
     }
@@ -259,9 +262,16 @@ app.get('/fetch-error', async (req, res) => {
 });
 
 app.get('/logs', async (req, res) => {
-  await sleep(50);
-  const logged = await readFile(logFile, 'utf8').catch((e) => (e.code === 'ENOENT' ? '' : Promise.reject(e)));
-  const fileLines = logged.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  // The file transport writes asynchronously, so we read the file until it has a line for each
+  // entry the stream transport got, for at most 5 seconds.
+  const deadline = Date.now() + 5000;
+  let fileLines;
+  for (;;) {
+    const logged = await readFile(logFile, 'utf8').catch((e) => (e.code === 'ENOENT' ? '' : Promise.reject(e)));
+    fileLines = logged.slice(0, logged.lastIndexOf('\n') + 1).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    if (fileLines.length >= winstonLines.length || Date.now() > deadline) break;
+    await sleep(5);
+  }
   res.json({
     winston: winstonLines,
     file: fileLines,

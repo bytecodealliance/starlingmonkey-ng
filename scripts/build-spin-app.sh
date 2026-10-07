@@ -74,19 +74,23 @@ componentize() {
         -p "$APPS/$app" -o "$OUT/$name.wasm" "$APPS/$app/$entry"
 }
 
-# with_data APP: the options that give APP's top level a writable /data, which is $OUT/APP/data.
+# with_data APP: set DATA_OPTIONS to the options that give APP's top level a writable /data,
+# which is $OUT/APP/data.
 with_data() {
     mkdir -p "$OUT/$1/data"
-    echo --init-env DATA_DIR=/data --init-dir "$OUT/$1/data::/data"
+    DATA_OPTIONS=(--init-env DATA_DIR=/data --init-dir "$OUT/$1/data::/data")
 }
 
 componentize koa-portal koa-portal app.mjs
 componentize rest-api rest-api spin.mjs
 # EJS checks that an included template exists with a synchronous `fs.existsSync` on every render.
-componentize ssr-site ssr-site spin.mjs --allow-blocking-host-io $(with_data ssr-site)
-componentize files files spin.mjs $(with_data files)
+with_data ssr-site
+componentize ssr-site ssr-site spin.mjs --allow-blocking-host-io "${DATA_OPTIONS[@]}"
+with_data files
+componentize files files spin.mjs "${DATA_OPTIONS[@]}"
 componentize auth auth spin.mjs
-componentize data data spin.mjs $(with_data data) --init-env UPSTREAM_URL=http://upstream.spin.internal
+with_data data
+componentize data data spin.mjs "${DATA_OPTIONS[@]}" --init-env UPSTREAM_URL=http://upstream.spin.internal
 componentize upstream data upstream.mjs
 
 mkdir -p "$OUT/koa-portal" "$OUT/ssr-site"

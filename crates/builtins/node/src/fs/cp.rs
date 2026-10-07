@@ -868,7 +868,7 @@ pub(super) fn cp_callback(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     let run = || -> Result<(), Thrown> {
         let (options, callback) = match js::function::is_callable(super::ops::arg(&values, 2)) {
             true => (None, super::ops::arg(&values, 2)),
@@ -906,7 +906,7 @@ pub(super) fn cp_promise(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     let run = || -> Result<js::Promise<'_>, Thrown> {
         let (options, filter_this, filter) =
             parse_options(scope, Some(super::ops::arg(&values, 2)))?;
@@ -965,7 +965,7 @@ pub(super) fn cp_sync(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     let run = || -> Result<(), Thrown> {
         let (options, filter_this, filter) =
             parse_options(scope, Some(super::ops::arg(&values, 2)))?;

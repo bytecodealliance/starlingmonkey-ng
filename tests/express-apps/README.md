@@ -15,7 +15,10 @@ deps/node-bin/bin/node tests/express-apps/run.mjs --mode=spin     # the Spin app
 The driver installs an app's pinned dependencies with `npm ci` when its `node_modules` is
 missing. It uses `target/release/starlingmonkey` unless `--runtime` names another binary, and
 `target/wasm32-wasip3/release/starling.wasm` for `--mode=wasm`, which needs `wasmtime` on the
-`PATH`. Each app writes its files to a new temporary directory, `DATA_DIR`, in each run.
+`PATH`. Each app writes its files to a new temporary directory, `DATA_DIR`, in each run. The
+driver and `bench.mjs` start each server on a free port and wait until it listens there, which
+they check with `lsof`: a port another process listens on fails the run. Without `lsof`, any
+listener counts while the server is running.
 
 ## Apps
 
@@ -87,7 +90,9 @@ deps/node-bin/bin/node tests/express-apps/bench.mjs --report=target/express-benc
   `--duration` seconds (5) at each `--concurrency` (1 and 32). Each repeat (`--repeat`, 3) starts
   every app under every config once, in turn. Routes that add state to the app, such as the
   `POST`s that store items, run last. A response with another status than the route's is an
-  error.
+  error, and the latencies are those of the responses with a 2xx status. `oha` runs on the same
+  machine as the server, with `--client-threads` threads (the number of CPUs by default), which
+  the results record.
 - Startup is measured in `--startup-runs` (5) separate processes: the time until the server
   accepts a TCP connection, and the latency of the first request after that. The first request
   of a component instantiates it.

@@ -16,8 +16,8 @@ use js::typedarray::ViewKind;
 use js::{Function, Object};
 
 use crate::errors::{
-    out_of_range_received, validate_function, validate_object, validate_plain_object,
-    validate_string, ErrorKind, NodeError, Thrown,
+    out_of_range_received, validate_boolean, validate_function, validate_integer,
+    validate_plain_object, validate_string, ErrorKind, NodeError, Thrown,
 };
 use crate::inspect::{self, InspectOptions};
 
@@ -69,6 +69,24 @@ fn inspect_callback(
     text.as_str().to_jsval_raw_throwing(scope)
 }
 
+/// The object `util.inspect.defaultOptions` holds: the default options without `stylize`, sealed
+/// as Node.js seals its `inspectDefaultOptions`.
+fn default_options_object<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+    let options = InspectOptions::default().to_object(scope)?;
+    let defaults = Object::new_plain(scope)?;
+    let attrs = js::class_spec::JSPROP_ENUMERATE | js::class_spec::JSPROP_PERMANENT;
+    for key in inspect::CUSTOM_OPTIONS_PROPERTIES.keys() {
+        if let js::object::TemplateKey::Name(name) = key {
+            if *name != c"stylize" {
+                let value = options.get_property(scope, name)?;
+                defaults.define_property(scope, name, value, attrs as u32)?;
+            }
+        }
+    }
+    defaults.try_prevent_extensions(scope)?;
+    Ok(defaults)
+}
+
 /// The getter of `util.inspect.defaultOptions`, whose payload is the options object.
 fn default_options_get(
     _scope: &Scope<'_>,
@@ -86,7 +104,7 @@ fn default_options_set(
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let run = || -> Result<(), Thrown> {
-        let options = validate_object(scope, args.get(0), "options")?;
+        let options = validate_plain_object(scope, args.get(0), "options", false)?;
         let defaults = Object::from_value(scope, *payload)?;
         defaults.assign(scope, options)?;
         Ok(())
@@ -151,7 +169,7 @@ fn promisified(
             Function::new_callback(scope, c"", 1, settle_promise, *promise)?,
         ),
     };
-    let mut call_args = crate::callback_args(&args);
+    let mut call_args = args.rest(0);
     call_args.push((*settle).to_jsval_throwing(scope)?);
     match Function::call(scope, args.this(), original, &call_args) {
         Ok(result) => {
@@ -333,7 +351,7 @@ fn callbackified(
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let run = || -> Result<Value, Thrown> {
-        let mut call_args = crate::callback_args(&args);
+        let mut call_args = args.rest(0);
         let callback = call_args
             .pop()
             .unwrap_or(scope.root_value(js::value::undefined()));
@@ -485,7 +503,7 @@ fn deprecated(
         }
     }
     let function = state.data().function.get(scope);
-    let call_args = crate::callback_args(&args);
+    let call_args = args.rest(0);
     if args.is_constructing() {
         let new_target =
             Object::from_value(scope, args.new_target()).map_err(|e| e.throw(scope))?;
@@ -526,19 +544,13 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     }
 }
 
-/// The body of a `debuglog` logger, whose payload is the section's name: print the formatted
-/// arguments to stderr as `SECTION PID: message`.
-fn debug_log(
+/// Print `args`, formatted, to stderr as `SECTION PID: message`.
+fn print_debug(
     scope: &Scope<'_>,
-    args: CallbackArgs<'_>,
-    payload: HandleValue,
-) -> Result<Value, ExnThrown> {
-    let section = String::from_jsval(scope, payload, ()).unwrap_or_default();
-    let message = inspect::format(
-        scope,
-        &crate::callback_args(&args),
-        &InspectOptions::default(),
-    )?;
+    section: &str,
+    args: &[HandleValue<'_>],
+) -> Result<(), ExnThrown> {
+    let message = inspect::format(scope, args, &InspectOptions::default())?;
     // A wasm instance has no process ID, so we print 1 there.
     let pid = if cfg!(target_arch = "wasm32") {
         1
@@ -546,6 +558,80 @@ fn debug_log(
         std::process::id()
     };
     eprintln!("{} {pid}: {message}", section.to_ascii_uppercase());
+    Ok(())
+}
+
+/// The body of an enabled `debuglog` logger, whose payload is the section's name: print the
+/// formatted arguments to stderr as `SECTION PID: message`.
+fn debug_log(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let section = String::from_jsval(scope, payload, ()).unwrap_or_default();
+    print_debug(scope, &section, &args.rest(0))?;
+    Ok(js::value::undefined())
+}
+
+/// The state of a `debuglog` logger created with a callback.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct DebugLogger {
+    /// The callback, which the logger's first call calls with the function that logs.
+    callback: Heap<Value>,
+    /// The section's name.
+    #[no_trace]
+    section: String,
+    /// Whether `NODE_DEBUG` enables the section.
+    #[no_trace]
+    enabled: bool,
+    /// Whether the logger was called.
+    #[no_trace]
+    called: bool,
+}
+
+#[core_runtime::jsmethods]
+impl DebugLogger {}
+
+/// A function named `name` that logs for `section` with [`debug_log`] if `enabled` and does
+/// nothing otherwise, with an `enabled` property of `enabled`.
+fn debug_function<'s>(
+    scope: &'s Scope<'_>,
+    name: &'static CStr,
+    section: &str,
+    enabled: bool,
+) -> Result<Object<'s>, ExnThrown> {
+    let function = if enabled {
+        Function::new_callback(scope, name, 0, debug_log, section)?
+    } else {
+        Function::new_callback(scope, name, 0, do_nothing, ())?
+    };
+    function.set_property(scope, c"enabled", enabled)?;
+    Ok(*function)
+}
+
+/// The body of a `debuglog` logger created with a callback, whose payload is its [`DebugLogger`]
+/// state. The first call calls the callback with a function that logs for the section, and every
+/// call then logs if the section is enabled.
+fn debug_log_with_callback(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let state = cast_payload::<DebugLogger>(scope, payload);
+    let (section, enabled, first) = {
+        let mut data = state.data_mut();
+        let first = !data.called;
+        data.called = true;
+        (data.section.clone(), data.enabled, first)
+    };
+    if first {
+        let debug = debug_function(scope, c"debug", &section, enabled)?;
+        let callback = state.data().callback.get(scope);
+        Function::call(scope, HandleValue::undefined(), callback, &[debug])?;
+    }
+    if enabled {
+        print_debug(scope, &section, &args.rest(0))?;
+    }
     Ok(js::value::undefined())
 }
 
@@ -850,14 +936,6 @@ fn object_is(
     }
 }
 
-/// Whether `value` is an object whose builtin tag is one of `tags`, with an own
-/// `Symbol.toStringTag` disregarded.
-fn has_tag(scope: &Scope<'_>, value: HandleValue<'_>, tags: &[&str]) -> Result<bool, ExnThrown> {
-    object_is(scope, value, |object| {
-        inspect::has_builtin_tag(scope, object, tags)
-    })
-}
-
 /// Whether `value` is a boxed primitive of `kind`, or of any kind for `None`.
 fn is_boxed(
     scope: &Scope<'_>,
@@ -1005,11 +1083,13 @@ pub mod types {
     }
     /// <https://nodejs.org/api/util.html#utiltypesisgeneratorobjectvalue>
     #[function(length = 0)]
-    pub fn is_generator_object(
-        scope: &Scope<'_>,
-        value: HandleValue<'_>,
-    ) -> Result<bool, ExnThrown> {
-        has_tag(scope, value, &["Generator", "AsyncGenerator"])
+    pub fn is_generator_object(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
+        let Ok(object) = Object::from_value(scope, *value) else {
+            return false;
+        };
+        // SAFETY: `object` is a live, rooted object, and a class's name is a static C string.
+        let name = unsafe { CStr::from_ptr((*js::object::get_object_class(object.as_raw())).name) };
+        matches!(name.to_bytes(), b"Generator" | b"AsyncGenerator")
     }
     /// <https://nodejs.org/api/util.html#utiltypesisdatevalue>
     #[function(length = 0)]
@@ -1137,9 +1217,18 @@ pub mod types {
 pub mod module {
     use super::*;
 
-    /// <https://nodejs.org/api/util.html#utilformatformat-args>
-    pub fn format(scope: &Scope<'_>, args: RestArgs<HandleValue<'_>>) -> Result<String, ExnThrown> {
-        inspect::format_current(scope, &args)
+    /// <https://nodejs.org/api/util.html#utilformatformat-args>: a single string argument is
+    /// returned as it is.
+    pub fn format<'s>(
+        scope: &'s Scope<'_>,
+        args: RestArgs<HandleValue<'_>>,
+    ) -> Result<HandleValue<'s>, ExnThrown> {
+        if let [only] = &args[..] {
+            if only.is_string() {
+                return Ok(scope.root_value(only.get()));
+            }
+        }
+        inspect::format_current(scope, &args)?.to_jsval_throwing(scope)
     }
 
     /// <https://nodejs.org/api/util.html#utilformatwithoptionsinspectoptions-format-args>
@@ -1215,24 +1304,30 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/util.html#utilgetcallsitesframecount-options>: the `frameCount`
-    /// innermost frames of the calling code, 10 by default. `scriptId` is always `"0"`.
+    /// innermost frames of the calling code, 10 by default. An object or `null` as the only
+    /// argument is `options`. `scriptId` is always `"0"`, and `options.sourceMap` is validated but
+    /// not applied.
+    #[function(length = 0)]
     pub fn get_call_sites<'s>(
         scope: &'s Scope<'_>,
         frame_count: Option<HandleValue<'_>>,
+        options: Option<HandleValue<'_>>,
     ) -> Result<js::Array<'s>, Thrown> {
-        let count = match frame_count.filter(|count| count.is_number()) {
-            Some(count) => {
-                let count = count.to_number();
-                if !(1.0..=200.0).contains(&count) || count.fract() != 0.0 {
-                    return Err(NodeError::out_of_range(
-                        "frameCount",
-                        ">= 1 && <= 200",
-                        &count.to_string(),
-                    )
-                    .into());
-                }
-                count as usize
+        let (frame_count, options) = match (frame_count, options) {
+            (Some(value), None) if value.is_null() || inspect::is_typeof_object(scope, value) => {
+                (None, Some(value))
             }
+            pair => pair,
+        };
+        if let Some(options) = options {
+            let options = validate_plain_object(scope, options, "options", false)?;
+            let source_map = options.get_property(scope, c"sourceMap")?;
+            if !source_map.is_undefined() {
+                validate_boolean(scope, source_map, "options.sourceMap")?;
+            }
+        }
+        let count = match frame_count {
+            Some(count) => validate_integer(scope, count, "frameCount", 1.0, 200.0)? as usize,
             None => 10,
         };
         let error_class = crate::stack_trace::error_constructor(scope)?;
@@ -1265,9 +1360,9 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/util.html#utildeprecatefn-msg-code-options>: the wrapper has `fn`'s
-    /// `length`, `fn` as its prototype, and `fn.prototype`, if it has one, as its `prototype`.
-    /// With the option `modifyPrototype: false`, it has none of these, and its `prototype` is an
-    /// object of its own.
+    /// `length`, `fn` as its prototype, and `fn.prototype` as its `prototype` if that is truthy.
+    /// With the option `modifyPrototype: false`, it has none of these. A wrapper without
+    /// `fn.prototype` has a `prototype` object of its own.
     #[function(length = 3)]
     pub fn deprecate<'s>(
         scope: &'s Scope<'_>,
@@ -1297,10 +1392,11 @@ pub mod module {
         })?;
         let wrapper =
             Function::new_constructor_callback(scope, c"deprecated", 0, deprecated, state)?;
+        let prototype = Object::new_plain(scope)?;
+        prototype.define_property(scope, c"constructor", *wrapper, 0)?;
+        let attrs = js::class_spec::JSPROP_PERMANENT as u32;
+        wrapper.define_property(scope, c"prototype", prototype, attrs)?;
         if !modify_prototype {
-            let prototype = Object::new_plain(scope)?;
-            prototype.define_property(scope, c"constructor", *wrapper, 0)?;
-            wrapper.set_property(scope, c"prototype", prototype)?;
             return Ok(*wrapper);
         }
         wrapper.set_prototype(scope, function.handle())?;
@@ -1320,23 +1416,41 @@ pub mod module {
 
     /// <https://nodejs.org/api/util.html#utildebuglogsection-callback>: a logger that prints to
     /// stderr if `NODE_DEBUG` enables `section`, and does nothing otherwise. Its `enabled`
-    /// property is `true` in the first case.
+    /// property is `true` in the first case. With a `callback` function, the logger's first call
+    /// calls it with a function that logs for the section, also when `enabled` was read before,
+    /// which makes Node.js skip the call.
     #[function(length = 2)]
-    pub fn debuglog<'s>(scope: &'s Scope<'_>, section: String) -> Result<Object<'s>, ExnThrown> {
+    pub fn debuglog<'s>(
+        scope: &'s Scope<'_>,
+        section: String,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
         let enabled = debug_enabled(&section);
-        let logger = if enabled {
-            Function::new_callback(scope, c"debug", 0, debug_log, section.as_str())?
-        } else {
-            Function::new_callback(scope, c"debug", 0, do_nothing, ())?
+        let Some(callback) = callback.filter(|callback| {
+            Object::from_value(scope, **callback).is_ok_and(|callback| callback.is_callable())
+        }) else {
+            return debug_function(scope, c"logger", &section, enabled);
         };
+        let state =
+            js::class::create_instance_with::<DebugLoggerImpl>(scope, |_| DebugLoggerImpl {
+                callback: Heap::from(callback.get()),
+                section,
+                enabled,
+                called: false,
+            })?;
+        let logger = Function::new_callback(scope, c"logger", 0, debug_log_with_callback, state)?;
         logger.set_property(scope, c"enabled", enabled)?;
         Ok(*logger)
     }
 
     /// <https://nodejs.org/api/util.html#utildebugsection>: `debuglog`.
     #[function(length = 2)]
-    pub fn debug<'s>(scope: &'s Scope<'_>, section: String) -> Result<Object<'s>, ExnThrown> {
-        debuglog(scope, section)
+    pub fn debug<'s>(
+        scope: &'s Scope<'_>,
+        section: String,
+        callback: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        debuglog(scope, section, callback)
     }
 
     /// <https://nodejs.org/api/util.html#utilstripvtcontrolcharactersstr>
@@ -1473,10 +1587,16 @@ pub mod module {
         ))
     }
 
-    /// <https://nodejs.org/api/util.html#utilisarrayobject>: `Array.isArray`.
+    /// <https://nodejs.org/api/util.html#utilisarrayobject>: `Array.isArray`, which emits DEP0044
+    /// once.
     pub fn is_array(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
+        crate::process::deprecate_once(
+            scope,
+            "The `util.isArray` API is deprecated. Please use `Array.isArray()` instead.",
+            "DEP0044",
+        )?;
         match Object::from_value(scope, *value) {
-            Ok(object) => js::Array::is_array(scope, object.handle()),
+            Ok(object) => js::Array::is_array_or_array_proxy(scope, object.handle()),
             Err(_) => Ok(false),
         }
     }
@@ -1490,12 +1610,18 @@ pub mod module {
     }
 
     /// `util._extend(target, source)`: copy `source`'s own enumerable properties onto `target`.
+    /// Emits DEP0060 once.
     #[function(name = "_extend")]
     pub fn extend<'s>(
         scope: &'s Scope<'_>,
         target: HandleValue<'_>,
         source: HandleValue<'_>,
     ) -> Result<HandleValue<'s>, ExnThrown> {
+        crate::process::deprecate_once(
+            scope,
+            "The `util._extend` API is deprecated. Please use Object.assign() instead.",
+            "DEP0060",
+        )?;
         let target_value = scope.root_value(target.get());
         if let (Ok(target), Ok(source)) = (
             Object::from_value(scope, *target),
@@ -1609,6 +1735,7 @@ fn define_color_tables(scope: &Scope<'_>, inspect: Object<'_>) -> Result<(), Exn
 /// Register the classes of `node:util`.
 pub(crate) fn register_classes(scope: &Scope<'_>, global: Object<'_>) {
     Deprecated::add_to_global(scope, global);
+    DebugLogger::add_to_global(scope, global);
     Promisified::add_to_global(scope, global);
     PromisifySettle::add_to_global(scope, global);
     CallbackifyCall::add_to_global(scope, global);
@@ -1622,8 +1749,7 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         let inspect = Function::new_callback(scope, c"inspect", 2, inspect_callback, ())?;
         inspect.set_property(scope, c"custom", inspect::INSPECT_CUSTOM.value(scope)?)?;
         js::class::register_realm_object::<inspect::InspectFunction>(scope, *inspect);
-        let defaults = InspectOptions::default().to_object(scope)?;
-        defaults.delete_property(scope, c"stylize")?;
+        let defaults = default_options_object(scope)?;
         js::class::register_realm_object::<inspect::DefaultOptions>(scope, defaults);
         let getter = Function::new_callback(scope, c"get", 0, default_options_get, defaults)?;
         let setter = Function::new_callback(scope, c"set", 1, default_options_set, defaults)?;

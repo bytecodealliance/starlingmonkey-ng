@@ -20,6 +20,7 @@ import fs, {
 } from "node:fs";
 import fsp from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
+import { inspect } from "node:util";
 import { eq, deepEq, throws } from "./harness.mjs";
 
 const wasm = process.arch === "wasm32";
@@ -75,6 +76,8 @@ try {
   eq(mkdirSync(`${dir}/a/b/c`, { recursive: true }), `${dir}/a`, "recursive mkdir returns the first directory");
   eq(mkdirSync(`${dir}/a/b/c`, { recursive: true }), undefined, "recursive mkdir of an existing directory");
   eq(failure(() => mkdirSync(`${dir}/a`)).code, "EEXIST", "mkdir of an existing directory");
+  const notDir = failure(() => mkdirSync(`${file}/x/y`, { recursive: true }));
+  deepEq([notDir.code, notDir.path], ["ENOTDIR", `${file}/x/y`], "recursive mkdir below a file names the path");
   writeFileSync(`${dir}/a/b/inner.txt`, "");
   deepEq(sorted(readdirSync(dir)), ["a", "file.txt"], "readdirSync");
   deepEq(sorted(readdirSync(dir, { recursive: true })), ["a", "a/b", "a/b/c", "a/b/inner.txt", "file.txt"], "recursive readdir");
@@ -87,6 +90,13 @@ try {
   eq(failure(() => fs.rmdirSync(`${dir}/a`)).code, "ENOTEMPTY", "rmdir of a non-empty directory");
   const isDirectory = failure(() => rmSync(`${dir}/a`));
   deepEq([isDirectory.name, isDirectory.code, isDirectory.syscall], ["SystemError", "ERR_FS_EISDIR", "rm"], "rm of a directory");
+  // `errno`, `syscall` and `path` are accessors over `info`, and `dest` is absent without one.
+  eq(Object.getOwnPropertyDescriptor(isDirectory, "errno").get !== undefined, true, "errno is an accessor");
+  eq("dest" in isDirectory, false, "a SystemError without a dest");
+  eq(inspect(isDirectory).startsWith("SystemError [ERR_FS_EISDIR]: "), true, "the stack header of a SystemError has its code");
+  isDirectory.path = "elsewhere";
+  eq(Buffer.isBuffer(isDirectory.info.path), true, "setting path stores a Buffer in info");
+  eq(isDirectory.path, "elsewhere", "path reads info.path as a string");
   eq(failure(() => readdirSync(file)).code, "ENOTDIR", "readdir of a file");
 
   // Copying, renaming, removing, times and access.
@@ -123,6 +133,11 @@ try {
   eq(fs.fstatSync(fd).size, 6, "fstatSync");
   fs.ftruncateSync(fd, 3);
   eq(readSync(fd, buffer, { position: 0 }), 3, "readSync with options and ftruncateSync");
+  const window = Buffer.alloc(6, ".");
+  eq(readSync(fd, window, 2, 2, 1), 2, "readSync into an offset of the buffer");
+  eq(window.toString(), "..XY..", "readSync writes only the bytes read");
+  eq(writeSync(fd, new Uint8Array([0x41, 0x42, 0x43]), 1, 1, 0), 1, "writeSync of a slice");
+  eq(readFileSync(`${dir}/fd.txt`, "latin1"), "BXY", "writeSync writes only the slice");
   closeSync(fd);
   eq(failure(() => closeSync(fd)).code, "EBADF", "closing twice");
   eq(failure(() => readSync(fd, buffer)).syscall, "read", "reading a closed descriptor");
@@ -141,6 +156,12 @@ try {
   const read = await callback((done) => fs.read(callbackFd, Buffer.alloc(4), 0, 4, 0, done));
   deepEq([read[0], read[1], read[2].toString()], [null, 4, "data"], "read passes the count and buffer");
   deepEq(await callback((done) => fs.close(callbackFd, done)), [null], "close with a callback");
+  const noCallbackFd = openSync(file, "r");
+  eq(fs.close(noCallbackFd), undefined, "close without a callback");
+  throws(() => fs.close("x"), "ERR_INVALID_ARG_TYPE", "close without a callback validates the descriptor");
+  throws(() => fs.close(noCallbackFd, null), "ERR_INVALID_ARG_TYPE", "close with a callback that isn't a function");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  eq(failure(() => fs.fstatSync(noCallbackFd)).code, "EBADF", "close without a callback closes the descriptor");
   throws(() => fs.readFile(file), "ERR_INVALID_ARG_TYPE", "callback functions need a callback");
 
   // Descriptors from callback opens, with callback and synchronous functions. On wasm, these
@@ -346,6 +367,80 @@ try {
   for await (const chunk of input) chunks.push(chunk);
   deepEq(chunks, ["llo ", "str"], "ReadStream with start, end and highWaterMark");
   eq(input.bytesRead, 7, "bytesRead");
+  // Assigned fields change what the streams do, as in Node.js.
+  const moved = createReadStream(`${dir}/stream.txt`, { highWaterMark: 4 });
+  moved.on("open", () => Object.assign(moved, { pos: 6, bytesRead: 100 }));
+  const movedChunks = [];
+  for await (const chunk of moved) movedChunks.push(chunk);
+  deepEq([Buffer.concat(movedChunks).toString(), moved.bytesRead, moved.pos], ["streams", 107, 13], "assigning pos and bytesRead");
+  const extended = createReadStream(`${dir}/stream.txt`, { start: 0, end: 1 });
+  extended.on("open", () => { extended.end = 4; });
+  const extendedChunks = [];
+  for await (const chunk of extended) extendedChunks.push(chunk);
+  eq(Buffer.concat(extendedChunks).toString(), "hello", "assigning end");
+  const positioned = createWriteStream(`${dir}/positioned.txt`, { start: 0 });
+  await new Promise((resolve) => positioned.on("open", resolve));
+  positioned.pos = 2;
+  positioned.end("X");
+  await new Promise((resolve) => positioned.on("close", resolve));
+  eq(readFileSync(`${dir}/positioned.txt`, "latin1"), "\0\0X", "assigning a WriteStream's pos");
+  const repositioned = createReadStream(`${dir}/stream.txt`, { start: 0 });
+  repositioned.on("open", () => { repositioned.pos = null; });
+  const repositionedChunks = [];
+  for await (const chunk of repositioned) repositionedChunks.push(chunk);
+  eq(Buffer.concat(repositionedChunks).toString(), "hello streams", "a ReadStream whose pos is set to null reads on");
+  const misplaced = createReadStream(`${dir}/stream.txt`, { start: 0 });
+  misplaced.on("open", () => { misplaced.pos = "x"; });
+  misplaced.resume();
+  eq((await new Promise((resolve) => misplaced.on("error", resolve))).code, "ERR_OUT_OF_RANGE", "a ReadStream whose pos is set to a string errors");
+
+  // graceful-fs replaces `open` with one that opens the file and assigns `fd`.
+  function GracefulReadStream(...args) {
+    fs.ReadStream.call(this, ...args);
+  }
+  Object.setPrototypeOf(GracefulReadStream.prototype, fs.ReadStream.prototype);
+  GracefulReadStream.prototype.open = function () {
+    fs.open(this.path, this.flags, this.mode, (error, fd) => {
+      if (error) {
+        this.destroy();
+        this.emit("error", error);
+      } else {
+        this.fd = fd;
+        this.emit("open", fd);
+        this.read();
+      }
+    });
+  };
+  function GracefulWriteStream(...args) {
+    fs.WriteStream.call(this, ...args);
+  }
+  Object.setPrototypeOf(GracefulWriteStream.prototype, fs.WriteStream.prototype);
+  GracefulWriteStream.prototype.open = function () {
+    fs.open(this.path, this.flags, this.mode, (error, fd) => {
+      if (error) {
+        this.destroy();
+        this.emit("error", error);
+      } else {
+        this.fd = fd;
+        this.emit("open", fd);
+      }
+    });
+  };
+  const gracefulOut = new GracefulWriteStream(`${dir}/graceful.txt`);
+  gracefulOut.write("graceful ");
+  gracefulOut.end("streams");
+  await new Promise((resolve) => gracefulOut.on("close", resolve));
+  eq(gracefulOut.bytesWritten, 16, "a WriteStream with a replaced open writes");
+  const gracefulIn = new GracefulReadStream(`${dir}/graceful.txt`, { highWaterMark: 5 });
+  const gracefulEvents = [];
+  gracefulIn.on("open", (fd) => gracefulEvents.push(fd === gracefulIn.fd));
+  gracefulIn.on("ready", () => gracefulEvents.push("ready"));
+  const gracefulChunks = [];
+  for await (const chunk of gracefulIn) gracefulChunks.push(chunk.toString());
+  deepEq(gracefulChunks, ["grace", "ful s", "tream", "s"], "a ReadStream with a replaced open reads");
+  deepEq(gracefulEvents, [true], "a replaced open emits open but not ready");
+  const gracefulMissing = new GracefulReadStream(`${dir}/missing.txt`);
+  eq((await new Promise((resolve) => gracefulMissing.on("error", resolve))).code, "ENOENT", "a replaced open's error");
   await pipeline(createReadStream(`${dir}/stream.txt`), createWriteStream(`${dir}/piped.txt`));
   eq(readFileSync(`${dir}/piped.txt`, "utf8"), "hello streams", "pipeline between file streams");
   const broken = createReadStream(`${dir}/missing`);
@@ -429,9 +524,57 @@ try {
   let stopEvents = 0;
   stopped.on("stop", () => stopEvents++);
   fs.unwatchFile(polled);
+  // Calling the handle's `onchange` with a status that isn't a number doesn't abort.
+  const called = fs.watchFile(`${dir}/called.txt`, () => {});
+  called._handle.onchange("x");
+  fs.unwatchFile(`${dir}/called.txt`);
   eq(stopEvents, 0, "stop is emitted later");
   await new Promise((resolve) => setImmediate(resolve));
   eq(stopEvents, 1, "unwatchFile stops the watcher");
+
+  // Argument checks that follow Node.js.
+  {
+    const file = `${dir}/checks`;
+    writeFileSync(file, "hello");
+    throws(() => openSync(file, 1.5), "ERR_OUT_OF_RANGE", "a fractional numeric flag");
+    throws(() => fs.truncateSync(file, -(2 ** 60)), "ERR_OUT_OF_RANGE", "a length below MIN_SAFE_INTEGER");
+    throws(() => mkdirSync(`${dir}/m`, { recursive: 1 }), "ERR_INVALID_ARG_TYPE", "a non-boolean recursive");
+    throws(() => readdirSync(dir, { recursive: 1 }), "ERR_INVALID_ARG_TYPE", "a non-boolean readdir recursive");
+    throws(() => rmSync(`${dir}/none`, { force: "yes" }), "ERR_INVALID_ARG_TYPE", "a non-boolean force");
+    throws(() => rmSync(`${dir}/none`, { force: true, maxRetries: -1 }), "ERR_OUT_OF_RANGE", "a negative maxRetries");
+    throws(() => fs.symlinkSync("a", `${dir}/link`, "bogus"), "ERR_INVALID_ARG_VALUE", "an unknown symlink type");
+    throws(() => statSync(`${dir}/none`, { throwIfNoEntry: 0 }), "ENOENT", "only false keeps stat from throwing");
+    eq(fs.accessSync(file, 0.5), undefined, "access truncates the mode");
+    eq(throws(() => fs.accessSync(file, 8), "ERR_OUT_OF_RANGE", "a mode above 7").message, "mode is out of range: >= 0 && <= 7", "access mode message");
+    throws(() => fs.accessSync(file, "1"), "ERR_INVALID_ARG_TYPE", "a string mode");
+    const fd = openSync(file, "r+");
+    try {
+      throws(() => writeSync(fd, "abc", null, "hex"), "ERR_INVALID_ARG_VALUE", "odd hex data");
+      eq(writeSync(fd, Buffer.from("ab"), 0, 2, -5), 2, "a negative position writes at the current position");
+      eq(readSync(fd, Buffer.alloc(4), 0, 1.5, 0), 1, "the read length is truncated");
+      eq(throws(() => readSync(fd, Buffer.alloc(4), 0, 5, 0), "ERR_OUT_OF_RANGE", "a long read").message.includes("It must be <= 4"), true, "the read length range");
+      eq(throws(() => fs.futimesSync(fd, "x", 1), "ERR_INVALID_ARG_TYPE", "a bad atime").message.includes('"atime"'), true, "futimes names atime");
+    } finally {
+      closeSync(fd);
+    }
+    eq(fs.realpathSync(""), process.cwd(), "realpath of the empty path");
+    const order = [];
+    fs.exists(123, (exists) => order.push(`cb ${exists}`));
+    order.push("after");
+    deepEq(order, ["cb false", "after"], "exists calls back before returning for an invalid path");
+    deepEq(Object.getOwnPropertyNames(fs.Dirent.prototype).filter((name) => name !== "constructor").slice(0, 2), ["isDirectory", "isFile"], "Dirent method order");
+    eq(Object.getOwnPropertyDescriptor(fs.Stats.prototype, "atime").enumerable, true, "Stats dates are enumerable");
+    if (existsSync("/dev/null")) {
+      fs.copyFileSync("/dev/null", `${dir}/null-copy`);
+      eq(readFileSync(`${dir}/null-copy`, "utf8"), "", "copying a device copies its reported size");
+    }
+    const handle = await promises.open(file, "r");
+    try {
+      eq(Object.getPrototypeOf(await handle.read()), null, "FileHandle read results have no prototype");
+    } finally {
+      await handle.close();
+    }
+  }
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }

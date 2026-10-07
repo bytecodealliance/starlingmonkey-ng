@@ -1999,9 +1999,7 @@ pub mod socket_class {
         }
         let flag = |name| -> Result<bool, ExnThrown> {
             match options {
-                Some(options) => Ok(js::conversion::to_boolean(
-                    options.get_property(scope, name)?,
-                )),
+                Some(options) => crate::support::truthy(scope, options, name),
                 None => Ok(false),
             }
         };

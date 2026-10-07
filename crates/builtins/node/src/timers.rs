@@ -299,7 +299,8 @@ impl Timeout {
         properties.write(scope, &REFED, is_refed)?;
         properties.write(scope, &HAS_PRIMITIVE, false)?;
         write_async_resource(scope, &mut properties, id)?;
-        properties.finish(scope)
+        properties.finish(scope)?;
+        crate::domain::init_resource(scope, this)
     }
 
     /// <https://nodejs.org/api/timers.html#timeoutrefresh>: restart the timeout with its delay,
@@ -623,7 +624,8 @@ impl Immediate {
         }
         IMMEDIATE_IDS.with_borrow_mut(|ids| ids.insert(id));
         write_async_resource(scope, &mut properties, id)?;
-        properties.finish(scope)
+        properties.finish(scope)?;
+        crate::domain::init_resource(scope, this)
     }
 
     /// <https://nodejs.org/api/timers.html#immediateref>

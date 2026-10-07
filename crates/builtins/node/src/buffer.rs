@@ -20,9 +20,15 @@ use js::ArrayBufferView;
 use js::{Function, Object};
 
 use crate::errors::{ErrorKind, NodeError, Thrown};
+use crate::support::try_collect;
 
-/// The largest `Buffer` the runtime creates, `buffer.constants.MAX_LENGTH`.
-pub const MAX_LENGTH: f64 = 2147483647.0;
+/// Node.js's `kMaxLength`, `buffer.constants.MAX_LENGTH`: the largest size the size checks
+/// accept.
+pub const MAX_LENGTH: f64 = crate::errors::MAX_SAFE_INTEGER;
+
+/// The largest `Buffer` the runtime creates. Creating a larger one fails with the error Node.js
+/// throws when the allocation fails.
+pub const ALLOCATION_LIMIT: f64 = 2147483647.0;
 
 /// The longest string the engine can create, `buffer.constants.MAX_STRING_LENGTH`.
 pub const MAX_STRING_LENGTH: f64 = 1073741822.0;
@@ -66,6 +72,34 @@ impl Encoding {
             .find(|(known, _)| known.eq_ignore_ascii_case(name))
             .map(|(_, encoding)| *encoding)
     }
+
+    /// The encoding the JS string `name` names, as [`Encoding::parse`] finds it, without
+    /// allocating.
+    pub fn from_js(scope: &Scope<'_>, name: js::JSString<'_>) -> Result<Option<Self>, ExnThrown> {
+        /// The length of the longest name, `base64url`.
+        const LONGEST: usize = 9;
+        if name.len() > LONGEST {
+            return Ok(None);
+        }
+        let mut ascii = [0u8; LONGEST];
+        // SAFETY: the closure makes no call into SpiderMonkey.
+        let ascii = unsafe {
+            name.with_chars(scope, |chars| {
+                let mut copy = |units: &mut dyn Iterator<Item = u16>| {
+                    for (index, unit) in units.enumerate() {
+                        ascii[index] = u8::try_from(unit).ok().filter(u8::is_ascii)?;
+                    }
+                    Some(())
+                };
+                match chars {
+                    Chars::Latin1(bytes) => copy(&mut bytes.iter().map(|byte| u16::from(*byte))),
+                    Chars::TwoByte(units) => copy(&mut units.iter().copied()),
+                }?;
+                std::str::from_utf8(&ascii[..name.len()]).ok()
+            })
+        }?;
+        Ok(ascii.and_then(Self::parse))
+    }
 }
 
 /// Whether ICU's conversion callbacks drop `code` instead of substituting it, ICU's
@@ -107,64 +141,101 @@ fn base64_digit(c: u8) -> Option<u8> {
 }
 
 /// Decode base64 or base64url `chars` as Node does: characters outside both alphabets are skipped,
-/// decoding stops at the first `=`, and missing padding is allowed.
-fn decode_base64(chars: impl Iterator<Item = u32>) -> Vec<u8> {
-    let mut out = Vec::new();
+/// decoding stops at the first `=`, and missing padding is allowed. Returns `None` if allocating
+/// the bytes fails.
+fn decode_base64(chars: impl Iterator<Item = u32>) -> Option<Vec<u8>> {
     let mut accumulator = 0u32;
     let mut bits = 0;
-    for c in chars {
-        if c == u32::from(b'=') {
-            break;
-        }
-        let Some(digit) = u8::try_from(c).ok().and_then(base64_digit) else {
-            continue;
-        };
+    let digits = chars
+        .take_while(|c| *c != u32::from(b'='))
+        .filter_map(|c| u8::try_from(c).ok().and_then(base64_digit));
+    try_collect(digits.filter_map(|digit| {
         accumulator = (accumulator << 6) | u32::from(digit);
         bits += 6;
-        if bits >= 8 {
+        (bits >= 8).then(|| {
             bits -= 8;
-            out.push((accumulator >> bits) as u8);
-        }
-    }
-    out
+            (accumulator >> bits) as u8
+        })
+    }))
 }
 
 /// Decode hex `chars` as Node does: pairs of hex digits, up to the first pair that isn't one.
-fn decode_hex(chars: impl Iterator<Item = u32>) -> Vec<u8> {
-    let digits: Vec<u32> = chars.collect();
-    let mut out = Vec::with_capacity(digits.len() / 2);
-    for pair in digits.as_chunks::<2>().0 {
-        let high = char::from_u32(pair[0]).and_then(|c| c.to_digit(16));
-        let low = char::from_u32(pair[1]).and_then(|c| c.to_digit(16));
-        match (high, low) {
-            (Some(high), Some(low)) => out.push((high * 16 + low) as u8),
-            _ => break,
-        }
-    }
-    out
+/// Returns `None` if allocating the bytes fails.
+fn decode_hex(mut chars: impl Iterator<Item = u32>) -> Option<Vec<u8>> {
+    let digit = |c: u32| char::from_u32(c).and_then(|c| c.to_digit(16));
+    try_collect(std::iter::from_fn(move || {
+        let high = digit(chars.next()?)?;
+        let low = digit(chars.next()?)?;
+        Some((high * 16 + low) as u8)
+    }))
 }
 
-/// The bytes `string` encodes to in `encoding`.
+/// The UTF-8 bytes of `c`.
+fn utf8_bytes(c: char) -> impl Iterator<Item = u8> {
+    let mut buffer = [0; 4];
+    let length = c.encode_utf8(&mut buffer).len();
+    buffer.into_iter().take(length)
+}
+
+/// The UTF-16 code units of `c`.
+pub(crate) fn utf16_units_of(c: char) -> impl Iterator<Item = u16> {
+    let mut buffer = [0; 2];
+    let length = c.encode_utf16(&mut buffer).len();
+    buffer.into_iter().take(length)
+}
+
+/// The characters of the UTF-8 bytes `bytes`, with each invalid sequence as one U+FFFD, as
+/// `String::from_utf8_lossy` decodes them.
+pub(crate) fn lossy_chars(bytes: &[u8]) -> impl Iterator<Item = char> + '_ {
+    bytes.utf8_chunks().flat_map(|chunk| {
+        let invalid = !chunk.invalid().is_empty();
+        let replacement = invalid.then_some(char::REPLACEMENT_CHARACTER);
+        chunk.valid().chars().chain(replacement)
+    })
+}
+
+/// The characters of the UTF-16 code units `units`, with each lone surrogate as U+FFFD.
+fn chars_of_units(units: impl IntoIterator<Item = u16>) -> impl Iterator<Item = char> {
+    char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+}
+
+/// The bytes `string` encodes to in `encoding`. Failing to allocate them reports out of memory.
 pub fn encode_string(
     scope: &Scope<'_>,
     string: js::JSString<'_>,
     encoding: Encoding,
 ) -> Result<Vec<u8>, ExnThrown> {
+    let mut reserved = Vec::new();
     if encoding == Encoding::Utf8 {
-        return Ok(string.to_utf8(scope)?.into_bytes());
+        let length = string.utf8_length(scope)?;
+        if reserved.try_reserve_exact(length).is_err() {
+            js::exception::report_out_of_memory(scope);
+            return Err(ExnThrown);
+        }
     }
     // SAFETY: the closure makes no call into SpiderMonkey.
     let bytes = unsafe {
         string.with_chars(scope, |chars| match (encoding, chars) {
-            (Encoding::Latin1 | Encoding::Ascii, Chars::Latin1(bytes)) => bytes.to_vec(),
+            // `reserved` has room for all of the bytes.
+            (Encoding::Utf8, Chars::Latin1(bytes)) => {
+                reserved.extend(bytes.iter().flat_map(|byte| utf8_bytes(char::from(*byte))));
+                Some(reserved)
+            }
+            (Encoding::Utf8, Chars::TwoByte(units)) => {
+                reserved.extend(chars_of_units(units.iter().copied()).flat_map(utf8_bytes));
+                Some(reserved)
+            }
+            (Encoding::Latin1 | Encoding::Ascii, Chars::Latin1(bytes)) => {
+                js::typedarray::try_copy(bytes)
+            }
             (Encoding::Latin1 | Encoding::Ascii, Chars::TwoByte(units)) => {
-                units.iter().map(|unit| *unit as u8).collect()
+                try_collect(units.iter().map(|unit| *unit as u8))
             }
             (Encoding::Utf16le, Chars::Latin1(bytes)) => {
-                bytes.iter().flat_map(|byte| [*byte, 0]).collect()
+                try_collect(bytes.iter().flat_map(|byte| [*byte, 0]))
             }
             (Encoding::Utf16le, Chars::TwoByte(units)) => {
-                units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+                try_collect(units.iter().flat_map(|unit| unit.to_le_bytes()))
             }
             (Encoding::Base64 | Encoding::Base64Url, Chars::Latin1(bytes)) => {
                 decode_base64(bytes.iter().map(|byte| u32::from(*byte)))
@@ -179,37 +250,82 @@ pub fn encode_string(
             (Encoding::Hex, Chars::TwoByte(units)) => {
                 decode_hex(units.iter().map(|unit| u32::from(*unit as u8)))
             }
-            (Encoding::Utf8, _) => unreachable!("handled above"),
         })
     }?;
-    Ok(bytes)
+    bytes.ok_or_else(|| {
+        js::exception::report_out_of_memory(scope);
+        ExnThrown
+    })
 }
 
 /// The lowercase hexadecimal digits of `bytes`, two per byte.
-pub(crate) fn hex_digits(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn hex_digit_bytes(bytes: &[u8]) -> impl Iterator<Item = u8> + '_ {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    bytes
-        .iter()
-        .flat_map(|byte| {
-            [
-                DIGITS[usize::from(byte >> 4)],
-                DIGITS[usize::from(byte & 0xf)],
-            ]
-        })
-        .collect()
+    bytes.iter().flat_map(|byte| {
+        [
+            DIGITS[usize::from(byte >> 4)],
+            DIGITS[usize::from(byte & 0xf)],
+        ]
+    })
 }
 
-/// `bytes` decoded as `encoding` into a JS string.
-pub fn decode_bytes<'s>(
+/// The lowercase hexadecimal digits of `bytes`, two per byte, or `None` if allocating them fails.
+pub(crate) fn hex_digits(bytes: &[u8]) -> Option<Vec<u8>> {
+    try_collect(hex_digit_bytes(bytes))
+}
+
+/// The text of bytes decoded in an encoding whose JS string isn't created from the bytes
+/// themselves: ASCII and hex as Latin-1, UTF-16LE as code units, and base64 as a `String`, or
+/// `OutOfMemory` if allocating the text failed.
+enum Decoded {
+    Latin1(Vec<u8>),
+    Units(Vec<u16>),
+    Text(String),
+    OutOfMemory,
+}
+
+/// `bytes` decoded as `encoding`, or `None` for UTF-8 and Latin-1, whose JS strings are created
+/// from the bytes.
+fn decoded(bytes: &[u8], encoding: Encoding) -> Option<Decoded> {
+    let decoded = match encoding {
+        Encoding::Utf8 | Encoding::Latin1 => return None,
+        Encoding::Ascii => try_collect(bytes.iter().map(|byte| byte & 0x7f)).map(Decoded::Latin1),
+        Encoding::Utf16le => utf16_units(bytes).map(Decoded::Units),
+        Encoding::Base64 => web_globals::base64::encode(bytes, false).map(Decoded::Text),
+        Encoding::Base64Url => web_globals::base64::encode(bytes, true).map(Decoded::Text),
+        Encoding::Hex => hex_digits(bytes).map(Decoded::Latin1),
+    };
+    Some(decoded.unwrap_or(Decoded::OutOfMemory))
+}
+
+/// The JS string of `decoded`.
+fn decoded_string<'s>(
     scope: &'s Scope<'_>,
-    bytes: &[u8],
-    encoding: Encoding,
+    decoded: Decoded,
 ) -> Result<js::JSString<'s>, ExnThrown> {
+    match decoded {
+        Decoded::Latin1(bytes) => js::JSString::from_latin1(scope, &bytes),
+        Decoded::Units(units) => js::JSString::from_utf16(scope, &units),
+        Decoded::Text(text) => js::JSString::from_str(scope, &text),
+        Decoded::OutOfMemory => {
+            js::exception::report_out_of_memory(scope);
+            Err(ExnThrown)
+        }
+    }
+}
+
+/// Throw `ERR_STRING_TOO_LONG` if `length` bytes decoded as `encoding` are too long for a JS
+/// string.
+fn check_decoded_length(
+    scope: &Scope<'_>,
+    length: usize,
+    encoding: Encoding,
+) -> Result<(), ExnThrown> {
     let length = match encoding {
-        Encoding::Hex => bytes.len() * 2,
-        Encoding::Base64 | Encoding::Base64Url => bytes.len().div_ceil(3) * 4,
-        Encoding::Utf16le => bytes.len() / 2,
-        Encoding::Utf8 | Encoding::Latin1 | Encoding::Ascii => bytes.len(),
+        Encoding::Hex => length * 2,
+        Encoding::Base64 | Encoding::Base64Url => length.div_ceil(3) * 4,
+        Encoding::Utf16le => length / 2,
+        Encoding::Utf8 | Encoding::Latin1 | Encoding::Ascii => length,
     };
     if length as f64 > MAX_STRING_LENGTH {
         return Err(NodeError::new(
@@ -222,31 +338,44 @@ pub fn decode_bytes<'s>(
         )
         .throw(scope));
     }
-    match encoding {
-        Encoding::Utf8 => js::JSString::from_utf8_lossy(scope, bytes),
-        Encoding::Latin1 => js::JSString::from_latin1(scope, bytes),
-        Encoding::Ascii => {
-            let ascii: Vec<u8> = bytes.iter().map(|byte| byte & 0x7f).collect();
-            js::JSString::from_latin1(scope, &ascii)
+    Ok(())
+}
+
+/// `bytes` decoded as `encoding` into a JS string.
+pub fn decode_bytes<'s>(
+    scope: &'s Scope<'_>,
+    bytes: &[u8],
+    encoding: Encoding,
+) -> Result<js::JSString<'s>, ExnThrown> {
+    check_decoded_length(scope, bytes.len(), encoding)?;
+    match decoded(bytes, encoding) {
+        Some(decoded) => decoded_string(scope, decoded),
+        None if encoding == Encoding::Latin1 => js::JSString::from_latin1(scope, bytes),
+        None => js::JSString::from_utf8_lossy(scope, bytes),
+    }
+}
+
+/// The bytes `start..end` of `view`, which must be within it, decoded as `encoding` into a JS
+/// string. Only the bytes of UTF-8 and Latin-1 are copied first.
+fn decode_view<'s>(
+    scope: &'s Scope<'_>,
+    view: ArrayBufferView<'_>,
+    start: usize,
+    end: usize,
+    encoding: Encoding,
+) -> Result<js::JSString<'s>, ExnThrown> {
+    check_decoded_length(scope, end - start, encoding)?;
+    let decoded = view.with_bytes(|bytes| {
+        let bytes = &bytes[start..end];
+        decoded(bytes, encoding).ok_or_else(|| js::typedarray::try_copy(bytes))
+    });
+    match decoded {
+        Ok(decoded) => decoded_string(scope, decoded),
+        Err(Some(bytes)) => decode_bytes(scope, &bytes, encoding),
+        Err(None) => {
+            js::exception::report_out_of_memory(scope);
+            Err(ExnThrown)
         }
-        Encoding::Utf16le => {
-            let units: Vec<u16> = bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .collect();
-            js::JSString::from_utf16(scope, &units)
-        }
-        Encoding::Base64 | Encoding::Base64Url => {
-            let url = encoding == Encoding::Base64Url;
-            let Some(text) = web_globals::base64::encode(bytes, url) else {
-                js::exception::report_out_of_memory(scope);
-                return Err(ExnThrown);
-            };
-            js::JSString::from_str(scope, &text)
-        }
-        Encoding::Hex => js::JSString::from_latin1(scope, &hex_digits(bytes)),
     }
 }
 
@@ -267,14 +396,6 @@ pub fn new_buffer<'s>(scope: &'s Scope<'_>, bytes: &[u8]) -> Result<Object<'s>, 
     Ok(array)
 }
 
-/// A new `Buffer` holding a copy of `bytes`.
-pub(crate) fn buffer_from_vec<'s>(
-    scope: &'s Scope<'_>,
-    bytes: Vec<u8>,
-) -> Result<Object<'s>, ExnThrown> {
-    new_buffer(scope, &bytes)
-}
-
 /// A new zero-filled `Buffer` of `length` bytes.
 fn new_zeroed_buffer<'s>(scope: &'s Scope<'_>, length: usize) -> Result<Object<'s>, ExnThrown> {
     let array = js::Uint8Array::new(scope, length)?;
@@ -287,11 +408,52 @@ fn new_zeroed_buffer<'s>(scope: &'s Scope<'_>, length: usize) -> Result<Object<'
 pub(crate) fn new_buffer_with<'s>(
     scope: &'s Scope<'_>,
     length: usize,
-    fill: impl FnOnce(&mut [u8]) -> Result<(), ExnThrown> + Send,
+    fill: impl FnOnce(&mut [u8]) + Send,
 ) -> Result<Object<'s>, ExnThrown> {
     let buffer = new_zeroed_buffer(scope, length)?;
     let view = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
-    view.with_bytes_mut(fill)?;
+    view.with_bytes_mut(fill);
+    Ok(buffer)
+}
+
+/// The smallest `Vec` [`uint8_array_from_vec`] gives its memory to the array.
+const ADOPTED_LENGTH: usize = 1024;
+
+/// A new `Uint8Array` of `bytes`. A `Vec` of at least [`ADOPTED_LENGTH`] bytes that fill at least
+/// half of its capacity becomes the memory of the array, and other `Vec`s are copied.
+pub(crate) fn uint8_array_from_vec<'s>(
+    scope: &'s Scope<'_>,
+    bytes: Vec<u8>,
+) -> Result<Object<'s>, ExnThrown> {
+    let length = bytes.len();
+    let array = if length < ADOPTED_LENGTH || length * 2 < bytes.capacity() {
+        js::Uint8Array::with_data(scope, &bytes)?
+    } else {
+        let memory = js::ArrayBuffer::from_external(scope, bytes)?;
+        js::Uint8Array::with_buffer(scope, memory, 0, length)?
+    };
+    Ok(*array.as_array_buffer_view())
+}
+
+/// A new `Buffer` of `bytes`, which takes their memory as [`uint8_array_from_vec`] does.
+pub(crate) fn buffer_from_vec<'s>(
+    scope: &'s Scope<'_>,
+    bytes: Vec<u8>,
+) -> Result<Object<'s>, ExnThrown> {
+    let array = uint8_array_from_vec(scope, bytes)?;
+    array.set_prototype(scope, buffer_prototype(scope)?.handle())?;
+    Ok(array)
+}
+
+/// A new `Buffer` with a copy of the bytes of `view`.
+pub(crate) fn copy_of_view<'s>(
+    scope: &'s Scope<'_>,
+    view: ArrayBufferView<'_>,
+) -> Result<Object<'s>, ExnThrown> {
+    let length = view.byte_length();
+    let buffer = new_zeroed_buffer(scope, length)?;
+    let target = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
+    target.copy_region_from(0, view, 0, length);
     Ok(buffer)
 }
 
@@ -308,9 +470,9 @@ fn utf8_buffer<'s>(
 }
 
 /// A new `Buffer` viewing `length` bytes of `buffer` from `offset`.
-fn buffer_view<'s>(
+fn buffer_view<'s, 'b>(
     scope: &'s Scope<'_>,
-    buffer: js::ArrayBuffer<'_>,
+    buffer: impl js::typedarray::ViewableBuffer<'b>,
     offset: usize,
     length: usize,
 ) -> Result<Object<'s>, ExnThrown> {
@@ -396,21 +558,18 @@ fn lookup_encoding(
     scope: &Scope<'_>,
     value: HandleValue<'_>,
 ) -> Result<Option<Encoding>, ExnThrown> {
-    let name = js::JSString::from_value(scope, value)?.to_utf8(scope)?;
-    Ok(Encoding::parse(&name))
+    Encoding::from_js(scope, js::JSString::from_value(scope, value)?)
 }
 
-/// `ERR_UNKNOWN_ENCODING` for the encoding argument `value`.
+/// `ERR_UNKNOWN_ENCODING` for the encoding argument `value`, which the message shows as
+/// `util.format`'s `%s` formats it.
 pub(crate) fn unknown_encoding(scope: &Scope<'_>, value: HandleValue<'_>) -> Thrown {
-    let name = js::JSString::from_value(scope, value)
-        .and_then(|name| name.to_utf8(scope))
-        .unwrap_or_default();
-    NodeError::new(
-        ErrorKind::TypeError,
-        "ERR_UNKNOWN_ENCODING",
-        format!("Unknown encoding: {name}"),
-    )
-    .into()
+    let message = js::class::get_or_init_atom(scope, c"Unknown encoding: %s")
+        .and_then(|template| crate::inspect::format_current(scope, &[template, value]));
+    match message {
+        Ok(message) => NodeError::new(ErrorKind::TypeError, "ERR_UNKNOWN_ENCODING", message).into(),
+        Err(ExnThrown) => Thrown::Pending,
+    }
 }
 
 /// The encoding a falsy or `"utf8"` `value` selects, UTF-8, or the one [`lookup_encoding`] finds,
@@ -481,14 +640,16 @@ fn search_bytes(
     }
 }
 
-/// `bytes` as little-endian UTF-16 code units, without a trailing odd byte.
-fn utf16_units(bytes: &[u8]) -> Vec<u16> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect()
+/// `bytes` as little-endian UTF-16 code units, without a trailing odd byte, or `None` if
+/// allocating them fails.
+fn utf16_units(bytes: &[u8]) -> Option<Vec<u16>> {
+    try_collect(
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair)),
+    )
 }
 
 /// Node.js's `IndexOfOffset`: the position a search for a needle of `needle_length` bytes starts
@@ -658,7 +819,9 @@ fn index_of(
             utf16: found == Encoding::Utf16le,
             text,
         }
-    } else if let Ok(view) = uint8_array_arg(scope, value, "value") {
+    } else if let Some(view) =
+        as_view(scope, value).filter(|view| view.view_kind() == js::typedarray::ViewKind::Uint8)
+    {
         Needle::Bytes {
             bytes: view.copy_bytes(scope)?,
             utf16: found == Some(Encoding::Utf16le),
@@ -1129,12 +1292,12 @@ fn write_number(
 // Buffer
 // ============================================================================
 
-/// Node.js's `fromArrayBuffer`: a `Buffer` viewing `buffer` from `byte_offset`, for `length`
-/// bytes or to its end. Both are converted to numbers, a `NaN` offset is 0, and a length that isn't
-/// positive is 0.
-fn from_array_buffer<'s>(
+/// Node.js's `fromArrayBuffer`: a `Buffer` viewing `buffer`, an `ArrayBuffer` or a
+/// `SharedArrayBuffer`, from `byte_offset`, for `length` bytes or to its end. Both are converted
+/// to numbers, a `NaN` offset is 0, and a length that isn't positive is 0.
+fn from_array_buffer<'s, 'b>(
     scope: &'s Scope<'_>,
-    buffer: js::ArrayBuffer<'_>,
+    buffer: impl js::typedarray::ViewableBuffer<'b>,
     byte_offset: Option<HandleValue<'_>>,
     length: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, Thrown> {
@@ -1194,16 +1357,12 @@ fn from_array_like<'s>(scope: &'s Scope<'_>, array_like: Object<'_>) -> Result<O
             view.view_kind(),
             ViewKind::Uint8 | ViewKind::Uint8Clamped | ViewKind::Int8
         ) {
-            return Ok(new_buffer(scope, &view.copy_bytes(scope)?)?);
+            return Ok(copy_of_view(scope, view)?);
         }
     }
     let count = to_number(scope, array_like.get_property(scope, c"length")?)?;
     let count = if count > 0.0 { count.trunc() } else { 0.0 };
-    if count > MAX_LENGTH {
-        js::error::throw_range_error(scope, c"Array buffer allocation failed");
-        return Err(Thrown::Pending);
-    }
-    let count = count as u32;
+    let count = fast_buffer_length(scope, count)? as u32;
     let buffer = new_zeroed_buffer(scope, count as usize)?;
     let view = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
     for index in 0..count {
@@ -1231,7 +1390,10 @@ fn buffer_from<'s>(
         if encoding == Encoding::Utf8 {
             return Ok(utf8_buffer(scope, string)?);
         }
-        return Ok(new_buffer(scope, &encode_string(scope, string, encoding)?)?);
+        return Ok(buffer_from_vec(
+            scope,
+            encode_string(scope, string, encoding)?,
+        )?);
     }
     let invalid = || {
         NodeError::invalid_arg_type(
@@ -1245,9 +1407,17 @@ fn buffer_from<'s>(
     if let Ok(buffer) = object.cast::<js::ArrayBuffer>() {
         return from_array_buffer(scope, buffer, encoding_or_offset, length);
     }
+    if let Ok(buffer) = object.cast::<js::SharedArrayBuffer>() {
+        return from_array_buffer(scope, buffer, encoding_or_offset, length);
+    }
     // An object whose `valueOf` returns a string or another object, such as a `String` object.
+    // A truthy `valueOf` is called, and one that isn't a function throws.
     let value_of = object.get_property(scope, c"valueOf")?;
-    if Object::from_value(scope, value_of).is_ok_and(|f| f.is_callable()) {
+    if js::conversion::to_boolean(value_of) {
+        if !js::function::is_callable(value_of) {
+            let message = String::from("value.valueOf is not a function");
+            return Err(js::error::TypeError(message).throw(scope).into());
+        }
         let primitive = Function::call(scope, object, value_of, &[] as &[Value])?;
         let other_object = primitive.is_object() && primitive.to_object() != object.as_raw();
         if other_object || primitive.is_string() {
@@ -1284,8 +1454,24 @@ fn buffer_from<'s>(
     Err(invalid().into())
 }
 
-/// A `Buffer.alloc` size argument: an integer from 0 to [`MAX_LENGTH`].
-fn size_arg(scope: &Scope<'_>, size: HandleValue<'_>) -> Result<usize, Thrown> {
+/// Element `index` of the `list` argument of `Buffer.concat`, which must be a `Uint8Array`.
+fn concat_element<'s>(
+    scope: &'s Scope<'_>,
+    list: Object<'_>,
+    index: u32,
+) -> Result<ArrayBufferView<'s>, Thrown> {
+    let item = list.get_element(scope, index)?;
+    as_view(scope, item)
+        .filter(|view| view.view_kind() == js::typedarray::ViewKind::Uint8)
+        .ok_or_else(|| {
+            let name = format!("list[{index}]");
+            let expected = "an instance of Buffer or Uint8Array";
+            NodeError::invalid_arg_type(scope, &name, expected, item).into()
+        })
+}
+
+/// A `Buffer.alloc` size argument: a number from 0 to [`MAX_LENGTH`].
+pub(crate) fn size_arg(scope: &Scope<'_>, size: HandleValue<'_>) -> Result<f64, Thrown> {
     if !size.is_number() {
         return Err(NodeError::invalid_arg_type(scope, "size", "of type number", size).into());
     }
@@ -1297,6 +1483,29 @@ fn size_arg(scope: &Scope<'_>, size: HandleValue<'_>) -> Result<usize, Thrown> {
             &crate::errors::out_of_range_received(size),
         )
         .into());
+    }
+    Ok(size)
+}
+
+/// `size`, a non-negative number, as a length, or the `RangeError` that Node.js's
+/// `new FastBuffer(size)` throws for a size above [`ALLOCATION_LIMIT`].
+fn fast_buffer_length(scope: &Scope<'_>, size: f64) -> Result<usize, Thrown> {
+    if size > ALLOCATION_LIMIT {
+        js::error::throw_range_error(scope, c"Array buffer allocation failed");
+        return Err(Thrown::Pending);
+    }
+    Ok(size as usize)
+}
+
+/// `size`, a non-negative number, as a length, or the `ERR_MEMORY_ALLOCATION_FAILED` that
+/// Node.js's `createUnsafeBuffer(size)` throws for a size above [`ALLOCATION_LIMIT`].
+pub(crate) fn unsafe_buffer_length(scope: &Scope<'_>, size: f64) -> Result<usize, Thrown> {
+    if size > ALLOCATION_LIMIT {
+        let code = "ERR_MEMORY_ALLOCATION_FAILED";
+        let error = NodeError::new(ErrorKind::RangeError, code, "Failed to allocate memory");
+        let error = error.to_native_value(scope)?;
+        js::exception::set_pending(scope, error, js::native::ExceptionStackBehavior::Capture);
+        return Err(Thrown::Pending);
     }
     Ok(size as usize)
 }
@@ -1424,7 +1633,7 @@ fn slice_as<'s>(
     }
     let start = array_index(scope, start, 0)?;
     let end = array_index(scope, end, view.byte_length())?;
-    if start >= view.byte_length() || end <= start {
+    if end <= start {
         return Ok(js::JSString::empty(scope));
     }
     if end > view.byte_length() {
@@ -1435,12 +1644,7 @@ fn slice_as<'s>(
         )
         .into());
     }
-    let bytes = view.with_bytes(|bytes| js::typedarray::try_copy(&bytes[start..end]));
-    let bytes = bytes.ok_or_else(|| {
-        js::exception::report_out_of_memory(scope);
-        Thrown::Pending
-    })?;
-    Ok(decode_bytes(scope, &bytes, encoding)?)
+    Ok(decode_view(scope, view, start, end, encoding)?)
 }
 
 /// The `*Write` methods: write `string` in `encoding` into `this` from `offset`, at most `length`
@@ -1512,11 +1716,14 @@ fn fill_encoding(scope: &Scope<'_>, value: Option<HandleValue<'_>>) -> Result<En
     let Some(value) = value.filter(|value| !value.is_undefined() && !value.is_null()) else {
         return Ok(Encoding::Utf8);
     };
-    let name = crate::errors::validate_string(scope, value, "encoding")?;
+    if !value.is_string() {
+        return Err(NodeError::invalid_arg_type(scope, "encoding", "of type string", value).into());
+    }
+    let name = js::JSString::from_value(scope, value)?;
     if name.is_empty() {
         return Ok(Encoding::Utf8);
     }
-    Encoding::parse(&name).ok_or_else(|| unknown_encoding(scope, value))
+    Encoding::from_js(scope, name)?.ok_or_else(|| unknown_encoding(scope, value))
 }
 
 /// Node.js's `_fill(buf, value, offset, end, encoding)` for a buffer of `length` bytes: the range
@@ -1617,8 +1824,14 @@ struct FillPlan {
 impl FillPlan {
     /// Write the pattern over the range of `bytes`.
     fn apply(&self, bytes: &mut [u8]) {
-        for (index, byte) in bytes[self.start..self.stop].iter_mut().enumerate() {
-            *byte = self.pattern[index % self.pattern.len()];
+        let range = &mut bytes[self.start..self.stop];
+        match self.pattern.as_slice() {
+            [byte] => range.fill(*byte),
+            pattern => {
+                for chunk in range.chunks_mut(pattern.len()) {
+                    chunk.copy_from_slice(&pattern[..chunk.len()]);
+                }
+            }
         }
     }
 }
@@ -1637,7 +1850,7 @@ fn construct<'s>(
                 NodeError::invalid_arg_type(scope, "string", "of type string", value).into(),
             );
         }
-        let size = size_arg(scope, value)?;
+        let size = fast_buffer_length(scope, size_arg(scope, value)?)?;
         return Ok(new_zeroed_buffer(scope, size)?);
     }
     buffer_from(scope, value, encoding_or_offset, length)
@@ -1757,8 +1970,13 @@ pub mod buffer {
     ) -> Result<Object<'s>, Thrown> {
         let size = size_arg(scope, size)?;
         let fill = fill.filter(|fill| !fill.is_undefined());
+        let fill = fill.filter(|fill| !(fill.is_number() && fill.to_number() == 0.0));
+        let size = match fill {
+            Some(_) if size > 0.0 => unsafe_buffer_length(scope, size)?,
+            _ => fast_buffer_length(scope, size)?,
+        };
         let mut plan = None;
-        if let Some(fill) = fill.filter(|fill| !(fill.is_number() && fill.to_number() == 0.0)) {
+        if let Some(fill) = fill {
             if size > 0 {
                 let start = scope.root_value(js::value::from_f64(0.0));
                 let end = scope.root_value(js::value::from_f64(size as f64));
@@ -1769,7 +1987,6 @@ pub mod buffer {
             if let Some(plan) = plan {
                 plan.apply(bytes);
             }
-            Ok(())
         })?)
     }
 
@@ -1779,7 +1996,7 @@ pub mod buffer {
         scope: &'s Scope<'_>,
         size: HandleValue<'_>,
     ) -> Result<Object<'s>, Thrown> {
-        let size = size_arg(scope, size)?;
+        let size = unsafe_buffer_length(scope, size_arg(scope, size)?)?;
         Ok(new_zeroed_buffer(scope, size)?)
     }
 
@@ -1789,7 +2006,7 @@ pub mod buffer {
         scope: &'s Scope<'_>,
         size: HandleValue<'_>,
     ) -> Result<Object<'s>, Thrown> {
-        let size = size_arg(scope, size)?;
+        let size = unsafe_buffer_length(scope, size_arg(scope, size)?)?;
         Ok(new_zeroed_buffer(scope, size)?)
     }
 
@@ -1829,14 +2046,12 @@ pub mod buffer {
                 }
             } as f64);
         }
-        if let Some(view) = as_view(scope, value) {
-            return Ok(view.byte_length() as f64);
-        }
-        if let Ok(buffer) = Object::from_value(scope, *value)
-            .map_err(|_| ())
-            .and_then(|object| object.cast::<js::ArrayBuffer>().map_err(|_| ()))
-        {
-            return Ok(buffer.byte_length() as f64);
+        let object = Object::from_value(scope, *value).ok();
+        let source_length = object.and_then(|object| {
+            js::typedarray::with_buffer_source_bytes(object, |bytes| bytes.len())
+        });
+        if let Some(length) = source_length {
+            return Ok(length as f64);
         }
         Err(NodeError::invalid_arg_type(
             scope,
@@ -1859,7 +2074,9 @@ pub mod buffer {
         Ok(a.with_bytes_pair(b, |a, b| a.cmp(b)) as i32)
     }
 
-    /// <https://nodejs.org/api/buffer.html#static-method-bufferconcatlist-totallength>
+    /// <https://nodejs.org/api/buffer.html#static-method-bufferconcatlist-totallength>: as in
+    /// Node.js, each element is read twice, once to validate it and once to copy it, so no list of
+    /// the elements is kept.
     #[static_method(length = 2)]
     pub fn concat<'s>(
         scope: &'s Scope<'_>,
@@ -1880,32 +2097,26 @@ pub mod buffer {
             None => None,
             Some(total) => Some(crate::errors::validate_integer(
                 scope, total, "length", 0.0, MAX_LENGTH,
-            )? as usize),
+            )?),
         };
-        let mut views = Vec::new();
+        let mut sum = 0usize;
         for index in 0..count {
-            let item = array.get_element(scope, index)?;
-            let view = as_view(scope, item)
-                .filter(|view| view.view_kind() == js::typedarray::ViewKind::Uint8)
-                .ok_or_else(|| {
-                    let name = format!("list[{index}]");
-                    let expected = "an instance of Buffer or Uint8Array";
-                    NodeError::invalid_arg_type(scope, &name, expected, item)
-                })?;
-            views.push(view);
+            let inner = scope.inner_scope();
+            sum = sum.saturating_add(concat_element(&inner, array, index)?.byte_length());
         }
-        let length =
-            total.unwrap_or_else(|| views.iter().map(|view| view.byte_length()).sum::<usize>());
+        let length = unsafe_buffer_length(scope, total.unwrap_or(sum as f64))?;
         let buffer = new_zeroed_buffer(scope, length)?;
         let target = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
         let mut position = 0;
-        for view in views {
-            if position == length {
-                break;
-            }
+        for index in 0..count {
+            let inner = scope.inner_scope();
+            let view = concat_element(&inner, array, index)?;
             let count = view.byte_length().min(length - position);
             target.copy_region_from(position, view, 0, count);
             position += count;
+            if count < view.byte_length() {
+                break;
+            }
         }
         Ok(buffer)
     }
@@ -1923,8 +2134,9 @@ pub mod buffer {
     #[static_method]
     pub fn is_encoding(scope: &Scope<'_>, encoding: HandleValue<'_>) -> bool {
         encoding.is_string()
-            && String::from_jsval(scope, encoding, ())
-                .is_ok_and(|name| Encoding::parse(&name).is_some())
+            && js::JSString::from_value(scope, encoding)
+                .and_then(|name| Encoding::from_js(scope, name))
+                .is_ok_and(|found| found.is_some())
     }
 
     /// <https://nodejs.org/api/buffer.html#buftostringencoding-start-end>: `start` and `end` are
@@ -1939,7 +2151,8 @@ pub mod buffer {
         end: Option<HandleValue<'_>>,
     ) -> Result<js::JSString<'s>, Thrown> {
         let view = this_view(this)?;
-        let length = view.byte_length() as f64;
+        // Node.js clamps the range to `this.length`, the element count of a typed array.
+        let length = view.array_length() as f64;
         let start = match start {
             None => 0.0,
             Some(start) => to_number(scope, start)?,
@@ -1973,12 +2186,7 @@ pub mod buffer {
         // The conversions can run JS that shrinks the buffer.
         let end = (end as usize).min(view.byte_length());
         let start = (start as usize).min(end);
-        let bytes = view.with_bytes(|bytes| js::typedarray::try_copy(&bytes[start..end]));
-        let bytes = bytes.ok_or_else(|| {
-            js::exception::report_out_of_memory(scope);
-            Thrown::Pending
-        })?;
-        Ok(decode_bytes(scope, &bytes, encoding)?)
+        Ok(decode_view(scope, view, start, end, encoding)?)
     }
 
     /// <https://nodejs.org/api/buffer.html#bufwritestring-offset-length-encoding>: `offset` or
@@ -2059,12 +2267,10 @@ pub mod buffer {
             return Ok(new_buffer(scope, &[])?);
         }
         let range = start * element_size..end * element_size;
-        let bytes = typed.with_bytes(|bytes| js::typedarray::try_copy(&bytes[range]));
-        let bytes = bytes.ok_or_else(|| {
-            js::exception::report_out_of_memory(scope);
-            Thrown::Pending
-        })?;
-        Ok(new_buffer(scope, &bytes)?)
+        let buffer = new_zeroed_buffer(scope, range.len())?;
+        let target = ArrayBufferView::from_object(buffer).ok_or(ExnThrown)?;
+        target.copy_region_from(0, typed, range.start, range.len());
+        Ok(buffer)
     }
 
     /// Node.js's `utf8Slice(start, end)`.
@@ -2231,10 +2437,10 @@ pub mod buffer {
     /// <https://nodejs.org/api/buffer.html#buftojson>
     #[method(name = "toJSON")]
     pub fn to_json<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<Object<'s>, Thrown> {
-        let bytes = this_view(this)?.copy_bytes(scope)?;
+        let view = this_view(this)?;
+        let data = view.copy_bytes(scope)?;
         let json = Object::new_plain(scope)?;
         json.set_property(scope, c"type", "Buffer")?;
-        let data: Vec<f64> = bytes.iter().map(|byte| f64::from(*byte)).collect();
         json.set_property(scope, c"data", js::Array::with_contents(scope, &data)?)?;
         Ok(json)
     }
@@ -2299,7 +2505,7 @@ pub mod buffer {
         source_start: Option<HandleValue<'_>>,
         source_end: Option<HandleValue<'_>>,
     ) -> Result<f64, Thrown> {
-        let source = this_view(this)?.copy_bytes(scope)?;
+        let source = this_view(this)?;
         let target = as_view(scope, target).ok_or_else(|| {
             NodeError::invalid_arg_type(
                 scope,
@@ -2324,8 +2530,8 @@ pub mod buffer {
             .into());
         }
         let (source_start, _) = integer(source_start, 0.0)?;
-        if source_start < 0.0 || source_start > source.len() as f64 {
-            let range = format!(">= 0 && <= {}", source.len());
+        if source_start < 0.0 || source_start > source.byte_length() as f64 {
+            let range = format!(">= 0 && <= {}", source.byte_length());
             return Err(NodeError::out_of_range(
                 "sourceStart",
                 &range,
@@ -2333,7 +2539,7 @@ pub mod buffer {
             )
             .into());
         }
-        let (source_end, _) = integer(source_end, source.len() as f64)?;
+        let (source_end, _) = integer(source_end, source.byte_length() as f64)?;
         if source_end < 0.0 {
             return Err(NodeError::out_of_range(
                 "sourceEnd",
@@ -2348,16 +2554,15 @@ pub mod buffer {
         }
         let count = (source_end - source_start)
             .min(target_length - target_start)
-            .min(source.len() as f64 - source_start);
+            .min(source.byte_length() as f64 - source_start);
         if count <= 0.0 {
             return Ok(0.0);
         }
         let (target_start, source_start, count) =
             (target_start as usize, source_start as usize, count as usize);
-        target.with_bytes_mut(|target| {
-            target[target_start..target_start + count]
-                .copy_from_slice(&source[source_start..source_start + count]);
-        });
+        // `count` keeps both ranges within their views, whose lengths were read after the last
+        // conversion.
+        target.copy_region_from(target_start, source, source_start, count);
         Ok(count as f64)
     }
 
@@ -2523,7 +2728,7 @@ pub mod buffer {
         proto.set_property_by_id(scope, custom, *inspect)?;
         let of = Function::new_callback(scope, c"of", 0, buffer_of, ())?;
         ctor.define_property(scope, c"of", *of, enumerable)?;
-        ctor.set_property(scope, c"poolSize", 8192)?;
+        ctor.set_property(scope, c"poolSize", 65536)?;
         Ok(())
     }
 }
@@ -2535,7 +2740,7 @@ fn buffer_of(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let buffer = new_buffer(scope, &vec![0; args.len() as usize])?;
+    let buffer = new_zeroed_buffer(scope, args.len() as usize)?;
     for index in 0..args.len() {
         buffer.set_element(scope, index, args.get(index))?;
     }
@@ -2578,18 +2783,22 @@ fn swap(this: Object<'_>, width: usize) -> Result<Object<'_>, Thrown> {
     Ok(this)
 }
 
-/// `buffer.isUtf8(input)` and `buffer.isAscii(input)`.
+/// `buffer.isUtf8(input)` and `buffer.isAscii(input)`, which accept a typed array, an
+/// `ArrayBuffer` or a `SharedArrayBuffer`.
 fn check_bytes(
     scope: &Scope<'_>,
     input: HandleValue<'_>,
     check: fn(&[u8]) -> bool,
 ) -> Result<bool, Thrown> {
-    let object = Object::from_value(scope, *input).ok();
-    if let Some(view) = object.and_then(ArrayBufferView::from_object) {
-        return Ok(view.with_bytes(check));
-    }
-    if let Some(buffer) = object.and_then(|object| object.cast::<js::ArrayBuffer>().ok()) {
-        return Ok(buffer.with_bytes(check));
+    let checked = Object::from_value(scope, *input)
+        .ok()
+        .filter(|object| {
+            ArrayBufferView::from_object(*object)
+                .is_none_or(|view| view.view_kind().is_typed_array())
+        })
+        .and_then(|object| js::typedarray::with_buffer_source_bytes(object, check));
+    if let Some(checked) = checked {
+        return Ok(checked);
     }
     Err(NodeError::invalid_arg_type(
         scope,
@@ -2672,74 +2881,74 @@ pub mod module {
         let (Some(from), Some(to)) = (encoding(from_encoding)?, encoding(to_encoding)?) else {
             return Err(error("U_ILLEGAL_ARGUMENT_ERROR"));
         };
-        let utf16_bytes = |units: &[u16]| -> Vec<u8> {
-            units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
-        };
+        let utf16_bytes =
+            |units: &[u16]| try_collect(units.iter().flat_map(|unit| unit.to_le_bytes()));
         let bytes = match (from, to) {
             (Encoding::Latin1 | Encoding::Ascii, Encoding::Utf16le) => {
-                source.iter().flat_map(|byte| [*byte, 0]).collect()
+                try_collect(source.iter().flat_map(|byte| [*byte, 0]))
             }
             (Encoding::Utf8, Encoding::Utf16le) => {
                 let text =
                     std::str::from_utf8(&source).map_err(|_| error("U_INVALID_CHAR_FOUND"))?;
-                utf16_bytes(&text.encode_utf16().collect::<Vec<_>>())
+                try_collect(text.encode_utf16().flat_map(u16::to_le_bytes))
             }
             (Encoding::Utf16le, Encoding::Utf8) => {
-                let units = utf16_units(&source);
-                if units.is_empty() {
+                let units = || {
+                    source
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|pair| u16::from_le_bytes(*pair))
+                };
+                if source.len() < 2 || char::decode_utf16(units()).any(|c| c.is_err()) {
                     return Err(error("U_INVALID_CHAR_FOUND"));
                 }
-                String::from_utf16(&units)
-                    .map_err(|_| error("U_INVALID_CHAR_FOUND"))?
-                    .into_bytes()
+                try_collect(chars_of_units(units()).flat_map(utf8_bytes))
             }
             _ => {
-                let mut units: Vec<u16> = match from {
-                    Encoding::Utf8 => String::from_utf8_lossy(&source).encode_utf16().collect(),
+                let units = match from {
+                    Encoding::Utf8 => try_collect(lossy_chars(&source).flat_map(utf16_units_of)),
                     Encoding::Utf16le => utf16_units(&source),
-                    Encoding::Ascii => source
-                        .iter()
-                        .map(|byte| {
-                            if byte.is_ascii() {
-                                u16::from(*byte)
-                            } else {
-                                0xfffd
-                            }
-                        })
-                        .collect(),
-                    _ => source.iter().map(|byte| u16::from(*byte)).collect(),
+                    Encoding::Ascii => try_collect(source.iter().map(|byte| {
+                        if byte.is_ascii() {
+                            u16::from(*byte)
+                        } else {
+                            0xfffd
+                        }
+                    })),
+                    _ => try_collect(source.iter().map(|byte| u16::from(*byte))),
+                };
+                let Some(units) = units else {
+                    js::exception::report_out_of_memory(scope);
+                    return Err(Thrown::Pending);
                 };
                 match to {
                     Encoding::Utf16le => {
                         // Lone surrogates and a trailing odd byte decode as U+FFFD.
-                        units = char::decode_utf16(units.iter().copied())
-                            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-                            .flat_map(|c| {
-                                let mut buffer = [0; 2];
-                                c.encode_utf16(&mut buffer).to_vec()
-                            })
-                            .collect();
-                        if source.len() % 2 == 1 {
-                            units.push(0xfffd);
-                        }
-                        utf16_bytes(&units)
+                        let odd = (source.len() % 2 == 1).then_some(0xfffd);
+                        try_collect(chars_of_units(units).flat_map(utf16_units_of).chain(odd))
+                            .and_then(|units| utf16_bytes(&units))
                     }
-                    Encoding::Utf8 => String::from_utf16_lossy(&units).into_bytes(),
+                    Encoding::Utf8 => try_collect(chars_of_units(units).flat_map(utf8_bytes)),
                     // Each character the encoding can't represent, including a surrogate pair,
                     // becomes one `?`, except that default-ignorable characters are dropped.
-                    _ => char::decode_utf16(units.iter().copied())
-                        .filter_map(|c| match c.map(u32::from) {
+                    _ => try_collect(char::decode_utf16(units).filter_map(
+                        |c| match c.map(u32::from) {
                             Ok(code) if code < 0x80 || (to == Encoding::Latin1 && code < 0x100) => {
                                 Some(code as u8)
                             }
                             Ok(code) if is_default_ignorable(code) => None,
                             _ => Some(b'?'),
-                        })
-                        .collect(),
+                        },
+                    )),
                 }
             }
         };
-        Ok(new_buffer(scope, &bytes)?)
+        let Some(bytes) = bytes else {
+            js::exception::report_out_of_memory(scope);
+            return Err(Thrown::Pending);
+        };
+        Ok(buffer_from_vec(scope, bytes)?)
     }
 
     /// <https://nodejs.org/api/buffer.html#bufferisutf8input>
@@ -2807,28 +3016,23 @@ fn slow_buffer(
     } else {
         HandleValue::undefined()
     };
-    let size = size_arg(scope, size).map_err(|error| error.throw(scope))?;
+    let size = size_arg(scope, size).and_then(|size| unsafe_buffer_length(scope, size));
+    let size = size.map_err(|error| error.throw(scope))?;
     new_zeroed_buffer(scope, size)?.to_jsval_raw_throwing(scope)
 }
 
-/// `buffer.SlowBuffer`: [`slow_buffer`] deprecated with DEP0030, as `util.deprecate` wraps it.
+/// `buffer.SlowBuffer`: [`slow_buffer`] deprecated with DEP0030 by `util.deprecate`.
 fn slow_buffer_function<'s>(scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ExnThrown> {
     let function = Function::new_constructor_callback(scope, c"SlowBuffer", 1, slow_buffer, ())?;
-    let util = crate::internal_modules::module_default(scope, "node:util")?;
-    let wrapper = Function::call_by_name(
+    let message = js::class::get_or_init_atom(
         scope,
-        util.handle(),
-        c"deprecate",
-        &[
-            function.to_jsval_throwing(scope)?,
-            js::class::get_or_init_atom(
-                scope,
-                c"SlowBuffer() is deprecated. Please use Buffer.allocUnsafeSlow()",
-            )?,
-            js::class::get_or_init_atom(scope, c"DEP0030")?,
-        ],
+        c"SlowBuffer() is deprecated. Please use Buffer.allocUnsafeSlow()",
     )?;
-    Ok(scope.root_value(wrapper.get()))
+    let code = js::class::get_or_init_atom(scope, c"DEP0030")?;
+    let function = function.to_jsval_throwing(scope)?;
+    let wrapper = crate::util::module::deprecate(scope, function, Some(message), Some(code), None)
+        .map_err(|error| error.throw(scope))?;
+    wrapper.to_jsval_throwing(scope)
 }
 
 js::instance_local! {

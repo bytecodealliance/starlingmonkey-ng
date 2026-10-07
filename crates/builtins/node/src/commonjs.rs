@@ -9,22 +9,29 @@
 //! `__filename` and `__dirname`, with `this` the module's `exports`.
 //!
 //! `require` loads builtin modules, CommonJS modules, JSON files and ES modules, which it
-//! evaluates synchronously. `core_runtime::module` calls [`load_for_import`] for an ES module's
-//! `import` of a CommonJS module.
+//! evaluates synchronously. As in Node.js, each step goes through the property that code can
+//! replace: `require` calls `module.require`, which calls `Module._load`, which calls
+//! `Module._resolveFilename` and `module.load`, which calls the `Module._extensions` loader for the
+//! file's extension, and the `.js` loader calls `module._compile`. `core_runtime::module` calls
+//! [`load_for_import`] for an ES module's `import` of a CommonJS module, which starts at
+//! `module.load`.
 //!
 //! Reading a module file blocks, which isn't allowed while serving requests. So when a script
 //! that serves requests loads a CommonJS module, we also resolve and read the CommonJS modules
 //! and JSON files its source `require`s with a string literal, and theirs in turn. A later
 //! `require` of one of them uses that resolution and source without host I/O.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use core_runtime::module::{builtin_module, resolve_require, ResolveError, SourceFormat};
+use core_runtime::module::{
+    builtin_module, resolve_require, ResolveError, ResolveErrorKind, SourceFormat,
+};
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
@@ -70,6 +77,9 @@ js::instance_local! {
     /// against and its specifier.
     static RESOLVED: RefCell<BTreeMap<(PathBuf, String), (PathBuf, SourceFormat)>> =
         const { RefCell::new(BTreeMap::new()) };
+
+    /// The formats of the files [`resolve`] and [`load_for_import`] resolved, by path.
+    static FORMATS: RefCell<BTreeMap<PathBuf, SourceFormat>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 /// The source of the file at `path`, with a byte order mark and a `#!` line removed: the source
@@ -167,7 +177,7 @@ fn prefetch_requires(dir: &Path, source: &str) {
         if RESOLVED.with_borrow(|resolved| resolved.contains_key(&key)) {
             continue;
         }
-        let Ok((path, format)) = resolve_require(&key.1, &key.0) else {
+        let Ok((path, format)) = resolve_now(&key.1, &key.0) else {
             continue;
         };
         RESOLVED.with_borrow_mut(|resolved| resolved.insert(key, (path.clone(), format)));
@@ -197,29 +207,69 @@ fn prefetch_requires(dir: &Path, source: &str) {
 
 /// The path and format `specifier` resolves to from `dir`: the resolution
 /// [`prefetch_requires`] found, or the result of resolving it now.
-fn resolve(specifier: &str, dir: &Path) -> Result<(PathBuf, SourceFormat), ResolveError> {
+///
+/// Resolving reads the file system, which blocks, so it throws `ERR_BLOCKING_NOT_ALLOWED` where
+/// blocking isn't allowed.
+fn resolve(specifier: &str, dir: &Path) -> Result<(PathBuf, SourceFormat), NodeError> {
     let key = (dir.to_path_buf(), specifier.to_string());
-    if let Some(resolution) = RESOLVED.with_borrow(|resolved| resolved.get(&key).cloned()) {
-        return Ok(resolution);
+    let resolution = match RESOLVED.with_borrow(|resolved| resolved.get(&key).cloned()) {
+        Some(resolution) => resolution,
+        None => {
+            if let Some(error) =
+                crate::errors::blocking_not_allowed(&format!("Resolving '{specifier}'"))
+            {
+                return Err(error);
+            }
+            resolve_now(specifier, dir).map_err(resolve_failed)?
+        }
+    };
+    FORMATS.with_borrow_mut(|formats| formats.insert(resolution.0.clone(), resolution.1));
+    Ok(resolution)
+}
+
+/// The path and format `specifier` resolves to from `dir`: the `node_modules` lookup of
+/// `resolve_require`, and for a bare specifier it doesn't find, the file or directory it names in
+/// each of the [`global_paths`] in turn, as Node.js searches `Module.globalPaths`.
+fn resolve_now(specifier: &str, dir: &Path) -> Result<(PathBuf, SourceFormat), ResolveError> {
+    let error = match resolve_require(specifier, dir) {
+        Ok(resolution) => return Ok(resolution),
+        Err(error) => error,
+    };
+    let bare = !specifier.starts_with('.') && !Path::new(specifier).is_absolute();
+    if !bare || error.kind != ResolveErrorKind::NotFound {
+        return Err(error);
     }
-    resolve_require(specifier, dir)
+    global_paths()
+        .iter()
+        .find_map(|global| resolve_require(&format!("./{specifier}"), global).ok())
+        .ok_or(error)
+}
+
+/// The format of the file at `path`: the one [`resolve`] or [`load_for_import`] found for it, or
+/// the one resolving `path` finds now, or CommonJS if that fails.
+fn format_of(path: &Path) -> SourceFormat {
+    if let Some(format) = FORMATS.with_borrow(|formats| formats.get(path).copied()) {
+        return format;
+    }
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    resolve(&path.to_string_lossy(), dir).map_or(SourceFormat::CommonJs, |(_, format)| format)
 }
 
 /// What loading a module file produced.
 enum Loaded<'s> {
     /// The module's `module.exports`.
     Exports(HandleValue<'s>),
-    /// The file is an `Ambiguous` one with ES module syntax, which must be loaded as an ES
-    /// module. Nothing was cached for it.
+    /// The file is an ES module, which must be loaded as one. Nothing was cached for it.
     EsModule,
 }
 
-/// Load the module file at `path`, of `format`, for a `require` from `parent`, or for an
-/// `import` without one. A module loaded before comes from `require.cache`.
+/// Load the module file at `path` for a `require` from `parent`, or for an `import` without one,
+/// as Node.js's `Module._load` does after resolving: a module loaded before comes from
+/// `require.cache`, and otherwise a new `Module` is cached and its `load` method runs the file. An
+/// error removes the module from the cache.
 fn load_file<'s>(
     scope: &'s Scope<'_>,
     path: &Path,
-    format: SourceFormat,
     parent: Option<Object<'_>>,
 ) -> Result<Loaded<'s>, Thrown> {
     let cache = module_cache(scope)?;
@@ -228,19 +278,10 @@ fn load_file<'s>(
         std::ffi::CString::new(key.as_str()).map_err(|_| module_not_found(&key, "invalid path"))?;
     let cached = cache.get_property_by_name(scope, &c_key)?;
     if let Ok(cached) = Object::from_value(scope, cached) {
+        if let Some(parent) = parent {
+            add_child(scope, parent, cached)?;
+        }
         return Ok(Loaded::Exports(cached.get_property(scope, c"exports")?));
-    }
-    if format == SourceFormat::Other {
-        return Err(NodeError::new(
-            ErrorKind::Error,
-            "ERR_DLOPEN_FAILED",
-            format!("Native addons and other non-JavaScript modules can't be loaded: {key}"),
-        )
-        .into());
-    }
-    if format == SourceFormat::Module {
-        let namespace = core_runtime::module::require_module(scope, path)?;
-        return Ok(Loaded::Exports(esm_exports(scope, namespace)?));
     }
 
     let ctor = module_class::class_constructor(scope)?;
@@ -253,74 +294,121 @@ fn load_file<'s>(
         ctor,
         &[key.as_str().to_jsval_throwing(scope)?, parent_value],
     )?;
-    module.set_property(scope, c"filename", key.as_str())?;
-    set_node_module_paths(scope, module, path.parent().unwrap_or(Path::new("/")))?;
     cache.set_property_by_name(scope, &c_key, module)?;
     if js::class::realm_object::<MainModule>(scope).is_none()
         && core_runtime::module::entry_path().as_deref() == Some(key.as_str())
     {
         js::class::register_realm_object::<MainModule>(scope, module);
+        module.set_property(scope, c"id", ".")?;
     }
 
-    let loaded = run_file(scope, module, path, format);
+    let loaded = Function::call_by_name(scope, module.handle(), c"load", &[key.as_str()]);
     match loaded {
-        Ok(Loaded::Exports(_)) => {
-            module.set_property(scope, c"loaded", true)?;
-            Ok(Loaded::Exports(module.get_property(scope, c"exports")?))
-        }
-        Ok(Loaded::EsModule) => {
+        Ok(_) if is_es_module(scope, module)? => {
             cache.delete_property_by_name(scope, &c_key)?;
+            if let Some(parent) = parent {
+                remove_child(scope, parent, module)?;
+            }
+            FORMATS.with_borrow_mut(|formats| {
+                formats.insert(path.to_path_buf(), SourceFormat::Module)
+            });
             Ok(Loaded::EsModule)
         }
-        Err(error) => {
+        Ok(_) => Ok(Loaded::Exports(module.get_property(scope, c"exports")?)),
+        Err(ExnThrown) => {
             // The exception stays pending while the entry is removed.
             let exception = js::exception::take_pending(scope);
             let _ = cache.delete_property_by_name(scope, &c_key);
             if let Some(exception) = exception {
                 js::exception::throw_value(scope, exception);
             }
-            Err(error)
+            Err(Thrown::Pending)
         }
     }
 }
 
-/// Run the file at `path`, of `format`, as `module`.
-fn run_file<'s>(
-    scope: &'s Scope<'_>,
-    module: Object<'_>,
-    path: &Path,
-    format: SourceFormat,
-) -> Result<Loaded<'s>, Thrown> {
-    let source = read_source(path)?;
-    if format != SourceFormat::Json {
-        prefetch_requires(path.parent().unwrap_or(Path::new("/")), &source);
+/// Append `child` to `parent.children` unless it is in it, as Node.js's `updateChildren` does for
+/// a module that comes from `require.cache`.
+fn add_child(scope: &Scope<'_>, parent: Object<'_>, child: Object<'_>) -> Result<(), ExnThrown> {
+    let children = parent.get_property(scope, c"children")?;
+    let Some(children) = crate::support::as_array(scope, children) else {
+        return Ok(());
+    };
+    let child = child.to_jsval_throwing(scope)?;
+    if children.index_of(scope, child)?.is_none() {
+        children.push(scope, child)?;
     }
-    run_source(scope, module, &source, path, format)
+    Ok(())
 }
 
-/// Run `source`, the source of the file at `path`, of `format`, as `module`.
+/// Remove `child` from `parent.children`, where the `Module` constructor added it.
+fn remove_child(scope: &Scope<'_>, parent: Object<'_>, child: Object<'_>) -> Result<(), ExnThrown> {
+    let children = parent.get_property(scope, c"children")?;
+    let Some(children) = crate::support::as_array(scope, children) else {
+        return Ok(());
+    };
+    if let Some(index) = children.index_of(scope, child.to_jsval_throwing(scope)?)? {
+        children.remove(scope, index, 1)?;
+    }
+    Ok(())
+}
+
+/// The state of `module`, if it is a `Module` or holds the state of one.
+fn module_state<'s>(
+    scope: &'s Scope<'_>,
+    module: Object<'s>,
+) -> Result<Option<ModuleState<'s>>, ExnThrown> {
+    js::class::find_instance_state::<ModuleState>(scope, module, false)
+}
+
+/// Whether running the file of `module` found an ES module, which didn't run.
+fn is_es_module<'s>(scope: &'s Scope<'_>, module: Object<'s>) -> Result<bool, ExnThrown> {
+    Ok(module_state(scope, module)?.is_some_and(|state| state.data().es_module))
+}
+
+/// Run `source`, the CommonJS source of the file at `path`, as `module`. With `ambiguous`, a
+/// `SyntaxError` from compiling it marks `module` as an ES module instead, and nothing runs.
 fn run_source<'s>(
+    scope: &'s Scope<'_>,
+    module: Object<'s>,
+    source: &str,
+    path: &Path,
+    ambiguous: bool,
+) -> Result<(), Thrown> {
+    let filename = path.to_string_lossy();
+    let dirname = path
+        .parent()
+        .map_or_else(|| "/".into(), |dir| dir.to_string_lossy().into_owned());
+    let exports = module.get_property(scope, c"exports")?;
+    let loaded = run_wrapped(
+        scope, module, source, &filename, &dirname, exports, ambiguous,
+    )?;
+    if let Loaded::EsModule = loaded {
+        if let Some(state) = module_state(scope, module)? {
+            state.data_mut().es_module = true;
+        }
+    }
+    Ok(())
+}
+
+/// Run `source` as the body of the CommonJS wrapper function of `module`, called with `this` and
+/// the `__filename` and `__dirname` given. With `ambiguous`, a `SyntaxError` from compiling the
+/// body makes it an ES module, and nothing runs.
+fn run_wrapped<'s>(
     scope: &'s Scope<'_>,
     module: Object<'_>,
     source: &str,
-    path: &Path,
-    format: SourceFormat,
+    filename: &str,
+    dirname: &str,
+    this: HandleValue<'_>,
+    ambiguous: bool,
 ) -> Result<Loaded<'s>, Thrown> {
-    if format == SourceFormat::Json {
-        let value = js::json::parse(scope, source)?;
-        module.set_property(scope, c"exports", value)?;
-        return Ok(Loaded::Exports(value));
-    }
-    let filename = path.to_string_lossy();
     // The function's body starts a line after the header `compile_function` puts before it, so
     // starting at line 0 numbers the file's first line 1.
     let wrapper =
-        match js::compile::compile_function(scope, c"", &WRAPPER_PARAMS, source, &filename, 0) {
+        match js::compile::compile_function(scope, c"", &WRAPPER_PARAMS, source, filename, 0) {
             Ok(wrapper) => wrapper,
-            Err(ExnThrown)
-                if format == SourceFormat::Ambiguous
-                    && js::exception::is_syntax_error_pending(scope) =>
-            {
+            Err(ExnThrown) if ambiguous && js::exception::is_syntax_error_pending(scope) => {
                 js::exception::clear(scope);
                 return Ok(Loaded::EsModule);
             }
@@ -328,18 +416,103 @@ fn run_source<'s>(
         };
     let exports = module.get_property(scope, c"exports")?;
     let require = make_require(scope, module)?;
-    let dirname = path
-        .parent()
-        .map_or_else(|| "/".into(), |dir| dir.to_string_lossy().into_owned());
     let args = [
         exports,
         require.to_jsval_throwing(scope)?,
         module.to_jsval_throwing(scope)?,
-        filename.as_ref().to_jsval_throwing(scope)?,
-        dirname.as_str().to_jsval_throwing(scope)?,
+        filename.to_jsval_throwing(scope)?,
+        dirname.to_jsval_throwing(scope)?,
     ];
-    Function::call(scope, exports, *wrapper, &args)?;
+    Function::call(scope, this, *wrapper, &args)?;
     Ok(Loaded::Exports(exports))
+}
+
+js::instance_local! {
+    /// Whether the `-e` script came from `-p`, whose completion value is printed at exit.
+    static PRINT_EVAL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set whether the `-e` script came from `-p`.
+pub(crate) fn set_print_eval(print: bool) {
+    PRINT_EVAL.with(|cell| cell.set(print));
+}
+
+/// The [`core_runtime::module::CommonJsEval`]: run `-e` code as Node.js does. The code runs as a
+/// classic script named `[eval]`, after `module`, `exports`, `require`, `__filename` (`[eval]`)
+/// and `__dirname` (`.`) were set on the global object for the CommonJS module `[eval]`, whose
+/// `filename` is `[eval]` in the working directory and whose `require` resolves from there. The
+/// module isn't in `require.cache` and isn't `require.main`. With `-p`, the script's completion
+/// value is logged when the process exits. Code that doesn't compile as a script, such as code
+/// with ES module syntax or a top-level `await`, runs as an ES module instead, except with `-p`,
+/// where code that compiles as an ES module throws `ERR_EVAL_ESM_CANNOT_PRINT`.
+pub(crate) fn run_eval(scope: &Scope<'_>, source: &str) -> Result<bool, ExnThrown> {
+    let script = match js::compile::compile_with_filename(scope, source, "[eval]", 1) {
+        Ok(script) => script,
+        Err(ExnThrown) if js::exception::is_syntax_error_pending(scope) => {
+            js::exception::clear(scope);
+            if PRINT_EVAL.with(Cell::get) && compiles_as_module(scope, source) {
+                let message = "--print cannot be used with ESM input";
+                let error = NodeError::new(ErrorKind::Error, "ERR_EVAL_ESM_CANNOT_PRINT", message);
+                return Err(error.throw(scope));
+            }
+            return Ok(false);
+        }
+        Err(ExnThrown) => return Err(ExnThrown),
+    };
+    let set_globals = || -> Result<(), Thrown> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let ctor = module_class::class_constructor(scope)?;
+        let undefined = scope.root_value(js::value::undefined());
+        let module = Function::construct(
+            scope,
+            ctor,
+            &["[eval]".to_jsval_throwing(scope)?, undefined],
+        )?;
+        module.set_property(
+            scope,
+            c"filename",
+            cwd.join("[eval]").to_string_lossy().as_ref(),
+        )?;
+        set_node_module_paths(scope, module, &cwd)?;
+        let global = scope.global();
+        global.set_property(scope, c"module", module)?;
+        global.set_property(scope, c"exports", module.get_property(scope, c"exports")?)?;
+        global.set_property(scope, c"__dirname", ".")?;
+        global.set_property(scope, c"require", make_require(scope, module)?)?;
+        global.set_property(scope, c"__filename", "[eval]")?;
+        Ok(())
+    };
+    set_globals().map_err(|thrown| thrown.throw(scope))?;
+    let value = js::compile::execute_script(scope, script)?;
+    if PRINT_EVAL.with(Cell::get) {
+        let print = Function::new_callback(scope, c"", 0, print_value, value)?;
+        let process = crate::process::global_process(scope)?;
+        crate::events::listen(scope, process, c"on", c"exit", *print)?;
+    }
+    Ok(true)
+}
+
+/// Whether `source` compiles as an ES module. Nothing is evaluated.
+fn compiles_as_module(scope: &Scope<'_>, source: &str) -> bool {
+    let options = js::compile::options(scope, c"[eval]".into(), 1);
+    let mut text = js::module_raw::transform_str_to_source_text(source);
+    // SAFETY: `options` and `text` are live locals.
+    let compiled = unsafe { js::module::compile_module(scope, options.ptr, &mut text) }.is_ok();
+    js::exception::clear(scope);
+    compiled
+}
+
+/// The `exit` listener `-p` adds, whose payload is the script's completion value: log it as
+/// `console.log` does.
+fn print_value(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    value: HandleValue,
+) -> Result<Value, ExnThrown> {
+    if let Some(console) = crate::console::console_object(scope) {
+        Function::call_by_name(scope, console.handle(), c"log", &[value])?;
+    }
+    Ok(js::value::undefined())
 }
 
 /// The value `require` returns for an ES module with namespace `namespace`: its export named
@@ -354,21 +527,63 @@ fn esm_exports<'s>(
     namespace.to_jsval_throwing(scope)
 }
 
-/// The `require` of `parent`: resolve `specifier` from it and load the module.
-fn require_from<'s>(
+/// The path a `require` of `request` from `parent`, a module or `undefined`, resolves to, or
+/// `request` itself if it names a builtin module, as Node.js's `Module._resolveFilename` returns
+/// it.
+fn resolve_filename(
+    scope: &Scope<'_>,
+    request: &str,
+    parent: HandleValue<'_>,
+) -> Result<String, Thrown> {
+    if builtin_module(request).is_some() {
+        return Ok(request.to_string());
+    }
+    let base = match Object::from_value(scope, *parent) {
+        Ok(parent) => module_dir(scope, parent)?,
+        Err(_) => PathBuf::from(crate::process::cwd()),
+    };
+    let (path, _) = resolve(request, &base)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Node.js's `Module._load(request, parent, isMain)`: the exports of the builtin module a
+/// `node:` `request` names, or else of the module that `Module._resolveFilename` resolves
+/// `request` to, loaded with [`load_file`]. An ES module is loaded and evaluated synchronously.
+fn load_request<'s>(
     scope: &'s Scope<'_>,
-    parent: Object<'_>,
-    specifier: &str,
+    request: HandleValue<'_>,
+    parent: HandleValue<'_>,
+    is_main: HandleValue<'_>,
 ) -> Result<HandleValue<'s>, Thrown> {
-    if let Some(namespace) = core_runtime::module::builtin_namespace(scope, specifier)? {
+    let specifier = validate_string(scope, request, "request")?;
+    if specifier.starts_with("node:") {
+        let Some(namespace) = core_runtime::module::builtin_namespace(scope, &specifier)? else {
+            return Err(NodeError::new(
+                ErrorKind::Error,
+                "ERR_UNKNOWN_BUILTIN_MODULE",
+                format!("No such built-in module: {specifier}"),
+            )
+            .into());
+        };
         return Ok(namespace.get_property(scope, c"default")?);
     }
-    let base = module_dir(scope, parent)?;
-    let (path, format) = resolve(specifier, &base).map_err(resolve_failed)?;
-    match load_file(scope, &path, format, Some(parent))? {
+    let ctor = module_class::class_constructor(scope)?;
+    let filename = Function::call_by_name(
+        scope,
+        ctor.handle(),
+        c"_resolveFilename",
+        &[request, parent, is_main],
+    )?;
+    let filename = validate_string(scope, filename, "filename")?;
+    if let Some(namespace) = core_runtime::module::builtin_namespace(scope, &filename)? {
+        return Ok(namespace.get_property(scope, c"default")?);
+    }
+    let path = Path::new(&filename);
+    let parent = Object::from_value(scope, *parent).ok();
+    match load_file(scope, path, parent)? {
         Loaded::Exports(exports) => Ok(exports),
         Loaded::EsModule => {
-            let namespace = core_runtime::module::require_module(scope, &path)?;
+            let namespace = core_runtime::module::require_module(scope, path)?;
             Ok(esm_exports(scope, namespace)?)
         }
     }
@@ -390,55 +605,34 @@ fn module_dir(scope: &Scope<'_>, module: Object<'_>) -> Result<PathBuf, ExnThrow
     Ok(PathBuf::from(crate::process::cwd()))
 }
 
-/// The body of a `require` function, whose payload is the requiring module.
+/// The body of a `require` function, whose payload is the requiring module: call the module's
+/// `require` method with the argument.
 fn require_callback(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let run = || -> Result<Value, Thrown> {
-        let parent = Object::from_value(scope, payload)?;
-        let specifier = validate_string(scope, args.get(0), "id")?;
-        if specifier.is_empty() {
-            return Err(NodeError::invalid_arg_value(
-                scope,
-                "id",
-                args.get(0),
-                "must be a non-empty string",
-            )
-            .into());
-        }
-        Ok(require_from(scope, parent, &specifier)?.get())
-    };
-    run().map_err(|error| error.throw(scope))
+    let parent = Object::from_value(scope, payload).map_err(|e| e.throw(scope))?;
+    Ok(Function::call_by_name(scope, parent.handle(), c"require", &[args.get(0)])?.get())
 }
 
-/// `require.resolve(request)`: the path `request` resolves to from the requiring module, the
-/// payload, or the name of the builtin module it names.
+/// `require.resolve(request, options)`: `Module._resolveFilename(request, module, false,
+/// options)` for the requiring module, the payload.
 fn resolve_callback(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let run = || -> Result<Value, Thrown> {
-        let parent = Object::from_value(scope, payload)?;
-        let specifier = validate_string(scope, args.get(0), "request")?;
-        if let Some(builtin) = builtin_module(&specifier) {
-            let name = if specifier.starts_with("node:") {
-                builtin.name
-            } else {
-                builtin.name.trim_start_matches("node:")
-            };
-            return Ok(name.to_jsval_raw_throwing(scope)?);
-        }
-        let base = module_dir(scope, parent)?;
-        let (path, _) = resolve(&specifier, &base).map_err(resolve_failed)?;
-        Ok(path
-            .to_string_lossy()
-            .as_ref()
-            .to_jsval_raw_throwing(scope)?)
-    };
-    run().map_err(|error| error.throw(scope))
+    validate_string(scope, args.get(0), "request").map_err(|thrown| thrown.throw(scope))?;
+    let ctor = module_class::class_constructor(scope)?;
+    let is_main = scope.root_value(js::value::from_bool(false));
+    let resolved = Function::call_by_name(
+        scope,
+        ctor.handle(),
+        c"_resolveFilename",
+        &[args.get(0), payload, is_main, args.get(1)],
+    )?;
+    Ok(resolved.get())
 }
 
 /// The key of the realm's main module: the CommonJS module of the entry script, if it is one.
@@ -458,46 +652,92 @@ fn make_require<'s>(scope: &'s Scope<'_>, module: Object<'s>) -> Result<Object<'
     Ok(*require)
 }
 
-/// Set `module.paths` to Node.js's `Module._nodeModulePaths(dir)`: the `node_modules` directory
-/// of `dir` and of each directory above it, except in directories named `node_modules`.
+/// Set `module.paths` to `Module._nodeModulePaths(dir)`, called through the property.
 fn set_node_module_paths(
     scope: &Scope<'_>,
     module: Object<'_>,
     dir: &Path,
 ) -> Result<(), ExnThrown> {
-    let paths: Vec<String> = dir
-        .ancestors()
-        .filter(|dir| dir.file_name().is_none_or(|name| name != "node_modules"))
-        .map(|dir| dir.join("node_modules").to_string_lossy().into_owned())
-        .collect();
-    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
-    module.set_property(scope, c"paths", js::Array::with_contents(scope, &paths)?)
+    let ctor = module_class::class_constructor(scope)?;
+    let dir = dir.to_string_lossy();
+    let paths = Function::call_by_name(scope, ctor.handle(), c"_nodeModulePaths", &[dir.as_ref()])?;
+    module.set_property(scope, c"paths", paths)
 }
 
-/// The key of the parent of a module, which its `parent` accessor reads, Node.js's
-/// `kModuleParent`.
-static MODULE_PARENT: js::symbol::CachedSymbol = js::symbol::CachedSymbol::new(c"kModuleParent");
+/// Node.js's `Module._nodeModulePaths(from)`: the `node_modules` directory of `from`, resolved to
+/// an absolute path, and of each directory above it, except of directories named `node_modules`,
+/// ending with `/node_modules`.
+fn node_module_paths(from: &str) -> Vec<String> {
+    const NODE_MODULES: &[u8] = b"node_modules";
+    let from = crate::path::resolve_paths(&[from.to_string()]);
+    if from == "/" {
+        return vec!["/node_modules".to_string()];
+    }
+    let mut paths = Vec::new();
+    let mut last = from.len();
+    // How many characters before the last `/` matched the end of `node_modules`, or `None` once
+    // one didn't.
+    let mut matched = Some(0);
+    for (index, &byte) in from.as_bytes().iter().enumerate().rev() {
+        if byte == b'/' {
+            if matched != Some(NODE_MODULES.len()) {
+                paths.push(format!("{}/node_modules", &from[..last]));
+            }
+            last = index;
+            matched = Some(0);
+        } else if let Some(count) = matched {
+            matched = (count < NODE_MODULES.len()
+                && NODE_MODULES[NODE_MODULES.len() - 1 - count] == byte)
+                .then_some(count + 1);
+        }
+    }
+    paths.push("/node_modules".to_string());
+    paths
+}
 
-/// The getter of `Module.prototype.parent`.
+/// The state of a `Module`.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct ModuleState {
+    /// Node.js's `kModuleParent`, which `Module.prototype.parent` reads and writes.
+    parent: Heap<Value>,
+    /// Whether the next `_compile` runs the source of a file that is an ES module if it doesn't
+    /// compile as CommonJS.
+    #[no_trace]
+    ambiguous: bool,
+    /// Whether the module's file turned out to be an ES module, which didn't run.
+    #[no_trace]
+    es_module: bool,
+}
+
+#[core_runtime::jsmethods]
+impl ModuleState {}
+
+/// The getter of `Module.prototype.parent`: the parent in the state `this` holds itself, not
+/// through its prototype chain, or `undefined` if it holds none.
 fn get_parent(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let this = crate::support::this_object(scope, &args)?;
-    Ok(this
-        .get_property_by_id(scope, MODULE_PARENT.id(scope)?)?
-        .get())
+    let state = js::class::find_instance_state::<ModuleState>(scope, this, false)?;
+    Ok(state.map_or_else(js::value::undefined, |state| {
+        state.data().parent.get(scope).get()
+    }))
 }
 
-/// The setter of `Module.prototype.parent`.
+/// The setter of `Module.prototype.parent`, which gives `this` a state of its own if it holds
+/// none.
 fn set_parent(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let this = crate::support::this_object(scope, &args)?;
-    this.set_property_by_id(scope, MODULE_PARENT.id(scope)?, args.get(0))?;
+    module_class::__ensure_state(scope, this)?;
+    if let Some(state) = js::class::find_instance_state::<ModuleState>(scope, this, false)? {
+        state.data().parent.set(args.get(0).get());
+    }
     Ok(js::value::undefined())
 }
 
@@ -552,57 +792,150 @@ fn directory_noop(path: String) -> String {
 }
 
 /// The [`core_runtime::module::CommonJsLoader`]: run the CommonJS module at `path` for an
-/// `import`, or return `None` if it is an `Ambiguous` file with ES module syntax.
+/// `import`, or return `None` if it is an `Ambiguous` file with ES module syntax. An `Ambiguous`
+/// file that an earlier load found to be an ES module isn't compiled again.
 pub(crate) fn load_for_import<'s>(
     scope: &'s Scope<'_>,
     path: &Path,
     format: SourceFormat,
 ) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-    match load_file(scope, path, format, None) {
+    let known = FORMATS.with_borrow(|formats| formats.get(path).copied());
+    if format == SourceFormat::Ambiguous && known == Some(SourceFormat::Module) {
+        return Ok(None);
+    }
+    FORMATS.with_borrow_mut(|formats| formats.insert(path.to_path_buf(), format));
+    match load_file(scope, path, None) {
         Ok(Loaded::Exports(exports)) => Ok(Some(exports)),
         Ok(Loaded::EsModule) => Ok(None),
         Err(error) => Err(error.throw(scope)),
     }
 }
 
-/// Run the file at `path` as `module`: as JSON for a `.json` file, and as CommonJS otherwise. A
-/// `.node` file is a native addon, which can't be loaded.
-fn run_by_extension(scope: &Scope<'_>, module: Object<'_>, path: &Path) -> Result<(), Thrown> {
-    let format = match path.extension().and_then(|extension| extension.to_str()) {
-        Some("json") => SourceFormat::Json,
-        Some("node") => SourceFormat::Other,
-        _ => SourceFormat::CommonJs,
-    };
-    if format == SourceFormat::Other {
-        return Err(NodeError::new(
-            ErrorKind::Error,
-            "ERR_DLOPEN_FAILED",
-            format!("Native addons can't be loaded: {}", path.display()),
-        )
-        .into());
-    }
-    run_file(scope, module, path, format)?;
-    Ok(())
-}
-
-/// A `Module._extensions` loader, `(module, filename)`: run the file at `filename` as `module`
-/// according to its extension.
-fn load_extension(
+/// The `Module._extensions` loader for `.js` files, `(module, filename)`: mark `module` as an ES
+/// module for an ES module file, or else read the file and run it with `module._compile`. A file
+/// whose format is neither JavaScript nor JSON can't be loaded.
+fn load_js_extension(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let module = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
-    let filename =
-        validate_string(scope, args.get(1), "filename").map_err(|thrown| thrown.throw(scope))?;
-    run_by_extension(scope, module, Path::new(&filename)).map_err(|thrown| thrown.throw(scope))?;
+    let run = || -> Result<(), Thrown> {
+        let module = Object::from_value(scope, args.get(0))?;
+        let filename = validate_string(scope, args.get(1), "filename")?;
+        let path = Path::new(&filename);
+        let format = format_of(path);
+        match format {
+            SourceFormat::Json => return load_json(scope, module, path),
+            SourceFormat::Other => {
+                return Err(NodeError::new(
+                    ErrorKind::Error,
+                    "ERR_DLOPEN_FAILED",
+                    format!(
+                        "Native addons and other non-JavaScript modules can't be loaded: \
+                         {filename}"
+                    ),
+                )
+                .into())
+            }
+            SourceFormat::Module => {
+                if let Some(state) = module_state(scope, module)? {
+                    state.data_mut().es_module = true;
+                }
+                return Ok(());
+            }
+            SourceFormat::CommonJs | SourceFormat::Ambiguous => {}
+        }
+        let source = read_source(path)?;
+        prefetch_requires(path.parent().unwrap_or(Path::new("/")), &source);
+        if let Some(state) = module_state(scope, module)? {
+            state.data_mut().ambiguous = format == SourceFormat::Ambiguous;
+        }
+        Function::call_by_name(
+            scope,
+            module.handle(),
+            c"_compile",
+            &[source.as_str(), filename.as_str()],
+        )?;
+        Ok(())
+    };
+    run().map_err(|thrown| thrown.throw(scope))?;
     Ok(js::value::undefined())
 }
 
-/// `Module.globalPaths`: `.node_modules` and `.node_libraries` in the home directory, then
-/// `lib/node` in the installation prefix, the directory above the executable's.
+/// Set `module.exports` to the value of the JSON file at `path`.
+fn load_json(scope: &Scope<'_>, module: Object<'_>, path: &Path) -> Result<(), Thrown> {
+    let source = read_source(path)?;
+    let value = js::json::parse(scope, &source)?;
+    module.set_property(scope, c"exports", value)?;
+    Ok(())
+}
+
+/// The `Module._extensions` loader for `.json` files, `(module, filename)`: set `module.exports`
+/// to the file's value.
+fn load_json_extension(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let run = || -> Result<(), Thrown> {
+        let module = Object::from_value(scope, args.get(0))?;
+        let filename = validate_string(scope, args.get(1), "filename")?;
+        load_json(scope, module, Path::new(&filename))
+    };
+    run().map_err(|thrown| thrown.throw(scope))?;
+    Ok(js::value::undefined())
+}
+
+/// The `Module._extensions` loader for `.node` files: native addons can't be loaded.
+fn load_node_extension(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let filename = crate::support::rust_string(scope, args.get(1)).unwrap_or_default();
+    Err(NodeError::new(
+        ErrorKind::Error,
+        "ERR_DLOPEN_FAILED",
+        format!("Native addons can't be loaded: {filename}"),
+    )
+    .throw(scope))
+}
+
+/// Node.js's `findLongestRegisteredExtension`: the longest extension of the base name of
+/// `filename`, after a dot that doesn't start it, that `extensions` has a truthy loader for, or
+/// `.js`.
+fn registered_extension(
+    scope: &Scope<'_>,
+    extensions: Object<'_>,
+    filename: &str,
+) -> Result<String, Thrown> {
+    let name = Path::new(filename)
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    for (index, _) in name.match_indices('.').filter(|(index, _)| *index > 0) {
+        let extension = &name[index..];
+        let Ok(key) = std::ffi::CString::new(extension) else {
+            continue;
+        };
+        let loader = extensions.get_property_by_name(scope, &key)?;
+        if js::conversion::to_boolean(loader) {
+            return Ok(extension.to_string());
+        }
+    }
+    Ok(".js".to_string())
+}
+
+/// `Module.globalPaths`: the non-empty entries of the `:`-separated `NODE_PATH` environment
+/// variable, `.node_modules` and `.node_libraries` in the home directory, then `lib/node` in the
+/// installation prefix, the directory above the executable's.
 fn global_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    let mut paths: Vec<PathBuf> = std::env::var_os("NODE_PATH")
+        .map(|node_path| {
+            std::env::split_paths(&node_path)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
         let home = PathBuf::from(home);
         paths.push(home.join(".node_modules"));
@@ -617,7 +950,7 @@ fn global_paths() -> Vec<PathBuf> {
     paths
 }
 
-#[core_runtime::jsfunction_class(name = "Module")]
+#[core_runtime::jsfunction_class(name = "Module", state = "ModuleState")]
 pub mod module_class {
     use super::*;
 
@@ -639,7 +972,7 @@ pub mod module_class {
         this.set_property(scope, c"path", path.as_str())?;
         this.set_property(scope, c"exports", Object::new_plain(scope)?)?;
         let parent = parent.unwrap_or(HandleValue::undefined());
-        this.set_property_by_id(scope, MODULE_PARENT.id(scope)?, parent)?;
+        state_of(scope, this)?.data().parent.set(parent.get());
         if let Ok(parent) = Object::from_value(scope, *parent) {
             let siblings = parent.get_property(scope, c"children")?;
             let siblings = Object::from_value(scope, *siblings)
@@ -671,6 +1004,18 @@ pub mod module_class {
         Ok(make_require(scope, module)?)
     }
 
+    /// Node.js's `Module._nodeModulePaths(from)`, which [`set_node_module_paths`] calls.
+    #[static_method(name = "_nodeModulePaths", length = 1)]
+    pub fn node_module_paths_static<'s>(
+        scope: &'s Scope<'_>,
+        from: HandleValue<'_>,
+    ) -> Result<js::Array<'s>, Thrown> {
+        let from = validate_string(scope, from, "paths[0]")?;
+        let paths = node_module_paths(&from);
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        Ok(js::Array::with_contents(scope, &paths)?)
+    }
+
     /// <https://nodejs.org/api/module.html#moduleisbuiltinmodulename>
     #[static_method]
     pub fn is_builtin(scope: &Scope<'_>, name: HandleValue<'_>) -> bool {
@@ -682,28 +1027,70 @@ pub mod module_class {
     #[static_method(name = "syncBuiltinESMExports")]
     pub fn sync_builtin_esm_exports() {}
 
-    /// `module.require(id)`: `require(id)` from this module.
+    /// Node.js's `Module._load(request, parent, isMain)`, which `module.require` calls: the
+    /// exports of the module `request` names, loaded for `parent`. `isMain` is passed on to
+    /// `Module._resolveFilename` and has no other effect.
+    #[static_method(name = "_load", length = 3)]
+    pub fn load_static<'s>(
+        scope: &'s Scope<'_>,
+        request: HandleValue<'_>,
+        parent: Option<HandleValue<'_>>,
+        is_main: Option<HandleValue<'_>>,
+    ) -> Result<HandleValue<'s>, Thrown> {
+        let parent = parent.unwrap_or(HandleValue::undefined());
+        let is_main = is_main.unwrap_or(HandleValue::undefined());
+        load_request(scope, request, parent, is_main)
+    }
+
+    /// Node.js's `Module._resolveFilename(request, parent, isMain, options)`, which `Module._load`
+    /// and `require.resolve` call: `request` if it names a builtin module, and otherwise the path
+    /// it resolves to from `parent`'s directory, or from the working directory without a parent.
+    /// `isMain` and `options`, whose `paths` Node.js searches instead, have no effect.
+    #[static_method(name = "_resolveFilename", length = 4)]
+    pub fn resolve_filename_static<'s>(
+        scope: &'s Scope<'_>,
+        request: HandleValue<'_>,
+        parent: Option<HandleValue<'_>>,
+    ) -> Result<HandleValue<'s>, Thrown> {
+        let request = validate_string(scope, request, "request")?;
+        let parent = parent.unwrap_or(HandleValue::undefined());
+        let filename = resolve_filename(scope, &request, parent)?;
+        Ok(filename.as_str().to_jsval_throwing(scope)?)
+    }
+
+    /// `module.require(id)`: `Module._load(id, this, false)`.
     pub fn require<'s>(
         scope: &'s Scope<'_>,
         this: Object<'_>,
         id: HandleValue<'_>,
     ) -> Result<HandleValue<'s>, Thrown> {
-        let id = validate_string(scope, id, "id")?;
-        if id.is_empty() {
-            let value = js::class::get_or_init_atom(scope, c"")?;
+        let id_string = validate_string(scope, id, "id")?;
+        if id_string.is_empty() {
             return Err(NodeError::invalid_arg_value(
                 scope,
                 "id",
-                value,
+                id,
                 "must be a non-empty string",
             )
             .into());
         }
-        require_from(scope, this, &id)
+        let ctor = class_constructor(scope)?;
+        let args = [
+            scope.root_value(id.get()),
+            scope.root_value(this.to_jsval_throwing(scope)?.get()),
+            scope.root_value(js::value::from_bool(false)),
+        ];
+        Ok(Function::call_by_name(
+            scope,
+            ctor.handle(),
+            c"_load",
+            &args,
+        )?)
     }
 
-    /// `module.load(filename)`: set this module's `filename` and run the file at `filename` as
-    /// it: as JSON for a `.json` file, and as CommonJS otherwise.
+    /// `module.load(filename)`: set this module's `filename` and `paths`, run the file at
+    /// `filename` as this module with the `Module._extensions` loader of its longest registered
+    /// extension, or the `.js` loader, and set `loaded`.
     pub fn load(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -711,13 +1098,29 @@ pub mod module_class {
     ) -> Result<(), Thrown> {
         let filename = validate_string(scope, filename, "filename")?;
         this.set_property(scope, c"filename", filename.as_str())?;
-        run_by_extension(scope, this, Path::new(&filename))?;
+        let dir = Path::new(&filename).parent().unwrap_or(Path::new("/"));
+        set_node_module_paths(scope, this, dir)?;
+        let extensions = class_constructor(scope)?.get_property(scope, c"_extensions")?;
+        let extensions = Object::from_value(scope, extensions)?;
+        let extension = registered_extension(scope, extensions, &filename)?;
+        let key = std::ffi::CString::new(extension).map_err(|_| ExnThrown)?;
+        let loader = extensions.get_property_by_name(scope, &key)?;
+        Function::call(
+            scope,
+            extensions,
+            loader,
+            &[
+                this.to_jsval_throwing(scope)?,
+                filename.as_str().to_jsval_throwing(scope)?,
+            ],
+        )?;
         this.set_property(scope, c"loaded", true)?;
         Ok(())
     }
 
     /// `module._compile(content, filename)`: run `content` as the CommonJS source of this module,
-    /// whose file is `filename`.
+    /// whose file is `filename`. When the `.js` loader calls it for a file without a declared
+    /// format, source that doesn't compile as CommonJS marks the module as an ES module instead.
     #[method(name = "_compile", length = 3)]
     pub fn compile(
         scope: &Scope<'_>,
@@ -727,14 +1130,9 @@ pub mod module_class {
     ) -> Result<(), Thrown> {
         let content = validate_string(scope, content, "content")?;
         let filename = validate_string(scope, filename, "filename")?;
-        run_source(
-            scope,
-            this,
-            &content,
-            Path::new(&filename),
-            SourceFormat::CommonJs,
-        )?;
-        Ok(())
+        let state = state_of(scope, this)?;
+        let ambiguous = std::mem::take(&mut state.data_mut().ambiguous);
+        run_source(scope, this, &content, Path::new(&filename), ambiguous)
     }
 
     /// The static members that aren't functions: `_cache`, `_extensions`, `builtinModules`,
@@ -746,8 +1144,13 @@ pub mod module_class {
         proto.define_accessor(scope, c"parent", Some(*getter), Some(*setter), 0)?;
         let extensions = Object::new_plain(scope)?;
         extensions.set_prototype(scope, js::native::HandleObject::null())?;
-        for name in [c".js", c".json", c".node"] {
-            let loader = Function::new_callback(scope, name, 2, load_extension, ())?;
+        let loaders: [(&std::ffi::CStr, js::function::Callback); 3] = [
+            (c".js", load_js_extension),
+            (c".json", load_json_extension),
+            (c".node", load_node_extension),
+        ];
+        for (name, loader) in loaders {
+            let loader = Function::new_callback(scope, name, 2, loader, ())?;
             extensions.set_property(scope, name, *loader)?;
         }
         ctor.set_property(scope, c"_extensions", extensions)?;
@@ -789,7 +1192,8 @@ pub mod module_class {
     node_args,
     name = "node:module",
     default = "Module",
-    mirror = "builtinModules, createRequire, isBuiltin, syncBuiltinESMExports"
+    mirror = "_cache, _extensions, _load, _nodeModulePaths, _resolveFilename, builtinModules, \
+              constants, createRequire, globalPaths, isBuiltin, syncBuiltinESMExports"
 )]
 pub mod module {
     pub use super::module_class as Module;

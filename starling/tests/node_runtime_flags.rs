@@ -46,6 +46,28 @@ fn flags_appear_in_exec_argv() {
     );
 }
 
+/// A `--node-compat` process sets `STARLINGMONKEY_NODE_OPTIONS` in its environment, which a child
+/// gets unless it is given an environment without it, so the runtime started by a shell in a child
+/// has Node.js compatibility.
+#[test]
+fn options_variable_is_inherited() {
+    let source = r#"
+        const { execSync, spawnSync } = require("child_process");
+        const options = (env) =>
+            spawnSync("/bin/sh", ["-c", 'echo "[$STARLINGMONKEY_NODE_OPTIONS]"'], { env }).stdout.toString().trim();
+        console.log(process.env.STARLINGMONKEY_NODE_OPTIONS);
+        console.log(options(undefined), options({ ...process.env }), options({}));
+        console.log(execSync(`"${process.execPath}" -e "console.log(typeof require)"`).toString().trim());
+    "#;
+    let out = run(&[], source);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let options = "--node-compat --allow-node-runtime-flags";
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{options}\n[{options}] [{options}] []\nfunction\n")
+    );
+}
+
 /// Without `--allow-node-runtime-flags`, a Node.js flag is an unknown option.
 #[test]
 fn flags_need_the_option() {
@@ -109,6 +131,26 @@ fn expose_internals_resolves_internal_modules() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
 }
 
+/// `internal/errors.kIsNodeError` is the symbol of the property that the errors of Node's `ERR_`
+/// codes have.
+#[test]
+fn internal_errors_exports_the_is_node_error_symbol() {
+    let source = "const { kIsNodeError } = require('internal/errors');\n\
+                  let error;\n\
+                  try { Buffer.alloc(-1); } catch (e) { error = e; }\n\
+                  console.log(error[kIsNodeError], new Error('x')[kIsNodeError]);";
+    let out = run(
+        &[
+            "--allow-node-runtime-flags",
+            "--expose-internals",
+            "--no-warnings",
+        ],
+        source,
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true undefined\n");
+}
+
 /// `--abort-on-uncaught-exception` aborts the process on an uncaught exception, without calling
 /// the `uncaughtException` listeners.
 #[cfg(unix)]
@@ -127,4 +169,26 @@ fn abort_on_uncaught_exception_aborts() {
     assert_eq!(out.status.signal(), Some(6), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("Uncaught Error: boom\n\nFROM\n"));
+}
+
+/// `--dns-result-order` sets the initial `dns.getDefaultResultOrder()`, and an invalid value ends
+/// the process with Node.js's message before the script runs.
+#[test]
+fn dns_result_order_sets_the_default_order() {
+    let source = "console.log(require('node:dns').getDefaultResultOrder());";
+    let out = run(
+        &["--allow-node-runtime-flags", "--dns-result-order=ipv6first"],
+        source,
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ipv6first\n");
+    let out = run(
+        &["--allow-node-runtime-flags", "--dns-result-order=first"],
+        source,
+    );
+    assert_ne!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("must be one of: 'verbatim'"),
+        "{out:?}"
+    );
 }

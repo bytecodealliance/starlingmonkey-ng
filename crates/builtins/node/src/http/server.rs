@@ -15,6 +15,7 @@
 //! nothing serves requests, so `listen()` emits an `ERR_SERVE_MODE_REQUIRED` error. In a
 //! component without a `wasi:http/handler` export, `listen()` throws that error.
 
+use fetch_event::fetch_event::FetchEvent;
 use js::conversion::ToJSVal;
 use js::error::{ExnThrown, ThrowException};
 use js::function::CallbackArgs;
@@ -22,7 +23,7 @@ use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::HandleValue;
-use js::{Function, Object};
+use js::Object;
 
 use super::incoming::{new_message, MessageHead};
 use super::outgoing::{Served, Transport};
@@ -58,7 +59,16 @@ pub(crate) struct HttpServerState {
 #[core_runtime::jsmethods]
 impl HttpServerState {}
 
-/// The key of the shared array of listening servers.
+/// The servers that serve the runtime's requests, in the order they started listening.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct ListeningServers {
+    servers: Vec<Heap<js::object::Object>>,
+}
+
+#[core_runtime::jsmethods]
+impl ListeningServers {}
+
+/// The key of the global's listening servers.
 static SERVERS_KEY: u8 = 0;
 
 /// Whether `listen()` accepts connections through `net.Server`: when the runtime runs a script as
@@ -67,14 +77,17 @@ pub(super) fn listens_itself() -> bool {
     core_runtime::event_loop::running_as_command() && crate::runtime_flags::get().http_listen
 }
 
-/// The listening servers of the current global, in the order they started listening.
-fn servers<'s>(scope: &'s Scope<'_>) -> Result<js::Array<'s>, ExnThrown> {
+/// The listening servers of the current global.
+fn servers<'s>(scope: &'s Scope<'_>) -> Result<ListeningServers<'s>, ExnThrown> {
     let servers =
         js::class::get_or_init_shared_object(scope, &SERVERS_KEY as *const u8 as usize, |scope| {
-            Ok(*js::Array::new(scope, 0)?)
+            let servers = js::class::create_instance_with::<ListeningServersImpl>(scope, |_| {
+                ListeningServersImpl::default()
+            })?;
+            Ok(servers.as_object())
         })?;
     servers
-        .cast::<js::Array>()
+        .cast::<ListeningServers>()
         .map_err(|_| js::error::TypeError("unexpected object".into()).throw(scope))
 }
 
@@ -83,11 +96,11 @@ fn server_for<'s>(
     scope: &'s Scope<'_>,
     port: Option<u16>,
 ) -> Result<Option<Object<'s>>, ExnThrown> {
+    let servers = servers(scope)?;
+    let servers = servers.data();
     let mut first = None;
-    for server in servers(scope)?.to_vec(scope)? {
-        let Ok(server) = Object::from_value(scope, server) else {
-            continue;
-        };
+    for server in &servers.servers {
+        let server = server.get(scope);
         if first.is_none() {
             first = Some(server);
         }
@@ -133,21 +146,28 @@ fn socket_event(
     Ok((count > 0.0).then_some(name))
 }
 
-/// Respond to `event` with `response`.
+/// Respond to `event` with `response`, a `Response` or a promise of one, as
+/// `event.respondWith(response)` does.
 fn respond_with(
     scope: &Scope<'_>,
-    event: Object<'_>,
+    event: FetchEvent<'_>,
     response: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    Function::call_by_name(scope, event.handle(), c"respondWith", &[response])?;
-    Ok(())
+    let response = js::PromiseOf::new(scope, response, |scope, args, _| {
+        js::promise::check_promise_value_type::<web_fetch::response::Response>(
+            scope,
+            args.get(0),
+            "Response",
+        )
+    })?;
+    event.respond_with(scope, response)
 }
 
 /// Respond to `event` with a 501, since served requests have no socket to emit `event_name`
 /// with.
 fn respond_not_implemented(
     scope: &Scope<'_>,
-    event: Object<'_>,
+    event: FetchEvent<'_>,
     event_name: &std::ffi::CStr,
 ) -> Result<(), ExnThrown> {
     let body = format!(
@@ -186,7 +206,7 @@ fn on_fetch(
 ) -> Result<Value, ExnThrown> {
     let event = Object::from_value(scope, args.get(0)).map_err(|e| e.throw(scope))?;
     let fetch_event = event
-        .cast::<fetch_event::fetch_event::FetchEvent>()
+        .cast::<FetchEvent>()
         .map_err(|_| js::error::TypeError("not a FetchEvent".into()).throw(scope))?;
     let request = fetch_event.request(scope);
     let url = request.current_url();
@@ -197,7 +217,7 @@ fn on_fetch(
     };
     let mut headers = request.headers(scope).list();
     if let Some(name) = socket_event(scope, server, &method, &headers)? {
-        respond_not_implemented(scope, event, name)?;
+        respond_not_implemented(scope, fetch_event, name)?;
         return Ok(js::value::undefined());
     }
 
@@ -208,6 +228,7 @@ fn on_fetch(
         owner: None,
     };
     let socket = super::host_socket::new_host_socket(scope, connection)?;
+    socket.set_property(scope, c"server", server)?;
     let path = match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_string(),
@@ -235,12 +256,18 @@ fn on_fetch(
         super::incoming::set_web_source(scope, req, stream)?;
     }
 
+    let line = super::outgoing::RequestLine {
+        method: &method,
+        version: (1, 1),
+    };
+    let reject = server.get_property(scope, c"rejectNonStandardBodyWrites")?;
     let res = super::outgoing::new_response(
         scope,
         req,
+        Some(line),
         None,
         crate::stream::state::default_high_water_mark(false),
-        false,
+        js::conversion::to_boolean(reject),
     )?;
     let req_value = req.to_jsval_throwing(scope)?;
     let promise = js::Promise::new_pending(scope)?;
@@ -248,10 +275,10 @@ fn on_fetch(
         let state = super::outgoing::state_of(scope, res)?;
         let mut data = state.data_mut();
         data.socket = Some(Heap::from(socket));
-        data.transport = Transport::Served(Served::new(promise));
+        data.transport = Transport::Served(Served::new(promise, method == "HEAD"));
     }
     super::host_socket::set_owner(scope, socket, Some(res))?;
-    respond_with(scope, event, promise.to_jsval_throwing(scope)?)?;
+    respond_with(scope, fetch_event, promise.to_jsval_throwing(scope)?)?;
     let emitted = crate::events::emit(
         scope,
         server,
@@ -525,7 +552,7 @@ pub mod server_class {
             std::mem::replace(&mut data.parent.listening, true)
         };
         if !listening {
-            servers(scope)?.push(scope, this)?;
+            servers(scope)?.data_mut().servers.push(Heap::from(this));
         }
         this.set_property(scope, c"_handle", Object::new_plain(scope)?)?;
         let listener = crate::support::shared_function(scope, on_fetch, 1)?;
@@ -565,11 +592,10 @@ pub mod server_class {
             state.data_mut().closing = true;
             return crate::net::server::server_class::close(scope, this, callback);
         }
-        let servers = servers(scope)?;
-        let index = servers.index_of(scope, this.to_jsval_throwing(scope)?)?;
-        if let Some(index) = index {
-            servers.remove(scope, index, 1)?;
-        }
+        servers(scope)?
+            .data_mut()
+            .servers
+            .retain(|server| server.get(scope).handle().get() != this.handle().get());
         let was_listening = std::mem::replace(&mut state.data_mut().parent.listening, false);
         this.set_property(scope, c"_handle", js::value::null())?;
         crate::net::on_close(scope, this, callback, was_listening)?;

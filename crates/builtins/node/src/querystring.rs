@@ -6,12 +6,16 @@
 //! surrogates pass through `parse` and `unescape` as they are.
 
 use js::conversion::FromJSVal;
-use js::error::ExnThrown;
+use js::error::{ExnThrown, ThrowException};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
+use js::native::Value;
 use js::prelude::HandleValue;
 use js::{Function, Object};
 
+use crate::buffer::MAX_STRING_LENGTH;
 use crate::errors::{ErrorKind, NodeError, Thrown};
+use crate::support::{decode_uri_component, hex_digit, DecodeUriError};
 
 /// Whether `escape` leaves `byte` as is: `A-Z a-z 0-9 - _ . ! ~ * ' ( )`.
 fn is_unreserved(byte: u8) -> bool {
@@ -21,11 +25,16 @@ fn is_unreserved(byte: u8) -> bool {
 /// The uppercase hex digits.
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-/// `querystring.escape` for a string without lone surrogates.
-pub fn escape_str(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// `querystring.escape` for a string without lone surrogates, which leaves `:` as is if `colon`,
+/// or `None` if allocating the result fails.
+pub fn escape_str(text: &str, colon: bool) -> Option<String> {
+    let kept = |byte: u8| is_unreserved(byte) || (colon && byte == b':');
+    let escaped = text.bytes().filter(|byte| !kept(*byte)).count();
+    let mut out = String::new();
+    out.try_reserve_exact(text.len().checked_add(escaped.checked_mul(2)?)?)
+        .ok()?;
     for byte in text.bytes() {
-        if is_unreserved(byte) {
+        if kept(byte) {
             out.push(byte as char);
         } else {
             out.push('%');
@@ -33,7 +42,36 @@ pub fn escape_str(text: &str) -> String {
             out.push(HEX[usize::from(byte & 0xf)] as char);
         }
     }
-    out
+    Some(out)
+}
+
+/// Reserve room for `additional` more code units of a string in `out`. Throws V8's
+/// `RangeError: Invalid string length` if the string would exceed [`MAX_STRING_LENGTH`], and
+/// reports out of memory if the allocation fails.
+fn reserve(scope: &Scope<'_>, out: &mut Vec<u16>, additional: usize) -> Result<(), ExnThrown> {
+    if out.len().saturating_add(additional) as f64 > MAX_STRING_LENGTH {
+        return Err(js::error::throw_range_error(
+            scope,
+            c"Invalid string length",
+        ));
+    }
+    out.try_reserve(additional).map_err(|_| {
+        js::exception::report_out_of_memory(scope);
+        ExnThrown
+    })
+}
+
+/// Append `units` to `out`, reserving room with [`reserve`].
+fn append(scope: &Scope<'_>, out: &mut Vec<u16>, units: &[u16]) -> Result<(), ExnThrown> {
+    reserve(scope, out, units.len())?;
+    out.extend_from_slice(units);
+    Ok(())
+}
+
+/// Report out of memory, for a failed allocation that returned `None`.
+fn out_of_memory(scope: &Scope<'_>) -> ExnThrown {
+    js::exception::report_out_of_memory(scope);
+    ExnThrown
 }
 
 /// The UTF-16 code units of `value` converted to a string.
@@ -53,9 +91,11 @@ fn invalid_uri() -> Thrown {
 
 /// Node.js's `encodeStr` with the `noEscape` table: the UTF-8 bytes of `units` percent-encoded,
 /// except the unreserved ASCII characters. A surrogate code unit is combined with the code unit
-/// after it, whatever that is, and is an error at the end of `units`.
-fn encode_units(units: &[u16]) -> Result<Vec<u16>, Thrown> {
-    let mut out = Vec::with_capacity(units.len());
+/// after it, whatever that is, and is an error at the end of `units`. The output is limited as
+/// [`reserve`] limits it.
+fn encode_units(scope: &Scope<'_>, units: &[u16]) -> Result<Vec<u16>, Thrown> {
+    let mut out = Vec::new();
+    reserve(scope, &mut out, units.len())?;
     let hex = |out: &mut Vec<u16>, byte: u32| {
         out.push(u16::from(b'%'));
         out.push(u16::from(HEX[(byte >> 4) as usize & 0xf]));
@@ -63,6 +103,8 @@ fn encode_units(units: &[u16]) -> Result<Vec<u16>, Thrown> {
     };
     let mut index = 0;
     while index < units.len() {
+        // One step writes at most four escapes of three code units.
+        reserve(scope, &mut out, 12)?;
         let unit = u32::from(units[index]);
         if unit < 0x80 {
             if is_unreserved(unit as u8) {
@@ -93,17 +135,13 @@ fn encode_units(units: &[u16]) -> Result<Vec<u16>, Thrown> {
     Ok(out)
 }
 
-/// The value of hex digit `unit`, if it is one.
-fn hex_digit(unit: u16) -> Option<u8> {
-    char::from_u32(u32::from(unit))
-        .and_then(|c| c.to_digit(16))
-        .map(|digit| digit as u8)
-}
-
 /// Node.js's `unescapeBuffer`: `%XX` escapes decoded to bytes, and `+` to a space if
 /// `decode_spaces`. Malformed escapes are kept, and other code units are stored as their low byte.
-fn unescape_buffer(units: &[u16], decode_spaces: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(units.len());
+/// `None` if allocating the bytes fails.
+fn unescape_buffer(units: &[u16], decode_spaces: bool) -> Option<Vec<u8>> {
+    // There is at most one byte per code unit, so nothing below reallocates.
+    let mut out = Vec::new();
+    out.try_reserve_exact(units.len()).ok()?;
     let mut index = 0;
     while index < units.len() {
         let unit = units[index];
@@ -128,51 +166,6 @@ fn unescape_buffer(units: &[u16], decode_spaces: bool) -> Vec<u8> {
         out.push(unit as u8);
         index += 1;
     }
-    out
-}
-
-/// JS's `decodeURIComponent` of `units`, or `None` where it throws a `URIError`: each `%XX`
-/// escape sequence of a UTF-8 encoded code point replaced by the code point.
-fn decode_uri_component(units: &[u16]) -> Option<Vec<u16>> {
-    let byte_at = |index: usize| -> Option<u8> {
-        if units.get(index) != Some(&u16::from(b'%')) {
-            return None;
-        }
-        Some(hex_digit(*units.get(index + 1)?)? * 16 + hex_digit(*units.get(index + 2)?)?)
-    };
-    let mut out = Vec::with_capacity(units.len());
-    let mut index = 0;
-    while index < units.len() {
-        if units[index] != u16::from(b'%') {
-            out.push(units[index]);
-            index += 1;
-            continue;
-        }
-        let lead = byte_at(index)?;
-        index += 3;
-        if lead < 0x80 {
-            out.push(u16::from(lead));
-            continue;
-        }
-        let length = match lead {
-            0xc0..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf7 => 4,
-            _ => return None,
-        };
-        let mut bytes = vec![lead];
-        for _ in 1..length {
-            let byte = byte_at(index)?;
-            if byte & 0xc0 != 0x80 {
-                return None;
-            }
-            bytes.push(byte);
-            index += 3;
-        }
-        let c = std::str::from_utf8(&bytes).ok()?.chars().next()?;
-        let mut buffer = [0u16; 2];
-        out.extend_from_slice(c.encode_utf16(&mut buffer));
-    }
     Some(out)
 }
 
@@ -183,12 +176,14 @@ fn unescape_units<'s>(
     units: &[u16],
     decode_spaces: bool,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    if let Some(decoded) = decode_uri_component(units) {
-        return string_value(scope, &decoded);
+    match decode_uri_component(units) {
+        Ok(decoded) => return string_value(scope, &decoded),
+        Err(DecodeUriError::OutOfMemory) => return Err(out_of_memory(scope)),
+        Err(DecodeUriError::Malformed) => {}
     }
-    let bytes = unescape_buffer(units, decode_spaces);
-    let decoded: Vec<u16> = String::from_utf8_lossy(&bytes).encode_utf16().collect();
-    string_value(scope, &decoded)
+    let bytes = unescape_buffer(units, decode_spaces).ok_or_else(|| out_of_memory(scope))?;
+    let decoded = js::JSString::from_utf8_lossy(scope, &bytes)?;
+    Ok(scope.root_value(decoded.as_value()))
 }
 
 /// A `sep` or `eq` argument: the code units of its string value, or `default` if it is falsy.
@@ -218,19 +213,56 @@ fn option_function<'s>(
         .then_some(function))
 }
 
-/// The value of `querystring[name]` if an application replaced the function the module exports
-/// under `name`, as `parse` and `stringify` then call the replacement.
+/// The module's default export and the functions it exports as `escape` and `unescape`, read from
+/// the module's namespace once per global.
+#[core_runtime::jsclass(hidden)]
+pub(crate) struct ModuleExports {
+    exports: Heap<js::object::Object>,
+    escape: Heap<Value>,
+    unescape: Heap<Value>,
+}
+
+#[core_runtime::jsmethods]
+impl ModuleExports {}
+
+/// The key of the global's [`ModuleExports`].
+static EXPORTS_KEY: u8 = 0;
+
+/// The value of `querystring[name]`, for `escape` or `unescape`, if an application replaced the
+/// function the module exports under `name`, as `parse` and `stringify` then call the
+/// replacement.
 fn replaced_function<'s>(
     scope: &'s Scope<'_>,
     name: &'static std::ffi::CStr,
 ) -> Result<Option<HandleValue<'s>>, ExnThrown> {
-    let Some(namespace) = core_runtime::module::builtin_namespace(scope, "node:querystring")?
-    else {
-        return Ok(None);
-    };
-    let original = namespace.get_property(scope, name)?;
-    let Ok(exports) = Object::from_value(scope, *namespace.get_property(scope, c"default")?) else {
-        return Ok(None);
+    let shared =
+        js::class::get_or_init_shared_object(scope, &EXPORTS_KEY as *const u8 as usize, |scope| {
+            let namespace = core_runtime::module::builtin_namespace(scope, "node:querystring")?
+                .ok_or_else(|| js::error::TypeError("no node:querystring".into()).throw(scope))?;
+            let exports = Object::from_value(scope, *namespace.get_property(scope, c"default")?)
+                .map_err(|error| error.throw(scope))?;
+            let escape = namespace.get_property(scope, c"escape")?;
+            let unescape = namespace.get_property(scope, c"unescape")?;
+            let shared = js::class::create_instance_with::<ModuleExportsImpl>(scope, |_| {
+                ModuleExportsImpl {
+                    exports: Heap::from(exports),
+                    escape: Heap::from(escape.get()),
+                    unescape: Heap::from(unescape.get()),
+                }
+            })?;
+            Ok(shared.as_object())
+        })?;
+    let shared = shared
+        .cast::<ModuleExports>()
+        .map_err(|_| js::error::TypeError("unexpected object".into()).throw(scope))?;
+    let (exports, original) = {
+        let data = shared.data();
+        let original = if name == c"escape" {
+            &data.escape
+        } else {
+            &data.unescape
+        };
+        (data.exports.get(scope), original.get(scope))
     };
     let current = exports.get_property(scope, name)?;
     if js::comparison::strictly_equal(scope, original, current)? {
@@ -338,7 +370,7 @@ fn stringify_part(
     }
     // Strings, and numbers whose string form has an exponent, are escaped.
     if value.is_string() || (value.is_number() && value.to_number().abs() >= 1e21) {
-        return encode_units(&text);
+        return encode_units(scope, &text);
     }
     Ok(text)
 }
@@ -352,7 +384,7 @@ pub mod module {
         scope: &'s Scope<'_>,
         text: HandleValue<'_>,
     ) -> Result<js::JSString<'s>, Thrown> {
-        let encoded = encode_units(&units(scope, text)?)?;
+        let encoded = encode_units(scope, &units(scope, text)?)?;
         Ok(js::JSString::from_utf16(scope, &encoded)?)
     }
 
@@ -370,7 +402,10 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/querystring.html#querystringunescapebufferstr-decodespaces>: a
-    /// `Buffer` of the bytes `%XX` escapes encode, with `+` as a space if `decode_spaces`.
+    /// `Buffer` of the bytes `%XX` escapes encode, with `+` as a space if `decode_spaces`. For a
+    /// `text` other than a string, the code units are the first `text.length` of `String(text)`,
+    /// with zeros past its end, and `Buffer.allocUnsafe`'s error for a `length` that isn't a valid
+    /// size. `null` and `undefined` fail reading their `length`.
     #[function(length = 2)]
     pub fn unescape_buffer<'s>(
         scope: &'s Scope<'_>,
@@ -379,7 +414,28 @@ pub mod module {
     ) -> Result<Object<'s>, Thrown> {
         let decode_spaces =
             decode_spaces.is_some_and(|value| bool::from_jsval(scope, value, ()).unwrap_or(false));
-        let bytes = super::unescape_buffer(&units(scope, text)?, decode_spaces);
+        let text_units = if text.is_string() {
+            units(scope, text)?
+        } else {
+            if text.is_null() || text.is_undefined() {
+                let kind = if text.is_null() { "null" } else { "undefined" };
+                let message = format!("Cannot read properties of {kind} (reading 'length')");
+                return Err(js::error::TypeError(message).throw(scope).into());
+            }
+            let object = Object::from_value_coerce(scope, text)?;
+            let size = crate::buffer::size_arg(scope, object.get_property(scope, c"length")?)?;
+            let size = crate::buffer::unsafe_buffer_length(scope, size)?;
+            let mut text_units = units(scope, text)?;
+            if size > text_units.len() {
+                text_units
+                    .try_reserve_exact(size - text_units.len())
+                    .map_err(|_| out_of_memory(scope))?;
+            }
+            text_units.resize(size, 0);
+            text_units
+        };
+        let bytes = super::unescape_buffer(&text_units, decode_spaces)
+            .ok_or_else(|| out_of_memory(scope))?;
         Ok(crate::buffer::new_buffer(scope, &bytes)?)
     }
 
@@ -438,7 +494,7 @@ pub mod module {
                     let end = index + 1 - sep_index;
                     if eq_index < eq.len() {
                         if last < end {
-                            key.extend_from_slice(&text[last..end]);
+                            append(scope, &mut key, &text[last..end])?;
                         } else if key.is_empty() {
                             pairs -= 1.0;
                             if pairs == 0.0 {
@@ -451,7 +507,7 @@ pub mod module {
                             continue;
                         }
                     } else if last < end {
-                        value.extend_from_slice(&text[last..end]);
+                        append(scope, &mut value, &text[last..end])?;
                     }
                     add_key_value(
                         scope,
@@ -486,7 +542,7 @@ pub mod module {
                     if eq_index == eq.len() {
                         let end = index + 1 - eq_index;
                         if last < end {
-                            key.extend_from_slice(&text[last..end]);
+                            append(scope, &mut key, &text[last..end])?;
                         }
                         encode_check = 0;
                         last = index + 1;
@@ -513,16 +569,16 @@ pub mod module {
                     }
                 }
                 if code == u16::from(b'+') {
-                    key.extend_from_slice(&text[last..index]);
-                    key.extend_from_slice(plus);
+                    append(scope, &mut key, &text[last..index])?;
+                    append(scope, &mut key, plus)?;
                     last = index + 1;
                     index += 1;
                     continue;
                 }
             }
             if code == u16::from(b'+') {
-                value.extend_from_slice(&text[last..index]);
-                value.extend_from_slice(plus);
+                append(scope, &mut value, &text[last..index])?;
+                append(scope, &mut value, plus)?;
                 last = index + 1;
             } else if !value_encoded {
                 if code == u16::from(b'%') {
@@ -542,9 +598,9 @@ pub mod module {
         }
         if last < text.len() {
             if eq_index < eq.len() {
-                key.extend_from_slice(&text[last..]);
+                append(scope, &mut key, &text[last..])?;
             } else if sep_index < sep.len() {
-                value.extend_from_slice(&text[last..]);
+                append(scope, &mut value, &text[last..])?;
             }
         } else if eq_index == 0 && key.is_empty() {
             return Ok(object);
@@ -563,6 +619,7 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/querystring.html#querystringdecodestr-sep-eq-options>
+    #[function(length = 4)]
     pub fn decode<'s>(
         scope: &'s Scope<'_>,
         text: HandleValue<'_>,
@@ -596,46 +653,46 @@ pub mod module {
             Some(encode) => Some(encode),
             None => replaced_function(scope, c"escape")?,
         };
-        // Copying `object` onto an object without a prototype reads each of its own enumerable
-        // properties once, in `Object.keys` order.
-        let copy = Object::new_plain(scope)?;
-        copy.set_prototype(scope, js::native::HandleObject::null())?;
-        copy.assign(scope, object)?;
+        // As Node.js does, the keys are `Object.keys(object)`, and each value is read once after.
+        // Each element of an array value is read as its pair is written. The text is limited as
+        // [`reserve`] limits it.
         let mut fields: Vec<u16> = Vec::new();
-        for key in copy.own_keys(scope)? {
-            if key.is_symbol() {
-                continue;
-            }
+        for key in object.own_enumerable_keys(scope)? {
             let id = scope.root_id(js::id::value_to_id(scope, key)?);
-            let value = copy.get_property_by_id(scope, id)?;
+            let value = object.get_property_by_id(scope, id)?;
             let key = scope.root_value(js::JSString::from_value(scope, key)?.as_value());
             let mut prefix = stringify_part(scope, key, encode)?;
-            prefix.extend_from_slice(&eq);
-            let array = Object::from_value(scope, value)
-                .ok()
-                .filter(|value| js::Array::is_array(scope, value.handle()).unwrap_or(false));
-            let items = match array {
+            append(scope, &mut prefix, &eq)?;
+            let array = match Object::from_value(scope, value) {
+                Ok(value) if js::Array::is_array_or_array_proxy(scope, value.handle())? => {
+                    Some(value)
+                }
+                _ => None,
+            };
+            let add = |fields: &mut Vec<u16>, item| -> Result<(), Thrown> {
+                if !fields.is_empty() {
+                    append(scope, fields, &sep)?;
+                }
+                append(scope, fields, &prefix)?;
+                append(scope, fields, &stringify_part(scope, item, encode)?)?;
+                Ok(())
+            };
+            match array {
                 Some(array) => {
                     let length =
                         f64::from_jsval(scope, array.get_property(scope, c"length")?, ())? as u32;
-                    (0..length)
-                        .map(|element| array.get_element(scope, element))
-                        .collect::<Result<Vec<_>, _>>()?
+                    for element in 0..length {
+                        add(&mut fields, array.get_element(scope, element)?)?;
+                    }
                 }
-                None => vec![value],
-            };
-            for item in items {
-                if !fields.is_empty() {
-                    fields.extend_from_slice(&sep);
-                }
-                fields.extend_from_slice(&prefix);
-                fields.extend(stringify_part(scope, item, encode)?);
+                None => add(&mut fields, value)?,
             }
         }
         Ok(js::JSString::from_utf16(scope, &fields)?)
     }
 
     /// <https://nodejs.org/api/querystring.html#querystringencodeobj-sep-eq-options>
+    #[function(length = 4)]
     pub fn encode<'s>(
         scope: &'s Scope<'_>,
         object: HandleValue<'_>,
@@ -645,4 +702,21 @@ pub mod module {
     ) -> Result<js::JSString<'s>, Thrown> {
         stringify(scope, object, sep, eq, options)
     }
+}
+
+/// Register `node:querystring`, whose `default` export has Node.js's property order.
+pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
+    if !crate::stub::register_implemented::<module::js_module>(scope, name) {
+        return false;
+    }
+    let order = [
+        c"unescapeBuffer",
+        c"unescape",
+        c"escape",
+        c"stringify",
+        c"encode",
+        c"parse",
+        c"decode",
+    ];
+    crate::stub::order_default_export(scope, name, &order).is_ok()
 }

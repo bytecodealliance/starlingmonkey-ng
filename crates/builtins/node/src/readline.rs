@@ -4,8 +4,8 @@
 //! <https://nodejs.org/api/readline.html>.
 //!
 //! An `Interface` reads its input's `data` events, decodes `Buffer` chunks as UTF-8, and emits a
-//! `line` event for each line, which ends at `\n`, `\r\n` or `\r`. A line read while a
-//! `question` is pending goes to the question's callback instead. Terminal features (raw
+//! `line` event for each line, which ends at `\n`, `\r\n`, `\r`, U+2028 or U+2029. A line read
+//! while a `question` is pending goes to the question's callback instead. Terminal features (raw
 //! keypresses, history, completion and cursor editing) are not supported, so `terminal` is always
 //! `false`.
 
@@ -39,18 +39,23 @@ fn use_after_close() -> NodeError {
 pub(crate) struct InterfaceState {
     /// The callback of the pending question, or `undefined`.
     question: Heap<Value>,
-    #[no_trace]
-    prompt: String,
+    /// The prompt, the value `setPrompt` was last given, which `prompt()` writes.
+    prompt: Heap<Value>,
+    /// The prompt a pending question replaced, which answering or cancelling it restores.
+    old_prompt: Heap<Value>,
     /// The UTF-8 decoder of `Buffer` input chunks, which holds an incomplete character until the
     /// next chunk.
     #[no_trace]
     decoder: crate::string_decoder::NativeDecoderImpl,
-    /// Whether the last input ended with `\r`, so that a `\n` starting the next one ends no line.
+    /// The `crlfDelay` option: for how many milliseconds after a chunk that ends with `\r` a `\n`
+    /// starting the next chunk ends no line.
     #[no_trace]
-    saw_return: bool,
-    /// The input of the line being read.
+    crlf_delay: f64,
+    /// When a chunk that ended with `\r` was written, in milliseconds of the monotonic clock.
     #[no_trace]
-    partial: String,
+    saw_return_at: Option<f64>,
+    /// The input of the line being read, a string.
+    partial: Heap<Value>,
     #[no_trace]
     closed: bool,
     #[no_trace]
@@ -77,31 +82,27 @@ fn state_of<'s>(
     interface_class::state_of(scope, interface)
 }
 
-/// The text of the input chunk `chunk`: a string, or a `Buffer` decoded by the interface's UTF-8
-/// decoder.
-fn decode(
-    scope: &Scope<'_>,
-    state: InterfaceState<'_>,
-    chunk: HandleValue<'_>,
-) -> Result<String, ExnThrown> {
-    if chunk.is_string() {
-        return Ok(String::from_jsval(scope, chunk, ()).unwrap_or_default());
-    }
-    let Some(view) = js::ArrayBufferView::from_value(scope, chunk) else {
-        return Ok(String::new());
-    };
-    let bytes = view.copy_bytes(scope)?;
-    let units = state.data_mut().decoder.decode(&bytes);
-    Ok(String::from_utf16_lossy(&units))
+/// The monotonic clock, in milliseconds.
+fn now_ms() -> f64 {
+    platform::clock::monotonic_ns() as f64 / 1e6
 }
 
-/// Handle the line `line`: answer the pending question with it, or emit it as a `line` event.
-fn on_line(scope: &Scope<'_>, interface: Object<'_>, line: &str) -> Result<(), ExnThrown> {
+/// Node.js's `kOnLine`: answer the pending question with `line`, restoring the prompt it
+/// replaced, or emit `line` as a `line` event.
+fn on_line(
+    scope: &Scope<'_>,
+    interface: Object<'_>,
+    line: HandleValue<'_>,
+) -> Result<(), ExnThrown> {
     let state = state_of(scope, interface)?;
-    let line = js::JSString::from_str(scope, line)?.to_jsval_throwing(scope)?;
     let question = state.data().question.get(scope);
     if js::function::is_callable(question) {
-        state.data_mut().question.set(js::value::undefined());
+        {
+            let data = state.data();
+            data.question.set(js::value::undefined());
+            let old_prompt = data.old_prompt.get(scope);
+            data.prompt.set(old_prompt.get());
+        }
         Function::call(scope, js::value::undefined(), question, &[line])?;
         return Ok(());
     }
@@ -109,40 +110,87 @@ fn on_line(scope: &Scope<'_>, interface: Object<'_>, line: &str) -> Result<(), E
     Ok(())
 }
 
-/// Add `text` to the line being read, and handle each line it completes. A `\r` that ends one
-/// piece of text and a `\n` that starts the next end a single line.
-fn feed(scope: &Scope<'_>, interface: Object<'_>, text: &str) -> Result<(), ExnThrown> {
+/// The line endings in `units`, as Node.js's `lineEnding` pattern `/\r?\n|\r(?!\n)|\u2028|\u2029/`
+/// matches them: the index of each and of the character after it. Returns `None` if allocating
+/// the list fails.
+fn line_endings(units: impl Iterator<Item = u16>) -> Option<Vec<(usize, usize)>> {
+    let mut units = units.enumerate().peekable();
+    crate::support::try_collect(std::iter::from_fn(move || loop {
+        let (index, unit) = units.next()?;
+        match unit {
+            0x0a | 0x2028 | 0x2029 => return Some((index, index + 1)),
+            0x0d if units.next_if(|(_, next)| *next == 0x0a).is_some() => {
+                return Some((index, index + 2))
+            }
+            0x0d => return Some((index, index + 1)),
+            _ => {}
+        }
+    }))
+}
+
+/// Node.js's `kNormalWrite`: decode `chunk` with the interface's decoder, add it to the line being
+/// read, and handle each line it completes. A `\n` that starts a chunk within `crlfDelay`
+/// milliseconds of a chunk that ended with `\r` is dropped. Only the chunk is searched for line
+/// endings, and each line is a substring of it.
+fn normal_write(
+    scope: &Scope<'_>,
+    interface: Object<'_>,
+    chunk: HandleValue<'_>,
+) -> Result<(), Thrown> {
+    if chunk.is_undefined() {
+        return Ok(());
+    }
     let state = state_of(scope, interface)?;
-    let mut lines = Vec::new();
+    let mut string = crate::string_decoder::write_chunk(scope, chunk, |bytes| {
+        state.data_mut().decoder.decode_chunk(bytes)
+    })?;
+    let now = now_ms();
+    let (saw_return_at, crlf_delay) = {
+        let data = state.data();
+        (data.saw_return_at, data.crlf_delay)
+    };
+    if saw_return_at.is_some_and(|at| now - at <= crlf_delay) {
+        if !string.is_empty() && string.char_at(scope, 0)? == u16::from(b'\n') {
+            string = string.substring(scope, 1, string.len() - 1)?;
+        }
+        state.data_mut().saw_return_at = None;
+    }
+    if string.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: the closure makes no call into SpiderMonkey.
+    let endings = unsafe {
+        string.with_chars(scope, |chars| match chars {
+            js::string::StrChars::Latin1(bytes) => {
+                line_endings(bytes.iter().map(|byte| u16::from(*byte)))
+            }
+            js::string::StrChars::TwoByte(units) => line_endings(units.iter().copied()),
+        })
+    }?
+    .ok_or_else(|| {
+        js::exception::report_out_of_memory(scope);
+        ExnThrown
+    })?;
+    let partial = js::JSString::from_value(scope, state.data().partial.get(scope))?;
+    let (Some(&(first_end, mut start)), Some(&(_, last_start))) = (endings.first(), endings.last())
+    else {
+        let partial = partial.concat(scope, string)?;
+        state.data_mut().partial.set(partial.as_value());
+        return Ok(());
+    };
+    let ends_with_return = string.char_at(scope, string.len() - 1)? == u16::from(b'\r');
+    let first = partial.concat(scope, string.substring(scope, 0, first_end)?)?;
+    let rest = string.substring(scope, last_start, string.len() - last_start)?;
     {
         let mut data = state.data_mut();
-        let mut text = text;
-        if data.saw_return {
-            text = text.strip_prefix('\n').unwrap_or(text);
-            data.saw_return = false;
-        }
-        let mut buffer = std::mem::take(&mut data.partial);
-        buffer.push_str(text);
-        let mut rest = buffer.as_str();
-        while let Some(end) = rest.find(['\r', '\n']) {
-            lines.push(rest[..end].to_string());
-            let after = &rest[end..];
-            rest = if let Some(after_crlf) = after.strip_prefix("\r\n") {
-                after_crlf
-            } else {
-                if after == "\r" {
-                    data.saw_return = true;
-                }
-                &after[1..]
-            };
-        }
-        data.partial = rest.to_string();
+        data.saw_return_at = ends_with_return.then_some(now);
+        data.partial.set(rest.as_value());
     }
-    for line in lines {
-        on_line(scope, interface, &line)?;
-        if state.data().closed {
-            return Ok(());
-        }
+    on_line(scope, interface, first.to_jsval_throwing(scope)?)?;
+    for &(end, next) in &endings[1..] {
+        let line = string.substring(scope, start, end - start)?;
+        on_line(scope, interface, line.to_jsval_throwing(scope)?)?;
+        start = next;
     }
     Ok(())
 }
@@ -154,16 +202,15 @@ fn on_data(
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let interface = cast_payload::<Object>(scope, payload);
-    let state = state_of(scope, interface)?;
-    if !state.data().closed {
-        let text = decode(scope, state, args.get(0))?;
-        feed(scope, interface, &text)?;
+    if !state_of(scope, interface)?.data().closed {
+        normal_write(scope, interface, args.get(0)).map_err(|thrown| thrown.throw(scope))?;
     }
     Ok(js::value::undefined())
 }
 
-/// The `end` listener of an interface's input, whose payload is the interface: handle the last
-/// line, if it has no line ending, and close the interface.
+/// The `end` listener of an interface's input, whose payload is the interface: emit the last
+/// line as a `line` event, if it has no line ending, and close the interface. A pending question
+/// doesn't get the line.
 fn on_end(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
@@ -174,9 +221,9 @@ fn on_end(
     if state.data().closed {
         return Ok(js::value::undefined());
     }
-    let line = std::mem::take(&mut state.data_mut().partial);
+    let line = js::JSString::from_value(scope, state.data().partial.get(scope))?;
     if !line.is_empty() {
-        on_line(scope, interface, &line)?;
+        crate::events::emit(scope, interface, c"line", &[line.to_jsval_throwing(scope)?])?;
     }
     Function::call_by_name(scope, interface.handle(), c"close", js::function::EmptyArgs)?;
     Ok(js::value::undefined())
@@ -194,20 +241,25 @@ fn on_error(
     Ok(js::value::undefined())
 }
 
-/// Write `text` to the interface's output, if it has one.
-fn write_output(scope: &Scope<'_>, interface: Object<'_>, text: &str) -> Result<(), ExnThrown> {
+/// Node.js's `kWriteToOutput`: write `text`, which must be a string, to the interface's output, if
+/// it has one.
+fn write_output(
+    scope: &Scope<'_>,
+    interface: Object<'_>,
+    text: HandleValue<'_>,
+) -> Result<(), Thrown> {
+    if !text.is_string() {
+        let error = NodeError::invalid_arg_type(scope, "stringToWrite", "of type string", text);
+        return Err(error.into());
+    }
     if let Some(output) = interface.obj(scope, c"output")? {
-        Function::call_by_name(
-            scope,
-            output.handle(),
-            c"write",
-            &[js::conversion::ToJSVal::to_jsval_throwing(text, scope)?],
-        )?;
+        Function::call_by_name(scope, output.handle(), c"write", &[text])?;
     }
     Ok(())
 }
 
-/// Ask `query` on `interface`, with `callback` receiving the answer.
+/// Node.js's `kQuestion`: make `query` the prompt, until `callback` receives the answer, and
+/// prompt. A question asked while another is pending only prompts again.
 fn ask(
     scope: &Scope<'_>,
     interface: Object<'_>,
@@ -218,62 +270,126 @@ fn ask(
     if state.data().closed {
         return Err(use_after_close().into());
     }
-    if js::function::is_callable(state.data().question.get(scope)) {
-        interface_class::prompt(scope, interface)?;
-        return Ok(());
+    if !js::function::is_callable(state.data().question.get(scope)) {
+        let data = state.data();
+        let prompt = data.prompt.get(scope);
+        data.old_prompt.set(prompt.get());
+        data.prompt.set(query.get());
+        data.question.set(callback.get());
     }
-    state.data_mut().question.set(callback.get());
-    let query = js::JSString::from_value(scope, query)?.to_utf8(scope)?;
-    write_output(scope, interface, &query)?;
-    interface_class::resume(scope, interface)?;
-    Ok(())
+    interface_class::prompt(scope, interface)
 }
 
-/// The arguments of `createInterface` and the `Interface` constructor: an options object with
-/// `input`, or the input followed by the output.
+/// The value of the `crlfDelay` option `value`: at least 100, and 100 if `value` is falsy.
+fn crlf_delay(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<f64, ExnThrown> {
+    if !js::conversion::to_boolean(value) {
+        return Ok(100.0);
+    }
+    let delay = f64::from_jsval(scope, value, ()).map_err(|_| ExnThrown)?;
+    // `Math.max(100, delay)`, which is `NaN` for `NaN`.
+    Ok(if delay.is_nan() {
+        delay
+    } else {
+        delay.max(100.0)
+    })
+}
+
+/// Node.js's `InterfaceConstructor`, for the arguments of `createInterface` and the `Interface`
+/// constructors: an options object with a truthy `input`, or the input, the output and the
+/// completer. Of the history options, `history` and `historySize` are validated and stored.
+/// `completer` is stored as it is.
 fn init_interface(
     scope: &Scope<'_>,
     this: Object<'_>,
     input: HandleValue<'_>,
     output: Option<HandleValue<'_>>,
+    completer: Option<HandleValue<'_>>,
 ) -> Result<(), Thrown> {
+    this.set_property(scope, c"isCompletionEnabled", true)?;
+    this.set_property(scope, c"escapeCodeTimeout", 500)?;
+    this.set_property(scope, c"tabSize", 8)?;
     crate::events::event_emitter::init(scope, this, None)?;
-    let (input, output, signal, prompt) = match Object::from_value(scope, *input) {
-        Ok(options) if !options.val(scope, c"input")?.is_undefined() => (
-            options.val(scope, c"input")?,
-            options.val(scope, c"output")?,
-            options.val(scope, c"signal")?,
-            options.val(scope, c"prompt")?,
-        ),
-        _ => (
-            input,
-            output.unwrap_or(HandleValue::undefined()),
-            HandleValue::undefined(),
-            HandleValue::undefined(),
-        ),
+    let undefined = HandleValue::undefined();
+    let (mut input, mut output, mut completer) = (
+        input,
+        output.unwrap_or(undefined),
+        completer.unwrap_or(undefined),
+    );
+    let (mut signal, mut prompt, mut delay) = (undefined, undefined, undefined);
+    let (mut history, mut history_size) = (undefined, undefined);
+    let options = Object::from_value(scope, *input).ok();
+    let options = match options {
+        Some(options) if js::conversion::to_boolean(options.val(scope, c"input")?) => Some(options),
+        _ => None,
     };
-    // As in Node.js, a falsy `signal` is ignored.
+    if let Some(options) = options {
+        output = options.val(scope, c"output")?;
+        completer = options.val(scope, c"completer")?;
+        signal = options.val(scope, c"signal")?;
+        history_size = options.val(scope, c"historySize")?;
+        history = options.val(scope, c"history")?;
+        let tab_size = options.val(scope, c"tabSize")?;
+        if !tab_size.is_undefined() {
+            let tab_size =
+                crate::errors::validate_integer(scope, tab_size, "tabSize", 1.0, 4294967295.0)?;
+            this.set_property(scope, c"tabSize", tab_size)?;
+        }
+        prompt = options.val(scope, c"prompt")?;
+        let timeout = options.val(scope, c"escapeCodeTimeout")?;
+        if !timeout.is_undefined() {
+            if !timeout.is_number() || !timeout.to_number().is_finite() {
+                let current = this.val(scope, c"escapeCodeTimeout")?;
+                let name = "input.escapeCodeTimeout";
+                return Err(
+                    NodeError::invalid_arg_value(scope, name, current, "is invalid").into(),
+                );
+            }
+            this.set_property(scope, c"escapeCodeTimeout", timeout)?;
+        }
+        // As in Node.js, a falsy `signal` is ignored.
+        if js::conversion::to_boolean(signal) {
+            crate::errors::validate_abort_signal(scope, signal, "options.signal")?;
+        }
+        delay = options.val(scope, c"crlfDelay")?;
+        input = options.val(scope, c"input")?;
+        if !history.is_undefined() && !js::Array::is_array_value(scope, history)? {
+            let error =
+                NodeError::invalid_arg_type(scope, "history", "an instance of Array", history);
+            return Err(error.into());
+        }
+        if !history_size.is_undefined() {
+            crate::errors::validate_number(scope, history_size, "size", 0.0)?;
+        }
+    }
+    if !completer.is_undefined() && !js::function::is_callable(completer) {
+        return Err(
+            NodeError::invalid_arg_value(scope, "completer", completer, "is invalid").into(),
+        );
+    }
     let signal = if js::conversion::to_boolean(signal) {
-        crate::errors::validate_abort_signal(scope, signal, "options.signal")?;
         Some(Object::from_value(scope, *signal)?)
     } else {
         None
     };
     let input_object = Object::from_value(scope, *input)
         .map_err(|_| NodeError::invalid_arg_type(scope, "input", "an instance of Stream", input))?;
-    let prompt = match crate::support::rust_string(scope, prompt) {
-        Some(prompt) => prompt,
-        None => "> ".to_string(),
+    let prompt = if prompt.is_undefined() {
+        js::JSString::from_str(scope, "> ")?.to_jsval_throwing(scope)?
+    } else {
+        prompt
     };
+    let crlf_delay = crlf_delay(scope, delay)?;
     let data = Function::new_callback(scope, c"", 1, on_data, this)?;
     let end = Function::new_callback(scope, c"", 0, on_end, this)?;
     let error = Function::new_callback(scope, c"", 1, on_error, this)?;
     *interface_class::state_of(scope, this)?.data_mut() = InterfaceStateImpl {
         question: Heap::from(js::value::undefined()),
-        prompt,
+        prompt: Heap::from(prompt.get()),
+        old_prompt: Heap::from(js::value::undefined()),
         decoder: crate::string_decoder::NativeDecoderImpl::default(),
-        saw_return: false,
-        partial: String::new(),
+        crlf_delay,
+        saw_return_at: None,
+        partial: Heap::from(js::JSString::empty(scope).as_value()),
         closed: false,
         paused: false,
         on_data: Some(Heap::from(*data)),
@@ -283,18 +399,22 @@ fn init_interface(
         on_abort: None,
         line_iterator: None,
     };
-    this.set_property(scope, c"completer", js::value::undefined())?;
-    this.set_property(scope, c"crlfDelay", 100)?;
-    this.set_property(scope, c"escapeCodeTimeout", 500)?;
-    this.set_property(scope, c"history", *js::Array::new(scope, 0)?)?;
+    if history.is_undefined() {
+        history = js::Array::new(scope, 0)?.to_jsval_throwing(scope)?;
+    }
+    this.set_property(scope, c"history", history)?;
     this.set_property(scope, c"historyIndex", -1)?;
-    this.set_property(scope, c"historySize", 30)?;
-    this.set_property(scope, c"input", input)?;
-    this.set_property(scope, c"isCompletionEnabled", true)?;
+    if history_size.is_undefined() {
+        this.set_property(scope, c"historySize", 30)?;
+    } else {
+        this.set_property(scope, c"historySize", history_size)?;
+    }
     this.set_property(scope, c"isFlushing", false)?;
     this.set_property(scope, c"line", "")?;
     this.set_property(scope, c"output", output)?;
-    this.set_property(scope, c"tabSize", 8)?;
+    this.set_property(scope, c"input", input)?;
+    this.set_property(scope, c"crlfDelay", crlf_delay)?;
+    this.set_property(scope, c"completer", completer)?;
     this.set_property(scope, c"terminal", false)?;
     for (event, listener) in [(c"error", error), (c"data", data), (c"end", end)] {
         crate::events::listen(scope, input_object, c"on", event, *listener)?;
@@ -381,13 +501,14 @@ pub mod interface_class {
         this: Object<'_>,
         input: HandleValue<'_>,
         output: Option<HandleValue<'_>>,
+        completer: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        super::init_interface(scope, this, input, output)
+        super::init_interface(scope, this, input, output, completer)
     }
 
     /// <https://nodejs.org/api/readline.html#rlclose>: stop reading the input, pause, and emit
     /// `close`.
-    pub fn close(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
+    pub fn close(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
         let state = state_of(scope, this)?;
         if state.data().closed {
             return Ok(());
@@ -424,36 +545,42 @@ pub mod interface_class {
         Ok(())
     }
 
-    /// <https://nodejs.org/api/readline.html#rlpause>
-    pub fn pause<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+    /// <https://nodejs.org/api/readline.html#rlpause>: returns `this`, or `undefined` if the
+    /// interface was already paused.
+    pub fn pause<'s>(scope: &'s Scope<'_>, this: Object<'s>) -> Result<HandleValue<'s>, Thrown> {
         let state = state_of(scope, this)?;
-        if !state.data().paused {
-            if let Some(input) = this.obj(scope, c"input")? {
-                Function::call_by_name(scope, input.handle(), c"pause", js::function::EmptyArgs)?;
-            }
-            state.data_mut().paused = true;
-            this.set_property(scope, c"paused", true)?;
-            crate::events::emit(scope, this, c"pause", &[])?;
+        if state.data().closed {
+            return Err(use_after_close().into());
         }
-        Ok(this)
+        if state.data().paused {
+            return Ok(HandleValue::undefined());
+        }
+        if let Some(input) = this.obj(scope, c"input")? {
+            Function::call_by_name(scope, input.handle(), c"pause", js::function::EmptyArgs)?;
+        }
+        state.data_mut().paused = true;
+        this.set_property(scope, c"paused", true)?;
+        crate::events::emit(scope, this, c"pause", &[])?;
+        Ok(this.to_jsval_throwing(scope)?)
     }
 
-    /// <https://nodejs.org/api/readline.html#rlresume>
-    pub fn resume<'s>(scope: &Scope<'_>, this: Object<'s>) -> Result<Object<'s>, ExnThrown> {
+    /// <https://nodejs.org/api/readline.html#rlresume>: returns `this`, or `undefined` if the
+    /// interface wasn't paused.
+    pub fn resume<'s>(scope: &'s Scope<'_>, this: Object<'s>) -> Result<HandleValue<'s>, Thrown> {
         let state = state_of(scope, this)?;
-        let (paused, closed) = {
-            let data = state.data();
-            (data.paused, data.closed)
-        };
-        if paused && !closed {
-            if let Some(input) = this.obj(scope, c"input")? {
-                Function::call_by_name(scope, input.handle(), c"resume", js::function::EmptyArgs)?;
-            }
-            state.data_mut().paused = false;
-            this.set_property(scope, c"paused", false)?;
-            crate::events::emit(scope, this, c"resume", &[])?;
+        if state.data().closed {
+            return Err(use_after_close().into());
         }
-        Ok(this)
+        if !state.data().paused {
+            return Ok(HandleValue::undefined());
+        }
+        if let Some(input) = this.obj(scope, c"input")? {
+            Function::call_by_name(scope, input.handle(), c"resume", js::function::EmptyArgs)?;
+        }
+        state.data_mut().paused = false;
+        this.set_property(scope, c"paused", false)?;
+        crate::events::emit(scope, this, c"resume", &[])?;
+        Ok(this.to_jsval_throwing(scope)?)
     }
 
     /// <https://nodejs.org/api/readline.html#rlquestionquery-options-callback>
@@ -489,43 +616,47 @@ pub mod interface_class {
         Ok(())
     }
 
-    /// <https://nodejs.org/api/readline.html#rlsetpromptprompt>
+    /// <https://nodejs.org/api/readline.html#rlsetpromptprompt>: `prompt` is stored as it is.
     pub fn set_prompt(
         scope: &Scope<'_>,
         this: Object<'_>,
-        prompt: String,
+        prompt: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
-        state_of(scope, this)?.data_mut().prompt = prompt;
+        state_of(scope, this)?.data_mut().prompt.set(prompt.get());
         Ok(())
     }
 
     /// <https://nodejs.org/api/readline.html#rlgetprompt>
-    pub fn get_prompt(scope: &Scope<'_>, this: Object<'_>) -> Result<String, ExnThrown> {
-        Ok(state_of(scope, this)?.data().prompt.clone())
+    pub fn get_prompt<'s>(
+        scope: &'s Scope<'_>,
+        this: Object<'_>,
+    ) -> Result<HandleValue<'s>, ExnThrown> {
+        Ok(state_of(scope, this)?.data().prompt.get(scope))
     }
 
-    /// <https://nodejs.org/api/readline.html#rlpromptpreservecursor>
+    /// <https://nodejs.org/api/readline.html#rlpromptpreservecursor>: resume the interface and
+    /// write the prompt, which must be a string, to the output.
     pub fn prompt(scope: &Scope<'_>, this: Object<'_>) -> Result<(), Thrown> {
+        let state = state_of(scope, this)?;
+        if state.data().paused {
+            interface_class::resume(scope, this)?;
+        }
+        let prompt = state.data().prompt.get(scope);
+        super::write_output(scope, this, prompt)
+    }
+
+    /// <https://nodejs.org/api/readline.html#rlwritedata-key>: resume the interface and handle
+    /// `data` as input, a string or the bytes of a `Buffer`, typed array or `DataView`.
+    #[method(length = 2)]
+    pub fn write(scope: &Scope<'_>, this: Object<'_>, data: HandleValue<'_>) -> Result<(), Thrown> {
         let state = state_of(scope, this)?;
         if state.data().closed {
             return Err(use_after_close().into());
         }
-        interface_class::resume(scope, this)?;
-        let prompt = state.data().prompt.clone();
-        super::write_output(scope, this, &prompt)?;
-        Ok(())
-    }
-
-    /// <https://nodejs.org/api/readline.html#rlwritedata-key>: handle `data` as input.
-    pub fn write(scope: &Scope<'_>, this: Object<'_>, data: HandleValue<'_>) -> Result<(), Thrown> {
-        if state_of(scope, this)?.data().closed {
-            return Err(use_after_close().into());
+        if state.data().paused {
+            interface_class::resume(scope, this)?;
         }
-        if data.is_string() {
-            let text = String::from_jsval(scope, data, ())?;
-            super::feed(scope, this, &text)?;
-        }
-        Ok(())
+        super::normal_write(scope, this, data)
     }
 
     /// <https://nodejs.org/api/readline.html#rlgetcursorpos>: the column after the prompt.
@@ -533,7 +664,9 @@ pub mod interface_class {
         scope: &'s Scope<'_>,
         this: Object<'_>,
     ) -> Result<Object<'s>, ExnThrown> {
-        let columns = crate::inspect::columns(&state_of(scope, this)?.data().prompt);
+        let prompt = state_of(scope, this)?.data().prompt.get(scope);
+        let prompt = js::JSString::from_value(scope, prompt)?.to_utf8(scope)?;
+        let columns = crate::inspect::columns(&prompt);
         let position = Object::new_plain(scope)?;
         position.set_property(scope, c"cols", columns as f64)?;
         position.set_property(scope, c"rows", 0)?;
@@ -587,8 +720,9 @@ pub mod promises_interface_class {
         this: Object<'_>,
         input: HandleValue<'_>,
         output: Option<HandleValue<'_>>,
+        completer: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        super::init_interface(scope, this, input, output)
+        super::init_interface(scope, this, input, output, completer)
     }
 
     /// <https://nodejs.org/api/readline.html#rlquestionquery-options>: a promise for the answer.
@@ -694,6 +828,23 @@ pub(crate) struct QuestionAnswer {
 #[core_runtime::jsmethods]
 impl QuestionAnswer {}
 
+/// Node.js's `kQuestionCancel`: drop the pending question, if there is one, restore the prompt it
+/// replaced, and write a line break, as `clearLine()` does without a terminal.
+fn cancel_question(scope: &Scope<'_>, interface: Object<'_>) -> Result<(), Thrown> {
+    let state = state_of(scope, interface)?;
+    if !js::function::is_callable(state.data().question.get(scope)) {
+        return Ok(());
+    }
+    {
+        let data = state.data();
+        data.question.set(js::value::undefined());
+        let old_prompt = data.old_prompt.get(scope);
+        data.prompt.set(old_prompt.get());
+    }
+    let line_break = js::class::get_or_init_atom(scope, c"\r\n")?;
+    write_output(scope, interface, line_break)
+}
+
 /// The abort listener of a question, whose payload is a [`QuestionAbort`]: cancel the question,
 /// and reject the promise, if there is one, with an `AbortError`.
 fn question_aborted(
@@ -705,10 +856,7 @@ fn question_aborted(
     let interface = abort.data().interface.get(scope);
     let signal = abort.data().signal.get(scope);
     let promise = abort.data().promise.get(scope);
-    state_of(scope, interface)?
-        .data_mut()
-        .question
-        .set(js::value::undefined());
+    cancel_question(scope, interface).map_err(|thrown| thrown.throw(scope))?;
     if let Some(promise) = promise {
         let promise = promise
             .cast::<js::Promise>()
@@ -741,15 +889,6 @@ fn question_answered(
         Function::call(scope, js::value::undefined(), callback, &[args.get(0)])?;
     }
     Ok(js::value::undefined())
-}
-
-/// A number as a template literal interpolates it.
-fn js_number(number: f64) -> String {
-    if number.fract() == 0.0 && number.abs() < 1e21 {
-        format!("{}", number as i64)
-    } else {
-        number.to_string()
-    }
 }
 
 /// Call `callback` with `null` in a tick, if it is a function, and return `true`, as Node.js's
@@ -800,7 +939,7 @@ fn create_promises_interface(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     let class = promises_interface_class::class_constructor(scope)?;
     create(scope, class, &values)?.to_jsval_raw_throwing(scope)
 }
@@ -918,9 +1057,12 @@ pub mod module {
                 NodeError::new(ErrorKind::TypeError, "ERR_INVALID_CURSOR_POS", message).into(),
             );
         }
-        let column = super::js_number(x.to_number() + 1.0);
+        let column = crate::errors::number_to_string(x.to_number() + 1.0);
         let code = if y.is_number() {
-            format!("\x1b[{};{column}H", super::js_number(y.to_number() + 1.0))
+            format!(
+                "\x1b[{};{column}H",
+                crate::errors::number_to_string(y.to_number() + 1.0)
+            )
         } else {
             format!("\x1b[{column}G")
         };
@@ -950,14 +1092,14 @@ pub mod module {
         }
         let mut code = String::new();
         if dx < 0.0 {
-            code.push_str(&format!("\x1b[{}D", super::js_number(-dx)));
+            code.push_str(&format!("\x1b[{}D", crate::errors::number_to_string(-dx)));
         } else if dx > 0.0 {
-            code.push_str(&format!("\x1b[{}C", super::js_number(dx)));
+            code.push_str(&format!("\x1b[{}C", crate::errors::number_to_string(dx)));
         }
         if dy < 0.0 {
-            code.push_str(&format!("\x1b[{}A", super::js_number(-dy)));
+            code.push_str(&format!("\x1b[{}A", crate::errors::number_to_string(-dy)));
         } else if dy > 0.0 {
-            code.push_str(&format!("\x1b[{}B", super::js_number(dy)));
+            code.push_str(&format!("\x1b[{}B", crate::errors::number_to_string(dy)));
         }
         Ok(super::write_escape(scope, stream, &code, callback)?)
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! `net.Socket`: a `Duplex` over a `platform::net` TCP connection.
+//! `net.Socket`: a `Duplex` over a `platform::net` TCP connection, or over a `platform::child` pipe
+//! to a child process.
 //!
 //! A socket's state is a [`SocketState`], which extends the state of the stream with the
 //! socket's connection, its byte counts and its idle timer. Each read and write takes its half of
@@ -19,23 +20,80 @@ use js::native::Value;
 use js::object::{PropertyTemplate, TemplateKey};
 use js::prelude::HandleValue;
 use js::{Function, Object};
-use platform::net::{Connection, ConnectionReader, ConnectionWriter, NetError};
+use platform::net::{Connection, ConnectionReader, ConnectionWriter, NetError, Received};
 
 use super::blocklist::Rules;
-use crate::buffer::new_buffer;
+use crate::buffer::buffer_from_vec;
 use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
 use crate::fs::UvError;
 use crate::stream::state::{StreamState, StreamStateImpl, WritableSide, W};
 use crate::support::{chunk_bytes, spawn_cancellable_with_ref, until_cancelled, Canceller};
 
-/// The halves of a TCP connection that no read or write in progress holds, and the cancellations
-/// of the read and the write in progress.
+/// The halves of a TCP connection or a pipe that no read or write in progress holds, and the
+/// cancellations of the read and the write in progress.
 #[derive(Default)]
 pub(crate) struct TcpLink {
-    reader: Option<ConnectionReader>,
-    writer: Option<ConnectionWriter>,
+    reader: Option<LinkReader>,
+    writer: Option<LinkWriter>,
     cancel_read: Option<Canceller>,
     cancel_write: Option<Canceller>,
+    /// The descriptor of a pipe.
+    fd: Option<i32>,
+    /// Whether the connection stopped delivering bytes, and the next read gets its outcome.
+    stopped: bool,
+}
+
+/// The reading half of a TCP connection or a pipe.
+pub(crate) enum LinkReader {
+    Tcp(ConnectionReader),
+    Pipe(platform::child::PipeReader),
+}
+
+impl LinkReader {
+    /// The next bytes received, or how the connection ended, as [`ConnectionReader::receive`]
+    /// returns them.
+    async fn receive(&mut self) -> Result<Received, NetError> {
+        match self {
+            LinkReader::Tcp(reader) => reader.receive().await,
+            LinkReader::Pipe(reader) => Ok(match reader.read().await? {
+                Some(bytes) => Received::Bytes(bytes),
+                None => Received::End,
+            }),
+        }
+    }
+}
+
+/// The writing half of a TCP connection or a pipe.
+pub(crate) enum LinkWriter {
+    Tcp(ConnectionWriter),
+    Pipe(platform::child::PipeWriter),
+}
+
+impl LinkWriter {
+    /// Send all of `data`.
+    async fn write(&mut self, data: Vec<u8>) -> Result<(), NetError> {
+        match self {
+            LinkWriter::Tcp(writer) => writer.write(data).await,
+            LinkWriter::Pipe(writer) => writer.write(data).await,
+        }
+    }
+
+    /// Send as much of `data` as the connection takes without waiting, and return the bytes not
+    /// sent.
+    fn try_write(&mut self, data: Vec<u8>) -> Vec<u8> {
+        match self {
+            LinkWriter::Tcp(writer) => writer.try_write(data),
+            LinkWriter::Pipe(writer) => writer.try_write(data),
+        }
+    }
+
+    /// End this side of the connection.
+    async fn shutdown(&mut self) -> Result<(), NetError> {
+        match self {
+            LinkWriter::Tcp(writer) => writer.shutdown().await,
+            LinkWriter::Pipe(writer) => writer.shutdown().await,
+        }
+    }
 }
 
 /// What a socket reads from and writes to.
@@ -48,18 +106,21 @@ pub(crate) enum Link {
     Connecting(Canceller),
     /// A TCP connection.
     Tcp(TcpLink),
+    /// A pipe to a child process.
+    Pipe(TcpLink),
     /// The standard input of a `tty.ReadStream`.
     Stdin(crate::tty::StdinLink),
 }
 
 /// A write or shutdown that came while the socket was connecting: the bytes, or `None` for the
-/// shutdown, and the callback.
+/// shutdown, the callback, and the `close` listener of a write.
 #[js::must_root]
 #[derive(core_runtime::Traceable)]
 pub(crate) struct DeferredWrite {
     #[no_trace]
     bytes: Option<Vec<u8>>,
     callback: Heap<Value>,
+    on_close: Option<Heap<js::object::Object>>,
 }
 
 /// The state of a `net.Socket`: the state of the stream, and the socket's own.
@@ -114,6 +175,10 @@ pub(crate) struct SocketState {
     /// Whether the socket destroys itself once it reads anything, which [`guard_reads`] sets.
     #[no_trace]
     read_guard: bool,
+    /// Whether a child process got the socket's pipe as one of its descriptors, so the socket
+    /// doesn't read from it.
+    #[no_trace]
+    used_as_stdio: bool,
 }
 
 /// A connect waiting for the addresses the `lookup` option's callback gives: the host and the
@@ -152,13 +217,19 @@ impl SocketStateImpl {
             .map(|addr| addr.ip())
     }
 
-    /// Remove the write or shutdown waiting for the connect, and return its bytes and callback.
+    /// Remove the write or shutdown waiting for the connect, and return its bytes, callback and
+    /// `close` listener.
+    #[allow(clippy::type_complexity)]
     fn take_deferred<'s>(
         &mut self,
         scope: &'s Scope<'_>,
-    ) -> Option<(Option<Vec<u8>>, HandleValue<'s>)> {
+    ) -> Option<(Option<Vec<u8>>, HandleValue<'s>, Option<Object<'s>>)> {
         let deferred = self.deferred.as_mut()?;
-        let taken = (deferred.bytes.take(), deferred.callback.get(scope));
+        let taken = (
+            deferred.bytes.take(),
+            deferred.callback.get(scope),
+            deferred.on_close.take_rooted(scope),
+        );
         self.deferred = None;
         Some(taken)
     }
@@ -235,16 +306,86 @@ pub(super) fn attach(
     {
         let mut data = state.data_mut();
         data.link = Link::Tcp(TcpLink {
-            reader: Some(reader),
-            writer: Some(writer),
+            reader: Some(LinkReader::Tcp(reader)),
+            writer: Some(LinkWriter::Tcp(writer)),
             cancel_read: None,
             cancel_write: None,
+            fd: None,
+            stopped: false,
         });
         data.local = Some(local_addr);
         data.peer = Some(peer_addr);
         data.handle = Some(Heap::from(handle));
     }
     socket.set_property(scope, c"connecting", false)
+}
+
+/// Make `pipe` the pipe of `socket`, a socket of a child process's standard stream.
+pub(crate) fn attach_pipe(
+    scope: &Scope<'_>,
+    socket: Object<'_>,
+    pipe: platform::child::Pipe,
+) -> Result<(), ExnThrown> {
+    let state = socket_class::state_of(scope, socket)?;
+    let fd = pipe.as_raw_fd();
+    let (reader, writer) = pipe
+        .split()
+        .map_err(|error| UvError::new(error, "pipe").throw(scope))?;
+    let handle = Object::new_plain(scope)?;
+    let mut data = state.data_mut();
+    data.link = Link::Pipe(TcpLink {
+        reader: Some(LinkReader::Pipe(reader)),
+        writer: Some(LinkWriter::Pipe(writer)),
+        cancel_read: None,
+        cancel_write: None,
+        fd: Some(fd),
+        stopped: false,
+    });
+    data.handle = Some(Heap::from(handle));
+    Ok(())
+}
+
+/// The descriptor of the pipe of `socket`, if it is a socket over a pipe to a child process.
+pub(crate) fn pipe_fd(scope: &Scope<'_>, socket: Object<'_>) -> Result<Option<i32>, ExnThrown> {
+    let Some(state) = state_of(scope, socket)? else {
+        return Ok(None);
+    };
+    let fd = match &state.data().link {
+        Link::Pipe(pipe) => pipe.fd,
+        _ => None,
+    };
+    Ok(fd)
+}
+
+/// Stop reading from the pipe of `socket`, which a child process got as one of its descriptors,
+/// and pause the socket, as Node.js does for a stream it passes to a child.
+pub(crate) fn use_as_stdio(scope: &Scope<'_>, socket: Object<'_>) -> Result<(), ExnThrown> {
+    let Some(state) = state_of(scope, socket)? else {
+        return Ok(());
+    };
+    let cancel = {
+        let mut data = state.data_mut();
+        data.used_as_stdio = true;
+        match &mut data.link {
+            Link::Pipe(pipe) => pipe.cancel_read.take(),
+            _ => None,
+        }
+    };
+    if let Some(cancel) = cancel {
+        let _ = cancel.send(());
+    }
+    if let Some(side) = crate::stream::state::ReadableSide::try_of(scope, socket)? {
+        side.get_mut()
+            .flags
+            .remove(crate::stream::state::R::READING);
+    }
+    Function::call_by_name(scope, socket.handle(), c"pause", js::function::EmptyArgs)?;
+    socket.set_property(scope, c"readableFlowing", false)
+}
+
+/// Whether a child process got the pipe of `socket` as one of its descriptors.
+pub(crate) fn used_as_stdio(scope: &Scope<'_>, socket: Object<'_>) -> Result<bool, ExnThrown> {
+    Ok(state_of(scope, socket)?.is_some_and(|state| state.data().used_as_stdio))
 }
 
 /// Drop the connection of `socket` and cancel its connect, read and write in progress, without
@@ -266,7 +407,7 @@ pub(super) fn release(
         Link::Connecting(canceller) => {
             let _ = canceller.send(());
         }
-        Link::Tcp(tcp) => {
+        Link::Tcp(tcp) | Link::Pipe(tcp) => {
             for canceller in [tcp.cancel_read, tcp.cancel_write].into_iter().flatten() {
                 let _ = canceller.send(());
             }
@@ -418,7 +559,8 @@ async fn connect_to(
 }
 
 /// Make `socket` destroy itself once it reads data or the end of the connection while `guard`,
-/// without emitting them, and start reading now. Sockets of other classes are left alone.
+/// without emitting them, and start reading now. The socket is destroyed at once if its
+/// connection already stopped delivering bytes. Sockets of other classes are left alone.
 pub(crate) fn guard_reads(
     scope: &Scope<'_>,
     socket: Object<'_>,
@@ -428,10 +570,18 @@ pub(crate) fn guard_reads(
         return Ok(());
     };
     state.data_mut().read_guard = guard;
-    if guard && matches!(state.data().link, Link::Tcp(_)) {
-        start_read(scope, socket, &state)?;
+    if !guard {
+        return Ok(());
     }
-    Ok(())
+    let stopped = match &state.data().link {
+        Link::Tcp(tcp) => tcp.stopped,
+        _ => return Ok(()),
+    };
+    if stopped {
+        Function::call_by_name(scope, socket.handle(), c"destroy", js::function::EmptyArgs)?;
+        return Ok(());
+    }
+    start_read(scope, socket, &state)
 }
 
 /// Start the first read of `socket` unless it is paused, so `end` is emitted even without a
@@ -466,7 +616,10 @@ fn connect_done(
     touch(scope, socket, &state)?;
     crate::events::emit(scope, socket, c"connect", &[])?;
     let deferred = state.data_mut().take_deferred(scope);
-    if let Some((bytes, callback)) = deferred {
+    if let Some((bytes, callback, on_close)) = deferred {
+        if let Some(on_close) = on_close {
+            crate::events::listen(scope, socket, c"removeListener", c"close", on_close)?;
+        }
         write_or_shutdown(scope, socket, &state, bytes, callback)?;
     }
     crate::events::emit(scope, socket, c"ready", &[])?;
@@ -640,11 +793,8 @@ fn lookup_done(
     let PendingLookup { host, target, all } = pending;
     let host_value = host.as_str().to_jsval_throwing(scope)?;
     let error = args.get(0);
-    let connecting = |scope: &Scope<'_>| -> Result<bool, ExnThrown> {
-        Ok(js::conversion::to_boolean(
-            socket.get_property(scope, c"connecting")?,
-        ))
-    };
+    // Whether the socket still connects: a `lookup` listener can destroy it.
+    let connecting = || matches!(state.data().link, Link::Connecting(_));
     let fail = |scope: &Scope<'_>, error: HandleValue<'_>| -> Result<Value, ExnThrown> {
         js::jobs::queue_native_tick(scope, connect_error_tick, socket, &[error])?;
         Ok(js::value::undefined())
@@ -658,7 +808,7 @@ fn lookup_done(
             c"lookup",
             &[error, address, family, host_value],
         )?;
-        if !connecting(scope)? {
+        if !connecting() {
             return Ok(js::value::undefined());
         }
         if js::conversion::to_boolean(error) {
@@ -677,7 +827,7 @@ fn lookup_done(
         connect(scope, socket, &state, host, Some(vec![ip]), target)?;
         return Ok(js::value::undefined());
     }
-    if !connecting(scope)? {
+    if !connecting() {
         return Ok(js::value::undefined());
     }
     if js::conversion::to_boolean(error) {
@@ -706,7 +856,7 @@ fn lookup_done(
             c"lookup",
             &[error, address, family, host_value],
         )?;
-        if !connecting(scope)? {
+        if !connecting() {
             return Ok(js::value::undefined());
         }
         if let Some(ip) = lookup_address(scope, address, family) {
@@ -753,30 +903,39 @@ fn invalid_family(scope: &Scope<'_>, family: HandleValue<'_>, host: &str, port: 
 }
 
 /// The completion of a read: push the `Buffer` read, or `null` at the end, or destroy the socket
-/// with the error.
+/// with the error. A cancelled read, which gives `undefined`, pushes nothing. `false` means that
+/// the connection stopped delivering bytes, and the next read is started to get its outcome.
 fn read_done(
     scope: &Scope<'_>,
     socket: Object<'_>,
     result: Result<HandleValue<'_>, HandleValue<'_>>,
 ) -> Result<(), ExnThrown> {
     let chunk = match result {
+        Ok(chunk) if chunk.is_undefined() => return Ok(()),
         Ok(chunk) => chunk,
         Err(error) => {
             Function::call_by_name(scope, socket.handle(), c"destroy", &[error])?;
             return Ok(());
         }
     };
-    if state_of(scope, socket)?.is_some_and(|state| state.data().read_guard) {
+    let state = state_of(scope, socket)?;
+    if state.as_ref().is_some_and(|state| state.data().read_guard) {
         Function::call_by_name(scope, socket.handle(), c"destroy", js::function::EmptyArgs)?;
+        return Ok(());
+    }
+    if chunk.is_boolean() {
+        if let Some(state) = &state {
+            start_read(scope, socket, state)?;
+        }
         return Ok(());
     }
     if let Some(view) = Object::from_value(scope, chunk)
         .ok()
         .and_then(js::ArrayBufferView::from_object)
     {
-        if let Some(state) = state_of(scope, socket)? {
+        if let Some(state) = &state {
             state.data_mut().bytes_read += view.byte_length() as f64;
-            touch(scope, socket, &state)?;
+            touch(scope, socket, state)?;
         }
     }
     Function::call_by_name(scope, socket.handle(), c"push", &[chunk])?;
@@ -795,7 +954,7 @@ fn start_read(
     state: &SocketState<'_>,
 ) -> Result<(), ExnThrown> {
     let reader = match &mut state.data_mut().link {
-        Link::Tcp(tcp) => tcp.reader.take(),
+        Link::Tcp(tcp) | Link::Pipe(tcp) => tcp.reader.take(),
         _ => None,
     };
     let Some(mut reader) = reader else {
@@ -806,26 +965,32 @@ fn start_read(
         scope,
         socket,
         |cancelled| async move {
-            let result = until_cancelled(cancelled, reader.read()).await?;
+            let result = until_cancelled(cancelled, reader.receive()).await;
             Some((reader, result))
         },
         |scope, socket, (reader, result)| {
+            let stopped = matches!(result, Some(Ok(Received::Stopped)));
             if let Some(state) = state_of(scope, socket)? {
-                if let Link::Tcp(tcp) = &mut state.data_mut().link {
+                if let Link::Tcp(tcp) | Link::Pipe(tcp) = &mut state.data_mut().link {
                     tcp.reader = Some(reader);
                     tcp.cancel_read = None;
+                    tcp.stopped |= stopped;
                 }
             }
             match result {
-                Ok(Some(bytes)) => new_buffer(scope, &bytes)?.to_jsval_throwing(scope),
-                Ok(None) => Ok(HandleValue::null()),
-                Err(error) => Err(UvError::net(&error, "read").throw(scope)),
+                None => Ok(HandleValue::undefined()),
+                Some(Ok(Received::Bytes(bytes))) => {
+                    buffer_from_vec(scope, bytes)?.to_jsval_throwing(scope)
+                }
+                Some(Ok(Received::End)) => Ok(HandleValue::null()),
+                Some(Ok(Received::Stopped)) => Ok(scope.root_value(js::value::from_bool(false))),
+                Some(Err(error)) => Err(UvError::net(&error, "read").throw(scope)),
             }
         },
         read_done,
         referenced,
     )?;
-    if let Link::Tcp(tcp) = &mut state.data_mut().link {
+    if let Link::Tcp(tcp) | Link::Pipe(tcp) = &mut state.data_mut().link {
         tcp.cancel_read = Some(canceller);
     }
     Ok(())
@@ -896,6 +1061,10 @@ fn write_or_shutdown(
                 Link::Tcp(TcpLink {
                     writer: Some(writer),
                     ..
+                })
+                | Link::Pipe(TcpLink {
+                    writer: Some(writer),
+                    ..
                 }) => Some(writer.try_write(bytes)),
                 _ => None,
             };
@@ -917,7 +1086,7 @@ fn write_or_shutdown(
         bytes => bytes,
     };
     let writer = match &mut state.data_mut().link {
-        Link::Tcp(tcp) => tcp.writer.take(),
+        Link::Tcp(tcp) | Link::Pipe(tcp) => tcp.writer.take(),
         _ => None,
     };
     let Some(mut writer) = writer else {
@@ -944,7 +1113,7 @@ fn write_or_shutdown(
         },
         move |scope, socket, (writer, result)| {
             if let Some(state) = state_of(scope, socket)? {
-                if let Link::Tcp(tcp) = &mut state.data_mut().link {
+                if let Link::Tcp(tcp) | Link::Pipe(tcp) = &mut state.data_mut().link {
                     tcp.writer = Some(writer);
                     tcp.cancel_write = None;
                 }
@@ -956,7 +1125,7 @@ fn write_or_shutdown(
         write_done,
         referenced,
     )?;
-    if let Link::Tcp(tcp) = &mut state.data_mut().link {
+    if let Link::Tcp(tcp) | Link::Pipe(tcp) = &mut state.data_mut().link {
         tcp.cancel_write = Some(canceller);
     }
     Ok(())
@@ -971,28 +1140,60 @@ fn write_bytes(
 ) -> Result<(), ExnThrown> {
     let state = socket_class::state_of(scope, socket)?;
     state.data_mut().bytes_dispatched += bytes.len() as f64;
-    if defer_until_connected(&state, Some(bytes.clone()), callback) {
-        return Ok(());
+    match defer_until_connected(&state, Some(bytes), callback) {
+        Ok(()) => {
+            // As in Node.js's `_writeGeneric`, a `close` before the connect calls the callback.
+            let on_close = Function::new_callback(scope, c"onClose", 0, closed_early, callback)?;
+            crate::events::listen(scope, socket, c"once", c"close", *on_close)?;
+            if let Some(deferred) = state.data_mut().deferred.as_mut() {
+                deferred.on_close = Some(Heap::from(*on_close));
+            }
+            Ok(())
+        }
+        Err(bytes) => write_or_shutdown(scope, socket, &state, bytes, callback),
     }
-    write_or_shutdown(scope, socket, &state, Some(bytes), callback)
 }
 
 /// Keep the write of `bytes`, or the shutdown for `None`, until the connect in progress
-/// completes, and return whether the socket is connecting.
+/// completes. Returns `bytes` as the error if the socket isn't connecting.
 fn defer_until_connected(
     state: &SocketState<'_>,
     bytes: Option<Vec<u8>>,
     callback: HandleValue<'_>,
-) -> bool {
+) -> Result<(), Option<Vec<u8>>> {
     let mut data = state.data_mut();
     if !matches!(data.link, Link::Connecting(_)) {
-        return false;
+        return Err(bytes);
     }
     data.deferred = Some(DeferredWrite {
         bytes,
         callback: Heap::from(callback.get()),
+        on_close: None,
     });
-    true
+    Ok(())
+}
+
+/// The `close` listener of a socket with a write waiting for the connect, whose payload is the
+/// write's callback: call it with `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`.
+fn closed_early(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    callback: HandleValue,
+) -> Result<Value, ExnThrown> {
+    closed_before_connection(scope, callback)?;
+    Ok(js::value::undefined())
+}
+
+/// Call `callback` with `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`.
+fn closed_before_connection(scope: &Scope<'_>, callback: HandleValue<'_>) -> Result<(), ExnThrown> {
+    let closed = NodeError::new(
+        ErrorKind::Error,
+        "ERR_SOCKET_CLOSED_BEFORE_CONNECTION",
+        "Socket closed before the connection was established",
+    )
+    .to_value(scope)?;
+    Function::call(scope, HandleValue::undefined(), callback, &[closed])?;
+    Ok(())
 }
 
 /// The callback of the timer that emits `close` on a destroyed socket, whose `this` is the
@@ -1003,7 +1204,7 @@ fn emit_close(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let socket = crate::support::this_object(scope, &args)?;
-    let close: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+    let close: Vec<HandleValue<'_>> = args.rest(0);
     crate::events::emit(scope, socket, c"close", &close)?;
     Ok(js::value::undefined())
 }
@@ -1209,6 +1410,16 @@ fn get_handle(
     Ok(handle.map_or(js::value::null(), |handle| handle.as_value()))
 }
 
+/// The getter of `_connecting`, Node.js's alias of `this.connecting`.
+fn get_connecting(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = crate::support::this_object(scope, &args)?;
+    Ok(this.get_property(scope, c"connecting")?.get())
+}
+
 /// The setter of `_handle`.
 fn set_handle(
     scope: &Scope<'_>,
@@ -1282,7 +1493,10 @@ fn get_pending(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let pending = match this_state(scope, &args)? {
-        Some((_, state)) => !matches!(state.data().link, Link::Tcp(_) | Link::Stdin(_)),
+        Some((_, state)) => !matches!(
+            state.data().link,
+            Link::Tcp(_) | Link::Pipe(_) | Link::Stdin(_)
+        ),
         None => true,
     };
     Ok(js::value::from_bool(pending))
@@ -1391,7 +1605,8 @@ pub mod socket_class {
     use super::*;
 
     /// <https://nodejs.org/api/net.html#new-netsocketoptions>: the stream options `options`
-    /// apply, `signal` destroys the socket when aborted, and `connect` skips the addresses that
+    /// apply, except the object modes, which throw, and `decodeStrings`, which is `false`.
+    /// `signal` destroys the socket when aborted, and `connect` skips the addresses that
     /// `blockList` blocks. `fd` and `handle` are not supported.
     #[constructor(length = 1)]
     pub fn init(
@@ -1399,6 +1614,23 @@ pub mod socket_class {
         this: Object<'_>,
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
+        if let Some(options) = options.and_then(|options| Object::from_value(scope, *options).ok())
+        {
+            let mut unsupported = None;
+            for name in [c"objectMode", c"readableObjectMode", c"writableObjectMode"] {
+                let value = options.get_property(scope, name)?;
+                if js::conversion::to_boolean(value) {
+                    unsupported = Some((name, value));
+                    break;
+                }
+            }
+            if let Some((name, value)) = unsupported {
+                let name = format!("options.{}", name.to_string_lossy());
+                return Err(
+                    NodeError::invalid_arg_value(scope, &name, value, "is not supported").into(),
+                );
+            }
+        }
         this.set_property(scope, c"connecting", false)?;
         this.set_property(scope, c"_hadError", false)?;
         this.set_property(scope, c"_parent", HandleValue::null())?;
@@ -1414,6 +1646,7 @@ pub mod socket_class {
         base.set_property(scope, c"allowHalfOpen", allow_half_open)?;
         base.set_property(scope, c"emitClose", false)?;
         base.set_property(scope, c"autoDestroy", true)?;
+        base.set_property(scope, c"decodeStrings", false)?;
         crate::stream::init_duplex(scope, this, Some(base.to_jsval_throwing(scope)?))?;
         let on_end = crate::support::shared_named_function(
             scope,
@@ -1575,7 +1808,7 @@ pub mod socket_class {
     #[method(name = "_read", length = 1)]
     pub fn read_impl(scope: &Scope<'_>, this: Object<'_>) -> Result<(), ExnThrown> {
         let state = state_of(scope, this)?;
-        if matches!(state.data().link, Link::Tcp(_)) {
+        if matches!(state.data().link, Link::Tcp(_) | Link::Pipe(_)) {
             return start_read(scope, this, &state);
         }
         state.data_mut().read_pending = true;
@@ -1628,10 +1861,10 @@ pub mod socket_class {
         callback: HandleValue<'_>,
     ) -> Result<(), ExnThrown> {
         let state = state_of(scope, this)?;
-        if defer_until_connected(&state, None, callback) {
+        if defer_until_connected(&state, None, callback).is_ok() {
             return Ok(());
         }
-        if !matches!(state.data().link, Link::Tcp(_)) {
+        if !matches!(state.data().link, Link::Tcp(_) | Link::Pipe(_)) {
             Function::call(
                 scope,
                 HandleValue::undefined(),
@@ -1646,8 +1879,9 @@ pub mod socket_class {
     /// Cancel the connect, read and write in progress, drop the connection, call `callback`
     /// with `error`, and then emit `close` with whether `error` is given in a later event loop
     /// turn. A socket that never connected emits `close` without an argument in the tick queue.
-    /// The server that accepted the socket counts one connection less. A write waiting for the
-    /// connect gets `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`.
+    /// The server that accepted the socket counts one connection less. A shutdown waiting for
+    /// the connect gets `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`, and a write waiting for it gets
+    /// the error from the `close` listener that the write added.
     #[method(name = "_destroy")]
     pub fn destroy_impl(
         scope: &Scope<'_>,
@@ -1667,14 +1901,8 @@ pub mod socket_class {
             )
         };
         release(scope, this, state)?;
-        if let Some((_, callback)) = deferred {
-            let closed = NodeError::new(
-                ErrorKind::Error,
-                "ERR_SOCKET_CLOSED_BEFORE_CONNECTION",
-                "Socket closed before the connection was established",
-            )
-            .to_value(scope)?;
-            Function::call(scope, HandleValue::undefined(), callback, &[closed])?;
+        if let Some((_, deferred, None)) = deferred {
+            closed_before_connection(scope, deferred)?;
         }
         Function::call(scope, HandleValue::undefined(), callback, &[error])?;
         if connected {
@@ -1836,16 +2064,42 @@ pub mod socket_class {
         Ok(())
     }
 
-    /// <https://nodejs.org/api/net.html#socketresetanddestroy>
+    /// <https://nodejs.org/api/net.html#socketresetanddestroy>: a socket without a connection
+    /// is destroyed with `ERR_SOCKET_CLOSED`, and a pipe or standard input throws
+    /// `ERR_INVALID_HANDLE_TYPE`. A TCP connection, or a connect in progress, is destroyed
+    /// without sending a reset.
     pub fn reset_and_destroy<'s>(
         scope: &Scope<'_>,
         this: Object<'s>,
     ) -> Result<Object<'s>, ExnThrown> {
-        Function::call_by_name(scope, this.handle(), c"destroy", js::function::EmptyArgs)?;
+        let state = state_of(scope, this)?;
+        let (unconnected, other_handle) = {
+            let data = state.data();
+            (
+                matches!(data.link, Link::None),
+                matches!(data.link, Link::Pipe(_) | Link::Stdin(_)),
+            )
+        };
+        if other_handle {
+            return Err(NodeError::new(
+                ErrorKind::TypeError,
+                "ERR_INVALID_HANDLE_TYPE",
+                "This handle type cannot be sent",
+            )
+            .throw(scope));
+        }
+        if unconnected {
+            let error = NodeError::new(ErrorKind::Error, "ERR_SOCKET_CLOSED", "Socket is closed")
+                .to_value(scope)?;
+            Function::call_by_name(scope, this.handle(), c"destroy", &[error])?;
+        } else {
+            Function::call_by_name(scope, this.handle(), c"destroy", js::function::EmptyArgs)?;
+        }
         Ok(this)
     }
 
-    /// Define `_handle`, `readyState`, `pending`, the byte counts and the address getters.
+    /// Define `_handle`, `readyState`, `pending`, the byte counts, the address getters and
+    /// `_connecting`.
     #[setup]
     pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
         let enumerable = js::class_spec::JSPROP_ENUMERATE as u32;
@@ -1866,6 +2120,9 @@ pub mod socket_class {
             let getter = Function::new_callback(scope, name, 0, get_address, index as f64)?;
             proto.define_accessor(scope, name, Some(*getter), None, enumerable)?;
         }
+        let getter = Function::new_callback(scope, c"_connecting", 0, get_connecting, ())?;
+        let permanent = js::class_spec::JSPROP_PERMANENT as u32;
+        proto.define_accessor(scope, c"_connecting", Some(*getter), None, permanent)?;
         Ok(())
     }
 }

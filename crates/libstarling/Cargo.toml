@@ -15,7 +15,6 @@ test = false
 debugmozjs = ['js/debugmozjs', "cpp-builtins/debugmozjs", "fetch-event/debugmozjs"]
 
 [dependencies]
-node-builtins.workspace = true
 bytes.workspace = true
 core-runtime.workspace = true
 event-listener.workspace = true
@@ -23,6 +22,7 @@ futures-lite.workspace = true
 futures-util.workspace = true
 http.workspace = true
 js.workspace = true
+node-builtins.workspace = true
 platform.workspace = true
 fetch-event.workspace = true
 url.workspace = true

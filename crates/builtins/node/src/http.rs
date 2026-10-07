@@ -17,7 +17,7 @@ mod parser;
 mod server;
 mod wire;
 
-use js::conversion::ToJSVal;
+use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
@@ -139,32 +139,35 @@ pub(crate) fn is_token(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
+/// Whether `unit` can be a character of a header value: a tab, `0x20` to `0x7e` or `0x80` to
+/// `0xff`, or, if `lenient`, any character up to `0xff` but NUL, LF and CR, as Node.js's
+/// `checkInvalidHeaderChar` checks.
+fn valid_header_unit(unit: u32, lenient: bool) -> bool {
+    if lenient {
+        unit <= 0xff && !matches!(unit, 0x00 | 0x0a | 0x0d)
+    } else {
+        unit == 0x09 || (0x20..=0x7e).contains(&unit) || (0x80..=0xff).contains(&unit)
+    }
+}
+
+/// Whether `value` contains a character that a header value can't, as [`valid_header_unit`]
+/// checks with `lenient`.
+pub(crate) fn has_invalid_header_char_with(value: &str, lenient: bool) -> bool {
+    value.chars().any(|c| !valid_header_unit(c as u32, lenient))
+}
+
 /// Whether `value` contains a character that a header value can't: one outside tab, `0x20` to
 /// `0x7e`, and `0x80` to `0xff`.
 pub(crate) fn has_invalid_header_char(value: &str) -> bool {
-    value.chars().any(|c| {
-        let c = c as u32;
-        !(c == 0x09 || (0x20..=0x7e).contains(&c) || (0x80..=0xff).contains(&c))
-    })
+    has_invalid_header_char_with(value, false)
 }
 
 /// `number` converted to a 32-bit integer, as `number | 0` does.
-fn to_int32(number: f64) -> i32 {
+pub(crate) fn to_int32(number: f64) -> i32 {
     if !number.is_finite() {
         return 0;
     }
     number.trunc().rem_euclid(4294967296.0) as u32 as i32
-}
-
-/// Whether `object[name]` is truthy.
-fn flag(
-    scope: &Scope<'_>,
-    object: Object<'_>,
-    name: &'static std::ffi::CStr,
-) -> Result<bool, ExnThrown> {
-    Ok(js::conversion::to_boolean(
-        object.get_property(scope, name)?,
-    ))
 }
 
 /// `object[key]`.
@@ -193,6 +196,15 @@ js::instance_local! {
     static WARNED_LENIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether `--insecure-http-parser` was given. Its first use emits a warning.
+fn insecure_http_parser(scope: &Scope<'_>) -> Result<bool, ExnThrown> {
+    let lenient = crate::runtime_flags::get().insecure_http_parser;
+    if lenient && !WARNED_LENIENT.replace(true) {
+        crate::process::emit_warning(scope, "Using insecure HTTP parsing", "Warning")?;
+    }
+    Ok(lenient)
+}
+
 /// Whether the HTTP parser of a server or request with the options `validation`, its
 /// `httpValidation`, and `insecure`, its `insecureHTTPParser`, is lenient, as Node.js's
 /// `calculateLenientFlags` computes it. `'strict'` is strict, `'relaxed'` and `'insecure'` are
@@ -211,11 +223,7 @@ pub(crate) fn lenient_parser(
     if !insecure.is_undefined() {
         return Ok(js::conversion::to_boolean(insecure));
     }
-    let lenient = crate::runtime_flags::get().insecure_http_parser;
-    if lenient && !WARNED_LENIENT.replace(true) {
-        crate::process::emit_warning(scope, "Using insecure HTTP parsing", "Warning")?;
-    }
-    Ok(lenient)
+    insecure_http_parser(scope)
 }
 
 /// Check the `insecureHTTPParser` option `insecure` and the `httpValidation` option
@@ -263,19 +271,120 @@ pub(crate) fn status_text(status: u16) -> Option<&'static str> {
 
 /// The header name `name`, or `ERR_INVALID_HTTP_TOKEN` if it isn't a valid token.
 fn validate_name(scope: &Scope<'_>, name: HandleValue<'_>) -> Result<String, Thrown> {
+    if name.is_string() {
+        let text: String = js::conversion::FromJSVal::from_jsval(scope, name, ())?;
+        if is_token(&text) {
+            return Ok(text);
+        }
+    }
     module::validate_header_name(scope, name, None)?;
     Ok(js::conversion::FromJSVal::from_jsval(scope, name, ())?)
 }
 
-/// Check that `value` is a valid value for the header `name`, or each element of it is.
-fn validate_value(scope: &Scope<'_>, name: &str, value: HandleValue<'_>) -> Result<(), Thrown> {
+/// Whether the header values of `message` are checked leniently, as in Node.js's
+/// `_isLenientHeaderValidation`: by the first of `message.httpValidation` and
+/// `message.req.socket.server.httpValidation` that isn't `undefined`, lenient unless it is
+/// `'strict'`, else by the first of `message.insecureHTTPParser` and
+/// `message.req.socket.server.insecureHTTPParser` that is a boolean, and else by
+/// `--insecure-http-parser`.
+pub(crate) fn lenient_headers(scope: &Scope<'_>, message: Object<'_>) -> Result<bool, ExnThrown> {
+    let mut server = message.get_property(scope, c"req")?;
+    for key in [c"socket", c"server"] {
+        server = match Object::from_value(scope, *server) {
+            Ok(object) => object.get_property(scope, key)?,
+            Err(_) => HandleValue::undefined(),
+        };
+    }
+    let server = Object::from_value(scope, *server).ok();
+    let server_option = |name| -> Result<HandleValue<'_>, ExnThrown> {
+        match server {
+            Some(server) => server.get_property(scope, name),
+            None => Ok(HandleValue::undefined()),
+        }
+    };
+    let mut validation = message.get_property(scope, c"httpValidation")?;
+    if validation.is_undefined() {
+        validation = server_option(c"httpValidation")?;
+    }
+    if !validation.is_undefined() {
+        return Ok(!crate::support::is_str(scope, validation, c"strict")?);
+    }
+    for insecure in [
+        message.get_property(scope, c"insecureHTTPParser")?,
+        server_option(c"insecureHTTPParser")?,
+    ] {
+        if insecure.is_boolean() {
+            return Ok(insecure.to_boolean());
+        }
+    }
+    insecure_http_parser(scope)
+}
+
+/// Check that `value` is a valid value for the header `name` of `message`, or each element of it
+/// is, as [`check_header_value`] checks.
+fn validate_value(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    name: &str,
+    value: HandleValue<'_>,
+) -> Result<(), Thrown> {
     if let Some(items) = crate::support::array_elements(scope, value)? {
         for item in items {
-            module::validate_header_value(scope, name.to_string(), item)?;
+            check_header_value(scope, message, name, item)?;
         }
         return Ok(());
     }
-    module::validate_header_value(scope, name.to_string(), value)
+    check_header_value(scope, message, name, value)
+}
+
+/// Check `value` for the header `name` of `message` as `validateHeaderValue` does, leniently if
+/// [`lenient_headers`] holds for `message`, which is only computed for a value that the strict
+/// check rejects. Strings are scanned in place, and numbers, whose string forms have no invalid
+/// characters, aren't converted.
+fn check_header_value(
+    scope: &Scope<'_>,
+    message: Object<'_>,
+    name: &str,
+    value: HandleValue<'_>,
+) -> Result<(), Thrown> {
+    if value.is_number() {
+        return Ok(());
+    }
+    if value.is_undefined() {
+        return module::validate_header_value(scope, name.to_string(), value);
+    }
+    let text = if value.is_string() {
+        None
+    } else {
+        Some(String::from_jsval(scope, value, ())?)
+    };
+    let invalid = |lenient: bool| -> Result<bool, ExnThrown> {
+        if let Some(text) = &text {
+            return Ok(has_invalid_header_char_with(text, lenient));
+        }
+        let string = js::JSString::from_value(scope, value)?;
+        // SAFETY: the closure makes no call into SpiderMonkey.
+        unsafe {
+            string.with_chars(scope, |chars| match chars {
+                js::string::StrChars::Latin1(chars) => chars
+                    .iter()
+                    .any(|&unit| !valid_header_unit(u32::from(unit), lenient)),
+                js::string::StrChars::TwoByte(units) => units
+                    .iter()
+                    .any(|&unit| !valid_header_unit(u32::from(unit), lenient)),
+            })
+        }
+    };
+    let invalid = invalid(false)? && (!lenient_headers(scope, message)? || invalid(true)?);
+    if invalid {
+        return Err(NodeError::new(
+            ErrorKind::TypeError,
+            "ERR_INVALID_CHAR",
+            format!("Invalid character in header content [\"{name}\"]"),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// The keys of the shared `http.globalAgent` and `https.globalAgent`.
@@ -521,9 +630,10 @@ pub(crate) fn register_https(scope: &Scope<'_>, name: &'static str) -> bool {
     )
 }
 
-/// Register `node:http` with `METHODS`, `STATUS_CODES` and `globalAgent`.
+/// Register `node:http` with `METHODS`, `STATUS_CODES`, `globalAgent`, and the classes of the
+/// globals `WebSocket`, `CloseEvent` and `MessageEvent`.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
-    let tables = || -> Result<[(&'static str, HandleValue<'_>); 3], ExnThrown> {
+    let tables = || -> Result<[(&'static str, HandleValue<'_>); 6], ExnThrown> {
         let methods: Vec<HandleValue<'_>> = METHODS
             .iter()
             .map(|method| js::JSString::from_str(scope, method)?.to_jsval_throwing(scope))
@@ -535,10 +645,20 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
             codes.set_property_by_name(scope, &key, reason)?;
         }
         let agent = global_agent(scope, false)?;
+        let web_socket =
+            js::class::class_constructor::<web_websocket::websocket::WebSocketImpl>(scope)?;
+        let close_event =
+            js::class::class_constructor::<web_websocket::close_event::CloseEventImpl>(scope)?;
+        let message_event = js::class::class_constructor::<
+            web_globals::events::message_event::MessageEventImpl,
+        >(scope)?;
         Ok([
             ("METHODS", (*methods).to_jsval_throwing(scope)?),
             ("STATUS_CODES", codes.to_jsval_throwing(scope)?),
             ("globalAgent", agent.to_jsval_throwing(scope)?),
+            ("WebSocket", web_socket.to_jsval_throwing(scope)?),
+            ("CloseEvent", close_event.to_jsval_throwing(scope)?),
+            ("MessageEvent", message_event.to_jsval_throwing(scope)?),
         ])
     };
     let Ok(tables) = tables() else {
@@ -568,6 +688,7 @@ pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Res
     incoming::IncomingState::add_to_global(scope, global);
     outgoing::OutgoingState::add_to_global(scope, global);
     server::HttpServerState::add_to_global(scope, global);
+    server::ListeningServers::add_to_global(scope, global);
     outgoing::outgoing_message_class::register(scope)?;
     outgoing::server_response_class::register(scope)?;
     incoming::incoming_message_class::register(scope)?;

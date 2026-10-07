@@ -118,6 +118,9 @@ bitflags! {
         const DATA_EMITTED = 1 << 18;
         /// Node's `kDataListening`, which has no accessor.
         const DATA_LISTENING = 1 << 19;
+        /// Whether `Readable.toWeb` added its no-op `error` listener, which Node.js records in
+        /// the `kErrorSentinelAttached` property.
+        const ERROR_SENTINEL_ATTACHED = 1 << 20;
     }
 }
 
@@ -171,14 +174,12 @@ pub(crate) struct ReadablePart {
     /// The index of the first chunk in `buffer` that wasn't read yet.
     #[no_trace]
     pub(crate) buffer_index: f64,
-    /// The buffered chunks, an array that `readableBuffer` returns, with `null` below
-    /// `buffer_index`.
-    pub(crate) buffer: Heap<js::array::Array>,
-    /// The destinations of `pipe`, an array.
-    pub(crate) pipes: Heap<js::array::Array>,
-    /// The writers a pipe waits for `drain` from: `null`, a writer, or a `Set` of them once
-    /// `MULTI_AWAIT_DRAIN` is set.
-    pub(crate) await_drain_writers: Heap<Value>,
+    /// The buffered chunks, Node's `buffer` array, with `null` below `buffer_index`.
+    pub(crate) buffer: Vec<Heap<Value>>,
+    /// The destinations of `pipe`, Node's `pipes` array.
+    pub(crate) pipes: Vec<Heap<Value>>,
+    /// The writers a pipe waits for `drain` from.
+    pub(crate) await_drain_writers: AwaitDrainWriters,
     /// The error, which is only ever a truthy value.
     pub(crate) errored: Option<Heap<Value>>,
     /// The default encoding, or `None` for `utf8`.
@@ -200,6 +201,23 @@ impl ReadablePart {
                 .flags
                 .intersects(R::DESTROYED | R::ERROR_EMITTED | R::END_EMITTED)
     }
+}
+
+/// Node's `awaitDrainWriters`.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+pub(crate) enum AwaitDrainWriters {
+    /// `null`, a writer, or another value assigned to `awaitDrainWriters`.
+    Value(Heap<Value>),
+    /// A `Set` of writers, in insertion order, which `pipe` creates once a stream has a second
+    /// destination.
+    Set(Vec<Heap<Value>>),
+}
+
+/// The rooted contents of [`AwaitDrainWriters`].
+pub(crate) enum DrainWriters<'s> {
+    Value(HandleValue<'s>),
+    Set(Vec<HandleValue<'s>>),
 }
 
 /// A write the writable part buffers: Node's `{ chunk, encoding, callback }`, with `undefined` as
@@ -396,12 +414,75 @@ impl<'s> ReadableSide<'s> {
         unsafe { part.readable.as_raw().is_boolean() && !part.readable.as_raw().to_boolean() }
     }
 
-    pub(crate) fn buffer<'r>(&self, scope: &'r Scope<'_>) -> js::Array<'r> {
-        self.get().buffer.get(scope)
+    /// The buffered chunk at `index`, or `undefined` past the end of the buffer.
+    pub(crate) fn chunk<'r>(&self, scope: &'r Scope<'_>, index: usize) -> HandleValue<'r> {
+        match self.get().buffer.get(index) {
+            Some(chunk) => chunk.get(scope),
+            None => HandleValue::undefined(),
+        }
     }
 
-    pub(crate) fn pipes<'r>(&self, scope: &'r Scope<'_>) -> js::Array<'r> {
-        self.get().pipes.get(scope)
+    /// Replace the buffered chunk at `index` with `chunk`, if the buffer reaches `index`.
+    pub(crate) fn set_chunk(&self, index: usize, chunk: HandleValue<'_>) {
+        if let Some(slot) = self.get().buffer.get(index) {
+            slot.set(chunk.get());
+        }
+    }
+
+    /// The number of entries in the buffer, including the `null`s below `buffer_index`.
+    pub(crate) fn buffer_len(&self) -> usize {
+        self.get().buffer.len()
+    }
+
+    /// The buffer as a new array, as Node's `buffer` array holds it.
+    pub(crate) fn buffer_array<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+    ) -> Result<js::Array<'r>, ExnThrown> {
+        js::Array::with_contents(scope, &rooted(scope, &self.get().buffer))
+    }
+
+    /// The destinations of `pipe`.
+    pub(crate) fn pipes<'r>(&self, scope: &'r Scope<'_>) -> Vec<HandleValue<'r>> {
+        rooted(scope, &self.get().pipes)
+    }
+
+    /// The writers a pipe waits for `drain` from.
+    pub(crate) fn await_drain_writers<'r>(&self, scope: &'r Scope<'_>) -> DrainWriters<'r> {
+        match &self.get().await_drain_writers {
+            AwaitDrainWriters::Value(value) => DrainWriters::Value(value.get(scope)),
+            AwaitDrainWriters::Set(writers) => DrainWriters::Set(rooted(scope, writers)),
+        }
+    }
+
+    /// Set the writers a pipe waits for `drain` from.
+    pub(crate) fn set_await_drain_writers(&self, writers: DrainWriters<'_>) {
+        self.get_mut().await_drain_writers = match writers {
+            DrainWriters::Value(value) => AwaitDrainWriters::Value(Heap::from(value.get())),
+            DrainWriters::Set(writers) => AwaitDrainWriters::Set(
+                writers
+                    .iter()
+                    .map(|writer| Heap::from(writer.get()))
+                    .collect(),
+            ),
+        };
+    }
+
+    /// `awaitDrainWriters` as a JS value: `null`, a writer, or a new `Set` of writers.
+    pub(crate) fn await_drain_writers_value<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+    ) -> Result<HandleValue<'r>, ExnThrown> {
+        match self.await_drain_writers(scope) {
+            DrainWriters::Value(value) => Ok(value),
+            DrainWriters::Set(writers) => {
+                let set = js::Set::new(scope)?;
+                for writer in writers {
+                    set.add(scope, writer)?;
+                }
+                set.to_jsval_throwing(scope)
+            }
+        }
     }
 
     pub(crate) fn decoder<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
@@ -431,14 +512,11 @@ impl<'s> ReadableSide<'s> {
             None => js::class::get_or_init_atom(scope, c"utf8"),
         }
     }
+}
 
-    pub(crate) fn await_drain_writers<'r>(&self, scope: &'r Scope<'_>) -> HandleValue<'r> {
-        self.get().await_drain_writers.get(scope)
-    }
-
-    pub(crate) fn set_await_drain_writers(&self, writers: HandleValue<'_>) {
-        self.get().await_drain_writers.set(writers.get());
-    }
+/// The values of `heaps`, rooted.
+fn rooted<'r>(scope: &'r Scope<'_>, heaps: &[Heap<Value>]) -> Vec<HandleValue<'r>> {
+    heaps.iter().map(|value| value.get(scope)).collect()
 }
 
 /// The writable part of a stream's state.
@@ -688,7 +766,7 @@ pub(crate) fn buffered_array<'s>(
         entry.set_property(scope, c"chunk", chunk)?;
         entry.set_property(scope, c"encoding", encoding)?;
         if callback.is_undefined() {
-            entry.set_property(scope, c"callback", crate::support::noop_function(scope)?)?;
+            entry.set_property(scope, c"callback", crate::support::nop(scope)?)?;
         } else {
             entry.set_property(scope, c"callback", callback)?;
         }
@@ -891,11 +969,11 @@ fn readable_field_get(
     };
     Ok(match ReadableField::from_payload(payload) {
         ReadableField::HighWaterMark => js::value::from_f64(side.get().high_water_mark),
-        ReadableField::Buffer => side.buffer(scope).as_value(),
+        ReadableField::Buffer => side.buffer_array(scope)?.as_value(),
         ReadableField::BufferIndex => js::value::from_f64(side.get().buffer_index),
         ReadableField::Length => js::value::from_f64(side.get().length),
-        ReadableField::Pipes => side.pipes(scope).as_value(),
-        ReadableField::AwaitDrainWriters => side.await_drain_writers(scope).get(),
+        ReadableField::Pipes => js::Array::with_contents(scope, &side.pipes(scope))?.as_value(),
+        ReadableField::AwaitDrainWriters => side.await_drain_writers_value(scope)?.get(),
         ReadableField::Errored => or_null(side.errored(scope)),
         ReadableField::DefaultEncoding => side.default_encoding(scope)?.get(),
         ReadableField::Decoder => side
@@ -906,9 +984,7 @@ fn readable_field_get(
             Some(flowing) => js::value::from_bool(flowing),
             None => js::value::null(),
         },
-        ReadableField::PipesCount => {
-            js::value::from_f64(f64::from(side.pipes(scope).length(scope)?))
-        }
+        ReadableField::PipesCount => js::value::from_f64(side.get().pipes.len() as f64),
         ReadableField::Paused => js::value::from_bool(side.get().paused == Some(true)),
         ReadableField::Readable => side.get().readable.get(scope).get(),
     })
@@ -927,17 +1003,29 @@ fn readable_field_set(
         ReadableField::HighWaterMark => side.get_mut().high_water_mark = to_number(scope, value)?,
         ReadableField::Buffer => {
             if let Some(array) = as_array(scope, value) {
-                side.get().buffer.set(array);
+                let chunks = array.to_vec(scope)?;
+                side.get_mut().buffer =
+                    chunks.iter().map(|chunk| Heap::from(chunk.get())).collect();
             }
         }
         ReadableField::BufferIndex => side.get_mut().buffer_index = to_number(scope, value)?,
         ReadableField::Length => side.get_mut().length = to_number(scope, value)?,
         ReadableField::Pipes => {
             if let Some(array) = as_array(scope, value) {
-                side.get().pipes.set(array);
+                let pipes = array.to_vec(scope)?;
+                side.get_mut().pipes = pipes.iter().map(|pipe| Heap::from(pipe.get())).collect();
             }
         }
-        ReadableField::AwaitDrainWriters => side.set_await_drain_writers(value),
+        ReadableField::AwaitDrainWriters => {
+            let set = Object::from_value(scope, *value)
+                .ok()
+                .and_then(|object| object.cast::<js::Set>().ok());
+            let writers = match set {
+                Some(set) => DrainWriters::Set(set.values_vec(scope)?),
+                None => DrainWriters::Value(value),
+            };
+            side.set_await_drain_writers(writers);
+        }
         ReadableField::Errored => side.set_errored(value),
         ReadableField::DefaultEncoding => {
             side.get_mut().default_encoding =
@@ -1065,7 +1153,7 @@ fn writable_field_get(
                 .map(|callback| callback.get(scope));
             match callback {
                 Some(callback) => callback.get(),
-                None => crate::support::noop_function(scope)?.as_value(),
+                None => crate::support::nop(scope)?.as_value(),
             }
         }
         WritableField::AfterWriteTickInfo => after_write_tick_info_object(scope, side)?,

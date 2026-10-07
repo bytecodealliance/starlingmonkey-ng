@@ -1,7 +1,7 @@
 // `node:querystring`.
 
 import qs from "node:querystring";
-import { deepEq, eq } from "./harness.mjs";
+import { deepEq, eq, throws } from "./harness.mjs";
 
 const parsed = qs.parse("foo=bar&abc=xyz&abc=123&empty=&flag&sp=a+b&enc=%E2%82%AC&bad=%zz");
 eq(Object.getPrototypeOf(parsed), null, "no prototype");
@@ -50,3 +50,18 @@ try {
   popError = error.message;
 }
 eq(popError, "popthrow", "pop getter exceptions propagate");
+eq(qs.stringify({ a: new Proxy([1, 2], {}), c: [] }), "a=1&a=2", "stringify writes a proxied array as one pair per element");
+eq(qs.unescape("%E9%ZZ+x", true), "�%ZZ x", "unescape falls back to the bytes as UTF-8");
+{
+  let calls = 0;
+  const encoded = qs.stringify({ k: [1, 2] }, null, null, { encodeURIComponent: (text) => text + calls++ });
+  eq(encoded, "k0=11&k0=22", "stringify encodes each element as it writes its pair");
+}
+
+// `unescapeBuffer` fails for a value without a string's `length` and `charCodeAt`.
+throws(() => qs.unescapeBuffer(5), "ERR_INVALID_ARG_TYPE", "unescapeBuffer of a number");
+deepEq([...qs.unescapeBuffer(["a", "b"])], [0x61, 0x2c], "unescapeBuffer reads String(text) up to text.length");
+deepEq([...qs.unescapeBuffer({ length: 17 })].slice(14), [0x5d, 0, 0], "unescapeBuffer pads with zeros");
+eq(qs.unescapeBuffer(new String("a%20b")).toString(), "a b", "unescapeBuffer of a String object");
+deepEq([qs.decode.length, qs.encode.length], [4, 4], "decode and encode lengths");
+eq(Object.keys(qs).join(), "unescapeBuffer,unescape,escape,stringify,encode,parse,decode", "key order");

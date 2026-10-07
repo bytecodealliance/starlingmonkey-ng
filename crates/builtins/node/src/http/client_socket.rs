@@ -171,7 +171,7 @@ fn had_error(scope: &Scope<'_>, socket: HandleValue<'_>) -> Result<bool, ExnThro
     let Ok(socket) = Object::from_value(scope, *socket) else {
         return Ok(false);
     };
-    if crate::http::flag(scope, socket, c"_hadError")? {
+    if crate::support::truthy(scope, socket, c"_hadError")? {
         return Ok(true);
     }
     socket.set_property(scope, c"_hadError", true)?;
@@ -328,7 +328,7 @@ fn on_socket_tick(
     })
     .flatten();
     if let Ok(socket_object) = Object::from_value(scope, *socket) {
-        let agent = crate::http::flag(scope, request, c"agent")?;
+        let agent = crate::support::truthy(scope, request, c"agent")?;
         if !js::conversion::to_boolean(error)
             && agent
             && !super::wire::socket_destroyed(scope, socket_object)?
@@ -416,12 +416,13 @@ fn fail_request(
     socket: HandleValue<'_>,
     error: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
-    let error =
-        if !js::conversion::to_boolean(error) && !crate::http::flag(scope, request, c"aborted")? {
-            conn_reset(scope, "socket hang up")?
-        } else {
-            error
-        };
+    let error = if !js::conversion::to_boolean(error)
+        && !crate::support::truthy(scope, request, c"aborted")?
+    {
+        conn_reset(scope, "socket hang up")?
+    } else {
+        error
+    };
     if js::conversion::to_boolean(error) {
         let tunnel = match Object::from_value(scope, *error) {
             Ok(error) => crate::support::is_str(
@@ -432,7 +433,7 @@ fn fail_request(
             Err(_) => false,
         };
         let forwarded = match Object::from_value(scope, *socket) {
-            Ok(socket) => crate::http::flag(scope, socket, c"_hadError")?,
+            Ok(socket) => crate::support::truthy(scope, socket, c"_hadError")?,
             Err(_) => false,
         };
         if !tunnel && !forwarded {
@@ -466,7 +467,7 @@ fn tick_on_socket(
     } else {
         Some(DEFAULT_MAX_HEADERS)
     };
-    let join_duplicates = crate::http::flag(scope, request, c"joinDuplicateHeaders")?;
+    let join_duplicates = crate::support::truthy(scope, request, c"joinDuplicateHeaders")?;
     let parser = Parser::new(Kind::Response, max_header_size, None, lenient);
     let reused = {
         let pool = parser_pool(scope)?;
@@ -516,7 +517,7 @@ fn tick_on_socket(
     }
     let agent_timeout = match Object::from_value(scope, *request.get_property(scope, c"agent")?) {
         Ok(agent) => match Object::from_value(scope, *agent.get_property(scope, c"options")?) {
-            Ok(options) => crate::http::flag(scope, options, c"timeout")?,
+            Ok(options) => crate::support::truthy(scope, options, c"timeout")?,
             Err(_) => false,
         },
         Err(_) => false,
@@ -595,10 +596,14 @@ fn socket_on_data(
     else {
         return Ok(js::value::undefined());
     };
-    {
+    let fed = {
         let mut data = handle.data_mut();
         let parser = &mut data.parser;
-        view.with_bytes(|bytes| parser.feed(bytes));
+        view.with_bytes(|bytes| parser.feed(bytes))
+    };
+    if fed.is_err() {
+        js::exception::report_out_of_memory(scope);
+        return Err(ExnThrown);
     }
     loop {
         let event = handle.data_mut().parser.next();
@@ -641,9 +646,9 @@ fn socket_on_data(
     let Some(response) = response else {
         return Ok(js::value::undefined());
     };
-    if crate::http::flag(scope, response, c"upgrade")? {
+    if crate::support::truthy(scope, response, c"upgrade")? {
         upgrade(scope, request, socket, handle, response)?;
-    } else if crate::http::flag(scope, response, c"complete")?
+    } else if crate::support::truthy(scope, response, c"complete")?
         && !informational(status_of(scope, response)?)
     {
         remove(scope, socket, c"data", socket_on_data, c"socketOnData")?;
@@ -809,7 +814,7 @@ fn on_incoming(
         return Ok(HeadAction::Body);
     }
     request.set_property(scope, c"res", response)?;
-    if crate::http::flag(scope, response, c"upgrade")? {
+    if crate::support::truthy(scope, response, c"upgrade")? {
         return Ok(HeadAction::Upgrade);
     }
     let method = request.get_property(scope, c"method")?;
@@ -844,9 +849,9 @@ fn on_incoming(
         )?;
         return Ok(HeadAction::SkipBody);
     }
-    if crate::http::flag(scope, request, c"shouldKeepAlive")?
+    if crate::support::truthy(scope, request, c"shouldKeepAlive")?
         && !keep_alive
-        && !crate::http::flag(scope, request, c"upgradeOrConnect")?
+        && !crate::support::truthy(scope, request, c"upgradeOrConnect")?
     {
         request.set_property(scope, c"shouldKeepAlive", false)?;
     }
@@ -858,7 +863,7 @@ fn on_incoming(
     crate::events::listen(scope, request, c"on", c"finish", on_finish)?;
     let on_timeout = listener(scope, response_on_timeout, c"responseOnTimeout", 0)?;
     crate::events::listen(scope, socket, c"on", c"timeout", on_timeout)?;
-    let listened = !crate::http::flag(scope, request, c"aborted")?
+    let listened = !crate::support::truthy(scope, request, c"aborted")?
         && crate::events::emit(
             scope,
             request,
@@ -889,7 +894,7 @@ fn on_body(scope: &Scope<'_>, handle: ParserHandle<'_>, body: Vec<u8>) -> Result
     let Some(response) = response else {
         return Ok(());
     };
-    if skips_pending(scope, response)? || crate::http::flag(scope, response, c"_dumped")? {
+    if skips_pending(scope, response)? || crate::support::truthy(scope, response, c"_dumped")? {
         return Ok(());
     }
     let chunk = buffer_from_vec(scope, body)?.to_jsval_throwing(scope)?;
@@ -946,7 +951,7 @@ fn socket_on_end(
     let request = http_message(scope, socket)?;
     if let Some(request) = request {
         let request_socket = request.get_property(scope, c"socket")?;
-        if !crate::http::flag(scope, request, c"res")? && !had_error(scope, request_socket)? {
+        if !crate::support::truthy(scope, request, c"res")? && !had_error(scope, request_socket)? {
             emit_error_event(scope, request, conn_reset(scope, "socket hang up")?)?;
         }
     }
@@ -975,13 +980,13 @@ fn socket_close_listener(
     mark_destroyed(scope, request)?;
     match response {
         Some(response) => {
-            if !crate::http::flag(scope, response, c"complete")? {
+            if !crate::support::truthy(scope, response, c"complete")? {
                 let error = conn_reset(scope, "aborted")?;
                 Function::call_by_name(scope, response.handle(), c"destroy", &[error])?;
             }
             close_request(scope, request)?;
-            if !crate::http::flag(scope, response, c"aborted")?
-                && crate::http::flag(scope, response, c"readable")?
+            if !crate::support::truthy(scope, response, c"aborted")?
+                && crate::support::truthy(scope, response, c"readable")?
             {
                 Function::call_by_name(scope, response.handle(), c"push", &[HandleValue::null()])?;
             }
@@ -1045,7 +1050,7 @@ fn on_drain(
     let Some(state) = super::outgoing::try_state_of(scope, message)? else {
         return Ok(js::value::undefined());
     };
-    if !crate::http::flag(scope, message, c"finished")?
+    if !crate::support::truthy(scope, message, c"finished")?
         && std::mem::take(&mut state.data_mut().need_drain)
     {
         crate::events::emit(scope, message, c"drain", &[])?;
@@ -1099,7 +1104,7 @@ fn response_on_end(
     let state = super::outgoing::state_of(scope, request)?;
     let socket = socket_of(scope, &state);
     if let Some(socket) = socket {
-        if crate::http::flag(scope, request, c"timeoutCb")? {
+        if crate::support::truthy(scope, request, c"timeoutCb")? {
             remove(
                 scope,
                 socket,
@@ -1117,7 +1122,7 @@ fn response_on_end(
         )?;
     }
     request.set_property(scope, c"_ended", true)?;
-    if !crate::http::flag(scope, request, c"shouldKeepAlive")? {
+    if !crate::support::truthy(scope, request, c"shouldKeepAlive")? {
         if let Some(socket) = socket {
             if super::wire::socket_writable(scope, socket)? {
                 let method = if crate::support::has_method(scope, socket, c"destroySoon")? {
@@ -1128,8 +1133,8 @@ fn response_on_end(
                 Function::call_by_name(scope, socket.handle(), method, js::function::EmptyArgs)?;
             }
         }
-    } else if crate::http::flag(scope, request, c"writableFinished")?
-        && !crate::http::flag(scope, response, c"aborted")?
+    } else if crate::support::truthy(scope, request, c"writableFinished")?
+        && !crate::support::truthy(scope, response, c"aborted")?
     {
         response_keep_alive(scope, request)?;
     }
@@ -1204,8 +1209,8 @@ fn request_on_finish(
 ) -> Result<Value, ExnThrown> {
     let request = crate::support::this_object(scope, &args)?;
     let destroyed = super::outgoing::state_of(scope, request)?.data().destroyed;
-    if crate::http::flag(scope, request, c"shouldKeepAlive")?
-        && crate::http::flag(scope, request, c"_ended")?
+    if crate::support::truthy(scope, request, c"shouldKeepAlive")?
+        && crate::support::truthy(scope, request, c"_ended")?
         && !destroyed
     {
         response_keep_alive(scope, request)?;
@@ -1239,7 +1244,7 @@ pub(super) fn destroy(
 /// Listen to `timeout` on the socket of `request`, now or once it has one, to emit `timeout` on
 /// the request, unless that listener was added, as Node.js's `listenSocketTimeout` does.
 fn listen_socket_timeout(scope: &Scope<'_>, request: Object<'_>) -> Result<(), ExnThrown> {
-    if crate::http::flag(scope, request, c"timeoutCb")? {
+    if crate::support::truthy(scope, request, c"timeoutCb")? {
         return Ok(());
     }
     let timeout_listener = listener(scope, emit_request_timeout, c"emitRequestTimeout", 0)?;
@@ -1275,7 +1280,7 @@ pub(super) fn set_timeout(
     msecs: HandleValue<'_>,
     callback: Option<HandleValue<'_>>,
 ) -> Result<(), Thrown> {
-    if crate::http::flag(scope, request, c"_ended")? {
+    if crate::support::truthy(scope, request, c"_ended")? {
         return Ok(());
     }
     listen_socket_timeout(scope, request)?;
@@ -1309,7 +1314,7 @@ fn set_timeout_on_socket(
 
 /// Set the timeout of `socket` to `msecs`, once it connected if it is connecting.
 fn set_socket_timeout(scope: &Scope<'_>, socket: Object<'_>, msecs: f64) -> Result<(), ExnThrown> {
-    if crate::http::flag(scope, socket, c"connecting")? {
+    if crate::support::truthy(scope, socket, c"connecting")? {
         let set = Function::new_callback(scope, c"", 0, set_timeout_on_connect, msecs)?;
         return crate::events::listen(scope, socket, c"once", c"connect", *set);
     }

@@ -47,6 +47,88 @@ const once = (emitter, event) => new Promise((resolve) => emitter.once(event, re
   throws(() => rl.question("again? ", () => {}), "ERR_USE_AFTER_CLOSE", "questions after close");
 }
 
+// A question makes its query the prompt until it is answered, `write` resumes the interface and
+// decodes Buffers, and U+2028 and U+2029 end lines.
+{
+  const input = new PassThrough();
+  const output = new PassThrough();
+  output.setEncoding("utf8");
+  const written = [];
+  output.on("data", (data) => written.push(data));
+  const rl = readline.createInterface({ input, output, prompt: "P> " });
+  let answer;
+  rl.question("Q? ", (line) => (answer = line));
+  eq(rl.getPrompt(), "Q? ", "the query is the prompt during a question");
+  rl.write("yes\n");
+  eq(answer, "yes", "write answers the question");
+  eq(rl.getPrompt(), "P> ", "answering restores the prompt");
+  const lines = [];
+  rl.on("line", (line) => lines.push(line));
+  eq(rl.pause(), rl, "pause returns the interface");
+  eq(rl.pause(), undefined, "pausing a paused interface returns undefined");
+  rl.write(Buffer.from("buf\n"));
+  eq(rl.paused, false, "write resumes the interface");
+  eq(rl.resume(), undefined, "resuming a running interface returns undefined");
+  rl.write(new Uint8Array([0xe2, 0x82]));
+  rl.write(new Uint8Array([0xac, 0x0a]));
+  rl.write("u\u2028v\u2029w\n");
+  deepEq(lines, ["buf", "€", "u", "v", "w"], "lines written to the interface");
+  throws(() => rl.write(5), "ERR_INVALID_ARG_TYPE", "write of a number");
+  throws(() => rl.question(5, () => {}), "ERR_INVALID_ARG_TYPE", "a query that isn't a string");
+  rl.close();
+  await null;
+  eq(written.join(""), "Q? ", "the query is written as the prompt");
+  throws(() => rl.pause(), "ERR_USE_AFTER_CLOSE", "pause after close");
+  throws(() => rl.resume(), "ERR_USE_AFTER_CLOSE", "resume after close");
+}
+
+// An unterminated last line is emitted as a `line` event, even with a question pending, and lines
+// after a `close()` in the same chunk are still emitted.
+{
+  const input = new PassThrough();
+  const rl = readline.createInterface({ input });
+  const events = [];
+  rl.on("line", (line) => events.push(`line ${line}`));
+  rl.question("q? ", (line) => events.push(`answer ${line}`));
+  input.end("partial");
+  await once(rl, "close");
+  deepEq(events, ["line partial"], "the last line skips the question");
+  const input2 = new PassThrough();
+  const rl2 = readline.createInterface({ input: input2 });
+  const lines = [];
+  rl2.on("line", (line) => {
+    lines.push(line);
+    rl2.close();
+  });
+  input2.write("a\nb\n");
+  deepEq(lines, ["a", "b"], "lines after close in a chunk");
+}
+
+// Options.
+{
+  const make = (options) => readline.createInterface({ input: new PassThrough(), ...options });
+  throws(() => make({ historySize: -1 }), "ERR_OUT_OF_RANGE", "a negative historySize");
+  throws(() => make({ history: 5 }), "ERR_INVALID_ARG_TYPE", "a history that isn't an array");
+  throws(() => make({ completer: 5 }), "ERR_INVALID_ARG_VALUE", "a completer that isn't a function");
+  throws(() => make({ tabSize: 0 }), "ERR_OUT_OF_RANGE", "a tabSize of 0");
+  throws(() => make({ escapeCodeTimeout: Infinity }), "ERR_INVALID_ARG_VALUE", "an infinite escapeCodeTimeout");
+  const rl = make({ historySize: 50, history: ["a"], tabSize: 4, escapeCodeTimeout: 7, crlfDelay: 300, prompt: 5 });
+  deepEq([rl.historySize, rl.history, rl.tabSize, rl.escapeCodeTimeout, rl.crlfDelay, rl.getPrompt()], [50, ["a"], 4, 7, 300, 5], "options are stored");
+  eq(make({ crlfDelay: 50 }).crlfDelay, 100, "crlfDelay is at least 100");
+}
+
+// A `\n` that starts a chunk ends no line only within `crlfDelay` of a chunk that ended with `\r`.
+{
+  const input = new PassThrough();
+  const rl = readline.createInterface({ input, crlfDelay: 100 });
+  const lines = [];
+  rl.on("line", (line) => lines.push(line));
+  input.write("a\r");
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  input.write("\nb\n");
+  deepEq(lines, ["a", "", "b"], "a late \\n ends an empty line");
+}
+
 // Async iteration.
 {
   const input = new PassThrough();

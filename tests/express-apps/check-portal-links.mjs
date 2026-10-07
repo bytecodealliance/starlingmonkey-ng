@@ -7,9 +7,9 @@
 //
 // It loads the portal's home page and each app's page, then requests every link of those pages
 // and submits every form with its fields' values, uploading a small text file for file fields.
-// Redirects are followed. A link or form works if its final response has a status below 400, and
-// for forms that create something only once, such as a registration, 409. Exits with status 1 if
-// anything doesn't work.
+// Redirects are followed. A link or form works if its final response has a status below 400, or
+// 409, which forms that create something only once, such as a registration, return when submitted
+// again. Exits with status 1 if anything doesn't work.
 
 const base = (process.argv[2] ?? 'http://127.0.0.1:3000').replace(/\/$/, '');
 

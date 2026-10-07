@@ -120,6 +120,10 @@ throws(() => zlib.createBrotliCompress({ flush: 4 }), "ERR_OUT_OF_RANGE", "Brotl
 eq(crc32("hello"), 907060870, "crc32");
 eq(crc32("world", crc32("hello ")), crc32("hello world"), "crc32 continues from a value");
 eq(crc32(Buffer.from([1, 2, 3])), 1438416925, "crc32 of a buffer");
+throws(() => crc32(new ArrayBuffer(2)), "ERR_INVALID_ARG_TYPE", "crc32 rejects an ArrayBuffer");
+const viewed = Buffer.from("view");
+const view = new DataView(viewed.buffer, viewed.byteOffset, viewed.length);
+eq(inflateSync(deflateSync(view)).toString(), "view", "conversions of a DataView");
 eq(codes.Z_DATA_ERROR, -3, "codes by name");
 eq(codes["-3"], "Z_DATA_ERROR", "codes by number");
 eq(constants.Z_BEST_COMPRESSION, 9, "constants");
@@ -273,4 +277,27 @@ eq(constants.Z_BEST_COMPRESSION, 9, "constants");
     await new Promise((resolve) => paused.on("end", resolve).end());
     eq(total, 1 << 20, `${create.name} continues once read`);
   }
+}
+
+// Argument checks and shapes that follow Node.js.
+{
+  eq(throws(() => deflateSync("a", { chunkSize: Infinity }), "ERR_OUT_OF_RANGE", "an infinite chunkSize").message.endsWith("Received Infinity"), true, "the received number is JS number text");
+  eq(throws(() => deflateSync("a", { level: 2 ** 40 }), "ERR_OUT_OF_RANGE", "a large level").message.endsWith("Received 1_099_511_627_776"), true, "a large received integer has separators");
+  throws(() => createDeflate().flush(99, () => {}), "ERR_OUT_OF_RANGE", "flush validates kind");
+  throws(() => createDeflate().flush("x", () => {}), "ERR_INVALID_ARG_TYPE", "flush rejects a non-number kind");
+  throws(() => zlib.createBrotliCompress().flush(4, () => {}), "ERR_OUT_OF_RANGE", "flush validates a Brotli kind");
+  throws(() => deflate("a", { level: 99 }, "notfn"), "ERR_OUT_OF_RANGE", "options are validated before the callback");
+  eq(throws(() => deflate(5, () => {}), "ERR_INVALID_ARG_TYPE", "invalid data").message.startsWith('The "chunk" argument'), true, "callback functions name the data chunk");
+  eq(Object.isFrozen(codes), true, "codes is frozen");
+  const proto = zlib.Deflate.prototype;
+  deepEq([proto.flush.length, proto.params.length, proto.close.length], [2, 3, 1], "method lengths");
+  const stream = createDeflate();
+  eq(stream._closed, false, "_closed before destroy");
+  stream.destroy();
+  eq(stream._closed, true, "_closed after destroy");
+  const flushed = createDeflate();
+  flushed.on("data", () => {});
+  flushed.write("a");
+  await new Promise((resolve) => flushed.flush(constants.Z_FINISH, resolve));
+  eq(flushed._outOffset, 9, "_outOffset counts the bytes pushed of the output buffer");
 }

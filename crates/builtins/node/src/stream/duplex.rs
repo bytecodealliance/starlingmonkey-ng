@@ -70,11 +70,6 @@ pub mod duplex {
     }
 }
 
-/// Whether `value` is the boolean `false`.
-fn is_false(value: HandleValue<'_>) -> bool {
-    value.is_boolean() && !value.to_boolean()
-}
-
 /// The `Duplex` constructor's body.
 pub(crate) fn init_duplex(
     scope: &Scope<'_>,
@@ -86,13 +81,13 @@ pub(crate) fn init_duplex(
     match options.and_then(|options| Object::from_value(scope, options).ok()) {
         Some(options) => {
             let allow = options.get_property(scope, c"allowHalfOpen")?;
-            stream.set_property(scope, c"allowHalfOpen", !is_false(allow))?;
-            if is_false(options.get_property(scope, c"readable")?) {
+            stream.set_property(scope, c"allowHalfOpen", !crate::support::is_false(allow))?;
+            if crate::support::is_false(options.get_property(scope, c"readable")?) {
                 let side = ReadableSide::of(scope, stream)?;
                 side.get().readable.set(js::value::from_bool(false));
                 side.set(R::ENDED | R::END_EMITTED, true);
             }
-            if is_false(options.get_property(scope, c"writable")?) {
+            if crate::support::is_false(options.get_property(scope, c"writable")?) {
                 let side = WritableSide::of(scope, stream)?;
                 side.get_mut().writable = Some(false);
                 side.set(W::ENDING | W::ENDED | W::FINISHED, true);
@@ -484,12 +479,9 @@ pub(crate) fn init_transform(
             }
         }
     }
-    let prefinish = js::class::get_or_init_shared_function(
-        scope,
-        transform_prefinish as *const () as usize,
-        |scope| js::Function::new_callback(scope, c"prefinish", 0, transform_prefinish, ()),
-    )?;
-    crate::events::listen(scope, stream, c"on", c"prefinish", *prefinish)?;
+    let prefinish =
+        crate::support::shared_named_function(scope, transform_prefinish, c"prefinish", 0)?;
+    crate::events::listen(scope, stream, c"on", c"prefinish", prefinish)?;
     Ok(())
 }
 

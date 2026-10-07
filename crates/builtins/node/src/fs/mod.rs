@@ -37,7 +37,7 @@ use js::promise::{PromiseFuture, PromiseOutcome};
 use js::{Function, Object};
 use platform::fs::{FileKind, FsError, Stat};
 
-use crate::buffer::{decode_bytes, encode_string, new_buffer, Encoding};
+use crate::buffer::{buffer_from_vec, decode_bytes, encode_string, new_buffer, Encoding};
 use crate::errors::{validate_function, validate_integer, NodeError, Thrown};
 
 pub(crate) use classes::{new_dirent, DIRENT_PROPERTIES, STATS_PROPERTIES};
@@ -397,7 +397,7 @@ impl Prepared {
 }
 
 /// `text` in `encoding`, or as a `Buffer` of its UTF-8 bytes for `None`.
-fn text_value<'s>(
+pub(crate) fn text_value<'s>(
     scope: &'s Scope<'_>,
     text: &str,
     encoding: Option<Encoding>,
@@ -420,7 +420,7 @@ fn convert<'s>(
         Output::Unit => return Ok(Vec::new()),
         Output::Bytes(bytes) => match encoding {
             Some(encoding) => decode_bytes(scope, &bytes, encoding)?.to_jsval_throwing(scope)?,
-            None => new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?,
+            None => buffer_from_vec(scope, bytes)?.to_jsval_throwing(scope)?,
         },
         Output::Count(count) => scope.root_value(js::value::from_f64(count as f64)),
         Output::Stat(None) => HandleValue::undefined(),
@@ -430,11 +430,11 @@ fn convert<'s>(
         Output::MaybeText(None) => HandleValue::undefined(),
         Output::MaybeText(Some(text)) => text_value(scope, &text, encoding)?,
         Output::Names(names) => {
-            let array = js::Array::new(scope, names.len())?;
-            for (index, name) in names.iter().enumerate() {
-                array.set_element(scope, index as u32, text_value(scope, name, encoding)?)?;
-            }
-            array.to_jsval_throwing(scope)?
+            let names = names
+                .iter()
+                .map(|name| text_value(scope, name, encoding))
+                .collect::<Result<Vec<_>, _>>()?;
+            js::Array::with_contents(scope, &names)?.to_jsval_throwing(scope)?
         }
         Output::File(file) => scope.root_value(js::value::from_f64(f64::from(insert_file(file)))),
         #[cfg(target_arch = "wasm32")]
@@ -443,12 +443,11 @@ fn convert<'s>(
             scope.root_value(js::value::from_f64(f64::from(fd)))
         }
         Output::Entries(entries) => {
-            let array = js::Array::new(scope, entries.len())?;
-            for (index, entry) in entries.iter().enumerate() {
-                let dirent = classes::dirent_value(scope, entry, encoding)?;
-                array.set_element(scope, index as u32, dirent)?;
-            }
-            array.to_jsval_throwing(scope)?
+            let dirents = entries
+                .iter()
+                .map(|entry| classes::dirent_value(scope, entry, encoding))
+                .collect::<Result<Vec<_>, _>>()?;
+            js::Array::with_contents(scope, &dirents)?.to_jsval_throwing(scope)?
         }
     };
     Ok(vec![value])
@@ -480,9 +479,7 @@ pub(crate) fn path_arg(
         if let Some(view) = js::ArrayBufferView::from_object(object) {
             view.with_bytes(|bytes| String::from_utf8_lossy(bytes).into_owned())
         } else if crate::url::is_url(scope, value)? {
-            let href = object.get_property(scope, c"href")?;
-            let href = js::JSString::from_value(scope, href)?.to_utf8(scope)?;
-            crate::url::file_url_to_path(scope, &href)?
+            crate::url::file_url_to_path(scope, object)?
         } else {
             return Err(invalid().into());
         }
@@ -549,6 +546,20 @@ pub(crate) fn flag_option(
     name: &'static std::ffi::CStr,
 ) -> Result<bool, ExnThrown> {
     Ok(option(scope, options, name)?.is_some_and(|value| js::conversion::to_boolean(value)))
+}
+
+/// `options[name]`, which must be a boolean if it isn't `undefined`, as Node's `validateBoolean`
+/// checks it, with errors naming `label`. `undefined` is `false`.
+pub(crate) fn boolean_option(
+    scope: &Scope<'_>,
+    options: Option<HandleValue<'_>>,
+    name: &'static std::ffi::CStr,
+    label: &str,
+) -> Result<bool, Thrown> {
+    match option(scope, options, name)? {
+        Some(value) => crate::errors::validate_boolean(scope, value, label),
+        None => Ok(false),
+    }
 }
 
 /// The encoding of `options`, which is the encoding's name or an object with an `encoding`
@@ -707,7 +718,10 @@ pub(crate) fn flags_arg(
         NodeError::invalid_arg_value(scope, "flags", value, "is invalid").into()
     };
     let text = match value {
-        Some(value) if value.is_number() => return numeric_flags(value.to_number() as i32),
+        Some(value) if value.is_number() => {
+            let bits = validate_integer(scope, value, "flags", -2147483648.0, 2147483647.0)?;
+            return numeric_flags(bits as i32);
+        }
         Some(value) if value.is_string() => String::from_jsval(scope, value, ())?,
         Some(value) => return Err(invalid(value)),
         None => default.to_string(),
@@ -772,20 +786,19 @@ pub(crate) fn data_arg(
         let string = js::JSString::from_value(scope, value)?;
         return Ok(encode_string(scope, string, encoding)?);
     }
-    Object::from_value(scope, *value)
+    let view = Object::from_value(scope, *value)
         .ok()
-        .and_then(js::ArrayBufferView::from_object)
-        .map(|view| view.copy_bytes(scope))
-        .transpose()?
-        .ok_or_else(|| {
-            NodeError::invalid_arg_type(
-                scope,
-                "data",
-                "of type string or an instance of Buffer, TypedArray, or DataView",
-                value,
-            )
-            .into()
-        })
+        .and_then(js::ArrayBufferView::from_object);
+    if let Some(view) = view {
+        return Ok(view.copy_bytes(scope)?);
+    }
+    Err(NodeError::invalid_arg_type(
+        scope,
+        "data",
+        "of type string or an instance of Buffer, TypedArray, or DataView",
+        value,
+    )
+    .into())
 }
 
 // ============================================================================
@@ -819,6 +832,17 @@ fn insert_handle(handle: Handle) -> i32 {
 /// allowed: on WASI, for a `std::fs` file, and natively never.
 pub(crate) fn close_blocks(fd: i32) -> bool {
     cfg!(target_arch = "wasm32") && matches!(Handle::of(fd, "close"), Ok(Handle::File(_)))
+}
+
+/// The host's descriptor of the file open as `fd`, which isn't 0, 1 or 2. `None` if `fd` isn't
+/// open, and on hosts without descriptors.
+pub(crate) fn host_fd(fd: i32) -> Option<i32> {
+    #[cfg(unix)]
+    if let Ok(Handle::File(file)) = Handle::of(fd, "spawn") {
+        return Some(std::os::fd::AsRawFd::as_raw_fd(&*file));
+    }
+    let _ = fd;
+    None
 }
 
 /// Remove `fd` from the table, or return `EBADF`. The file closes once the operations on it that
@@ -879,6 +903,22 @@ pub(crate) enum Handle {
     Stdin,
     Stdout,
     Stderr,
+}
+
+/// Standard input for reads of descriptor 0. On Unix, it reads the descriptor itself, without a
+/// buffer, so a read takes only the bytes it returns, as Node's `read(2)` does.
+#[cfg(unix)]
+fn stdin_reader() -> std::mem::ManuallyDrop<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: `ManuallyDrop` keeps the file from closing descriptor 0, which the process owns. A
+    // read of a closed descriptor fails with `EBADF`.
+    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) })
+}
+
+/// Standard input for reads of descriptor 0.
+#[cfg(not(unix))]
+fn stdin_reader() -> std::io::Stdin {
+    std::io::stdin()
 }
 
 impl Handle {
@@ -944,7 +984,7 @@ impl Handle {
                     bytes.len()
                 })
             }
-            (Handle::Stdin, _) => std::io::stdin().read(buffer),
+            (Handle::Stdin, _) => stdin_reader().read(buffer),
             _ => return Err(UvError::code("EBADF", "read")),
         };
         result.map_err(|error| UvError::new(error, "read"))
@@ -961,7 +1001,7 @@ impl Handle {
                 bytes = read;
                 bytes.len()
             }),
-            Handle::Stdin => std::io::stdin().read_to_end(&mut bytes),
+            Handle::Stdin => stdin_reader().read_to_end(&mut bytes),
             _ => return Err(UvError::code("EBADF", "read")),
         };
         result.map_err(|error| UvError::new(error, "read"))?;
@@ -1157,6 +1197,19 @@ pub(crate) fn run_callback(
     Ok(())
 }
 
+/// Start `prepared` as `function`, and once it finished, report its error as uncaught.
+fn run_reporting(scope: &Scope<'_>, function: &str, prepared: Prepared) -> Result<(), Thrown> {
+    let deliver: Deliver = Box::new(|scope, values| {
+        if let Err(ExnThrown) = values {
+            let error = js::exception::take_pending_or_undefined(scope);
+            core_runtime::event_loop::timer::rethrow_in_microtask(scope, error)?;
+        }
+        Ok(HandleValue::undefined())
+    });
+    start(scope, function, prepared, Variant::Callback, deliver)?;
+    Ok(())
+}
+
 /// The body of `fs.exists[util.promisify.custom](path)`, whose payload is unused: a promise that
 /// resolves with whether `path` exists. An invalid `path` resolves it with `false`.
 fn exists_promise(
@@ -1182,7 +1235,7 @@ fn call_op(
     let index = payload.to_number() as usize;
     let op = &ops::OPS[index / 3];
     let variant = [Variant::Sync, Variant::Callback, Variant::Promise][index % 3];
-    let mut values = crate::callback_args(&args);
+    let mut values = args.rest(0);
     let mut run = || -> Result<Value, Thrown> {
         match variant {
             Variant::Sync => {
@@ -1190,10 +1243,36 @@ fn call_op(
                 Ok(run_sync(scope, op.sync, prepared)?.get())
             }
             Variant::Callback => {
-                let callback = values.pop().unwrap_or(HandleValue::undefined());
-                validate_function(scope, callback, "cb")?;
+                // `fs.close(fd, callback)` takes the callback from its second argument, and
+                // reports a failure as uncaught when it is `undefined`.
+                let callback = if op.name == "close" {
+                    let callback = values.get(1).copied().filter(|value| !value.is_undefined());
+                    values.truncate(1);
+                    callback
+                } else {
+                    Some(values.pop().unwrap_or(HandleValue::undefined()))
+                };
+                if let Some(callback) = callback {
+                    validate_function(scope, callback, "cb")?;
+                }
+                // `exists` calls back with `false` before returning for a path that `access`
+                // rejects, as Node's `exists` catches the error of `fs.access`.
+                if let (Some(callback), "exists") = (callback, op.name) {
+                    let path = values.first().copied().unwrap_or(HandleValue::undefined());
+                    if path_arg(scope, path, "path").is_err() {
+                        js::exception::clear(scope);
+                        let args = [false];
+                        js::Function::call(scope, js::value::undefined(), callback, &args)?;
+                        return Ok(js::value::undefined());
+                    }
+                }
                 let prepared = (op.parse)(scope, &values, variant)?;
-                run_callback(scope, op.name, prepared, callback, op.name != "exists")?;
+                match callback {
+                    Some(callback) => {
+                        run_callback(scope, op.name, prepared, callback, op.name != "exists")?
+                    }
+                    None => run_reporting(scope, op.name, prepared)?,
+                }
                 Ok(js::value::undefined())
             }
             Variant::Promise => {
@@ -1463,6 +1542,7 @@ pub(crate) fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Res
     streams::StreamRequest::add_to_global(scope, global);
     watch::AbortListener::add_to_global(scope, global);
     watch::FSEvent::add_to_global(scope, global);
+    watch::IgnoreMatcher::add_to_global(scope, global);
     watch::WatchIterator::add_to_global(scope, global);
     watch::RecursiveNext::add_to_global(scope, global);
     watch::StatChange::add_to_global(scope, global);

@@ -273,12 +273,14 @@ fn prepare_stack<'s>(
     error: Object<'s>,
     stack: &str,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let sites = js::Array::new(scope, 0)?;
-    for (index, frame) in stack.lines().filter_map(Frame::parse).enumerate() {
-        let site =
-            js::class::create_instance_with::<CallSiteImpl>(scope, |_| CallSiteImpl { frame })?;
-        sites.set_element(scope, index as u32, site)?;
-    }
+    let sites = stack
+        .lines()
+        .filter_map(Frame::parse)
+        .map(|frame| {
+            js::class::create_instance_with::<CallSiteImpl>(scope, |_| CallSiteImpl { frame })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let sites = js::Array::with_contents(scope, &sites)?;
     PREPARING.set(true);
     let result = Function::call(
         scope,
@@ -305,8 +307,7 @@ fn define_stack(
 
 /// The realm's `Error` constructor.
 pub(crate) fn error_constructor<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let error = js::class::get_class_object(scope, js::class_spec::JSProtoKey::JSProto_Error)?;
-    Object::from_handle(error).ok_or(ExnThrown)
+    crate::support::class_object(scope, js::class_spec::JSProtoKey::JSProto_Error)
 }
 
 /// `Error.captureStackTrace(object[, constructorOpt])`, whose payload is `original`: call
@@ -317,7 +318,7 @@ fn capture_stack_trace(
     args: CallbackArgs<'_>,
     original: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let args = crate::callback_args(&args);
+    let args = args.rest(0);
     Function::call(scope, js::value::undefined(), original, &args)?;
     let error_ctor = error_constructor(scope)?;
     let (Some(prepare), Some(object)) = (

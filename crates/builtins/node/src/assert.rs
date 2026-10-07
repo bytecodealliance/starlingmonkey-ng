@@ -18,6 +18,7 @@ use crate::errors::{
     js_string, validate_function, validate_plain_object, ErrorKind, NodeError, Thrown,
 };
 use crate::inspect::{self, Compact, Getters, InspectOptions};
+use crate::support::{try_collect, try_filled_vec};
 
 /// `value` as `util.inspect` shows it with the current default options.
 fn show(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<String, ExnThrown> {
@@ -33,14 +34,60 @@ fn inspect_value(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<String, Ex
     options.max_array_length = f64::INFINITY;
     options.show_hidden = false;
     options.show_proxy = false;
-    options.sorted = true;
+    options.sorted = inspect::Sorted::Yes;
     options.getters = Getters::All;
     inspect::inspect(scope, value, options)
 }
 
-/// Whether `value` is an object whose `typeof` is `'object'`.
-fn is_typeof_object(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
-    Object::from_value(scope, *value).is_ok_and(|object| !object.is_callable())
+/// Node.js's `copyError`: a plain object with the prototype and own enumerable properties of the
+/// error `source`, its `message` as a read-only own property, and its own `cause`, copied in turn
+/// if it is an error. The copy has no own `stack`.
+fn copy_error<'s>(scope: &'s Scope<'_>, source: Object<'_>) -> Result<Object<'s>, ExnThrown> {
+    let _guard = crate::errors::check_stack(scope)?;
+    let target = match source.get_prototype(scope)? {
+        Some(proto) => Object::new_plain_with_proto(scope, proto.handle())?,
+        None => Object::new_plain(scope)?,
+    };
+    target.assign(scope, source)?;
+    let readonly = (js::class_spec::JSPROP_READONLY | js::class_spec::JSPROP_PERMANENT) as u32;
+    let message = source.get_property(scope, c"message")?;
+    if target.has_own_property(scope, c"message")? {
+        target.set_property(scope, c"message", message)?;
+    } else {
+        target.define_property(scope, c"message", message, readonly)?;
+    }
+    if source.has_own_property(scope, c"cause")? {
+        let mut cause = source.get_property(scope, c"cause")?;
+        if let Ok(object) = Object::from_value(scope, *cause) {
+            if inspect::is_error(scope, object)? {
+                cause = copy_error(scope, object)?.to_jsval_throwing(scope)?;
+            }
+        }
+        if target.has_own_property(scope, c"cause")? {
+            target.set_property(scope, c"cause", cause)?;
+        } else {
+            target.define_property(scope, c"cause", cause, readonly)?;
+        }
+    }
+    Ok(target)
+}
+
+/// `value` as an object if it has a `stack` property and is an `instanceof Error`, the condition
+/// under which an `AssertionError` without a message shows a [`copy_error`] of it.
+fn error_to_copy<'s>(
+    scope: &'s Scope<'_>,
+    value: HandleValue<'_>,
+) -> Result<Option<Object<'s>>, ExnThrown> {
+    match Object::from_value(scope, *value) {
+        Ok(object)
+            if !object.is_callable()
+                && object.has_property(scope, c"stack")?
+                && inspect::is_error_instance(scope, object)? =>
+        {
+            Ok(Some(object))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// The `typeof` of `value`.
@@ -66,16 +113,6 @@ fn is_regexp(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrow
     }
 }
 
-/// `regexp.exec(text) !== null`.
-fn regexp_matches(
-    scope: &Scope<'_>,
-    regexp: HandleValue<'_>,
-    text: HandleValue<'_>,
-) -> Result<bool, ExnThrown> {
-    let regexp = Object::from_value(scope, *regexp).map_err(|e| e.throw(scope))?;
-    Ok(!Function::call_by_name(scope, regexp.handle(), c"exec", &[text])?.is_null())
-}
-
 /// Whether the realm's `Error` constructor is in the prototype chain of `ctor`.
 fn derives_from_error(scope: &Scope<'_>, ctor: Object<'_>) -> Result<bool, ExnThrown> {
     let error_ctor = crate::stack_trace::error_constructor(scope)?;
@@ -87,11 +124,6 @@ fn derives_from_error(scope: &Scope<'_>, ctor: Object<'_>) -> Result<bool, ExnTh
         current = candidate.get_prototype(scope)?;
     }
     Ok(false)
-}
-
-/// The UTF-16 length of `text`.
-fn js_len(text: &str) -> usize {
-    text.encode_utf16().count()
 }
 
 // ---------------------------------------------------------------------------
@@ -137,19 +169,22 @@ impl DiffOp {
     }
 }
 
-/// Node.js's `myersDiff` of the lines `actual` and `expected`, in reverse order.
+/// Node.js's `myersDiff` of the lines `actual` and `expected`, in reverse order, or `None` if
+/// allocating its state fails. The state takes `2 * (actual.len() + expected.len()) + 1` words
+/// for each inserted or deleted line.
 pub(crate) fn myers_diff(
     actual: &[String],
     expected: &[String],
     comma: bool,
-) -> Vec<(DiffOp, String)> {
+) -> Option<Vec<(DiffOp, String)>> {
     let equal =
         |a: &str, b: &str| a == b || (comma && (format!("{a},") == b || a == format!("{b},")));
     let max = actual.len() + expected.len();
-    let mut v = vec![0isize; 2 * max + 1];
-    let mut trace = Vec::new();
+    let mut v = try_filled_vec::<isize>(max.checked_mul(2)?.checked_add(1)?)?;
+    let mut trace: Vec<Vec<isize>> = Vec::new();
     for level in 0..=max as isize {
-        trace.push(v.clone());
+        trace.try_reserve(1).ok()?;
+        trace.push(try_collect(v.iter().copied())?);
         let mut diagonal = -level;
         while diagonal <= level {
             let offset = (diagonal + max as isize) as usize;
@@ -171,12 +206,12 @@ pub(crate) fn myers_diff(
             }
             v[offset] = x;
             if x as usize >= actual.len() && y >= 0 && y as usize >= expected.len() {
-                return backtrack(&trace, actual, expected, comma);
+                return Some(backtrack(&trace, actual, expected, comma));
             }
             diagonal += 2;
         }
     }
-    Vec::new()
+    Some(Vec::new())
 }
 
 /// Node.js's `backtrack` for [`myers_diff`].
@@ -275,7 +310,8 @@ fn create_err_diff(
     custom: Option<&str>,
 ) -> Result<String, ExnThrown> {
     let mut operator = operator.to_string();
-    let objects = is_typeof_object(scope, actual) && is_typeof_object(scope, expected);
+    let objects =
+        inspect::is_typeof_object(scope, actual) && inspect::is_typeof_object(scope, expected);
     let functions = type_of(scope, actual) == "function" && type_of(scope, expected) == "function";
     if operator == "strictEqual" && (objects || functions) {
         operator = "strictEqualObject".into();
@@ -288,10 +324,11 @@ fn create_err_diff(
     let mut skipped = false;
     let simple = split_actual.len() <= 1
         && split_expected.len() <= 1
-        && (!is_typeof_object(scope, actual) || !is_typeof_object(scope, expected));
+        && (!inspect::is_typeof_object(scope, actual)
+            || !inspect::is_typeof_object(scope, expected));
     let message = if simple {
         let (a, e) = (&split_actual[0], &split_expected[0]);
-        let mut length = js_len(a) + js_len(e);
+        let mut length = inspect::js_len(a) + inspect::js_len(e);
         if actual.is_string() {
             length -= 2;
         }
@@ -304,7 +341,8 @@ fn create_err_diff(
             format!("{a} !== {e}")
         } else {
             let mut message = format!("\n+ {a}\n- {e}");
-            if actual.is_string() && expected.is_string() && length <= 80 {
+            // As in Node.js, the indicator is shown for values of every type.
+            if inspect::js_len(a) + inspect::js_len(e) <= 80 {
                 let a_units: Vec<u16> = a.encode_utf16().collect();
                 let e_units: Vec<u16> = e.encode_utf16().collect();
                 if let Some(index) =
@@ -327,8 +365,11 @@ fn create_err_diff(
             split_actual.join("\n")
         }
     } else {
-        let comma = is_typeof_object(scope, actual);
-        let diff = myers_diff(&split_actual, &split_expected, comma);
+        let comma = inspect::is_typeof_object(scope, actual);
+        let diff = myers_diff(&split_actual, &split_expected, comma).ok_or_else(|| {
+            js::exception::report_out_of_memory(scope);
+            ExnThrown
+        })?;
         let (message, diff_skipped) = print_myers_diff(&diff, &operator);
         if operator == "partialDeepStrictEqual" {
             header = "+ actual - expected".into();
@@ -371,7 +412,11 @@ fn generate_message(
             lines.truncate(47);
         }
         return Ok(if lines.len() == 1 {
-            let separator = if js_len(&lines[0]) > 5 { "\n\n" } else { " " };
+            let separator = if inspect::js_len(&lines[0]) > 5 {
+                "\n\n"
+            } else {
+                " "
+            };
             format!("{base}{separator}{}", lines[0])
         } else {
             format!("{base}\n\n{}\n", lines.join("\n"))
@@ -382,15 +427,15 @@ fn generate_message(
     let known = readable_operator(operator);
     if operator == "notDeepEqual" && result == other {
         result = format!("{}\n\n{result}", known.unwrap_or_default());
-        if js_len(&result) > 1024 {
+        if inspect::js_len(&result) > 1024 {
             result = truncate_units(&result, 1021) + "...";
         }
         return Ok(result);
     }
-    if js_len(&result) > 512 {
+    if inspect::js_len(&result) > 512 {
         result = truncate_units(&result, 509) + "...";
     }
-    if js_len(&other) > 512 {
+    if inspect::js_len(&other) > 512 {
         other = truncate_units(&other, 509) + "...";
     }
     if operator == "deepEqual" {
@@ -423,13 +468,30 @@ fn fail_with(
     operator: &str,
     generated: Option<bool>,
 ) -> Thrown {
+    match js::JSString::from_str(scope, operator) {
+        Ok(operator) => {
+            let operator = scope.root_value(operator.as_value());
+            fail_with_operator(scope, message, actual, expected, operator, generated)
+        }
+        Err(ExnThrown) => Thrown::Pending,
+    }
+}
+
+/// [`fail_with`] with an `operator` of any value.
+fn fail_with_operator(
+    scope: &Scope<'_>,
+    message: Option<HandleValue<'_>>,
+    actual: HandleValue<'_>,
+    expected: HandleValue<'_>,
+    operator: HandleValue<'_>,
+    generated: Option<bool>,
+) -> Thrown {
     let message = message.filter(|message| !message.is_undefined());
     if let Some(error) = message.filter(|message| js::exception::is_error_object(scope, *message)) {
         js::exception::throw_value(scope, error);
         return Thrown::Pending;
     }
     let build = || -> Result<HandleValue<'_>, ExnThrown> {
-        let operator = scope.root_value(js::JSString::from_str(scope, operator)?.as_value());
         let message = message.unwrap_or(HandleValue::undefined());
         let error = new_assertion_error(scope, message, actual, expected, operator, None)?;
         if let Some(generated) = generated {
@@ -555,7 +617,10 @@ fn comparison<'s>(
         let mut shown = value;
         if let Some(actual) = actual {
             let have = actual.get_property_by_id(scope, id)?;
-            if have.is_string() && is_regexp(scope, value)? && regexp_matches(scope, value, have)? {
+            if have.is_string()
+                && is_regexp(scope, value)?
+                && inspect::regexp_exec_matches(scope, value, have)?
+            {
                 shown = have;
             }
         }
@@ -644,7 +709,7 @@ fn expected_exception(
         if is_regexp(scope, expected)? {
             let text = js_string(scope, actual)?;
             let text_value = generated(scope, &text)?;
-            if regexp_matches(scope, expected, text_value)? {
+            if inspect::regexp_exec_matches(scope, expected, text_value)? {
                 return Ok(());
             }
             generated_text = format!(
@@ -652,7 +717,7 @@ fn expected_exception(
                 show(scope, expected)?,
                 show(scope, text_value)?
             );
-        } else if !is_typeof_object(scope, actual) {
+        } else if !inspect::is_typeof_object(scope, actual) {
             let text = if has_message {
                 None
             } else {
@@ -706,7 +771,9 @@ fn expected_exception(
                 let id = scope.root_id(js::id::value_to_id(scope, *key)?);
                 let have = actual_object.get_property_by_id(scope, id)?;
                 let want = expected_object.get_property_by_id(scope, id)?;
-                if have.is_string() && is_regexp(scope, want)? && regexp_matches(scope, want, have)?
+                if have.is_string()
+                    && is_regexp(scope, want)?
+                    && inspect::regexp_exec_matches(scope, want, have)?
                 {
                     continue;
                 }
@@ -833,7 +900,7 @@ fn expects_error(
         }
         let text_string = js_string(scope, text)?;
         match actual {
-            Some(actual) if is_typeof_object(scope, actual) => {
+            Some(actual) if inspect::is_typeof_object(scope, actual) => {
                 let actual = Object::from_value(scope, *actual).map_err(|e| e.throw(scope))?;
                 let actual_message = actual.get_property(scope, c"message")?;
                 if actual_message.is_string() && js_string(scope, actual_message)? == text_string {
@@ -911,7 +978,7 @@ fn has_matching_error(
     let Some(expected_object) = expected_object else {
         if is_regexp(scope, expected)? {
             let text = generated(scope, &js_string(scope, actual)?)?;
-            return Ok(regexp_matches(scope, expected, text)?);
+            return Ok(inspect::regexp_exec_matches(scope, expected, text)?);
         }
         return Err(NodeError::invalid_arg_type(
             scope,
@@ -1134,7 +1201,8 @@ fn await_rejection<'s>(
 /// `None`, without its `diff` property. Its message is `message` if that is neither `null` nor
 /// `undefined`, followed by a diff for the operators `deepStrictEqual`, `strictEqual` and
 /// `partialDeepStrictEqual`. Otherwise the message is generated from `actual`, `expected` and
-/// `operator`.
+/// `operator`, where both `actual` and `expected` are replaced by their [`copy_error`] if
+/// [`error_to_copy`] accepts both, in the message and in the error's properties.
 fn assertion_error_without_diff<'s>(
     scope: &'s Scope<'_>,
     message: HandleValue<'_>,
@@ -1152,6 +1220,7 @@ fn assertion_error_without_diff<'s>(
         operator_text.as_str(),
         "deepStrictEqual" | "strictEqual" | "partialDeepStrictEqual"
     );
+    let mut copies = None;
     let text = if !message.is_null() && !message.is_undefined() {
         let message = js_string(scope, message)?;
         if custom_diff {
@@ -1160,8 +1229,19 @@ fn assertion_error_without_diff<'s>(
             message
         }
     } else {
+        if let (Some(a), Some(b)) = (
+            error_to_copy(scope, actual)?,
+            error_to_copy(scope, expected)?,
+        ) {
+            copies = Some((
+                copy_error(scope, a)?.to_jsval_throwing(scope)?,
+                copy_error(scope, b)?.to_jsval_throwing(scope)?,
+            ));
+        }
+        let (actual, expected) = copies.unwrap_or((actual, expected));
         generate_message(scope, actual, expected, &operator_text)?
     };
+    let (actual, expected) = copies.unwrap_or((actual, expected));
     let error = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, &text)?;
     let error = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
     let proto = match proto {
@@ -1257,30 +1337,71 @@ pub mod assertion_error {
     }
 }
 
-/// `assert.fail(message)`: "Failed" as a generated message if there is none.
-fn assert_fail(scope: &Scope<'_>, message: Option<HandleValue<'_>>) -> Result<(), Thrown> {
+/// `assert.fail(actual, expected, message, operator)`. Without arguments or with a nullish one,
+/// the message is "Failed", and with one, the argument is the message. With more arguments,
+/// DEP0094 is emitted once, and a message is generated from `actual`, `expected` and `operator`
+/// unless `message` is given. `operator` is `'!='` with two arguments, and `'fail'` when it is
+/// `undefined`.
+fn assert_fail(scope: &Scope<'_>, args: &CallArgs) -> Result<(), Thrown> {
+    let count = args.argc_;
+    let arg = |index: u32| {
+        if index < count {
+            scope.root_value(args.get(index).get())
+        } else {
+            HandleValue::undefined()
+        }
+    };
     let undefined = HandleValue::undefined();
-    match message.filter(|message| !message.is_undefined() && !message.is_null()) {
-        Some(message) => Err(fail_with(
+    let actual = arg(0);
+    if count <= 1 && (actual.is_undefined() || actual.is_null()) {
+        let text = generated(scope, "Failed")?;
+        return Err(fail_with(
             scope,
-            Some(message),
+            Some(text),
+            undefined,
+            undefined,
+            "fail",
+            Some(true),
+        ));
+    }
+    if count == 1 {
+        return Err(fail_with(
+            scope,
+            Some(actual),
             undefined,
             undefined,
             "fail",
             None,
-        )),
-        None => {
-            let text = generated(scope, "Failed")?;
-            Err(fail_with(
+        ));
+    }
+    crate::process::deprecate_once(
+        scope,
+        "assert.fail() with more than one argument is deprecated. Please use \
+         assert.strictEqual() instead or only pass a message.",
+        "DEP0094",
+    )?;
+    let operator = match (count, arg(3)) {
+        (2, _) => "!=",
+        (_, operator) if operator.is_undefined() => "fail",
+        (_, operator) => {
+            return Err(fail_with_operator(
                 scope,
-                Some(text),
-                undefined,
-                undefined,
-                "fail",
-                Some(true),
+                Some(arg(2)),
+                actual,
+                arg(1),
+                operator,
+                None,
             ))
         }
-    }
+    };
+    Err(fail_with(
+        scope,
+        Some(arg(2)),
+        actual,
+        arg(1),
+        operator,
+        None,
+    ))
 }
 
 /// `assert.throws(fn, expected, message)`.
@@ -1366,7 +1487,7 @@ fn check_match(
         );
     }
     let is_string = string.is_string();
-    if is_string && regexp_matches(scope, regexp, string)? != negated {
+    if is_string && inspect::regexp_exec_matches(scope, regexp, string)? != negated {
         return Ok(());
     }
     let operator = if negated { "doesNotMatch" } else { "match" };
@@ -1542,9 +1663,17 @@ impl CallTracker {
             }
             None => 1.0,
         };
+        // Without a function, Node.js tracks `Function.prototype`, whose name is empty.
         let function = match function {
             Some(function) => function,
-            None => crate::support::noop_function(scope)?.to_jsval_throwing(scope)?,
+            None => {
+                let prototype = js::class::get_class_prototype(
+                    scope,
+                    js::class_spec::JSProtoKey::JSProto_Function,
+                )?;
+                let prototype = Object::from_handle(prototype).ok_or(ExnThrown)?;
+                prototype.to_jsval_throwing(scope)?
+            }
         };
         let name = Object::from_value(scope, *function)
             .ok()
@@ -1858,8 +1987,8 @@ pub mod module {
 
     /// <https://nodejs.org/api/assert.html#assertfailmessage>
     #[function(length = 5)]
-    pub fn fail(scope: &Scope<'_>, message: Option<HandleValue<'_>>) -> Result<(), Thrown> {
-        assert_fail(scope, message)
+    pub fn fail(scope: &Scope<'_>, args: &CallArgs) -> Result<(), ExnThrown> {
+        assert_fail(scope, args).map_err(|error| error.throw(scope))
     }
 
     /// <https://nodejs.org/api/assert.html#assertmatchstring-regexp-message>
@@ -1890,7 +2019,12 @@ pub mod module {
     }
 }
 
-#[core_runtime::jsmodule(node_args, name = "node:assert/strict", default = "ok")]
+#[core_runtime::jsmodule(
+    node_args,
+    name = "node:assert/strict",
+    default = "ok",
+    self_export = "strict"
+)]
 pub mod strict {
     use super::*;
 
@@ -2036,8 +2170,8 @@ pub mod strict {
 
     /// <https://nodejs.org/api/assert.html#assertfailmessage>
     #[function(length = 5)]
-    pub fn fail(scope: &Scope<'_>, message: Option<HandleValue<'_>>) -> Result<(), Thrown> {
-        assert_fail(scope, message)
+    pub fn fail(scope: &Scope<'_>, args: &CallArgs) -> Result<(), ExnThrown> {
+        assert_fail(scope, args).map_err(|error| error.throw(scope))
     }
 
     /// <https://nodejs.org/api/assert.html#assertmatchstring-regexp-message>
@@ -2068,17 +2202,12 @@ pub mod strict {
     }
 }
 
-/// Register `node:assert`, whose `strict` is `node:assert/strict`'s `default` export, which gets
-/// itself as its `strict` property.
+/// Register `node:assert`, whose `strict` is `node:assert/strict`'s `default` export.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let strict = || -> Result<HandleValue<'_>, ExnThrown> {
-        let strict = core_runtime::module::builtin_namespace(scope, "node:assert/strict")?
+        core_runtime::module::builtin_namespace(scope, "node:assert/strict")?
             .ok_or(ExnThrown)?
-            .get_property(scope, c"default")?;
-        if let Ok(object) = Object::from_value(scope, *strict) {
-            object.set_property(scope, c"strict", strict)?;
-        }
-        Ok(strict)
+            .get_property(scope, c"default")
     };
     let Ok(strict) = strict() else {
         return false;

@@ -73,8 +73,21 @@ impl Order {
 }
 
 js::instance_local! {
-    /// The order `setDefaultResultOrder` set.
-    static DEFAULT_ORDER: Cell<Order> = const { Cell::new(Order::Verbatim) };
+    /// The order `setDefaultResultOrder` set, if it was called.
+    static DEFAULT_ORDER: Cell<Option<Order>> = const { Cell::new(None) };
+}
+
+/// The default lookup order: the one `setDefaultResultOrder` set, or else the one
+/// `--dns-result-order` gave, or else `verbatim`.
+fn default_order() -> Order {
+    DEFAULT_ORDER.with(Cell::get).unwrap_or_else(|| {
+        let flags = crate::runtime_flags::get();
+        let name = flags.dns_result_order.as_deref();
+        Order::NAMES
+            .iter()
+            .find(|(order_name, _)| Some(*order_name) == name)
+            .map_or(Order::Verbatim, |(_, order)| *order)
+    })
 }
 
 /// The options of a lookup: the address family to keep, 0 for both, its `getaddrinfo` flags,
@@ -155,7 +168,7 @@ pub(crate) fn lookup_options(
         family: 0,
         hints: 0,
         all: false,
-        order: DEFAULT_ORDER.with(Cell::get),
+        order: default_order(),
     };
     let Some(options) = options.filter(|options| !options.is_undefined()) else {
         return Ok(parsed);
@@ -452,7 +465,7 @@ fn lookup_promise(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     let hostname = values
         .first()
         .copied()
@@ -465,7 +478,7 @@ fn lookup_promise(
 /// Set the default lookup order to the order `value` names.
 fn set_default_order(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<(), Thrown> {
     let order = validate_order(scope, value, "dnsOrder")?;
-    DEFAULT_ORDER.with(|default| default.set(order));
+    DEFAULT_ORDER.with(|default| default.set(Some(order)));
     Ok(())
 }
 
@@ -485,7 +498,7 @@ fn get_order_callback(
     _args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let name = DEFAULT_ORDER.with(Cell::get).name();
+    let name = default_order().name();
     js::JSString::from_str(scope, name)?.to_jsval_raw_throwing(scope)
 }
 
@@ -702,7 +715,7 @@ pub mod module {
 
     /// <https://nodejs.org/api/dns.html#dnsgetdefaultresultorder>
     pub fn get_default_result_order() -> &'static str {
-        DEFAULT_ORDER.with(Cell::get).name()
+        default_order().name()
     }
 }
 

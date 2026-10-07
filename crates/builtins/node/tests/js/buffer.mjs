@@ -51,6 +51,29 @@ deepEq([...Buffer.alloc(4, "ab")], [97, 98, 97, 98], "alloc with a string fill")
 deepEq([...Buffer.alloc(3, 1)], [1, 1, 1], "alloc with a number fill");
 eq(Buffer.allocUnsafe(2).length, 2, "allocUnsafe");
 throws(() => Buffer.alloc(-1), "ERR_OUT_OF_RANGE", "negative size");
+eq(kMaxLength, Number.MAX_SAFE_INTEGER, "kMaxLength is Node's");
+eq(
+  throws(() => Buffer.allocUnsafe(-1), "ERR_OUT_OF_RANGE", "allocUnsafe of a negative size").message,
+  'The value of "size" is out of range. It must be >= 0 && <= 9007199254740991. Received -1',
+  "size checks report Node's bound",
+);
+eq(
+  throws(() => Buffer.concat([Buffer.alloc(1)], 2 ** 53), "ERR_OUT_OF_RANGE", "concat beyond kMaxLength").message,
+  'The value of "length" is out of range. It must be >= 0 && <= 9007199254740991. Received 9_007_199_254_740_992',
+  "concat reports Node's bound",
+);
+for (const [create, error] of [
+  [() => Buffer.alloc(2 ** 32), "Array buffer allocation failed"],
+  [() => Buffer(2 ** 32), "Array buffer allocation failed"],
+  [() => Buffer.from({ length: 2 ** 32 }), "Array buffer allocation failed"],
+  [() => Buffer.alloc(2 ** 32, 1), "ERR_MEMORY_ALLOCATION_FAILED"],
+  [() => Buffer.allocUnsafe(2 ** 32), "ERR_MEMORY_ALLOCATION_FAILED"],
+  [() => Buffer.allocUnsafeSlow(2 ** 32), "ERR_MEMORY_ALLOCATION_FAILED"],
+  [() => Buffer.concat([Buffer.alloc(1)], 2 ** 32), "ERR_MEMORY_ALLOCATION_FAILED"],
+]) {
+  const thrown = throws(create, RangeError, `${create} beyond the allocation limit`);
+  eq(thrown.code ?? thrown.message, error, `${create} fails as Node's allocation does`);
+}
 eq(Buffer(3).length, 3, "Buffer(size) without new");
 eq(new Buffer("ab").toString(), "ab", "new Buffer(string)");
 eq(Buffer.byteLength("héllo"), 6, "byteLength");
@@ -141,6 +164,33 @@ eq(throws(() => numbers.writeBigInt64LE(1, 0), TypeError, "BigInt writes take a 
 
 eq(isUtf8(Buffer.from("é")) && !isUtf8(Buffer.from([0xff])), true, "isUtf8");
 eq(isAscii(Buffer.from("a")) && !isAscii(Buffer.from("é")), true, "isAscii");
+eq(isUtf8(new SharedArrayBuffer(1)) && isAscii(new SharedArrayBuffer(1)), true, "isUtf8 and isAscii of a SharedArrayBuffer");
+throws(() => isUtf8(new DataView(new ArrayBuffer(1))), "ERR_INVALID_ARG_TYPE", "isUtf8 rejects a DataView");
+eq(Buffer.byteLength(new SharedArrayBuffer(4)), 4, "byteLength of a SharedArrayBuffer");
+eq(Buffer.poolSize, 65536, "poolSize");
+
+// Node.js reads each element of the list twice, once to validate it and once to copy it.
+{
+  let reads = 0;
+  const list = [Buffer.from("x")];
+  Object.defineProperty(list, 1, { get: () => (reads++, Buffer.from("ab")) });
+  eq(Buffer.concat(list).toString(), "xab", "concat of a getter element");
+  eq(reads, 2, "concat reads each element twice");
+  eq(Buffer.concat([Buffer.from("ab"), Buffer.from("cd")], 3).toString(), "abc", "concat truncates");
+  eq(Buffer.concat([Buffer.from("ab")], 4).toString("hex"), "61620000", "concat zero-fills");
+}
+
+// `valueOf` and `toString` edge cases.
+eq(throws(() => Buffer.from({ valueOf: 1, length: 2 }), TypeError, "a non-function valueOf").message, "value.valueOf is not a function", "a truthy non-function valueOf is called");
+deepEq([...Buffer.from({ valueOf: 0, length: 1 })], [0], "a falsy valueOf is skipped");
+eq(Buffer.prototype.toString.call(new Uint16Array([0x6261, 0x6463]), "latin1"), "ab", "toString of a Uint16Array reads this.length bytes");
+eq(throws(() => Buffer.from("a").toString({}), "ERR_UNKNOWN_ENCODING", "an object encoding").message, "Unknown encoding: {}", "an unknown encoding is formatted with %s");
+eq(throws(() => Buffer.from("a").toString([1, 2]), "ERR_UNKNOWN_ENCODING", "an array encoding").message, "Unknown encoding: [ 1, 2 ]", "an unknown array encoding is inspected");
+throws(() => Buffer.from("hello").utf8Slice(100, 200), "ERR_OUT_OF_RANGE", "utf8Slice checks end after an out-of-range start");
+eq(Buffer.from("hello").utf8Slice(100), "", "utf8Slice from past the end");
+eq(Buffer.from("hello").latin1Slice(7, 6), "", "latin1Slice of an empty range past the end");
+deepEq([...Buffer.alloc(7).fill("abc", 1, 6)], [0, 97, 98, 99, 97, 98, 0], "fill repeats a pattern in a range");
+deepEq([Buffer.isEncoding("Utf-16LE"), Buffer.isEncoding("BASE64URL"), Buffer.isEncoding("utf8\u0100"), Buffer.isEncoding("base64url1")], [true, true, false, false], "isEncoding ignores case and rejects longer names");
 
 // Node.js assigns Buffer's methods, so they are enumerable, which libraries such as safer-buffer
 // copy with `for...in`.
@@ -173,3 +223,15 @@ eq(FileExport, globalThis.File, "File is the global's");
   eq(response.headers.get("content-type"), "text/plain", "a Blob body's content type");
   eq(await response.text(), "abcde", "a Blob body");
 }
+
+// `ERR_INVALID_ARG_TYPE` describes objects as Node's `determineSpecificType` does.
+eq(throws(() => Buffer.alloc(Object.create(null)), "ERR_INVALID_ARG_TYPE").message.endsWith("Received [Object: null prototype] {}"), true, "an object without a prototype");
+eq(throws(() => Buffer.alloc({ constructor: { name: "" } }), "ERR_INVALID_ARG_TYPE").message.endsWith("Received an instance of "), true, "a constructor with an empty name");
+eq(throws(() => Buffer.alloc({ constructor: {} }), "ERR_INVALID_ARG_TYPE").message.endsWith("Received [Object]"), true, "a constructor without a name");
+
+// `Buffer.from` views a `SharedArrayBuffer` without copying it.
+const sharedMemory = new SharedArrayBuffer(4);
+const sharedView = Buffer.from(sharedMemory, 1, 2);
+sharedView[0] = 7;
+deepEq([...new Uint8Array(sharedMemory)], [0, 7, 0, 0], "Buffer.from(sharedArrayBuffer) shares its memory");
+eq(sharedView.buffer, sharedMemory, "the Buffer's buffer is the SharedArrayBuffer");

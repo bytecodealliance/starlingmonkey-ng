@@ -16,7 +16,9 @@ use js::{Function, Object};
 
 use super::destroy::{self, error_or_destroy, error_or_destroy_with};
 use super::eos::{EosCallback, EosOptions};
-use super::state::{ReadablePart, ReadableSide, StreamState, WritableSide, R, W};
+use super::state::{
+    AwaitDrainWriters, DrainWriters, ReadablePart, ReadableSide, StreamState, WritableSide, R, W,
+};
 use crate::errors::{ErrorKind, NodeError, Thrown};
 use crate::events::{listen, listener_count};
 use crate::support::{has_method, is_str, is_true, rust_string, this_object};
@@ -135,11 +137,6 @@ fn option<'s>(
     }
 }
 
-/// Whether `value` is anything but `false`, as Node's `options.x !== false` tests it.
-fn not_false(value: HandleValue<'_>) -> bool {
-    !(value.is_boolean() && !value.to_boolean())
-}
-
 /// Give `holder`'s state a readable part for `options`: Node's `new ReadableState()`, of a
 /// `Duplex`'s readable side if `is_duplex`.
 pub(crate) fn init_readable_part(
@@ -166,11 +163,11 @@ pub(crate) fn init_readable_part(
     };
     flags.set(
         R::EMIT_CLOSE,
-        not_false(option(scope, options, c"emitClose")?),
+        !crate::support::is_false(option(scope, options, c"emitClose")?),
     );
     flags.set(
         R::AUTO_DESTROY,
-        not_false(option(scope, options, c"autoDestroy")?),
+        !crate::support::is_false(option(scope, options, c"autoDestroy")?),
     );
     let default_encoding = option(scope, options, c"defaultEncoding")?;
     let default_encoding = if default_encoding.is_null_or_undefined() {
@@ -186,8 +183,6 @@ pub(crate) fn init_readable_part(
     } else {
         (None, None)
     };
-    let buffer = js::Array::new(scope, 0)?;
-    let pipes = js::Array::new(scope, 0)?;
     holder.data_mut().readable = Some(ReadablePart {
         flags,
         flowing: None,
@@ -195,9 +190,9 @@ pub(crate) fn init_readable_part(
         high_water_mark,
         length: 0.0,
         buffer_index: 0.0,
-        buffer: Heap::from(buffer),
-        pipes: Heap::from(pipes),
-        await_drain_writers: Heap::from(js::value::null()),
+        buffer: Vec::new(),
+        pipes: Vec::new(),
+        await_drain_writers: AwaitDrainWriters::Value(Heap::from(js::value::null())),
         errored: None,
         default_encoding: default_encoding.map(|value| Heap::from(value.get())),
         decoder: decoder.map(Heap::from),
@@ -330,25 +325,29 @@ fn readable_add_chunk(
     Ok(can_push_more(side))
 }
 
-/// `awaitDrainWriters` as a `Set`, if it is one.
-fn await_drain_set<'s>(scope: &'s Scope<'_>, side: ReadableSide<'_>) -> Option<js::Set<'s>> {
-    let writers = side.await_drain_writers(scope);
-    Object::from_value(scope, *writers)
-        .ok()?
-        .cast::<js::Set>()
-        .ok()
+/// The index of the first of `values` that is `value`, compared with `===`.
+fn position(
+    scope: &Scope<'_>,
+    values: &[HandleValue<'_>],
+    value: HandleValue<'_>,
+) -> Result<Option<usize>, ExnThrown> {
+    for (index, candidate) in values.iter().enumerate() {
+        if js::comparison::strictly_equal(scope, *candidate, value)? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
 }
 
 /// Clear the writers the stream waits for `drain` from.
-fn clear_await_drain(scope: &Scope<'_>, side: ReadableSide<'_>) -> Result<(), ExnThrown> {
+fn clear_await_drain(side: ReadableSide<'_>) {
     if side.has(R::MULTI_AWAIT_DRAIN) {
-        if let Some(writers) = await_drain_set(scope, side) {
-            writers.clear(scope)?;
+        if let AwaitDrainWriters::Set(writers) = &mut side.get_mut().await_drain_writers {
+            writers.clear();
         }
     } else {
-        side.set_await_drain_writers(HandleValue::null());
+        side.set_await_drain_writers(DrainWriters::Value(HandleValue::null()));
     }
-    Ok(())
 }
 
 /// Node's `addChunk`: emit the chunk as `data` if the stream is flowing with an empty buffer, and
@@ -368,24 +367,23 @@ fn add_chunk(
             && part.length == 0.0
     };
     if emit_now {
-        clear_await_drain(scope, side)?;
+        clear_await_drain(side);
         side.set(R::DATA_EMITTED, true);
         crate::events::emit(scope, stream, c"data", &[chunk])?;
     } else {
         let added = added_length(scope, chunk, side.has(R::OBJECT_MODE))?;
-        side.get_mut().length += added;
-        let buffer = side.buffer(scope);
-        if add_to_front {
-            let index = side.get().buffer_index;
-            if index > 0.0 {
-                side.get_mut().buffer_index = index - 1.0;
-                buffer.set_element(scope, (index - 1.0) as u32, chunk)?;
-            } else {
-                buffer.unshift(scope, chunk)?;
-            }
+        let mut part = side.get_mut();
+        part.length += added;
+        let index = part.buffer_index as usize;
+        if add_to_front && index > 0 && index <= part.buffer.len() {
+            part.buffer_index = (index - 1) as f64;
+            part.buffer[index - 1].set(chunk.get());
+        } else if add_to_front {
+            part.buffer.insert(0, Heap::from(chunk.get()));
         } else {
-            buffer.push(scope, chunk)?;
+            part.buffer.push(Heap::from(chunk.get()));
         }
+        drop(part);
         if side.has(R::NEED_READABLE) {
             emit_readable(scope, stream, side)?;
         }
@@ -406,7 +404,7 @@ fn on_eof_chunk(
         let chunk =
             Function::call_by_name(scope, decoder.handle(), c"end", js::function::EmptyArgs)?;
         if !chunk.is_null_or_undefined() && chunk_length(scope, chunk)? > 0.0 {
-            side.buffer(scope).push(scope, chunk)?;
+            side.get_mut().buffer.push(Heap::from(chunk.get()));
             let added = added_length(scope, chunk, side.has(R::OBJECT_MODE))?;
             side.get_mut().length += added;
         }
@@ -445,7 +443,7 @@ fn emit_readable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     emit_readable_now(scope, stream, side)?;
     Ok(js::value::undefined())
@@ -504,7 +502,7 @@ fn maybe_read_more_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     let zero = zero(scope);
     loop {
@@ -546,9 +544,8 @@ fn how_much_to_read(scope: &Scope<'_>, n: f64, side: ReadableSide<'_>) -> Result
     }
     if n.is_nan() {
         if flowing && length > 0.0 {
-            let index = side.get().buffer_index as u32;
-            let first = side.buffer(scope).get_element(scope, index)?;
-            return chunk_length(scope, first);
+            let index = side.get().buffer_index as usize;
+            return chunk_length(scope, side.chunk(scope, index));
         }
         return Ok(length);
     }
@@ -680,7 +677,7 @@ pub(crate) fn read<'s>(
         n = 0.0;
     } else {
         side.get_mut().length -= n;
-        clear_await_drain(scope, side)?;
+        clear_await_drain(side);
     }
     if side.length() == 0.0 {
         if !side.has(R::ENDED) {
@@ -708,7 +705,7 @@ fn from_list<'s>(
         let part = side.get();
         (
             part.length,
-            part.buffer_index as u32,
+            part.buffer_index as usize,
             part.flags.contains(R::OBJECT_MODE),
             part.decoder.is_some(),
         )
@@ -716,56 +713,55 @@ fn from_list<'s>(
     if total == 0.0 {
         return Ok(HandleValue::null());
     }
-    let buffer = side.buffer(scope);
-    let len = buffer.length(scope)?;
-    let take = |index: &mut u32| -> Result<HandleValue<'s>, ExnThrown> {
-        let value = buffer.get_element(scope, *index)?;
-        buffer.set_element(scope, *index, js::value::null())?;
+    let len = side.buffer_len();
+    let take = |index: &mut usize| -> HandleValue<'s> {
+        let value = side.chunk(scope, *index);
+        side.set_chunk(*index, HandleValue::null());
         *index += 1;
-        Ok(value)
+        value
     };
     let ret;
     if object_mode {
-        ret = take(&mut index)?;
+        ret = take(&mut index);
     } else if n.is_nan() || n >= total {
         if decoding {
             let mut text = js::JSString::empty(scope);
             while index < len {
-                let part = js::JSString::from_value(scope, take(&mut index)?)?;
+                let part = js::JSString::from_value(scope, take(&mut index))?;
                 text = text.concat(scope, part)?;
             }
             ret = text.to_jsval_throwing(scope)?;
-        } else if len - index == 1 {
-            ret = take(&mut index)?;
+        } else if len.saturating_sub(index) == 1 {
+            ret = take(&mut index);
         } else {
             let mut parts = Vec::new();
             while index < len {
-                parts.push(take(&mut index)?);
+                parts.push(take(&mut index));
             }
             ret = concat_buffers(scope, &parts)?;
         }
     } else {
-        let first = buffer.get_element(scope, index)?;
+        let first = side.chunk(scope, index);
         let first_length = chunk_length(scope, first)?;
         if n < first_length {
             ret = slice(scope, first, 0.0, Some(n))?;
             let rest = slice(scope, first, n, None)?;
-            buffer.set_element(scope, index, rest)?;
+            side.set_chunk(index, rest);
         } else if n == first_length {
-            ret = take(&mut index)?;
+            ret = take(&mut index);
         } else {
             let mut remaining = n;
             let mut parts = Vec::new();
             while index < len && remaining > 0.0 {
-                let data = buffer.get_element(scope, index)?;
+                let data = side.chunk(scope, index);
                 let data_length = chunk_length(scope, data)?;
                 if remaining >= data_length {
-                    parts.push(take(&mut index)?);
+                    parts.push(take(&mut index));
                     remaining -= data_length;
                 } else {
                     parts.push(slice(scope, data, 0.0, Some(remaining))?);
                     let rest = slice(scope, data, remaining, None)?;
-                    buffer.set_element(scope, index, rest)?;
+                    side.set_chunk(index, rest);
                     remaining = 0.0;
                 }
             }
@@ -780,14 +776,16 @@ fn from_list<'s>(
             }
         }
     }
+    let mut part = side.get_mut();
     if index == len {
-        buffer.set_length(scope, 0)?;
-        side.get_mut().buffer_index = 0.0;
+        part.buffer.clear();
+        part.buffer_index = 0.0;
     } else if index > 1024 {
-        buffer.remove(scope, 0, index)?;
-        side.get_mut().buffer_index = 0.0;
+        let taken = index.min(part.buffer.len());
+        part.buffer.drain(..taken);
+        part.buffer_index = 0.0;
     } else {
-        side.get_mut().buffer_index = f64::from(index);
+        part.buffer_index = index as f64;
     }
     Ok(ret)
 }
@@ -842,7 +840,7 @@ fn end_readable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     let emit = {
         let part = side.get();
@@ -883,7 +881,7 @@ fn end_writable_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let writable = js::conversion::to_boolean(stream.get_property(scope, c"writable")?)
         && !js::conversion::to_boolean(stream.get_property(scope, c"writableEnded")?)
         && !js::conversion::to_boolean(stream.get_property(scope, c"destroyed")?);
@@ -926,7 +924,7 @@ fn resume_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     let zero = zero(scope);
     if !side.has(R::READING) {
@@ -958,7 +956,7 @@ fn update_readable_listening(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = ReadableSide::of(scope, stream)?;
     let readable = js::class::get_or_init_atom(scope, c"readable")?;
     let listening = listener_count(scope, stream, readable)? > 0.0;
@@ -987,7 +985,7 @@ fn read_zero_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     Function::call_by_name(scope, stream.handle(), c"read", &[zero(scope)])?;
     Ok(js::value::undefined())
 }
@@ -1058,25 +1056,28 @@ pub(crate) fn set_encoding<'s>(
         part.encoding = js::conversion::to_boolean(decoder_encoding)
             .then(|| Heap::from(decoder_encoding.get()));
     }
-    let buffer = side.buffer(scope);
-    let len = buffer.length(scope)?;
     let mut content = js::JSString::empty(scope);
-    for index in side.get().buffer_index as u32..len {
-        let data = buffer.get_element(scope, index)?;
+    let mut index = side.get().buffer_index as usize;
+    while index < side.buffer_len() {
+        let data = side.chunk(scope, index);
         let written = Function::call_by_name(scope, decoder.handle(), c"write", &[data])?;
         content = content.concat(scope, js::JSString::from_value(scope, written)?)?;
+        index += 1;
     }
     if side.has(R::ENDED) {
         let rest =
             Function::call_by_name(scope, decoder.handle(), c"end", js::function::EmptyArgs)?;
         content = content.concat(scope, js::JSString::from_value(scope, rest)?)?;
     }
-    buffer.set_length(scope, 0)?;
-    side.get_mut().buffer_index = 0.0;
+    let content_value = content.to_jsval_throwing(scope)?;
+    let mut part = side.get_mut();
+    part.buffer.clear();
+    part.buffer_index = 0.0;
     if !content.is_empty() {
-        buffer.push(scope, content.to_jsval_throwing(scope)?)?;
+        part.buffer.push(Heap::from(content_value.get()));
     }
-    side.get_mut().length = content.len() as f64;
+    part.length = content.len() as f64;
+    drop(part);
     Ok(stream)
 }
 
@@ -1127,17 +1128,16 @@ pub(crate) fn pipe<'s>(
     let side = ReadableSide::of(scope, src)?;
     let dest_object = Object::from_value(scope, dest)
         .map_err(|_| js::error::TypeError("dest must be a stream".into()).throw(scope))?;
-    let pipes = side.pipes(scope);
-    if pipes.length(scope)? == 1 && !side.has(R::MULTI_AWAIT_DRAIN) {
+    if side.get().pipes.len() == 1 && !side.has(R::MULTI_AWAIT_DRAIN) {
         side.set(R::MULTI_AWAIT_DRAIN, true);
-        let existing = side.await_drain_writers(scope);
-        let set = js::Set::new(scope)?;
-        if js::conversion::to_boolean(existing) {
-            set.add(scope, existing)?;
-        }
-        side.set_await_drain_writers(set.to_jsval_throwing(scope)?);
+        let writers = match side.await_drain_writers(scope) {
+            DrainWriters::Value(writer) if js::conversion::to_boolean(writer) => vec![writer],
+            DrainWriters::Value(_) => Vec::new(),
+            DrainWriters::Set(writers) => writers,
+        };
+        side.set_await_drain_writers(DrainWriters::Set(writers));
     }
-    pipes.push(scope, dest)?;
+    side.get_mut().pipes.push(Heap::from(dest.get()));
 
     let state = PipeState::new(scope, src, dest_object)?;
     let end_option = options
@@ -1240,15 +1240,15 @@ fn pipe_pause(scope: &Scope<'_>, state: PipeState<'_>) -> Result<(), ExnThrown> 
     if !cleaned_up {
         let side = ReadableSide::of(scope, src)?;
         let pipes = side.pipes(scope);
-        let count = pipes.length(scope)?;
-        if count == 1
-            && js::comparison::strictly_equal(scope, pipes.get_element(scope, 0)?, dest_value)?
-        {
-            side.set_await_drain_writers(dest_value);
+        if pipes.len() == 1 && js::comparison::strictly_equal(scope, pipes[0], dest_value)? {
+            side.set_await_drain_writers(DrainWriters::Value(dest_value));
             side.set(R::MULTI_AWAIT_DRAIN, false);
-        } else if count > 1 && pipes.index_of(scope, dest_value)?.is_some() {
-            if let Some(writers) = await_drain_set(scope, side) {
-                writers.add(scope, dest_value)?;
+        } else if pipes.len() > 1 && position(scope, &pipes, dest_value)?.is_some() {
+            if let DrainWriters::Set(mut writers) = side.await_drain_writers(scope) {
+                if position(scope, &writers, dest_value)?.is_none() {
+                    writers.push(dest_value);
+                    side.set_await_drain_writers(DrainWriters::Set(writers));
+                }
             }
         }
         Function::call_by_name(scope, src.handle(), c"pause", js::function::EmptyArgs)?;
@@ -1274,21 +1274,24 @@ fn pipe_ondrain(
     };
     let dest = dest.to_jsval_throwing(scope)?;
     let side = ReadableSide::of(scope, src)?;
-    let writers = side.await_drain_writers(scope);
-    if js::comparison::strictly_equal(scope, writers, dest)? {
-        side.set_await_drain_writers(HandleValue::null());
-    } else if side.has(R::MULTI_AWAIT_DRAIN) {
-        if let Some(writers) = await_drain_set(scope, side) {
-            writers.delete(scope, dest)?;
+    match side.await_drain_writers(scope) {
+        DrainWriters::Value(writer) => {
+            if js::comparison::strictly_equal(scope, writer, dest)? {
+                side.set_await_drain_writers(DrainWriters::Value(HandleValue::null()));
+            }
+        }
+        DrainWriters::Set(mut writers) => {
+            if side.has(R::MULTI_AWAIT_DRAIN) {
+                if let Some(index) = position(scope, &writers, dest)? {
+                    writers.remove(index);
+                    side.set_await_drain_writers(DrainWriters::Set(writers));
+                }
+            }
         }
     }
-    let writers = side.await_drain_writers(scope);
-    let empty = if !writers.is_object() {
-        true
-    } else if side.has(R::MULTI_AWAIT_DRAIN) {
-        await_drain_set(scope, side).is_some_and(|set| set.size(scope) == 0)
-    } else {
-        false
+    let empty = match side.await_drain_writers(scope) {
+        DrainWriters::Value(writer) => !js::conversion::to_boolean(writer),
+        DrainWriters::Set(writers) => writers.is_empty(),
     };
     if empty && side.has(R::DATA_LISTENING) {
         Function::call_by_name(scope, src.handle(), c"resume", js::function::EmptyArgs)?;
@@ -1387,7 +1390,11 @@ fn pipe_cleanup(scope: &Scope<'_>, state: PipeState<'_>) -> Result<(), ExnThrown
         return Ok(());
     };
     let side = ReadableSide::of(scope, src)?;
-    if js::conversion::to_boolean(side.await_drain_writers(scope)) {
+    let awaiting = match side.await_drain_writers(scope) {
+        DrainWriters::Value(writer) => js::conversion::to_boolean(writer),
+        DrainWriters::Set(_) => true,
+    };
+    if awaiting {
         let needs = match super::util::sides(scope, dest)?.writable {
             None => true,
             Some(writable) => writable.need_drain(scope)?,
@@ -1477,27 +1484,32 @@ pub(crate) fn unpipe<'s>(
 ) -> Result<Object<'s>, ExnThrown> {
     let side = ReadableSide::of(scope, stream)?;
     let pipes = side.pipes(scope);
-    if pipes.length(scope)? == 0 {
+    if pipes.is_empty() {
         return Ok(stream);
     }
     let stream_value = stream.to_jsval_throwing(scope)?;
     let dest = dest.filter(|dest| js::conversion::to_boolean(*dest));
     let Some(dest) = dest else {
-        let dests = pipes.to_vec(scope)?;
-        side.get().pipes.set(js::Array::new(scope, 0)?);
+        side.get_mut().pipes.clear();
         Function::call_by_name(scope, stream.handle(), c"pause", js::function::EmptyArgs)?;
-        for dest in dests {
+        for dest in pipes {
             if let Ok(dest) = Object::from_value(scope, dest) {
                 crate::events::emit(scope, dest, c"unpipe", &[stream_value, unpipe_info(scope)?])?;
             }
         }
         return Ok(stream);
     };
-    let Some(index) = pipes.index_of(scope, dest)? else {
+    let Some(index) = position(scope, &pipes, dest)? else {
         return Ok(stream);
     };
-    pipes.remove(scope, index, 1)?;
-    if pipes.length(scope)? == 0 {
+    let remaining = {
+        let mut part = side.get_mut();
+        if index < part.pipes.len() {
+            part.pipes.remove(index);
+        }
+        part.pipes.len()
+    };
+    if remaining == 0 {
         Function::call_by_name(scope, stream.handle(), c"pause", js::function::EmptyArgs)?;
     }
     if let Ok(dest) = Object::from_value(scope, dest) {
@@ -1525,6 +1537,11 @@ pub(crate) struct IteratorState {
     listener: Option<Heap<js::object::Object>>,
     /// The promise of the last `next()` call.
     pending: Option<Heap<js::promise::Promise>>,
+    /// The promise of the step that awaits a chunk, which [`iterator_yield`] or
+    /// [`iterator_reject`] settles.
+    yielding: Option<Heap<js::promise::Promise>>,
+    /// The reactions to the chunk a step awaits, created on first use.
+    on_chunk: Option<(Heap<js::object::Object>, Heap<js::object::Object>)>,
     #[no_trace]
     destroy_on_return: bool,
     #[no_trace]
@@ -1586,7 +1603,9 @@ pub(crate) fn async_iterator<'s>(
         wrap_static(scope, stream, Some(wrap_options))?
     };
     let destroy_on_return = match options {
-        Some(options) => not_false(options.get_property(scope, c"destroyOnReturn")?),
+        Some(options) => {
+            !crate::support::is_false(options.get_property(scope, c"destroyOnReturn")?)
+        }
         None => true,
     };
     let state =
@@ -1599,6 +1618,8 @@ pub(crate) fn async_iterator<'s>(
             cleanup: None,
             listener: None,
             pending: None,
+            yielding: None,
+            on_chunk: None,
             destroy_on_return,
             done: false,
             started: false,
@@ -1750,9 +1771,22 @@ fn iterator_step(
     };
     if !chunk.is_null() {
         let awaited = js::Promise::call_original_resolve(scope, chunk)?;
-        let fulfilled = Function::new_callback(scope, c"", 1, iterator_yield, promise)?;
-        let rejected = Function::new_callback(scope, c"", 1, iterator_reject, promise)?;
-        awaited.then(scope, Some(*fulfilled), Some(*rejected))?;
+        let on_chunk = state
+            .data()
+            .on_chunk
+            .as_ref()
+            .map(|(fulfilled, rejected)| (fulfilled.get(scope), rejected.get(scope)));
+        let (fulfilled, rejected) = match on_chunk {
+            Some(reactions) => reactions,
+            None => {
+                let fulfilled = *Function::new_callback(scope, c"", 1, iterator_yield, state)?;
+                let rejected = *Function::new_callback(scope, c"", 1, iterator_reject, state)?;
+                state.data_mut().on_chunk = Some((Heap::from(fulfilled), Heap::from(rejected)));
+                (fulfilled, rejected)
+            }
+        };
+        state.data_mut().yielding = Some(Heap::from(promise));
+        awaited.add_reactions(scope, Some(fulfilled), Some(rejected))?;
         return Ok(());
     }
     let error = state.data().error.get(scope);
@@ -1769,25 +1803,34 @@ fn iterator_step(
     Ok(())
 }
 
-/// Fulfill the promise that is the payload with `{ value, done: false }`.
+/// Fulfill the promise of the step that awaits a chunk with `{ value, done: false }`. The payload
+/// is the [`IteratorState`].
 fn iterator_yield(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let promise = cast_payload::<js::Promise>(scope, payload);
-    let result = js::iteration::create_iter_result(scope, args.get(0), false)?;
-    promise.resolve(scope, result)?;
+    let state = cast_payload::<IteratorState>(scope, payload);
+    let promise = state.data_mut().yielding.take_rooted(scope);
+    if let Some(promise) = promise {
+        let result = js::iteration::create_iter_result(scope, args.get(0), false)?;
+        promise.resolve(scope, result)?;
+    }
     Ok(js::value::undefined())
 }
 
-/// Reject the promise that is the payload with the argument.
+/// Reject the promise of the step that awaits a chunk with the argument. The payload is the
+/// [`IteratorState`].
 fn iterator_reject(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    cast_payload::<js::Promise>(scope, payload).reject(scope, args.get(0))?;
+    let state = cast_payload::<IteratorState>(scope, payload);
+    let promise = state.data_mut().yielding.take_rooted(scope);
+    if let Some(promise) = promise {
+        promise.reject(scope, args.get(0))?;
+    }
     Ok(js::value::undefined())
 }
 
@@ -2419,7 +2462,7 @@ pub(crate) fn init_new_readable<'w>(
         }
         None => init_readable_with(scope, stream, options, false, Some(properties))?,
     }
-    crate::events::init_new_emitter(scope, properties)?;
+    crate::events::init_new_emitter(scope, stream, properties)?;
     if properties.get(scope, c"_construct")?.is_null_or_undefined() {
         return Ok(());
     }
@@ -2492,7 +2535,7 @@ fn on_constructed(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let Some(state) = super::state::try_state(scope, stream)? else {
         return Ok(js::value::undefined());
     };
@@ -2512,18 +2555,16 @@ fn on_constructed(
 pub(crate) fn accessor(
     scope: &Scope<'_>,
     proto: Object<'_>,
-    name: &CStr,
+    name: &'static CStr,
     getter: Callback,
     setter: Option<Callback>,
 ) -> Result<(), ExnThrown> {
     let shared = |body: Callback, nargs: u32| {
-        js::class::get_or_init_shared_function(scope, body as usize, |scope| {
-            Function::new_callback(scope, name, nargs, body, ())
-        })
+        crate::support::shared_named_function(scope, body, name, nargs)
     };
     let get = shared(getter, 0)?;
     let set = setter.map(|setter| shared(setter, 1)).transpose()?;
-    proto.define_accessor_by_name(scope, name, Some(*get), set.map(|set| *set), 0)
+    proto.define_accessor_by_name(scope, name, Some(get), set, 0)
 }
 
 /// The readable part of the state of an accessor's `this`, if it has one.
@@ -2567,7 +2608,7 @@ fn get_readable_buffer(
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     Ok(match this_side(scope, &args)? {
-        Some(side) => side.buffer(scope).as_value(),
+        Some(side) => side.buffer_array(scope)?.as_value(),
         None => js::value::undefined(),
     })
 }
@@ -2837,12 +2878,7 @@ fn async_dispose_start<'s>(
         EosCallback::Native(async_dispose_settle, payload),
     )
     .map_err(|error| error.throw(scope))?;
-    let fulfilled = js::class::get_or_init_shared_function(
-        scope,
-        return_undefined as *const () as usize,
-        |scope| Function::new_callback(scope, c"", 0, return_undefined, ()),
-    )?;
-    closed.then(scope, Some(*fulfilled), None)
+    closed.then(scope, Some(crate::support::nop(scope)?), None)
 }
 
 /// The `finished` callback of [`async_dispose`], whose payload is a [`DisposeState`].
@@ -2875,14 +2911,6 @@ fn async_dispose_settle(
     } else {
         promise.resolve(scope, HandleValue::null())?;
     }
-    Ok(js::value::undefined())
-}
-
-fn return_undefined(
-    _scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    _payload: HandleValue,
-) -> Result<Value, ExnThrown> {
     Ok(js::value::undefined())
 }
 

@@ -28,6 +28,12 @@ eq(base64.end(Buffer.from("d")), "ZA==", "end pads the rest");
 eq(new StringDecoder("hex").write(Buffer.from([1, 255])), "01ff", "hex");
 throws(() => new StringDecoder("nope"), "ERR_UNKNOWN_ENCODING", "unknown encoding");
 throws(() => new StringDecoder({ toString() { return "hex"; } }), "ERR_UNKNOWN_ENCODING", "a non-string encoding");
+eq(throws(() => new StringDecoder({}), "ERR_UNKNOWN_ENCODING", "an object encoding").message, "Unknown encoding: {}", "an unknown encoding is formatted with %s");
+{
+  const decoder = new StringDecoder("utf16le");
+  eq(decoder.write(Buffer.from([0x61, 0x00, 0x3d])), "a", "UTF-16 holds back an odd byte");
+  eq(decoder.write(Buffer.from([0xd8, 0x00, 0xde, 0x62, 0x00])), "😀b", "UTF-16 completes a surrogate pair across chunks");
+}
 
 // Constructors that call `StringDecoder` on themselves, as iconv-lite's do.
 function Wrapper(encoding) {

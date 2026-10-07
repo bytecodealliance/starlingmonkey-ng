@@ -2,7 +2,7 @@
 
 //! `fs.ReadStream` and `fs.WriteStream`, following Node.js v24's `lib/internal/fs/streams.js`.
 
-use js::conversion::ToJSVal;
+use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::{cast_payload, CallbackArgs, EmptyArgs};
 use js::gc::handle::{Heap, OptionHeapExt};
@@ -17,13 +17,15 @@ use crate::errors::{validate_integer, NodeError, Thrown};
 use crate::stream::state::{StreamState, StreamStateImpl};
 use crate::support::Props;
 
-/// The payload of the `open` and `write` callbacks and of the `close` listener on a stream's
-/// `FileHandle`: the stream, and the callback of its `_construct` or `_write`, or its `close`
-/// method.
+/// The payload of the `open` and `write` callbacks, of the `close` listener on a stream's
+/// `FileHandle` and of the `emit` that `_construct` installs for a replaced `open` method: the
+/// stream, the callback of its `_construct` or `_write` or its `close` method, and for the
+/// installed `emit`, the stream's previous `emit`.
 #[core_runtime::jsclass(hidden)]
 pub(super) struct StreamRequest {
     stream: Heap<js::object::Object>,
     callback: Heap<Value>,
+    emit: Heap<Value>,
 }
 
 #[core_runtime::jsmethods]
@@ -38,6 +40,7 @@ fn stream_request<'s>(
     js::class::create_instance_with::<StreamRequestImpl>(scope, |_| StreamRequestImpl {
         stream: Heap::from(stream),
         callback: Heap::from(callback.get()),
+        emit: Heap::from(js::value::undefined()),
     })
 }
 
@@ -84,8 +87,9 @@ fn base_options<'s>(
 }
 
 /// The state of an `fs.ReadStream` or an `fs.WriteStream`: the state of the stream, the
-/// `FileHandle` it reads or writes, which the stream closes, and whether a read or write is in
-/// progress.
+/// `FileHandle` it reads or writes, which the stream closes, whether a read or write is in
+/// progress, and the values Node.js keeps in the stream's own properties, which accessors on the
+/// prototypes read and assign (see [`Field`]).
 #[core_runtime::jsclass(hidden, extends = StreamState)]
 pub(crate) struct FileStreamState {
     parent: StreamStateImpl,
@@ -94,6 +98,51 @@ pub(crate) struct FileStreamState {
     performing_io: bool,
     /// The `_destroy` that waits for the read or write in progress to finish.
     pending_close: Option<Heap<CloseRequestImpl>>,
+    fd: Heap<Value>,
+    path: Heap<Value>,
+    flags: Heap<Value>,
+    mode: Heap<Value>,
+    start: Heap<Value>,
+    pos: Heap<Value>,
+    end: Heap<Value>,
+    /// `bytesRead` of a `ReadStream`, and `bytesWritten` of a `WriteStream`.
+    transferred: Heap<Value>,
+}
+
+/// A value of [`FileStreamState`] that Node.js keeps in an own property of a file stream.
+#[derive(Clone, Copy)]
+enum Field {
+    /// The descriptor: a number once the file is open, and `null` before and after.
+    Fd,
+    /// The path the stream opens, or `undefined` for a stream of a descriptor.
+    Path,
+    /// The flags the file is opened with.
+    Flags,
+    /// The mode the file is opened with.
+    Mode,
+    /// The `start` option.
+    Start,
+    /// The position of the next read or write, or `undefined` for the file's position.
+    Pos,
+    /// The position of the last byte a `ReadStream` reads.
+    End,
+    /// The count of bytes read or written.
+    Transferred,
+}
+
+impl FileStreamStateImpl {
+    fn field(&self, field: Field) -> &Heap<Value> {
+        match field {
+            Field::Fd => &self.fd,
+            Field::Path => &self.path,
+            Field::Flags => &self.flags,
+            Field::Mode => &self.mode,
+            Field::Start => &self.start,
+            Field::Pos => &self.pos,
+            Field::End => &self.end,
+            Field::Transferred => &self.transferred,
+        }
+    }
 }
 
 #[core_runtime::jsmethods]
@@ -115,22 +164,155 @@ fn handle_closed(
     Ok(js::value::undefined())
 }
 
-/// Set the fields both stream classes share on `stream` from `path` and the `options` copy:
-/// `fd`, `path`, `flags`, `mode`, `start` and `pos`. A `FileHandle` as `options.fd` is kept in
-/// the stream's [`FileStreamState`], and as in Node.js's `importFd`, the stream references the
-/// handle's descriptor and is closed when the handle emits `close`.
-fn init_fields(
+/// The value of `field` of the file stream `stream`.
+fn field_value<'s>(
+    scope: &'s Scope<'_>,
+    stream: Object<'_>,
+    field: Field,
+) -> Result<HandleValue<'s>, ExnThrown> {
+    Ok(read_stream_class::state_of(scope, stream)?
+        .data()
+        .field(field)
+        .get(scope))
+}
+
+/// Set `field` of the file stream `stream` to `value`.
+fn set_field<'s>(
+    scope: &'s Scope<'_>,
+    stream: Object<'_>,
+    field: Field,
+    value: impl ToJSVal<'s>,
+) -> Result<(), ExnThrown> {
+    let value = value.to_jsval_throwing(scope)?;
+    read_stream_class::state_of(scope, stream)?
+        .data()
+        .field(field)
+        .set(value.get());
+    Ok(())
+}
+
+/// Add `count` to the bytes `stream` read or wrote, as Node.js's `+=` adds it to a number.
+fn add_transferred(scope: &Scope<'_>, stream: Object<'_>, count: f64) -> Result<(), ExnThrown> {
+    let total = field_value(scope, stream, Field::Transferred)?;
+    let total = f64::from_jsval_throwing(scope, total, ())? + count;
+    set_field(scope, stream, Field::Transferred, total)
+}
+
+/// The accessors of the file stream prototypes, each a property name and the field it reads and
+/// assigns.
+const ACCESSORS: [(&std::ffi::CStr, Field); 9] = [
+    (c"fd", Field::Fd),
+    (c"path", Field::Path),
+    (c"flags", Field::Flags),
+    (c"mode", Field::Mode),
+    (c"start", Field::Start),
+    (c"end", Field::End),
+    (c"pos", Field::Pos),
+    (c"bytesRead", Field::Transferred),
+    (c"bytesWritten", Field::Transferred),
+];
+
+/// The [`ACCESSORS`] of `ReadStream.prototype` and of `WriteStream.prototype`.
+const READ_ACCESSORS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+const WRITE_ACCESSORS: [usize; 7] = [0, 1, 2, 3, 4, 6, 8];
+
+/// The getter of an accessor, whose payload is its index in [`ACCESSORS`]: the field of `this`,
+/// or `undefined` for an object without a file stream's state.
+fn get_accessor(
     scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = crate::support::this_object(scope, &args)?;
+    let (_, field) = ACCESSORS[payload.to_number() as usize];
+    let Some(state) = read_stream_class::try_state_of(scope, this)? else {
+        return Ok(js::value::undefined());
+    };
+    let value = state.data().field(field).get(scope);
+    Ok(value.get())
+}
+
+/// The setter of an accessor, whose payload is its index in [`ACCESSORS`]: set the field of
+/// `this` to the value. An object without a file stream's state gets an own data property.
+fn set_accessor(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let this = crate::support::this_object(scope, &args)?;
+    let (name, field) = ACCESSORS[payload.to_number() as usize];
+    let value = args.get(0);
+    match read_stream_class::try_state_of(scope, this)? {
+        Some(state) => state.data().field(field).set(value.get()),
+        None => {
+            let attrs = js::class_spec::JSPROP_ENUMERATE as u32;
+            this.define_property(scope, name, value, attrs)?;
+        }
+    }
+    Ok(js::value::undefined())
+}
+
+/// Define the accessors `indices` of [`ACCESSORS`] on `prototype`, and the deprecated `open`
+/// method, which `open` implements.
+fn define_members(
+    scope: &Scope<'_>,
+    prototype: Object<'_>,
+    indices: &[usize],
+    open: js::function::Callback,
+) -> Result<(), ExnThrown> {
+    for &index in indices {
+        let (name, _) = ACCESSORS[index];
+        let payload = index as f64;
+        let getter = Function::new_callback(scope, name, 0, get_accessor, payload)?;
+        let setter = Function::new_callback(scope, name, 1, set_accessor, payload)?;
+        let attrs = js::class_spec::JSPROP_ENUMERATE as u32;
+        prototype.define_accessor(scope, name, Some(*getter), Some(*setter), attrs)?;
+    }
+    let open = crate::support::shared_named_function(scope, open, c"deprecated", 0)?;
+    let attrs = js::class_spec::JSPROP_ENUMERATE as u32;
+    prototype.define_property(scope, c"open", open, attrs)
+}
+
+/// `ReadStream.prototype.open()`, which does nothing but emit the deprecation warning DEP0135.
+fn open_read(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let message = "ReadStream.prototype.open() is deprecated";
+    crate::process::deprecate_once(scope, message, "DEP0135")?;
+    Ok(js::value::undefined())
+}
+
+/// `WriteStream.prototype.open()`, which does nothing but emit the deprecation warning DEP0135.
+fn open_write(
+    scope: &Scope<'_>,
+    _args: CallbackArgs<'_>,
+    _payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let message = "WriteStream.prototype.open() is deprecated";
+    crate::process::deprecate_once(scope, message, "DEP0135")?;
+    Ok(js::value::undefined())
+}
+
+/// Set the fields both stream classes share on `stream` from `path` and the `options` copy:
+/// `fd`, `path`, `flags`, `mode`, `start` and `pos`. Returns `options.start`, which is `undefined`
+/// or a validated integer. A `FileHandle` as `options.fd` is kept in the stream's
+/// [`FileStreamState`], and as in Node.js's `importFd`, the stream references the handle's
+/// descriptor and is closed when the handle emits `close`.
+fn init_fields<'s>(
+    scope: &'s Scope<'_>,
     stream: Object<'_>,
     path: HandleValue<'_>,
     options: Object<'_>,
     default_flags: &str,
-) -> Result<(), Thrown> {
+) -> Result<HandleValue<'s>, Thrown> {
     let fd = options.val(scope, c"fd")?;
     if fd.is_null() || fd.is_undefined() {
         let path = super::path_arg(scope, path, "path")?;
-        stream.set_property(scope, c"fd", js::value::null())?;
-        stream.set_property(scope, c"path", path.as_str())?;
+        let path = js::JSString::from_str(scope, &path)?.to_jsval_throwing(scope)?;
+        set_field(scope, stream, Field::Fd, HandleValue::null())?;
+        set_field(scope, stream, Field::Path, path)?;
     } else {
         let fd = match super::promises::file_handle_fd(scope, fd)? {
             Some(handle_fd) => {
@@ -156,28 +338,27 @@ fn init_fields(
             }
             None => super::fd_arg(scope, fd)?,
         };
-        stream.set_property(scope, c"fd", fd)?;
-        stream.set_property(scope, c"path", js::value::undefined())?;
+        set_field(scope, stream, Field::Fd, f64::from(fd))?;
+        set_field(scope, stream, Field::Path, HandleValue::undefined())?;
     }
-    let flags = options.val(scope, c"flags")?;
+    let mut flags = options.val(scope, c"flags")?;
     if flags.is_undefined() {
-        stream.set_property(scope, c"flags", default_flags)?;
-    } else {
-        stream.set_property(scope, c"flags", flags)?;
+        flags = js::JSString::from_str(scope, default_flags)?.to_jsval_throwing(scope)?;
     }
+    set_field(scope, stream, Field::Flags, flags)?;
     let mode = options.val(scope, c"mode")?;
     if mode.is_undefined() {
-        stream.set_property(scope, c"mode", 0o666)?;
+        set_field(scope, stream, Field::Mode, f64::from(0o666))?;
     } else {
-        stream.set_property(scope, c"mode", mode)?;
+        set_field(scope, stream, Field::Mode, mode)?;
     }
     let start = options.val(scope, c"start")?;
     if !start.is_undefined() {
         validate_integer(scope, start, "start", 0.0, crate::errors::MAX_SAFE_INTEGER)?;
     }
-    stream.set_property(scope, c"start", start)?;
-    stream.set_property(scope, c"pos", start)?;
-    Ok(())
+    set_field(scope, stream, Field::Start, start)?;
+    set_field(scope, stream, Field::Pos, start)?;
+    Ok(start)
 }
 
 /// The `open` callback of `_construct`, whose payload is a [`StreamRequest`]: record the
@@ -195,24 +376,80 @@ fn opened(
         Function::call(scope, HandleValue::undefined(), callback, &[error])?;
         return Ok(js::value::undefined());
     }
-    let fd = args.get(1);
-    stream.set_property(scope, c"fd", fd)?;
+    set_field(scope, stream, Field::Fd, args.get(1))?;
     Function::call(scope, HandleValue::undefined(), callback, EmptyArgs)?;
+    let fd = field_value(scope, stream, Field::Fd)?;
     crate::events::emit(scope, stream, c"open", &[fd])?;
     crate::events::emit(scope, stream, c"ready", &[])?;
     Ok(js::value::undefined())
 }
 
-/// The `_construct` of both stream classes: open `this.path` unless `this.fd` is a descriptor.
+/// The `emit` that `_construct` installs on a stream whose `open` method was replaced, whose
+/// payload is a [`StreamRequest`]: an `open` event restores the stream's `emit`, calls the
+/// callback of `_construct`, and is emitted. An `error` event restores the `emit` and calls the
+/// callback with the error. Other events are emitted.
+fn replaced_open_emit(
+    scope: &Scope<'_>,
+    args: CallbackArgs<'_>,
+    payload: HandleValue,
+) -> Result<Value, ExnThrown> {
+    let request = cast_payload::<StreamRequest>(scope, payload);
+    let (callback, emit) = {
+        let data = request.data();
+        (data.callback.get(scope), data.emit.get(scope))
+    };
+    let this = scope.root_value(args.this());
+    let event = args.get(0);
+    let is_open = crate::support::is_str(scope, event, c"open")?;
+    if is_open || crate::support::is_str(scope, event, c"error")? {
+        let this_object = Object::from_value(scope, *this).map_err(|e| e.throw(scope))?;
+        this_object.set_property(scope, c"emit", emit)?;
+        if !is_open {
+            Function::call(scope, HandleValue::undefined(), callback, &[args.get(1)])?;
+            return Ok(js::value::undefined());
+        }
+        Function::call(scope, HandleValue::undefined(), callback, EmptyArgs)?;
+    }
+    let values = args.rest(0);
+    Function::call(scope, this, emit, &values)?;
+    Ok(js::value::undefined())
+}
+
+/// The `_construct` of both stream classes. A stream with a descriptor is constructed at once. A
+/// stream whose `open` method isn't the prototypes' is opened by calling it, with an `emit` that
+/// completes the construction on the `open` or `error` event it emits, as in Node.js. Otherwise
+/// the stream's path is opened.
 fn construct(scope: &Scope<'_>, this: Object<'_>, callback: HandleValue<'_>) -> Result<(), Thrown> {
-    if this.val(scope, c"fd")?.is_number() {
+    if field_value(scope, this, Field::Fd)?.is_number() {
         Function::call(scope, HandleValue::undefined(), callback, EmptyArgs)?;
         return Ok(());
     }
+    let open = this.get_property(scope, c"open")?;
+    let originals = [
+        crate::support::shared_named_function(scope, open_read, c"deprecated", 0)?,
+        crate::support::shared_named_function(scope, open_write, c"deprecated", 0)?,
+    ];
+    let replaced = match Object::from_value(scope, *open) {
+        Ok(open) => originals
+            .iter()
+            .all(|original| original.as_raw() != open.as_raw()),
+        Err(_) => true,
+    };
+    if replaced {
+        let request = stream_request(scope, this, callback)?;
+        request
+            .data()
+            .emit
+            .set(this.get_property(scope, c"emit")?.get());
+        let emit = Function::new_callback(scope, c"", 0, replaced_open_emit, request)?;
+        this.set_property(scope, c"emit", *emit)?;
+        Function::call_by_name(scope, this.handle(), c"open", EmptyArgs)?;
+        return Ok(());
+    }
     let args = [
-        this.val(scope, c"path")?,
-        this.val(scope, c"flags")?,
-        this.val(scope, c"mode")?,
+        field_value(scope, this, Field::Path)?,
+        field_value(scope, this, Field::Flags)?,
+        field_value(scope, this, Field::Mode)?,
     ];
     let prepared = (ops::OPS[ops::index_of("open")].parse)(scope, &args, Variant::Callback)?;
     let done = Function::new_callback(
@@ -336,7 +573,7 @@ fn close(
     error: HandleValue<'_>,
     callback: HandleValue<'_>,
 ) -> Result<(), Thrown> {
-    let fd = this.val(scope, c"fd")?;
+    let fd = field_value(scope, this, Field::Fd)?;
     if !fd.is_number() {
         Function::call(scope, js::value::undefined(), callback, &[error])?;
         return Ok(());
@@ -352,14 +589,14 @@ fn close(
     if let Some(handle) = handle {
         // As Node.js's `FileHandleOperations.close`: release the stream's reference, then close
         // the handle.
-        this.set_property(scope, c"fd", js::value::null())?;
+        set_field(scope, this, Field::Fd, HandleValue::null())?;
         handle.release(scope)?;
         let closing = handle.close(scope)?;
         closing.add_reactions(scope, Some(*done), Some(*done))?;
         return Ok(());
     }
     let prepared = (ops::OPS[ops::index_of("close")].parse)(scope, &[fd], Variant::Callback)?;
-    this.set_property(scope, c"fd", js::value::null())?;
+    set_field(scope, this, Field::Fd, HandleValue::null())?;
     run_callback(
         scope,
         "close",
@@ -369,7 +606,8 @@ fn close(
     )
 }
 
-/// The getter of `pending`: whether the file isn't open yet.
+/// The getter of `pending`: whether the stream's descriptor is `null`, as it is before the file is
+/// open and once it is closed.
 fn pending(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -377,18 +615,27 @@ fn pending(
 ) -> Result<Value, ExnThrown> {
     let this =
         Object::from_value(scope, scope.root_value(args.this())).map_err(|e| e.throw(scope))?;
-    Ok(js::value::from_bool(this.val(scope, c"fd")?.is_null()))
+    let fd = field_value(scope, this, Field::Fd)?;
+    Ok(js::value::from_bool(fd.is_null()))
 }
 
-/// Define the `pending` getter on `prototype`.
-fn define_pending(scope: &Scope<'_>, prototype: Object<'_>) -> Result<(), ExnThrown> {
+/// Define the `pending` getter, the accessors `indices` of [`ACCESSORS`] and the deprecated
+/// `open` method implemented by `open` on `prototype`.
+fn define_prototype(
+    scope: &Scope<'_>,
+    prototype: Object<'_>,
+    indices: &[usize],
+    open: js::function::Callback,
+) -> Result<(), ExnThrown> {
     let getter = Function::new_callback(scope, c"pending", 0, pending, ())?;
-    prototype.define_accessor(scope, c"pending", Some(*getter), None, 0)
+    prototype.define_accessor(scope, c"pending", Some(*getter), None, 0)?;
+    define_members(scope, prototype, indices, open)
 }
 
-/// The `read` callback of `_read`, whose payload is the stream: push the bytes read, or `null` at
-/// the end of the file, or destroy the stream with the error. On a destroyed stream, run the
-/// `_destroy` that waited for the read instead.
+/// The `read` callback of `_read`, whose payload is the stream and whose arguments are the error,
+/// the count and a `Buffer` of the bytes read: advance the position, unless it is `undefined`, and
+/// push the bytes, or `null` at the end of the file, or destroy the stream with the error. On a
+/// destroyed stream, run the `_destroy` that waited for the read instead.
 fn was_read(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -408,13 +655,13 @@ fn was_read(
         Function::call_by_name(scope, stream.handle(), c"push", &[HandleValue::null()])?;
         return Ok(js::value::undefined());
     }
-    let total = stream.num(scope, c"bytesRead")?;
-    stream.set_property(scope, c"bytesRead", total + count)?;
-    let buffer = Object::from_value(scope, args.get(2)).map_err(|e| e.throw(scope))?;
-    let zero = scope.root_value(js::value::from_f64(0.0));
-    let end = scope.root_value(js::value::from_f64(count));
-    let chunk = Function::call_by_name(scope, buffer.handle(), c"subarray", &[zero, end])?;
-    Function::call_by_name(scope, stream.handle(), c"push", &[chunk])?;
+    let position = field_value(scope, stream, Field::Pos)?;
+    if !position.is_undefined() {
+        let position = f64::from_jsval_throwing(scope, position, ())? + count;
+        set_field(scope, stream, Field::Pos, position)?;
+    }
+    add_transferred(scope, stream, count)?;
+    Function::call_by_name(scope, stream.handle(), c"push", &[args.get(2)])?;
     Ok(js::value::undefined())
 }
 
@@ -437,24 +684,25 @@ pub mod read_stream_class {
         options: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
         let options = base_options(scope, options, Some(64.0 * 1024.0))?;
-        init_fields(scope, this, path, options, "r")?;
+        let start = init_fields(scope, this, path, options, "r")?;
         let end = options.val(scope, c"end")?;
-        let end = if end.is_undefined() {
+        // As in Node.js, `Infinity` is the one end that isn't a safe integer.
+        let end = if end.is_undefined() || (end.is_number() && end.to_number() == f64::INFINITY) {
             f64::INFINITY
         } else {
-            validate_integer(scope, end, "end", 0.0, f64::INFINITY)?
+            validate_integer(scope, end, "end", 0.0, crate::errors::MAX_SAFE_INTEGER)?
         };
-        let start = this.val(scope, c"start")?;
         if start.is_number() && start.to_number() > end {
+            let end = crate::errors::number_to_string(end);
             return Err(NodeError::out_of_range(
                 "start",
                 &format!("<= \"end\" (here: {end})"),
-                &start.to_number().to_string(),
+                &crate::errors::out_of_range_received(start.to_number()),
             )
             .into());
         }
-        this.set_property(scope, c"end", end)?;
-        this.set_property(scope, c"bytesRead", 0)?;
+        super::set_field(scope, this, Field::End, end)?;
+        super::set_field(scope, this, Field::Transferred, 0.0)?;
         crate::stream::readable_class::init(scope, this, Some(options.to_jsval_throwing(scope)?))
     }
 
@@ -469,34 +717,38 @@ pub mod read_stream_class {
 
     #[method(name = "_read")]
     pub fn read_impl(scope: &Scope<'_>, this: Object<'_>, size: f64) -> Result<(), Thrown> {
-        let position = this.val(scope, c"pos")?;
-        let end = this.num(scope, c"end")?;
-        let size = if position.is_undefined() {
-            size.min(end - this.num(scope, c"bytesRead")? + 1.0)
+        let position = super::field_value(scope, this, Field::Pos)?;
+        let end = super::field_value(scope, this, Field::End)?;
+        let end = f64::from_jsval_throwing(scope, end, ())?;
+        let start = if position.is_undefined() {
+            None
         } else {
-            size.min(end - position.to_number() + 1.0)
+            Some(f64::from_jsval_throwing(scope, position, ())?)
+        };
+        let limit = match start {
+            None => {
+                let bytes_read = super::field_value(scope, this, Field::Transferred)?;
+                end - f64::from_jsval_throwing(scope, bytes_read, ())? + 1.0
+            }
+            Some(start) => end - start + 1.0,
+        };
+        // The size is `NaN` if `limit` is, as `Math.min` computes it.
+        let size = if limit.is_nan() {
+            limit
+        } else {
+            size.min(limit)
         };
         if size <= 0.0 {
             Function::call_by_name(scope, this.handle(), c"push", &[HandleValue::null()])?;
             return Ok(());
         }
-        let buffer =
-            crate::buffer::new_buffer(scope, &vec![0; size as usize])?.to_jsval_throwing(scope)?;
-        let args = [
-            this.val(scope, c"fd")?,
-            buffer,
-            scope.root_value(js::value::from_f64(0.0)),
-            scope.root_value(js::value::from_f64(size)),
-            if position.is_number() {
-                position
-            } else {
-                HandleValue::null()
-            },
-        ];
-        let prepared = (ops::OPS[ops::index_of("read")].parse)(scope, &args, Variant::Callback)?;
-        if position.is_number() {
-            this.set_property(scope, c"pos", position.to_number() + size)?;
+        // Node.js allocates the buffer for the read here, which fails for a size of `NaN`.
+        if size.is_nan() {
+            let range = ">= 0 && <= 9007199254740991";
+            return Err(NodeError::out_of_range("size", range, "NaN").into());
         }
+        let fd = super::field_value(scope, this, Field::Fd)?;
+        let prepared = ops::read_chunk(scope, fd, size as usize, position)?;
         let done = Function::new_callback(scope, c"", 3, was_read, this)?;
         super::start_io(scope, this, "read", prepared, done)
     }
@@ -527,7 +779,7 @@ pub mod read_stream_class {
 
     #[setup]
     pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        super::define_pending(scope, proto)
+        super::define_prototype(scope, proto, &super::READ_ACCESSORS, super::open_read)
     }
 }
 
@@ -560,8 +812,7 @@ fn written(
         Function::call(scope, HandleValue::undefined(), callback, &[error])?;
         return Ok(js::value::undefined());
     }
-    let total = stream.num(scope, c"bytesWritten")?;
-    stream.set_property(scope, c"bytesWritten", total + args.get(1).to_number())?;
+    add_transferred(scope, stream, args.get(1).to_number())?;
     Function::call(scope, HandleValue::undefined(), callback, EmptyArgs)?;
     Ok(js::value::undefined())
 }
@@ -587,7 +838,7 @@ pub mod write_stream_class {
         let options = base_options(scope, options, None)?;
         options.set_property(scope, c"decodeStrings", true)?;
         init_fields(scope, this, path, options, "w")?;
-        this.set_property(scope, c"bytesWritten", 0)?;
+        super::set_field(scope, this, Field::Transferred, 0.0)?;
         crate::stream::writable_class::init(scope, this, Some(options.to_jsval_throwing(scope)?))
     }
 
@@ -608,9 +859,9 @@ pub mod write_stream_class {
         _encoding: HandleValue<'_>,
         callback: HandleValue<'_>,
     ) -> Result<(), Thrown> {
-        let position = this.val(scope, c"pos")?;
+        let position = super::field_value(scope, this, Field::Pos)?;
         let args = [
-            this.val(scope, c"fd")?,
+            super::field_value(scope, this, Field::Fd)?,
             chunk,
             HandleValue::null(),
             HandleValue::null(),
@@ -626,7 +877,8 @@ pub mod write_stream_class {
                 .ok()
                 .and_then(js::ArrayBufferView::from_object)
                 .map_or(0, |view| view.byte_length());
-            this.set_property(scope, c"pos", position.to_number() + length as f64)?;
+            let position = position.to_number() + length as f64;
+            super::set_field(scope, this, Field::Pos, position)?;
         }
         let request = stream_request(scope, this, callback)?;
         let done = Function::new_callback(scope, c"", 2, written, request)?;
@@ -684,7 +936,7 @@ pub mod write_stream_class {
 
     #[setup]
     pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
-        super::define_pending(scope, proto)
+        super::define_prototype(scope, proto, &super::WRITE_ACCESSORS, super::open_write)
     }
 }
 

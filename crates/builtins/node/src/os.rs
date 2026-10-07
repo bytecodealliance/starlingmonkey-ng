@@ -15,6 +15,7 @@ use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::Object;
 
+use crate::buffer::Encoding;
 use crate::errors::Thrown;
 
 /// The memory `totalmem()` and `freemem()` report.
@@ -198,6 +199,31 @@ const SIGNALS: &[(&std::ffi::CStr, i32)] = &[
     (c"SIGPWR", 30),
     (c"SIGSYS", 31),
 ];
+
+/// The signals of `os.constants.signals`.
+fn signal_table() -> &'static [(&'static std::ffi::CStr, i32)] {
+    if crate::process::platform() == "darwin" {
+        DARWIN_SIGNALS
+    } else {
+        SIGNALS
+    }
+}
+
+/// The number of the signal `name`, such as `SIGTERM`, in `os.constants.signals`.
+pub(crate) fn signal_number(name: &str) -> Option<i32> {
+    signal_table()
+        .iter()
+        .find(|(known, _)| known.to_bytes() == name.as_bytes())
+        .map(|(_, number)| *number)
+}
+
+/// The name of the signal `number`: the first name `os.constants.signals` has for it.
+pub(crate) fn signal_name(number: i32) -> Option<&'static str> {
+    signal_table()
+        .iter()
+        .find(|(_, known)| *known == number)
+        .and_then(|(name, _)| name.to_str().ok())
+}
 
 /// Linux's `errno` values.
 const ERRNO: &[(&std::ffi::CStr, i32)] = &[
@@ -390,8 +416,12 @@ pub mod module {
         .into()
     }
 
-    /// <https://nodejs.org/api/os.html#oshostname>: `HOSTNAME`, or `localhost`.
+    /// <https://nodejs.org/api/os.html#oshostname>: the host's name natively, and `HOSTNAME` or
+    /// `localhost` on wasm.
     pub fn hostname(scope: &Scope<'_>) -> Result<String, ExnThrown> {
+        if let Some(hostname) = platform::process::hostname() {
+            return Ok(hostname);
+        }
         Ok(env_var(scope, "HOSTNAME")?.unwrap_or_else(|| "localhost".into()))
     }
 
@@ -466,17 +496,34 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/os.html#osuserinfooptions>: `uid` and `gid` are -1, and the rest
-    /// comes from `USER`, `HOME` and `SHELL`.
+    /// comes from `USER`, `HOME` and `SHELL`. The strings are in `options.encoding`, as `Buffer`s
+    /// for `'buffer'`, and in UTF-8 for a missing or unknown encoding.
     #[function(length = 1)]
-    pub fn user_info<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+    pub fn user_info<'s>(
+        scope: &'s Scope<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, ExnThrown> {
+        let mut encoding = Some(Encoding::Utf8);
+        if let Some(options) = options.and_then(|options| Object::from_value(scope, *options).ok())
+        {
+            let value = options.get_property(scope, c"encoding")?;
+            if value.is_string() {
+                let name = String::from_jsval(scope, value, ()).map_err(|_| ExnThrown)?;
+                encoding = match name.as_str() {
+                    "buffer" => None,
+                    name => Some(Encoding::parse(name).unwrap_or(Encoding::Utf8)),
+                };
+            }
+        }
+        let text = |text: &str| crate::fs::text_value(scope, text, encoding);
         let info = Object::new_plain(scope)?;
         info.set_property(scope, c"uid", -1)?;
         info.set_property(scope, c"gid", -1)?;
         let username = env_var(scope, "USER")?.unwrap_or_else(|| "starlingmonkey".into());
-        info.set_property(scope, c"username", username.as_str())?;
-        info.set_property(scope, c"homedir", homedir(scope)?.as_str())?;
+        info.set_property(scope, c"username", text(&username)?)?;
+        info.set_property(scope, c"homedir", text(&homedir(scope)?)?)?;
         match env_var(scope, "SHELL")? {
-            Some(shell) => info.set_property(scope, c"shell", shell.as_str())?,
+            Some(shell) => info.set_property(scope, c"shell", text(&shell)?)?,
             None => info.set_property(scope, c"shell", js::value::null())?,
         }
         Ok(info)
@@ -492,9 +539,24 @@ pub mod module {
         Ok(0)
     }
 
-    /// <https://nodejs.org/api/os.html#ossetprioritypid-priority>: has no effect.
+    /// <https://nodejs.org/api/os.html#ossetprioritypid-priority>: validates `pid`, a 32-bit
+    /// integer, and `priority`, an integer from -20 to 19, and has no effect. With one argument,
+    /// the argument is `priority`.
     #[function(length = 2)]
-    pub fn set_priority() {}
+    pub fn set_priority(
+        scope: &Scope<'_>,
+        pid: HandleValue<'_>,
+        priority: HandleValue<'_>,
+    ) -> Result<(), Thrown> {
+        let (pid, priority) = if priority.is_undefined() {
+            (scope.root_value(js::value::from_i32(0)), pid)
+        } else {
+            (pid, priority)
+        };
+        crate::errors::validate_integer(scope, pid, "pid", -2147483648.0, 2147483647.0)?;
+        crate::errors::validate_integer(scope, priority, "priority", -20.0, 19.0)?;
+        Ok(())
+    }
 }
 
 /// Register `node:os`, whose `constants` is [`constants`].

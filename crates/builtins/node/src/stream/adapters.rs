@@ -31,7 +31,7 @@ use super::eos::{EosCallback, EosOptions, EosStateImpl};
 use super::readable::{buffer_from, is_buffer, is_encoding};
 use super::util::{is_destroyed, is_readable, is_writable, is_writable_ended, sides};
 use crate::errors::{validate_plain_object, NodeError, Thrown};
-use crate::support::{class_object, is_str, noop_function, rust_string};
+use crate::support::{class_object, is_str, nop, rust_string};
 
 /// Whether `value` is a `ReadableStream`, by its brand.
 pub(crate) fn is_readable_stream(scope: &Scope<'_>, value: HandleValue<'_>) -> bool {
@@ -213,16 +213,11 @@ fn byte_length_size(
     Ok(chunk.get_property(scope, c"byteLength")?.get())
 }
 
-/// The shared function running `body`.
-fn shared_function<'s>(
-    scope: &'s Scope<'_>,
-    name: &CStr,
-    body: Callback,
-) -> Result<js::Callable<'s>, ExnThrown> {
-    let function = js::class::get_or_init_shared_function(scope, body as usize, |scope| {
-        Function::new_callback(scope, name, 1, body, ())
-    })?;
-    Ok(function.as_callable())
+/// The shared `size` function of a queuing strategy, running `body`.
+fn size_function<'s>(scope: &'s Scope<'_>, body: Callback) -> Result<js::Callable<'s>, ExnThrown> {
+    crate::support::shared_named_function(scope, body, c"size", 1)?
+        .cast::<js::Callable>()
+        .map_err(|_| js::error::TypeError("size is not callable".into()).throw(scope))
 }
 
 /// Node's `newWritableStreamFromStreamWritable`: a `WritableStream` writing to the Node.js
@@ -262,7 +257,7 @@ pub(crate) fn writable_to_web<'s>(
         size: if object_mode {
             None
         } else {
-            Some(shared_function(scope, c"size", chunk_size)?)
+            Some(size_function(scope, chunk_size)?)
         },
     };
 
@@ -322,7 +317,7 @@ fn writable_to_web_finished(
     if let Some(cleanup) = cleanup {
         super::eos::cleanup(scope, cleanup)?;
     }
-    crate::events::listen(scope, stream, c"on", c"error", noop_function(scope)?)?;
+    crate::events::listen(scope, stream, c"on", c"error", nop(scope)?)?;
     let (backpressure, closed) = {
         let mut data = state.data_mut();
         (data.backpressure.get(scope), data.closed.take_rooted(scope))
@@ -615,7 +610,7 @@ pub(crate) fn readable_to_web<'s>(
                 size: if object_mode {
                     None
                 } else {
-                    Some(shared_function(scope, c"size", byte_length_size)?)
+                    Some(size_function(scope, byte_length_size)?)
                 },
             }
         } else {
@@ -735,7 +730,8 @@ fn readable_to_web_data(
 }
 
 /// The key of the property marking a stream that has the no-op `error` listener
-/// [`readable_to_web`] adds.
+/// [`readable_to_web`] adds. A stream with a readable part is marked by its
+/// `ERROR_SENTINEL_ATTACHED` flag too, and the property is only read for other streams.
 static ERROR_SENTINEL_ATTACHED: js::symbol::CachedSymbol =
     js::symbol::CachedSymbol::new(c"kErrorSentinelAttached");
 
@@ -761,8 +757,16 @@ fn readable_to_web_finished(
         super::eos::cleanup(scope, cleanup)?;
     }
     let key = ERROR_SENTINEL_ATTACHED.id(scope)?;
-    if !stream.has_property_by_id(scope, key)? {
-        crate::events::listen(scope, stream, c"on", c"error", noop_function(scope)?)?;
+    let side = super::state::ReadableSide::try_of(scope, stream)?;
+    let attached = match side {
+        Some(side) => side.has(super::state::R::ERROR_SENTINEL_ATTACHED),
+        None => stream.has_property_by_id(scope, key)?,
+    };
+    if !attached {
+        crate::events::listen(scope, stream, c"on", c"error", nop(scope)?)?;
+        if let Some(side) = side {
+            side.set(super::state::R::ERROR_SENTINEL_ATTACHED, true);
+        }
         stream.set_property_by_id(scope, key, true)?;
     }
     if state.data().was_canceled {
@@ -1309,7 +1313,7 @@ fn write_all(
     }
     let handles: Vec<_> = writes.iter().map(|promise| promise.handle()).collect();
     let all = js::Promise::wait_for_all_from(scope, &handles)?;
-    let fulfilled = noop_function(scope)?;
+    let fulfilled = nop(scope)?;
     all.then(scope, Some(fulfilled), None)?
         .to_jsval_raw_throwing(scope)
 }

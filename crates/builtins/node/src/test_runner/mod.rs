@@ -36,7 +36,7 @@ use web_globals::events::algorithms::ScriptStackState;
 use web_globals::signals::abort_controller::{AbortController, AbortControllerImpl};
 
 use crate::errors::{ErrorKind, NodeError, Thrown};
-use crate::support::rust_string;
+use crate::support::{is_str, is_thenable, rust_string};
 
 /// The record kinds.
 const ROOT: u8 = 0;
@@ -76,24 +76,24 @@ mod phase {
 const TIMEOUT_MAX: f64 = 2147483647.0;
 
 /// The `node:assert` functions `t.assert` holds, as Node.js's `methodsToCopy` lists them.
-const ASSERT_METHODS: &[&str] = &[
-    "deepEqual",
-    "deepStrictEqual",
-    "doesNotMatch",
-    "doesNotReject",
-    "doesNotThrow",
-    "equal",
-    "fail",
-    "ifError",
-    "match",
-    "notDeepEqual",
-    "notDeepStrictEqual",
-    "notEqual",
-    "notStrictEqual",
-    "partialDeepStrictEqual",
-    "rejects",
-    "strictEqual",
-    "throws",
+const ASSERT_METHODS: &[&std::ffi::CStr] = &[
+    c"deepEqual",
+    c"deepStrictEqual",
+    c"doesNotMatch",
+    c"doesNotReject",
+    c"doesNotThrow",
+    c"equal",
+    c"fail",
+    c"ifError",
+    c"match",
+    c"notDeepEqual",
+    c"notDeepStrictEqual",
+    c"notEqual",
+    c"notStrictEqual",
+    c"partialDeepStrictEqual",
+    c"rejects",
+    c"strictEqual",
+    c"throws",
 ];
 
 /// How an awaited step settled.
@@ -308,8 +308,16 @@ pub(crate) struct Harness {
     /// The number of `beforeExit` events.
     #[no_trace]
     exits: u32,
-    /// The functions `t.assert` wraps, by name.
-    assertions: Option<Heap<js::object::Object>>,
+    /// The functions `t.assert` wraps, in the order their names were added, once first used.
+    assertions: Option<Vec<Assertion>>,
+}
+
+/// A function `t.assert` wraps, and its name, a string.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+struct Assertion {
+    name: Heap<Value>,
+    function: Heap<Value>,
 }
 
 #[core_runtime::jsmethods]
@@ -342,25 +350,13 @@ fn root<'s>(scope: &'s Scope<'_>) -> Result<TestRecord<'s>, ExnThrown> {
     let process = crate::process::process_value(scope)?;
     if let Ok(process) = Object::from_value(scope, process) {
         let listener = Function::new_callback(scope, c"", 0, on_before_exit, ())?;
-        let event = js::class::get_or_init_atom(scope, c"beforeExit")?;
-        Function::call_by_name(
-            scope,
-            process.handle(),
-            c"on",
-            &[event, (*listener).to_jsval_throwing(scope)?],
-        )?;
+        crate::events::listen(scope, process, c"on", c"beforeExit", *listener)?;
         for (name, event) in [
             ("uncaughtException", c"uncaughtException"),
             ("unhandledRejection", c"unhandledRejection"),
         ] {
             let listener = Function::new_callback(scope, c"", 1, on_uncaught, name)?;
-            let event = js::class::get_or_init_atom(scope, event)?;
-            Function::call_by_name(
-                scope,
-                process.handle(),
-                c"on",
-                &[event, (*listener).to_jsval_throwing(scope)?],
-            )?;
+            crate::events::listen(scope, process, c"on", event, *listener)?;
         }
     }
     Ok(root)
@@ -496,14 +492,27 @@ fn parent_of<'s>(scope: &'s Scope<'_>, record: TestRecord<'_>) -> Option<TestRec
         .map(|parent| parent.get(scope))
 }
 
-/// Mark `record` failed with `error`, the value the reporter shows, unless it failed already.
+/// Mark `record` failed with `error`, the value the reporter shows, unless it failed already. An
+/// `ERR_TEST_FAILURE` error with a `cause` is shown as its cause, as Node.js's reporters show it.
 /// `failure_type` is the `failureType` of Node.js's `ERR_TEST_FAILURE`.
 fn fail(
-    _scope: &Scope<'_>,
+    scope: &Scope<'_>,
     record: TestRecord<'_>,
     error: HandleValue<'_>,
     failure_type: &'static str,
 ) -> Result<(), ExnThrown> {
+    let error = match Object::from_value(scope, *error) {
+        Ok(object)
+            if is_str(
+                scope,
+                object.get_property(scope, c"code")?,
+                c"ERR_TEST_FAILURE",
+            )? && object.has_own_property(scope, c"cause")? =>
+        {
+            object.get_property(scope, c"cause")?
+        }
+        _ => error,
+    };
     let mut data = record.data_mut();
     if data.failed {
         return Ok(());
@@ -548,9 +557,21 @@ fn timeout_message(record: TestRecord<'_>) -> String {
     )
 }
 
-/// The `ERR_TEST_FAILURE` error with `message`.
-fn test_failure(message: &str) -> NodeError {
-    NodeError::new(ErrorKind::Error, "ERR_TEST_FAILURE", message)
+/// Throw Node.js's `ERR_TEST_FAILURE` error with `message`, which is also its `cause`, and the
+/// `failureType` `failure_type`.
+fn throw_test_failure(scope: &Scope<'_>, message: &str, failure_type: &str) -> ExnThrown {
+    let error = (|| -> Result<HandleValue<'_>, ExnThrown> {
+        let error =
+            NodeError::new(ErrorKind::Error, "ERR_TEST_FAILURE", message).to_value(scope)?;
+        let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
+        object.set_property(scope, c"failureType", failure_type)?;
+        object.set_property(scope, c"cause", message)?;
+        Ok(error)
+    })();
+    match error {
+        Ok(error) => js::exception::throw_value(scope, error),
+        Err(thrown) => thrown,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,22 +721,38 @@ fn mock_of<'s>(
     Ok(tracker)
 }
 
-/// The assertion functions `t.assert` wraps: the realm's map from names to functions, holding the
-/// [`ASSERT_METHODS`] of `node:assert` and the functions `assert.register` added.
-fn assertions<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+/// The assertion functions `t.assert` wraps, as names and functions in the order the names were
+/// added, Node.js's `getAssertionMap`: on first use, the [`ASSERT_METHODS`] of `node:assert`, and
+/// then the functions `assert.register` added.
+fn assertions<'s>(
+    scope: &'s Scope<'_>,
+) -> Result<Vec<(HandleValue<'s>, HandleValue<'s>)>, ExnThrown> {
     let harness = harness(scope)?;
-    if let Some(map) = harness.data().assertions.as_ref().map(|map| map.get(scope)) {
-        return Ok(map);
-    }
-    let map = Object::new_with_null_prototype(scope)?;
-    if let Some(assert) = core_runtime::module::builtin_namespace(scope, "node:assert")? {
-        for &name in ASSERT_METHODS {
-            let c_name = std::ffi::CString::new(name).map_err(|_| ExnThrown)?;
-            map.set_property_by_name(scope, &c_name, assert.get_property_by_name(scope, &c_name)?)?;
+    if harness.data().assertions.is_none() {
+        let mut methods = Vec::with_capacity(ASSERT_METHODS.len());
+        if let Some(assert) = core_runtime::module::builtin_namespace(scope, "node:assert")? {
+            for &name in ASSERT_METHODS {
+                let key = js::class::get_or_init_atom(scope, name)?;
+                methods.push((key, assert.get_property(scope, name)?));
+            }
         }
+        harness.data_mut().assertions.get_or_insert(
+            methods
+                .iter()
+                .map(|(name, function)| Assertion {
+                    name: Heap::from(name.get()),
+                    function: Heap::from(function.get()),
+                })
+                .collect(),
+        );
     }
-    harness.data_mut().assertions = Some(Heap::from(map));
-    Ok(map)
+    let data = harness.data();
+    Ok(data
+        .assertions
+        .iter()
+        .flatten()
+        .map(|assertion| (assertion.name.get(scope), assertion.function.get(scope)))
+        .collect())
 }
 
 /// The payload of [`counted_assertion`]: the test record and the assertion function.
@@ -742,7 +779,7 @@ fn counted_assertion(
     };
     count_for_plan(record);
     let ctx = context_of(scope, record)?.to_jsval_throwing(scope)?;
-    let call_args: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+    let call_args: Vec<HandleValue<'_>> = args.rest(0);
     Ok(Function::call(scope, ctx, callee, &call_args)?.get())
 }
 
@@ -977,16 +1014,6 @@ fn build_suite(scope: &Scope<'_>, record: TestRecord<'_>) -> Result<(), ExnThrow
             record.data_mut().built = true;
             Ok(())
         }
-    }
-}
-
-/// Whether `value` is an object with a `then` method.
-fn is_thenable(scope: &Scope<'_>, value: HandleValue<'_>) -> Result<bool, ExnThrown> {
-    match Object::from_value(scope, value).ok() {
-        Some(object) => Ok(js::function::is_callable(
-            object.get_property(scope, c"then")?,
-        )),
-        None => Ok(false),
     }
 }
 
@@ -1673,7 +1700,12 @@ fn callback_done(
 ) -> Result<Value, ExnThrown> {
     let callback = cast_payload::<DoneCallback>(scope, payload);
     if std::mem::replace(&mut callback.data_mut().called, true) {
-        return Err(test_failure("callback invoked multiple times").throw(scope));
+        let message = "callback invoked multiple times";
+        return Err(throw_test_failure(
+            scope,
+            message,
+            "multipleCallbackInvocations",
+        ));
     }
     let promise = callback.data().promise.get(scope);
     let error = args.get(0);
@@ -2247,7 +2279,8 @@ fn get_test_context(
     }
 }
 
-/// `assert.register(name, fn)`: add `fn` to the functions `t.assert` holds, under `name`.
+/// `assert.register(name, fn)`: add `fn` to the functions `t.assert` holds, under `name`. A
+/// function registered under a name it already holds replaces that name's function in place.
 fn register_assertion(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
@@ -2258,8 +2291,23 @@ fn register_assertion(
         crate::errors::validate_string(scope, name, "name")?;
         let callee = args.get(1);
         crate::errors::validate_function(scope, callee, "fn")?;
-        let id = scope.root_id(js::id::value_to_id(scope, name)?);
-        assertions(scope)?.set_property_by_id(scope, id, callee)?;
+        let mut position = None;
+        for (index, (existing, _)) in assertions(scope)?.into_iter().enumerate() {
+            if js::comparison::strictly_equal(scope, existing, name)? {
+                position = Some(index);
+                break;
+            }
+        }
+        let harness = harness(scope)?;
+        let mut data = harness.data_mut();
+        let assertions = data.assertions.get_or_insert_default();
+        match position {
+            Some(index) => assertions[index].function.set(callee.get()),
+            None => assertions.push(Assertion {
+                name: Heap::from(name.get()),
+                function: Heap::from(callee.get()),
+            }),
+        }
         Ok(())
     };
     register().map_err(|error| error.throw(scope))?;
@@ -2406,11 +2454,9 @@ fn assert_of<'s>(scope: &'s Scope<'_>, record: TestRecord<'_>) -> Result<Object<
         return Ok(assert);
     }
     let assert = Object::new_with_null_prototype(scope)?;
-    let map = assertions(scope)?;
     let mut has_ok = false;
-    for key in map.own_keys(scope)? {
+    for (key, callee) in assertions(scope)? {
         let id = scope.root_id(js::id::value_to_id(scope, key)?);
-        let callee = map.get_property_by_id(scope, id)?;
         let wrapper = counted_assertion_function(scope, record, callee)?;
         assert.set_property_by_id(scope, id, *wrapper)?;
         has_ok |= crate::support::is_str(scope, key, c"ok")?;
@@ -2436,12 +2482,11 @@ fn add_diagnostic(record: TestRecord<'_>, message: Option<HandleValue<'_>>) {
 }
 
 /// The rooted front element of `queue`, which is removed from it.
-#[js::allow_unrooted]
 fn pop_front_rooted<'s>(
     scope: &'s Scope<'_>,
     queue: &mut VecDeque<Heap<TestRecordImpl>>,
 ) -> Option<TestRecord<'s>> {
-    queue.pop_front().map(|record| record.get(scope))
+    queue.pop_front().map(|record| record.take(scope))
 }
 
 /// The context of a test, its function's first argument:
@@ -2551,7 +2596,8 @@ impl TestContext {
     pub fn plan(&self, scope: &Scope<'_>, count: HandleValue<'_>) -> Result<(), Thrown> {
         let record = record_of(scope, &self.data().record)?;
         if record.data().plan.is_some() {
-            return Err(test_failure("cannot set plan more than once").into());
+            let message = "cannot set plan more than once";
+            return Err(throw_test_failure(scope, message, "testCodeFailure").into());
         }
         let count = crate::errors::validate_integer(scope, count, "count", 0.0, 4294967295.0)?;
         let mut data = record.data_mut();

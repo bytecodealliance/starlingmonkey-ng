@@ -10,7 +10,7 @@
 //! The key derivation functions derive keys on the JS thread, and their callback forms call back
 //! in a later turn of the event loop.
 
-use digest::DynDigest;
+use digest::{DynDigest, Mac};
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::ExnThrown;
 use js::gc::scope::Scope;
@@ -18,58 +18,149 @@ use js::prelude::HandleValue;
 use js::{ArrayBufferView, Object};
 
 use crate::buffer::{decode_bytes, encode_string, new_buffer, Encoding};
-use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
+use crate::errors::{out_of_range_received, validate_function, ErrorKind, NodeError, Thrown};
 
-/// A new hasher for the digest `name`, and the digest's block size in bytes, or `None` for a
-/// digest that isn't supported. Names are case-insensitive, and may have an `RSA-` prefix or a
-/// hyphen after `SHA`.
-fn hasher(name: &str) -> Option<(Box<dyn DynDigest>, usize)> {
+/// The canonical name of the digest `name`, or `None` for a digest that isn't supported. Names
+/// are case-insensitive, and may have an `RSA-` prefix or a hyphen after `SHA`.
+fn digest_name(name: &str) -> Option<&'static str> {
     let name = name.to_ascii_lowercase();
     let name = name.strip_prefix("rsa-").unwrap_or(&name);
-    let name = match name {
-        "sha-1" => "sha1",
-        "sha-224" => "sha224",
-        "sha-256" => "sha256",
-        "sha-384" => "sha384",
-        "sha-512" => "sha512",
-        "sha-512/224" | "sha512/224" => "sha512-224",
-        "sha-512/256" | "sha512/256" => "sha512-256",
-        "ripemd" | "rmd160" | "ripemd-160" => "ripemd160",
-        name => name,
-    };
     Some(match name {
-        "md5" => (Box::new(md5::Md5::default()), 64),
-        "sha1" => (Box::new(sha1::Sha1::default()), 64),
-        "sha224" => (Box::new(sha2::Sha224::default()), 64),
-        "sha256" => (Box::new(sha2::Sha256::default()), 64),
-        "sha384" => (Box::new(sha2::Sha384::default()), 128),
-        "sha512" => (Box::new(sha2::Sha512::default()), 128),
-        "sha512-224" => (Box::new(sha2::Sha512_224::default()), 128),
-        "sha512-256" => (Box::new(sha2::Sha512_256::default()), 128),
-        "sha3-224" => (Box::new(sha3::Sha3_224::default()), 144),
-        "sha3-256" => (Box::new(sha3::Sha3_256::default()), 136),
-        "sha3-384" => (Box::new(sha3::Sha3_384::default()), 104),
-        "sha3-512" => (Box::new(sha3::Sha3_512::default()), 72),
-        "ripemd160" => (Box::new(ripemd::Ripemd160::default()), 64),
+        "md5" => "md5",
+        "sha1" | "sha-1" => "sha1",
+        "sha224" | "sha-224" => "sha224",
+        "sha256" | "sha-256" => "sha256",
+        "sha384" | "sha-384" => "sha384",
+        "sha512" | "sha-512" => "sha512",
+        "sha512-224" | "sha-512/224" | "sha512/224" => "sha512-224",
+        "sha512-256" | "sha-512/256" | "sha512/256" => "sha512-256",
+        "sha3-224" => "sha3-224",
+        "sha3-256" => "sha3-256",
+        "sha3-384" => "sha3-384",
+        "sha3-512" => "sha3-512",
+        "ripemd160" | "ripemd" | "rmd160" | "ripemd-160" => "ripemd160",
         _ => return None,
     })
 }
 
-/// The supported digest names, as `getHashes` lists them.
+/// Evaluate `$body` with the type `$D` bound to the digest of the canonical digest name `$name`,
+/// as [`digest_name`] returns it.
+macro_rules! with_digest {
+    ($name:expr, |$D:ident| $body:expr) => {
+        match $name {
+            "md5" => {
+                type $D = md5::Md5;
+                $body
+            }
+            "sha1" => {
+                type $D = sha1::Sha1;
+                $body
+            }
+            "sha224" => {
+                type $D = sha2::Sha224;
+                $body
+            }
+            "sha256" => {
+                type $D = sha2::Sha256;
+                $body
+            }
+            "sha384" => {
+                type $D = sha2::Sha384;
+                $body
+            }
+            "sha512" => {
+                type $D = sha2::Sha512;
+                $body
+            }
+            "sha512-224" => {
+                type $D = sha2::Sha512_224;
+                $body
+            }
+            "sha512-256" => {
+                type $D = sha2::Sha512_256;
+                $body
+            }
+            "sha3-224" => {
+                type $D = sha3::Sha3_224;
+                $body
+            }
+            "sha3-256" => {
+                type $D = sha3::Sha3_256;
+                $body
+            }
+            "sha3-384" => {
+                type $D = sha3::Sha3_384;
+                $body
+            }
+            "sha3-512" => {
+                type $D = sha3::Sha3_512;
+                $body
+            }
+            _ => {
+                type $D = ripemd::Ripemd160;
+                $body
+            }
+        }
+    };
+}
+
+/// A hasher of one of the supported digests, which can be cloned without its type.
+trait SendDigest: DynDigest + Send {
+    fn clone_boxed(&self) -> Box<dyn SendDigest>;
+}
+
+impl<D: DynDigest + Clone + Send + 'static> SendDigest for D {
+    fn clone_boxed(&self) -> Box<dyn SendDigest> {
+        Box::new(self.clone())
+    }
+}
+
+/// A new hasher for the digest `name`, or `None` for a digest that isn't supported.
+fn hasher(name: &str) -> Option<Box<dyn SendDigest>> {
+    let name = digest_name(name)?;
+    Some(with_digest!(name, |D| Box::new(D::default())))
+}
+
+/// An HMAC of one of the supported digests, which `update` and `finalize` reach without its type.
+trait DynMac: Send {
+    fn update(&mut self, data: &[u8]);
+    fn finalize(self: Box<Self>) -> Vec<u8>;
+}
+
+impl<M: Mac + Send + 'static> DynMac for M {
+    fn update(&mut self, data: &[u8]) {
+        Mac::update(self, data);
+    }
+
+    fn finalize(self: Box<Self>) -> Vec<u8> {
+        Mac::finalize(*self).into_bytes().to_vec()
+    }
+}
+
+/// A new HMAC of the digest `name` keyed with `key`, or `None` for a digest that isn't supported.
+fn hmac(name: &str, key: &[u8]) -> Option<Box<dyn DynMac>> {
+    let name = digest_name(name)?;
+    Some(with_digest!(name, |D| Box::new(
+        <hmac::Hmac<D> as hmac::KeyInit>::new_from_slice(key)
+            .expect("HMAC takes keys of any length")
+    )))
+}
+
+/// The supported digest names, as `getHashes` lists them, in byte order as Node.js sorts them.
 const HASHES: &[&str] = &[
     "RSA-MD5",
     "RSA-RIPEMD160",
     "RSA-SHA1",
     "RSA-SHA224",
     "RSA-SHA256",
-    "RSA-SHA384",
-    "RSA-SHA512",
-    "RSA-SHA512/224",
-    "RSA-SHA512/256",
     "RSA-SHA3-224",
     "RSA-SHA3-256",
     "RSA-SHA3-384",
     "RSA-SHA3-512",
+    "RSA-SHA384",
+    "RSA-SHA512",
+    "RSA-SHA512/224",
+    "RSA-SHA512/256",
     "md5",
     "ripemd",
     "ripemd160",
@@ -77,14 +168,14 @@ const HASHES: &[&str] = &[
     "sha1",
     "sha224",
     "sha256",
-    "sha384",
-    "sha512",
-    "sha512-224",
-    "sha512-256",
     "sha3-224",
     "sha3-256",
     "sha3-384",
     "sha3-512",
+    "sha384",
+    "sha512",
+    "sha512-224",
+    "sha512-256",
 ];
 
 /// The error `createHash` throws for a digest that isn't supported: a plain `Error`.
@@ -103,6 +194,55 @@ fn invalid_digest(name: &str) -> NodeError {
     )
 }
 
+/// The `outputLength` of the `options` of a `Hash`, checked as Node.js's `Hash` constructor
+/// checks it: `None` if `options` isn't an object or the option is `undefined`, and otherwise a
+/// uint32 or `ERR_INVALID_ARG_TYPE`/`ERR_OUT_OF_RANGE`.
+fn output_length_option(
+    scope: &Scope<'_>,
+    options: HandleValue<'_>,
+) -> Result<Option<f64>, Thrown> {
+    let Ok(options) = Object::from_value(scope, *options) else {
+        return Ok(None);
+    };
+    if options.is_callable() {
+        return Ok(None);
+    }
+    let length = options.get_property(scope, c"outputLength")?;
+    if length.is_undefined() {
+        return Ok(None);
+    }
+    let name = "options.outputLength";
+    Ok(Some(crate::errors::validate_integer(
+        scope,
+        length,
+        name,
+        0.0,
+        4294967295.0,
+    )?))
+}
+
+/// Check that the `outputLength` option `length` is the output length of `hasher`, none of whose
+/// digests has extendable output. A different length throws OpenSSL's
+/// `ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH` error, an `Error` with `library`, `reason` and `code`.
+fn check_output_length(
+    scope: &Scope<'_>,
+    hasher: &dyn SendDigest,
+    length: Option<f64>,
+) -> Result<(), Thrown> {
+    match length {
+        Some(length) if length != hasher.output_size() as f64 => {
+            let message = "error:030000B2:digital envelope routines::not XOF or invalid length";
+            let error = js::error::new_error(scope, js::error::JSExnType::JSEXN_ERR, message)?;
+            let object = Object::from_value(scope, *error).map_err(|e| e.throw(scope))?;
+            object.set_property(scope, c"library", "digital envelope routines")?;
+            object.set_property(scope, c"reason", "not XOF or invalid length")?;
+            object.set_property(scope, c"code", "ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH")?;
+            Err(js::exception::throw_value(scope, error).into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `ERR_CRYPTO_HASH_FINALIZED`.
 fn finalized() -> NodeError {
     NodeError::new(
@@ -112,14 +252,30 @@ fn finalized() -> NodeError {
     )
 }
 
+/// The bytes of a string or of a view, as [`data_bytes`] gives them.
+enum DataBytes<'s> {
+    Encoded(Vec<u8>),
+    View(ArrayBufferView<'s>),
+}
+
+impl DataBytes<'_> {
+    /// Call `f` with the bytes.
+    fn with<R>(&self, f: impl FnOnce(&[u8]) -> R + Send) -> R {
+        match self {
+            DataBytes::Encoded(bytes) => f(bytes),
+            DataBytes::View(view) => view.with_bytes(f),
+        }
+    }
+}
+
 /// The bytes of `data`, a string in `encoding` or a `Buffer`, `TypedArray` or `DataView`. A
 /// string in an unknown encoding is UTF-8, and one in hex must have an even length.
-fn data_bytes(
-    scope: &Scope<'_>,
+fn data_bytes<'s>(
+    scope: &'s Scope<'_>,
     data: HandleValue<'_>,
     encoding: Option<HandleValue<'_>>,
     name: &str,
-) -> Result<Vec<u8>, Thrown> {
+) -> Result<DataBytes<'s>, Thrown> {
     if data.is_string() {
         let encoding_value = encoding.filter(|encoding| encoding.is_string());
         let encoding = match encoding_value {
@@ -136,22 +292,21 @@ fn data_bytes(
                 NodeError::invalid_arg_value(scope, "encoding", encoding_value, &reason).into(),
             );
         }
-        return Ok(encode_string(scope, string, encoding)?);
+        return Ok(DataBytes::Encoded(encode_string(scope, string, encoding)?));
     }
-    Object::from_value(scope, *data)
+    match Object::from_value(scope, *data)
         .ok()
         .and_then(ArrayBufferView::from_object)
-        .map(|view| view.copy_bytes(scope))
-        .transpose()?
-        .ok_or_else(|| {
-            NodeError::invalid_arg_type(
-                scope,
-                name,
-                "of type string or an instance of Buffer, TypedArray, or DataView",
-                data,
-            )
-            .into()
-        })
+    {
+        Some(view) => Ok(DataBytes::View(view)),
+        None => Err(NodeError::invalid_arg_type(
+            scope,
+            name,
+            "of type string or an instance of Buffer, TypedArray, or DataView",
+            data,
+        )
+        .into()),
+    }
 }
 
 /// `bytes` as a `Buffer`, or as a string in the encoding `encoding` names. An unknown encoding
@@ -180,7 +335,7 @@ fn output<'s>(
 pub struct NativeHash {
     /// The hasher, or `None` once `digest` was called.
     #[no_trace]
-    hasher: Option<Box<dyn DynDigest>>,
+    hasher: Option<Box<dyn SendDigest>>,
     /// The digest's name, for `copy`.
     #[no_trace]
     algorithm: String,
@@ -192,13 +347,9 @@ impl NativeHash {}
 /// The state of an `Hmac`.
 #[core_runtime::jsclass(hidden)]
 pub struct NativeHmac {
-    /// The inner hasher, or `None` once `digest` was called.
+    /// The HMAC, or `None` once `digest` was called.
     #[no_trace]
-    inner: Option<Box<dyn DynDigest>>,
-    /// The outer hasher, already updated with the key XORed with the outer pad, or `None` once
-    /// `digest` was called.
-    #[no_trace]
-    outer: Option<Box<dyn DynDigest>>,
+    mac: Option<Box<dyn DynMac>>,
 }
 
 #[core_runtime::jsmethods]
@@ -209,7 +360,7 @@ impl NativeHmac {}
 fn init_hash(
     scope: &Scope<'_>,
     this: Object<'_>,
-    hasher: Box<dyn DynDigest>,
+    hasher: Box<dyn SendDigest>,
     algorithm: String,
     options: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
@@ -224,7 +375,7 @@ fn init_hash(
 /// `_options`.
 fn new_hash<'s>(
     scope: &'s Scope<'_>,
-    hasher: Box<dyn DynDigest>,
+    hasher: Box<dyn SendDigest>,
     algorithm: String,
     options: HandleValue<'_>,
 ) -> Result<Object<'s>, ExnThrown> {
@@ -245,11 +396,8 @@ fn init_hmac(
     let name = crate::errors::validate_string(scope, algorithm, "hmac")?;
     let encoding = string_option(scope, options, c"encoding", "options.encoding")?;
     let key = secret_key_bytes(scope, key, encoding.as_deref())?;
-    let (inner, outer) = hmac_state(&name, &key).ok_or_else(|| invalid_digest(&name))?;
-    *hmac_class::state_of(scope, this)?.data_mut() = NativeHmacImpl {
-        inner: Some(inner),
-        outer: Some(outer),
-    };
+    let mac = hmac(&name, &key).ok_or_else(|| invalid_digest(&name))?;
+    *hmac_class::state_of(scope, this)?.data_mut() = NativeHmacImpl { mac: Some(mac) };
     let options = options.unwrap_or(HandleValue::undefined());
     Ok(this.set_property(scope, c"_options", options)?)
 }
@@ -274,10 +422,12 @@ pub mod hash_class {
     ) -> Result<(), Thrown> {
         crate::process::deprecate_once(scope, "crypto.Hash constructor is deprecated.", "DEP0179")?;
         let name = crate::errors::validate_string(scope, algorithm, "algorithm")?;
-        let Some((hasher, _)) = hasher(&name) else {
+        let options = options.unwrap_or(HandleValue::undefined());
+        let output_length = output_length_option(scope, options)?;
+        let Some(hasher) = hasher(&name) else {
             return Err(unsupported_digest(scope, "Digest method not supported"));
         };
-        let options = options.unwrap_or(HandleValue::undefined());
+        check_output_length(scope, &*hasher, output_length)?;
         Ok(init_hash(scope, this, hasher, name, options)?)
     }
 
@@ -293,9 +443,10 @@ pub mod hash_class {
         if state.data().hasher.is_none() {
             return Err(finalized().into());
         }
-        let bytes = data_bytes(scope, data, encoding, "data")?;
+        let input = data_bytes(scope, data, encoding, "data")?;
         let mut data = state.data_mut();
-        data.hasher.as_mut().ok_or_else(finalized)?.update(&bytes);
+        let hasher = data.hasher.as_mut().ok_or_else(finalized)?;
+        input.with(|bytes| hasher.update(bytes));
         Ok(this)
     }
 
@@ -316,14 +467,20 @@ pub mod hash_class {
 
     /// <https://nodejs.org/api/crypto.html#hashcopyoptions>
     #[method(length = 1)]
-    pub fn copy<'s>(scope: &'s Scope<'_>, this: Object<'_>) -> Result<Object<'s>, Thrown> {
-        let state = {
+    pub fn copy<'s>(
+        scope: &'s Scope<'_>,
+        this: Object<'_>,
+        options: Option<HandleValue<'_>>,
+    ) -> Result<Object<'s>, Thrown> {
+        let (hasher, algorithm) = {
             let state = state_of(scope, this)?;
             let data = state.data();
-            let hasher = data.hasher.as_ref().ok_or_else(finalized)?.box_clone();
+            let hasher = data.hasher.as_ref().ok_or_else(finalized)?.clone_boxed();
             (hasher, data.algorithm.clone())
         };
-        Ok(new_hash(scope, state.0, state.1, HandleValue::undefined())?)
+        let options = options.unwrap_or(HandleValue::undefined());
+        check_output_length(scope, &*hasher, output_length_option(scope, options)?)?;
+        Ok(new_hash(scope, hasher, algorithm, options)?)
     }
 }
 
@@ -360,12 +517,13 @@ pub mod hmac_class {
         encoding: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
         let state = state_of(scope, this)?;
-        if state.data().inner.is_none() {
+        if state.data().mac.is_none() {
             return Err(finalized().into());
         }
-        let bytes = data_bytes(scope, data, encoding, "data")?;
+        let input = data_bytes(scope, data, encoding, "data")?;
         let mut data = state.data_mut();
-        data.inner.as_mut().ok_or_else(finalized)?.update(&bytes);
+        let mac = data.mac.as_mut().ok_or_else(finalized)?;
+        input.with(|bytes| mac.update(bytes));
         Ok(this)
     }
 
@@ -376,50 +534,13 @@ pub mod hmac_class {
         this: Object<'_>,
         encoding: Option<HandleValue<'_>>,
     ) -> Result<HandleValue<'s>, Thrown> {
-        let (inner, mut outer) = {
-            let state = state_of(scope, this)?;
-            let mut data = state.data_mut();
-            let inner = data.inner.take().ok_or_else(finalized)?;
-            (inner, data.outer.take().ok_or_else(finalized)?)
-        };
-        outer.update(&inner.finalize());
-        output(scope, &outer.finalize(), encoding)
+        let mac = state_of(scope, this)?
+            .data_mut()
+            .mac
+            .take()
+            .ok_or_else(finalized)?;
+        output(scope, &mac.finalize(), encoding)
     }
-}
-
-/// The inner and the outer hasher of an HMAC.
-type HmacState = (Box<dyn DynDigest>, Box<dyn DynDigest>);
-
-/// The state of an HMAC of the digest `name` keyed with `key`, as RFC 2104 defines it: the inner
-/// hasher updated with the key XORed with the inner pad, and the outer hasher updated with the key
-/// XORed with the outer pad. `None` for a digest that isn't supported.
-fn hmac_state(name: &str, key: &[u8]) -> Option<HmacState> {
-    let (mut inner, block) = hasher(name)?;
-    let mut key = key.to_vec();
-    if key.len() > block {
-        let (mut long, _) = hasher(name)?;
-        long.update(&key);
-        key = long.finalize().to_vec();
-    }
-    key.resize(block, 0);
-    let inner_key: Vec<u8> = key.iter().map(|byte| byte ^ 0x36).collect();
-    inner.update(&inner_key);
-    let mut outer = inner.box_clone();
-    outer.reset();
-    let outer_key: Vec<u8> = key.iter().map(|byte| byte ^ 0x5c).collect();
-    outer.update(&outer_key);
-    Some((inner, outer))
-}
-
-/// The HMAC of `data` with the keyed state `state`, which stays unchanged.
-fn hmac_digest(state: &HmacState, data: &[&[u8]]) -> Vec<u8> {
-    let mut inner = state.0.box_clone();
-    for part in data {
-        inner.update(part);
-    }
-    let mut outer = state.1.box_clone();
-    outer.update(&inner.finalize());
-    outer.finalize().to_vec()
 }
 
 /// `options[name]` as a string, or `None` if `options` is `undefined` or `null` or the option is
@@ -452,13 +573,13 @@ fn byte_source(
     if value.is_string() {
         let encoding = match encoding {
             None | Some("" | "buffer") => Encoding::Utf8,
-            Some(name) => Encoding::parse(name).ok_or_else(|| {
-                NodeError::new(
-                    ErrorKind::TypeError,
-                    "ERR_UNKNOWN_ENCODING",
-                    format!("Unknown encoding: {name}"),
-                )
-            })?,
+            Some(name) => match Encoding::parse(name) {
+                Some(encoding) => encoding,
+                None => {
+                    let name = name.to_jsval_throwing(scope)?;
+                    return Err(crate::buffer::unknown_encoding(scope, name));
+                }
+            },
         };
         let string = js::JSString::from_value(scope, value)?;
         return Ok(Some(encode_string(scope, string, encoding)?));
@@ -489,7 +610,7 @@ fn secret_key_bytes(
             )
             .into());
         }
-        return Ok(data.bytes.clone());
+        return Ok(js::typedarray::copy_slice_or_report(scope, &data.bytes)?);
     }
     byte_source(scope, key, encoding)?.ok_or_else(|| {
         let expected = "of type string or an instance of ArrayBuffer, Buffer, TypedArray, \
@@ -638,20 +759,14 @@ impl SecretKeyObject {
         scope: &'r Scope<'_>,
         options: Option<HandleValue<'_>>,
     ) -> Result<HandleValue<'r>, Thrown> {
-        let bytes = self.data().parent.bytes.clone();
+        let mut jwk = false;
         if let Some(options) = options.filter(|options| !options.is_undefined()) {
-            let options = crate::errors::validate_plain_object(scope, options, "options", true)?;
+            let options = crate::errors::validate_plain_object(scope, options, "options", false)?;
             let format = options.get_property(scope, c"format")?;
             match crate::support::rust_string(scope, format).as_deref() {
                 _ if format.is_undefined() => {}
                 Some("buffer") => {}
-                Some("jwk") => {
-                    let jwk = Object::new_plain(scope)?;
-                    jwk.set_property(scope, c"kty", "oct")?;
-                    let k = decode_bytes(scope, &bytes, Encoding::Base64Url)?;
-                    jwk.set_property(scope, c"k", k)?;
-                    return Ok(jwk.to_jsval_throwing(scope)?);
-                }
+                Some("jwk") => jwk = true,
                 _ => {
                     let reason = "must be one of: undefined, 'buffer', 'jwk'";
                     return Err(NodeError::invalid_arg_value(
@@ -664,7 +779,15 @@ impl SecretKeyObject {
                 }
             }
         }
-        Ok(new_buffer(scope, &bytes)?.to_jsval_throwing(scope)?)
+        let bytes = js::typedarray::copy_slice_or_report(scope, &self.data().parent.bytes)?;
+        if jwk {
+            let jwk = Object::new_plain(scope)?;
+            jwk.set_property(scope, c"kty", "oct")?;
+            let k = decode_bytes(scope, &bytes, Encoding::Base64Url)?;
+            jwk.set_property(scope, c"k", k)?;
+            return Ok(jwk.to_jsval_throwing(scope)?);
+        }
+        Ok(crate::buffer::buffer_from_vec(scope, bytes)?.to_jsval_throwing(scope)?)
     }
 }
 
@@ -722,9 +845,12 @@ fn validate_size(
     }
     let number = value.to_number() * element_size as f64;
     if !(0.0..=2147483647.0).contains(&number) {
-        return Err(
-            NodeError::out_of_range(name, ">= 0 && <= 2147483647", &number.to_string()).into(),
-        );
+        return Err(NodeError::out_of_range(
+            name,
+            ">= 0 && <= 2147483647",
+            &out_of_range_received(number),
+        )
+        .into());
     }
     Ok(number)
 }
@@ -784,23 +910,18 @@ fn pbkdf2_bytes(
     iterations: u32,
     length: usize,
 ) -> Result<Vec<u8>, DeriveError> {
-    let state = hmac_state(name, password).ok_or_else(|| invalid_digest(name))?;
+    let digest = digest_name(name).ok_or_else(|| invalid_digest(name))?;
     if length == 0 {
         return Err(DeriveError::Failed);
     }
     let mut output = derived_key_buffer(length)?;
-    let mut block_index = 1u32;
-    while output.len() < length {
-        let mut u = hmac_digest(&state, &[salt, &block_index.to_be_bytes()]);
-        let mut t = u.clone();
-        for _ in 1..iterations {
-            u = hmac_digest(&state, &[&u]);
-            t.iter_mut().zip(&u).for_each(|(t, u)| *t ^= u);
-        }
-        let take = t.len().min(length - output.len());
-        output.extend_from_slice(&t[..take]);
-        block_index += 1;
-    }
+    output.resize(length, 0);
+    with_digest!(digest, |D| pbkdf2::pbkdf2_hmac::<D>(
+        password,
+        salt,
+        iterations,
+        &mut output
+    ));
     Ok(output)
 }
 
@@ -813,8 +934,8 @@ fn hkdf_bytes(
     info: &[u8],
     length: usize,
 ) -> Result<Vec<u8>, DeriveError> {
-    let (digest, _) = hasher(name).ok_or_else(|| invalid_digest(name))?;
-    let size = digest.output_size();
+    let digest = digest_name(name).ok_or_else(|| invalid_digest(name))?;
+    let size = with_digest!(digest, |D| <D as digest::Digest>::output_size());
     if length > 255 * size {
         return Err(NodeError::new(
             ErrorKind::RangeError,
@@ -826,18 +947,11 @@ fn hkdf_bytes(
     if length == 0 {
         return Err(DeriveError::Failed);
     }
-    let extract = hmac_state(name, salt).ok_or_else(|| invalid_digest(name))?;
-    let prk = hmac_digest(&extract, &[key]);
-    let expand = hmac_state(name, &prk).ok_or_else(|| invalid_digest(name))?;
     let mut output = derived_key_buffer(length)?;
-    let mut previous = Vec::new();
-    let mut counter = 1u8;
-    while output.len() < length {
-        previous = hmac_digest(&expand, &[&previous, info, &[counter]]);
-        let take = previous.len().min(length - output.len());
-        output.extend_from_slice(&previous[..take]);
-        counter = counter.wrapping_add(1);
-    }
+    output.resize(length, 0);
+    with_digest!(digest, |D| hkdf::Hkdf::<D>::new(Some(salt), key)
+        .expand(info, &mut output)
+        .expect("the length is at most 255 times the digest's size"));
     Ok(output)
 }
 
@@ -907,47 +1021,13 @@ fn check_scrypt_params(params: &ScryptParams) -> Result<(), NodeError> {
 
 /// The Salsa20/8 core of RFC 7914 applied to `block` in place.
 fn salsa20_8(block: &mut [u32; 16]) {
-    let mut x = *block;
-    for _ in 0..4 {
-        for (a, b, c, d) in [
-            (4, 0, 12, 7),
-            (8, 4, 0, 9),
-            (12, 8, 4, 13),
-            (0, 12, 8, 18),
-            (9, 5, 1, 7),
-            (13, 9, 5, 9),
-            (1, 13, 9, 13),
-            (5, 1, 13, 18),
-            (14, 10, 6, 7),
-            (2, 14, 10, 9),
-            (6, 2, 14, 13),
-            (10, 6, 2, 18),
-            (3, 15, 11, 7),
-            (7, 3, 15, 9),
-            (11, 7, 3, 13),
-            (15, 11, 7, 18),
-            (1, 0, 3, 7),
-            (2, 1, 0, 9),
-            (3, 2, 1, 13),
-            (0, 3, 2, 18),
-            (6, 5, 4, 7),
-            (7, 6, 5, 9),
-            (4, 7, 6, 13),
-            (5, 4, 7, 18),
-            (11, 10, 9, 7),
-            (8, 11, 10, 9),
-            (9, 8, 11, 13),
-            (10, 9, 8, 18),
-            (12, 15, 14, 7),
-            (13, 12, 15, 9),
-            (14, 13, 12, 13),
-            (15, 14, 13, 18),
-        ] {
-            x[a] ^= x[b].wrapping_add(x[c]).rotate_left(d);
-        }
-    }
-    for (word, mixed) in block.iter_mut().zip(x) {
-        *word = word.wrapping_add(mixed);
+    use salsa20::cipher::StreamCipherCore;
+    let mut output =
+        salsa20::cipher::Block::<salsa20::SalsaCore<salsa20::cipher::consts::U4>>::default();
+    salsa20::SalsaCore::<salsa20::cipher::consts::U4>::from_raw_state(*block)
+        .write_keystream_block(&mut output);
+    for (word, bytes) in block.iter_mut().zip(output.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
     }
 }
 
@@ -1151,7 +1231,7 @@ fn derived_async(
 }
 
 /// The arguments of `pbkdf2` and `pbkdf2Sync`, checked as Node.js's `check` in
-/// `lib/internal/crypto/pbkdf2.js` checks them, and the derived key.
+/// `lib/internal/crypto/pbkdf2.js` checks them, and a function that derives the key.
 fn pbkdf2_args(
     scope: &Scope<'_>,
     password: HandleValue<'_>,
@@ -1159,39 +1239,41 @@ fn pbkdf2_args(
     iterations: HandleValue<'_>,
     keylen: HandleValue<'_>,
     digest: HandleValue<'_>,
-) -> Result<Result<Vec<u8>, DeriveError>, Thrown> {
+) -> Result<impl FnOnce() -> Result<Vec<u8>, DeriveError>, Thrown> {
     let digest = crate::errors::validate_string(scope, digest, "digest")?;
     let password = array_buffer_or_view(scope, password, "password")?;
     let salt = array_buffer_or_view(scope, salt, "salt")?;
     let iterations = validate_int32(scope, iterations, "iterations", 1.0)?;
     let keylen = validate_int32(scope, keylen, "keylen", 0.0)?;
-    Ok(pbkdf2_bytes(
-        &digest,
-        &password,
-        &salt,
-        iterations as u32,
-        keylen as usize,
-    ))
+    Ok(move || {
+        pbkdf2_bytes(
+            &digest,
+            &password,
+            &salt,
+            iterations as u32,
+            keylen as usize,
+        )
+    })
 }
 
 /// The arguments of `scrypt` and `scryptSync`, checked as Node.js's `check` in
-/// `lib/internal/crypto/scrypt.js` checks them, and the derived key.
+/// `lib/internal/crypto/scrypt.js` checks them, and a function that derives the key.
 fn scrypt_args(
     scope: &Scope<'_>,
     password: HandleValue<'_>,
     salt: HandleValue<'_>,
     keylen: HandleValue<'_>,
     options: HandleValue<'_>,
-) -> Result<Result<Vec<u8>, DeriveError>, Thrown> {
+) -> Result<impl FnOnce() -> Result<Vec<u8>, DeriveError>, Thrown> {
     let password = array_buffer_or_view(scope, password, "password")?;
     let salt = array_buffer_or_view(scope, salt, "salt")?;
     let keylen = validate_int32(scope, keylen, "keylen", 0.0)?;
     let params = scrypt_options(scope, options)?;
-    Ok(scrypt_bytes(&password, &salt, &params, keylen as usize))
+    Ok(move || scrypt_bytes(&password, &salt, &params, keylen as usize))
 }
 
 /// The arguments of `hkdf` and `hkdfSync`, checked as Node.js's `validateParameters` in
-/// `lib/internal/crypto/hkdf.js` checks them, and the derived key.
+/// `lib/internal/crypto/hkdf.js` checks them, and a function that derives the key.
 fn hkdf_args(
     scope: &Scope<'_>,
     digest: HandleValue<'_>,
@@ -1199,10 +1281,10 @@ fn hkdf_args(
     salt: HandleValue<'_>,
     info: HandleValue<'_>,
     length: HandleValue<'_>,
-) -> Result<Result<Vec<u8>, DeriveError>, Thrown> {
+) -> Result<impl FnOnce() -> Result<Vec<u8>, DeriveError>, Thrown> {
     let digest = crate::errors::validate_string(scope, digest, "digest")?;
     let key = match key_object(scope, key) {
-        Some(key) => key.data().bytes.clone(),
+        Some(key) => js::typedarray::copy_slice_or_report(scope, &key.data().bytes)?,
         None => byte_source(scope, key, None)?.ok_or_else(|| {
             let expected = "of type string or an instance of SecretKeyObject, ArrayBuffer, \
                             TypedArray, DataView, or Buffer";
@@ -1223,11 +1305,37 @@ fn hkdf_args(
         return Err(NodeError::out_of_range(
             "info",
             "must not contain more than 1024 bytes",
-            &info.len().to_string(),
+            &out_of_range_received(info.len() as f64),
         )
         .into());
     }
-    Ok(hkdf_bytes(&digest, &key, &salt, &info, length as usize))
+    Ok(move || hkdf_bytes(&digest, &key, &salt, &info, length as usize))
+}
+
+/// A view of the bytes `randomFill` and `randomFillSync` fill in `buffer`, and the size of its
+/// elements: `buffer` itself if it is an `ArrayBufferView`, and a `Uint8Array` over it if it is an
+/// `ArrayBuffer` or a `SharedArrayBuffer`. Other values are `ERR_INVALID_ARG_TYPE`.
+fn fill_target<'s>(
+    scope: &'s Scope<'_>,
+    buffer: HandleValue<'_>,
+) -> Result<(ArrayBufferView<'s>, usize), Thrown> {
+    if let Ok(object) = Object::from_value(scope, *buffer) {
+        if let Some(view) = ArrayBufferView::from_object(object) {
+            return Ok((view, view.view_kind().element_size()));
+        }
+        let whole = if let Ok(array_buffer) = object.cast::<js::ArrayBuffer>() {
+            Some(js::Uint8Array::with_buffer_to_end(scope, array_buffer, 0)?)
+        } else if let Ok(shared) = object.cast::<js::SharedArrayBuffer>() {
+            Some(js::Uint8Array::with_buffer_to_end(scope, shared, 0)?)
+        } else {
+            None
+        };
+        if let Some(whole) = whole {
+            return Ok((whole.as_array_buffer_view(), 1));
+        }
+    }
+    let expected = "an instance of ArrayBuffer or ArrayBufferView";
+    Err(NodeError::invalid_arg_type(scope, "buf", expected, buffer).into())
 }
 
 /// A random integer from `0` up to, but excluding, `range`, without bias.
@@ -1280,9 +1388,9 @@ pub mod module {
             callback = digest;
             digest = undefined;
         }
-        let result = pbkdf2_args(scope, arg(0), arg(1), arg(2), arg(3), digest)?;
+        let derive = pbkdf2_args(scope, arg(0), arg(1), arg(2), arg(3), digest)?;
         let callback = validate_function(scope, callback, "callback")?;
-        derived_async(scope, result, callback, false)
+        derived_async(scope, derive(), callback, false)
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptopbkdf2syncpassword-salt-iterations-keylen-digest>
@@ -1293,8 +1401,8 @@ pub mod module {
     ) -> Result<HandleValue<'s>, Thrown> {
         let undefined = HandleValue::undefined();
         let arg = |index: usize| args.get(index).copied().unwrap_or(undefined);
-        let result = pbkdf2_args(scope, arg(0), arg(1), arg(2), arg(3), arg(4))?;
-        derived_sync(scope, result, false)
+        let derive = pbkdf2_args(scope, arg(0), arg(1), arg(2), arg(3), arg(4))?;
+        derived_sync(scope, derive(), false)
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptoscryptpassword-salt-keylen-options-callback>:
@@ -1308,9 +1416,9 @@ pub mod module {
         } else {
             (arg(3), arg(4))
         };
-        let result = scrypt_args(scope, arg(0), arg(1), arg(2), options)?;
+        let derive = scrypt_args(scope, arg(0), arg(1), arg(2), options)?;
         let callback = validate_function(scope, callback, "callback")?;
-        derived_async(scope, result, callback, false)
+        derived_async(scope, derive(), callback, false)
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptoscryptsyncpassword-salt-keylen-options>
@@ -1321,8 +1429,8 @@ pub mod module {
     ) -> Result<HandleValue<'s>, Thrown> {
         let undefined = HandleValue::undefined();
         let arg = |index: usize| args.get(index).copied().unwrap_or(undefined);
-        let result = scrypt_args(scope, arg(0), arg(1), arg(2), arg(3))?;
-        derived_sync(scope, result, false)
+        let derive = scrypt_args(scope, arg(0), arg(1), arg(2), arg(3))?;
+        derived_sync(scope, derive(), false)
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptohkdfdigest-ikm-salt-info-keylen-callback>:
@@ -1332,9 +1440,9 @@ pub mod module {
     pub fn hkdf(scope: &Scope<'_>, args: RestArgs<HandleValue<'_>>) -> Result<(), Thrown> {
         let undefined = HandleValue::undefined();
         let arg = |index: usize| args.get(index).copied().unwrap_or(undefined);
-        let result = hkdf_args(scope, arg(0), arg(1), arg(2), arg(3), arg(4))?;
+        let derive = hkdf_args(scope, arg(0), arg(1), arg(2), arg(3), arg(4))?;
         let callback = validate_function(scope, arg(5), "callback")?;
-        derived_async(scope, result, callback, true)
+        derived_async(scope, derive(), callback, true)
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptohkdfsyncdigest-ikm-salt-info-keylen>: the key as
@@ -1346,8 +1454,8 @@ pub mod module {
     ) -> Result<HandleValue<'s>, Thrown> {
         let undefined = HandleValue::undefined();
         let arg = |index: usize| args.get(index).copied().unwrap_or(undefined);
-        let result = hkdf_args(scope, arg(0), arg(1), arg(2), arg(3), arg(4))?;
-        derived_sync(scope, result, true)
+        let derive = hkdf_args(scope, arg(0), arg(1), arg(2), arg(3), arg(4))?;
+        derived_sync(scope, derive(), true)
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptocreatehashalgorithm-options>
@@ -1358,10 +1466,12 @@ pub mod module {
         options: Option<HandleValue<'_>>,
     ) -> Result<Object<'s>, Thrown> {
         let name = crate::errors::validate_string(scope, algorithm, "algorithm")?;
-        let Some((hasher, _)) = hasher(&name) else {
+        let options = options.unwrap_or(HandleValue::undefined());
+        let output_length = output_length_option(scope, options)?;
+        let Some(hasher) = hasher(&name) else {
             return Err(unsupported_digest(scope, "Digest method not supported"));
         };
-        let options = options.unwrap_or(HandleValue::undefined());
+        check_output_length(scope, &*hasher, output_length)?;
         Ok(new_hash(scope, hasher, name, options)?)
     }
 
@@ -1398,7 +1508,7 @@ pub mod module {
             return Err(NodeError::invalid_arg_type(
                 scope,
                 "input",
-                "an instance of Buffer, TypedArray, or DataView or of type string",
+                "of type string or an instance of Buffer, TypedArray, or DataView",
                 data,
             )
             .into());
@@ -1433,13 +1543,13 @@ pub mod module {
                 }
             }
         };
-        let Some((mut hasher, _)) = hasher(&name) else {
+        let Some(mut hasher) = hasher(&name) else {
             return Err(unsupported_digest(
                 scope,
                 &format!("Digest method {name} is not supported"),
             ));
         };
-        hasher.update(&data_bytes(scope, data, None, "data")?);
+        data_bytes(scope, data, None, "data")?.with(|bytes| hasher.update(bytes));
         let digest = hasher.finalize();
         match encoding {
             Some(encoding) => Ok(decode_bytes(scope, &digest, encoding)?.to_jsval_throwing(scope)?),
@@ -1468,10 +1578,7 @@ pub mod module {
             Some(callback) => Some(validate_function(scope, callback, "callback")?),
             None => None,
         };
-        let buffer = crate::buffer::new_buffer_with(scope, size, |bytes| {
-            platform::random::fill(bytes);
-            Ok(())
-        })?;
+        let buffer = crate::buffer::new_buffer_with(scope, size, platform::random::fill)?;
         let buffer = buffer.to_jsval_throwing(scope)?;
         if let Some(callback) = callback {
             defer(scope, callback, buffer)?;
@@ -1488,22 +1595,8 @@ pub mod module {
         offset: Option<HandleValue<'_>>,
         size: Option<HandleValue<'_>>,
     ) -> Result<HandleValue<'s>, Thrown> {
-        let object = Object::from_value(scope, *buffer).ok();
-        let view = object.and_then(ArrayBufferView::from_object);
-        let array_buffer = object.and_then(|object| object.cast::<js::ArrayBuffer>().ok());
-        let (length, element_size) = match (view, array_buffer) {
-            (Some(view), _) => (view.byte_length(), view.view_kind().element_size()),
-            (None, Some(array_buffer)) => (array_buffer.byte_length(), 1),
-            (None, None) => {
-                return Err(NodeError::invalid_arg_type(
-                    scope,
-                    "buf",
-                    "an instance of ArrayBuffer or ArrayBufferView",
-                    buffer,
-                )
-                .into())
-            }
-        };
+        let (view, element_size) = fill_target(scope, buffer)?;
+        let length = view.byte_length();
         let offset = match offset.filter(|offset| !offset.is_undefined()) {
             Some(offset) => {
                 if !offset.is_number() {
@@ -1514,9 +1607,12 @@ pub mod module {
                 let bytes = offset.to_number() * element_size as f64;
                 if !(0.0..=length.min(2147483647) as f64).contains(&bytes) {
                     let range = format!(">= 0 && <= {}", length.min(2147483647));
-                    return Err(
-                        NodeError::out_of_range("offset", &range, &bytes.to_string()).into(),
-                    );
+                    return Err(NodeError::out_of_range(
+                        "offset",
+                        &range,
+                        &out_of_range_received(bytes),
+                    )
+                    .into());
                 }
                 bytes as usize
             }
@@ -1529,7 +1625,7 @@ pub mod module {
                     return Err(NodeError::out_of_range(
                         "size + offset",
                         &format!("<= {length}"),
-                        &(offset as f64 + size).to_string(),
+                        &out_of_range_received(offset as f64 + size),
                     )
                     .into());
                 }
@@ -1537,12 +1633,7 @@ pub mod module {
             }
             None => length - offset,
         };
-        let fill = |bytes: &mut [u8]| platform::random::fill(&mut bytes[offset..offset + size]);
-        if let Some(view) = view {
-            view.with_bytes_mut(fill);
-        } else if let Some(array_buffer) = array_buffer {
-            array_buffer.with_bytes_mut(fill);
-        }
+        view.with_bytes_mut(|bytes| platform::random::fill(&mut bytes[offset..offset + size]));
         Ok(buffer)
     }
 
@@ -1553,6 +1644,7 @@ pub mod module {
         buffer: HandleValue<'_>,
         args: RestArgs<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
+        fill_target(scope, buffer)?;
         let Some((callback, sizes)) = args.split_last() else {
             return Err(NodeError::invalid_arg_type(
                 scope,
@@ -1573,7 +1665,7 @@ pub mod module {
     /// <https://nodejs.org/api/crypto.html#cryptorandomuuidoptions>
     #[function(name = "randomUUID", length = 1)]
     pub fn random_uuid() -> String {
-        platform::random::uuid_v4()
+        web_globals::crypto::random_uuid()
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptorandomintmin-max-callback>: `min` may be left
@@ -1616,16 +1708,19 @@ pub mod module {
             return Err(NodeError::out_of_range(
                 "max",
                 &format!("greater than the value of \"min\" ({min})"),
-                &max.to_string(),
+                &out_of_range_received(max),
             )
             .into());
         }
         let range = max - min;
         if range > 281474976710655.0 {
             let name = if min_left_out { "max" } else { "max - min" };
-            return Err(
-                NodeError::out_of_range(name, "<= 281474976710655", &range.to_string()).into(),
-            );
+            return Err(NodeError::out_of_range(
+                name,
+                "<= 281474976710655",
+                &out_of_range_received(range),
+            )
+            .into());
         }
         let value = min + random_below(range as u64) as f64;
         let value = scope.root_value(js::value::from_f64(value));
@@ -1638,37 +1733,44 @@ pub mod module {
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptotimingsafeequala-b>: compares every byte,
-    /// whatever the result.
+    /// whatever the result. An argument of the wrong type gets the message of Node.js's C++
+    /// check, which doesn't describe the value.
     #[function(length = 0)]
     pub fn timing_safe_equal(
         scope: &Scope<'_>,
         a: HandleValue<'_>,
         b: HandleValue<'_>,
     ) -> Result<bool, Thrown> {
-        let bytes = |value: HandleValue<'_>, name: &str| -> Result<Vec<u8>, Thrown> {
-            let bytes = match Object::from_value(scope, *value) {
-                Ok(object) => js::typedarray::copy_buffer_source_bytes(scope, object)?,
-                Err(_) => None,
-            };
-            bytes.ok_or_else(|| {
-                let expected = "an instance of ArrayBuffer, Buffer, TypedArray, or DataView";
-                NodeError::invalid_arg_type(scope, name, expected, value).into()
-            })
+        let source = |value: HandleValue<'_>, name: &str| -> Result<Object<'_>, Thrown> {
+            Object::from_value(scope, *value)
+                .ok()
+                .filter(|object| js::typedarray::is_buffer_source(*object))
+                .ok_or_else(|| {
+                    let message = format!(
+                        "The \"{name}\" argument must be an instance of ArrayBuffer, Buffer, \
+                         TypedArray, or DataView."
+                    );
+                    NodeError::new(ErrorKind::TypeError, "ERR_INVALID_ARG_TYPE", message).into()
+                })
         };
-        let a = bytes(a, "buf1")?;
-        let b = bytes(b, "buf2")?;
-        if a.len() != b.len() {
-            return Err(NodeError::new(
+        let a = source(a, "buf1")?;
+        let b = source(b, "buf2")?;
+        let equal = js::typedarray::with_buffer_source_bytes_pair(a, b, |a, b| {
+            (a.len() == b.len()).then(|| {
+                a.iter()
+                    .zip(b)
+                    .fold(0u8, |difference, (x, y)| difference | (x ^ y))
+                    == 0
+            })
+        });
+        equal.flatten().ok_or_else(|| {
+            NodeError::new(
                 ErrorKind::RangeError,
                 "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH",
                 "Input buffers must have the same byte length",
             )
-            .into());
-        }
-        Ok(a.iter()
-            .zip(&b)
-            .fold(0u8, |difference, (x, y)| difference | (x ^ y))
-            == 0)
+            .into()
+        })
     }
 
     /// <https://nodejs.org/api/crypto.html#cryptogetrandomvaluestypedarray>: the global
@@ -1679,23 +1781,16 @@ pub mod module {
     ) -> Result<HandleValue<'s>, ExnThrown> {
         let view = Object::from_value(scope, *array)
             .ok()
-            .and_then(|object| object.cast::<js::ArrayBufferView>().ok())
-            .filter(|view| view.view_kind().is_integer_array());
+            .and_then(|object| object.cast::<js::ArrayBufferView>().ok());
         let Some(view) = view else {
             return Err(web_globals::dom_exception::throw_dom_exception(
                 scope,
                 "TypeMismatchError",
-                "The data argument must be an integer-type TypedArray",
+                web_globals::crypto::TYPE_MISMATCH_MESSAGE,
             ));
         };
-        if view.byte_length() > 65536 {
-            return Err(web_globals::dom_exception::throw_dom_exception(
-                scope,
-                "QuotaExceededError",
-                "The requested length exceeds 65,536 bytes",
-            ));
-        }
-        view.with_bytes_mut(platform::random::fill);
+        web_globals::crypto::get_random_values(view)
+            .map_err(|error| js::error::ThrowException::throw(error, scope))?;
         Ok(array)
     }
 }

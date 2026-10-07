@@ -824,6 +824,56 @@ fn concurrent_requests_in_one_instance_keep_their_own_state() {
     assert_met_in_one_instance(&[&slow, &quick, &streamed_body]);
 }
 
+/// Requests interleaved in one instance each keep their `AsyncLocalStorage` store across host I/O,
+/// a timer and a settled-promise `await`, with the store they `run` their handler in.
+#[test]
+fn concurrent_requests_keep_their_own_async_local_storage() {
+    let gate = common::start_held_upstream("go");
+    let handler = format!(
+        r#"import {{ AsyncLocalStorage }} from 'node:async_hooks';
+    {INSTANCE_ID}
+    const storage = new AsyncLocalStorage();
+    addEventListener('fetch', (event) => {{
+        const url = new URL(event.request.url);
+        if (url.pathname === '/ready') {{
+            event.respondWith(new Response('ready'));
+            return;
+        }}
+        const tag = url.searchParams.get('tag');
+        event.respondWith(storage.run(tag, async () => {{
+            await fetch('http://127.0.0.1:{gate}/hold');
+            const delay = Number(url.searchParams.get('delay'));
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            await null;
+            return new Response('store=' + storage.getStore() + ' instance=' + globalThis.instance);
+        }}));
+    }});"#,
+        gate = gate.port()
+    );
+    let Some(server) = Serve::new(18478)
+        .reusing_one_instance()
+        .without_gc_zeal()
+        .flags(["--node-compat"])
+        .module("handler.mjs", &handler)
+        .start()
+    else {
+        return;
+    };
+
+    let mut seen = server.idle_so_far();
+    let slow = spawn_request(server.port(), "/?tag=alpha&delay=600");
+    await_admission(&gate, &server, &mut seen, "alpha");
+    let quick = spawn_request(server.port(), "/?tag=beta&delay=100");
+    await_admission(&gate, &server, &mut seen, "beta");
+    gate.release();
+
+    let slow = slow.join().unwrap();
+    let quick = quick.join().unwrap();
+    assert!(slow.contains("store=alpha "), "{slow}");
+    assert!(quick.contains("store=beta "), "{quick}");
+    assert_met_in_one_instance(&[&slow, &quick]);
+}
+
 /// The realm-stack worry the `RUNTIME` thread-local is written around: entering the global's realm
 /// per request would mean `JSAutoRealm` scopes dropping out of order under interleaving, restoring
 /// the wrong realm under whichever requests are still in flight. Requests here are deliberately
@@ -2955,56 +3005,6 @@ fn a_client_hanging_up_mid_body_aborts_the_request_signal() {
         "{}",
         server.log()
     );
-}
-
-/// Requests interleaved in one instance each keep their `AsyncLocalStorage` store across host I/O,
-/// a timer and a settled-promise `await`, with the store they `run` their handler in.
-#[test]
-fn concurrent_requests_keep_their_own_async_local_storage() {
-    let gate = common::start_held_upstream("go");
-    let handler = format!(
-        r#"import {{ AsyncLocalStorage }} from 'node:async_hooks';
-    {INSTANCE_ID}
-    const storage = new AsyncLocalStorage();
-    addEventListener('fetch', (event) => {{
-        const url = new URL(event.request.url);
-        if (url.pathname === '/ready') {{
-            event.respondWith(new Response('ready'));
-            return;
-        }}
-        const tag = url.searchParams.get('tag');
-        event.respondWith(storage.run(tag, async () => {{
-            await fetch('http://127.0.0.1:{gate}/hold');
-            const delay = Number(url.searchParams.get('delay'));
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            await null;
-            return new Response('store=' + storage.getStore() + ' instance=' + globalThis.instance);
-        }}));
-    }});"#,
-        gate = gate.port()
-    );
-    let Some(server) = Serve::new(18478)
-        .reusing_one_instance()
-        .without_gc_zeal()
-        .flags(["--node-compat"])
-        .module("handler.mjs", &handler)
-        .start()
-    else {
-        return;
-    };
-
-    let mut seen = server.idle_so_far();
-    let slow = spawn_request(server.port(), "/?tag=alpha&delay=600");
-    await_admission(&gate, &server, &mut seen, "alpha");
-    let quick = spawn_request(server.port(), "/?tag=beta&delay=100");
-    await_admission(&gate, &server, &mut seen, "beta");
-    gate.release();
-
-    let slow = slow.join().unwrap();
-    let quick = quick.join().unwrap();
-    assert!(slow.contains("store=alpha "), "{slow}");
-    assert!(quick.contains("store=beta "), "{quick}");
-    assert_met_in_one_instance(&[&slow, &quick]);
 }
 
 /// With `--node-compat`, an `http.createServer` server responds to the requests a `wasi:http` host

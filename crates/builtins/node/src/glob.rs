@@ -9,7 +9,7 @@
 //! engine's `RegExp`. Matching follows minimatch's POSIX rules on every platform.
 
 use js::error::{ExnThrown, ThrowException};
-use js::gc::handle::RootedHeap;
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 
 /// The options of a [`Glob`] that differ between Node's uses of minimatch.
@@ -32,13 +32,21 @@ pub(crate) fn platform_nocase() -> bool {
 /// The longest pattern minimatch accepts, in UTF-16 code units.
 const MAX_PATTERN_LENGTH: usize = 1024 * 64;
 
-/// A compiled glob pattern.
+/// A compiled glob pattern. Its regular expressions are `Heap`s, so a `Glob` lives in traced
+/// storage, such as a `RootedTraceableBox` or a class's private data.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
 pub(crate) struct Glob {
     /// Whether the pattern is empty, which only matches the empty path.
+    #[no_trace]
     empty: bool,
     /// The alternatives the pattern expands to, each a list of segment matchers.
+    #[no_trace]
     set: Vec<Vec<Part>>,
+    #[no_trace]
     options: GlobOptions,
+    /// The `RegExp`s of the [`Regex`] segment matchers, in the order of their `index`.
+    compiled: Vec<Heap<js::regexp::RegExp>>,
 }
 
 /// The matcher of one path segment.
@@ -57,8 +65,8 @@ struct Regex {
     source: String,
     flags: String,
     fast: Option<FastTest>,
-    /// The `RegExp` of `source` and `flags`, once [`Glob::new`] compiled it.
-    compiled: Option<RootedHeap<js::regexp::RegExp>>,
+    /// The index of the `RegExp` of `source` and `flags` in [`Glob::compiled`].
+    index: usize,
 }
 
 /// The tests minimatch substitutes for the regular expressions of common segment patterns.
@@ -151,6 +159,7 @@ impl Glob {
                 empty: true,
                 set: Vec::new(),
                 options,
+                compiled: Vec::new(),
             });
         }
         let expanded = brace_expand(scope, &pattern)?;
@@ -169,16 +178,18 @@ impl Glob {
             .collect::<Result<_, _>>()?;
         // We compile every regular expression here so that an invalid one throws a `SyntaxError`
         // whatever the path, as in Node.js.
+        let mut compiled = Vec::new();
         for part in set.iter_mut().flatten() {
             if let Part::Regex(regex) = part {
-                let compiled = compile_regex(scope, &regex.source, &regex.flags)?;
-                regex.compiled = Some(RootedHeap::new(compiled));
+                regex.index = compiled.len();
+                compiled.push(compile_regex(scope, &regex.source, &regex.flags)?);
             }
         }
         Ok(Glob {
             empty: false,
             set,
             options,
+            compiled: compiled.into_iter().map(Heap::from).collect(),
         })
     }
 
@@ -226,7 +237,7 @@ impl Glob {
         match part {
             Part::Globstar => Ok(false),
             Part::Literal(literal) => Ok(literal == segment),
-            Part::Regex(regex) => match (&regex.fast, &regex.compiled) {
+            Part::Regex(regex) => match (&regex.fast, self.compiled.get(regex.index)) {
                 (Some(fast), _) => Ok(fast.test(segment, self.options.nocase)),
                 (None, Some(compiled)) => regex_test(scope, compiled.get(scope), segment),
                 (None, None) => Ok(false),
@@ -1014,7 +1025,7 @@ fn parse_part(scope: &Scope<'_>, pattern: &str, options: GlobOptions) -> Result<
             source,
             flags,
             fast: FastTest::of(pattern),
-            compiled: None,
+            index: 0,
         }),
     })
 }

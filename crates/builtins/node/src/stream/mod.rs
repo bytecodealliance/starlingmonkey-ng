@@ -8,7 +8,7 @@
 //! Node's names, so code that inspects them reads the same values. `process.nextTick` work runs
 //! in the tick queue of `process.nextTick`.
 
-mod adapters;
+pub(crate) mod adapters;
 mod destroy;
 mod duplex;
 mod duplex_pair;

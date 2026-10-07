@@ -90,6 +90,11 @@ test("plan mismatch", (t) => {
   t.assert.ok(true);
 });
 
+test("plan twice", (t) => {
+  t.plan(1);
+  t.plan(1);
+});
+
 test("timeout", { timeout: 10 }, () => new Promise(() => {}));
 
 test("uncaught", (t, done) => {
@@ -189,6 +194,10 @@ test("mock.method", (t) => {
   t.mock.getter(object, "prop", () => "mocked");
   eq(object.prop, "mocked", "mock.getter");
   throws(() => t.mock.method(object, "value"), "ERR_INVALID_ARG_VALUE", "only methods");
+  const badName = throws(() => t.mock.method(object, 1), "ERR_INVALID_ARG_TYPE", "method names");
+  eq(badName.message.startsWith('The "methodName" argument must be one of type string or symbol.'), true, "the methodName message");
+  const fixed = Object.defineProperty({}, "m", { value() {}, writable: false, configurable: false });
+  eq(throws(() => t.mock.method(fixed, "m", () => {}), TypeError, "a fixed method").message, "Cannot redefine property: m", "V8's message");
 });
 
 test("mock restored after the test", () => {
@@ -223,6 +232,7 @@ const expected = `
 ✖ callback error (*ms)
 ✔ plan (*ms)
 ✖ plan mismatch (*ms)
+✖ plan twice (*ms)
 ✖ timeout (*ms)
 ✖ uncaught (*ms)
 ▶ only subtests
@@ -243,10 +253,10 @@ const expected = `
 ✔ mock.fn (*ms)
 ✔ mock.method (*ms)
 ✔ mock restored after the test (*ms)
-ℹ tests 28
+ℹ tests 29
 ℹ suites 3
 ℹ pass 13
-ℹ fail 7
+ℹ fail 8
 ℹ cancelled 4
 ℹ skipped 3
 ℹ todo 1
@@ -275,6 +285,9 @@ const expected = `
 
 ✖ plan mismatch (*ms)
   'plan expected 2 assertions but received 1'
+
+✖ plan twice (*ms)
+  'cannot set plan more than once'
 
 ✖ timeout (*ms)
   'test timed out after 10ms'

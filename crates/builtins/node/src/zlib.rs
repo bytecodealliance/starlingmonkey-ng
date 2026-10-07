@@ -18,14 +18,16 @@ use compression::{Codec, Flush, Format, Params, ZlibError};
 use js::conversion::{FromJSVal, ToJSVal};
 use js::error::{ExnThrown, ThrowException};
 use js::function::{cast_payload, CallbackArgs};
-use js::gc::handle::Heap;
+use js::gc::handle::{Heap, OptionHeapExt};
 use js::gc::scope::Scope;
 use js::native::{HandleId, Value};
 use js::prelude::HandleValue;
 use js::Object;
 
-use crate::buffer::{encode_string, new_buffer, Encoding, MAX_LENGTH};
-use crate::errors::{validate_function, ErrorKind, NodeError, Thrown};
+use crate::buffer::{
+    buffer_from_vec, encode_string, new_buffer, Encoding, ALLOCATION_LIMIT, MAX_LENGTH,
+};
+use crate::errors::{number_to_string, validate_function, ErrorKind, NodeError, Thrown};
 use crate::stream::state::{StreamState, StreamStateImpl};
 use crate::support::{next_tick_call, Props};
 
@@ -364,27 +366,49 @@ fn max_flush(a: f64, b: f64) -> f64 {
     }
 }
 
-/// The bytes of `data`: a string as UTF-8, or the bytes of a `Buffer`, `TypedArray`, `DataView`
-/// or `ArrayBuffer`.
-fn input_bytes(scope: &Scope<'_>, data: HandleValue<'_>) -> Result<Vec<u8>, Thrown> {
-    if data.is_string() {
-        let string = js::JSString::from_value(scope, data)?;
-        return Ok(encode_string(scope, string, Encoding::Utf8)?);
-    }
-    let bytes = match Object::from_value(scope, *data) {
-        Ok(object) => js::typedarray::copy_buffer_source_bytes(scope, object)?,
-        Err(_) => None,
-    };
-    bytes.ok_or_else(|| {
-        NodeError::invalid_arg_type(
-            scope,
-            "buffer",
-            "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer",
-            data,
-        )
-        .into()
-    })
+/// The input of a conversion or a write: a `Buffer`, `TypedArray`, `DataView` or `ArrayBuffer`
+/// chunk, whose bytes are read in place, or bytes of its own, such as those of a string chunk.
+enum Input<'s> {
+    Chunk(Object<'s>),
+    Bytes(Vec<u8>),
 }
+
+impl<'s> Input<'s> {
+    /// The input of the chunk `data`, the argument `name`. Other values than strings and buffer
+    /// sources are an `ERR_INVALID_ARG_TYPE` that names `expected` as the expected types.
+    fn of(
+        scope: &'s Scope<'_>,
+        data: HandleValue<'_>,
+        name: &str,
+        expected: &str,
+    ) -> Result<Self, Thrown> {
+        if data.is_string() {
+            let string = js::JSString::from_value(scope, data)?;
+            return Ok(Input::Bytes(encode_string(scope, string, Encoding::Utf8)?));
+        }
+        match Object::from_value(scope, *data) {
+            Ok(chunk) if js::typedarray::is_buffer_source(chunk) => Ok(Input::Chunk(chunk)),
+            _ => Err(NodeError::invalid_arg_type(scope, name, expected, data).into()),
+        }
+    }
+
+    /// Call `f` with the bytes of the input.
+    fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R + Send) -> R {
+        match self {
+            Input::Chunk(chunk) => js::typedarray::with_buffer_source_bytes(*chunk, f)
+                .expect("a chunk input is a buffer source"),
+            Input::Bytes(bytes) => f(bytes),
+        }
+    }
+}
+
+/// The types the synchronous conversions, such as `deflateSync`, accept as input.
+const SYNC_INPUT_TYPES: &str =
+    "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer";
+
+/// The types a stream's `write` accepts, which the callback conversions, such as `deflate`, write
+/// their input with. They accept an `ArrayBuffer` too.
+const CHUNK_TYPES: &str = "of type string or an instance of Buffer, TypedArray, or DataView";
 
 /// Node.js's `checkRangesOrGetDefault`: the number `value`, or `default` if it is `undefined` or
 /// `NaN`. Other values are an error unless they are a finite number from `min` to `max`.
@@ -403,12 +427,14 @@ fn range_or_default(
         return Err(NodeError::invalid_arg_type(scope, name, "of type number", value).into());
     }
     let number = value.to_number();
+    let received = crate::errors::out_of_range_received(number);
     if number.is_infinite() {
-        return Err(NodeError::out_of_range(name, "a finite number", &number.to_string()).into());
+        return Err(NodeError::out_of_range(name, "a finite number", &received).into());
     }
     if number < min || number > max {
+        let (min, max) = (number_to_string(min), number_to_string(max));
         let range = format!(">= {min} and <= {max}");
-        return Err(NodeError::out_of_range(name, &range, &number.to_string()).into());
+        return Err(NodeError::out_of_range(name, &range, &received).into());
     }
     Ok(number)
 }
@@ -621,40 +647,36 @@ fn zlib_format_options(
 
 /// Compress or decompress all of `data` in `format`, in steps of `chunkSize` bytes of output, as
 /// Node.js's `processChunkSync` does. The conversion fails with `ERR_BUFFER_TOO_LARGE` after the
-/// first step that takes the output past `maxOutputLength`. A codec error in that step takes
-/// precedence.
+/// first step that takes the output past `maxOutputLength` or [`ALLOCATION_LIMIT`]. A codec error
+/// in that step takes precedence.
 fn convert<'s>(
     scope: &'s Scope<'_>,
     format: Format,
-    data: HandleValue<'_>,
-    options: Option<HandleValue<'_>>,
-) -> Result<Result<Object<'s>, ZlibError>, Thrown> {
-    let options = zlib_options(scope, options, format)?;
-    let bytes = input_bytes(scope, data)?;
+    input: Input<'_>,
+    options: ZlibOptions,
+) -> Result<Result<Object<'s>, ZlibError>, ExnThrown> {
     let mut codec = Codec::new(format, &options.params);
     let flush = format.family().finish_flush(options.finish_flush);
-    let max = options.max_output_length as usize;
-    let mut output = Vec::new();
-    let mut offset = 0;
-    loop {
-        let step = codec.process(
-            &bytes[offset..],
-            flush,
-            options.chunk_size as usize,
-            &mut output,
-        );
-        let progress = match step {
-            Ok(progress) => progress,
-            Err(error) => return Ok(Err(error)),
-        };
-        offset += progress.consumed;
-        if output.len() > max {
-            let message = format!("Cannot create a Buffer larger than {max} bytes");
-            return Ok(Err(ZlibError::too_large(message)));
+    let max = options.max_output_length.min(ALLOCATION_LIMIT) as usize;
+    let chunk_size = options.chunk_size as usize;
+    let output = input.with_bytes(|bytes| {
+        let mut output = Vec::new();
+        let mut offset = 0;
+        loop {
+            let progress = codec.process(&bytes[offset..], flush, chunk_size, &mut output)?;
+            offset += progress.consumed;
+            if output.len() > max {
+                let message = format!("Cannot create a Buffer larger than {max} bytes");
+                return Err(ZlibError::too_large(message));
+            }
+            if progress.done {
+                return Ok(output);
+            }
         }
-        if progress.done {
-            return Ok(Ok(new_buffer(scope, &output)?));
-        }
+    });
+    match output {
+        Ok(output) => Ok(Ok(buffer_from_vec(scope, output)?)),
+        Err(error) => Ok(Err(error)),
     }
 }
 
@@ -665,26 +687,31 @@ fn convert_sync<'s>(
     data: HandleValue<'_>,
     options: Option<HandleValue<'_>>,
 ) -> Result<Object<'s>, Thrown> {
-    convert(scope, format, data, options)?.map_err(|error| error.throw(scope).into())
+    let options = zlib_options(scope, options, format)?;
+    let input = Input::of(scope, data, "buffer", SYNC_INPUT_TYPES)?;
+    convert(scope, format, input, options)?.map_err(|error| error.throw(scope).into())
 }
 
 /// The body of the callback functions, such as `deflate`: compress or decompress `data` in
-/// `format`, and call the callback, the last of `rest`, with the error or the result in a
-/// microtask. `rest` may start with options.
+/// `format`, and call the callback with the error or the result in a microtask. `rest` is the
+/// options and the callback, or the callback alone. As in Node.js, the options are validated
+/// before the callback, and `data` last, as a stream's `write` validates a chunk.
 fn convert_async(
     scope: &Scope<'_>,
     format: Format,
     data: HandleValue<'_>,
     rest: &[HandleValue<'_>],
 ) -> Result<(), Thrown> {
-    let undefined = scope.root_value(js::value::undefined());
-    let (options, callback) = match rest {
-        [] => (None, undefined),
-        [callback] => (None, *callback),
-        [options, callback, ..] => (Some(*options), *callback),
-    };
+    let undefined = HandleValue::undefined();
+    let (mut options, mut callback) = (rest.first().copied(), rest.get(1).copied());
+    if options.is_some_and(js::function::is_callable) {
+        (options, callback) = (None, options);
+    }
+    let options = zlib_options(scope, options, format)?;
+    let callback = callback.unwrap_or(undefined);
     validate_function(scope, callback, "callback")?;
-    match convert(scope, format, data, options)? {
+    let input = Input::of(scope, data, "chunk", CHUNK_TYPES)?;
+    match convert(scope, format, input, options)? {
         Ok(output) => {
             let null = scope.root_value(js::value::null());
             next_tick_call(scope, callback, &[null, output.to_jsval_throwing(scope)?])?
@@ -723,8 +750,9 @@ pub(crate) struct ZlibState {
     /// The count of bytes pushed of the current output buffer, Node's `_outOffset`.
     #[no_trace]
     out_offset: usize,
-    /// The input of the write that waits for the readable side to be read, and the offset of the
-    /// bytes not processed yet.
+    /// The input of the write that waits for the readable side to be read: its chunk, or else its
+    /// bytes, and the offset of the bytes not processed yet.
+    paused_chunk: Option<Heap<js::object::Object>>,
     #[no_trace]
     paused_input: Vec<u8>,
     #[no_trace]
@@ -761,14 +789,16 @@ fn open_state<'s>(scope: &'s Scope<'_>, stream: Object<'s>) -> Result<ZlibState<
 
 /// Process `input` from `offset` with the codec of `stream` and `flush`, push the output in
 /// buffers of at most `chunkSize` bytes, and add the bytes processed to `bytesWritten`, as Node.js's
-/// `processCallback` does. Once all output is pushed, `callback` is called without arguments. It
-/// is called with the error if the codec fails, and without arguments as soon as the stream is
-/// destroyed. When a push fills the readable side and output remains, the write waits until the
-/// readable side is read, and [`resume_write`] continues it.
+/// `processCallback` does. `_outOffset` follows the bytes pushed of the current output buffer.
+/// Once all output is pushed, `callback` is called without arguments. It is called with the error
+/// if the codec fails, and without arguments if the stream is closed when a step starts or after a
+/// push. When a push fills the readable side and output remains, the write waits until the
+/// readable side is read, and [`resume_write`] continues it. `_destroy` drops a waiting write,
+/// whose callback is then never called, as in Node.js.
 fn process_write(
     scope: &Scope<'_>,
     stream: Object<'_>,
-    input: Vec<u8>,
+    input: Input<'_>,
     mut offset: usize,
     flush: Flush,
     callback: HandleValue<'_>,
@@ -783,21 +813,25 @@ fn process_write(
             return Ok(());
         }
         let mut output = Vec::new();
-        let (result, written) = {
+        let (result, written, pushed_offset, next_offset) = {
             let mut data = state.data_mut();
             let data = &mut *data;
             let limit = data.chunk_size - data.out_offset;
-            let result = data
-                .codec
-                .process(&input[offset..], flush, limit, &mut output);
+            let codec = &mut data.codec;
+            let result = input.with_bytes(|bytes| {
+                let rest = &bytes[offset.min(bytes.len())..];
+                codec.process(rest, flush, limit, &mut output)
+            });
+            let mut pushed_offset = data.out_offset;
             if let Ok(progress) = result {
                 data.bytes_written += progress.consumed as f64;
                 data.out_offset += output.len();
+                pushed_offset = data.out_offset;
                 if !progress.done || data.out_offset >= data.chunk_size {
                     data.out_offset = 0;
                 }
             }
-            (result, data.bytes_written)
+            (result, data.bytes_written, pushed_offset, data.out_offset)
         };
         let progress = match result {
             Ok(progress) => progress,
@@ -808,12 +842,18 @@ fn process_write(
             }
         };
         offset += progress.consumed;
-        stream.set_property(scope, c"bytesWritten", written)?;
+        if progress.consumed > 0 {
+            stream.set_property(scope, c"bytesWritten", written)?;
+        }
         let mut full = false;
         if !output.is_empty() {
-            let buffer = new_buffer(scope, &output)?.to_jsval_throwing(scope)?;
+            stream.set_property(scope, c"_outOffset", pushed_offset as f64)?;
+            let buffer = buffer_from_vec(scope, output)?.to_jsval_throwing(scope)?;
             let pushed = js::Function::call_by_name(scope, stream.handle(), c"push", &[buffer])?;
             full = !js::conversion::to_boolean(pushed);
+        }
+        if next_offset != pushed_offset && !is_closed(scope, stream)? {
+            stream.set_property(scope, c"_outOffset", next_offset as f64)?;
         }
         if progress.done || is_closed(scope, stream)? {
             js::Function::call(scope, undefined, callback, js::function::EmptyArgs)?;
@@ -822,7 +862,10 @@ fn process_write(
         if full {
             {
                 let mut data = state.data_mut();
-                data.paused_input = input;
+                match input {
+                    Input::Chunk(chunk) => data.paused_chunk = Some(Heap::from(chunk)),
+                    Input::Bytes(bytes) => data.paused_input = bytes,
+                }
                 data.paused_offset = offset;
                 data.paused_flush = flush;
                 data.paused_callback = Some(Heap::from(callback.get()));
@@ -867,12 +910,11 @@ fn continue_write(
             .as_ref()
             .map(|callback| callback.get(scope));
         data.paused_callback = None;
-        (
-            std::mem::take(&mut data.paused_input),
-            data.paused_offset,
-            data.paused_flush,
-            callback,
-        )
+        let input = match data.paused_chunk.take_rooted(scope) {
+            Some(chunk) => Input::Chunk(chunk),
+            None => Input::Bytes(std::mem::take(&mut data.paused_input)),
+        };
+        (input, data.paused_offset, data.paused_flush, callback)
     };
     if let Some(callback) = callback {
         process_write(scope, stream, input, offset, flush, callback)?;
@@ -906,9 +948,10 @@ fn flush_flag<'s>(scope: &'s Scope<'_>) -> Result<HandleId<'s>, ExnThrown> {
     FLUSH_FLAG.id(scope)
 }
 
-/// The flush the chunk `chunk` written to `stream` is processed with, as Node.js's `_transform`
-/// chooses it: the flush constant of the chunk's flush flag, or the stream's `flush` option, and
-/// at least the stream's `finishFlush` for the last chunk written before `end()`.
+/// The flush the chunk `chunk` of `length` bytes written to `stream` is processed with, as
+/// Node.js's `_transform` chooses it: the flush constant of the chunk's flush flag, or the
+/// stream's `flush` option, and at least the stream's `finishFlush` for the last chunk written
+/// before `end()`. Only the empty chunks [`flush_stream`] writes have a flush flag.
 fn chunk_flush(
     scope: &Scope<'_>,
     stream: Object<'_>,
@@ -925,15 +968,25 @@ fn chunk_flush(
         )
     };
     let mut kind = default_flush;
-    if let Ok(chunk) = Object::from_value(scope, *chunk) {
-        let flag = chunk.get_property_by_id(scope, flush_flag(scope)?)?;
-        if flag.is_number() {
-            kind = flag.to_number();
+    if length == 0 {
+        if let Ok(chunk) = Object::from_value(scope, *chunk) {
+            let flag = chunk.get_property_by_id(scope, flush_flag(scope)?)?;
+            if flag.is_number() {
+                kind = flag.to_number();
+            }
         }
     }
-    if stream.flag(scope, c"writableEnded")?
-        && stream.num(scope, c"writableLength")? == length as f64
-    {
+    let last = match crate::stream::state::WritableSide::try_of(scope, stream)? {
+        Some(side) => {
+            let part = side.get();
+            part.flags.contains(crate::stream::state::W::ENDING) && part.length == length as f64
+        }
+        None => {
+            stream.flag(scope, c"writableEnded")?
+                && stream.num(scope, c"writableLength")? == length as f64
+        }
+    };
+    if last {
         kind = max_flush(kind, finish_flush);
     }
     Ok(family.finish_flush(kind))
@@ -1099,12 +1152,12 @@ pub mod zlib_class {
         if is_closed(scope, this)? {
             return next_tick_call(scope, callback, &[]);
         }
-        let input = input_bytes(scope, chunk).and_then(|bytes| {
-            let flush = chunk_flush(scope, this, chunk, bytes.len())?;
-            Ok((bytes, flush))
+        let input = Input::of(scope, chunk, "chunk", CHUNK_TYPES).and_then(|input| {
+            let flush = chunk_flush(scope, this, chunk, input.with_bytes(<[u8]>::len))?;
+            Ok((input, flush))
         });
         match input {
-            Ok((bytes, flush)) => process_write(scope, this, bytes, 0, flush, callback),
+            Ok((input, flush)) => process_write(scope, this, input, 0, flush, callback),
             Err(error) => complete(scope, callback, Err(error)),
         }
     }
@@ -1124,7 +1177,7 @@ pub mod zlib_class {
             data.codec.format().family().finish_flush(kind)
         });
         match flush {
-            Ok(flush) => process_write(scope, this, Vec::new(), 0, flush, callback),
+            Ok(flush) => process_write(scope, this, Input::Bytes(Vec::new()), 0, flush, callback),
             Err(error) => complete(scope, callback, Err(error)),
         }
     }
@@ -1143,6 +1196,7 @@ pub mod zlib_class {
             let params = data.codec.params().clone();
             data.codec = Codec::closed(data.codec.created(), params);
             data.closed = true;
+            data.paused_chunk = None;
             data.paused_input = Vec::new();
             data.paused_callback = None;
         }
@@ -1152,28 +1206,30 @@ pub mod zlib_class {
     }
 
     /// <https://nodejs.org/api/zlib.html#zlibflushkind-callback>: `kind` defaults to
-    /// `Z_FULL_FLUSH`, or `BROTLI_OPERATION_FLUSH` or `ZSTD_e_flush`.
+    /// `Z_FULL_FLUSH`, or `BROTLI_OPERATION_FLUSH` or `ZSTD_e_flush`, and is validated against
+    /// the flush constants of the stream's family.
+    #[method(length = 2)]
     pub fn flush(
         scope: &Scope<'_>,
         this: Object<'_>,
         kind: Option<HandleValue<'_>>,
         callback: Option<HandleValue<'_>>,
     ) -> Result<(), Thrown> {
-        let (kind, callback) = match kind {
-            Some(kind) if js::function::is_callable(kind) => (None, Some(kind)),
-            _ => (kind, callback),
-        };
+        let undefined = HandleValue::undefined();
+        let (mut kind, mut callback) = (kind.unwrap_or(undefined), callback.unwrap_or(undefined));
+        if js::function::is_callable(kind)
+            || (kind.is_undefined() && !js::conversion::to_boolean(callback))
+        {
+            (kind, callback) = (undefined, kind);
+        }
         // A destroyed stream has no handle, and fails the write below.
         let family = if is_closed(scope, this)? {
             Family::Zlib
         } else {
             open_state(scope, this)?.data().codec.format().family()
         };
-        let full_flush = family.flush_constants().4;
-        let kind = kind
-            .filter(|kind| kind.is_number())
-            .map_or(full_flush, |kind| kind.to_number());
-        let callback = callback.unwrap_or_else(|| scope.root_value(js::value::undefined()));
+        let (lowest, highest, _, _, full_flush) = family.flush_constants();
+        let kind = range_or_default(scope, kind, "kind", lowest, highest, full_flush)?;
         Ok(flush_stream(scope, this, kind, callback)?)
     }
 
@@ -1222,6 +1278,7 @@ pub mod zlib_class {
 
     /// <https://nodejs.org/api/zlib.html#zlibclosecallback>: `callback` is called once the
     /// stream finished, closed or failed, as `stream.finished` calls it.
+    #[method(length = 1)]
     pub fn close(
         scope: &Scope<'_>,
         this: Object<'_>,
@@ -1243,6 +1300,24 @@ pub mod zlib_class {
         data.codec = Codec::new(data.codec.created(), &params);
         Ok(())
     }
+
+    /// Define the enumerable `_closed` getter.
+    #[setup]
+    pub fn setup(scope: &Scope<'_>, _ctor: Object<'_>, proto: Object<'_>) -> Result<(), ExnThrown> {
+        let getter = js::Function::new_callback(scope, c"get _closed", 0, super::closed, ())?;
+        let attrs = js::class_spec::JSPROP_ENUMERATE as u32;
+        proto.define_accessor(scope, c"_closed", Some(*getter), None, attrs)
+    }
+}
+
+/// The `_closed` getter: whether `_destroy` freed the codec of `this`. It is `true` for an object
+/// that isn't a zlib stream, which has no handle.
+fn closed(scope: &Scope<'_>, args: CallbackArgs<'_>, _: HandleValue) -> Result<Value, ExnThrown> {
+    let closed = match Object::from_value(scope, args.this()) {
+        Ok(this) => zlib_class::try_state_of(scope, this)?.is_none_or(|state| state.data().closed),
+        Err(_) => true,
+    };
+    Ok(js::value::from_bool(closed))
 }
 
 /// Define the zlib stream class `$name` for `$format` in the module `$module`.
@@ -1655,7 +1730,11 @@ pub mod module {
         data: HandleValue<'_>,
         value: Option<HandleValue<'_>>,
     ) -> Result<f64, Thrown> {
-        let bytes = input_bytes(scope, data)?;
+        if !data.is_string() && js::ArrayBufferView::from_value(scope, data).is_none() {
+            let expected = "of type string or an instance of Buffer, TypedArray, or DataView";
+            return Err(NodeError::invalid_arg_type(scope, "data", expected, data).into());
+        }
+        let input = Input::of(scope, data, "data", CHUNK_TYPES)?;
         let initial = match value.filter(|value| !value.is_undefined()) {
             None => 0.0,
             Some(value) => {
@@ -1663,13 +1742,13 @@ pub mod module {
             }
         };
         let mut hasher = crc32fast::Hasher::new_with_initial(initial as u32);
-        hasher.update(&bytes);
+        input.with_bytes(|bytes| hasher.update(bytes));
         Ok(f64::from(hasher.finalize()))
     }
 }
 
-/// Register `node:zlib` with `constants`, and with `codes`, which maps each code name to its
-/// number and each number to its name.
+/// Register `node:zlib` with `constants`, and with `codes`, a frozen object that maps each code
+/// name to its number and each number to its name.
 pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
     let tables = || -> Result<(HandleValue<'_>, HandleValue<'_>), ExnThrown> {
         let key = |name: &str| std::ffi::CString::new(name).expect("the names have no NULs");
@@ -1680,8 +1759,11 @@ pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
         let codes = Object::new_plain(scope)?;
         for (code, value) in CODES {
             codes.set_property_by_name(scope, &key(code), value)?;
+        }
+        for (code, value) in CODES {
             codes.set_property_by_name(scope, &key(&value.to_string()), code)?;
         }
+        codes.freeze(scope)?;
         Ok((
             constants.to_jsval_throwing(scope)?,
             codes.to_jsval_throwing(scope)?,

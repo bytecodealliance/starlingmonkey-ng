@@ -46,6 +46,26 @@ eq(http.STATUS_CODES[418], "I'm a Teapot", "STATUS_CODES");
   eq(response.complete, true, "complete after the body");
 }
 
+// `setTimeout` adds a truthy callback as a listener, which must be a function.
+{
+  throws(() => new ServerResponse({ method: "GET" }).setTimeout(10, 5), "ERR_INVALID_ARG_TYPE", "OutgoingMessage.setTimeout callback");
+  throws(() => new IncomingMessage().setTimeout(10, 5), "ERR_INVALID_ARG_TYPE", "IncomingMessage.setTimeout callback");
+  const request = http.request(`${base}/echo`).on("error", () => {});
+  throws(() => request.setTimeout(10, 5), "ERR_INVALID_ARG_TYPE", "ClientRequest.setTimeout callback");
+  request.destroy();
+}
+
+// `end` with a callback after the request finished calls it with `ERR_STREAM_ALREADY_FINISHED`.
+{
+  const request = http.get(`${base}/echo`);
+  const response = await respond(request);
+  await read(response);
+  if (!request.writableFinished) await new Promise((resolve) => request.on("finish", resolve));
+  const errors = [];
+  request.end((error) => errors.push(error?.code));
+  deepEq(errors, ["ERR_STREAM_ALREADY_FINISHED"], "end after finish");
+}
+
 // POST with options, headers and a body written in pieces.
 {
   const request = http.request({
@@ -163,6 +183,24 @@ eq(http.STATUS_CODES[418], "I'm a Teapot", "STATUS_CODES");
   await new Promise((resolve) => setTimeout(resolve, 0));
   deepEq(lateErrors, ["ERR_STREAM_WRITE_AFTER_END", "ERR_STREAM_WRITE_AFTER_END"], "write after end");
 
+  // The callbacks of `end` run before the `finish` listeners, and get the error of a failed
+  // last write, which later `end` callbacks get too.
+  const failing = new ServerResponse({ method: "GET" });
+  const failingSocket = new Writable({ write(chunk, encoding, callback) { callback(new Error("write failed")); } });
+  failingSocket.on("error", () => {});
+  failing.assignSocket(failingSocket);
+  const endErrors = [];
+  await new Promise((resolve) => failing.end("x", (error) => resolve(endErrors.push(error?.message))));
+  await new Promise((resolve) => failing.end((error) => resolve(endErrors.push(error?.message))));
+  deepEq(endErrors, ["write failed", "write failed"], "end callbacks after a failed write");
+  const ordered = new ServerResponse({ method: "GET" });
+  ordered.assignSocket(new Writable({ write(chunk, encoding, callback) { callback(); } }));
+  const endOrder = [];
+  ordered.on("finish", () => endOrder.push("finish"));
+  await new Promise((resolve) => ordered.end("y", (error) => resolve(endOrder.push(error))));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  deepEq(endOrder, [null, "finish"], "end callbacks before finish listeners");
+
   const headers = new ServerResponse({ method: "GET" });
   headers.setHeader("a", ["1"]);
   headers.appendHeader("A", "2");
@@ -175,6 +213,36 @@ eq(http.STATUS_CODES[418], "I'm a Teapot", "STATUS_CODES");
   deepEq([headers.statusCode, headers.getHeader("x-a")], [200, ["2", "3"]], "writeHead truncates the status and replaces headers");
   throws(() => new ServerResponse({}).writeHead(200, ["X-A"]), "ERR_INVALID_ARG_VALUE", "header arrays have pairs");
   throws(() => http.validateHeaderValue("x", Symbol()), TypeError, "header values convert to strings");
+
+  // Header values are checked leniently for a server whose `httpValidation` isn't `'strict'`, or
+  // whose `insecureHTTPParser` is `true`: only NUL, CR, LF and characters above 0xff are invalid.
+  const responseOf = (options) => new ServerResponse({ socket: { server: http.createServer(options) } });
+  for (const options of [{ httpValidation: "relaxed" }, { insecureHTTPParser: true }]) {
+    const lenient = responseOf(options);
+    lenient.setHeader("X-A", "a\x01b");
+    eq(lenient.getHeader("x-a"), "a\x01b", `control characters with ${JSON.stringify(options)}`);
+    throws(() => lenient.setHeader("X-B", "a\0b"), "ERR_INVALID_CHAR", "NUL in a lenient header value");
+    throws(() => lenient.appendHeader("X-B", "a\u0100"), "ERR_INVALID_CHAR", "characters above 0xff");
+    lenient.addTrailers({ "X-C": "\x7f" });
+    eq(lenient._trailer, "X-C: \x7f\r\n", "lenient trailers");
+  }
+  const sink = () => new Writable({ write(chunk, encoding, callback) { callback(); } });
+  const [first, second] = [sink(), sink()];
+  const moved = new ServerResponse({ method: "GET" });
+  moved.socket = first;
+  moved.cork();
+  moved.socket = second;
+  deepEq([first.writableCorked, second.writableCorked, moved.writableCorked], [0, 1, 1], "the socket setter moves the corks");
+  const hexLength = new ServerResponse({ method: "GET" });
+  hexLength.setHeader("Content-Length", "0x10");
+  hexLength.writeHead(200);
+  eq(hexLength._contentLength, 16, "Content-Length converts as a JS number");
+  const trailers = new ServerResponse({ method: "GET" });
+  trailers.addTrailers({ A: "x" });
+  throws(() => trailers.addTrailers({ A: "z", B: "y\n" }), "ERR_INVALID_CHAR", "invalid trailer value");
+  eq(trailers._trailer, "A: z\r\n", "addTrailers replaces the trailers, up to an invalid one");
+  throws(() => responseOf({ httpValidation: "strict" }).setHeader("X-A", "a\x01b"), "ERR_INVALID_CHAR", "strict validation");
+  throws(() => responseOf({}).setHeader("X-A", "a\x01b"), "ERR_INVALID_CHAR", "strict by default");
 }
 
 // A message the runtime creates reads an inherited `_maxListeners` through an accessor, which can
@@ -209,4 +277,36 @@ eq(http.STATUS_CODES[418], "I'm a Teapot", "STATUS_CODES");
   } finally {
     Object.defineProperty(EventEmitter.prototype, "_maxListeners", original);
   }
+}
+
+// `WebSocket`'s binding errors are undici's.
+{
+  eq(
+    throws(() => new http.WebSocket(), TypeError, "a WebSocket without a URL").message,
+    "WebSocket constructor: 1 argument required, but 0 found.",
+    "the missing URL's message",
+  );
+  eq(
+    throws(() => http.WebSocket("ws://127.0.0.1:1/"), TypeError, "a WebSocket call without new").message,
+    "Class constructor _WebSocket cannot be invoked without 'new'",
+    "the message of a call without new",
+  );
+  const onopen = Object.getOwnPropertyDescriptor(http.WebSocket.prototype, "onopen");
+  const error = throws(() => onopen.get.call({}), "ERR_INVALID_THIS", "onopen of another object");
+  eq(error.message, "Illegal invocation", "the message of an event handler's invalid this");
+  const socket = new http.WebSocket("ws://127.0.0.1:1/");
+  socket.onerror = () => {};
+  eq(
+    throws(() => socket.send(), TypeError, "send without data").message,
+    "WebSocket.send: 1 argument required, but 0 found.",
+    "the message of send without data",
+  );
+}
+
+// A header value array with a huge length throws a `RangeError` instead of being read element by
+// element.
+{
+  const huge = [];
+  huge.length = 2 ** 32 - 1;
+  throws(() => new OutgoingMessage().setHeader("x", huge), RangeError, "a huge header value array");
 }

@@ -219,10 +219,7 @@ pub(crate) fn listen_args<'s>(
     scope: &'s Scope<'_>,
     args: &[HandleValue<'s>],
 ) -> Result<ListenArgs<'s>, Thrown> {
-    let callback = args
-        .last()
-        .copied()
-        .filter(|last| js::function::is_callable(*last));
+    let callback = listen_callback(args);
     let first = args.first().copied();
     let options = match first {
         Some(first) if first.is_object() && !js::function::is_callable(first) => {
@@ -288,6 +285,13 @@ pub(crate) fn listen_args<'s>(
         .into());
     }
     Err(NodeError::invalid_arg_value(scope, "options", options_value, "is invalid").into())
+}
+
+/// The callback among `listen`'s arguments `args`: the last one, if it is a function.
+fn listen_callback<'s>(args: &[HandleValue<'s>]) -> Option<HandleValue<'s>> {
+    args.last()
+        .copied()
+        .filter(|last| js::function::is_callable(*last))
 }
 
 /// The tick callback and `abort` listener whose payload is a server: call its `close`, as the
@@ -447,19 +451,34 @@ pub mod server_class {
             let value = js::conversion::to_boolean(option(name)?);
             this.set_property(scope, name, value)?;
         }
-        let delay = option(c"keepAliveInitialDelay")?;
-        let delay = if delay.is_number() {
-            (delay.to_number() / 1000.0).trunc()
-        } else {
-            0.0
+        let number = |name: &str, value: HandleValue<'_>| -> Result<Option<f64>, Thrown> {
+            if value.is_undefined() {
+                return Ok(None);
+            }
+            if !value.is_number() {
+                return Err(
+                    NodeError::invalid_arg_type(scope, name, "of type number", value).into(),
+                );
+            }
+            Ok(Some(value.to_number()))
         };
-        this.set_property(scope, c"keepAliveInitialDelay", delay)?;
+        let delay = number(
+            "options.keepAliveInitialDelay",
+            option(c"keepAliveInitialDelay")?,
+        )?;
         let high_water_mark = option(c"highWaterMark")?;
-        if high_water_mark.is_null_or_undefined() {
-            let mark = crate::stream::state::default_high_water_mark(false);
-            this.set_property(scope, c"highWaterMark", mark)?;
-        } else {
-            this.set_property(scope, c"highWaterMark", high_water_mark)?;
+        let mark = number("options.highWaterMark", high_water_mark)?;
+        // A negative delay counts as 0, and `undefined` and `NaN` convert to 0.
+        let delay = crate::http::to_int32(delay.map_or(f64::NAN, |delay| delay.max(0.0)) / 1000.0);
+        this.set_property(scope, c"keepAliveInitialDelay", delay)?;
+        match mark {
+            Some(mark) if mark >= 0.0 || mark.is_nan() => {
+                this.set_property(scope, c"highWaterMark", high_water_mark)?;
+            }
+            _ => {
+                let mark = crate::stream::state::default_high_water_mark(false);
+                this.set_property(scope, c"highWaterMark", mark)?;
+            }
         }
         let block_list = option(c"blockList")?;
         if js::conversion::to_boolean(block_list) {
@@ -487,11 +506,17 @@ pub mod server_class {
             )
             .into());
         }
+        // The callback is a `listening` listener even if the other arguments are invalid.
+        if let Some(callback) = listen_callback(&args) {
+            Function::call_by_name(
+                scope,
+                this.handle(),
+                c"once",
+                &[js::class::get_or_init_atom(scope, c"listening")?, callback],
+            )?;
+        }
         let ListenArgs {
-            port,
-            host,
-            callback,
-            signal,
+            port, host, signal, ..
         } = listen_args(scope, &args)?;
         let ip = match host.as_deref() {
             None => IpAddr::from([0, 0, 0, 0]),
@@ -500,14 +525,6 @@ pub mod server_class {
                 NodeError::not_implemented("listen() on a host name other than localhost")
             })?,
         };
-        if let Some(callback) = callback {
-            Function::call_by_name(
-                scope,
-                this.handle(),
-                c"once",
-                &[js::class::get_or_init_atom(scope, c"listening")?, callback],
-            )?;
-        }
         if let Some(signal) = signal {
             if js::conversion::to_boolean(signal.get_property(scope, c"aborted")?) {
                 js::jobs::queue_native_tick(scope, close_tick, this, &[])?;

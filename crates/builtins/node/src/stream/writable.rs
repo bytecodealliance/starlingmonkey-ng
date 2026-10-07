@@ -32,11 +32,6 @@ fn reset_buffer(side: WritableSide<'_>) {
     part.flags.insert(W::ALL_BUFFERS | W::ALL_NOOP);
 }
 
-/// Whether `value` is anything but `false`, as Node's `options.x !== false` tests it.
-fn not_false(value: HandleValue<'_>) -> bool {
-    !(value.is_boolean() && !value.to_boolean())
-}
-
 /// Give `holder`'s state a writable part for `options` whose `onwrite` writes to `stream`: Node's
 /// `new WritableState()`, of a `Duplex`'s writable side if `is_duplex`.
 pub(crate) fn init_writable_part(
@@ -67,9 +62,18 @@ pub(crate) fn init_writable_part(
         )?,
         None => super::state::default_high_water_mark(false),
     };
-    flags.set(W::DECODE_STRINGS, not_false(option(c"decodeStrings")?));
-    flags.set(W::EMIT_CLOSE, not_false(option(c"emitClose")?));
-    flags.set(W::AUTO_DESTROY, not_false(option(c"autoDestroy")?));
+    flags.set(
+        W::DECODE_STRINGS,
+        !crate::support::is_false(option(c"decodeStrings")?),
+    );
+    flags.set(
+        W::EMIT_CLOSE,
+        !crate::support::is_false(option(c"emitClose")?),
+    );
+    flags.set(
+        W::AUTO_DESTROY,
+        !crate::support::is_false(option(c"autoDestroy")?),
+    );
     let default_encoding = option(c"defaultEncoding")?;
     let default_encoding = if default_encoding.is_null_or_undefined() {
         None
@@ -326,7 +330,7 @@ fn onwrite_error_tick(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     onwrite_error(scope, stream, side, args.get(0), args.get(1))?;
     Ok(js::value::undefined())
@@ -338,7 +342,7 @@ fn onwrite(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     if !side.has(W::EXPECT_WRITE_CB) {
         error_or_destroy_with(scope, stream, multiple_callback(), false)?;
@@ -436,7 +440,7 @@ fn after_write_tick_noop(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     after_write(scope, stream, side, 1.0, HandleValue::undefined())?;
     Ok(js::value::undefined())
@@ -692,7 +696,7 @@ fn on_final(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     let error = args.get(0);
     if side.has(W::PREFINISHED) {
@@ -771,7 +775,7 @@ fn finish_if_needed_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     if need_finish(side) {
         finish(scope, stream, side)?;
@@ -786,7 +790,7 @@ fn finish_tick(
     _args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let stream = cast_payload::<js::Object>(scope, payload);
+    let stream = cast_payload::<Object>(scope, payload);
     let side = WritableSide::of(scope, stream)?;
     finish(scope, stream, side)?;
     Ok(js::value::undefined())
@@ -1286,29 +1290,19 @@ fn has_instance(
     args: CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let Some(ctor) = Object::from_value(scope, args.this())
-        .ok()
-        .filter(|ctor| ctor.is_callable())
-    else {
+    let Ok(ctor) = Object::from_value(scope, args.this()) else {
         return Ok(js::value::from_bool(false));
     };
-    let Ok(candidate) = Object::from_value(scope, args.get(0)) else {
-        return Ok(js::value::from_bool(false));
-    };
-    let proto = ctor.get_property(scope, c"prototype")?;
-    if let Ok(proto) = Object::from_value(scope, proto) {
-        let mut current = candidate.get_prototype(scope)?;
-        while let Some(object) = current {
-            if proto.as_raw() == object.as_raw() {
-                return Ok(js::value::from_bool(true));
-            }
-            current = object.get_prototype(scope)?;
-        }
+    if ctor.ordinary_has_instance(scope, args.get(0))? {
+        return Ok(js::value::from_bool(true));
     }
     let writable_ctor = writable::class_constructor(scope)?;
     if ctor.as_raw() != writable_ctor.as_raw() {
         return Ok(js::value::from_bool(false));
     }
+    let Ok(candidate) = Object::from_value(scope, args.get(0)) else {
+        return Ok(js::value::from_bool(false));
+    };
     Ok(js::value::from_bool(
         WritableSide::try_of(scope, candidate)?.is_some(),
     ))

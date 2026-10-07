@@ -482,7 +482,7 @@ pub(crate) fn eos_native<'s>(
     }
     if immediate.is_some() {
         if options.error {
-            let nop = crate::support::noop_function(scope)?;
+            let nop = crate::support::nop(scope)?;
             add_listener(scope, state, stream, c"error", nop)?;
         }
     } else if let Some(signal) = options.signal {

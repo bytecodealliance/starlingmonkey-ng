@@ -28,12 +28,12 @@
 
 import { spawn, execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, readdirSync, realpathSync } from 'node:fs';
-import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { freePort, waitForListener } from './servers.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '../..');
@@ -81,35 +81,6 @@ const DEFAULT_MASKS = [
   [/127\.0\.0\.1:\d+/g, '127.0.0.1:<port>'],
   [/localhost:\d+/g, 'localhost:<port>'],
 ];
-
-async function freePort() {
-  return new Promise((res, rej) => {
-    const s = createServer();
-    s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address();
-      s.close(() => res(port));
-    });
-    s.on('error', rej);
-  });
-}
-
-async function waitForPort(port, child, timeoutMs = 30000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (child.exitCode !== null) throw new Error(`process exited with ${child.exitCode}`);
-    const ok = await new Promise((res) => {
-      const s = connect(port, '127.0.0.1');
-      s.on('connect', () => {
-        s.destroy();
-        res(true);
-      });
-      s.on('error', () => res(false));
-    });
-    if (ok) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`port ${port} not listening after ${timeoutMs} ms`);
-}
 
 /** The real path of `appDir`'s `node_modules`, in a list, if it is a symbolic link. */
 function linkedNodeModules(appDir) {
@@ -299,14 +270,21 @@ async function runUnder(kind, appDir, scenario) {
   client.ctx = ctx;
   client.masks = [...(scenario.masks || []), ...(mode === 'spin' ? scenario.spinMasks || [] : [])];
   let error;
+  const closed = new Promise((res) => child.on('close', res));
   try {
     // Spin compiles the components before it listens.
-    await waitForPort(port, child, mode === 'spin' ? 300000 : 30000);
+    await waitForListener(child, port, { timeoutMs: mode === 'spin' ? 300000 : 30000 });
     await scenario.default(client);
+    // A server that exited, for example after a crash, fails the run even if every response
+    // arrived before it did.
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`the server exited during the scenario (${child.exitCode ?? child.signalCode})`);
+    }
   } catch (e) {
     error = e;
   } finally {
     child.kill('SIGKILL');
+    await closed;
     await extra.teardown?.();
     rmSync(ctx.dataDir, { recursive: true, force: true });
   }

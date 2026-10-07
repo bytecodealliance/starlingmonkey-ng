@@ -289,7 +289,7 @@ impl<'s> MockTracker<'s> {
             return Err(NodeError::invalid_arg_type(
                 scope,
                 "methodName",
-                "of type string or symbol",
+                "one of type string or symbol",
                 method_name,
             )
             .into());
@@ -463,7 +463,7 @@ fn find_descriptor_value<'s>(
 }
 
 /// Define the property `id` of `object` from the descriptor object `descriptor`, as
-/// `Object.defineProperty` does.
+/// `Object.defineProperty` does, with V8's message for a property that can't be redefined.
 fn define_from_descriptor(
     scope: &Scope<'_>,
     object: Object<'_>,
@@ -471,9 +471,14 @@ fn define_from_descriptor(
     descriptor: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
     if !object.define_property_from_descriptor(scope, id, descriptor)? {
-        return Err(
-            js::error::TypeError("can't redefine non-configurable property".into()).throw(scope),
-        );
+        let key = js::id::id_to_key(scope, id.get())?;
+        let key = if key.is_symbol() {
+            crate::inspect::symbol_to_string(scope, key)
+        } else {
+            js::JSString::from_value(scope, key)?.to_utf8(scope)?
+        };
+        let message = format!("Cannot redefine property: {key}");
+        return Err(js::error::TypeError(message).throw(scope));
     }
     Ok(())
 }

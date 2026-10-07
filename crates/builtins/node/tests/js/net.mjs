@@ -101,6 +101,33 @@ throws(() => server.listen(0), "ERR_SERVER_ALREADY_LISTEN", "listening twice");
   await within(closing, "closing a drained server");
 }
 
+// A write followed by `destroy` reaches the peer, from the `connection` listener and after a read.
+{
+  const destroying = net.createServer((socket) => {
+    socket.write("accepted ");
+    socket.destroy();
+  });
+  const replying = net.createServer((socket) => {
+    socket.once("data", (data) => {
+      socket.write(`read ${data}`);
+      socket.destroy();
+    });
+  });
+  for (const server of [destroying, replying]) {
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  }
+  const received = [];
+  for (const server of [destroying, replying]) {
+    const client = net.connect(server.address().port, "127.0.0.1");
+    client.on("data", (data) => received.push(data.toString()));
+    client.on("error", () => {});
+    if (server === replying) client.write("request");
+    await within(once(client, "close"), "a destroyed peer's connection closing");
+    await within(new Promise((resolve) => server.close(resolve)), "closing a destroying server");
+  }
+  eq(received.join(""), "accepted read request", "writes before destroy");
+}
+
 // Errors.
 {
   const inUse = net.createServer();
@@ -309,4 +336,51 @@ throws(() => server.listen(0), "ERR_SERVER_ALREADY_LISTEN", "listening twice");
   eq(early.listening, true, "listening until the tick queue runs");
   await within(once(early, "close"), "closing on an aborted signal");
   deepEq(events, ["close"], "an aborted signal closes the server before listening is emitted");
+}
+
+// Constructor options Node.js validates, `listen`'s callback, `_connecting` and `resetAndDestroy`.
+{
+  throws(() => net.createServer({ keepAliveInitialDelay: "x" }), "ERR_INVALID_ARG_TYPE", "keepAliveInitialDelay type");
+  throws(() => net.createServer({ highWaterMark: "x" }), "ERR_INVALID_ARG_TYPE", "highWaterMark type");
+  const options = net.createServer({ keepAliveInitialDelay: 3500, highWaterMark: -1 });
+  deepEq([options.keepAliveInitialDelay, options.highWaterMark], [3, 65536], "server number options");
+  const objectMode = throws(() => new Socket({ objectMode: true }), "ERR_INVALID_ARG_VALUE", "objectMode");
+  eq(objectMode.message, "The property 'options.objectMode' is not supported. Received true", "objectMode message");
+  throws(() => new Socket({ writableObjectMode: 1 }), "ERR_INVALID_ARG_VALUE", "writableObjectMode");
+  eq(new Socket()._writableState.decodeStrings, false, "sockets don't decode strings");
+  const connecting = Object.getOwnPropertyDescriptor(Socket.prototype, "_connecting");
+  deepEq([typeof connecting.get, connecting.enumerable, connecting.configurable], ["function", false, false], "_connecting");
+
+  const server = net.createServer((socket) => socket.on("error", () => {}).destroy());
+  const events = [];
+  server.on("listening", () => events.push("listening"));
+  throws(() => server.listen(99999, () => events.push("callback")), "ERR_SOCKET_BAD_PORT", "listen port range");
+  await within(new Promise((resolve) => server.listen(0, "127.0.0.1", resolve)), "listening after a bad port");
+  deepEq(events, ["listening", "callback"], "the callback of a listen that threw");
+  const { port } = server.address();
+
+  const unconnected = new Socket();
+  const resetEvents = [];
+  unconnected.on("error", (error) => resetEvents.push(error.code));
+  unconnected.on("close", () => resetEvents.push("close"));
+  unconnected.resetAndDestroy();
+  await within(once(unconnected, "close"), "resetAndDestroy");
+  deepEq(resetEvents, ["ERR_SOCKET_CLOSED", "close"], "resetAndDestroy without a connection");
+
+  // A write waiting for the connect gets its error from a `close` listener added by the write.
+  const order = [];
+  const client = net.connect(port, "127.0.0.1");
+  client.on("close", () => order.push("close"));
+  eq(client._connecting, true, "_connecting while connecting");
+  client.write("x", (error) => order.push(error.code));
+  client.on("error", (error) => order.push(error.message));
+  client.destroy(new Error("destroyed"));
+  await within(once(client, "close"), "destroying a connecting socket");
+  deepEq(order, ["destroyed", "close", "ERR_SOCKET_CLOSED_BEFORE_CONNECTION"], "destroy before the connect");
+  const connected = net.connect(port, "127.0.0.1").on("error", () => {});
+  connected.write("y");
+  await within(once(connected, "connect"), "connecting");
+  eq(connected.listenerCount("close"), 0, "the connect removes the write's close listener");
+  connected.destroy();
+  await within(new Promise((resolve) => server.close(resolve)), "closing the option server");
 }

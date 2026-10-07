@@ -9,11 +9,12 @@
 //! code units. The two agree because they only look for `/` and `.`, which never occur inside a
 //! multi-byte UTF-8 sequence, so every index they split at is a character boundary.
 
+use js::error::ExnThrown;
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::Object;
 
-use crate::errors::{validate_object, validate_string, Thrown};
+use crate::errors::{validate_plain_object, validate_string, Thrown};
 use crate::glob::{platform_nocase, Glob, GlobOptions};
 
 /// Normalize `path`, resolving `.` and `..` segments. `..` segments above the start are kept if
@@ -320,13 +321,25 @@ pub mod path {
     pub const delimiter: &str = ":";
 
     /// <https://nodejs.org/api/path.html#pathresolvepaths>
+    ///
+    /// The arguments are validated from right to left up to the first absolute path, and those to
+    /// its left are ignored.
     pub fn resolve(scope: &Scope<'_>, paths: RestArgs<HandleValue<'_>>) -> Result<String, Thrown> {
-        let paths = paths
-            .iter()
-            .enumerate()
-            .map(|(index, path)| validate_string(scope, *path, &format!("paths[{index}]")))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(resolve_paths(&paths))
+        let mut used = Vec::new();
+        for (index, path) in paths.iter().enumerate().rev() {
+            let path = if path.is_string() {
+                validate_string(scope, *path, "")?
+            } else {
+                validate_string(scope, *path, &format!("paths[{index}]"))?
+            };
+            let absolute = path.starts_with('/');
+            used.push(path);
+            if absolute {
+                break;
+            }
+        }
+        used.reverse();
+        Ok(resolve_paths(&used))
     }
 
     /// <https://nodejs.org/api/path.html#pathnormalizepath>
@@ -342,8 +355,8 @@ pub mod path {
     /// <https://nodejs.org/api/path.html#pathjoinpaths>
     pub fn join(scope: &Scope<'_>, paths: RestArgs<HandleValue<'_>>) -> Result<String, Thrown> {
         let mut joined = String::new();
-        for (index, path) in paths.iter().enumerate() {
-            let path = validate_string(scope, *path, &format!("paths[{index}]"))?;
+        for path in paths.iter() {
+            let path = validate_string(scope, *path, "path")?;
             if path.is_empty() {
                 continue;
             }
@@ -451,7 +464,7 @@ pub mod path {
 
     /// <https://nodejs.org/api/path.html#pathformatpathobject>
     pub fn format(scope: &Scope<'_>, path_object: HandleValue<'_>) -> Result<String, Thrown> {
-        let object = validate_object(scope, path_object, "pathObject")?;
+        let object = validate_plain_object(scope, path_object, "pathObject", false)?;
         let field = |name: &'static std::ffi::CStr| -> Result<Option<String>, Thrown> {
             let value = object.get_property(scope, name)?;
             if value.is_undefined() || value.is_null() {
@@ -478,23 +491,6 @@ pub mod path {
             Some(dir) if Some(&dir) == root.as_ref() => format!("{dir}{base}"),
             Some(dir) => format!("{dir}/{base}"),
         })
-    }
-
-    /// <https://nodejs.org/api/path.html#pathmatchesglobpath-pattern>: whether `path` matches the
-    /// glob `pattern`. Segments with magic match case-insensitively on macOS and Windows.
-    pub fn matches_glob(
-        scope: &Scope<'_>,
-        path: HandleValue<'_>,
-        pattern: HandleValue<'_>,
-    ) -> Result<bool, Thrown> {
-        let path = validate_string(scope, path, "path")?;
-        let pattern = validate_string(scope, pattern, "pattern")?;
-        let options = GlobOptions {
-            nocase: platform_nocase(),
-            nocase_magic_only: true,
-            match_base: false,
-        };
-        Ok(Glob::new(scope, &pattern, options)?.matches(scope, &path)?)
     }
 
     /// <https://nodejs.org/api/path.html#pathparsepath>
@@ -544,4 +540,65 @@ pub mod path {
         parsed.set_property(scope, c"name", name)?;
         Ok(parsed)
     }
+
+    /// <https://nodejs.org/api/path.html#pathmatchesglobpath-pattern>: whether `path` matches the
+    /// glob `pattern`. Segments with magic match case-insensitively on macOS and Windows.
+    pub fn matches_glob(
+        scope: &Scope<'_>,
+        path: HandleValue<'_>,
+        pattern: HandleValue<'_>,
+    ) -> Result<bool, Thrown> {
+        let path = validate_string(scope, path, "path")?;
+        let pattern = validate_string(scope, pattern, "pattern")?;
+        let options = GlobOptions {
+            nocase: platform_nocase(),
+            nocase_magic_only: true,
+            match_base: false,
+        };
+        let glob = js::heap::RootedTraceableBox::new(Glob::new(scope, &pattern, options)?);
+        Ok(glob.matches(scope, &path)?)
+    }
+
+    /// `path._makeLong`, which `register_module` makes the same function as `toNamespacedPath` on
+    /// the `default` export. The named export is a separate function that does the same.
+    #[function(name = "_makeLong")]
+    pub fn make_long<'v>(path: HandleValue<'v>) -> HandleValue<'v> {
+        path
+    }
+}
+
+/// Register `node:path`, whose `default` export has the property order of Node.js's, with
+/// `_makeLong` last as the same function as `toNamespacedPath`.
+pub(crate) fn register_module(scope: &Scope<'_>, name: &'static str) -> bool {
+    if !crate::stub::register_implemented::<path::js_module>(scope, name) {
+        return false;
+    }
+    let order = || -> Result<(), ExnThrown> {
+        let default = crate::stub::order_default_export(
+            scope,
+            name,
+            &[
+                c"resolve",
+                c"normalize",
+                c"isAbsolute",
+                c"join",
+                c"relative",
+                c"toNamespacedPath",
+                c"dirname",
+                c"basename",
+                c"extname",
+                c"format",
+                c"parse",
+                c"matchesGlob",
+                c"sep",
+                c"delimiter",
+                c"win32",
+                c"posix",
+                c"_makeLong",
+            ],
+        )?;
+        let to_namespaced_path = default.get_property(scope, c"toNamespacedPath")?;
+        default.set_property(scope, c"_makeLong", to_namespaced_path)
+    };
+    order().is_ok()
 }

@@ -1306,6 +1306,50 @@ fn a_repeating_timer_keeps_running_between_requests() {
     handle.stop();
 }
 
+/// With `--node-compat`, an unreferenced `setInterval` at top level keeps firing for as long as
+/// the server runs, as it does in Node.js while a server listens. Caches purge their entries this
+/// way.
+#[test]
+fn an_unreferenced_repeating_timer_keeps_running_between_requests() {
+    let handler = r#"globalThis.ticks = 0;
+    setInterval(() => { globalThis.ticks += 1; }, 20).unref();
+    addEventListener('fetch', (event) => {
+        event.respondWith(new Response('ticks=' + globalThis.ticks));
+    });"#;
+    let port = 18535;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            eval_script: Some(handler.to_string()),
+            legacy_script: true,
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+    let ticks = || -> u32 {
+        request(port, "GET", "/", "")
+            .strip_prefix("ticks=")
+            .and_then(|n| n.parse().ok())
+            .expect("a tick count")
+    };
+
+    let mut samples = vec![ticks()];
+    for _ in 0..2 {
+        std::thread::sleep(Duration::from_millis(300));
+        samples.push(ticks());
+    }
+
+    // Serving a request also steps the script's loop, which fires an expired timer once, so the
+    // count has to grow by more than the requests account for.
+    assert!(
+        samples.windows(2).all(|pair| pair[1] >= pair[0] + 5),
+        "the unreferenced interval must fire while the server idles (went {samples:?})"
+    );
+
+    handle.stop();
+}
+
 /// The number after `ticks=` in the response to a request for `path` on `port`.
 fn ticks_at(port: u16, path: &str) -> u32 {
     request(port, "GET", path, "")
@@ -1331,6 +1375,66 @@ fn a_request_clears_a_top_level_interval() {
     std::thread::sleep(Duration::from_millis(300));
     let later = ticks_at(port, "/");
     assert_eq!(cleared, later, "the cleared interval kept firing");
+
+    handle.stop();
+}
+
+/// With `--node-compat`, a request handler that clears a top-level `setInterval` stops it, and a
+/// `refresh()` restarts a top-level `setTimeout` on the script's event loop, so that it fires once,
+/// a full delay after the last refresh.
+#[test]
+fn a_request_clears_and_refreshes_top_level_node_timers() {
+    let handler = r#"globalThis.ticks = 0;
+    globalThis.errors = 0;
+    process.on('uncaughtException', () => { globalThis.errors += 1; });
+    const interval = setInterval(() => { globalThis.ticks += 1; }, 20);
+    globalThis.fired = 0;
+    const timeout = setTimeout(() => { globalThis.fired += 1; }, 3000);
+    addEventListener('fetch', (event) => {
+        const path = new URL(event.request.url).pathname;
+        if (path === '/clear') clearInterval(interval);
+        if (path === '/refresh') timeout.refresh();
+        const count = path === '/clear' || path === '/'
+            ? globalThis.ticks + globalThis.errors
+            : globalThis.fired;
+        event.respondWith(new Response('ticks=' + count));
+    });"#;
+    let port = 18539;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            eval_script: Some(handler.to_string()),
+            legacy_script: true,
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    // A cleared interval that kept firing would call its cleared callback, which throws.
+    let cleared = ticks_at(port, "/clear");
+    for _ in 0..5 {
+        assert_eq!(
+            ticks_at(port, "/refresh"),
+            0,
+            "the timeout fired while refreshed"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        cleared,
+        ticks_at(port, "/"),
+        "the cleared interval kept firing"
+    );
+
+    let fired = eventually(port, "/fired", |answer| answer != "ticks=0");
+    assert_eq!(fired, "ticks=1");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        ticks_at(port, "/fired"),
+        1,
+        "the refreshed timeout fired more than once"
+    );
 
     handle.stop();
 }
@@ -3780,110 +3884,6 @@ fn wait_until_work_does_not_hold_a_connection_slot() {
     handle.stop();
 }
 
-/// With `--node-compat`, an unreferenced `setInterval` at top level keeps firing for as long as
-/// the server runs, as it does in Node.js while a server listens. Caches purge their entries this
-/// way.
-#[test]
-fn an_unreferenced_repeating_timer_keeps_running_between_requests() {
-    let handler = r#"globalThis.ticks = 0;
-    setInterval(() => { globalThis.ticks += 1; }, 20).unref();
-    addEventListener('fetch', (event) => {
-        event.respondWith(new Response('ticks=' + globalThis.ticks));
-    });"#;
-    let port = 18535;
-    let handle = start_serve_config(
-        RuntimeConfig {
-            eval_script: Some(handler.to_string()),
-            legacy_script: true,
-            serve: Some(port),
-            node_compat: true,
-            ..Default::default()
-        },
-        port,
-    );
-    let ticks = || -> u32 {
-        request(port, "GET", "/", "")
-            .strip_prefix("ticks=")
-            .and_then(|n| n.parse().ok())
-            .expect("a tick count")
-    };
-
-    let mut samples = vec![ticks()];
-    for _ in 0..2 {
-        std::thread::sleep(Duration::from_millis(300));
-        samples.push(ticks());
-    }
-
-    // Serving a request also steps the script's loop, which fires an expired timer once, so the
-    // count has to grow by more than the requests account for.
-    assert!(
-        samples.windows(2).all(|pair| pair[1] >= pair[0] + 5),
-        "the unreferenced interval must fire while the server idles (went {samples:?})"
-    );
-
-    handle.stop();
-}
-
-/// With `--node-compat`, a request handler that clears a top-level `setInterval` stops it, and a
-/// `refresh()` restarts a top-level `setTimeout` on the script's event loop, so that it fires once,
-/// a full delay after the last refresh.
-#[test]
-fn a_request_clears_and_refreshes_top_level_node_timers() {
-    let handler = r#"globalThis.ticks = 0;
-    globalThis.errors = 0;
-    process.on('uncaughtException', () => { globalThis.errors += 1; });
-    const interval = setInterval(() => { globalThis.ticks += 1; }, 20);
-    globalThis.fired = 0;
-    const timeout = setTimeout(() => { globalThis.fired += 1; }, 3000);
-    addEventListener('fetch', (event) => {
-        const path = new URL(event.request.url).pathname;
-        if (path === '/clear') clearInterval(interval);
-        if (path === '/refresh') timeout.refresh();
-        const count = path === '/clear' || path === '/'
-            ? globalThis.ticks + globalThis.errors
-            : globalThis.fired;
-        event.respondWith(new Response('ticks=' + count));
-    });"#;
-    let port = 18539;
-    let handle = start_serve_config(
-        RuntimeConfig {
-            eval_script: Some(handler.to_string()),
-            legacy_script: true,
-            serve: Some(port),
-            node_compat: true,
-            ..Default::default()
-        },
-        port,
-    );
-
-    // A cleared interval that kept firing would call its cleared callback, which throws.
-    let cleared = ticks_at(port, "/clear");
-    for _ in 0..5 {
-        assert_eq!(
-            ticks_at(port, "/refresh"),
-            0,
-            "the timeout fired while refreshed"
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    assert_eq!(
-        cleared,
-        ticks_at(port, "/"),
-        "the cleared interval kept firing"
-    );
-
-    let fired = eventually(port, "/fired", |answer| answer != "ticks=0");
-    assert_eq!(fired, "ticks=1");
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        ticks_at(port, "/fired"),
-        1,
-        "the refreshed timeout fired more than once"
-    );
-
-    handle.stop();
-}
-
 /// With `--node-compat`, a served request can't block on host I/O, such as a `require` with a
 /// computed specifier that reads a file, or `fs.readFileSync`, unless `--allow-blocking-host-io`
 /// allows it. A `require` with a literal specifier loads the source read while the top level ran.
@@ -4278,6 +4278,49 @@ fn node_http_responses_stay_open_for_other_requests() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// With `--node-compat`, a child process spawned by a request that responded before the child
+/// exited keeps the request's event loop running, so the child is reaped and emits `exit`.
+#[cfg(unix)]
+#[test]
+fn node_child_processes_outlive_the_response() {
+    let dir =
+        std::env::temp_dir().join(format!("starling-serve-node-child-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("server.cjs"),
+        r#"const http = require('http');
+        const { spawn } = require('child_process');
+        const exits = [];
+        http.createServer((req, res) => {
+            if (req.url === '/spawn') {
+                const child = spawn('sh', ['-c', 'sleep 0.2; exit 3']);
+                child.on('exit', (code) => exits.push(code));
+                res.end('spawned');
+            } else {
+                res.end(exits.join(','));
+            }
+        }).listen(0);
+        "#,
+    )
+    .unwrap();
+    let port = 18537;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            script_path: dir.join("server.cjs").to_string_lossy().into_owned(),
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    assert_eq!(request(port, "GET", "/spawn", ""), "spawned");
+    assert_eq!(eventually(port, "/exits", |exits| exits == "3"), "3");
+
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// With `--node-compat`, a pending `node:fs` operation keeps its request's event loop running, so a
 /// `WriteStream` that requests write to after their responses keeps writing every chunk.
 #[test]
@@ -4319,6 +4362,86 @@ fn node_fs_operations_outlive_the_response() {
     assert_eq!(request(port, "GET", "/b", ""), "ok");
     let expected = "/a 1\n/a 2\n/b 1\n/b 2\n";
     assert_eq!(eventually(port, "/read", |log| log == expected), expected);
+
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--node-compat`, the writes of a served `ServerResponse` are checked as Node.js's `write_`
+/// checks them, and its header values leniently under the server's `httpValidation`: `null` chunks, bodies that a status or `HEAD` doesn't allow under
+/// `rejectNonStandardBodyWrites`, a `strictContentLength` body that doesn't match its
+/// `Content-Length`, and writes after `destroy`.
+#[test]
+fn node_served_response_writes_are_checked() {
+    let dir =
+        std::env::temp_dir().join(format!("starling-serve-node-writes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("server.cjs"),
+        r#"const http = require('http');
+        const results = [];
+        const check = (name, f) => {
+            try {
+                results.push(`${name}: ${f()}`);
+            } catch (e) {
+                results.push(`${name}: ${e.code}`);
+            }
+        };
+        http.createServer({ rejectNonStandardBodyWrites: true, httpValidation: 'relaxed' }, (req, res) => {
+            if (req.url === '/lenient') {
+                check('lenient', () => res.setHeader('X-A', 'a\x01b').getHeader('X-A') === 'a\x01b');
+                res.end();
+            } else if (req.url === '/204') {
+                res.writeHead(204);
+                check('204', () => res.write('x'));
+                res.end();
+            } else if (req.url === '/null') {
+                check('null', () => res.write(null));
+                res.end();
+            } else if (req.url === '/strict') {
+                res.strictContentLength = true;
+                res.setHeader('Content-Length', 5);
+                check('long', () => res.write('abcdef'));
+                check('short', () => res.end('ab'));
+                res.destroy();
+            } else if (req.url === '/destroyed') {
+                res.destroy();
+                check('destroyed', () => res.write('x', (e) => results.push(`callback: ${e.code}`)));
+            } else {
+                res.end(results.join('\n'));
+            }
+        }).listen(0);
+        "#,
+    )
+    .unwrap();
+    let port = 18536;
+    let handle = start_serve_config(
+        RuntimeConfig {
+            script_path: dir.join("server.cjs").to_string_lossy().into_owned(),
+            serve: Some(port),
+            node_compat: true,
+            ..Default::default()
+        },
+        port,
+    );
+
+    for path in ["/lenient", "/204", "/null", "/strict", "/destroyed"] {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        raw_request(port, request.as_bytes());
+    }
+    let head = raw_request(
+        port,
+        b"HEAD /204 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(head.starts_with("HTTP/1.1 204"), "{head}");
+    let expected = "lenient: true\n204: ERR_HTTP_BODY_NOT_ALLOWED\nnull: ERR_STREAM_NULL_VALUES\n\
+                    long: true\n\
+                    short: ERR_HTTP_CONTENT_LENGTH_MISMATCH\ndestroyed: false\n\
+                    callback: ERR_STREAM_DESTROYED\n204: ERR_HTTP_BODY_NOT_ALLOWED";
+    assert_eq!(
+        eventually(port, "/report", |report| report == expected),
+        expected
+    );
 
     handle.stop();
     let _ = std::fs::remove_dir_all(&dir);

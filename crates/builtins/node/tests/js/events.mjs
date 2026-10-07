@@ -205,3 +205,32 @@ for (const options of [[], () => {}]) {
   const rejection = await once(new EventEmitter(), "x", options).then(() => "resolved", (error) => error.code);
   eq(rejection, "ERR_INVALID_ARG_TYPE", "once rejects options that aren't plain objects");
 }
+
+// The `once` wrapper is named `wrapper`, and `emit` has one declared parameter.
+const wrapped = new EventEmitter();
+wrapped.once("w", () => {});
+eq(wrapped.rawListeners("w")[0].name, "wrapper", "the name of a once wrapper");
+eq(EventEmitter.prototype.emit.length, 1, "emit.length");
+
+// `eventNames` skips the `undefined` entries `removeListener` leaves on an emitter in shape mode.
+const shaped = Object.create(EventEmitter.prototype);
+shaped._events = { __proto__: null };
+EventEmitter.call(shaped);
+const shapedListener = () => {};
+shaped.on("a", shapedListener);
+shaped.on("b", shapedListener);
+shaped.removeListener("a", shapedListener);
+deepEq(shaped.eventNames(), ["b"], "eventNames in shape mode");
+
+// `once` and `on` reject an emitter that is neither an `EventEmitter` nor an `EventTarget`.
+for (const emitter of [5, {}]) {
+  const message = await once(emitter, "x").then(() => "resolved", (error) => error.message);
+  eq(message.startsWith('The "emitter" argument must be an instance of EventEmitter.'), true, "once with a non-emitter");
+  let thrown = "returned";
+  try {
+    on(emitter, "x");
+  } catch (error) {
+    thrown = error.message;
+  }
+  eq(thrown.startsWith('The "emitter" argument must be an instance of EventEmitter.'), true, "on with a non-emitter");
+}

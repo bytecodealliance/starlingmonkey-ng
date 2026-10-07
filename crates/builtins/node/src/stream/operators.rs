@@ -97,13 +97,58 @@ fn await_value(
     )
 }
 
-/// A reaction function running `body` with `payload`.
-fn reaction<'s>(
+/// A reaction function a state created, and the callback it runs.
+#[js::must_root]
+#[derive(core_runtime::Traceable)]
+struct Reaction {
+    #[no_trace]
+    body: Callback,
+    function: Heap<js::object::Object>,
+}
+
+/// A state whose reaction functions run with the state as their payload, and are created once.
+trait Reactions: Copy {
+    fn reactions(&self) -> js::class::RefMut<'_, Vec<Reaction>>;
+}
+
+macro_rules! impl_reactions {
+    ($($state:ident => $data:ident),*) => {
+        $(impl Reactions for $state<'_> {
+            fn reactions(&self) -> js::class::RefMut<'_, Vec<Reaction>> {
+                js::class::RefMut::map(self.data_mut(), |data: &mut $data| &mut data.reactions)
+            }
+        })*
+    };
+}
+
+impl_reactions!(
+    Generator => GeneratorImpl,
+    LoopState => LoopStateImpl,
+    MapState => MapStateImpl,
+    ConsumeState => ConsumeStateImpl
+);
+
+/// The reaction function of `state` that runs `body` with `state` as its payload, created on its
+/// first use.
+fn reaction<'s, S: Reactions + ToJSVal<'s>>(
     scope: &'s Scope<'_>,
     body: Callback,
-    payload: impl ToJSVal<'s>,
+    state: S,
 ) -> Result<Object<'s>, ExnThrown> {
-    Ok(*Function::new_callback(scope, c"", 1, body, payload)?)
+    let cached = state
+        .reactions()
+        .iter()
+        .find(|reaction| std::ptr::fn_addr_eq(reaction.body, body))
+        .map(|reaction| reaction.function.get(scope));
+    if let Some(function) = cached {
+        return Ok(function);
+    }
+    let function = *Function::new_callback(scope, c"", 1, body, state)?;
+    state.reactions().push(Reaction {
+        body,
+        function: Heap::from(function),
+    });
+    Ok(function)
 }
 
 /// The kinds of request a generator takes.
@@ -146,6 +191,7 @@ type BodyResume = fn(&Scope<'_>, Object<'_>, Request, HandleValue<'_>) -> Result
 #[core_runtime::jsclass(hidden)]
 pub(crate) struct Generator {
     body: Option<Heap<js::object::Object>>,
+    reactions: Vec<Reaction>,
     requests: VecDeque<GenRequest>,
     #[no_trace]
     running: bool,
@@ -172,6 +218,7 @@ fn new_generator<'s>(
 ) -> Result<(Generator<'s>, Object<'s>), ExnThrown> {
     let gen = js::class::create_instance_with::<GeneratorImpl>(scope, |_| GeneratorImpl {
         body: Some(Heap::from(body)),
+        reactions: Vec::new(),
         requests: VecDeque::new(),
         running: false,
         phase: Phase::Start,
@@ -483,6 +530,7 @@ type LoopEnd = fn(&Scope<'_>, Object<'_>, End, HandleValue<'_>) -> Result<(), Ex
 #[core_runtime::jsclass(hidden)]
 pub(crate) struct LoopState {
     record: Option<Heap<AsyncIteratorRecordImpl>>,
+    reactions: Vec<Reaction>,
     owner: Option<Heap<js::object::Object>>,
     #[no_trace]
     on_value: Option<LoopValue>,
@@ -508,6 +556,7 @@ fn loop_open<'s>(
     let record = js::iteration::get_async_iterator(scope, iterable)?;
     js::class::create_instance_with::<LoopStateImpl>(scope, |_| LoopStateImpl {
         record: Some(Heap::from(record)),
+        reactions: Vec::new(),
         owner: Some(Heap::from(owner)),
         on_value: Some(on_value),
         on_end: Some(on_end),
@@ -692,6 +741,7 @@ enum MapEntry {
 #[core_runtime::jsclass(hidden)]
 pub(crate) struct MapState {
     gen: Option<Heap<GeneratorImpl>>,
+    reactions: Vec<Reaction>,
     stream: Heap<Value>,
     function: Heap<Value>,
     options: Heap<Value>,
@@ -767,6 +817,7 @@ fn map_generator<'s>(
 
     let state = js::class::create_instance_with::<MapStateImpl>(scope, |_| MapStateImpl {
         gen: None,
+        reactions: Vec::new(),
         stream: Heap::from(stream.get()),
         function: Heap::from(function.get()),
         options: Heap::from(options.get()),
@@ -1224,16 +1275,12 @@ fn filter_fn(
         }
     };
     let decide = if for_each {
-        js::class::get_or_init_shared_function(
-            scope,
-            empty_result as *const () as usize,
-            |scope| Function::new_callback(scope, c"", 1, empty_result, ()),
-        )?
+        crate::support::shared_function(scope, empty_result, 1)?
     } else {
-        Function::new_callback(scope, c"", 1, filter_decide, value)?
+        *Function::new_callback(scope, c"", 1, filter_decide, value)?
     };
     promise
-        .then(scope, Some(*decide), None)?
+        .then(scope, Some(decide), None)?
         .to_jsval_raw_throwing(scope)
 }
 
@@ -1629,6 +1676,7 @@ enum Consume {
 #[core_runtime::jsclass(hidden)]
 pub(crate) struct ConsumeState {
     promise: Option<Heap<js::promise::Promise>>,
+    reactions: Vec<Reaction>,
     over: Option<Heap<LoopStateImpl>>,
     options: Heap<Value>,
     result: Heap<Value>,
@@ -1656,6 +1704,7 @@ fn new_consume<'s>(
 ) -> Result<ConsumeState<'s>, ExnThrown> {
     js::class::create_instance_with::<ConsumeStateImpl>(scope, |_| ConsumeStateImpl {
         promise: Some(Heap::from(promise)),
+        reactions: Vec::new(),
         over: None,
         options: Heap::from(options.get()),
         result: Heap::from(result.get()),
@@ -1874,7 +1923,7 @@ fn every_fn(
     args: CallbackArgs<'_>,
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let call_args: Vec<HandleValue<'_>> = (0..args.len()).map(|index| args.get(index)).collect();
+    let call_args: Vec<HandleValue<'_>> = args.rest(0);
     let result = Function::call(scope, HandleValue::undefined(), payload, &call_args)
         .and_then(|result| js::Promise::call_original_resolve(scope, result));
     let promise = match result {
@@ -1903,11 +1952,7 @@ fn negate(
 
 /// The shared function of [`negate`].
 fn negate_function<'s>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let function =
-        js::class::get_or_init_shared_function(scope, negate as *const () as usize, |scope| {
-            Function::new_callback(scope, c"", 1, negate, ())
-        })?;
-    Ok(*function)
+    crate::support::shared_function(scope, negate, 1)
 }
 
 /// Node's `every(fn, options)`: `!(await some(async (...args) => !(await fn(...args))))`.
@@ -1974,7 +2019,7 @@ fn reduce(
             let error = crate::errors::abort_error(scope, Some(reason))?;
             state.data().result.set(error.get());
             let stream_object = Object::from_value_coerce(scope, stream)?;
-            let noop = crate::support::noop_function(scope)?;
+            let noop = crate::support::nop(scope)?;
             crate::events::listen(scope, stream_object, c"once", c"error", noop)?;
             let destroyed =
                 Function::call_by_name(scope, stream_object.handle(), c"destroy", &[error])?;

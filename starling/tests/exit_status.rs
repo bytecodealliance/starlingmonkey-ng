@@ -220,3 +220,191 @@ fn imported_module_syntax_error_keeps_its_location() {
     assert!(stderr.contains("expected expression"), "stderr: {stderr}");
     assert!(stderr.contains("bad.mjs:1:"), "stderr: {stderr}");
 }
+
+/// When an `uncaughtException` listener handles a throw from the entry script's top level, the
+/// ticks and promise reactions it queued run, in Node.js's order, and the process exits with 0.
+#[test]
+fn jobs_an_uncaught_exception_listener_queues_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.js");
+    std::fs::write(
+        &main,
+        "process.on('uncaughtException', (e) => {\n\
+         console.log('caught', e.message);\n\
+         process.nextTick(() => console.log('tick'));\n\
+         Promise.resolve().then(() => console.log('reaction'));\n\
+         });\n\
+         throw new Error('top');\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .arg("--node-compat")
+        .arg(&main)
+        .output()
+        .expect("failed to run starling");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "caught top\ntick\nreaction\n"
+    );
+}
+
+/// When an `uncaughtException` listener handles a rejection of the entry module's top-level
+/// `await`, the promise reactions it queued run before its ticks, as in Node.js.
+#[test]
+fn jobs_a_listener_queues_for_a_top_level_rejection_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        "process.on('uncaughtException', (e) => {\n\
+         console.log('caught', e.message);\n\
+         process.nextTick(() => console.log('tick'));\n\
+         Promise.resolve().then(() => console.log('reaction'));\n\
+         });\n\
+         await Promise.reject(new Error('top'));\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .arg("--node-compat")
+        .arg(&main)
+        .output()
+        .expect("failed to run starling");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "caught top\nreaction\ntick\n"
+    );
+}
+
+/// `-p` runs its code as `-e` does, and logs the completion value when the process exits, after
+/// the timers the code started.
+#[test]
+fn print_logs_the_completion_value_at_exit() {
+    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .args([
+            "--node-compat",
+            "-p",
+            "setTimeout(() => console.log('timer')); require('path').join('a', 'b')",
+        ])
+        .output()
+        .expect("failed to run starling");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "timer\na/b\n");
+}
+
+/// `-p` refuses code that only compiles as an ES module with `ERR_EVAL_ESM_CANNOT_PRINT`.
+#[test]
+fn print_refuses_es_module_input() {
+    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .args(["--node-compat", "-p", "await 3"])
+        .output()
+        .expect("failed to run starling");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ERR_EVAL_ESM_CANNOT_PRINT"),
+        "{out:?}"
+    );
+}
+
+/// `--trace-warnings` prints a warning with its stack frames and without the hint about the
+/// tracing flags.
+#[test]
+fn trace_warnings_prints_the_stack() {
+    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .args([
+            "--node-compat",
+            "--allow-node-runtime-flags",
+            "--trace-warnings",
+            "-e",
+            "process.emitWarning('w')",
+        ])
+        .output()
+        .expect("failed to run starling");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(") Warning: w\n    at "), "{stderr}");
+    assert!(!stderr.contains("--trace-warnings ..."), "{stderr}");
+}
+
+/// Run `source` as the CommonJS entry script `main.js` with `--node-compat`.
+fn run_node_script(source: &str) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.js");
+    std::fs::write(&main, source).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .arg("--node-compat")
+        .arg(&main)
+        .output()
+        .expect("failed to run starling")
+}
+
+/// `uncaughtExceptionMonitor` listeners get an uncaught exception or rejection and its origin
+/// before the `uncaughtException` listeners, and also when nothing else listens.
+#[test]
+fn uncaught_exception_monitor_runs_first() {
+    let out = run_node_script(
+        "process.on('uncaughtExceptionMonitor', (e, o) => console.log('monitor', e.message, o));\n\
+         process.on('uncaughtException', (e, o) => console.log('handler', e.message, o));\n\
+         setTimeout(() => Promise.reject(new Error('rejected')), 1);\n\
+         throw new Error('thrown');\n",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "monitor thrown uncaughtException\nhandler thrown uncaughtException\n\
+         monitor rejected unhandledRejection\nhandler rejected unhandledRejection\n"
+    );
+    let out = run_node_script(
+        "process.on('uncaughtExceptionMonitor', (e, o) => console.log('monitor', e.message, o));\n\
+         throw new Error('thrown');\n",
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "monitor thrown uncaughtException\n"
+    );
+}
+
+/// An exception an `unhandledRejection` listener throws is an uncaught exception of origin
+/// `uncaughtException`, which exits with code 1 if nothing handles it.
+#[test]
+fn unhandled_rejection_listener_exceptions_are_uncaught() {
+    let out = run_node_script(
+        "process.on('unhandledRejection', () => { throw new Error('boom'); });\n\
+         process.on('uncaughtException', (e, o) => console.log('caught', e.message, o));\n\
+         Promise.reject(1);\n",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "caught boom uncaughtException\n"
+    );
+    let out = run_node_script(
+        "process.on('unhandledRejection', () => { throw new Error('boom'); });\n\
+         Promise.reject(1);\n",
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Error: boom"));
+}
+
+/// With `process.throwDeprecation`, `emitWarning` returns and throws a deprecation warning in a
+/// tick, as an uncaught exception.
+#[test]
+fn thrown_deprecations_are_uncaught_exceptions() {
+    let out = run_node_script(
+        "process.throwDeprecation = true;\n\
+         process.on('uncaughtException', (e) => console.log('uncaught', e.name, e.message));\n\
+         try {\n\
+         process.emitWarning('x', 'DeprecationWarning');\n\
+         console.log('returned');\n\
+         } catch {\n\
+         console.log('caught');\n\
+         }\n",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "returned\nuncaught DeprecationWarning x\n"
+    );
+}

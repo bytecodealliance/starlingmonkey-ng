@@ -69,6 +69,8 @@ These flags take effect:
   so does `process.binding()` (DEP0111).
 - `--no-deprecation`, `--deprecation` and `--throw-deprecation`: the initial
   `process.noDeprecation` and `process.throwDeprecation`.
+- `--trace-warnings` and `--trace-deprecation`: the initial `process.traceProcessWarnings` and
+  `process.traceDeprecation`, with which a printed warning shows its `stack`.
 - `--abort-on-uncaught-exception`: an uncaught exception, unless
   `process.setUncaughtExceptionCaptureCallback` set a callback, prints `Uncaught` with the error
   and its stack frames, as Node.js does, and aborts the process with `SIGABRT` natively and traps
@@ -82,9 +84,15 @@ These flags take effect:
 - `--experimental-stream-iter`: `stream/iter` and `zlib/iter` can be imported. Their exports are
   stubs.
 - `--test-udp-no-try-send`: `dgram` sockets queue every send instead of sending it at once.
+- `--dns-result-order=verbatim|ipv4first|ipv6first`: the initial `dns.getDefaultResultOrder()`.
+- `--unhandled-rejections=throw|strict|warn|none|warn-with-error-code`: how a rejection nothing
+  handled is handled, as in Node.js. `throw` is the default.
 - `--insecure-http-parser`: HTTP servers and client requests without the `insecureHTTPParser` and
   `httpValidation` options parse messages leniently (see [`node:http`](#nodehttp-and-nodehttps)),
   and the first one to do so emits a warning.
+- `--no-experimental-websocket` and `--experimental-websocket`: with
+  `--no-experimental-websocket`, the globals `WebSocket` and `CloseEvent` don't exist (see
+  [`WebSocket`](#websocket)).
 
 These flags are accepted without effect:
 
@@ -199,9 +207,9 @@ These rules add to the practices for all builtins in
   on first use.
 - Standard classes, web classes, and the objects the global setup installs, such as `process`,
   `console`, `atob` and `btoa`, are reached through `js::class::get_class_object`, the class
-  registry or realm objects, and not through the global's properties, which code can replace. A
-  stub module is the exception: when it is first imported, an export takes the value of the
-  global of the same name, such as `stream/web`'s classes.
+  registry or realm objects, and not through the global's properties, which code can replace. The
+  stub modules `stream/web` and `worker_threads` are the exception: when one is first imported, an
+  export takes the value of the global of the same name, such as `stream/web`'s classes.
 - Node APIs have no step-structured specification. Each implemented function's doc comment links
   to the section of the Node.js API documentation it implements, and states where the
   implementation deviates from it.
@@ -210,8 +218,13 @@ These rules add to the practices for all builtins in
   `scripts/node-builtin-exports.mjs`): functions throw `ERR_METHOD_NOT_IMPLEMENTED` when called,
   classes when constructed (and can be extended), and primitive constants have Node's values.
 - Errors that Node gives a `code` have the same `code` and constructor (`Error`, `TypeError`,
-  `RangeError`, `URIError`). Those with an `ERR_` code have Node's `toString`, which returns
-  `` `${name} [${code}]: ${message}` ``, as a non-enumerable own property.
+  `RangeError`, `URIError`). Those with an `ERR_` code that Node creates in JavaScript inherit from
+  a prototype for their constructor and code, which inherits from the constructor's prototype, as
+  the classes of Node's `makeNodeErrorWithCode` do. It has a `constructor` getter returning the
+  constructor, a `toString` returning `` `${name} [${code}]: ${message}` `` with the code the error
+  was created with, and a `kIsNodeError` getter returning `true`. The errors themselves have an
+  own `code` and no own `toString`. Errors that Node creates in C++, such as `ERR_INVALID_URL`,
+  inherit from the constructor's prototype.
 - Where Node's behavior comes from its JavaScript or C++ implementation rather than from its
   documentation, such as argument validation order or event order, the implementation ports that
   code. [Testing](#testing) describes how the behavior is compared with Node's.
@@ -249,7 +262,15 @@ JavaScript file is an ES module. `.node` native addons are refused with `ERR_DLO
   modules. An ES module is loaded, linked and evaluated synchronously, and `require` returns its
   namespace, or its export named `"module.exports"` if it has one. An ES module graph whose
   top-level `await` doesn't settle synchronously can't be `require`d.
-- `require.resolve(request)` returns the resolved path, or the builtin module name.
+- As in Node.js, `require(id)` calls `module.require(id)`, which calls `Module._load(id, module,
+  false)`. That calls `Module._resolveFilename` for a specifier without the `node:` scheme, then,
+  for a module that isn't cached, `module.load(filename)`, which calls the `Module._extensions`
+  loader of the file's longest registered extension, or the `.js` one. The `.js` loader reads the
+  file and calls `module._compile(content, filename)`. Replacing any of these, as loaders and
+  instrumentation do, takes effect. An ES module's `import` of a CommonJS module starts at
+  `module.load`.
+- `require.resolve(request, options)` returns `Module._resolveFilename(request, module, false,
+  options)`: the resolved path, or the builtin module name. `options.paths` isn't supported.
 - `module.createRequire(filename)` takes an absolute path or a `file:` URL.
 - An ES module importing a CommonJS module gets its `module.exports` as the `default` export and
   as the `"module.exports"` export, and each own enumerable string-keyed property of
@@ -261,8 +282,8 @@ JavaScript file is an ES module. `.node` native addons are refused with `ERR_DLO
   CommonJS module also resolves and reads the CommonJS modules and JSON files its source
   `require`s with a string literal, transitively, while the top level runs, or before the Wizer
   snapshot. A later `require` of one of them loads it from memory. A `require` whose specifier
-  isn't a literal, or that names an ES module, still reads the file, and throws
-  `ERR_BLOCKING_NOT_ALLOWED` while serving.
+  isn't a literal, or that names an ES module, still resolves and reads the file, and throws
+  `ERR_BLOCKING_NOT_ALLOWED` while serving before it resolves the specifier.
 
 Deviation: Node determines a CommonJS module's named exports by analyzing its source, and runs it
 when the importing graph evaluates. StarlingMonkey runs it when the importing graph loads, before
@@ -280,6 +301,16 @@ Every file-backed ES module has:
 
 These exist with and without `--node-compat`. Modules with no file (`-e` scripts, native modules)
 have `resolve` and `main` only.
+
+## The command line
+
+With `--node-compat`, the arguments after the script path are the script's, and `process.argv`
+ends with them. `-e` code runs as Node.js runs it: `module`, `exports`, `require`, `__filename`
+(`[eval]`) and `__dirname` (`.`) are set on the global object for a CommonJS module `[eval]` whose
+`require` resolves from the working directory, and the code runs as a classic script, or as an ES
+module if it has ES module syntax or a top-level `await`. `-p` runs its code the same way and logs
+the completion value when the process exits, and refuses code that compiles only as an ES module
+with `ERR_EVAL_ESM_CANNOT_PRINT`.
 
 ## Stack traces
 
@@ -328,6 +359,36 @@ polls there, so it reports nothing while the runtime serves requests unless
   platform natively (`darwin`, `linux`, `win32`).
 - `process.arch` is `'wasm32'` on wasm, and the host's architecture in Node's naming natively.
 
+## Errors of the web classes
+
+Node.js implements its web classes, such as `URL`, `EventTarget`, `TextDecoder`, `Blob`,
+`performance` and the streams, on its own validators, so their errors carry Node's codes and
+messages. In `--node-compat` mode, the web builtins throw those errors too. Without the flag they
+throw the errors the specifications and WPT require.
+
+The web builtins report their errors through `js::error::throw_binding_error`, with the
+`BindingSite` of the member: the interface's name, the member's name and its kind. The binding
+code that the class macros generate reports a missing argument, an argument that fails to
+convert, a `this` that isn't an instance, a constructor that only the runtime calls and a
+constructor called without `new`. The builtins' own steps report the errors that Node.js gives a
+code, such as `ERR_INVALID_URL`, `ERR_ENCODING_NOT_SUPPORTED`, `ERR_INVALID_TUPLE`,
+`ERR_PERFORMANCE_INVALID_TIMESTAMP` and the streams' `ERR_INVALID_STATE` and
+`ERR_INVALID_ARG_VALUE`, as `Operation` errors with the code and the values the message includes,
+and argument errors that their steps find, such as an `addEventListener` listener that isn't an
+object, as the binding error of that argument. Errors of a class's algorithms that run outside a
+call of one of its members, such as a compression stream's transform, have a site with an empty
+member name.
+
+`--node-compat` installs the hook of `crates/builtins/node/src/errors/web.rs`. Its tables give,
+for each interface, Node's error for an invalid `this` (`ERR_INVALID_THIS` naming the type,
+undici's "Illegal invocation", or V8's error for a private field) and for a constructor that only
+the runtime calls, and for each member, Node's names of the arguments that `ERR_MISSING_ARGS`
+lists and Node's error for each argument that fails to convert. The `ERR_INVALID_STATE` messages
+are Node's for the stream operations the table maps. Members and arguments without an entry keep
+the web error. Where Node.js validates a value WebIDL accepts, or accepts a value WebIDL rejects,
+the web behavior applies, and [`node-compat-issues.md`](node-compat-issues.md) lists the known
+cases.
+
 ## Modules
 
 ### `node:path`
@@ -356,10 +417,10 @@ are produced.
 - The timeline is the `Performance` object's Rust state: the `mark` and `measure` buffers and the
   registered observers. An observer's callback runs in a zero-delay timer queued once for all
   observers with new entries, as Node.js's `setImmediate`, with the entries sorted by start
-  time. Errors of the shared classes are the web platform's: argument conversions throw a
-  `TypeError` without a `code` where Node.js throws `ERR_INVALID_ARG_TYPE` or
-  `ERR_MISSING_ARGS`, and `performance.mark` throws a `SyntaxError` `DOMException` for a
-  `nodeTiming` milestone name, where Node.js throws `ERR_INVALID_ARG_VALUE`.
+  time. The argument errors of the shared classes are Node's (see
+  [Errors of the web classes](#errors-of-the-web-classes)), but `performance.mark` throws a
+  `SyntaxError` `DOMException` for a `nodeTiming` milestone name, where Node.js throws
+  `ERR_INVALID_ARG_VALUE`.
 - `Performance.prototype` gets Node.js's non-enumerable `eventLoopUtilization`, `nodeTiming` and
   `timerify`, and Node.js's `toJSON`. `markResourceTiming`, `clearResourceTimings`,
   `setResourceTimingBufferSize` and `onresourcetimingbufferfull` are missing. `measure` takes
@@ -419,6 +480,9 @@ asymmetric keys, signatures and ciphers.
   keys of RFC 8018, RFC 7914 and RFC 5869 with the supported digests. scrypt's parameters are
   checked as OpenSSL checks them, including `maxmem`. The keys are derived on the JS thread,
   including in the callback forms, which call back in a later turn of the event loop.
+- HMAC, PBKDF2 and HKDF are RustCrypto's `hmac`, `pbkdf2` and `hkdf`, and scrypt's Salsa20/8
+  core is `salsa20`'s. scrypt's ROMix is implemented in `crypto.rs`, which allocates its memory
+  fallibly, since the `scrypt` crate allocates it with `vec!`.
 - Random bytes come from the operating system natively, and from `wasi:random/random` on wasm.
 - The callbacks of `randomBytes` and `randomFill` run in a later turn of the event loop, and
   `randomInt`'s in a tick.
@@ -444,8 +508,7 @@ implemented, including `bindStore`, `unbindStore` and `runStores`, and `TracingC
 `_eventsCount` and `_maxListeners`, as Node does. Its static members (`defaultMaxListeners`,
 `errorMonitor`, `captureRejectionSymbol`, `captureRejections`, `usingDomains`, `init`) are also
 named exports. `getEventListeners`, `getMaxListeners`, `setMaxListeners` and `listenerCount` are
-implemented, as are `once` and `on`, for emitters and `EventTarget`s, except that
-`getEventListeners` can't list an `EventTarget`'s listeners. `on`'s `highWaterMark` and
+implemented, as are `once` and `on`, for emitters and `EventTarget`s. `on`'s `highWaterMark` and
 `lowWaterMark` options call the emitter's `pause` and `resume` if it has them.
 `addAbortListener` and `EventEmitterAsyncResource` are stubs.
 
@@ -474,9 +537,13 @@ exports.
   end. An exception nothing caught, including one the entry script's top level throws, or a
   rejection nothing handled, goes to the `uncaughtException` or `unhandledRejection` listeners,
   and without one ends the process with exit code 1 after printing it as Node does: the
-  `util.inspect` of an error, followed by the Node.js version. An `uncaughtException`
-  listener that throws ends it with exit code 7. `setUncaughtExceptionCaptureCallback` is
-  implemented.
+  `util.inspect` of an error, followed by the Node.js version. A rejection with a reason that
+  isn't an error is handled as an `UnhandledPromiseRejection` error with the code
+  `ERR_UNHANDLED_REJECTION`, and `--unhandled-rejections` selects the other modes of Node.js. An
+  `uncaughtException` listener that throws ends it with exit code 7.
+  `setUncaughtExceptionCaptureCallback` is implemented. A promise that gets a handler after its
+  rejection was reported emits `rejectionHandled`, or a `PromiseRejectionHandledWarning` if
+  nothing listens.
 - `config` holds the `target_defaults` and `variables` fields test suites probe.
 - `exit(code)` emits `exit`, flushes stdout and stderr, and exits with `code`, `process.exitCode`,
   or 0. `exitCode` accepts the values Node accepts.
@@ -493,17 +560,21 @@ exports.
 - `execArgv` is the Node.js runtime flags (see [Runtime flags](#runtime-flags)), and `title` is
   `starlingmonkey` unless `--title` sets it. `binding(name)` returns the binding objects of
   [Internal modules](#internal-modules).
-- `pid` is 1 on wasm. `memoryUsage()` and `cpuUsage()` report 0. `umask()` is `0o022`, and
-  `getuid()`, `geteuid()`, `getgid()` and `getegid()` are 0. `kill()` throws
-  `ERR_METHOD_NOT_IMPLEMENTED`.
+- `pid` is 1 and `ppid` 0 on wasm. `memoryUsage()` and `cpuUsage()` report 0. `umask()` is
+  `0o022`, and `getuid()`, `geteuid()`, `getgid()` and `getegid()` are 0. `kill()` sends signals
+  natively, and throws `ENOSYS` on wasm (see [`node:child_process`](#nodechild_process)).
 
 ### `node:module`
 
 `Module` is the `default` export. `createRequire`, `isBuiltin`, `builtinModules`,
-`syncBuiltinESMExports` (which does nothing), `_cache`, `globalPaths` and `constants` are
-implemented, as are `module.require`, `module.load` and `module._compile`. `Module._extensions`
-has loaders for `.js`, `.json` and `.node` files, which `require` doesn't consult. The rest is
-stubs.
+`syncBuiltinESMExports` (which does nothing), `_cache`, `_load`, `_resolveFilename`,
+`_nodeModulePaths`, `globalPaths` and `constants` are implemented, as are `module.require`,
+`module.load` and `module._compile` (see [CommonJS](#commonjs)). `globalPaths` starts with the
+entries of `NODE_PATH`, and a bare specifier that no `node_modules` directory has is looked up in
+each of them, as in Node.js. `Module._extensions` has loaders for `.js`, `.json` and `.node` files.
+The rest is stubs. `Module.prototype.parent` reads and writes the parent kept in the module's Rust
+state, so the module has no property JavaScript can see for it, as in Node. Assigning `parent` on
+an object without that state gives the object its own.
 
 The legacy internal modules `_stream_duplex`, `_stream_passthrough`, `_stream_readable`,
 `_stream_transform` and `_stream_writable` are the `stream` classes. `_http_agent`,
@@ -535,6 +606,36 @@ emitted.
 - Reactions to settled promises that are created while a debugger has paused the program can run
   with another reaction's context.
 
+### `node:domain`
+
+`create`, `createDomain`, `Domain`, `active` and `_stack` are implemented, as are a domain's
+`run`, `enter`, `exit`, `add`, `remove`, `bind`, `intercept`, `_errorHandler` and `members`, and
+the `domain`, `domainEmitter`, `domainBound` and `domainThrown` properties of the errors a domain
+handles. As in Node.js 24, domains have no `dispose` or `parent`.
+
+- Loading the module makes `process.domain` an accessor, sets `EventEmitter.usingDomains`, and
+  makes `process` keep Node's `domainUncaughtExceptionClear` as its first `uncaughtException`
+  listener. Loading it while `process.setUncaughtExceptionCaptureCallback` set a callback throws
+  `ERR_DOMAIN_CALLBACK_NOT_AVAILABLE`, and setting one afterwards throws
+  `ERR_DOMAIN_CANNOT_SET_UNCAUGHT_EXCEPTION_CAPTURE`.
+- The async context holds the domain `process.domain` is when it is set. Timers, immediates,
+  `process.nextTick` callbacks, promise reactions, I/O callbacks and
+  `AsyncResource.runInAsyncScope` run with the domain of the context they captured entered, and
+  exit it afterwards. `Timeout`, `Immediate` and `AsyncResource` objects created while a domain
+  is active get it as their `domain`. Promises don't.
+- Emitters created while a domain is active get it as their `domain`. Once the module is loaded,
+  `emit` on an emitter with a domain calls the listeners with the domain entered, and emits an
+  `error` event without listeners on the domain.
+- An exception nothing caught goes to the `_errorHandler` of `process.domain` while a domain with
+  `error` listeners is entered, instead of to `uncaughtException`, and
+  `process.hasUncaughtExceptionCaptureCallback()` returns `true`. Whether a domain has `error`
+  listeners is checked when the exception is uncaught. A rejection nothing handles is emitted on
+  the domain it was rejected in. An exception a `queueMicrotask` callback throws is handled after
+  the callback exited its domain, as in Node.js.
+- `active` and `_stack` are accessors of the module object. `_stack` returns a new array of the
+  entered domains on each read. The named exports `active` and `_stack` of the ES module keep the
+  values they had when the module was loaded.
+
 ### `node:buffer` and `Buffer`
 
 `Buffer` is installed on every global. A `Buffer` is a `Uint8Array` whose prototype is
@@ -553,8 +654,11 @@ the low byte of each UTF-16 code unit.
 - `Buffer.copyBytesFrom`, the `parent` and `offset` getters, and the `utf8Slice`-style and
   `utf8Write`-style methods exist, and the `Uint` spellings of the read and write methods are the
   same functions as the `UInt` ones.
-- `kMaxLength` and `constants.MAX_LENGTH` are 2147483647, the largest `Buffer` the runtime
-  creates.
+- `kMaxLength` and `constants.MAX_LENGTH` are 9007199254740991, as in Node.js, and the size
+  checks report that bound. The runtime creates buffers of at most 2147483647 bytes. A larger size
+  fails with the error Node.js throws when the allocation fails: a `RangeError` with the message
+  `Array buffer allocation failed`, or `ERR_MEMORY_ALLOCATION_FAILED` where Node.js creates the
+  buffer with `createUnsafeBuffer`.
 - No pool backs small buffers: `Buffer.allocUnsafe` and `Buffer.from` of a string create a
   buffer with an `ArrayBuffer` of its own, whose `byteOffset` is 0. `Buffer.poolSize` is 65536,
   as in Node.js, and has no effect.
@@ -591,6 +695,11 @@ rest of the modules are stubs.
   `write` or `end` calls `writeHead` through the response, so a patched `writeHead` sees implicit
   headers too. As in Node.js, the headers `writeHead` is given are sent without being set, so
   `getHeader` doesn't return them, unless a header was set before.
+- Header values given to `setHeader`, `appendHeader`, `writeHead`, `addTrailers` and
+  `writeInformation` are checked leniently, with only NUL, CR, LF and characters above `0xff`
+  invalid, for a message whose `httpValidation`, or its server's, is set and isn't `'strict'`,
+  and otherwise for one whose `insecureHTTPParser`, or its server's, is `true`, or with
+  `--insecure-http-parser`, as in Node.js's `_isLenientHeaderValidation`.
 - A `ServerResponse` that doesn't respond to a served request writes HTTP/1.1 to the socket it is
   assigned with `assignSocket`, and queues what it writes in `outputData` until then, as in
   Node.js.
@@ -634,7 +743,8 @@ Each message, server and connection keeps its state in one Rust struct:
   payload, an `AgentSocket`, holds the agent, the socket and the socket's options.
 - Served requests and client requests through the runtime's HTTP client get a host socket, a
   `Socket` whose private data holds the peer's address the host reported, the local port, whether
-  it was destroyed, and the request it belongs to.
+  it was destroyed, and the request it belongs to. A served request's socket has the server as
+  its `server` property, as an accepted socket has in Node.js.
 
 A server that accepts connections itself handles each connection's requests as Node.js does:
 
@@ -691,7 +801,13 @@ For served requests:
   `ServerResponse`. A body that `end` writes whole is the response's body. Otherwise the response
   is sent with the first write, and its body is a native `ReadableStream` the later writes
   enqueue chunks on. The headers don't pass through a `Headers` guard, so `Set-Cookie` is sent
-  with `--enforce-fetch-restrictions` too.
+  with `--web-security-restrictions` too.
+- `writeHead` converts the header values to strings, and the response has the status, reason
+  phrase and headers it stored, as on the wire. `_header` is the status line, the header lines
+  and `Date`, without the `Connection`, `Keep-Alive`, `Content-Length` and `Transfer-Encoding`
+  lines Node.js adds to frame a response, and the properties that frame a response on the wire,
+  such as `chunkedEncoding`, `shouldKeepAlive` and `_last`, keep the values the constructor gave
+  them.
 - A served request with an `Upgrade` header, or a `CONNECT` request, gets a 501 response when the
   server has `upgrade` or `connect` listeners, since served requests have no socket to give them.
   Without such listeners it is a `request` event.
@@ -724,7 +840,7 @@ For clients, a request takes one of two paths:
 - A request to an `http:` URL in a script the CLI runs as a command, natively or on wasm, writes
   HTTP/1.1 to a socket, as Node.js's `ClientRequest` does.
 - Every other request goes through the runtime's HTTP client, reqwest natively and `wasi:http` on
-  wasm: requests to `https:` URLs, since the runtime's sockets have no TLS, and every request while
+  wasm: requests to `https:` URLs, since `net` sockets have no TLS, and every request while
   the runtime serves requests, with `--serve` or in a `wasi:http` component, including Spin. There
   `net` sockets work natively, but a component's host may not grant `wasi:sockets`, and a socket a
   served request's event loop reads isn't read once its response is sent, so an agent couldn't
@@ -790,6 +906,45 @@ written as its body:
   `true`.
 - `https.Agent` has `http.Agent`'s methods.
 
+### `WebSocket`
+
+`WebSocket` and `CloseEvent` are globals in every mode, as the web builtins of
+`crates/builtins/web-websocket` implement them, and `node:http` exports them and `MessageEvent`,
+as in Node.js. A socket speaks the WebSocket protocol through tungstenite over a `net` TCP
+connection, natively and on wasm, and over TLS for `wss:` URLs natively.
+
+- With `--node-compat`, the constructor's second argument can also be Node.js's options object,
+  `{ protocols, headers }`, where `headers` is anything `new Headers()` takes. Node's `dispatcher`
+  option is ignored. The handshake sends its own `Host`, `Connection`, `Upgrade`,
+  `Sec-WebSocket-Version` and `Sec-WebSocket-Key`, and leaves out those of `headers`. Node.js
+  sends the URL's host too, but fails the connection for a `Connection` or `Upgrade` header and
+  sends both values of the other two.
+- `wss:` connections verify the server's certificate against the Mozilla root certificates of
+  `webpki-roots` and the certificates of the PEM file `NODE_EXTRA_CA_CERTS` names, which is read
+  when the first `wss:` connection is made, as in Node.js. A local server with a self-signed
+  certificate is trusted by putting the certificate of its CA in `NODE_EXTRA_CA_CERTS`.
+- On wasm, a `wss:` connection fails with an `error` and a `close` event with code 1006. The
+  rustls providers that build for wasm without a C toolchain generate keys through `getrandom`
+  0.2, whose WASI backend makes the component import WASIp2 interfaces. A TLS 1.3 handshake with
+  `rustls-rustcrypto` works under `wasmtime`, so the dependency is what's missing.
+- The opening handshake requests no extension, so `permessage-deflate` isn't used and `extensions`
+  is always the empty string. Node.js negotiates `permessage-deflate`.
+- The username and password of the URL are sent as `Authorization: Basic`, as browsers do and
+  Node.js doesn't. `Origin` is sent when the runtime has a location (`--init-location`, or a WPT
+  run). No cookies are sent.
+- A connection that ends without the closing handshake fires `error` before `close`, as in
+  Node.js. Bad ports fail the connection before connecting, as in Node.js.
+- Incoming messages and frames are limited to 64 MiB. tungstenite reserves a frame's declared
+  length once its header arrives, and the limit bounds that allocation. Data sent with `send()`
+  is copied with fallible allocations, and a failed allocation fails the connection.
+- After the closing handshake completes, the socket ends its sending side and waits for the
+  server to close the connection, without a timeout.
+- An open socket keeps the event loop alive. With `--serve`, natively and under `wasmtime serve`,
+  a socket works while its request is handled. A socket still connecting or open when the
+  response is sent is abandoned with the rest of that request's work, and none of its events
+  fire. On wasm, the host must grant `wasi:sockets` and name lookups, as
+  `wasmtime run -Sinherit-network=y,tcp=y,allow-ip-name-lookup=y` does.
+
 ### `node:net` and `node:dns`
 
 TCP sockets and servers, over tokio natively and `wasi:sockets` on wasm: `Socket`, `Stream`,
@@ -817,10 +972,11 @@ TCP sockets and servers, over tokio natively and `wasi:sockets` on wasm: `Socket
   effect. `setTimeout` emits `timeout` once the
   socket was idle for the given time. Unless the socket allows half-open connections, a write
   after the peer ended the connection destroys the socket with `EPIPE`, as in Node.js.
-- Natively, a write sends what the connection takes at once before returning, and waits for the
-  rest. On wasm, every write waits. `bytesWritten` counts the bytes handed to the connection and
-  the bytes the socket buffers, as in Node.js, and `destroySoon` ends the socket and destroys it
-  once it finished writing.
+- A write sends what the connection takes at once before returning, and waits for the rest.
+  `destroy` and exiting cancel the rest, and what was sent at once still reaches the peer, as in
+  Node.js. `bytesWritten` counts the bytes handed to the connection and the bytes the socket
+  buffers, as in Node.js, and `destroySoon` ends the socket and destroys it once it finished
+  writing.
 - A socket's `blockList` option makes `connect` skip the addresses the list blocks, and fail with
   `ERR_IP_BLOCKED` if it blocks the last address tried. A server's `blockList` closes connections
   from the peers it blocks without emitting an event. A `blockList` in the options of a request
@@ -882,7 +1038,6 @@ host's name lookup, `setDefaultResultOrder` and `getDefaultResultOrder`, and the
   also adds them after the IPv6 addresses. The `ADDRCONFIG` hint has no effect.
 - `lookupService` uses the host's `getnameinfo` natively. On wasm, `wasi:sockets` has no such
   lookup, and it fails with `ENOTSUP`. Failed lookups are `ENOTFOUND`.
-- Node.js's `--dns-result-order` flag isn't supported.
 
 ### `node:dgram`
 
@@ -917,6 +1072,63 @@ multicast methods, `Symbol.asyncDispose`, and the deprecated `_`-prefixed member
   throw `ENOTSUP` once the arguments are valid. `reuseAddr` and `ipv6Only` have no effect there,
   and binding with `reusePort` emits `ENOTSUP`. Every send waits. The wasm module must be run
   with UDP access, such as `wasmtime run -Sinherit-network=y,udp=y`.
+
+### `node:child_process`
+
+Child processes, natively on Unix: `spawn`, `exec`, `execFile`, `fork`, `spawnSync`, `execSync`,
+`execFileSync`, `ChildProcess`, and the `util.promisify.custom` versions of `exec` and `execFile`,
+with Node.js's validation, events and errors. `process.kill(pid, signal)` sends signals with
+`kill(2)`.
+
+- A child's state is a `ChildState`, which holds the process until it exits, its standard streams,
+  the `timeout` option's timer and the `signal` option's listener, and the number of `close`
+  events of the streams and the channel that `close` waits for. `pid`, `exitCode`, `signalCode`,
+  `killed`, `connected`, `spawnfile`, `spawnargs`, `stdin`, `stdout`, `stderr`, `stdio`,
+  `_closesNeeded` and `_closesGot` are own data properties, as in Node.js, which the
+  implementation writes and never reads. `_handle` is a plain object until the child exits, and
+  `null` after that.
+- Pipes are Unix socket pairs, as libuv's are. The standard streams, and a pipe on a descriptor
+  above 2, are `net.Socket`s over them. A pipe's output that arrived before the child exited is
+  emitted before `exit`.
+- `stdio` takes `pipe`, `overlapped`, `ignore`, `inherit` and `ipc`, descriptor numbers, objects
+  with a numeric `fd`, such as `process.stdout`, and the streams of other children. Descriptors
+  above 2 are the files `fs` opened. Another child's stream gives the new child its pipe, and stops
+  reading from it, as in Node.js. Other streams without a descriptor, such as a TCP `net.Socket`,
+  throw `ERR_INVALID_ARG_VALUE`, where Node.js passes their handle.
+- The child starts with the default action for every signal, as libuv's children do, and leads a
+  new session with `detached`. `uid` and `gid` set its user and group. `windowsHide` and
+  `windowsVerbatimArguments` are validated and have no effect.
+- `ref` and `unref` set whether waiting for the exit keeps the event loop alive. The pipes keep it
+  alive until they are unreferenced or closed, as in Node.js. A referenced child keeps the event
+  loop of a served request running after the response until it exits.
+- A spawn that fails with `EACCES`, `EAGAIN`, `EMFILE`, `ENFILE`, `ENOENT` or `ENOSYS` emits
+  `error` in the tick queue, and `close` with the negated error number. Other errors throw, as in
+  Node.js.
+- Spawning `process.execPath`, this runtime's binary, adds `--node-compat`,
+  `--allow-node-runtime-flags`, and `--node-http-listen` if this process has it, after the program
+  name, unless the arguments have them. So the Node.js runtime flags among the arguments apply to
+  the child as [Runtime flags](#runtime-flags) describes.
+- At startup, this runtime natively sets `STARLINGMONKEY_NODE_OPTIONS` in its own environment to
+  the same options, separated by spaces, replacing any value it had, and `process.env` lists it.
+  This runtime's native command line adds the options in that variable after the program name, so
+  this runtime started by a shell or another program in a child process runs with them too, if the
+  child inherits the environment: with `env` omitted, or with an `env` that copies `process.env`.
+  An `env` without the variable, such as `{}`, leaves it out, as Node.js leaves out `NODE_OPTIONS`.
+- `fork`, and an `ipc` entry in `stdio`, connect parent and child over a socket pair. Each
+  message is a JSON text followed by a newline, Node.js's `json` serialization. `send`,
+  `disconnect`, `connected`, `channel` with its `ref` and `unref`, and the `message` and
+  `disconnect` events are supported. A process of this runtime whose environment has
+  `NODE_CHANNEL_FD` connects `process` to its parent before its entry script runs, as Node.js
+  does. `serialization: 'advanced'` and sending a handle throw `ERR_METHOD_NOT_IMPLEMENTED`.
+- A new `ChildProcess` is published on the `child_process` diagnostics channel, and each spawn
+  on the `child_process.spawn` tracing channel's `start`, `end` and `error` channels, with Node.js's
+  messages.
+- `spawnSync`, `execSync` and `execFileSync` block until the child exits, and throw
+  `ERR_BLOCKING_NOT_ALLOWED` where [blocking isn't allowed](#synchronous-host-io). Their
+  `maxBuffer` counts the bytes of all pipes, as Node.js's does.
+- On wasm, which can't spawn processes, spawning fails with `ENOSYS`: `spawn`, `exec`, `execFile`
+  and `fork` emit it as an `error` event, `spawnSync` returns it as the result's `error`, and
+  `execSync`, `execFileSync` and `process.kill` throw it.
 
 ### `node:tty` and `process.stdin`
 
@@ -986,6 +1198,11 @@ The implementation follows Node.js v24's `lib/internal/streams` function by func
   states expose, such as `objectMode`, `flowing`, `ended` and `needDrain`. They have no own
   properties. Assigning a value that isn't an array to `buffer` or `pipes` is ignored, as is
   assigning `bufferedIndex`.
+- The buffered chunks, the destinations of `pipe` and the writers a pipe waits for `drain` from
+  are kept in Rust. Deviation: each read of `buffer`, `pipes` and `readableBuffer` returns a new
+  array, and each read of `awaitDrainWriters` while it holds several writers a new `Set`.
+  Changing the array or the `Set` doesn't change the stream's state, and assigning `buffer`,
+  `pipes` or a `Set` to `awaitDrainWriters` copies their contents.
 - Work Node schedules with `process.nextTick` goes in the tick queue `process.nextTick` uses.
 - In a `pipeline`, a function stage's result stays an iterable unless a Node stream consumes it.
   Web streams aren't accepted in a `pipeline`, and `finished` doesn't accept them.
@@ -1044,7 +1261,10 @@ Workers aren't implemented, and the module is a stub whose `MessageChannel`, `Me
 - Adding a `message` listener with `addEventListener` starts a port, as `start()` does.
 - A started port keeps the event loop alive while it is entangled, has a `message` listener and
   isn't closed, transferred or unreferenced. An open `BroadcastChannel` keeps it alive until it is
-  closed or unreferenced.
+  closed or unreferenced. In serve mode they keep a request's event loop running as a timer does,
+  so a port or channel a handler leaves open is abandoned with the request's other work once the
+  response is sent.
+- Closing a port drops the messages queued for it that weren't delivered yet.
 - `port.on()` and the other `EventEmitter` methods of Node's ports don't exist.
 
 ### `node:util` and `node:util/types`
@@ -1122,7 +1342,8 @@ returns an `Immediate`. A `Timeout` converts to its timer's ID, which `clearTime
   runs while other work keeps the event loop running, and doesn't keep it running by itself.
   An unreferenced timer still pending when its event loop finishes is dropped with the loop. A
   request handler's timers belong to the request's event loop, so they never run during a later
-  request.
+  request. A component's snapshot holds the timers its top level left pending, and the instance
+  resumed from it runs them.
 - Timer callbacks get the timer as `this`, delays follow Node's rules, including its warnings for
   negative and too large delays, and nested timers aren't clamped.
 - `node:timers/promises` implements `setTimeout`, `setImmediate`, `scheduler.wait` and
@@ -1233,8 +1454,8 @@ functions, `crc32`, `constants` and `codes`. The zip archive functions are stubs
   but no `_outBuffer` or `_writeState`. `flush(kind)` validates `kind` against the flush
   constants of the stream's format.
 - The legacy `Z_*` constants on the module object are missing. They're in `constants`.
-- `flush(Z_FINISH)` runs as a full flush, without ending the compressed stream. A flush before the
-  first input produces no output.
+- `flush(Z_FINISH)` ends the compressed stream, as in Node.js, so a later write fails with
+  `Z_STREAM_ERROR`.
 - `params` validates the level and the strategy as Node does, and flushes and records them in
   `_level` and `_strategy` unless both are unchanged. The codec ignores the strategy, and keeps
   its level when the stream has already compressed input and the new level uses a different zlib
@@ -1298,21 +1519,24 @@ option validation. `vm.Module`, `vm.SourceTextModule` and `vm.SyntheticModule` a
 
 ## Testing
 
-Three kinds of tests check the implementation.
+Four kinds of tests check the implementation.
 
 - `crates/builtins/node/tests/js` has a script per module, each run by
   `cargo test -p node-builtins --test modules`, and the scripts that use host I/O also run on wasm
   in `scripts/test-runtime.sh`.
 - `tests/node-harness/run-node-tests.mjs` runs Node.js's own tests from `test/parallel`, at the
   tag `scripts/clone-node-tests.sh` pins, with Node's unmodified `test/common`. Each test runs as a
-  process of its own, with `--node-http-listen`, and passes if it exits with status 0.
+  process of its own, with `--node-http-listen`, and passes if it exits with status 0. It leads a
+  process group, which ends with it, so the processes it leaves running don't outlive it.
   `tests.txt` selects the tests by file name: every test except those of Node's build tooling,
   V8's heap and trace tooling, the inspector and QUIC. The runtime gets the flags of a test's
-  `// Flags:` line with `--allow-node-runtime-flags`. Tests whose flags the runtime rejects, and
-  tests whose source needs child processes, workers, `cluster` or `inspector`, are skipped without
-  running. `expectations.json` records each test's status, natively and, where it differs, on
-  wasm. The run fails if a test expected to pass fails or skips. `--update-expectations` records
-  the current results. `--target=deno` and `--target=bun` run the tests under Deno and Bun, as
+  `// Flags:` line with `--allow-node-runtime-flags`. Tests with flags the runtime doesn't accept,
+  tests whose source needs workers, `cluster` or `inspector`, and on wasm, tests whose source needs
+  child processes, are skipped without running. Natively, the child processes of `process.execPath` run
+  the runtime with Node.js compatibility (see [`node:child_process`](#nodechild_process)).
+  `expectations.json` records each test's status, natively and, where it differs, on wasm. The
+  run fails if a test's status changes to anything but `PASS`, and tests marked `FLAKY` aren't
+  compared. `--update-expectations` records the current results. `--target=deno` and `--target=bun` run the tests under Deno and Bun, as
   `scripts/fetch-other-runtimes.sh` downloads them, and `report.mjs --compare` lists the tests they
   pass and the runtime fails.
 - `tests/node-diff/fuzz.mjs` compares the runtime with Node.js on generated programs. The
@@ -1322,10 +1546,16 @@ Three kinds of tests check the implementation.
   `http.request` or raw requests over a `net` socket. Each program runs twice under Node.js, to
   drop operations whose result varies, and once under the runtime, with `--node-http-listen`. The
   fuzzer reruns each difference as a program of its one operation, groups the differences by
-  signature, and writes a report and reproductions to `target/node-diff`. Calls to unimplemented
-  functions share one signature per function. `known-diffs.json` lists the accepted signatures.
-  The oracle is the Node.js release `scripts/fetch-node-oracle.sh` downloads, the same version as
-  the Node.js tests.
+  signature, and writes a report and reproductions to `target/node-diff`. A signature names the
+  generator, the variant, the kind of difference and its detail: the error code, the first log
+  line that differs, or the first field of a result that differs. Calls to unimplemented
+  functions share one signature per function. `known-diffs.json` lists the accepted signatures by
+  their exact names, each with a reason. The oracle is the Node.js release
+  `scripts/fetch-node-oracle.sh` downloads, the same version as the Node.js tests, and the fuzzer
+  runs itself under it, since some generators read the running Node.js's modules.
+- `tests/express-apps/run.mjs` runs Express and Koa applications under Node.js and under the
+  runtime, sends both the requests of each application's scenario, and compares the responses,
+  natively, with `--serve`, on wasm, and under Spin (`--mode`).
 
 ```sh
 ./scripts/clone-node-tests.sh

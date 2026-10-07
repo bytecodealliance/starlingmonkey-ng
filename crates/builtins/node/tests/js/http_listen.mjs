@@ -225,6 +225,52 @@ eq(new Server() instanceof net.Server, true, "http.Server extends net.Server");
   raw.close();
 }
 
+// Request targets, chunk extensions, framing headers and trailer counts are checked as `llhttp`
+// checks them in its strict mode, with its error codes, reasons and positions.
+{
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.setHeader("Connection", "close");
+    req.on("end", () => res.end(`${req.url} ${req.rawTrailers.length / 2}`));
+  });
+  server.on("clientError", (error, socket) => {
+    socket.end(`HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n${error.code} ${error.reason} ${error.bytesParsed}`);
+  });
+  const port = await listen(server);
+  const get = (target) => `GET ${target} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n`;
+  const chunked = (body) => `POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n${body}`;
+  const cases = [
+    [get(" /"), "/ 0"],
+    [get("/ "), "/ 0"],
+    [get("http://a/b?c#d"), "http://a/b?c#d 0"],
+    [get("foo"), "HPE_INVALID_URL Invalid characters in url 8"],
+    [get("?x"), "HPE_INVALID_URL Unexpected start char in url 4"],
+    [get("a:b"), "HPE_INVALID_URL Unexpected char in url schema 6"],
+    [get("http://a#"), "HPE_INVALID_URL Unexpected char in url server 12"],
+    [chunked('1;a="b\\"c";d\r\nx\r\n0\r\n\r\n'), "/ 0"],
+    [chunked("1; a=b\r\nx\r\n0\r\n\r\n"), "HPE_STRICT Invalid character in chunk extensions 59"],
+    [chunked("1;a=\x01\r\nx\r\n0\r\n\r\n"), "HPE_STRICT Invalid character in chunk extensions value 61"],
+    [chunked('1;a="b"c\r\nx\r\n0\r\n\r\n'), "HPE_STRICT Invalid character in chunk extensions quote value 63"],
+    [chunked("1\nx\r\n0\r\n\r\n"), "HPE_CR_EXPECTED Missing expected CR after chunk size 58"],
+    [
+      "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n",
+      "HPE_INVALID_CONTENT_LENGTH Content-Length can't be present with Transfer-Encoding 69",
+    ],
+    [
+      "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+      "HPE_INVALID_TRANSFER_ENCODING Transfer-Encoding can't be present with Content-Length 63",
+    ],
+    [chunked(`1\r\nx\r\n0\r\n${"A: b\r\n".repeat(1000)}\r\n`), "/ 1000"],
+    [chunked(`1\r\nx\r\n0\r\n${"A: b\r\n".repeat(1001)}\r\n`), "HPE_HEADER_OVERFLOW Header overflow 6067"],
+  ];
+  for (const [request, expected] of cases) {
+    const response = await exchange(port, request);
+    eq(response.slice(response.indexOf("\r\n\r\n") + 4), expected, `the reply to ${JSON.stringify(request.slice(0, 60))}`);
+  }
+  server.close();
+  await within(once(server, "close"), "server close");
+}
+
 // A client request emits `socket` in a later tick, and a proxy that pipes the request body from
 // its `socket` listener, as httpxy does, completes.
 {
@@ -271,5 +317,24 @@ eq(new Server() instanceof net.Server, true, "http.Server extends net.Server");
   const [first, firstReused] = await within(get(), "first keep-alive request");
   const [second, secondReused] = await within(get(), "second keep-alive request");
   deepEq([first === second, firstReused, secondReused], [true, false, true], "socket reuse");
+  server.close();
+}
+
+// A response that closes the connection leaves the pipelined responses after it queued, so they
+// are destroyed when the socket closes.
+{
+  let second;
+  const server = http.createServer((req, res) => {
+    if (req.url === "/1") {
+      res.setHeader("Connection", "close");
+      res.end("one");
+    } else {
+      second = res;
+    }
+  });
+  const port = await listen(server);
+  await exchange(port, "GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHost: a\r\n\r\n");
+  if (!second.destroyed) await within(once(second, "close"), "the queued response closing");
+  eq(second.destroyed, true, "the queued response is destroyed");
   server.close();
 }

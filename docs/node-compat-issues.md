@@ -10,33 +10,33 @@ the end. Check that an item still applies before working on it, and remove it on
 Ordered by the use real applications make of them, not by the number of Node.js tests they
 unblock:
 
-1. `domain` and the global `WebSocket`.
-2. Node's error codes from the web classes in `--node-compat` mode. Node.js implements its web
-   classes (`performance`, `MessagePort`, `CompressionStream` and others) on its own validators, so
-   their argument errors carry codes such as `ERR_INVALID_ARG_TYPE` and `ERR_MISSING_ARGS`. The
-   web builtins throw plain `TypeError`s. One shared mechanism in the WebIDL conversions would
-   cover all of them.
+1. `node:tls`, and `https` on the runtime's sockets. Database drivers (`pg`, `mysql2`, `mongodb`)
+   connect with `tls.connect`, and `https` requests go through reqwest and `wasi:http` today.
+   `platform::tls` runs rustls client sessions over the runtime's sockets natively, which
+   `WebSocket` uses for `wss:`. On wasm, the pure-Rust rustls providers need `getrandom` 0.2, which
+   makes the component import WASIp2 interfaces (see `WebSocket` below).
+2. Asymmetric cryptography: `generateKeyPair`, `createPublicKey`/`createPrivateKey`, `KeyObject`,
+   `sign`/`verify`, `publicEncrypt`/`privateDecrypt` and `diffieHellman` for RSA, ECDSA, Ed25519
+   and X25519, and `crypto.subtle` (WebCrypto). JWT libraries need them: `jsonwebtoken` for RS256
+   and ES256, `jose` through WebCrypto. RustCrypto's pure-Rust crates build for wasm.
+3. Unix domain sockets for `net`, and `socketPath` for `http`, which local databases and the Docker
+   API use. Natively only, since WASI has no Unix sockets.
 
 Node.js internals that only Node's own tests load (`internal/repl`, `internal/webstreams/*`,
-`internal/dgram` and others) and `repl`, `child_process`, `cluster` and `worker_threads` come
-after these.
+`internal/dgram` and others) and `repl`, `cluster` and `worker_threads` come after these.
 
 ## Correctness
 
 ### Regressions and unexplained failures
 
-- **Two HTTP tests fail on wasm only.** `test-http-missing-header-separator-lf` and
-  `test-http-server-unconsume-consume` pass natively and fail on wasm, also with a
-  `starling.wasm` built from 145a6f2d, where `expectations.json` recorded them as passing. In
-  both, a server writes to a socket and destroys it at once, and the client gets the end of the
-  connection without the bytes. A plain `net` server that does the same delivers them. The cause
-  is unknown.
 - **`js::Unbox` crashes on scripted proxies.** A guard in `unbox` avoids the segmentation fault,
   but the root cause in the binding is unknown. A cross-compartment wrapper around a proxy may
   still reach it.
-- **The Express `data` app differs on one request occasionally.** It passes on rerun. The cause is
-  unverified. A likely cause is the fixed 100 ms sleep in its scenario, described under Tooling in
-  the review findings.
+- **The Express `data` app differed on one request occasionally.** It passed on rerun. The cause
+  is unknown. Its scenario waited 100 ms for the server to subscribe to new posts, and the app
+  waited 50 ms for its log file, where both now wait for a readiness signal. On 2026-10-10 neither
+  version failed: each passed 30 runs natively and 30 on wasm, 10 of each with 12 busy processes
+  on the 10 CPUs.
 
 ### Behavior that differs from Node.js
 
@@ -46,11 +46,15 @@ after these.
   `undefined`. The legacy URL code holds each field as a Rust `Option<String>`.
 - The DNS resolver differs from c-ares in these ways: `reverse` doesn't consult `/etc/hosts`,
   timeouts don't adapt to the measured latency of a server, `setLocalAddress` doesn't apply to
-  TCP queries, and `--dns-result-order` is rejected. The Node.js tests that replace
+  TCP queries. The Node.js tests that replace
   `internalBinding('cares_wrap')` functions (`test-dns-default-order-*`, `test-dns-lookup`,
   `test-dns-lookup-promises`, `test-dns-lookupService`, `test-dns-resolve-promises` and
   `test-dns-set-default-order`) and `test-dns-get-server`, which replaces
   `resolver._handle.getServers`, fail, since the implementation doesn't go through those objects.
+- An unreferenced child process that a served request spawned and that outlives the request's
+  event loop is never reaped, and stays a zombie until the server exits: waiting for its exit is
+  cancelled with the request's other pending work, and `platform::child::Child` doesn't reap on
+  drop. Its `exit` and `close` aren't emitted. A referenced child keeps the loop running instead.
 - `net.Server.prototype.listen` ignores `backlog`, `ipv6Only`, `reusePort` and `exclusive`:
   `platform::net::listen_stream` takes no socket options, and natively listens with a backlog of
   511.
@@ -62,6 +66,21 @@ after these.
   predicates misreport web streams too (see the review findings).
 - Assigning a non-array to `_readableState.buffer` or `_readableState.pipes`, or any value to
   `_writableState.bufferedIndex`, is ignored. Node.js throws a `TypeError` later.
+- The callback of a socket write that `destroy` cancels is never called. Node.js calls it with an
+  `ECANCELED` error.
+- `resetAndDestroy` on a connected `net.Socket`, or one that is connecting, closes the connection
+  normally instead of sending a reset, since `platform::net` can't reset a connection.
+- A socket `end` that waits for the connect gets `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` if the
+  socket is destroyed first. Node.js never calls that callback.
+- An `OutgoingMessage` or `ServerResponse` whose `highWaterMark` option isn't a number has the
+  default high water mark. Node.js keeps the value, which `writableHighWaterMark` returns.
+- A file `ReadStream` whose `pos` is set to a value that converts to a number but that `fs.read`
+  rejects as a position, such as `"3"` or `true`, is destroyed with that error. Node.js destroys
+  it without emitting `error` or `close`.
+- The `fd`, `path`, `flags`, `mode`, `start`, `pos`, `end`, `bytesRead` and `bytesWritten` of file
+  streams are enumerable accessors on `ReadStream.prototype` and `WriteStream.prototype`, where
+  Node.js has own data properties, so `Object.keys` and `util.inspect` of a stream don't list them.
+  WriteStreams also lack Node's `flush` property.
 - Object shapes:
   - Readables have their own `_eventsCount` and `shapeMode: false`. Node.js pre-shapes `_events`
     and sets `shapeMode: true`.
@@ -91,18 +110,54 @@ after these.
   - Disentangled ports emit no `close` event, keep-alive isn't recomputed when a listener is
     removed through an `AbortSignal`, and ports lack Node's `EventEmitter` methods (`port.on`).
   - Within one event-loop step, messages run before timers. Node.js runs timers first.
-  - Node's error codes and messages (`ERR_INVALID_ARG_VALUE`, `ERR_STREAM_NULL_VALUES`, the
-    `MessageEvent` messages) differ, and `CompressionStream` rejects string chunks, which Node.js
-    accepts.
+  - `CompressionStream` and `DecompressionStream` reject string chunks, which Node.js accepts.
 - `node:perf_hooks`:
-  - The timeline classes are the web platform's, whose argument conversions throw `TypeError`s
-    without Node.js's `ERR_INVALID_ARG_TYPE` and `ERR_MISSING_ARGS` codes, and whose
-    `PerformanceObserver` callbacks get a third argument.
+  - The timeline classes are the web platform's, whose `PerformanceObserver` callbacks get a
+    third argument.
   - No `resource`, `http`, `http2`, `net` or `dns` entries are produced, and
     `markResourceTiming`, `setResourceTimingBufferSize` and `clearResourceTimings` are missing.
   - Histograms can't be transferred through a `MessagePort` or cloned, and `samplePerIteration`
     samples with a timer. `nodeTiming.uvMetricsInfo` reports zeros.
 - `node:zlib` lacks the `rejectGarbageAfterEnd` option.
+- The errors of the web classes (see
+  [Errors of the web classes](node-compat.md#errors-of-the-web-classes)) differ from Node's in
+  these cases:
+  - Node.js validates values that WebIDL converts: `AbortSignal.timeout` takes any number, where
+    Node.js requires an integer from 0 to 2³²−1, `TextEncoder.prototype.encodeInto` converts its
+    source to a string, `addEventListener` takes any non-object `options` as `capture`,
+    `performance.measure` converts a number to a mark name, and `URLPattern` and its `exec` and
+    `test` methods convert a number to a string. Node.js throws `ERR_INVALID_ARG_TYPE` or
+    `ERR_OUT_OF_RANGE` for these.
+  - Options that are WebIDL dictionaries, such as those of the `Event` constructors,
+    `performance.mark` and `PerformanceObserver.prototype.observe`, take arrays and functions,
+    which Node's `validateObject` rejects with `ERR_INVALID_ARG_TYPE`. `new File(undefined, name)`
+    throws, where Node.js creates an empty file.
+  - A `postMessage` transfer list element that isn't an object throws a `TypeError`, where
+    Node.js throws a `DataCloneError` `DOMException`.
+  - `this` of `undefined` is the global object for the `EventTarget` methods, as WebIDL's
+    `[Global]` semantics define, where Node.js throws `ERR_INVALID_THIS`.
+  - Errors that V8 or undici create have V8's or undici's messages in Node.js, and the web
+    messages here: converting a symbol to a string, `ReadableStream.from` with a value that
+    isn't iterable (`ERR_ARG_NOT_ITERABLE`), the controllers of `ReadableStream` called on
+    another object, `MessageChannel`'s getters, `Headers` and `Request` conversions, the
+    `MessageEvent` constructor's dictionary, and invalid header names and methods.
+  - The message of a call of a value that isn't a function names the callee as SpiderMonkey's
+    expression decompiler prints it, where V8 quotes the source text. In CommonJS modules,
+    functions and `vm` scripts, an array literal prints as `[...]` (`[...].nope is not a
+    function` for `[1].nope()`), and `obj?.nope()` and `(0, obj.nope)()` print as `obj.nope`.
+    Builtins that call a method of an argument that has none name only the method (`on is not a
+    function`), where Node.js names its own variable (`dest.on is not a function`).
+  - The `DOMException`s of `atob`, `btoa`, `crypto.getRandomValues`, `structuredClone`,
+    `BroadcastChannel.prototype.postMessage` and `WebSocket`'s constructor, `send` and `close`
+    have the right names and codes, but the web messages. `crypto.getRandomValues` of a value
+    that isn't a typed array throws a `TypeError` where Node.js throws a `TypeMismatchError`
+    `DOMException`.
+  - Of the stream errors, the `ERR_OUT_OF_RANGE` and `ERR_INVALID_ARG_VALUE` errors of a BYOB
+    reader's `min` option and of `respond`'s `bytesWritten`, and the `RangeError` of a size
+    function's result, have the web messages without codes. `ERR_INVALID_STATE` errors without
+    a Node.js counterpart in `errors/web.rs` have the web message as their detail.
+  - `TextDecoderStream` rejects a chunk that isn't a buffer source with the web error, where
+    Node.js throws `ERR_INVALID_ARG_TYPE`.
 - `console.log` truncates strings at a NUL character, in the C++ console.
 - `Buffer.from` rejects a `SharedArrayBuffer`.
 - `Buffer.allocUnsafe` and `Buffer.from` of a string don't allocate from a pool, so their
@@ -123,8 +178,21 @@ after these.
   raises the depth for hosts with a larger native stack (see `README.md`). Beyond the limits,
   inspection prints Node's "Inspection interrupted prematurely" marker and the others throw a
   `RangeError`.
-- Code passed to `-e` runs as a module, so `require` is undefined there. `parseArgs` doesn't apply
-  Node's default `args` for `-e`.
+- `node:domain`:
+  - The callback hooks enter and exit a callback's domain without calling its `enter` and `exit`
+    methods, so overrides of those methods don't run for implicitly bound callbacks.
+  - Promises created in a domain have no `domain` property.
+  - Instances of `Domain` lack Node's `kWeak` symbol property.
+  - `domain._stack` is a new array on each read, so changing it doesn't change the stack.
+  - While a domain stays entered after the code that entered it returned, Node.js also enters it
+    around each run of its timer and immediate queues, through `MakeCallback` on `process`, and
+    emits `DEP0097`. The runtime doesn't.
+- An uncaught exception from `-e` code is printed without the source line and caret Node.js shows.
+  `parseArgs` doesn't apply Node's default `args` for `-e`.
+- `assert.ok(value)` and `assert(value)` without a message fail with `The expression evaluated to
+  a falsy value` alone. Node.js appends the source text of the call, such as `assert(1 === 2)`,
+  which it finds by tokenizing the calling line that V8 keeps for the captured frame. No runtime
+  API reads the source text of the calling script.
 
 ### The HTTP client
 
@@ -176,8 +244,24 @@ Requests through the runtime's HTTP client, reqwest natively and `wasi:http` on 
 - Fetch and files: `Body.blob()` throws, and `Blob.textStream` is missing.
 - `stream`: `Readable.prototype.compose`.
 - `net.Socket` lacks Node's `on`/`addListener` overrides.
-- Unimplemented modules: `repl`, `domain`, `child_process`, `worker_threads`, `cluster`,
-  `inspector`.
+- `WebSocket`:
+  - `wss:` on wasm. The rustls providers that build for wasm without a C toolchain need
+    `getrandom` 0.2, whose WASI backend makes the component import WASIp2 interfaces. A provider
+    whose key generation and `SecureRandom` use `platform::random` would remove that dependency.
+  - `permessage-deflate`, which tungstenite doesn't implement, so `extensions` is always empty.
+  - A timeout for the server to close the connection after the closing handshake.
+  - tungstenite accepts a handshake response's `Connection` header only if it is exactly
+    `Upgrade`, where RFC 6455 accepts a list of tokens that contains it.
+  - Node's `dispatcher` option.
+- Unimplemented modules: `repl`, `worker_threads`, `cluster`, `inspector`.
+- `child_process`:
+  - `serialization: 'advanced'` and sending handles over IPC (`send(message, socket)`).
+  - `stdio` entries that are TCP `net.Socket`s and other streams without a descriptor, which
+    Node.js passes to the child as handles.
+  - `internal/child_process` can't be loaded, so the tests that replace its functions fail.
+  - The child-process tests also fail for gaps elsewhere: `net.Socket` doesn't take `fd`,
+    `--stack-size` is rejected, `process.argv0` is `starlingmonkey` rather than the `argv[0]` the
+    process got, and `process.openStdin` and `process.getgroups` are stubs.
 - `vm`:
   - `vm.Module`, `vm.SourceTextModule` and `vm.SyntheticModule`.
   - The top-level `this` of a script in a context is a proxy of the contextified object, not the
@@ -209,9 +293,16 @@ Requests through the runtime's HTTP client, reqwest natively and `wasi:http` on 
   `express-rate-limit` logs `ERR_ERL_UNDEFINED_IP_ADDRESS`.
 - Spin's default instance reuse (128 requests per instance, 1 s idle) drops in-memory state such
   as sessions between instances.
-- On wasm, queued socket writes aren't flushed when the process exits after an uncaught exception.
+- A component's snapshot holds the timers its top level leaves pending, such as the unreferenced
+  `setInterval` with which `express-rate-limit`'s `MemoryStore` rotates its windows, and the
+  resumed instance runs them. A snapshot still can't hold other pending work, such as a `fetch` in
+  flight or a listening `MessagePort`. A component that exports neither `wasi:http/handler` nor
+  `wasi:cli/run` doesn't run the timers it holds.
 - wasmtime's HTTP client strips `Transfer-Encoding` and `Connection` from proxied responses.
-- `fetch` to a blocked port reports a different error than Node.js.
+- `fetch` to a blocked port reports a different error than Node.js. `fetch` doesn't check the
+  port with `web_fetch::algorithms::is_bad_port`, which `WebSocket` uses.
+- A `WebSocket` still connecting or open when its request's response is sent is abandoned, as
+  timers are.
 
 ### wasm platform limits
 
@@ -248,7 +339,7 @@ These tests fail only on wasm because of the platform:
   `tokio::time::sleep`, which has millisecond resolution.
 - **No JIT in wasm.** JavaScript runs about 4.6 times slower in components than natively.
 - **`fs.watch` polling.** Each watcher walks its directory tree synchronously on the JS thread
-  every 100 ms, and `ignore` globs are compiled again for every event.
+  every 100 ms.
 - **CommonJS.** An ambiguous `.js` file with ES module syntax is compiled twice: the compile as a
   CommonJS function body fails, and the file is compiled again as a module. Its `Module` object is
   dropped and removed from the parent's `children`, where Node.js keeps it with the namespace as its
@@ -274,11 +365,21 @@ These tests fail only on wasm because of the platform:
     the agent's two sockets isn't free yet when the test counts the free sockets. The cause is
     unknown.
   - WPT `hr-time/basic.any.js`
-  - The Express `realtime` app, and `auth` timing out at startup on wasm
+  - The Express `realtime` app, and `auth` timing out at startup on wasm. The `realtime` scenario
+    waited 100 ms for a long poll to start and for the server to remove closed WebSockets, where
+    it now waits until `/stats` shows both. On 2026-10-10 neither version failed: each passed 30
+    runs natively and 30 on wasm, 10 of each with 12 busy processes on the 10 CPUs. So the cause
+    of the earlier failures is unknown.
+  - The Express `rest-api` app on wasm once printed that it was listening on its port, but no
+    connection to `127.0.0.1` on that port succeeded for 30 seconds (2026-10-08). It passed on the
+    next 10 runs. The cause is unknown.
 - **Fuzzer signatures not on the accepted list.** `http/raw:log-differs["bytes"]` appears in about 1
   in 15,000 operations because of microtask ordering. It isn't on the accepted list, because that
-  key would hide real bugs. Two `shape/buffer` signatures for `Blob` and `File` behave the same
-  with older binaries.
+  key would hide real bugs. `http/raw:log-differs["clientError socket"]`, which has the same
+  cause, didn't occur in 20,000 programs on 2026-10-10 and was taken off the list.
+  `zlib/fixture`, which decompresses corrupted input, has a long tail of error code pairs: three
+  runs of 10,000 `zlib/fixture` programs found 4, 2 and 0 pairs that weren't listed yet. A new
+  pair fails the run until it is added.
 - **Spin.** The bundle needs `--allow-transient-write`, and Spin's `--direct-mounts` resolves mount
   paths against the current directory, which makes it unusable for the bundle.
 - **`node-builtins` is always linked** into every runtime and component, even without
@@ -288,8 +389,8 @@ These tests fail only on wasm because of the platform:
   - Crown reports 20 errors in `component-model`.
   - One `test-wizer.sh` case expects a stale message.
 - **The Node.js shape reference (`shapes-node26.txt`) came from Node 26.** The oracle is v24.21.0,
-  so shape claims need checking against the oracle. The fuzzer's `shape` generator has the same
-  problem when it runs under a newer `node` than the oracle (see the review findings).
+  so shape claims need checking against the oracle. The fuzzer runs its generators under the
+  oracle.
 - **The first wasm harness runs after a rebuild time out.** wasmtime compiles a new
   `starling.wasm` in each of the parallel processes until its cache holds the module, which can
   exceed the 30 s timeout. The wasm runs also time out when anything else loads the machine. The
@@ -308,10 +409,22 @@ These deviate from the rules in `docs/builtin-development.md` on purpose:
   object under one private name symbol, `STATE_HANDLE_KEY`. JavaScript can't read, list, copy or
   delete the property, as for `#private` fields.
 - `Props` remains for reading caller options and Node-public properties that Node.js itself reads
-  dynamically.
+  dynamically. That includes the `aborted` and `reason` of a signal, which `readline` and other
+  modules read, and its `addEventListener`, which they call, by name from any object
+  `validateAbortSignal` accepts, as Node.js does.
 - An `http.Agent`'s `requests`, `sockets`, `freeSockets` and `totalSocketCount` stay own data
   properties, which the agent reads and changes as Node.js's does, because libraries such as
   `agent-base` change them in place.
+- The setup of the Node.js globals wraps the methods of the global `console` object, which the
+  C++ builtins create without a Rust handle. It reads the object from the global when the global
+  is set up, before any content code runs.
+- `Readable.toWeb` defines Node's `kErrorSentinelAttached` symbol property on the streams it
+  adds its `error` listener to, as Node.js does. It reads the property back only for a stream
+  without Rust state, and reads a flag in the state otherwise.
+- `node:domain` keeps a domain's `members` array and the `domain` property of emitters, timers,
+  async resources and bound functions as own data properties, which it reads back as Node.js's
+  does, because libraries read and assign them. The errors a domain handles get the same own
+  properties as in Node.js.
 
 ## Review findings (2026-10-06)
 
@@ -336,49 +449,11 @@ for its structure.
   `shapeMode` in own symbol-keyed properties and reads them back as state: `kCapture` in
   `captures_rejections` (events.rs:88) for every listener that returns a value, and `shapeMode` in
   `removeListener` (events.rs:509). `emit_rejection` saves, sets and restores `kCapture` around an
-  emit (events.rs:732-745). The EventTarget listener limit (events.rs:1095, events.rs:1134) and
-  `Module.prototype.parent` (commonjs.rs:476-498, commonjs.rs:639) use the same pattern. The
-  accepted exceptions cover only `_events`, `_eventsCount` and `_maxListeners`. Either add these to
-  the accepted exceptions, since Node.js defines the same own properties and any object can be an
-  emitter, or keep the values in Rust state and write the properties without reading them back.
-- **Medium: `fs.watch` ignore patterns in a JS array.** `create_ignore_matcher` (watch.rs:702-762)
-  copies the patterns into a JS array with `set_element` and passes the array as the payload of a
-  matcher callback, which reads `length` and the elements back on every event. Use a
-  `#[jsclass(hidden)]` payload that holds the compiled globs and a `Vec<Heap<Value>>` of RegExp
-  and function matchers. That also removes the recompilation per event listed under Performance.
-- **Medium: `Readable.toWeb` marks streams with a symbol property.** adapters.rs:737-767 sets
-  `ERROR_SENTINEL_ATTACHED` as an own property of the stream and reads it back to decide whether to
-  add the `error` listener. Use a flag in the stream's Rust state, and keep the property only as a
-  fallback for foreign streams.
-- **Medium: the readable buffer, `pipes` and `awaitDrainWriters` are JS objects read back as
-  state.** `ReadablePart` holds `buffer` and `pipes` as JS arrays and `awaitDrainWriters` as a JS
-  `Set` (state.rs:173-180). Every buffered chunk goes through `JS_SetElement` and `JS_GetElement`
-  (readable.rs:713-803), and multi-pipe backpressure calls `Set` methods. `docs/node-compat.md`
-  documents the arrays, but this list doesn't name them as an exception. Record an explicit
-  exception, since libraries read `readableBuffer`, or keep a `VecDeque<Heap<Value>>` and build the
-  arrays in the getters.
-- **Medium: `node:test` keeps its assertion registry in a JS object.** `assertions`
-  (test_runner/mod.rs:701-715) builds a null-prototype object on first use and loads `node:assert`
-  then. `register_assertion` (2207-2219) writes to it and `assert_of` (2364-2373) reads it back with
-  `own_keys`. Keep a `Vec` of key and function `Heap`s in `HarnessImpl`, filled at registration.
-- **Medium: `InspectIntrinsics` looks up 29 intrinsics by name on the global.** inspect.rs:280-283
-  reads every name in `WELL_KNOWN_CONSTRUCTORS` (3227-3257) from the global at global setup. Use
-  `JSProtoKey`s with `js::class::get_class_object`. Node's set also holds `Buffer` and
-  `Float16Array`, which the list lacks.
-- **Medium: served requests call `respondWith` by name.** `on_fetch` calls
-  `Function::call_by_name(event, "respondWith")` (http/server.rs:134-141) on every request, although
-  the event is already a `FetchEvent` with the Rust method `FetchEvent::respond_with`
-  (fetch-event/src/fetch_event.rs:222). Content code can replace the prototype method. Call the Rust
-  method.
-- **Medium: a private-data borrow across a JS property get in `stat_onchange`.** In
-  `if handle.data().old_status == -1 && status == -1 && nlink(current)? == nlink(previous)?`
-  (watch.rs:1494), the borrow lives through the whole condition, and `nlink` reads `nlink` from the
-  `Stats` objects, which reaches a getter on `Stats.prototype`. A getter that calls `unwatchFile`
-  or `ref()` takes `data_mut()` and panics. Bind `old_status` first, and compare the raw `nlink`
-  values from `poll`.
-- **Medium: two `decodeURIComponent` implementations.** url.rs:62-75 decodes lossy UTF-8 Rust
-  strings and querystring.rs:136-177 decodes UTF-16 units, with different validation. Keep the
-  UTF-16 one in a shared place and call it from url.rs.
+  emit (events.rs:732-745). The EventTarget listener limit (events.rs:1095, events.rs:1134) uses
+  the same pattern. The accepted exceptions cover only `_events`, `_eventsCount` and
+  `_maxListeners`. Either add these to the accepted exceptions, since Node.js defines the same own
+  properties and any object can be an emitter, or keep the values in Rust state and write the
+  properties without reading them back.
 - **Low: error values made by throwing and taking the exception.** buffer.rs:2575-2585 (transcode,
   which also ignores a failed `set_property` of `errno`), util.rs:236-246, crypto.rs:1102-1103,
   events.rs:593-607, process.rs:798-803, and core-runtime module.rs:489-505, which also duplicates
@@ -390,49 +465,17 @@ for its structure.
   fs/streams.rs:238-242 call `then` and discard its result. `emit_in_tick` (watch.rs:770-783) calls
   `emit.bind` by name and queues the bound function. Use `Promise::add_reactions` and
   `js::jobs::queue_native_tick` with a payload.
-- **Low: duplicate helpers in the node crate.**
-  - `callback_args` (lib.rs:254) is written again inline at support.rs:188, events.rs:653,
-    events_async.rs:186 and 438 and diagnostics_channel.rs:833, and as `rest_args` (timers.rs:654)
-    and `args_from` (async_hooks.rs:110). Each copies the arguments into a new `Vec`, which
-    `console.log` and `util.format` do on every call. A `CallbackArgs` slice or `rest` accessor in
-    `crates/js` replaces them all.
-  - `support::array_elements` (support.rs:221-235) and `events_async::elements`
-    (events_async.rs:403-419) duplicate `js::Array::to_vec`. `events_async::flag` duplicates
-    `support::is_true`, and `events_async::method`, `events::with_method` and `support::has_method`
-    duplicate each other. `stack_trace::error_constructor` (stack_trace.rs:284) and destroy.rs:96-98
-    duplicate `support::class_object`.
-  - `not_false` (readable.rs:150, writable.rs:36) and `is_false` (duplex.rs:74) are one predicate.
-    `return_undefined` (readable.rs:2816-2863) and operators.rs:1226-1231 and 1905-1911 duplicate
-    `support::noop_function` and `support::shared_function`, and adapters.rs:217-226 is a copy of
-    `shared_function` with a name parameter.
-  - `js_number` (readline.rs:837-843) duplicates `errors::number_to_string` and formats `1e-7` and
-    numbers above 2^63 wrongly. `is_typeof_object` and `js_len` exist in both assert.rs and
-    inspect.rs. `collection_entries` (inspect.rs:562-607) duplicates `js::Map::entries_vec` and
-    `js::Set::values_vec`.
-  - `Writable[Symbol.hasInstance]` (writable.rs:1281-1312) walks the prototype chain by hand
-    instead of calling `Object::ordinary_has_instance`. It mishandles bound functions and returns
-    `false` where `OrdinaryHasInstance` throws for a non-object `prototype`.
-- **Low: duplicates in the shared crates.** `js::function::object_payload` (function.rs:612-621)
-  duplicates `cast_payload::<Object>`. `Map::entries_vec` and `Set::values_vec`
-  (collections/mod.rs:34-75) have no callers, and their callback returns `ExnThrown` with nothing
-  pending for a non-array payload. Node's `crypto.getRandomValues` (crypto.rs:1619-1646) copies
-  the web implementation (web-globals crypto.rs:23-55) with different messages, and node's
-  `randomUUID` bypasses `web_globals::crypto::random_uuid`. module.rs:874-875 and module.rs:972
-  repeat the fallback of `canonical_path` (module.rs:458).
-- **Low: arrays built with `Array::new` and `set_element`.** stack_trace.rs:253-258 and the
-  directory listings in fs/mod.rs:410-430 fill new arrays through `Array.prototype` setters. Use
-  `Array::with_contents`.
+- **Low: duplicate helpers in the node crate.** The inline argument copy in events.rs,
+  `rest_args` in timers.rs and `args_from` in async_hooks.rs duplicate `CallbackArgs::rest`, and
+  `events::with_method` duplicates `support::has_method`.
 - **Low: `.map_err(|_| ExnThrown)` on `FromJSVal` conversions.** state.rs:878, adapters.rs:257,
   605 and 1316, operators.rs:720 and 1300, six sites in inspect.rs, readline.rs:955 and 1027,
   errors.rs:191 and 252, os.rs:36, util.rs:974 and punycode.rs:389-430. The `f64` and `String`
   conversions only return `ExnPending`, so these are correct today, but the rule prescribes
   `from_jsval_throwing`. At adapters.rs:257 Node.js passes `writableHighWaterMark` through
   unconverted, and a foreign writable without it gets `NaN` here instead of the default.
-- **Low: runtime objects reached by name.** process.rs:1439 reads `process` back from the global
-  right after `functions::add_to_global` defines it, and console.rs:31 reads `console`.
-  test_runner/mod.rs:338-361 calls `process.on` by name, and readline.rs:569, 702-703, 743-752 and
-  824-829 read `aborted` and `reason` and call `addEventListener` on an `AbortSignal` by name. Use
-  the registration's return value, `crate::events::listen` and the `AbortSignal` Rust API.
+- **Low: a runtime object reached by name.** process.rs:1439 reads `process` back from the
+  global right after `functions::add_to_global` defines it. Use the registration's return value.
 - **Low: implemented functions without a Node.js documentation link.** All `*Sync`, callback and
   `create*` functions in zlib.rs:1725-2016, the `Stats` and `Dirent` `is*` methods
   (fs/classes.rs:116-143 and 253-280), the operations in fs/ops.rs, and `_write`, `_undestroy`,
@@ -505,12 +548,9 @@ for its structure.
   and `isWritable` (stream/mod.rs:342-373, util.rs:351-392) don't check the web streams. With the
   prebuilt binary, `isDisturbed` is `false` for a read or consumed `Response.body`, `isErrored` is
   `false` for an errored stream, and `isReadable` is `null`. Read the web streams' Rust state.
-- **Medium: served responses accept writes after `destroy()`.** The served branches of `write` and
-  `end` (outgoing.rs:957-976, 1000-1053) check only `ended`. After `destroy` or a client
-  disconnect, `send_served` returns `Ok(true)` (outgoing.rs:1488-1494), so `write` returns `true`,
-  its callback gets no error, and `end` still emits `finish`. Node.js reports
-  `ERR_STREAM_DESTROYED` and returns `false`. Server-sent event handlers that keep writing see
-  success. Check `destroyed` as `wire::write` does, and validate the chunk first.
+- **Medium: served responses emit `finish` after `destroy()`.** `write` and `end` with a chunk
+  report `ERR_STREAM_DESTROYED` after `destroy`, as in Node.js, but `end` then still emits
+  `finish` and calls its callback. Node.js emits only `close`.
 - **Medium: `net.Server` stops accepting after most accept errors.** net/server.rs:86-101 accepts
   again only after `ECONNABORTED`, `ECONNRESET` and `ENOTCONN`. After `EMFILE` the server stays
   `listening` but never accepts again. Node.js keeps accepting. Keep accepting while listening,
@@ -531,12 +571,6 @@ for its structure.
   (module.rs:391-444). With the prebuilt binary, `a.mjs` sees `{}` as `b`'s default. Node.js
   throws `ERR_REQUIRE_CYCLE_MODULE`. Track the graphs whose load is in progress and throw that
   error.
-- **Medium: jobs queued by the `uncaught` hook for a top-level rejection aren't drained.** After
-  `report_rejection` (core-runtime lib.rs:150, lib.rs:252-258), nothing runs `run_microtasks`
-  before `run_until` steps the loop. With the prebuilt binary, a handler that queues a `nextTick`
-  and a promise reaction runs the tick first, where Node.js runs the reaction first. Debug builds
-  likely fail the `!has_pending_jobs` assertion in `EventLoop::step`, which is unverified. Run
-  `run_microtasks` after each `uncaught` call that returns `true`.
 - **Medium: the equality assertions don't throw `ERR_MISSING_ARGS`.** assert.rs:484-537 treats a
   missing argument as `undefined`, so `assert.deepEqual(undefined)` passes and
   `assert.strictEqual(1)` throws an `AssertionError`. Check the argument count.
@@ -618,8 +652,6 @@ for its structure.
   constructors takes quadratic time, as in Node.js.
 - **Low: `assert.match`, `doesNotMatch`, `throws` and `rejects` call the RegExp's own `exec`.**
   assert.rs:70-77. Node.js calls the original `RegExp.prototype.exec`.
-- **Low: readline line endings.** U+2028 and U+2029 don't end lines (readline.rs:122), and lines
-  after a `close()` in the same chunk are dropped (readline.rs:136-141).
 - **Low: `queue_js_timer_with_id` doesn't check its precondition.** event_loop.rs:727-750
   overwrites a live timer's entry, which orphans its task. The one caller cancels first.
 - **Low: `import()` blocks while serving where `require()` is refused.** `resolve_file_module`
@@ -654,175 +686,39 @@ for its structure.
   HTTP server calls it several times per request (http/connection.rs, http/server.rs:129,
   http/incoming.rs:842). Without a `listener` argument, return 1 or the array length. With one,
   use Node's comparison, which also matches a raw `once` wrapper and treats `null` as absent.
-- **Medium: served responses build an HTTP/1.1 header block that is never sent.** On the served
-  path `writeHead` runs the wire `_storeHeader` port (outgoing.rs:1993-1997, wire.rs:241-373):
-  about 16 to 20 named property operations, `Date` formatting, a string conversion of every header
-  value, and a `_header` string that `data.header` keeps until the wrapper is finalized. `respond`
-  then converts every value again (outgoing.rs:1444). Give `store_header` a served mode, and
-  convert the values once. Not profiled.
-- **Medium: the served path reads back what it just wrote.** `init_response` reads `method`,
-  `httpVersionMajor` and `httpVersionMinor` from the request `on_fetch` just created
-  (outgoing.rs:1772-1786), `without_body` reads `method` again (outgoing.rs:1406-1410),
-  `init_message` allocates an options object and misses `readableHighWaterMark` on the `HostSocket`
-  (incoming.rs:596-610), and `server_for` copies the listening servers' JS array
-  (server.rs:79-98). Pass the values from `on_fetch`, and keep the servers in Rust.
 - **Low: own properties of new objects are set one by one.** readline's `Interface`
   (readline.rs:269-281) and assertion errors (assert.rs:1172-1181) set their properties with
   `set_property`, which also calls setters on the prototypes. Add `PropertyTemplate`s in Node's
-  key order. readline's keys are in alphabetical order today, `history`, `historyIndex`,
-  `historySize` and `isFlushing` are data properties where Node has accessors, and
-  `historyManager` is missing.
-- **Medium: every `net.Socket` write clones the chunk.** socket.rs:650-662 passes `bytes.clone()`
-  to `defer_until_connected`, which drops it unless the socket is connecting, and `write_or_shutdown`
-  copies the unwritten tail (socket.rs:604). This is every response chunk of a
-  `--node-http-listen` server. Move the bytes only when connecting, and `drain` the tail.
-- **Medium: `Buffer.prototype.copy` copies the whole source.** buffer.rs:2221 copies all of the
-  source before copying the range. Copying 10 bytes out of a 1 MB chunk copies 1 MB, which
-  multipart and WebSocket parsers do per slice. Copy only the range, with `ptr::copy` for overlap.
-- **Medium: `crypto` implements HMAC, PBKDF2, HKDF and scrypt by hand.** crypto.rs:384-417,
-  750-813 and 872-979. `hmac_digest` makes two `box_clone`s, a boxed `finalize` and a `to_vec` per
-  call, so PBKDF2 with 600,000 iterations makes about 2.4 million allocations on the JS thread.
-  The crate already depends on RustCrypto's digests. Use the `hmac`, `pbkdf2`, `hkdf` and `scrypt`
-  crates. The cost was not measured.
-- **Medium: `fs.ReadStream` allocates and copies three times per chunk.** `_read` allocates a
-  zeroed `Vec` and copies it into a new `Buffer` (fs/streams.rs:363-376), the worker reads into a
-  second zeroed `Vec` that `finish` copies (ops.rs:1259-1272), and `was_read` calls `subarray` and
-  `push` by name (fs/streams.rs:291-297). Static file serving takes this path. Read into one `Vec`
-  and create the chunk from the bytes read.
-- **Medium: zlib streams copy every chunk twice.** zlib.rs:1528-1531 copies the input view and
-  zlib.rs:1320-1322 copies the output into a new `Buffer`. Each chunk also reads a symbol property,
-  the `writableEnded` and `writableLength` getters, and writes `bytesWritten`
-  (zlib.rs:1372-1382, 1319). `compression` middleware runs every response through these. Process
-  the borrowed input, and read the Writable's Rust state.
-- **Medium: stream operators create six to nine functions per element.** operators.rs:550-561,
-  370-378, 904-918, 855-865, 1047-1076 and 2090-2092 create a new reaction pair per step with the
-  same payload. from.rs already creates its reactions once per state. Store the pairs in the
-  states.
-- **Medium: `for await` over a Readable creates two functions and an unused promise per chunk.**
-  readable.rs:1749-1754 and 1856-1858 call `then` with new closures that hold the step's promise.
-  Body parsers take this path. Keep one reaction pair in `IteratorState` and use `add_reactions`.
-- **Medium: readline searches the whole pending line for every chunk.** `feed`
-  (readline.rs:109-135) appends each chunk to the unfinished line and searches it again, which is
-  quadratic for long lines, and copies a `Buffer` chunk three times before searching. Search only
-  the new chunk, as Node's `kNormalWrite` does.
-- **Medium: `util.inspect` creates and atomizes `"constructor"` on every lookup.**
-  `named_descriptor` (inspect.rs:363-371) creates a new string and an id for every
-  `constructor_name` level of every logged object, and for `%s` and error comparisons. Pass ids
-  from `js::class::get_or_init_property_id`.
-- **Medium: `util.inspect` copies whole collections and buffers before truncating.**
-  `collection_entries` (inspect.rs:562-607) copies every entry of a Map or Set into a JS array to
-  show 100, `format_buffer` (1181-1185) and `format_array_buffer` (2260) copy the whole buffer to
-  show 50 or 100 bytes, and deep comparison copies both sides of typed arrays (3525, 3565-3566).
-  Iterate to the shown count, and compare borrowed slices.
-- **Low: per-call allocations in `Buffer` and `crypto`.** `Buffer.from(view)` and non-UTF-8
-  `Buffer.from(string)` fill a `Vec` and copy it into a new buffer. `Hash.update` and `Hmac.update`
-  copy their input before hashing (crypto.rs:141-144, 294-296, 361-363). `Buffer.prototype.toString`
-  and the `*Slice` methods copy before decoding (buffer.rs:1920, 1407), which inline data needs but
-  large buffers don't. Use `new_zeroed_buffer` and `new_buffer_with`, and hash from the borrowed
-  view.
-- **Low: per-call work in `path` and `querystring`.** `path.resolve` and `path.join` format an
-  argument name per argument (path.rs:327, 346, 91-93), and each relative `resolve` calls
-  `getcwd`. Each `querystring.parse` and `stringify` looks up the module namespace and its
-  `escape` and `unescape` (querystring.rs:223-240, 416, 593-599), and `stringify` copies its input
-  with `Object.assign`.
+  key order. readline's `history`, `historyIndex`, `historySize` and `isFlushing` are data
+  properties where Node has accessors, and `historyManager` is missing.
+- **Low: each relative `path.resolve` calls `getcwd`.** Node.js caches the working directory
+  until `process.chdir`, and the cache needs `process.rs` to clear it.
 - **Low: fixed event names created per call.** `on` (events.rs:370-371) and `removeListener`
   (events.rs:524, 878-879) create a new `JSString` for `newListener` or `removeListener`, as does
   async_hooks.rs:481. Use `js::class::get_or_init_atom`.
 - **Low: functions created per call for stateless callbacks.** A `toString` per `SystemError`
   (errors.rs:30), the `enable` and `disable` of `createHook` (async_hooks.rs:691-694) and
   `AsyncLocalStorage.snapshot` (async_hooks.rs:247). Use `js::class::get_or_init_shared_function`.
-- **Low: header handling copies.** Each `setHeader` converts the name to a `String` twice, copies
-  it once more and converts the value only to scan it (http.rs:187-201, outgoing.rs:296-328).
-  `store_header_value` and `header_value` allocate a lowercase copy per call
-  (outgoing.rs:713-727). The first `req.headers` read lowercases every name and scans linearly
-  (incoming.rs:383-395). web-fetch's `Headers::list` (headers.rs:141-144) copies the header list
-  that `on_fetch` then copies again (server.rs:195).
-- **Low: per-chunk work in served writes and body reads.** Every served `write` sets `_headerSent`
-  (outgoing.rs:969-971), and every chunk is copied into a `Vec` and again into a `Uint8Array`
-  (outgoing.rs:1541). `web_chunk` copies request body chunks twice (incoming.rs:351-356). The wire
-  path reads `strictContentLength` twice per chunk (wire.rs:736-738, 658), and the parser shifts
-  its buffer on every event (parser.rs:280-283).
+- **Low: the first `req.headers` read groups the header lines by a linear search.** It is
+  quadratic in the number of lines, which `maxHeadersCount` bounds.
 - **Low: per-chunk lookups in the readable byte path.** With `setEncoding()`, every pushed chunk
-  calls the decoder's `write` by name (readable.rs:327, 418, 1081), although `string_decoder` has a
-  Rust `write`. `chunk_length` looks up an own `length` on every chunk (readable.rs:99-105).
-- **Low: `InspectOptions::current` makes 24 lookups per formatted object.** inspect.rs:98-130 calls
-  `has_own_property` and then `get_property` for each of the 12 default options, and `Intrinsics`
-  is rebuilt for every nested `inspect`.
-- **Low: `new_error` deletes the `cause` that `CreateError` adds.** error.rs:529-596 does a lookup
-  and a delete on every error it creates. A glue variant without `cause` avoids both. Unverified
-  that the binding's `Maybe` conversion makes `cause` appear.
+  calls the decoder's `write` by name, as Node.js's `state.decoder.write(chunk)` does, since code
+  can reach the decoder through `_readableState`. `chunk_length` checks each typed array chunk
+  for an own `length`, which Node.js reads by name.
+- **Low: listing the keys of an array or typed array that aren't indices is linear in its
+  length.** `Object::own_non_index_keys` gets every own property id from `GetPropertyKeys`, which
+  has no flag to leave out elements, and skips the index ids. `util.inspect` of a 5,000,000-element
+  `Uint8Array` takes about 120 ms in a debug build. Node.js's `getOwnNonIndexProperties` doesn't
+  depend on the length.
+- **Low: `new_error` deletes the `cause` that `CreateError` adds.** The mozjs glue's
+  `CreateError` passes the cause as `mozilla::ToMaybe(&cause)`, which is never `Nothing`, so
+  every error it creates gets a `cause`. A glue variant without a cause avoids the lookup and the
+  delete.
 
 ### Tooling
 
-- **Medium: CI runs none of the Node.js compatibility suites.** No job in `.github/workflows/ci.yml`
-  and no `justfile` recipe runs `run-node-tests.mjs`, `fuzz.mjs` or `express-apps/run.mjs`, so
-  `expectations.json` and `known-diffs.json` are enforced only by hand. CI runs `test-runtime.sh`,
-  which covers three Node.js scripts on wasm. Add a native job (nightly or on a label) and `just`
-  recipes.
-- **Medium: accepted fuzzer signatures hide whole modules.** A `value-differs` signature holds only
-  the generator, the variant and the two type names (fuzz.mjs:300), so
-  `url/parse:value-differs[Url/Url]` accepts every `url.parse` difference, not only lone
-  surrogates, and `util/types:value-differs[true/false]` accepts any predicate that wrongly returns
-  `false`. The prefix keys `ServerResponse.prototype.*`, `ClientRequest.prototype.*`,
-  `Socket.prototype.*`, `Stream.prototype.*`, `Agent.*` and `globalAgent.*` accept a missing public
-  method, and `unimplemented:*` accepts any function that regresses to a stub
-  (known-diffs.json:27-63). Put the differing field in the signature, and list exact names.
-- **Medium: fuzzer crashes and hangs that need several operations never fail the run.** A
-  difference fails only when one operation reproduces it alone (fuzz.mjs:429-434, 464-466, 501).
-  A panic caused by an operation sequence is printed as an interaction and the run exits with 0.
-  Fail on every unknown crash and hang.
-- **Medium: fuzzer programs depend on the `node` that runs `fuzz.mjs`.** The `shape` generator
-  enumerates the driver's own exports and `zlib/fixture` compresses with the driver's zlib
-  (generators.mjs:1590-1608, 992-1014). The documented command uses the `node` on `PATH`, which can
-  be newer than the oracle, so seeds don't reproduce across machines, and a driver without zstd
-  makes the generator throw. Re-execute under the oracle, or compute these in an oracle child
-  process.
-- **Medium: `bench.mjs` fails on Linux and leaves servers running.** `load()` runs
-  `sysctl -n vm.loadavg` (bench.mjs:435-437), which is macOS and BSD only, before the first repeat.
-  In `benchApp` it runs outside the `try` after `launch()`. Servers are spawned `detached`
-  (bench.mjs:342) without a signal or exit handler, so an abort leaves them holding their ports.
-  Use `os.loadavg()`, and kill the process groups on exit. The Linux failure is unverified by a
-  run.
-- **Medium: the Express comparison passes when the runtime crashes after its last response.**
-  run.mjs:290-301 and 349-355 decide from the responses only, and don't check the child's exit
-  status or output. The `SIGKILL` isn't awaited before the output is read. Fail when the child
-  exited early, await `close`, and optionally fail on panics and uncaught errors in its output.
-- **Medium: fixed 100 ms sleeps in the `data` and `realtime` scenarios.**
-  data/scenario.mjs:45-50 and realtime/scenario.mjs:72-75 and 88-89 assume that the server
-  subscribed within 100 ms of the request starting, and data/app.mjs:262 sleeps 50 ms before
-  reading a log file. A slow runtime misses the event, which matches the known occasional `data`
-  difference and the flaky `realtime` app. That this causes them is unverified. Wait for a
-  readiness signal from the server instead.
-- **Low: the fuzzer's serializer sorts object keys.** prelude.js:67 hides property-order
-  differences in `querystring.parse`, `url.parse`, `parseArgs`, headers and `fs.Stats`. Serialize
-  in `Object.keys` order, and keep the explicit sorts in the generators that need them.
-- **Low: fuzzer deadlines are fixed under full parallel load.** `__settle` and the generators wait
-  200 ms to 3 s (prelude.js:108-112, generators.mjs:559, 1323, 1941), and `-j` defaults to the CPU
-  count. A slow runtime build can miss them. Scale the deadlines, or rerun a fresh signature
-  serially. Unverified by a run.
-- **Low: one crash gets two fuzzer signatures.** fuzz.mjs:283 and 288 give a crash an empty or an
-  `exit N` detail depending on earlier output, and `--update-known` records crash and hang keys
-  with empty reasons.
-- **Low: test-wizer's negative check doesn't check that the module ran.** test-wizer.sh:262-270
-  passes when the output lacks `run called`, including when nothing ran, and under `set -e` a
-  failing `wasmtime run` aborts the script instead of reporting `FAIL`.
-- **Low: downloads are pinned but not checksummed.** fetch-node-oracle.sh:34-35,
-  fetch-other-runtimes.sh:30-44, fetch-spin.sh:29-33 and the CI setup action verify no checksums,
-  and wasmtime is installed with `curl | bash`. The Deno version check also accepts `2.9.70` for
-  `2.9.7`. The wasm-tools install step is duplicated between ci.yml and the setup action.
-- **Low: the Express drivers accept any listener on the port they chose.** `freePort` releases the
-  port before the child binds it, and `waitForPort` accepts any connection (run.mjs:83-110,
-  bench.mjs:222-242, 370-374). Both drivers have their own copy of these helpers. Check that the
-  child is still running after connecting, and share the helpers.
-- **Low: benchmark methodology.** `oha` shares the machine's CPUs with the server, which affects
-  single-threaded and multi-threaded servers differently, and the client thread count isn't
-  recorded. `prepare` ignores response statuses (bench.mjs:164-215), and the latencies include
-  unexpected statuses.
-- **Low: documentation that doesn't match the tools.** The Testing section of `docs/node-compat.md`
-  lists three kinds of tests and leaves out `tests/express-apps`. README.md:978-979 describes
-  `test-runtime` as a hello-world, but it also runs the Node.js scripts.
-  The comment at check-portal-links.mjs:10-11 limits 409 to some forms, and line 80 accepts it for
-  all. build-spin-app.sh:71-74 word-splits a path with a space.
-- **Low: the runtime flag unit tests never run.** runtime_flags.rs:181-229 is a `#[cfg(test)]`
-  module, and `crates/builtins/node/Cargo.toml` sets `test = false` for the library. Move the cases
-  to `tests/modules.rs`.
+- **Medium: CI runs none of the Node.js compatibility suites.** `just node-test`,
+  `node-test-wasm`, `node-fuzz` and `express-test` run them locally, but no CI job does, so
+  `expectations.json` and `known-diffs.json` are enforced only by hand. The harness expectations
+  were recorded on macOS, and some results depend on the platform (`os` constants, error codes), so
+  a CI job needs either a macOS runner or separately recorded Linux results.

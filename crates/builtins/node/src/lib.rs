@@ -8,6 +8,7 @@
 pub mod assert;
 pub mod async_hooks;
 pub mod buffer;
+pub mod child_process;
 pub mod commonjs;
 mod console;
 pub mod constants;
@@ -15,6 +16,7 @@ pub mod crypto;
 pub mod dgram;
 pub mod diagnostics_channel;
 pub mod dns;
+mod domain;
 pub mod errors;
 pub mod events;
 mod events_async;
@@ -54,8 +56,10 @@ use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 
 /// The modules that import an implemented module besides its name and bare alias.
-const EXTRA_ALIASES: &[(&str, &[&str])] =
-    &[("node:path", &["path", "path/posix", "node:path/posix"])];
+const EXTRA_ALIASES: &[(&str, &[&str])] = &[
+    ("node:path", &["path", "path/posix", "node:path/posix"]),
+    ("node:util", &["util", "sys", "node:sys"]),
+];
 
 /// Register the builtin module `name`: its implementation if there is one, and its stub otherwise.
 fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
@@ -68,6 +72,7 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
             stub::register_implemented::<assert::strict::js_module>(scope, name)
         }
         "node:buffer" => buffer::register_module(scope, name),
+        "node:child_process" => child_process::register_module(scope, name),
         "node:constants" => constants::register_module(scope, name),
         "node:crypto" => crypto::register_module(scope, name),
         "node:dgram" => stub::register_implemented::<dgram::module::js_module>(scope, name),
@@ -79,6 +84,7 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
         "node:net" => stub::register_implemented::<net::module::js_module>(scope, name),
         "node:dns" => dns::register_module(scope, name),
         "node:dns/promises" => dns::register_promises(scope, name),
+        "node:domain" => domain::register_module(scope, name),
         "node:os" => os::register_module(scope, name),
         "node:punycode" => punycode::register_module(scope, name),
         "node:stream" => stream::register_module(scope, name),
@@ -95,9 +101,7 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
         "node:util" => util::register_module(scope, name),
         "node:util/types" => stub::register_implemented::<util::types::js_module>(scope, name),
         "node:vm" => vm::register_module(scope, name),
-        "node:querystring" => {
-            stub::register_implemented::<querystring::module::js_module>(scope, name)
-        }
+        "node:querystring" => querystring::register_module(scope, name),
         "node:string_decoder" => {
             stub::register_implemented::<string_decoder::module::js_module>(scope, name)
         }
@@ -105,7 +109,7 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
         "node:events" => stub::register_implemented::<events::module::js_module>(scope, name),
         "node:fs" => fs::register_module(scope, name),
         "node:fs/promises" => fs::register_promises(scope, name),
-        "node:path" => stub::register_implemented::<path::path::js_module>(scope, name),
+        "node:path" => path::register_module(scope, name),
         "node:perf_hooks" => perf_hooks::register_module(scope, name),
         "node:process" => process::register_module(scope, name),
         "node:zlib" => zlib::register_module(scope, name),
@@ -117,7 +121,8 @@ fn create_module(scope: &Scope<'_>, name: &'static str) -> bool {
 
 /// Install the Node.js globals on `global`: `process`, `Buffer`, `global`, `setImmediate` and
 /// `clearImmediate`, the `setTimeout` and `setInterval` that return `Timeout` objects, and `gc`
-/// with `--expose-gc`.
+/// with `--expose-gc`. With `--no-experimental-websocket`, remove the globals `WebSocket` and
+/// `CloseEvent`. A process that `child_process.fork` spawned connects `process` to its parent.
 pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
     let install = || -> Result<(), ExnThrown> {
         perf_hooks::mark_start();
@@ -134,9 +139,16 @@ pub fn add_to_global(scope: &Scope<'_>, global: js::Object<'_>) {
         global.define_property(scope, c"Buffer", buffer, 0)?;
         if runtime_flags::get().expose_gc {
             let gc = js::Function::new_callback(scope, c"gc", 0, collect_garbage, ())?;
-            global.define_property(scope, c"gc", *gc, 0)?;
+            // Enumerable and non-configurable, as Node.js defines it.
+            let flags = js::class_spec::JSPROP_ENUMERATE | js::class_spec::JSPROP_PERMANENT;
+            global.define_property(scope, c"gc", *gc, flags as u32)?;
         }
         global.set_property(scope, c"global", global)?;
+        if !runtime_flags::get().experimental_websocket {
+            global.delete_property(scope, c"WebSocket")?;
+            global.delete_property(scope, c"CloseEvent")?;
+        }
+        child_process::connect_to_parent(scope);
         perf_hooks::mark_bootstrap_complete();
         Ok(())
     };
@@ -170,6 +182,7 @@ fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), Exn
     events::event_emitter::register(scope)?;
     stream::register_classes(scope, global)?;
     dns::register_classes(scope, global)?;
+    domain::register_classes(scope, global)?;
     events::OnceState::add_to_global(scope, global);
     events::RejectionState::add_to_global(scope, global);
     events_async::OnIteration::add_to_global(scope, global);
@@ -188,10 +201,13 @@ fn register_classes(scope: &Scope<'_>, global: js::Object<'_>) -> Result<(), Exn
     assert::register_classes(scope, global)?;
     async_hooks::register_classes(scope, global)?;
     buffer::buffer::register(scope)?;
+    child_process::register_classes(scope, global)?;
+    commonjs::ModuleState::add_to_global(scope, global);
     commonjs::module_class::register(scope)?;
     crypto::register_classes(scope, global)?;
     dgram::register_classes(scope, global)?;
     perf_hooks::register_classes(scope, global)?;
+    querystring::ModuleExports::add_to_global(scope, global);
     inspect::register_classes(scope, global)?;
     util::register_classes(scope, global);
     diagnostics_channel::register_classes(scope, global)?;
@@ -230,6 +246,12 @@ fn collect_garbage(
     Ok(js::value::undefined())
 }
 
+/// Set whether the `-e` script came from `-p`, whose completion value is printed when the process
+/// exits.
+pub fn set_print_eval(print: bool) {
+    commonjs::set_print_eval(print);
+}
+
 /// Register every `node:` builtin module and the Node.js globals, so they exist in every runtime
 /// created after this call. The modules that only exist with a runtime flag are registered if
 /// [`runtime_flags::set`] enabled them: the `internal/` modules with `--expose-internals`, and
@@ -239,6 +261,8 @@ pub fn register() {
     core_runtime::runtime::register_global_initializer(add_to_global);
     core_runtime::runtime::register_resume_fixup(process::on_resume);
     core_runtime::module::set_commonjs_loader(Some(commonjs::load_for_import));
+    core_runtime::module::set_commonjs_eval(Some(commonjs::run_eval));
+    errors::install_web_errors();
     for &(name, aliases, _) in exports_table::BUILTIN_EXPORTS {
         let extra = EXTRA_ALIASES
             .iter()
@@ -274,15 +298,15 @@ pub fn register() {
     }
 }
 
-/// The arguments of a native function call.
-pub(crate) fn callback_args<'a>(args: &'a js::function::CallbackArgs<'_>) -> Vec<HandleValue<'a>> {
-    (0..args.len()).map(|index| args.get(index)).collect()
-}
-
-/// The builtin module names `module.builtinModules` lists: the bare names, and the names of the
-/// modules that only exist with the `node:` prefix.
+/// The builtin module names `module.builtinModules` lists: the bare names, then the names of the
+/// modules that only exist with the `node:` prefix, as Node.js orders them.
 pub(crate) fn builtin_module_names() -> impl Iterator<Item = &'static str> {
-    exports_table::BUILTIN_EXPORTS
-        .iter()
-        .map(|&(name, aliases, _)| aliases.first().copied().unwrap_or(name))
+    let names = || {
+        exports_table::BUILTIN_EXPORTS
+            .iter()
+            .map(|&(name, aliases, _)| aliases.first().copied().unwrap_or(name))
+    };
+    names()
+        .filter(|name| !name.starts_with("node:"))
+        .chain(names().filter(|name| name.starts_with("node:")))
 }

@@ -41,3 +41,19 @@ fn importing_the_entry_module_gets_the_entry_module() {
         );
     }
 }
+
+/// `crates/builtins/node/tests/js/child_process.mjs` passes when the binary runs it. The binary is
+/// `process.execPath` then, so the script's `fork` and IPC checks always run, which the in-process
+/// run of `node-builtins` skips without a built binary.
+#[test]
+fn child_process_script_forks_the_binary() {
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/builtins/node/tests/js/child_process.mjs"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .args(["--node-compat", script])
+        .output()
+        .expect("failed to run starling");
+    assert!(out.status.success(), "{out:?}");
+}

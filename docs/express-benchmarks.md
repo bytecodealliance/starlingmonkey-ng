@@ -295,6 +295,32 @@ runs of each build with 3 measurements each:
 | `clearImmediate(setImmediate(f))` | 921 | 766 |
 | `util.inspect` of an object with a custom inspection method | 1200 | 934 |
 
+## Served responses and header handling
+
+On 2026-10-11, the served path stopped building the HTTP/1.1 header block of `_storeHeader`, with
+its framing property reads and writes, for responses to served requests. `writeHead` now converts
+each header value once and keeps the status and headers for the web `Response`. The responses
+get the request's method and version from the `fetch` listener instead of reading them back, the
+listening servers are kept in Rust, `_headerSent` is set once, and a served request's socket no
+longer makes its `IncomingMessage` read options from an options object. The same commits made
+`setHeader` convert its name once and scan its value in place, and the HTTP/1.1 parser stopped
+shifting its buffer for every event.
+
+Other work loaded the machine, with a load average of 9 to 25. The servers of both builds ran
+side by side, and 4 pairs of 3 s runs alternated between them in ABBA order after a 1 s warmup
+of each server. CPU per request in µs, from the server process's CPU time, and requests per
+second, the medians of the 8 runs of each build:
+
+| Route | Config | c=1 µs before / after | c=1 req/s before / after | c=32 µs before / after | c=32 req/s before / after |
+|---|---|--:|--:|--:|--:|
+| `rest-api` `GET /health` | `serve` | 116.4 / 105.2 | 6097 / 6778 | 99.4 / 88.3 | 10052 / 11194 |
+| `rest-api` `GET /health` | `listen` | 99.0 / 81.0 | 8267 / 9946 | 78.8 / 69.0 | 14192 / 15294 |
+
+The runs of each cell spread by up to a factor of 2, so the 10 to 18% drops in the medians are
+an estimate. `bench.mjs` with 3 repeats, run for one build after the other, gave medians of 1683
+and 1866 requests per second for `serve` at 1 connection, 3623 and 3863 at 32, and for `listen`
+2869 and 2847 at 1 connection and 4217 and 4392 at 32, under a higher load.
+
 ## Fixes
 
 On 2026-10-05, profiles of `listen` under load (an unstripped release build sampled with macOS's

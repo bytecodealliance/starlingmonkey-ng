@@ -33,3 +33,18 @@ deepEq(ucs2.decode(5), [], "ucs2.decode of a non-string");
 eq(toUnicode("XN--MAANA-PTA.COM"), "XN--MAANA-PTA.COM", "uppercase prefix");
 throws(() => ucs2.encode([0x110000]), RangeError, "invalid code point");
 throws(() => ucs2.encode([{ valueOf() { throw new TypeError("boom"); } }]), TypeError, "valueOf exceptions propagate");
+
+// The errors of non-string arguments name Punycode.js's parameters.
+eq(throws(() => toASCII(5), TypeError).message, "domain.split is not a function", "toASCII of a number");
+eq(throws(() => toUnicode(5), TypeError).message, "domain.split is not a function", "toUnicode of a number");
+eq(throws(() => encode(["a"]), TypeError).message, "string.charCodeAt is not a function", "encode of an array");
+eq(throws(() => decode(["a"]), TypeError).message, "input.charCodeAt is not a function", "decode of an array");
+eq(throws(() => decode(5), TypeError).message, "input.lastIndexOf is not a function", "decode of a number");
+eq(toASCII(new String("mañana.com")), "xn--maana-pta.com", "toASCII of a String object");
+eq(decode(new String("maana-pta")), "mañana", "decode of a String object");
+deepEq([ucs2.decode.name, ucs2.encode.name], ["ucs2decode", "ucs2encode"], "ucs2 function names");
+eq(Object.keys(punycode).join(), "version,ucs2,decode,encode,toASCII,toUnicode", "key order");
+// `ucs2.encode` spreads its argument.
+eq(ucs2.encode(new Set([65, 66])), "AB", "ucs2.encode of an iterable");
+eq(ucs2.encode("65"), "\u0006\u0005", "ucs2.encode of a string");
+throws(() => ucs2.encode(5), TypeError, "ucs2.encode of a number");

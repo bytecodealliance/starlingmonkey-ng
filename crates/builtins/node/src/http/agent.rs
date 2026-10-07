@@ -174,7 +174,7 @@ fn pool_array<'s>(
     };
     let key = name.to_jsval_throwing(scope)?;
     let value = crate::http::get_by_key(scope, pool, key)?;
-    super::outgoing::as_array(scope, value)
+    Ok(crate::support::as_array(scope, value))
 }
 
 /// The array the pool `pool` of `agent` holds under `name`, created if it has none, as
@@ -189,7 +189,7 @@ fn pool_array_or_new<'s>(
         .ok_or_else(|| js::error::TypeError("the agent has no socket pool".into()).throw(scope))?;
     let key = name.to_jsval_throwing(scope)?;
     let value = crate::http::get_by_key(scope, pool, key)?;
-    if let Some(array) = super::outgoing::as_array(scope, value)? {
+    if let Some(array) = crate::support::as_array(scope, value) {
         return Ok(array);
     }
     let array = js::Array::new(scope, 0)?;
@@ -384,8 +384,8 @@ fn agent_on_free(
     let request = Object::from_value(scope, *socket.get_property(scope, c"_httpMessage")?).ok();
     let reusable = match request {
         Some(request) => {
-            crate::http::flag(scope, request, c"shouldKeepAlive")?
-                && crate::http::flag(scope, agent, c"keepAlive")?
+            crate::support::truthy(scope, request, c"shouldKeepAlive")?
+                && crate::support::truthy(scope, agent, c"keepAlive")?
         }
         None => false,
     };
@@ -462,7 +462,7 @@ fn install_data_guard(scope: &Scope<'_>, socket: Object<'_>) -> Result<(), ExnTh
         Function::call_by_name(scope, socket.handle(), c"destroy", js::function::EmptyArgs)?;
         return Ok(());
     }
-    if crate::http::flag(scope, socket, c"connecting")? {
+    if crate::support::truthy(scope, socket, c"connecting")? {
         let on_connect =
             crate::support::shared_named_function(scope, guard_on_connect, c"onConnect", 0)?;
         return crate::events::listen(scope, socket, c"once", c"connect", on_connect);
@@ -611,7 +611,7 @@ fn socket_on_timeout(
     };
     for key in pool.own_enumerable_keys(scope)? {
         let sockets = crate::http::get_by_key(scope, pool, key)?;
-        let Some(sockets) = super::outgoing::as_array(scope, sockets)? else {
+        let Some(sockets) = crate::support::as_array(scope, sockets) else {
             continue;
         };
         for entry in sockets.to_vec(scope)? {
@@ -990,7 +990,7 @@ pub mod agent_class {
                 created: false,
             })?;
         let created = Function::new_callback(scope, c"", 2, socket_created, creation)?;
-        if crate::http::flag(scope, this, c"keepAlive")? {
+        if crate::support::truthy(scope, this, c"keepAlive")? {
             options.set_property(scope, c"keepAlive", this.get_property(scope, c"keepAlive")?)?;
             options.set_property(
                 scope,
@@ -1061,10 +1061,10 @@ pub mod agent_class {
                         None => false,
                     };
                     if !busy {
-                        if let Some(queue) = super::super::outgoing::as_array(
+                        if let Some(queue) = crate::support::as_array(
                             scope,
                             crate::http::get_by_key(scope, requests, key)?,
-                        )? {
+                        ) {
                             waiting = Object::from_value(scope, *queue.get_element(scope, 0)?).ok();
                             options = match waiting {
                                 Some(request) => {
@@ -1201,7 +1201,7 @@ pub mod agent_class {
             };
             for key in pool.own_enumerable_keys(scope)? {
                 let sockets = crate::http::get_by_key(scope, pool, key)?;
-                let Some(sockets) = super::super::outgoing::as_array(scope, sockets)? else {
+                let Some(sockets) = crate::support::as_array(scope, sockets) else {
                     continue;
                 };
                 let mut index = 0;

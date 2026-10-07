@@ -96,17 +96,18 @@ fn check_is_http_token(
     Ok(js::value::from_bool(crate::http::is_token(&value)))
 }
 
-/// `_http_common._checkInvalidHeaderChar(value)`: whether `value` has a character a header value
-/// can't.
+/// `_http_common._checkInvalidHeaderChar(value, lenient)`: whether `value` has a character a
+/// header value can't, checked leniently if `lenient` is truthy.
 fn check_invalid_header_char(
     scope: &Scope<'_>,
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let value = String::from_jsval(scope, args.get(0), ()).unwrap_or_default();
-    Ok(js::value::from_bool(crate::http::has_invalid_header_char(
-        &value,
-    )))
+    let lenient = js::conversion::to_boolean(args.get(1));
+    Ok(js::value::from_bool(
+        crate::http::has_invalid_header_char_with(&value, lenient),
+    ))
 }
 
 /// A case-insensitive regular expression for `pattern`.

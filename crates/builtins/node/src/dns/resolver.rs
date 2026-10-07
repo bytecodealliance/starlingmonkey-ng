@@ -1126,7 +1126,7 @@ fn prototype_query(
     payload: HandleValue,
 ) -> Result<Value, ExnThrown> {
     let kind = QueryKind::ALL[payload.to_number() as usize];
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     query_with_callback(scope, scope.root_value(args.this()), kind, &values)
 }
 
@@ -1152,7 +1152,7 @@ fn prototype_resolve(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     resolve_with_callback(scope, scope.root_value(args.this()), &values)
 }
 
@@ -1162,7 +1162,7 @@ fn prototype_resolve_promise(
     args: CallbackArgs<'_>,
     _: HandleValue,
 ) -> Result<Value, ExnThrown> {
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     resolve_promise(scope, scope.root_value(args.this()), &values)
 }
 
@@ -1202,7 +1202,7 @@ fn bound_call(
         (data.resolver.get(scope), data.method)
     };
     let this = resolver.to_jsval_throwing(scope)?;
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     call_method(scope, this, method, &values)
 }
 

@@ -126,7 +126,7 @@ pub(super) struct Parser {
     /// Whether the parser accepts what `llhttp`'s lenient flags accept.
     lenient: bool,
     /// The bytes received and not parsed yet.
-    buffer: Vec<u8>,
+    buffer: bytes::BytesMut,
     /// The position of the first byte of `buffer` in the connection's bytes.
     position: usize,
     /// The position of the first byte of the last chunk fed in the connection's bytes.
@@ -199,7 +199,7 @@ impl Parser {
         Parser {
             kind,
             lenient,
-            buffer: Vec::new(),
+            buffer: bytes::BytesMut::new(),
             position: 0,
             chunk_start: 0,
             state: State::Head,
@@ -212,14 +212,14 @@ impl Parser {
         }
     }
 
-    /// Append received bytes.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Append received bytes. Fails if allocating room for them fails.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), std::collections::TryReserveError> {
         self.chunk_start = self.position + self.buffer.len();
         match &mut self.state {
-            State::Done => return,
+            State::Done => return Ok(()),
             State::Failed(_, report) => {
                 *report = !bytes.is_empty();
-                return;
+                return Ok(());
             }
             _ => {}
         }
@@ -230,7 +230,16 @@ impl Parser {
             }
             self.in_message = true;
         }
+        // `BytesMut` has no fallible reserve, so a buffer without room for `bytes` is copied into
+        // a `Vec` reserved fallibly.
+        if !self.buffer.try_reclaim(bytes.len()) {
+            let mut grown = Vec::new();
+            grown.try_reserve(self.buffer.len() + bytes.len())?;
+            grown.extend_from_slice(&self.buffer);
+            self.buffer = bytes::BytesMut::from(bytes::Bytes::from(grown));
+        }
         self.buffer.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Whether a message is in progress: its first byte arrived and it didn't complete.
@@ -270,7 +279,7 @@ impl Parser {
     pub fn take_rest(&mut self) -> Vec<u8> {
         self.state = State::Done;
         self.position += self.buffer.len();
-        std::mem::take(&mut self.buffer)
+        std::mem::take(&mut self.buffer).into()
     }
 
     /// Set what follows the head [`Parser::next`] returned last, unless it upgraded the
@@ -372,7 +381,7 @@ impl Parser {
     /// Drop the first `count` buffered bytes.
     fn consume(&mut self, count: usize) -> Vec<u8> {
         self.position += count;
-        self.buffer.drain(..count).collect()
+        self.buffer.split_to(count).to_vec()
     }
 
     /// End the current message.
@@ -452,6 +461,13 @@ impl Parser {
             } else if name.eq_ignore_ascii_case(b"upgrade") {
                 has_upgrade = true;
             } else if name.eq_ignore_ascii_case(b"content-length") {
+                if transfer_encoding && !self.lenient {
+                    return Err(Failure(
+                        "HPE_INVALID_CONTENT_LENGTH",
+                        "Content-Length can't be present with Transfer-Encoding",
+                        Some(offset(name) + name.len() + 1),
+                    ));
+                }
                 if let Some(index) = value.iter().position(|byte| !byte.is_ascii_digit()) {
                     return Err(Failure(
                         "HPE_INVALID_CONTENT_LENGTH",
@@ -482,6 +498,13 @@ impl Parser {
                 })?;
                 content_length = Some(length);
             } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+                if content_length.is_some() && !self.lenient {
+                    return Err(Failure(
+                        "HPE_INVALID_TRANSFER_ENCODING",
+                        "Transfer-Encoding can't be present with Content-Length",
+                        Some(offset(name) + name.len() + 1),
+                    ));
+                }
                 transfer_encoding = true;
                 let mut start = 0;
                 for token in value.split(|&byte| byte == b',') {
@@ -513,13 +536,6 @@ impl Parser {
         let bodiless = !request
             && ((100..200).contains(&line.status) || line.status == 204 || line.status == 304);
         let body = match (transfer_encoding, content_length) {
-            (true, Some(_)) if !self.lenient => {
-                return Err(Failure(
-                    "HPE_INVALID_TRANSFER_ENCODING",
-                    "Transfer-Encoding can't be present with Content-Length",
-                    Some(head_end),
-                ))
-            }
             (true, _) if chunked => Body::Chunked(Chunk::Size),
             (true, _) if request && !self.lenient => {
                 return Err(Failure(
@@ -645,17 +661,20 @@ impl Parser {
                         return Ok(None);
                     };
                     let line = &self.buffer[..end];
-                    let Some(line) = line.strip_suffix(b"\r\n") else {
-                        return Err(Failure(
-                            "HPE_LF_EXPECTED",
-                            "Expected LF after chunk size",
-                            Some(end),
-                        ));
+                    let size_end = if self.lenient {
+                        let Some(line) = line.strip_suffix(b"\r\n") else {
+                            return Err(Failure(
+                                "HPE_LF_EXPECTED",
+                                "Expected LF after chunk size",
+                                Some(end),
+                            ));
+                        };
+                        line.iter()
+                            .position(|&byte| byte == b';')
+                            .unwrap_or(line.len())
+                    } else {
+                        chunk_size_end(line)?
                     };
-                    let size_end = line
-                        .iter()
-                        .position(|&byte| byte == b';')
-                        .unwrap_or(line.len());
                     let digits = &line[..size_end];
                     if digits.is_empty() || !digits.iter().all(u8::is_ascii_hexdigit) {
                         return Err(Failure(
@@ -719,6 +738,15 @@ impl Parser {
                             if let Some(failure) = line_break {
                                 return Err(failure);
                             }
+                            if let Some(excess) = self.max_headers.and_then(|max| parsed.get(max)) {
+                                let at =
+                                    excess.name.as_ptr() as usize - self.buffer.as_ptr() as usize;
+                                return Err(Failure(
+                                    "HPE_HEADER_OVERFLOW",
+                                    "Header overflow",
+                                    Some(at + excess.name.len() + 1),
+                                ));
+                            }
                             let trailers = parsed
                                 .iter()
                                 .map(|header| (header.name.to_string(), latin1(header.value)))
@@ -754,6 +782,142 @@ impl Parser {
             }
         }
     }
+}
+
+/// The position after the size digits of the chunk-size line `line`, which ends with its first
+/// line feed, as `llhttp` checks the line in its strict mode: hexadecimal digits, then extensions,
+/// each `;` followed by a token name and an optional `=` with a token or a quoted string, then
+/// CRLF.
+fn chunk_size_end(line: &[u8]) -> Result<usize, Failure> {
+    enum State {
+        Size,
+        /// A name, and whether it is empty so far.
+        Name(bool),
+        Value,
+        Quoted,
+        QuotedPair,
+        AfterQuoted,
+        CarriageReturn,
+    }
+    let strict = |reason, at| Failure("HPE_STRICT", reason, Some(at));
+    let cr_expected = |reason, at| Failure("HPE_CR_EXPECTED", reason, Some(at));
+    let invalid_size = |at| {
+        Failure(
+            "HPE_INVALID_CHUNK_SIZE",
+            "Invalid character in chunk size",
+            Some(at),
+        )
+    };
+    let is_token = |byte: u8| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte);
+    let is_quoted_text =
+        |byte: u8| matches!(byte, b'\t' | b' ' | 0x21 | 0x23..=0x5b | 0x5d..=0x7e | 0x80..);
+    let mut size_end = 0;
+    let mut state = State::Size;
+    // The positions `llhttp` reports differ by state: some point at the byte, others after it.
+    for (index, &byte) in line.iter().enumerate() {
+        state = match state {
+            State::Size => match byte {
+                byte if byte.is_ascii_hexdigit() => State::Size,
+                _ if index == 0 => return Err(invalid_size(index)),
+                b';' => {
+                    size_end = index;
+                    State::Name(true)
+                }
+                b'\r' => {
+                    size_end = index;
+                    State::CarriageReturn
+                }
+                b'\n' => {
+                    return Err(cr_expected(
+                        "Missing expected CR after chunk size",
+                        index + 1,
+                    ))
+                }
+                b' ' | b'\t' => return Err(invalid_size(index + 1)),
+                _ => return Err(invalid_size(index)),
+            },
+            State::Name(empty) => match byte {
+                b' ' if empty => {
+                    return Err(strict("Invalid character in chunk extensions", index + 1))
+                }
+                byte if is_token(byte) => State::Name(false),
+                b'=' => State::Value,
+                b';' => State::Name(true),
+                b'\r' => State::CarriageReturn,
+                b'\n' => {
+                    return Err(cr_expected(
+                        "Missing expected CR after chunk extension name",
+                        index,
+                    ))
+                }
+                _ => {
+                    return Err(strict(
+                        "Invalid character in chunk extensions name",
+                        index + 1,
+                    ))
+                }
+            },
+            State::Value => match byte {
+                byte if is_token(byte) => State::Value,
+                b'"' => State::Quoted,
+                b';' => State::Name(true),
+                b'\r' => State::CarriageReturn,
+                b'\n' => {
+                    return Err(cr_expected(
+                        "Missing expected CR after chunk extension value",
+                        index,
+                    ))
+                }
+                _ => {
+                    return Err(strict(
+                        "Invalid character in chunk extensions value",
+                        index + 1,
+                    ))
+                }
+            },
+            State::Quoted => match byte {
+                b'"' => State::AfterQuoted,
+                b'\\' => State::QuotedPair,
+                byte if is_quoted_text(byte) => State::Quoted,
+                _ => {
+                    return Err(strict(
+                        "Invalid character in chunk extensions quoted value",
+                        index + 1,
+                    ))
+                }
+            },
+            State::QuotedPair => match byte {
+                b'\t' | b' ' | 0x21..=0x7e | 0x80.. => State::Quoted,
+                _ => {
+                    return Err(strict(
+                        "Invalid quoted-pair in chunk extensions quoted value",
+                        index + 1,
+                    ))
+                }
+            },
+            State::AfterQuoted => match byte {
+                b';' => State::Name(true),
+                b'\r' => State::CarriageReturn,
+                b'\n' => {
+                    return Err(cr_expected(
+                        "Missing expected CR after chunk extension value",
+                        index,
+                    ))
+                }
+                _ => {
+                    return Err(strict(
+                        "Invalid character in chunk extensions quote value",
+                        index,
+                    ))
+                }
+            },
+            State::CarriageReturn => match byte {
+                b'\n' => return Ok(size_end),
+                _ => return Err(strict("Expected LF after chunk size", index)),
+            },
+        };
+    }
+    Err(strict("Expected LF after chunk size", line.len()))
 }
 
 /// The slots for `httparse` to parse the header lines at the start of `bytes` into: one for each
@@ -869,8 +1033,10 @@ struct Field<'b> {
 }
 
 /// The request line at the start of `bytes`, or `None` if `bytes` ends before it does, as
-/// `llhttp` parses it in its strict mode: a method of `METHODS`, a URL of visible ASCII characters,
-/// and HTTP/0.9, 1.0, 1.1 or 2.0, separated by single spaces and ended by CRLF.
+/// `llhttp` parses it in its strict mode: a method of `METHODS`, a request target, and HTTP/0.9,
+/// 1.0, 1.1 or 2.0, separated by spaces and ended by CRLF. The target starts with `/` or `*`, or
+/// is an absolute URL with a scheme of letters followed by `://` and an authority. The target of
+/// `CONNECT` starts with an authority. The rest of a target is visible ASCII characters.
 fn request_line(bytes: &[u8]) -> Result<Option<StartLine>, Failure> {
     let method_end = bytes.iter().position(|&byte| byte == b' ');
     let token = &bytes[..method_end.unwrap_or(bytes.len())];
@@ -893,17 +1059,16 @@ fn request_line(bytes: &[u8]) -> Result<Option<StartLine>, Failure> {
     if !super::METHODS.contains(&method.as_str()) {
         return Err(invalid_method(matched));
     }
-    let url_start = method_end + 1;
-    if bytes.get(url_start).is_some_and(|&byte| byte == b' ') {
-        return Err(Failure(
-            "HPE_INVALID_URL",
-            "Unexpected start char in url",
-            Some(url_start),
-        ));
+    let mut url_start = method_end + 1;
+    while bytes.get(url_start) == Some(&b' ') {
+        url_start += 1;
     }
+    let Some(path_start) = url_authority(bytes, url_start, method == "CONNECT")? else {
+        return Ok(None);
+    };
     let mut section = "Invalid char in url path";
     let mut url_end = None;
-    for (index, &byte) in bytes.iter().enumerate().skip(url_start) {
+    for (index, &byte) in bytes.iter().enumerate().skip(path_start) {
         match byte {
             b' ' => {
                 url_end = Some(index);
@@ -926,7 +1091,17 @@ fn request_line(bytes: &[u8]) -> Result<Option<StartLine>, Failure> {
         return Ok(None);
     };
     let url = latin1(&bytes[url_start..url_end]);
-    let protocol = url_end + 1;
+    let mut protocol = url_end + 1;
+    while bytes.get(protocol) == Some(&b' ') {
+        protocol += 1;
+    }
+    if let Some(b'\t' | b'\x0c') = bytes.get(protocol) {
+        return Err(Failure(
+            "HPE_INVALID_URL",
+            "Invalid characters in url",
+            Some(protocol + 1),
+        ));
+    }
     for (offset, &expected) in b"HTTP/".iter().enumerate() {
         match bytes.get(protocol + offset) {
             None => return Ok(None),
@@ -978,6 +1153,55 @@ fn request_line(bytes: &[u8]) -> Result<Option<StartLine>, Failure> {
         minor,
         end: version + 5,
     }))
+}
+
+/// The position in `bytes` after the scheme and authority of the request target at `start`, as
+/// `llhttp` checks them in its strict mode, or `None` if `bytes` ends before it. A target that starts with `/` or `*` has neither, and a
+/// `CONNECT` target (`connect`) starts with the authority. The authority ends at `/`, `?`, a space
+/// or a line break.
+fn url_authority(bytes: &[u8], start: usize, connect: bool) -> Result<Option<usize>, Failure> {
+    let invalid_url = |reason, at| Failure("HPE_INVALID_URL", reason, Some(at));
+    // `llhttp` reports a tab, a form feed, or a space that ends the target early at the position
+    // after it.
+    let invalid_characters = |at: usize| invalid_url("Invalid characters in url", at + 1);
+    let mut index = start;
+    if !connect {
+        match bytes.get(index) {
+            None => return Ok(None),
+            Some(b'/' | b'*') => return Ok(Some(index)),
+            Some(b'\t' | b'\x0c') => return Err(invalid_characters(index)),
+            Some(byte) if !byte.is_ascii_alphabetic() => {
+                return Err(invalid_url("Unexpected start char in url", index))
+            }
+            Some(_) => {}
+        }
+        while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+            index += 1;
+        }
+        for (position, expected) in b"://".iter().copied().enumerate() {
+            match bytes.get(index) {
+                None => return Ok(None),
+                Some(&byte) if byte == expected => index += 1,
+                Some(b' ' | b'\t' | b'\x0c') if position < 2 => {
+                    return Err(invalid_characters(index))
+                }
+                Some(_) => return Err(invalid_url("Unexpected char in url schema", index)),
+            }
+        }
+    }
+    loop {
+        match bytes.get(index) {
+            None => return Ok(None),
+            Some(b'/' | b'?' | b' ' | b'\r' | b'\n') => return Ok(Some(index)),
+            Some(byte)
+                if byte.is_ascii_alphanumeric() || b"-_.!~*'()%;:&=+$,@[]".contains(byte) =>
+            {
+                index += 1
+            }
+            Some(b'\t' | b'\x0c') => return Err(invalid_characters(index)),
+            Some(_) => return Err(invalid_url("Unexpected char in url server", index)),
+        }
+    }
 }
 
 /// The HTTP version at `at` in `bytes`, after `HTTP/`, or `None` if `bytes` ends before it does:
@@ -1248,15 +1472,17 @@ mod tests {
     #[test]
     fn line_breaks_after_a_closing_message_are_consumed() {
         let mut parser = Parser::new(Kind::Request, 16384, None, false);
-        parser.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        parser
+            .feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+            .unwrap();
         let received = events(&mut parser);
         assert!(matches!(received.last(), Some(Event::Complete(_))));
         for _ in 0..100 {
-            parser.feed(&b"\r\n".repeat(512));
+            parser.feed(&b"\r\n".repeat(512)).unwrap();
             assert!(events(&mut parser).is_empty());
             assert!(parser.buffer.is_empty());
         }
-        parser.feed(b"\r\nX");
+        parser.feed(b"\r\nX").unwrap();
         let error = drain(&mut parser)
             .err()
             .expect("data after the closing message");
@@ -1267,9 +1493,11 @@ mod tests {
     #[test]
     fn trailers_beyond_the_header_limit_overflow() {
         let mut parser = Parser::new(Kind::Request, 64, None, false);
-        parser.feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+        parser
+            .feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
+            .unwrap();
         assert_eq!(events(&mut parser).len(), 1);
-        parser.feed(&b"A: b\r\n".repeat(64));
+        parser.feed(&b"A: b\r\n".repeat(64)).unwrap();
         let error = drain(&mut parser).err().expect("too many trailer lines");
         assert_eq!(error.code, "HPE_HEADER_OVERFLOW");
     }
@@ -1277,8 +1505,10 @@ mod tests {
     #[test]
     fn trailers_within_the_header_limit_are_parsed() {
         let mut parser = Parser::new(Kind::Request, 64, None, false);
-        parser.feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n");
-        parser.feed(b"1\r\nx\r\n0\r\nA: b\r\nC: d\r\n\r\n");
+        parser
+            .feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+        parser.feed(b"1\r\nx\r\n0\r\nA: b\r\nC: d\r\n\r\n").unwrap();
         let received = events(&mut parser);
         let Some(Event::Complete(trailers)) = received.last() else {
             panic!("the message completes");
@@ -1299,7 +1529,7 @@ mod tests {
         ];
         for (request, code, bytes_parsed) in cases {
             let mut parser = Parser::new(Kind::Request, 16384, None, false);
-            parser.feed(request);
+            parser.feed(request).unwrap();
             let error = drain(&mut parser).err().expect("a malformed request line");
             assert_eq!(
                 (error.code, error.reason, error.bytes_parsed),

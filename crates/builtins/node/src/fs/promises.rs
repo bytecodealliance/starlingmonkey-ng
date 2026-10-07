@@ -424,7 +424,7 @@ fn open(
     args: js::function::CallbackArgs<'_>,
     _payload: HandleValue,
 ) -> Result<js::native::Value, ExnThrown> {
-    let values = crate::callback_args(&args);
+    let values = args.rest(0);
     run_promise(scope, "open", &values, Some(as_file_handle))?.to_jsval_raw_throwing(scope)
 }
 

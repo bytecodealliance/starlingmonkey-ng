@@ -1,17 +1,17 @@
 // Every builtin module can be imported, and the ones not implemented throw when used.
 
 import { createRequire } from "node:module";
-import { spawn, ChildProcess } from "node:child_process";
-import childProcess from "child_process";
+import { connect, Http2ServerRequest } from "node:http2";
+import http2 from "http2";
 import { test } from "node:test";
 import { eq, throws } from "./harness.mjs";
 
-eq(typeof spawn, "function", "stub functions are functions");
-eq(childProcess.spawn, spawn, "the default export holds the named exports");
-throws(() => spawn("ls"), "ERR_METHOD_NOT_IMPLEMENTED", "stub functions throw");
-throws(() => new ChildProcess(), "ERR_METHOD_NOT_IMPLEMENTED", "stub classes throw");
-class Sub extends ChildProcess {}
-eq(Sub.prototype instanceof ChildProcess, true, "stub classes can be extended");
+eq(typeof connect, "function", "stub functions are functions");
+eq(http2.connect, connect, "the default export holds the named exports");
+throws(() => connect("http://localhost"), "ERR_METHOD_NOT_IMPLEMENTED", "stub functions throw");
+throws(() => new Http2ServerRequest(), "ERR_METHOD_NOT_IMPLEMENTED", "stub classes throw");
+class Sub extends Http2ServerRequest {}
+eq(Sub.prototype instanceof Http2ServerRequest, true, "stub classes can be extended");
 eq(typeof test, "function", "node:-only modules import");
 eq(typeof createRequire, "function", "module exports");
 const os = await import("node:os");
