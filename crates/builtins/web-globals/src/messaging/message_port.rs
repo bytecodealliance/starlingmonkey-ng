@@ -19,7 +19,7 @@ use js::heap::{RootedTraceableBox, Trace};
 use js::native::JSTracer;
 use js::prelude::HandleValue;
 use js::structured_clone::{CloneError, HostTransfer, Serialized};
-use js::{Callable, Object};
+use js::Object;
 
 use crate::dom_exception::throw_dom_exception;
 use crate::events::algorithms::{self as event_algorithms, ScriptStackState};
@@ -57,10 +57,6 @@ pub struct MessagePort {
     /// Whether `unref()` was called after the last `ref()`.
     #[no_trace]
     unreferenced: bool,
-    /// The `onmessage` event handler.
-    onmessage_handler: Option<Heap<js::function::Callable>>,
-    /// The `onmessageerror` event handler.
-    onmessageerror_handler: Option<Heap<js::function::Callable>>,
     /// The task that keeps the event loop alive while the port can receive messages. See
     /// [`super::set_node_ports`].
     #[no_trace]
@@ -175,8 +171,8 @@ impl MessagePort {
 
     /// <https://html.spec.whatwg.org/multipage/web-messaging.html#handler-messageport-onmessage>
     #[getter]
-    fn onmessage<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onmessage_handler.get(scope)
+    fn onmessage<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        crate::events::event_handler(scope, self, "message")
     }
 
     /// <https://html.spec.whatwg.org/multipage/web-messaging.html#handler-messageport-onmessage>
@@ -184,21 +180,21 @@ impl MessagePort {
     /// Setting it the first time enables the port message queue, as `start()` does.
     #[setter]
     fn set_onmessage(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
-        self.set_event_handler(scope, "message", value);
+        crate::events::set_event_handler(scope, self, "message", value);
         self.enable();
         self.update_keep_alive();
     }
 
     /// <https://html.spec.whatwg.org/multipage/web-messaging.html#handler-messageport-onmessageerror>
     #[getter]
-    fn onmessageerror<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onmessageerror_handler.get(scope)
+    fn onmessageerror<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        crate::events::event_handler(scope, self, "messageerror")
     }
 
     /// <https://html.spec.whatwg.org/multipage/web-messaging.html#handler-messageport-onmessageerror>
     #[setter]
     fn set_onmessageerror(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
-        self.set_event_handler(scope, "messageerror", value);
+        crate::events::set_event_handler(scope, self, "messageerror", value);
     }
 
     /// Node.js's `port.ref()`: let the port keep the event loop alive again. See
@@ -228,24 +224,6 @@ impl MessagePort {
     fn eq_object(&self, object: &Object<'_>) -> bool {
         // SAFETY: the pointers are only compared.
         unsafe { self.as_raw() == object.as_raw() }
-    }
-
-    /// Replace the event handler for `event_type` with `value` if it is callable, or remove it.
-    fn set_event_handler(&self, scope: &Scope<'_>, event_type: &str, value: HandleValue<'_>) {
-        let old = match event_type {
-            "message" => self.data().onmessage_handler.get(scope),
-            _ => self.data().onmessageerror_handler.get(scope),
-        };
-        let handler = crate::events::replace_event_handler(scope, self, event_type, old, value);
-        let mut data = self.data_mut();
-        let slot = match event_type {
-            "message" => &mut data.onmessage_handler,
-            _ => &mut data.onmessageerror_handler,
-        };
-        match handler {
-            Some(handler) => slot.set(handler),
-            None => *slot = None,
-        }
     }
 
     /// Enable the port message queue if it isn't enabled, which queues a task for each message

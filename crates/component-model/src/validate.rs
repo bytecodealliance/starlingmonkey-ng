@@ -748,36 +748,16 @@ fn copy_numeric_list(
     element: &TypeShape,
     path: &str,
 ) -> Result<Value, Mismatch> {
-    let bytes = view.copy_bytes();
-    let (size, _) = element
+    let (size, kind) = element
         .numeric_layout()
         .expect("only a numeric list is copied as a typed array");
-    // `push_numeric_list` reads the elements as a slice of their type, so they
-    // are copied into a buffer aligned for the widest one.
-    let mut aligned = vec![0u64; bytes.len().div_ceil(8)];
-    // SAFETY: `aligned` holds at least `bytes.len()` bytes, and the two buffers
-    // do not overlap.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            aligned.as_mut_ptr().cast::<u8>(),
-            bytes.len(),
-        )
-    };
-    let mut stack = CallStack::new();
-    // SAFETY: `aligned` holds `bytes.len() / size` elements of `element`'s type,
-    // at an alignment of 8.
-    unsafe {
-        value::push_numeric_list(
-            &mut stack,
-            scope,
-            element,
-            aligned.as_ptr().cast::<u8>(),
-            bytes.len() / size,
-        )
-    }
-    .map_err(|_| thrown(scope, path))?;
-    Ok(stack.pop_value())
+    let byte_length = view.byte_length();
+    let buffer = js::ArrayBuffer::new(scope, byte_length).map_err(|_| thrown(scope, path))?;
+    let copy = js::typedarray::construct_view(scope, kind, buffer, 0, byte_length / size)
+        .map_err(|_| thrown(scope, path))?;
+    let copy = js::ArrayBufferView::from_object(copy).expect("a typed array is a view");
+    copy.copy_region_from(0, view, 0, byte_length);
+    Ok(copy.as_value())
 }
 
 /// Run `f` with `segment` appended to `path`, and remove it again afterwards.

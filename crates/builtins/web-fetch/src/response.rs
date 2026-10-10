@@ -579,7 +579,7 @@ pub(crate) fn response_from_platform<'r>(
     // (Hiding the redirect target is a browser-security policy, gated by the request-restrictions
     // switch: without it, `redirect: "manual"` hands the caller the real redirect response —
     // status, `Location` header, body and all.)
-    if core_runtime::config::enforce_fetch_restrictions()
+    if core_runtime::config::web_security_restrictions()
         && redirect_mode == RequestRedirect::Manual
         && is_redirect_status(response.status)
     {

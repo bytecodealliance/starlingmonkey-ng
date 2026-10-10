@@ -745,8 +745,7 @@ fn array_buffer_transfer_moves_the_contents() {
     let moved = source.transfer(&scope).unwrap();
     assert!(source.is_detached());
     assert_eq!(moved.byte_length(), 4);
-    // SAFETY: nothing allocates while the slice is read.
-    assert_eq!(unsafe { moved.bytes() }, &[1, 2, 3, 4]);
+    assert_eq!(moved.with_bytes(<[u8]>::to_vec), [1, 2, 3, 4]);
 
     let empty = js::ArrayBuffer::new(&scope, 0).unwrap();
     let moved_empty = empty.transfer(&scope).unwrap();
@@ -1019,4 +1018,61 @@ fn property_writer_creates_template_properties_in_order() {
     properties.write(&scope, c"b", 2).unwrap();
     properties.finish(&scope).unwrap();
     assert_eq!(describe(object), "b,2,true,true,true|set a");
+}
+
+/// `own_keys`, `own_enumerable_keys` and `for_in_keys` return integer keys as strings, as
+/// `Reflect.ownKeys`, `Object.keys` and `for...in` do.
+#[test]
+fn key_lists_hold_integer_keys_as_strings() {
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+
+    let value = js::compile::evaluate(&scope, "({ 1: 'a', b: 'c', [Symbol('s')]: 'd' })").unwrap();
+    let object = Object::from_value(&scope, *value).unwrap();
+    let describe = |keys: Vec<js::prelude::HandleValue<'_>>| {
+        keys.iter()
+            .map(|key| {
+                if key.is_string() {
+                    String::from_jsval(&scope, *key, ()).unwrap()
+                } else {
+                    assert!(key.is_symbol(), "a key is a string or a symbol");
+                    "symbol".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    assert_eq!(describe(object.own_keys(&scope).unwrap()), "1,b,symbol");
+    assert_eq!(describe(object.own_enumerable_keys(&scope).unwrap()), "1,b");
+    assert_eq!(describe(object.for_in_keys(&scope).unwrap()), "1,b");
+}
+
+/// Calling a value that isn't callable from native code throws a `TypeError` naming the method or
+/// the value's source.
+#[test]
+fn native_calls_of_values_that_are_not_functions_name_them() {
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let message = |scope: &js::gc::scope::Scope<'_>| {
+        let error = js::exception::take_pending(scope).expect("a pending exception");
+        let error = Object::from_value(scope, error).expect("an error object");
+        let message = error.get_property(scope, c"message").unwrap();
+        String::from_jsval(scope, message, ()).unwrap()
+    };
+
+    let object = Object::new_plain(&scope).unwrap();
+    let result =
+        js::Function::call_by_name(&scope, object.handle(), c"nope", js::function::EmptyArgs);
+    assert!(result.is_err());
+    assert_eq!(message(&scope), "nope is not a function");
+
+    let five = scope.root_value(value::from_i32(5));
+    let result = js::Function::call(&scope, five, five, js::function::EmptyArgs);
+    assert!(result.is_err());
+    assert_eq!(message(&scope), "5 is not a function");
+
+    let undefined = scope.root_value(value::undefined());
+    let result = js::Function::call(&scope, undefined, undefined, js::function::EmptyArgs);
+    assert!(result.is_err());
+    assert_eq!(message(&scope), "undefined is not a function");
 }

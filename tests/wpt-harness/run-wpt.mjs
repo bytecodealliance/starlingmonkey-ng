@@ -875,7 +875,7 @@ function runScriptPath(testPath) {
 /// restricted runtime — and `--update-expectations` would then write those results into the
 /// `permissive_status` fields, corrupting them for the runs that do disable the restrictions.
 function restrictionFlags() {
-  return config.permissive ? ["--enforce-fetch-restrictions=false"] : [];
+  return config.permissive ? ["--web-security-restrictions=false"] : [];
 }
 
 // Build the command that runs `scriptFile` as a one-shot command: the runtime binary directly on

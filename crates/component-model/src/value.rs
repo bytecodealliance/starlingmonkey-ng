@@ -888,15 +888,15 @@ pub fn pop_numeric_list(
     // SAFETY: `layout` has a non-zero size, since `count > 0`.
     let dst = unsafe { std::alloc::alloc(layout) };
     if dst.is_null() {
-        std::alloc::handle_alloc_error(layout);
+        js::exception::report_out_of_memory(scope);
+        return Err(ExnThrown);
     }
-    // SAFETY: allocating cannot run JS or collect, so the view's backing store is
-    // still the one measured above. It holds exactly `layout.size()` bytes, `dst`
-    // is freshly allocated for that size, and the two regions do not overlap.
-    unsafe {
-        let src = view.bytes();
-        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, layout.size());
-    }
+    // SAFETY: `dst` is freshly allocated for `layout.size()` bytes, and nothing else
+    // references it.
+    let target = unsafe { std::slice::from_raw_parts_mut(dst, layout.size()) };
+    // Allocating cannot run JS or collect, so the view still holds exactly
+    // `layout.size()` bytes.
+    view.with_bytes(|src| target.copy_from_slice(src));
     Ok((dst, layout, count))
 }
 

@@ -250,18 +250,32 @@ impl<'s> Str<'s> {
         }
     }
 
-    /// Write this string as UTF-8 into `buffer`, with each lone surrogate as U+FFFD, up to the
-    /// last whole character that fits. Returns the number of bytes written.
-    pub fn write_utf8(&self, scope: &Scope<'_>, buffer: &mut [u8]) -> Result<usize, ExnThrown> {
-        // SAFETY: the conversion makes no call into SpiderMonkey.
+    /// Write this string as UTF-8 into the bytes `range` of `view`, with each lone surrogate as
+    /// U+FFFD, up to the last whole character that fits. Returns the number of bytes written.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` doesn't lie within `view`.
+    pub fn write_utf8(
+        &self,
+        scope: &Scope<'_>,
+        view: crate::ArrayBufferView<'_>,
+        range: std::ops::Range<usize>,
+    ) -> Result<usize, ExnThrown> {
+        // SAFETY: the closure makes no call into SpiderMonkey.
         unsafe {
-            self.with_chars(scope, |chars| match chars {
-                StrChars::Latin1(bytes) => {
-                    encoding_rs::mem::convert_latin1_to_utf8_partial(bytes, buffer).1
-                }
-                StrChars::TwoByte(units) => {
-                    encoding_rs::mem::convert_utf16_to_utf8_partial(units, buffer).1
-                }
+            self.with_chars(scope, |chars| {
+                view.with_bytes_mut(|bytes| {
+                    let buffer = &mut bytes[range];
+                    match chars {
+                        StrChars::Latin1(bytes) => {
+                            encoding_rs::mem::convert_latin1_to_utf8_partial(bytes, buffer).1
+                        }
+                        StrChars::TwoByte(units) => {
+                            encoding_rs::mem::convert_utf16_to_utf8_partial(units, buffer).1
+                        }
+                    }
+                })
             })
         }
     }

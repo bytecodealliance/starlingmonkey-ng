@@ -16,10 +16,17 @@ interface Entry {
   line: number;
   column: number | undefined;
   handler: Debugger.BreakpointHandler;
-  bound: { script: Debugger.Script; line: number; column: number } | undefined;
+  /** The position the breakpoint is set at, once it is set in a script. */
+  bound: { line: number; column: number } | undefined;
+  /** The URLs of the scripts the breakpoint is set in. */
+  urls: Set<string>;
 }
 
-/** Line breakpoints, keyed by client path. A breakpoint binds once a matching script loads. */
+/**
+ * Line breakpoints, keyed by client path. A breakpoint is set in every loaded script of its file,
+ * including the scripts each global compiles from that file, and in each one that loads later.
+ * Lines and columns are 1-based.
+ */
 export class Breakpoints {
   private nextId = 1;
   private readonly byPath = new Map<string, Entry[]>();
@@ -30,29 +37,39 @@ export class Breakpoints {
     private readonly onHit: (frame: Debugger.Frame, id: number) => void,
   ) {}
 
-  /** Replace the breakpoints in `clientPath`, binding each to loaded code where there is some. */
+  /** Replace the breakpoints in `clientPath`, setting each in the loaded code where there is some. */
   set(clientPath: string, requested: DebugProtocol.SourceBreakpoint[]): DebugProtocol.Breakpoint[] {
     for (const entry of this.byPath.get(clientPath) ?? []) {
       this.unbind(entry);
     }
+    if (requested.length === 0) {
+      this.byPath.delete(clientPath);
+      return [];
+    }
     const entries = requested.map((breakpoint) => this.create(breakpoint));
     this.byPath.set(clientPath, entries);
-    const urls = this.urlsFor(clientPath);
+    const scripts = this.urlsFor(clientPath).flatMap((url) => this.dbg.findScripts({ url }));
     for (const entry of entries) {
-      this.bind(entry, urls);
+      this.bind(entry, scripts);
     }
     return entries.map((entry) => describe(entry));
   }
 
-  /** Bind unbound breakpoints to the scripts of a newly loaded `url`. Returns those it bound. */
-  scriptLoaded(url: string): DebugProtocol.Breakpoint[] {
+  /**
+   * Set the breakpoints of the file `script` was compiled from in the scripts of that file in the
+   * global of `script`. Returns the breakpoints that were not set in any script before.
+   */
+  scriptLoaded(script: Debugger.Script): DebugProtocol.Breakpoint[] {
     const changed: DebugProtocol.Breakpoint[] = [];
+    let scripts: Debugger.Script[] | undefined;
     for (const [clientPath, entries] of this.byPath) {
-      if (!this.sources.matches(url, clientPath)) {
+      if (!this.sources.matches(script.url, clientPath)) {
         continue;
       }
+      scripts ??= this.dbg.findScripts({ url: script.url, global: script.global });
       for (const entry of entries) {
-        if (entry.bound === undefined && this.bind(entry, [url])) {
+        const wasBound = entry.bound !== undefined;
+        if (this.bind(entry, scripts) && !wasBound) {
           changed.push(describe(entry));
         }
       }
@@ -60,12 +77,19 @@ export class Breakpoints {
     return changed;
   }
 
-  /** The positions on lines `line` through `endLine` of `clientPath` a breakpoint can bind to. */
+  /** The positions on lines `line` through `endLine` of `clientPath` a breakpoint can be set at. */
   locations(clientPath: string, line: number, endLine = line): DebugProtocol.BreakpointLocation[] {
-    return this.candidates(this.urlsFor(clientPath), line, endLine).map(({ position }) => ({
-      line: position.lineNumber,
-      column: position.columnNumber,
-    }));
+    const scripts = this.urlsFor(clientPath).flatMap((url) => this.dbg.findScripts({ url }));
+    const seen = new Set<string>();
+    const locations: DebugProtocol.BreakpointLocation[] = [];
+    for (const { position } of this.candidates(scripts, line, endLine)) {
+      const key = `${position.lineNumber}:${position.columnNumber}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        locations.push({ line: position.lineNumber, column: position.columnNumber });
+      }
+    }
+    return locations;
   }
 
   clear(): void {
@@ -90,6 +114,7 @@ export class Breakpoints {
         },
       },
       bound: undefined,
+      urls: new Set(),
     };
   }
 
@@ -98,41 +123,51 @@ export class Breakpoints {
   }
 
   /**
-   * Set the breakpoint at the first position on the first line at or after its line that has
-   * code, preferring its requested column on that line.
+   * Set the breakpoint in `scripts` at the first position on the first line at or after its line
+   * that has code, preferring its requested column on that line. Each script gets the breakpoint
+   * at most once. Returns whether any script has code there.
    */
-  private bind(entry: Entry, urls: string[]): boolean {
-    const candidates = this.candidates(urls, entry.line, entry.line + MAX_LINE_SLIDE);
+  private bind(entry: Entry, scripts: Debugger.Script[]): boolean {
+    const candidates = this.candidates(scripts, entry.line, entry.line + MAX_LINE_SLIDE);
     if (candidates.length === 0) {
       return false;
     }
     const line = candidates[0].position.lineNumber;
     const onLine = candidates.filter((candidate) => candidate.position.lineNumber === line);
-    const chosen =
-      onLine.find((candidate) => candidate.position.columnNumber === entry.column) ?? onLine[0];
-    chosen.script.setBreakpoint(chosen.position.offset, entry.handler);
-    entry.bound = {
-      script: chosen.script,
-      line: chosen.position.lineNumber,
-      column: chosen.position.columnNumber,
-    };
+    const column = (
+      onLine.find((candidate) => candidate.position.columnNumber === entry.column) ?? onLine[0]
+    ).position.columnNumber;
+    for (const { script, position } of onLine) {
+      if (
+        position.columnNumber === column &&
+        !script.getBreakpoints(position.offset).includes(entry.handler)
+      ) {
+        script.setBreakpoint(position.offset, entry.handler);
+        entry.urls.add(script.url);
+      }
+    }
+    entry.bound ??= { line, column };
     return true;
   }
 
+  /** Remove the breakpoint from every script it is set in, which are found by URL. */
   private unbind(entry: Entry): void {
-    entry.bound?.script.clearBreakpoint(entry.handler);
+    for (const url of entry.urls) {
+      for (const script of this.dbg.findScripts({ url })) {
+        script.clearBreakpoint(entry.handler);
+      }
+    }
+    entry.urls.clear();
     entry.bound = undefined;
   }
 
-  /** Breakpoint positions on lines `minLine` through `maxLine`, in source order. */
-  private candidates(urls: string[], minLine: number, maxLine: number): Candidate[] {
+  /** Breakpoint positions on lines `minLine` through `maxLine` of `scripts`, in source order. */
+  private candidates(scripts: Debugger.Script[], minLine: number, maxLine: number): Candidate[] {
     const found: Candidate[] = [];
-    for (const url of urls) {
-      for (const script of this.dbg.findScripts({ url })) {
-        // `maxLine` is exclusive.
-        for (const position of script.getPossibleBreakpoints({ minLine, maxLine: maxLine + 1 })) {
-          found.push({ script, position });
-        }
+    for (const script of scripts) {
+      // `maxLine` is exclusive.
+      for (const position of script.getPossibleBreakpoints({ minLine, maxLine: maxLine + 1 })) {
+        found.push({ script, position });
       }
     }
     return found.sort(

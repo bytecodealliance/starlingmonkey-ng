@@ -69,6 +69,23 @@ fn elapsed_ms(origin: &TimeOriginSnapshot) -> f64 {
     platform::clock::monotonic_ns().saturating_sub(origin.monotonic_ns) as f64 / 1_000_000.
 }
 
+/// The resolution, in nanoseconds, that [`relative_ms`] coarsens timestamps to: 100
+/// microseconds, the resolution of <https://w3c.github.io/hr-time/#dfn-coarsen-time> without
+/// cross-origin isolated capability.
+const COARSENED_RESOLUTION_NS: i128 = 100_000;
+
+/// The timestamp `ns` nanoseconds after the time origin, in milliseconds. While the web security
+/// restrictions apply (see [`core_runtime::config::web_security_restrictions`]), it is coarsened
+/// to [`COARSENED_RESOLUTION_NS`], rounding down.
+fn relative_ms(ns: i128) -> f64 {
+    let ns = if core_runtime::config::web_security_restrictions() {
+        ns.div_euclid(COARSENED_RESOLUTION_NS) * COARSENED_RESOLUTION_NS
+    } else {
+        ns
+    };
+    ns as f64 / 1_000_000.
+}
+
 fn init_time_origin() {
     let _ = time_origin();
 }
@@ -116,15 +133,20 @@ pub struct Performance {
     observer_task_queued: Weak<()>,
 }
 
+/// <https://w3c.github.io/hr-time/#dfn-current-high-resolution-time>: the milliseconds since the
+/// time origin, coarsened as [`relative_ms`] describes.
 pub fn now() -> f64 {
-    elapsed_ms(&time_origin())
+    let origin = time_origin().monotonic_ns;
+    relative_ms(i128::from(
+        platform::clock::monotonic_ns().saturating_sub(origin),
+    ))
 }
 
 /// The milliseconds from the time origin to the [`platform::clock::monotonic_ns`] reading
-/// `monotonic_ns`, negative for a reading before it.
+/// `monotonic_ns`, negative for a reading before it, coarsened as [`relative_ms`] describes.
 pub fn ms_since_origin(monotonic_ns: u64) -> f64 {
     let origin = time_origin().monotonic_ns;
-    (monotonic_ns as f64 - origin as f64) / 1_000_000.
+    relative_ms(i128::from(monotonic_ns) - i128::from(origin))
 }
 
 /// The time origin as an ECMA-262 timestamp, `performance.timeOrigin`.
@@ -434,8 +456,10 @@ enum StartOrMeasureOptions<'a> {
 /// [`now`] from [`platform::clock::coarse_monotonic_ns`], for timestamps that don't need the
 /// precise clock, such as `Event.timeStamp`.
 pub fn coarse_now() -> f64 {
-    let origin = time_origin();
-    platform::clock::coarse_monotonic_ns().saturating_sub(origin.monotonic_ns) as f64 / 1_000_000.
+    let origin = time_origin().monotonic_ns;
+    relative_ms(i128::from(
+        platform::clock::coarse_monotonic_ns().saturating_sub(origin),
+    ))
 }
 
 #[webidl_methods]
@@ -842,6 +866,28 @@ mod tests {
             eval("Object.prototype.toString.call(performance)"),
             "[object Performance]"
         );
+    }
+
+    /// While the web security restrictions apply, `performance.now()` and the start times of marks
+    /// are multiples of 100 microseconds.
+    #[test]
+    fn timestamps_are_coarsened_under_web_security_restrictions() {
+        let result = eval_with_setup(
+            || {
+                runtime::register_global_initializer(|scope, global| {
+                    core_runtime::config::set_web_security_restrictions(true);
+                    super::add_to_global(scope, global);
+                });
+            },
+            "(() => {
+                const times = [];
+                for (let i = 0; i < 1000; i++) {
+                    times.push(performance.now(), performance.mark('m').startTime);
+                }
+                return times.every((t) => Math.abs(t * 10 - Math.round(t * 10)) < 1e-6);
+            })()",
+        );
+        assert_eq!(result, "true");
     }
 
     #[test]

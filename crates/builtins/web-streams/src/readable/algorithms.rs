@@ -4321,17 +4321,7 @@ fn copy_data_block_bytes(
     src_start: usize,
     count: usize,
 ) {
-    if count == 0 {
-        return;
-    }
-    // SAFETY: `dest` and `src` are distinct live, non-detached `ArrayBuffer`s
-    // (the descriptor's buffer and a queue entry's buffer); no GC runs during
-    // the memcpy, and the ranges are bounds-checked by the slice indexing.
-    unsafe {
-        let d = dest.bytes_mut();
-        let s = src.bytes();
-        d[dest_start..dest_start + count].copy_from_slice(&s[src_start..src_start + count]);
-    }
+    dest.copy_region_from(dest_start, src, src_start, count);
 }
 
 /// The descriptor's `buffer` slot as a rooted `ArrayBuffer`.

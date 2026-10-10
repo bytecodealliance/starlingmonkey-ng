@@ -374,16 +374,26 @@ fn pump_chunk_step(
     match Uint8Array::from_jsval(scope, chunk, ()) {
         // The spec's "a copy of chunk": the chunk's bytes are copied once, into the batch.
         Ok(array) => {
-            // SAFETY: the view's bytes are only read by the copy, which cannot run JS or trigger a
-            // GC.
-            let bytes = unsafe { array.as_array_buffer_view().bytes() };
-            // Appending to a batch reserves room up to the limit, so the batch is copied once
-            // rather than through every doubling of its capacity.
-            if !data.batch.is_empty() && data.batch.capacity() - data.batch.len() < bytes.len() {
-                let wanted = BATCH_LIMIT.max(data.batch.len() + bytes.len()) - data.batch.len();
-                data.batch.reserve_exact(wanted);
+            let batch = &mut data.batch;
+            let appended = array.with_slice(|bytes| {
+                // Appending to a batch reserves room up to the limit, so the batch is copied once
+                // rather than through every doubling of its capacity.
+                if batch.capacity() - batch.len() < bytes.len() {
+                    let wanted = if batch.is_empty() {
+                        bytes.len()
+                    } else {
+                        BATCH_LIMIT.max(batch.len() + bytes.len()) - batch.len()
+                    };
+                    batch.try_reserve_exact(wanted)?;
+                }
+                batch.extend_from_slice(bytes);
+                Ok::<(), std::collections::TryReserveError>(())
+            });
+            if appended.is_err() {
+                data.end = Some(StreamEnd::Errored(
+                    "The body chunk could not be allocated".to_string(),
+                ));
             }
-            data.batch.extend_from_slice(bytes);
         }
         Err(_) => {
             data.end = Some(StreamEnd::Errored(

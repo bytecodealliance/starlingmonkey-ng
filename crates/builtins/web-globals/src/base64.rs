@@ -8,23 +8,30 @@
 //!
 //! [Forgiving Base64]: https://infra.spec.whatwg.org/#forgiving-base64
 
+use js::error::{ExnThrown, ThrowException};
+use js::gc::scope::Scope;
+
+use crate::dom_exception::DOMExceptionError;
+
 #[core_runtime::jsglobals]
 pub mod base64_globals {
+    use super::BtoaError;
     use crate::dom_exception::DOMExceptionError;
 
     /// WHATWG `btoa(data)`: encode a byte string to base64.
     ///
     /// Coerces the argument to a string via `ToString`, then base64-encodes it.
     /// Throws `DOMException` with name `"InvalidCharacterError"` if the string
-    /// contains any code point above U+00FF.
-    pub fn btoa(data: String) -> Result<String, DOMExceptionError> {
+    /// contains any code point above U+00FF, and reports out of memory if the
+    /// encoded string can't be allocated.
+    pub fn btoa(data: String) -> Result<String, BtoaError> {
         // <https://html.spec.whatwg.org/#dom-btoa>: The `btoa(data)` method must throw an
         // "``InvalidCharacterError``" ``DOMException`` if _data_ contains any character whose code
         // point is greater than U+00FF. Otherwise, the user agent must convert _data_ to a byte
         // sequence whose _n_th byte is the eight-bit representation of the _n_th code point of
         // _data_, and then must apply `forgiving-base64 encode` to that byte sequence and return
         // the result.
-        super::btoa(&data).map_err(|msg| DOMExceptionError::new("InvalidCharacterError", msg))
+        super::btoa(&data)
     }
 
     /// WHATWG `atob(data)`: forgiving-base64 decode.
@@ -78,12 +85,14 @@ pub fn btoa_function<'s>(scope: &'s js::gc::scope::Scope<'_>) -> Option<js::Obje
 // ---------------------------------------------------------------------------
 
 /// `bytes` as base64: in the standard alphabet with `=` padding, or with `url`, in the URL-safe
-/// alphabet without padding.
-pub fn encode(bytes: &[u8], url: bool) -> String {
+/// alphabet without padding. `None` if allocating the text fails.
+pub fn encode(bytes: &[u8], url: bool) -> Option<String> {
     const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let alphabet = if url { URL } else { STANDARD };
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut out = String::new();
+    out.try_reserve_exact(bytes.len().div_ceil(3).checked_mul(4)?)
+        .ok()?;
     for chunk in bytes.chunks(3) {
         let n = (u32::from(chunk[0]) << 16)
             | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
@@ -97,32 +106,60 @@ pub fn encode(bytes: &[u8], url: bool) -> String {
             }
         }
     }
-    out
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
 // btoa implementation
 // ---------------------------------------------------------------------------
 
+/// Why [`btoa`] failed.
+#[derive(Debug, PartialEq)]
+pub enum BtoaError {
+    /// The input contains a code point above U+00FF.
+    InvalidCharacter,
+    /// Allocating the bytes or the encoded text failed.
+    OutOfMemory,
+}
+
+impl ThrowException for BtoaError {
+    fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+        match self {
+            BtoaError::InvalidCharacter => DOMExceptionError::new(
+                "InvalidCharacterError",
+                "The string to be encoded contains characters outside of the Latin1 range.",
+            )
+            .throw(scope),
+            BtoaError::OutOfMemory => {
+                js::exception::report_out_of_memory(scope);
+                ExnThrown
+            }
+        }
+    }
+}
+
 /// WHATWG `btoa`: encode a byte string to base64.
 ///
 /// The input string must contain only code points in the range U+0000..U+00FF
 /// (i.e., it must be a "byte string"). If any code point exceeds U+00FF, an
 /// `InvalidCharacterError` is thrown.
-pub(crate) fn btoa(data: &str) -> Result<String, String> {
+pub(crate) fn btoa(data: &str) -> Result<String, BtoaError> {
     // Validate that all characters are ≤ U+00FF (Latin-1 range).
+    let mut length = 0;
     for ch in data.chars() {
         if ch as u32 > 0x00FF {
-            return Err(
-                "The string to be encoded contains characters outside of the Latin1 range."
-                    .to_string(),
-            );
+            return Err(BtoaError::InvalidCharacter);
         }
+        length += 1;
     }
 
     // Collect the Latin-1 byte values.
-    let bytes: Vec<u8> = data.chars().map(|ch| ch as u8).collect();
-    Ok(encode(&bytes, false))
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| BtoaError::OutOfMemory)?;
+    bytes.extend(data.chars().map(|ch| ch as u8));
+    encode(&bytes, false).ok_or(BtoaError::OutOfMemory)
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +194,7 @@ pub fn forgiving_base64_decode(data: &str) -> Result<Vec<u8>, String> {
 // Nothing platform-specific in these tests, so skip them on wasm32.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use crate::base64::{atob, btoa};
+    use crate::base64::{atob, btoa, BtoaError};
 
     // -- btoa tests --
 
@@ -198,9 +235,7 @@ mod tests {
 
     #[test]
     fn btoa_rejects_non_latin1() {
-        let result = btoa("עברית");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("outside of the Latin1 range"));
+        assert_eq!(btoa("עברית"), Err(BtoaError::InvalidCharacter));
     }
 
     #[test]

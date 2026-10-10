@@ -124,6 +124,58 @@ fn onabort_set_null_removes_handler() {
     );
 }
 
+/// `onabort` keeps any object, callable or not, and is null for any other value. A handler that
+/// isn't callable does nothing when the event is dispatched.
+#[test]
+fn onabort_keeps_objects_and_nulls_other_values() {
+    assert_eq!(
+        eval(
+            r#"
+            var ac = new AbortController();
+            var object = {};
+            var results = [];
+            ac.signal.onabort = object;
+            results.push(ac.signal.onabort === object);
+            ac.signal.onabort = 5;
+            results.push(ac.signal.onabort);
+            ac.signal.onabort = object;
+            var called = false;
+            ac.signal.addEventListener("abort", function() { called = true; });
+            ac.abort();
+            results.push(called);
+            results.join()
+            "#
+        ),
+        "true,,true"
+    );
+}
+
+/// Replacing `onabort` keeps its listener's place among the event listeners, and the handler's
+/// listener is separate from a listener of the same function added with `addEventListener`.
+#[test]
+fn onabort_listener_keeps_its_place_and_identity() {
+    assert_eq!(
+        eval(
+            r#"
+            var ac = new AbortController();
+            var order = [];
+            var shared = function() { order.push("shared"); };
+            ac.signal.onabort = function() { order.push("a"); };
+            ac.signal.addEventListener("abort", function() { order.push("b"); });
+            ac.signal.onabort = function() { order.push("c"); };
+            ac.signal.addEventListener("abort", shared);
+            ac.signal.removeEventListener("abort", shared);
+            ac.signal.addEventListener("abort", shared);
+            ac.signal.onabort = shared;
+            ac.signal.removeEventListener("abort", shared);
+            ac.abort();
+            order.join()
+            "#
+        ),
+        "shared,b"
+    );
+}
+
 // ── Abort algorithms
 
 #[test]

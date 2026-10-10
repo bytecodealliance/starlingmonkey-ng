@@ -150,13 +150,13 @@ impl TextDecoderStream {
             .expect("set by the constructor")
     }
 
-    /// Decode `bytes` with the stream's decoder, `last` at the end of the input, and enqueue the
-    /// output in the stream's transform if it isn't empty. Throws a `TypeError` for malformed
-    /// input in the "fatal" error mode.
+    /// Decode the bytes of `input`, or no bytes if it is `None`, with the stream's decoder, `last`
+    /// at the end of the input, and enqueue the output in the stream's transform if it isn't
+    /// empty. Throws a `TypeError` for malformed input in the "fatal" error mode.
     fn decode_and_enqueue(
         &self,
         scope: &Scope<'_>,
-        bytes: &[u8],
+        input: Option<AllowSharedBufferSource<'_>>,
         last: bool,
     ) -> Result<(), ExnThrown> {
         let (output, encoding) = {
@@ -164,7 +164,14 @@ impl TextDecoderStream {
             let fatal = data.fatal;
             let encoding = data.encoding.expect("set by the constructor");
             let decoder = data.decoder.as_mut().expect("set by the constructor");
-            (decode_to_utf16(decoder, bytes, last, fatal), encoding)
+            let mut decode = |bytes: &[u8]| decode_to_utf16(decoder, bytes, last, fatal);
+            let output = match input {
+                Some(AllowSharedBufferSource::View(view)) => view.with_bytes(decode),
+                Some(AllowSharedBufferSource::Buffer(buffer)) => buffer.with_bytes(decode),
+                Some(AllowSharedBufferSource::Shared(buffer)) => buffer.with_bytes(decode),
+                None => decode(&[]),
+            };
+            (output, encoding)
         };
         let site = BindingSite {
             interface: <TextDecoderStreamImpl as js::class::ClassDef>::NAME,
@@ -199,14 +206,6 @@ impl TextDecoderStream {
         // Step 2: `Push` a `copy of` _bufferSource_ to _decoder_'s `I/O queue`.
         // We decode from _bufferSource_'s bytes before anything can run JavaScript, and nothing
         // retains them.
-        // SAFETY: the slices are borrowed only while the decoder runs, which can't run a GC.
-        let bytes: &[u8] = unsafe {
-            match buffer_source {
-                AllowSharedBufferSource::View(view) => view.bytes(),
-                AllowSharedBufferSource::Buffer(buffer) => buffer.bytes(),
-                AllowSharedBufferSource::Shared(buffer) => buffer.bytes(),
-            }
-        };
         // Step 3: Let _output_ be the `I/O queue` of scalar values « `end-of-queue` ».
         // Step 4: While true:
         // Step 4.1: Let _item_ be the result of `reading` from _decoder_'s `I/O queue`.
@@ -221,7 +220,7 @@ impl TextDecoderStream {
         // Step 4.4: If _result_ is `error`, then `throw` a ``TypeError``.
         // One `encoding_rs` call processes every item. The decoder's BOM removal performs
         // `serialize I/O queue`'s BOM handling.
-        self.decode_and_enqueue(scope, bytes, false)
+        self.decode_and_enqueue(scope, Some(buffer_source), false)
     }
 
     /// <https://encoding.spec.whatwg.org/#flush-and-enqueue>
@@ -239,7 +238,7 @@ impl TextDecoderStream {
         // Step 2.3.3: Return.
         // Step 2.4: Otherwise, if _result_ is `error`, `throw` a ``TypeError``.
         // One `encoding_rs` call with `last` set processes `end-of-queue`.
-        self.decode_and_enqueue(scope, &[], true)
+        self.decode_and_enqueue(scope, None, true)
     }
 }
 

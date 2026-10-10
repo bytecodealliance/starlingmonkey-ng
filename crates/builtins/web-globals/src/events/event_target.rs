@@ -43,6 +43,11 @@ pub(crate) struct EventListener {
     pub(crate) passive: Option<bool>,
     #[no_trace]
     pub(crate) once: bool,
+    /// Whether this is the listener of an event handler, whose `callback` is the handler's value.
+    /// Such a listener is never `once`, `capture` or `passive`, and `addEventListener` and
+    /// `removeEventListener` neither match nor remove it.
+    #[no_trace]
+    pub(crate) handler: bool,
 }
 
 /// Convert the `EventListener?` argument `callback` of the method `member`: `None` for `null` and

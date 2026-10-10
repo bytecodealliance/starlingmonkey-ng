@@ -112,6 +112,22 @@ fn native_serve_isolated_globals_are_debuggees() {
 }
 
 #[test]
+fn native_serve_isolated_breakpoints_stop_in_every_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_script(dir.path(), "main.js", HANDLER);
+    let (mut dap, port, _stderr) = attach_to_server(&script, &["--serve-isolated"], &[2]);
+    stop_in_handler_and_continue(&mut dap, port);
+    stop_in_handler_and_continue(&mut dap, port);
+    dap.set_breakpoints(&script, &[3]);
+    let response = get(port);
+    assert_eq!(dap.event("stopped")["reason"], "breakpoint");
+    assert_eq!(dap.top_frame_line(), 3);
+    dap.request("continue", json!({ "threadId": 1 }));
+    assert_eq!(response.join().unwrap(), "42");
+    terminate(dap);
+}
+
+#[test]
 fn native_serve_debugs_over_stdio() {
     let dir = tempfile::tempdir().unwrap();
     let script = write_script(dir.path(), "main.js", HANDLER);

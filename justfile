@@ -113,10 +113,10 @@ fmt-check *ARGS:
     cargo fmt --check {{ARGS}}
     {{_componentize}} fmt --check
 
-# Run clippy lints. ARGS go to the runtime workspace's `cargo clippy`.
+# Run clippy lints, failing on any warning. ARGS go to the runtime workspace's `cargo clippy`.
 clippy *ARGS:
-    cargo clippy --features debugmozjs --all-targets {{ARGS}}
-    {{_componentize}} clippy --all-targets
+    cargo clippy --features debugmozjs --all-targets {{ARGS}} -- -D warnings
+    {{_componentize}} clippy --all-targets -- -D warnings
 
 # Run GC zeal stress tests.
 # Defaults to quick tests on the `js` and `core-runtime` packages.

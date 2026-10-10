@@ -23,12 +23,28 @@
 //! let buf = ArrayBuffer::new(&scope, 1024)?;
 //! ```
 //!
-//! # Safety
+//! # Byte access
 //!
-//! Methods that hand out raw slices into a buffer's backing store
-//! (`data`, `data_mut`) are `unsafe`: callers must ensure that no GC runs
-//! and the buffer is not detached or transferred while the slice is live.
-//! Use [`copy_bytes`](Stack::copy_bytes) when you want an owned copy.
+//! A buffer's bytes are borrowed only for the duration of a closure: `with_bytes`,
+//! `with_bytes_mut` and `with_bytes_pair` on the handles, `with_slice` and `with_slice_mut` on
+//! typed arrays, and [`with_buffer_source_bytes`] for any `BufferSource`. The closure must be
+//! `Send`. A `Scope`, a rooted handle, a `Heap` and a borrow of a class's private data are not
+//! `Send`, so the closure can't capture them, and no GC, JS call or detach can happen while it
+//! runs. The slice can't outlive the closure. Closures that need a fallible copy use
+//! [`try_copy`]. `copy_bytes` returns an owned copy and reports out of memory if allocating it
+//! fails.
+//!
+//! Views of a `SharedArrayBuffer` and the buffer itself are accessed the same way. That is sound
+//! because the runtime runs JavaScript on a single thread and gives no other thread access to a
+//! `SharedArrayBuffer`'s memory, so nothing writes to the memory while a closure runs.
+//!
+//! A closure that uses the scope doesn't compile:
+//!
+//! ```compile_fail
+//! fn latin1<'s>(scope: &'s js::gc::scope::Scope<'_>, view: js::ArrayBufferView<'_>) {
+//!     view.with_bytes(|bytes| js::JSString::from_latin1(scope, bytes).is_ok());
+//! }
+//! ```
 //!
 //! The underlying SpiderMonkey element-type tags
 //! (`mozjs::typedarray::{Uint8, Int32, …}`) and the generic
@@ -233,41 +249,56 @@ impl<'s> Stack<'s, ArrayBuffer> {
         unsafe { JS::IsDetachedArrayBufferObject(self.as_raw()) }
     }
 
-    /// Borrow the buffer's backing bytes.
-    ///
-    /// # Safety
-    ///
-    /// No GC may run and the buffer must not be detached or transferred
-    /// while the returned slice is live.
-    pub unsafe fn bytes(self) -> &'s [u8] {
-        let (ptr, len) = array_buffer_length_and_data(self.as_raw());
-        if ptr.is_null() || len == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(ptr, len)
-        }
+    /// Call `f` with the buffer's bytes, which are empty for a detached buffer. See the
+    /// [module docs](self#byte-access).
+    pub fn with_bytes<R>(self, f: impl FnOnce(&[u8]) -> R + Send) -> R {
+        // SAFETY: `self` is a live `ArrayBuffer`, and `f` can't run a GC or detach it.
+        f(unsafe { slice_from_parts(array_buffer_length_and_data(self.as_raw())) })
     }
 
-    /// Mutably borrow the buffer's backing bytes.
-    ///
-    /// # Safety
-    ///
-    /// No GC may run and the buffer must not be detached or transferred
-    /// while the returned slice is live. Concurrent access via another
-    /// reference is undefined behaviour.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn bytes_mut(self) -> &'s mut [u8] {
-        let (ptr, len) = array_buffer_length_and_data(self.as_raw());
-        if ptr.is_null() || len == 0 {
-            &mut []
-        } else {
-            std::slice::from_raw_parts_mut(ptr, len)
-        }
+    /// Call `f` with the buffer's bytes, mutably. See [`Self::with_bytes`].
+    pub fn with_bytes_mut<R>(self, f: impl FnOnce(&mut [u8]) -> R + Send) -> R {
+        // SAFETY: as in `with_bytes`. No other reference to the bytes exists while `f` runs.
+        f(unsafe { slice_from_parts_mut(array_buffer_length_and_data(self.as_raw())) })
     }
 
-    /// Copy the buffer's contents into an owned `Vec`.
-    pub fn copy_bytes(self) -> Vec<u8> {
-        unsafe { self.bytes() }.to_vec()
+    /// A copy of the buffer's bytes. Failing to allocate it reports out of memory.
+    pub fn copy_bytes(self, scope: &Scope<'_>) -> Result<Vec<u8>, ExnThrown> {
+        copy_or_report(scope, self.with_bytes(try_copy))
+    }
+
+    /// Copy `count` bytes from `src` at `src_start` into this buffer at `dest_start`. The buffers
+    /// can be the same buffer, and the ranges can overlap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either range doesn't lie within its buffer.
+    pub fn copy_region_from(
+        self,
+        dest_start: usize,
+        src: Stack<'_, ArrayBuffer>,
+        src_start: usize,
+        count: usize,
+    ) {
+        // SAFETY: both are live `ArrayBuffer`s, and nothing runs between reading the pointers and
+        // copying.
+        let ((dest, dest_len), (from, src_len)) = unsafe {
+            (
+                array_buffer_length_and_data(self.as_raw()),
+                array_buffer_length_and_data(src.as_raw()),
+            )
+        };
+        assert!(dest_start
+            .checked_add(count)
+            .is_some_and(|end| end <= dest_len));
+        assert!(src_start
+            .checked_add(count)
+            .is_some_and(|end| end <= src_len));
+        if count != 0 {
+            // SAFETY: both ranges lie within their buffers, which are non-empty, so neither
+            // pointer is null. `ptr::copy` allows the ranges to overlap.
+            unsafe { std::ptr::copy(from.add(src_start), dest.add(dest_start), count) };
+        }
     }
 
     /// Transfer this buffer's contents into a new `ArrayBuffer`, detaching the
@@ -314,16 +345,7 @@ impl<'s> Stack<'s, ArrayBuffer> {
         length: usize,
     ) -> Result<Self, ExnThrown> {
         let out = Self::new(scope, length)?;
-        if length != 0 {
-            // SAFETY: both buffers are live and non-detached, the source region
-            // is within bounds (caller-validated), and no GC runs between the
-            // two borrows because no allocation happens here.
-            unsafe {
-                let src = self.bytes();
-                let dst = out.bytes_mut();
-                dst.copy_from_slice(&src[byte_offset..byte_offset + length]);
-            }
-        }
+        out.copy_region_from(0, self, byte_offset, length);
         Ok(out)
     }
 }
@@ -355,26 +377,48 @@ impl<'s> Stack<'s, SharedArrayBuffer> {
         root_or_throw(scope, obj)
     }
 
-    /// Borrow the buffer's backing bytes.
-    ///
-    /// # Safety
-    ///
-    /// No GC may run while the returned slice is live. Other threads sharing the buffer can
-    /// write to it concurrently.
-    pub unsafe fn bytes(self) -> &'s [u8] {
-        let mut len = 0;
-        let mut is_shared = false;
-        let mut ptr = std::ptr::null_mut();
-        JS::GetSharedArrayBufferLengthAndData(self.as_raw(), &mut len, &mut is_shared, &mut ptr);
-        if ptr.is_null() || len == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(ptr, len)
-        }
+    /// Call `f` with the buffer's bytes. See the [module docs](self#byte-access).
+    pub fn with_bytes<R>(self, f: impl FnOnce(&[u8]) -> R + Send) -> R {
+        // SAFETY: `self` is a live `SharedArrayBuffer`, and `f` can't run a GC.
+        f(unsafe { slice_from_parts(shared_array_buffer_length_and_data(self.as_raw())) })
+    }
+
+    /// A copy of the buffer's bytes. Failing to allocate it reports out of memory.
+    pub fn copy_bytes(self, scope: &Scope<'_>) -> Result<Vec<u8>, ExnThrown> {
+        copy_or_report(scope, self.with_bytes(try_copy))
     }
 }
 
 crate::gc::handle::deref_to_object!(SharedArrayBuffer);
+
+/// A buffer that typed arrays can view: an `ArrayBuffer` or a `SharedArrayBuffer`.
+pub trait ViewableBuffer<'b>: Copy {
+    /// The buffer object.
+    fn buffer_handle(self) -> mozjs::gc::Handle<'b, *mut JSObject>;
+    /// The buffer's length in bytes.
+    fn byte_length(self) -> usize;
+}
+
+impl<'b> ViewableBuffer<'b> for Stack<'b, ArrayBuffer> {
+    fn buffer_handle(self) -> mozjs::gc::Handle<'b, *mut JSObject> {
+        self.handle()
+    }
+
+    fn byte_length(self) -> usize {
+        Stack::<ArrayBuffer>::byte_length(self)
+    }
+}
+
+impl<'b> ViewableBuffer<'b> for Stack<'b, SharedArrayBuffer> {
+    fn buffer_handle(self) -> mozjs::gc::Handle<'b, *mut JSObject> {
+        self.handle()
+    }
+
+    fn byte_length(self) -> usize {
+        // SAFETY: `self` is a live `SharedArrayBuffer`.
+        unsafe { shared_array_buffer_length_and_data(self.as_raw()) }.1
+    }
+}
 
 crate::gc::handle::from_jsval_via_cast!(SharedArrayBuffer, c"Value isn't a SharedArrayBuffer");
 
@@ -563,53 +607,86 @@ impl<'s> Stack<'s, ArrayBufferView> {
         self.byte_length() / self.view_kind().element_size()
     }
 
-    /// Borrow the view's bytes.
-    ///
-    /// # Safety
-    ///
-    /// No GC may run and the buffer must not be detached while the
-    /// returned slice is live.
-    pub unsafe fn bytes(self) -> &'s [u8] {
-        let length = self.byte_length();
-        if length == 0 {
-            return &[];
-        }
-        let mut is_shared = false;
-        let nogc = JS::AutoRequireNoGC { _address: 0 };
-        let data = mozjs::jsapi::JS_GetArrayBufferViewData(self.as_raw(), &mut is_shared, &nogc);
-        if data.is_null() {
-            &[]
-        } else {
-            std::slice::from_raw_parts(data as *const u8, length)
+    /// Call `f` with the view's bytes, which are empty for a view of a detached buffer. See the
+    /// [module docs](self#byte-access).
+    pub fn with_bytes<R>(self, f: impl FnOnce(&[u8]) -> R + Send) -> R {
+        // SAFETY: `self` is a live view, and `f` can't run a GC or detach its buffer.
+        f(unsafe { slice_from_parts((self.data_ptr(), self.byte_length())) })
+    }
+
+    /// Call `f` with the view's bytes, mutably. See [`Self::with_bytes`].
+    pub fn with_bytes_mut<R>(self, f: impl FnOnce(&mut [u8]) -> R + Send) -> R {
+        // SAFETY: as in `with_bytes`. No other reference to the bytes exists while `f` runs.
+        f(unsafe { slice_from_parts_mut((self.data_ptr(), self.byte_length())) })
+    }
+
+    /// Call `f` with the bytes of this view and of `other`. See [`Self::with_bytes`].
+    pub fn with_bytes_pair<R>(
+        self,
+        other: Stack<'_, ArrayBufferView>,
+        f: impl FnOnce(&[u8], &[u8]) -> R + Send,
+    ) -> R {
+        // SAFETY: as in `with_bytes`. Both slices are shared, so they can overlap.
+        unsafe {
+            f(
+                slice_from_parts((self.data_ptr(), self.byte_length())),
+                slice_from_parts((other.data_ptr(), other.byte_length())),
+            )
         }
     }
 
-    /// Mutably borrow the view's bytes.
+    /// A copy of the view's bytes. Failing to allocate it reports out of memory.
+    pub fn copy_bytes(self, scope: &Scope<'_>) -> Result<Vec<u8>, ExnThrown> {
+        copy_or_report(scope, self.with_bytes(try_copy))
+    }
+
+    /// Copy `count` bytes from `src` at `src_start` into this view at `dest_start`. The views can
+    /// share a buffer, and the ranges can overlap.
     ///
-    /// # Safety
+    /// # Panics
     ///
-    /// No GC may run and the buffer must not be detached while the
-    /// returned slice is live. Concurrent access via another reference is
-    /// undefined behaviour.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn bytes_mut(self) -> &'s mut [u8] {
-        let length = self.byte_length();
-        if length == 0 {
-            return &mut [];
-        }
-        let mut is_shared = false;
-        let nogc = JS::AutoRequireNoGC { _address: 0 };
-        let data = mozjs::jsapi::JS_GetArrayBufferViewData(self.as_raw(), &mut is_shared, &nogc);
-        if data.is_null() {
-            &mut []
-        } else {
-            std::slice::from_raw_parts_mut(data as *mut u8, length)
+    /// Panics if either range doesn't lie within its view.
+    pub fn copy_region_from(
+        self,
+        dest_start: usize,
+        src: Stack<'_, ArrayBufferView>,
+        src_start: usize,
+        count: usize,
+    ) {
+        let (dest_len, src_len) = (self.byte_length(), src.byte_length());
+        assert!(dest_start
+            .checked_add(count)
+            .is_some_and(|end| end <= dest_len));
+        assert!(src_start
+            .checked_add(count)
+            .is_some_and(|end| end <= src_len));
+        if count != 0 {
+            // SAFETY: both ranges lie within their views, which are non-empty, so neither pointer
+            // is null, and nothing runs between reading the pointers and copying. `ptr::copy`
+            // allows the ranges to overlap.
+            unsafe {
+                std::ptr::copy(
+                    src.data_ptr().add(src_start),
+                    self.data_ptr().add(dest_start),
+                    count,
+                )
+            };
         }
     }
 
-    /// Copy the view's bytes into an owned `Vec`.
-    pub fn copy_bytes(self) -> Vec<u8> {
-        unsafe { self.bytes() }.to_vec()
+    /// A pointer to the view's first byte, or a null pointer for an empty view. The pointer is
+    /// valid for `byte_length()` bytes until the next GC or until the buffer is detached.
+    fn data_ptr(self) -> *mut u8 {
+        if self.byte_length() == 0 {
+            return std::ptr::null_mut();
+        }
+        let mut is_shared = false;
+        let nogc = JS::AutoRequireNoGC { _address: 0 };
+        // SAFETY: `self` is a live view. The pointer is only returned.
+        let data = unsafe {
+            mozjs::jsapi::JS_GetArrayBufferViewData(self.as_raw(), &mut is_shared, &nogc)
+        };
+        data as *mut u8
     }
 }
 
@@ -661,36 +738,61 @@ crate::gc::handle::deref_to_object!(ArrayBufferView);
 
 crate::gc::handle::from_jsval_via_cast!(ArrayBufferView, c"Value isn't a typed array or DataView");
 
-/// Copy the bytes held by any `BufferSource` (an `ArrayBuffer`,
-/// `SharedArrayBuffer`, or `ArrayBufferView`) into an owned `Vec`.
-///
-/// Returns `None` if `obj` is none of the above.
-pub fn copy_bytes_if_buffer_source(obj: Object<'_>) -> Option<Vec<u8>> {
-    // SAFETY: All functions called following JSAPI's contract.
+/// Whether `obj` is a `BufferSource`: an `ArrayBuffer`, a `SharedArrayBuffer` or an
+/// `ArrayBufferView`.
+pub fn is_buffer_source(obj: Object<'_>) -> bool {
+    // SAFETY: `obj` is a live object.
+    unsafe { buffer_source_parts(obj.as_raw()) }.is_some()
+}
+
+/// Call `f` with the bytes of `obj` if it is a `BufferSource` (see [`is_buffer_source`]), or
+/// return `None`. See the [module docs](self#byte-access).
+pub fn with_buffer_source_bytes<R>(
+    obj: Object<'_>,
+    f: impl FnOnce(&[u8]) -> R + Send,
+) -> Option<R> {
+    // SAFETY: `obj` is a live object, and `f` can't run a GC or detach a buffer.
+    unsafe { buffer_source_parts(obj.as_raw()) }.map(|parts| f(unsafe { slice_from_parts(parts) }))
+}
+
+/// Call `f` with the bytes of `a` and of `b` if both are `BufferSource`s, or return `None`. See
+/// [`with_buffer_source_bytes`].
+pub fn with_buffer_source_bytes_pair<R>(
+    a: Object<'_>,
+    b: Object<'_>,
+    f: impl FnOnce(&[u8], &[u8]) -> R + Send,
+) -> Option<R> {
+    // SAFETY: as in `with_buffer_source_bytes`. Both slices are shared, so they can overlap.
     unsafe {
-        if JS::IsArrayBufferObject(obj.as_raw()) {
-            let (ptr, len) = array_buffer_length_and_data(obj.as_raw());
-            if ptr.is_null() || len == 0 {
-                return Some(Vec::new());
-            }
-            return Some(std::slice::from_raw_parts(ptr, len).to_vec());
-        }
-        if JS::IsSharedArrayBufferObject(obj.as_raw()) {
-            let mut len = 0;
-            let mut is_shared = false;
-            let mut ptr = std::ptr::null_mut();
-            JS::GetSharedArrayBufferLengthAndData(obj.as_raw(), &mut len, &mut is_shared, &mut ptr);
-            if ptr.is_null() || len == 0 {
-                return Some(Vec::new());
-            }
-            return Some(std::slice::from_raw_parts(ptr, len).to_vec());
-        }
-        if mozjs::jsapi::JS_IsArrayBufferViewObject(obj.as_raw()) {
-            let view: Stack<'_, ArrayBufferView> = Stack::from_handle_unchecked(obj.handle());
-            return Some(view.copy_bytes());
-        }
+        let a = buffer_source_parts(a.as_raw())?;
+        let b = buffer_source_parts(b.as_raw())?;
+        Some(f(slice_from_parts(a), slice_from_parts(b)))
     }
-    None
+}
+
+/// A copy of the bytes of `obj` if it is a `BufferSource` (see [`is_buffer_source`]), or `None`.
+/// Failing to allocate the copy reports out of memory.
+pub fn copy_buffer_source_bytes(
+    scope: &Scope<'_>,
+    obj: Object<'_>,
+) -> Result<Option<Vec<u8>>, ExnThrown> {
+    match with_buffer_source_bytes(obj, try_copy) {
+        Some(copy) => copy_or_report(scope, copy).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// A copy of `bytes`. Failing to allocate it reports out of memory.
+pub fn copy_slice_or_report(scope: &Scope<'_>, bytes: &[u8]) -> Result<Vec<u8>, ExnThrown> {
+    copy_or_report(scope, try_copy(bytes))
+}
+
+/// A copy of `bytes`, or `None` if allocating it fails.
+pub fn try_copy(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len()).ok()?;
+    copy.extend_from_slice(bytes);
+    Some(copy)
 }
 
 // ---------------------------------------------------------------------------
@@ -761,36 +863,18 @@ impl<'s, T: TypedArrayKind> Stack<'s, T> {
         unsafe { mozjs::jsapi::JS_GetArrayBufferViewByteLength(self.as_raw()) }
     }
 
-    /// Borrow the typed array's elements.
-    ///
-    /// # Safety
-    ///
-    /// No GC may run and the underlying buffer must not be detached while
-    /// the returned slice is live.
-    pub unsafe fn as_slice(self) -> &'s [T::Element] {
-        let (ptr, len) = T::length_and_data(self.as_raw());
-        if ptr.is_null() || len == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(ptr, len)
-        }
+    /// Call `f` with the typed array's elements, which are empty for a detached buffer. See the
+    /// [module docs](self#byte-access).
+    pub fn with_slice<R>(self, f: impl FnOnce(&[T::Element]) -> R + Send) -> R {
+        // SAFETY: `self` is a live typed array of kind `T`, and `f` can't run a GC or detach its
+        // buffer.
+        f(unsafe { slice_from_parts(T::length_and_data(self.as_raw())) })
     }
 
-    /// Mutably borrow the typed array's elements.
-    ///
-    /// # Safety
-    ///
-    /// No GC may run and the underlying buffer must not be detached while
-    /// the returned slice is live. Concurrent access via another reference
-    /// is undefined behaviour.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn as_mut_slice(self) -> &'s mut [T::Element] {
-        let (ptr, len) = T::length_and_data(self.as_raw());
-        if ptr.is_null() || len == 0 {
-            &mut []
-        } else {
-            std::slice::from_raw_parts_mut(ptr, len)
-        }
+    /// Call `f` with the typed array's elements, mutably. See [`Self::with_slice`].
+    pub fn with_slice_mut<R>(self, f: impl FnOnce(&mut [T::Element]) -> R + Send) -> R {
+        // SAFETY: as in `with_slice`. No other reference to the elements exists while `f` runs.
+        f(unsafe { slice_from_parts_mut(T::length_and_data(self.as_raw())) })
     }
 
     /// View this typed array through the abstract `ArrayBufferView` handle.
@@ -803,21 +887,22 @@ impl<'s, T: TypedArrayKind> Stack<'s, T> {
 
 impl<'s> Stack<'s, Uint8Array> {
     /// Construct a `Uint8Array` viewing the region `[byte_offset,
-    /// byte_offset + length)` of `buffer`, without copying.
+    /// byte_offset + length)` of `buffer`, an `ArrayBuffer` or a `SharedArrayBuffer`, without
+    /// copying.
     ///
     /// This is the streams spec's `Construct(%Uint8Array%, « buffer, byteOffset,
     /// length »)`. The region must lie within `buffer`'s byte length.
-    pub fn with_buffer(
+    pub fn with_buffer<'b>(
         scope: &'s Scope<'_>,
-        buffer: Stack<'_, ArrayBuffer>,
+        buffer: impl ViewableBuffer<'b>,
         byte_offset: usize,
         length: usize,
     ) -> Result<Self, ExnThrown> {
-        // SAFETY: `buffer` is a live, rooted, non-detached `ArrayBuffer`.
+        // SAFETY: `buffer` is a live, rooted, non-detached buffer.
         let obj = unsafe {
             wrappers2::JS_NewUint8ArrayWithBuffer(
                 scope.cx_mut(),
-                buffer.handle(),
+                buffer.buffer_handle(),
                 byte_offset,
                 length as i64,
             )
@@ -825,19 +910,25 @@ impl<'s> Stack<'s, Uint8Array> {
         root_or_throw(scope, obj)
     }
 
-    /// Construct a `Uint8Array` viewing `buffer` from `byte_offset` to its end, without copying.
+    /// Construct a `Uint8Array` viewing `buffer`, an `ArrayBuffer` or a `SharedArrayBuffer`, from
+    /// `byte_offset` to its end, without copying.
     ///
     /// This is `new Uint8Array(buffer, byteOffset)`: for a resizable `buffer`, the view's length
     /// follows the buffer's. `byte_offset` must be at most `buffer`'s byte length.
-    pub fn with_buffer_to_end(
+    pub fn with_buffer_to_end<'b>(
         scope: &'s Scope<'_>,
-        buffer: Stack<'_, ArrayBuffer>,
+        buffer: impl ViewableBuffer<'b>,
         byte_offset: usize,
     ) -> Result<Self, ExnThrown> {
-        // SAFETY: `buffer` is a live, rooted, non-detached `ArrayBuffer`. A length of -1 views the
-        // buffer to its end.
+        // SAFETY: `buffer` is a live, rooted, non-detached buffer. A length of -1 views the buffer
+        // to its end.
         let obj = unsafe {
-            wrappers2::JS_NewUint8ArrayWithBuffer(scope.cx_mut(), buffer.handle(), byte_offset, -1)
+            wrappers2::JS_NewUint8ArrayWithBuffer(
+                scope.cx_mut(),
+                buffer.buffer_handle(),
+                byte_offset,
+                -1,
+            )
         };
         root_or_throw(scope, obj)
     }
@@ -1048,6 +1139,79 @@ unsafe fn array_buffer_length_and_data(obj: *mut JSObject) -> (*mut u8, usize) {
     JS::GetArrayBufferLengthAndData(obj, &mut length, &mut is_shared, &mut data);
     debug_assert!(!is_shared, "expected an unshared ArrayBuffer");
     (data, length)
+}
+
+/// Read the data pointer and length of a `SharedArrayBuffer`.
+///
+/// # Safety
+///
+/// `obj` must be a live `SharedArrayBuffer` object. The returned pointer is valid only until the
+/// next GC.
+unsafe fn shared_array_buffer_length_and_data(obj: *mut JSObject) -> (*mut u8, usize) {
+    let mut length = 0usize;
+    let mut is_shared = false;
+    let mut data: *mut u8 = std::ptr::null_mut();
+    JS::GetSharedArrayBufferLengthAndData(obj, &mut length, &mut is_shared, &mut data);
+    (data, length)
+}
+
+/// The data pointer and byte length of `obj` if it is an `ArrayBuffer`, a `SharedArrayBuffer` or an
+/// `ArrayBufferView`, or `None`.
+///
+/// # Safety
+///
+/// `obj` must be a live object. The returned pointer is valid only until the next GC or detach.
+unsafe fn buffer_source_parts(obj: *mut JSObject) -> Option<(*mut u8, usize)> {
+    if JS::IsArrayBufferObject(obj) {
+        return Some(array_buffer_length_and_data(obj));
+    }
+    if JS::IsSharedArrayBufferObject(obj) {
+        return Some(shared_array_buffer_length_and_data(obj));
+    }
+    if mozjs::jsapi::JS_IsArrayBufferViewObject(obj) {
+        let length = mozjs::jsapi::JS_GetArrayBufferViewByteLength(obj);
+        let mut is_shared = false;
+        let nogc = JS::AutoRequireNoGC { _address: 0 };
+        let data = mozjs::jsapi::JS_GetArrayBufferViewData(obj, &mut is_shared, &nogc);
+        return Some((data.cast(), length));
+    }
+    None
+}
+
+/// The slice of `len` elements at `ptr`, or an empty slice if `ptr` is null or `len` is 0.
+///
+/// # Safety
+///
+/// A non-null `ptr` must be valid for reads of `len` elements for `'a`, and nothing may write to
+/// them for `'a`.
+unsafe fn slice_from_parts<'a, T>((ptr, len): (*mut T, usize)) -> &'a [T] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, len)
+    }
+}
+
+/// The mutable slice of `len` elements at `ptr`, or an empty slice if `ptr` is null or `len` is 0.
+///
+/// # Safety
+///
+/// A non-null `ptr` must be valid for reads and writes of `len` elements for `'a`, and nothing else
+/// may access them for `'a`.
+unsafe fn slice_from_parts_mut<'a, T>((ptr, len): (*mut T, usize)) -> &'a mut [T] {
+    if ptr.is_null() || len == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(ptr, len)
+    }
+}
+
+/// `copy`, or, if it is `None`, an out-of-memory error reported on `scope`.
+fn copy_or_report(scope: &Scope<'_>, copy: Option<Vec<u8>>) -> Result<Vec<u8>, ExnThrown> {
+    copy.ok_or_else(|| {
+        crate::exception::report_out_of_memory(scope);
+        ExnThrown
+    })
 }
 
 /// Get the data pointer of a freshly created (and therefore non-detached,

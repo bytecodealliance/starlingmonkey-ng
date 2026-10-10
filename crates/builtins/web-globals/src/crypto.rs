@@ -47,8 +47,7 @@ pub fn get_random_values(
     // Step 4: Let byteList be a byte sequence containing the result of generating byteLength
     // random bytes.
     // Step 5: Write byteList to array, starting at array's byte offset.
-    // SAFETY: filling the bytes runs no JS, so nothing can GC or detach the buffer.
-    platform::random::fill(unsafe { array.bytes_mut() });
+    array.with_bytes_mut(platform::random::fill);
     // Step 6: Return array.
     Ok(array)
 }

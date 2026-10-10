@@ -123,7 +123,12 @@ pub unsafe fn evaluate_content_script(
         _ => {
             if let Some(error) = exception::take_pending(scope) {
                 if event_loop::with_event_loop(event_loop, |_| {
-                    lifecycle::uncaught(scope, error, None)
+                    let handled = lifecycle::uncaught(scope, error, None);
+                    // The jobs the `uncaught` hook queued run now, as they would after the script.
+                    if handled {
+                        event_loop::run_microtasks(scope);
+                    }
+                    handled
                 }) {
                     return Ok(ScriptEvaluation::new(None));
                 }
@@ -184,8 +189,13 @@ impl ScriptEvaluation {
         let Some(reason) = promise.result(scope) else {
             return;
         };
-        self.rejection_handled
-            .set(lifecycle::uncaught(scope, reason, None));
+        let handled = lifecycle::uncaught(scope, reason, None);
+        self.rejection_handled.set(handled);
+        // The promise jobs the hook queued run before its ticks, as in Node.js, where the hook runs
+        // during a microtask checkpoint.
+        if handled {
+            js::jobs::run_microtasks(scope);
+        }
     }
 
     /// Whether the script has finished evaluating.

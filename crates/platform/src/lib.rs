@@ -7,10 +7,11 @@
 //! platform-agnostic parts in one module and its backends in `<capability>_native`
 //! / `<capability>_wasm` modules, selected with `#[cfg(target_arch)]`. The capabilities
 //! are HTTP ([`http`]), used by `fetch`, the monotonic clock ([`clock`]), the filesystem
-//! ([`fs`]), the process ([`process`]), TCP sockets and name lookup ([`net`]), and TLS client
-//! sessions ([`tls`]).
+//! ([`fs`]), the process ([`process`]), child processes ([`child`]), TCP sockets and name lookup
+//! ([`net`]), and TLS client sessions ([`tls`]).
 //! [`stream`] holds the WASIp3 stream pumps those build on.
 
+pub mod child;
 pub mod clock;
 pub mod fs;
 pub mod http;

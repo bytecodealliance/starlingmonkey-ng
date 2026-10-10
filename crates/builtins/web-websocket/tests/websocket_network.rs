@@ -190,3 +190,54 @@ fn close_while_connecting_fails_the_connection() {
     ));
     assert_eq!(out, "state:2|error:Event|close:1006::false:3");
 }
+
+/// With Node.js's options, the opening handshake sends the `headers` option's headers, except
+/// those the handshake sets itself, whose own values are sent instead.
+#[test]
+#[allow(clippy::result_large_err)] // tungstenite's handshake callback returns its error response.
+fn sends_further_headers_but_not_the_handshake_headers() {
+    let (sender, received) = std::sync::mpsc::channel();
+    let url = start_server(move |stream| {
+        let record = |request: &tungstenite::handshake::server::Request, response| {
+            let headers: Vec<String> = request
+                .headers()
+                .iter()
+                .map(|(name, value)| format!("{name}={}", value.to_str().unwrap()))
+                .collect();
+            sender.send(headers).unwrap();
+            Ok(response)
+        };
+        let mut socket = tungstenite::accept_hdr(stream, record).unwrap();
+        while socket.read().is_ok() {}
+    });
+    web_websocket::websocket::set_node_compat(true);
+    let out = run_and_get_out(&format!(
+        r#"
+        globalThis.__out = "";
+        const ws = new WebSocket("{url}", {{ headers: {{
+            Host: "example.com", Connection: "keep-alive", Upgrade: "h2c",
+            "Sec-WebSocket-Version": "8", "Sec-WebSocket-Key": "abc", "X-Custom": "y",
+        }} }});
+        ws.onopen = () => {{ globalThis.__out = "open"; ws.close(); }};
+        "#
+    ));
+    assert_eq!(out, "open");
+    let headers = received.recv().unwrap();
+    let host = url
+        .trim_start_matches("ws://")
+        .trim_end_matches("/path")
+        .to_string();
+    let value = |name: &str| -> Vec<&str> {
+        headers
+            .iter()
+            .filter_map(|header| header.strip_prefix(&format!("{name}=")))
+            .collect()
+    };
+    assert_eq!(value("host"), [host.as_str()]);
+    assert_eq!(value("connection"), ["Upgrade"]);
+    assert_eq!(value("upgrade"), ["websocket"]);
+    assert_eq!(value("sec-websocket-version"), ["13"]);
+    assert_eq!(value("sec-websocket-key").len(), 1);
+    assert_ne!(value("sec-websocket-key"), ["abc"]);
+    assert_eq!(value("x-custom"), ["y"]);
+}

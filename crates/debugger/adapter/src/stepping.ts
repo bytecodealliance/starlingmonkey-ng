@@ -5,7 +5,9 @@ export type StepKind = "next" | "stepIn" | "stepOut";
 /**
  * Steps with `onStep`, `onPop` and `onEnterFrame` hooks. A step stops at the first breakpoint
  * position on a line other than the one the frame was on when the hook was set. A frame that
- * suspends at `await` or `yield` keeps its hooks and continues the step when it resumes.
+ * suspends at `await` or `yield` keeps its hooks and continues the step when it resumes. A step
+ * that leaves a frame without an older frame, such as a timer callback, stops in the next frame
+ * that is entered.
  */
 export class Stepper {
   private readonly hooked = new Set<Debugger.Frame>();
@@ -22,11 +24,15 @@ export class Stepper {
     }
     this.continueInCaller(frame);
     if (kind === "stepIn") {
-      this.dbg.onEnterFrame = (entered) => {
-        this.stop(entered);
-        return undefined;
-      };
+      this.stopInNextFrame();
     }
+  }
+
+  private stopInNextFrame(): void {
+    this.dbg.onEnterFrame = (entered) => {
+      this.stop(entered);
+      return undefined;
+    };
   }
 
   /** Remove every hook a step set. */
@@ -64,6 +70,8 @@ export class Stepper {
       if (caller !== null) {
         this.stopOnNewLine(caller);
         this.continueInCaller(caller);
+      } else {
+        this.stopInNextFrame();
       }
       return undefined;
     };

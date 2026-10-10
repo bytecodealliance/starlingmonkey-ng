@@ -16,6 +16,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -26,6 +29,9 @@ env:
   WASMTIME_VERSION: "49.0.0"
   WASM_TOOLS_VERSION: "1.258.0"
   STARLING_NIGHTLY: nightly-2026-09-24
+  # The Node.js that runs the harnesses and the debugger adapter's build, the version the Node.js
+  # compatibility work targets.
+  NODE_VERSION: "24.21.0"
   RUSTC_WRAPPER: sccache
   CCACHE: sccache
   # Bump to purge the sccache GHA cache.
@@ -39,7 +45,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
@@ -51,9 +57,9 @@ jobs:
       - name: Run clippy
         run: just clippy --all
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "lts/*"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Check the debugger adapter bundle
         run: just check-debugger-adapter
@@ -67,17 +73,13 @@ jobs:
     name: init.wit versioning
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The release tags the check compares with.
           fetch-depth: 0
 
       - name: Install wasm-tools
-        run: |
-          mkdir -p "$HOME/.wasm-tools/bin"
-          curl -sSfL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz" \
-            | tar xz --strip-components=1 -C "$HOME/.wasm-tools/bin" "wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux/wasm-tools"
-          echo "$HOME/.wasm-tools/bin" >> "$GITHUB_PATH"
+        run: ./.github/actions/setup/install-tool.sh wasm-tools "$WASM_TOOLS_VERSION"
 
       - name: Check init.wit's version
         run: ./scripts/check-init-wit.sh
@@ -107,7 +109,7 @@ jobs:
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
@@ -143,16 +145,16 @@ jobs:
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
           target: wasm32-wasip3
           wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "lts/*"
+          node-version: ${{ env.NODE_VERSION }}
 
       # `--tests` includes the `wit_to_ts` suite, which type-checks its output.
       - name: Install the TypeScript compiler
@@ -184,16 +186,16 @@ jobs:
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
           target: ${{ matrix.target }}
           wasi-sdk-version: ${{ env.WASI_SDK_VERSION }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "lts/*"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Clone WPT suite
         run: ./scripts/clone-wpt.sh
@@ -224,15 +226,15 @@ jobs:
     env:
       RUST_BACKTRACE: full
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
           target: native
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "lts/*"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Crown static analysis
         run: |

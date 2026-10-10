@@ -3,6 +3,8 @@
 //! <https://w3c.github.io/FileAPI/#file-section>
 
 use core_runtime::{webidl_dictionary, webidl_interface, webidl_methods};
+use js::error::ExnThrown;
+use js::gc::scope::Scope;
 
 use crate::blob::{normalize_type, process_blob_parts, Blob, BlobImpl, BlobPart, BlobPropertyBag};
 
@@ -29,14 +31,18 @@ impl File {
     /// <https://w3c.github.io/FileAPI/#dom-file-file>
     #[constructor]
     fn new(
+        scope: &Scope<'_>,
         file_bits: Vec<BlobPart<'_>>,
         file_name: String,
         options: Option<&FilePropertyBag>,
-    ) -> Self {
+    ) -> Result<Self, ExnThrown> {
         // Step 1: Let _bytes_ be the result of `processing blob parts` given _fileBits_ and
         //     _options_.
         let endings = options.and_then(|options| options.parent.endings);
-        let bytes = process_blob_parts(file_bits, endings);
+        let bytes = process_blob_parts(file_bits, endings).map_err(|_| {
+            js::exception::report_out_of_memory(scope);
+            ExnThrown
+        })?;
         // Step 2: Let _n_ be the _fileName_ argument to the constructor.
         let n = file_name;
         // Step 3: Process ``FilePropertyBag`` dictionary argument by running the following
@@ -62,11 +68,11 @@ impl File {
         // Step 4.3: _F_.``name`` is set to _n_.
         // Step 4.4: _F_.``type`` is set to _t_.
         // Step 4.5: _F_.``lastModified`` is set to _d_.
-        FileImpl {
+        Ok(FileImpl {
             parent: BlobImpl::with_bytes(bytes, t),
             name: n,
             last_modified: d,
-        }
+        })
     }
 
     /// <https://w3c.github.io/FileAPI/#dfn-name>

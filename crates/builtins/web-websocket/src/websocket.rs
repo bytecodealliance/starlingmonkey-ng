@@ -21,9 +21,10 @@ use js::heap::Trace;
 use js::native::JSTracer;
 use js::prelude::HandleValue;
 use js::promise::{PromiseFuture, PromiseOutcome};
-use js::{Callable, Promise};
+use js::typedarray::try_copy;
+use js::{Object, Promise};
 use platform::net::{ConnectionReader, ConnectionWriter, NetError};
-use tungstenite::{Bytes, Message};
+use tungstenite::Message;
 use url::Url;
 use web_fetch::headers::HeadersInit;
 use web_files::blob::{Blob, BlobPart};
@@ -123,10 +124,6 @@ pub struct WebSocket {
     connect_op: Option<Heap<js::promise::Promise>>,
     read_op: Option<Heap<js::promise::Promise>>,
     write_op: Option<Heap<js::promise::Promise>>,
-    onopen_handler: Option<Heap<js::function::Callable>>,
-    onerror_handler: Option<Heap<js::function::Callable>>,
-    onclose_handler: Option<Heap<js::function::Callable>>,
-    onmessage_handler: Option<Heap<js::function::Callable>>,
 }
 
 #[webidl_methods]
@@ -203,6 +200,10 @@ impl WebSocket {
             .map(|origin| origin.ascii_serialization());
         let mut headers = headers;
         if let Some(authorization) = url_credentials(&url_record) {
+            let Some(authorization) = authorization else {
+                js::exception::report_out_of_memory(scope);
+                return Err(ExnThrown);
+            };
             headers.push(("Authorization".to_string(), authorization));
         }
         let session = Session::start(Opening {
@@ -350,14 +351,12 @@ impl WebSocket {
         let message = match data {
             BlobPart::USVString(text) => Message::Text(text.into()),
             BlobPart::Blob(blob) => Message::Binary(blob.data().bytes.clone()),
-            // SAFETY: nothing runs JavaScript while the bytes are borrowed.
-            BlobPart::ArrayBuffer(buffer) => match copy_bytes(unsafe { buffer.bytes() }) {
-                Some(bytes) => Message::Binary(bytes),
+            BlobPart::ArrayBuffer(buffer) => match buffer.with_bytes(try_copy) {
+                Some(bytes) => Message::Binary(bytes.into()),
                 None => return self.fail_full(scope),
             },
-            // SAFETY: nothing runs JavaScript while the bytes are borrowed.
-            BlobPart::ArrayBufferView(view) => match copy_bytes(unsafe { view.bytes() }) {
-                Some(bytes) => Message::Binary(bytes),
+            BlobPart::ArrayBufferView(view) => match view.with_bytes(try_copy) {
+                Some(bytes) => Message::Binary(bytes.into()),
                 None => return self.fail_full(scope),
             },
         };
@@ -393,71 +392,50 @@ impl WebSocket {
 
     /// <https://websockets.spec.whatwg.org/#handler-websocket-onopen>
     #[getter]
-    fn onopen<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onopen_handler.get(scope)
+    fn onopen<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        web_globals::events::event_handler(scope, self, "open")
     }
 
     /// <https://websockets.spec.whatwg.org/#handler-websocket-onopen>
     #[setter]
     fn set_onopen(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
-        let old = self.data().onopen_handler.get(scope);
-        let handler = web_globals::events::replace_event_handler(scope, self, "open", old, value);
-        match handler {
-            Some(handler) => self.data_mut().onopen_handler.set(handler),
-            None => self.data_mut().onopen_handler = None,
-        }
+        web_globals::events::set_event_handler(scope, self, "open", value);
     }
 
     /// <https://websockets.spec.whatwg.org/#handler-websocket-onerror>
     #[getter]
-    fn onerror<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onerror_handler.get(scope)
+    fn onerror<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        web_globals::events::event_handler(scope, self, "error")
     }
 
     /// <https://websockets.spec.whatwg.org/#handler-websocket-onerror>
     #[setter]
     fn set_onerror(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
-        let old = self.data().onerror_handler.get(scope);
-        let handler = web_globals::events::replace_event_handler(scope, self, "error", old, value);
-        match handler {
-            Some(handler) => self.data_mut().onerror_handler.set(handler),
-            None => self.data_mut().onerror_handler = None,
-        }
+        web_globals::events::set_event_handler(scope, self, "error", value);
     }
 
     /// <https://websockets.spec.whatwg.org/#handler-websocket-onclose>
     #[getter]
-    fn onclose<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onclose_handler.get(scope)
+    fn onclose<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        web_globals::events::event_handler(scope, self, "close")
     }
 
     /// <https://websockets.spec.whatwg.org/#handler-websocket-onclose>
     #[setter]
     fn set_onclose(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
-        let old = self.data().onclose_handler.get(scope);
-        let handler = web_globals::events::replace_event_handler(scope, self, "close", old, value);
-        match handler {
-            Some(handler) => self.data_mut().onclose_handler.set(handler),
-            None => self.data_mut().onclose_handler = None,
-        }
+        web_globals::events::set_event_handler(scope, self, "close", value);
     }
 
     /// <https://websockets.spec.whatwg.org/#handler-websocket-onmessage>
     #[getter]
-    fn onmessage<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onmessage_handler.get(scope)
+    fn onmessage<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        web_globals::events::event_handler(scope, self, "message")
     }
 
     /// <https://websockets.spec.whatwg.org/#handler-websocket-onmessage>
     #[setter]
     fn set_onmessage(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
-        let old = self.data().onmessage_handler.get(scope);
-        let handler =
-            web_globals::events::replace_event_handler(scope, self, "message", old, value);
-        match handler {
-            Some(handler) => self.data_mut().onmessage_handler.set(handler),
-            None => self.data_mut().onmessage_handler = None,
-        }
+        web_globals::events::set_event_handler(scope, self, "message", value);
     }
 }
 
@@ -978,14 +956,6 @@ fn queue_bytes(link: &mut Link, bytes: Vec<u8>) -> bool {
     true
 }
 
-/// A copy of `bytes`, or `None` if allocating it failed.
-fn copy_bytes(bytes: &[u8]) -> Option<Bytes> {
-    let mut copy = Vec::new();
-    copy.try_reserve_exact(bytes.len()).ok()?;
-    copy.extend_from_slice(bytes);
-    Some(Bytes::from(copy))
-}
-
 /// A TCP connection to `port` on `host`, trying its addresses in turn.
 async fn connect_to(host: &str, port: u16) -> Result<platform::net::Connection, String> {
     let addrs = platform::net::resolve(host)
@@ -1083,8 +1053,8 @@ fn convert_protocols(
 }
 
 /// The `Authorization` header value of basic authentication with the username and password of
-/// `url`, if it has either.
-fn url_credentials(url: &Url) -> Option<String> {
+/// `url`, if it has either. The value is `None` if allocating it fails.
+fn url_credentials(url: &Url) -> Option<Option<String>> {
     if url.username().is_empty() && url.password().is_none() {
         return None;
     }
@@ -1092,10 +1062,7 @@ fn url_credentials(url: &Url) -> Option<String> {
     let mut credentials = decode(url.username());
     credentials.push(b':');
     credentials.extend(decode(url.password().unwrap_or_default()));
-    Some(format!(
-        "Basic {}",
-        web_globals::base64::encode(&credentials, false)
-    ))
+    Some(web_globals::base64::encode(&credentials, false).map(|encoded| format!("Basic {encoded}")))
 }
 
 /// Whether `byte` is a `tchar` of RFC 9110, which the tokens of a `Sec-WebSocket-Protocol` field

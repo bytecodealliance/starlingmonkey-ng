@@ -103,66 +103,71 @@ impl TextDecoder<'_> {
 
         // Step 3: If _input_ is given, then `push` a `copy of` _input_ to `this`'s `I/O queue`.
         //         (We decode directly from _input_'s bytes. Nothing retains them after this call.)
-        // SAFETY: `input` is rooted via the Uint8Array handle and the slice
-        // is only borrowed while `encoding_rs` decodes it and `latin1_string`
-        // copies it, which can't trigger GC or detach the underlying buffer.
-        let bytes: &[u8] = match input {
-            Some(ArrayBufferViewOrArrayBuffer::Buffer(input)) => unsafe { input.bytes() },
-            Some(ArrayBufferViewOrArrayBuffer::View(input)) => unsafe { input.bytes() },
-            None => &[],
+        let mut decode = |bytes: &[u8]| {
+            // windows-1252 decodes every byte outside 0x80..=0x9F to the code point of the same
+            // value, and its decoder keeps no state between calls, so such input is its own
+            // Latin-1 output.
+            if encoding == encoding_rs::WINDOWS_1252
+                && !bytes.iter().any(|b| (0x80..=0x9F).contains(b))
+            {
+                return Decoded::Latin1(js::typedarray::try_copy(bytes));
+            }
+            // A fresh decoder that decodes its whole input at once turns ASCII into the same
+            // characters in every ASCII-compatible encoding.
+            if fresh
+                && last
+                && encoding.is_ascii_compatible()
+                && encoding_rs::Encoding::ascii_valid_up_to(bytes) == bytes.len()
+            {
+                return Decoded::Latin1(js::typedarray::try_copy(bytes));
+            }
+
+            // Step 4: Let _output_ be the `I/O queue` of scalar values « `end-of-queue` ».
+            // Step 5: While true:
+            // Step 5.1: Let _item_ be the result of `reading` from `this`'s `I/O queue`.
+            // Step 5.2: If _item_ is `end-of-queue` and `this`'s `do not flush` is true, then
+            //           return the result of running `serialize I/O queue` with `this` and
+            //           _output_.
+            // Step 5.3: Otherwise:
+            // Step 5.3.1: Let _result_ be the result of `processing an item` with _item_,
+            //             `this`'s `decoder`, `this`'s `I/O queue`, _output_, and `this`'s `error
+            //             mode`.
+            // Step 5.3.2: If _result_ is `finished`, then return the result of running
+            //             `serialize I/O queue` with `this` and _output_.
+            // Step 5.3.3: Otherwise, if _result_ is `error`, `throw` a ``TypeError``.
+            //
+            // (One `encoding_rs` call processes every item. `last` is true when `end-of-queue`
+            // is processed rather than returned at step 5.2. The decoder's BOM removal performs
+            // `serialize I/O queue`'s BOM handling. We decode to UTF-16, which SpiderMonkey
+            // copies as is, or narrows to Latin-1 if every code unit fits.)
+            Decoded::Utf16(decode_to_utf16(decoder, bytes, last, fatal))
         };
-
-        // windows-1252 decodes every byte outside 0x80..=0x9F to the code point of the same
-        // value, and its decoder keeps no state between calls, so such input is its own
-        // Latin-1 output.
-        if encoding == encoding_rs::WINDOWS_1252 && !bytes.iter().any(|b| (0x80..=0x9F).contains(b))
-        {
-            return latin1_string(scope, bytes);
-        }
-        // A fresh decoder that decodes its whole input at once turns ASCII into the same
-        // characters in every ASCII-compatible encoding.
-        if fresh
-            && last
-            && encoding.is_ascii_compatible()
-            && encoding_rs::Encoding::ascii_valid_up_to(bytes) == bytes.len()
-        {
-            return latin1_string(scope, bytes);
-        }
-
-        // Step 4: Let _output_ be the `I/O queue` of scalar values « `end-of-queue` ».
-        // Step 5: While true:
-        // Step 5.1: Let _item_ be the result of `reading` from `this`'s `I/O queue`.
-        // Step 5.2: If _item_ is `end-of-queue` and `this`'s `do not flush` is true, then return
-        //           the result of running `serialize I/O queue` with `this` and _output_.
-        // Step 5.3: Otherwise:
-        // Step 5.3.1: Let _result_ be the result of `processing an item` with _item_, `this`'s
-        //             `decoder`, `this`'s `I/O queue`, _output_, and `this`'s `error mode`.
-        // Step 5.3.2: If _result_ is `finished`, then return the result of running `serialize
-        //             I/O queue` with `this` and _output_.
-        // Step 5.3.3: Otherwise, if _result_ is `error`, `throw` a ``TypeError``.
-        //
-        // (One `encoding_rs` call processes every item. `last` is true when `end-of-queue` is
-        // processed rather than returned at step 5.2. The decoder's BOM removal performs
-        // `serialize I/O queue`'s BOM handling. We decode to UTF-16, which SpiderMonkey copies
-        // as is, or narrows to Latin-1 if every code unit fits.)
-        let output = decode_to_utf16(decoder, bytes, last, fatal);
+        let decoded = match input {
+            Some(ArrayBufferViewOrArrayBuffer::Buffer(input)) => input.with_bytes(decode),
+            Some(ArrayBufferViewOrArrayBuffer::View(input)) => input.with_bytes(decode),
+            None => decode(&[]),
+        };
         drop(data);
-        let site = member_site::<TextDecoderImpl>("decode", MemberKind::Method);
-        let output = output.map_err(|error| error.throw(scope, site, encoding))?;
-        JSString::from_utf16(scope, &output)
+        match decoded {
+            Decoded::Latin1(Some(chars)) => JSString::from_latin1(scope, &chars),
+            Decoded::Latin1(None) => {
+                js::exception::report_out_of_memory(scope);
+                Err(ExnThrown)
+            }
+            Decoded::Utf16(output) => {
+                let site = member_site::<TextDecoderImpl>("decode", MemberKind::Method);
+                let output = output.map_err(|error| error.throw(scope, site, encoding))?;
+                JSString::from_utf16(scope, &output)
+            }
+        }
     }
 }
 
-/// A string of the Latin-1 characters `bytes`. The bytes are copied before the string is created,
-/// because creating it can run a GC, which moves the bytes a typed array holds inline.
-fn latin1_string<'r>(scope: &'r Scope<'_>, bytes: &[u8]) -> Result<JSString<'r>, ExnThrown> {
-    let mut copy = Vec::new();
-    if copy.try_reserve_exact(bytes.len()).is_err() {
-        js::exception::report_out_of_memory(scope);
-        return Err(ExnThrown);
-    }
-    copy.extend_from_slice(bytes);
-    JSString::from_latin1(scope, &copy)
+/// The result of decoding the input of `TextDecoder.decode`: a copy of input that is its own
+/// Latin-1 output, or `None` if allocating the copy failed, or the UTF-16 output.
+enum Decoded {
+    Latin1(Option<Vec<u8>>),
+    Utf16(Result<Vec<u16>, DecodeError>),
 }
 
 /// The encoding `label` names, or, if it names none or `replacement`, the `RangeError` of the

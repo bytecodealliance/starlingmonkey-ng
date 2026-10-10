@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! The `.length` of functions that the macros create: the count of parameters that aren't
-//! `Option<T>`, or the value of `#[js_length = N]` and of `length = N` in a `#[jsfunction_class]`
-//! member's or a `#[jsmethods]` constructor's attribute.
+//! `Option<T>`, or the value of `length = N` in a module function's `#[function]`, a
+//! `#[jsfunction_class]` member's or a `#[jsmethods]` constructor's attribute.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
@@ -23,7 +23,7 @@ mod length_module {
         a + b.unwrap_or(0.0)
     }
 
-    #[js_length = 3]
+    #[function(length = 3)]
     pub fn overridden(a: f64, b: Option<f64>) -> f64 {
         a + b.unwrap_or(0.0)
     }
@@ -31,7 +31,7 @@ mod length_module {
 
 #[jsglobals]
 mod length_globals {
-    #[js_length = 2]
+    #[function(length = 2)]
     pub fn global_overridden(a: Option<f64>) -> f64 {
         a.unwrap_or(1.0)
     }
@@ -39,7 +39,7 @@ mod length_globals {
 
 #[jsnamespace(name = "lengthNs")]
 mod length_ns {
-    #[js_length = 4]
+    #[function(length = 4)]
     pub fn ns_overridden(a: Option<f64>) -> f64 {
         a.unwrap_or(1.0)
     }

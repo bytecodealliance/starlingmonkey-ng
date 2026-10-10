@@ -1964,14 +1964,15 @@ impl<'s> IntoConstructor<'s> for Result<Object<'s>, ExnThrown> {
     }
 }
 
+/// The registry key of the constructor of class `T`.
+struct ConstructorOf<T>(PhantomData<T>);
+
 /// The constructor of class `T` in the current realm, or a `TypeError` if `T` isn't registered in
-/// it.
+/// it. The constructor is the one [`register_class`] created, whatever the prototype's
+/// `constructor` property holds.
 pub fn class_constructor<'s, T: ClassDef>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
-    let proto = registered_prototype::<T>(scope)?;
-    // SAFETY: `proto` is a registered class prototype, whose constructor `init_class` installed.
-    let ctor = unsafe { wrappers2::JS_GetConstructor(scope.cx_mut(), proto.handle()) };
-    // SAFETY: `ctor` is a live object, rooted here before anything can GC.
-    unsafe { Object::from_raw(scope, ctor) }.ok_or(ExnThrown)
+    registered_prototype::<T>(scope)?;
+    Ok(realm_object::<ConstructorOf<T>>(scope).expect("a registered class has a constructor"))
 }
 
 /// Register class `T` on the current global without defining its constructor on the global
@@ -2062,6 +2063,7 @@ pub unsafe fn register_class<'s, T: ClassDef>(
     .expect("Constructor was just installed");
 
     register_prototype::<T>(scope.global(), proto.handle().get());
+    register_prototype::<ConstructorOf<T>>(scope.global(), ctor.as_raw());
 
     // Define Symbol.toStringTag if the class specifies one.
     if !T::TO_STRING_TAG.is_empty() {

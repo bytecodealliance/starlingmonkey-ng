@@ -14,40 +14,57 @@
     onHit;
     nextId = 1;
     byPath = /* @__PURE__ */ new Map();
-    /** Replace the breakpoints in `clientPath`, binding each to loaded code where there is some. */
+    /** Replace the breakpoints in `clientPath`, setting each in the loaded code where there is some. */
     set(clientPath, requested) {
       for (const entry of this.byPath.get(clientPath) ?? []) {
         this.unbind(entry);
       }
+      if (requested.length === 0) {
+        this.byPath.delete(clientPath);
+        return [];
+      }
       const entries = requested.map((breakpoint) => this.create(breakpoint));
       this.byPath.set(clientPath, entries);
-      const urls = this.urlsFor(clientPath);
+      const scripts = this.urlsFor(clientPath).flatMap((url) => this.dbg.findScripts({ url }));
       for (const entry of entries) {
-        this.bind(entry, urls);
+        this.bind(entry, scripts);
       }
       return entries.map((entry) => describe(entry));
     }
-    /** Bind unbound breakpoints to the scripts of a newly loaded `url`. Returns those it bound. */
-    scriptLoaded(url) {
+    /**
+     * Set the breakpoints of the file `script` was compiled from in the scripts of that file in the
+     * global of `script`. Returns the breakpoints that were not set in any script before.
+     */
+    scriptLoaded(script) {
       const changed = [];
+      let scripts;
       for (const [clientPath, entries] of this.byPath) {
-        if (!this.sources.matches(url, clientPath)) {
+        if (!this.sources.matches(script.url, clientPath)) {
           continue;
         }
+        scripts ??= this.dbg.findScripts({ url: script.url, global: script.global });
         for (const entry of entries) {
-          if (entry.bound === void 0 && this.bind(entry, [url])) {
+          const wasBound = entry.bound !== void 0;
+          if (this.bind(entry, scripts) && !wasBound) {
             changed.push(describe(entry));
           }
         }
       }
       return changed;
     }
-    /** The positions on lines `line` through `endLine` of `clientPath` a breakpoint can bind to. */
+    /** The positions on lines `line` through `endLine` of `clientPath` a breakpoint can be set at. */
     locations(clientPath, line, endLine = line) {
-      return this.candidates(this.urlsFor(clientPath), line, endLine).map(({ position }) => ({
-        line: position.lineNumber,
-        column: position.columnNumber
-      }));
+      const scripts = this.urlsFor(clientPath).flatMap((url) => this.dbg.findScripts({ url }));
+      const seen = /* @__PURE__ */ new Set();
+      const locations = [];
+      for (const { position } of this.candidates(scripts, line, endLine)) {
+        const key = `${position.lineNumber}:${position.columnNumber}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          locations.push({ line: position.lineNumber, column: position.columnNumber });
+        }
+      }
+      return locations;
     }
     clear() {
       for (const entries of this.byPath.values()) {
@@ -69,44 +86,51 @@
             return void 0;
           }
         },
-        bound: void 0
+        bound: void 0,
+        urls: /* @__PURE__ */ new Set()
       };
     }
     urlsFor(clientPath) {
       return this.sources.loadedUrls().filter((url) => this.sources.matches(url, clientPath));
     }
     /**
-     * Set the breakpoint at the first position on the first line at or after its line that has
-     * code, preferring its requested column on that line.
+     * Set the breakpoint in `scripts` at the first position on the first line at or after its line
+     * that has code, preferring its requested column on that line. Each script gets the breakpoint
+     * at most once. Returns whether any script has code there.
      */
-    bind(entry, urls) {
-      const candidates = this.candidates(urls, entry.line, entry.line + MAX_LINE_SLIDE);
+    bind(entry, scripts) {
+      const candidates = this.candidates(scripts, entry.line, entry.line + MAX_LINE_SLIDE);
       if (candidates.length === 0) {
         return false;
       }
       const line = candidates[0].position.lineNumber;
       const onLine = candidates.filter((candidate) => candidate.position.lineNumber === line);
-      const chosen = onLine.find((candidate) => candidate.position.columnNumber === entry.column) ?? onLine[0];
-      chosen.script.setBreakpoint(chosen.position.offset, entry.handler);
-      entry.bound = {
-        script: chosen.script,
-        line: chosen.position.lineNumber,
-        column: chosen.position.columnNumber
-      };
+      const column = (onLine.find((candidate) => candidate.position.columnNumber === entry.column) ?? onLine[0]).position.columnNumber;
+      for (const { script, position } of onLine) {
+        if (position.columnNumber === column && !script.getBreakpoints(position.offset).includes(entry.handler)) {
+          script.setBreakpoint(position.offset, entry.handler);
+          entry.urls.add(script.url);
+        }
+      }
+      entry.bound ??= { line, column };
       return true;
     }
+    /** Remove the breakpoint from every script it is set in, which are found by URL. */
     unbind(entry) {
-      entry.bound?.script.clearBreakpoint(entry.handler);
+      for (const url of entry.urls) {
+        for (const script of this.dbg.findScripts({ url })) {
+          script.clearBreakpoint(entry.handler);
+        }
+      }
+      entry.urls.clear();
       entry.bound = void 0;
     }
-    /** Breakpoint positions on lines `minLine` through `maxLine`, in source order. */
-    candidates(urls, minLine, maxLine) {
+    /** Breakpoint positions on lines `minLine` through `maxLine` of `scripts`, in source order. */
+    candidates(scripts, minLine, maxLine) {
       const found = [];
-      for (const url of urls) {
-        for (const script of this.dbg.findScripts({ url })) {
-          for (const position of script.getPossibleBreakpoints({ minLine, maxLine: maxLine + 1 })) {
-            found.push({ script, position });
-          }
+      for (const script of scripts) {
+        for (const position of script.getPossibleBreakpoints({ minLine, maxLine: maxLine + 1 })) {
+          found.push({ script, position });
         }
       }
       return found.sort(
@@ -246,6 +270,47 @@
     return path?.replace(/\/+$/, "");
   }
 
+  // src/side-effects.ts
+  var TIME_LIMIT = 100;
+  var STEPS_PER_CHECK = 256;
+  var TERMINATE = { hit: () => null };
+  function evaluateWithoutSideEffects(expression, frame, global) {
+    const dbg = new Debugger();
+    dbg.exclusiveDebuggerOnEval = true;
+    dbg.shouldAvoidSideEffects = true;
+    const checked = /* @__PURE__ */ new Set();
+    try {
+      dbg.addAllGlobalsAsDebuggees();
+      const debuggeeGlobal = dbg.addDebuggee(global);
+      const deadline = Date.now() + TIME_LIMIT;
+      let steps = 0;
+      const outOfTime = () => ++steps % STEPS_PER_CHECK === 0 && Date.now() > deadline;
+      dbg.onEnterFrame = (entered) => {
+        if (outOfTime()) {
+          return null;
+        }
+        const script = entered.script;
+        if (script !== null && !checked.has(script)) {
+          checked.add(script);
+          for (const offset of script.getEffectfulOffsets()) {
+            script.setBreakpoint(offset, TERMINATE);
+          }
+        }
+        entered.onStep = () => outOfTime() ? null : void 0;
+        return void 0;
+      };
+      dbg.onNativeCall = () => null;
+      return frame !== void 0 ? dbg.adoptFrame(frame).eval(expression) : debuggeeGlobal.executeInGlobal(expression);
+    } finally {
+      dbg.onEnterFrame = void 0;
+      dbg.onNativeCall = void 0;
+      for (const script of checked) {
+        script.clearBreakpoint(TERMINATE);
+      }
+      dbg.removeAllDebuggees();
+    }
+  }
+
   // src/stepping.ts
   var Stepper = class {
     constructor(dbg, onStop) {
@@ -262,11 +327,14 @@
       }
       this.continueInCaller(frame);
       if (kind === "stepIn") {
-        this.dbg.onEnterFrame = (entered) => {
-          this.stop(entered);
-          return void 0;
-        };
+        this.stopInNextFrame();
       }
+    }
+    stopInNextFrame() {
+      this.dbg.onEnterFrame = (entered) => {
+        this.stop(entered);
+        return void 0;
+      };
     }
     /** Remove every hook a step set. */
     clear() {
@@ -301,6 +369,8 @@
         if (caller !== null) {
           this.stopOnNewLine(caller);
           this.continueInCaller(caller);
+        } else {
+          this.stopInNextFrame();
         }
         return void 0;
       };
@@ -335,6 +405,9 @@
       }
       return reference;
     }
+    getter(name, getter, receiver) {
+      return this.add({ kind: "getter", name, getter, receiver });
+    }
     get(reference) {
       return this.containers.get(reference);
     }
@@ -346,11 +419,16 @@
   };
   function describe2(value, refs) {
     if (value instanceof Debugger.Object) {
-      return {
+      const described = {
         value: preview(value),
-        type: value.callable ? "function" : value.class,
+        type: value.isProxy ? "Proxy" : value.callable ? "function" : value.class,
         variablesReference: refs.object(value)
       };
+      const length = indexedLength(value);
+      if (length !== void 0) {
+        described.indexedVariables = length;
+      }
+      return described;
     }
     if (value !== null && typeof value === "object") {
       if ("optimizedOut" in value) {
@@ -405,14 +483,14 @@
     }
     return scopes;
   }
-  function variablesOf(container, refs) {
-    if (container.kind === "object") {
-      const { object } = container;
-      const variables2 = object.getOwnPropertyNames().map((name) => property(object, name, refs));
-      if (object.proto !== null) {
-        variables2.push({ name: "[[Prototype]]", ...describe2(object.proto, refs) });
-      }
-      return variables2;
+  function variablesOf(container, refs, args) {
+    switch (container.kind) {
+      case "object":
+        return objectVariables(container.object, refs, args);
+      case "getter":
+        return [{ name: container.name, ...getterValue(container, refs) }];
+      case "scope":
+        break;
     }
     const variables = [];
     if (container.thisValue !== void 0) {
@@ -421,6 +499,17 @@
     const seen = /* @__PURE__ */ new Set();
     for (const env of container.envs) {
       if (env.optimizedOut) {
+        continue;
+      }
+      if (env.type !== "declarative") {
+        if (env.object !== void 0) {
+          for (const variable of ownProperties(env.object, refs)) {
+            if (!seen.has(variable.name)) {
+              seen.add(variable.name);
+              variables.push(variable);
+            }
+          }
+        }
         continue;
       }
       for (const name of env.names()) {
@@ -432,10 +521,93 @@
     }
     return variables;
   }
+  function objectVariables(object, refs, args) {
+    if (object.isProxy) {
+      return [
+        { name: "[[Target]]", ...describe2(object.proxyTarget ?? null, refs) },
+        { name: "[[Handler]]", ...describe2(object.proxyHandler ?? null, refs) }
+      ];
+    }
+    const length = indexedLength(object);
+    if (args.filter === "indexed" && length !== void 0) {
+      const start = Math.min(args.start ?? 0, length);
+      const end = Math.min(start + (args.count ?? length), length);
+      const variables2 = [];
+      for (let index = start; index < end; index++) {
+        variables2.push(property(object, String(index), refs));
+      }
+      return variables2;
+    }
+    const variables = args.filter === "named" && length !== void 0 ? namedProperties(object, length, refs) : ownProperties(object, refs);
+    if (object.proto !== null) {
+      variables.push({ name: "[[Prototype]]", ...describe2(object.proto, refs) });
+    }
+    return variables;
+  }
+  function ownProperties(object, refs) {
+    if (object.isProxy) {
+      return [];
+    }
+    return object.getOwnPropertyNames().map((name) => property(object, name, refs));
+  }
+  function namedProperties(object, length, refs) {
+    const isArray = object.class === "Array";
+    if (object.getOwnPropertyNamesLength() === length + (isArray ? 1 : 0)) {
+      return isArray ? [property(object, "length", refs)] : [];
+    }
+    return object.getOwnPropertyNames().filter((name) => !isIndex(name, length)).map((name) => property(object, name, refs));
+  }
+  function isIndex(name, length) {
+    return /^(0|[1-9][0-9]*)$/.test(name) && Number(name) < length;
+  }
+  var TYPED_ARRAY_CLASSES = /* @__PURE__ */ new Set([
+    "Int8Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float16Array",
+    "Float32Array",
+    "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array"
+  ]);
+  var typedArrayLength = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Int8Array.prototype),
+    "length"
+  )?.get;
+  function indexedLength(object) {
+    if (object.isProxy) {
+      return void 0;
+    }
+    if (object.class === "Array") {
+      const length = object.getOwnPropertyDescriptor("length")?.value;
+      return typeof length === "number" ? length : void 0;
+    }
+    if (TYPED_ARRAY_CLASSES.has(object.class)) {
+      return typedArrayLength.call(object.unsafeDereference());
+    }
+    return void 0;
+  }
+  function getterValue(container, refs) {
+    const completion = container.getter.call(container.receiver);
+    if (completion === null) {
+      return plain("<terminated>", "unavailable");
+    }
+    if ("throw" in completion) {
+      return plain(`Uncaught ${describe2(completion.throw, refs).value}`, "exception");
+    }
+    return describe2(completion.return, refs);
+  }
   function plain(value, type) {
     return { value, type, variablesReference: 0 };
   }
   function preview(object) {
+    if (object.isProxy) {
+      return "Proxy";
+    }
     if (object.callable) {
       return `ƒ ${object.name ?? object.displayName ?? ""}()`;
     }
@@ -445,6 +617,9 @@
       case "Object":
         return "{…}";
       default: {
+        if (TYPED_ARRAY_CLASSES.has(object.class)) {
+          return `${object.class}(${String(indexedLength(object))})`;
+        }
         if (!object.class.endsWith("Error")) {
           return object.class;
         }
@@ -456,8 +631,16 @@
   function property(object, name, refs) {
     const descriptor = object.getOwnPropertyDescriptor(name);
     if (descriptor !== void 0 && !("value" in descriptor)) {
-      const kinds = [descriptor.get && "get", descriptor.set && "set"].filter(Boolean).join("/");
-      return { name, value: `(${kinds})`, type: "accessor", variablesReference: 0 };
+      if (descriptor.get === void 0) {
+        return { name, value: "(set)", type: "accessor", variablesReference: 0 };
+      }
+      return {
+        name,
+        value: descriptor.set === void 0 ? "(get)" : "(get/set)",
+        type: "accessor",
+        presentationHint: { lazy: true },
+        variablesReference: refs.getter(name, descriptor.get, object)
+      };
     }
     return { name, ...describe2(descriptor?.value, refs) };
   }
@@ -465,6 +648,9 @@
     return env.type === "object" && env.parent === null;
   }
   function scopeName(env) {
+    if (env.type === "with") {
+      return "With Block";
+    }
     if (env.callee != null) {
       return `Closure (${env.callee.name ?? "anonymous"})`;
     }
@@ -484,10 +670,11 @@
     return error instanceof Error ? error.message : String(error);
   }
   var Adapter = class {
-    constructor(dbg, contentGlobal2) {
+    constructor(dbg, rawContentGlobal) {
       this.dbg = dbg;
+      this.rawContentGlobal = rawContentGlobal;
       dbg.addAllGlobalsAsDebuggees();
-      this.contentGlobal = dbg.addDebuggee(contentGlobal2);
+      this.contentGlobal = dbg.addDebuggee(rawContentGlobal);
       dbg.onNewGlobalObject = (global) => {
         dbg.addDebuggee(global);
       };
@@ -496,7 +683,12 @@
 `);
         return void 0;
       };
-      this.on("initialize", () => CAPABILITIES);
+      this.on("initialize", (request) => {
+        const args = request.arguments;
+        this.lineOffset = args.linesStartAt1 === false ? 1 : 0;
+        this.columnOffset = args.columnsStartAt1 === false ? 1 : 0;
+        return CAPABILITIES;
+      });
       this.on("launch", (request) => this.attach(request));
       this.on("attach", (request) => this.attach(request));
       this.on("configurationDone", () => {
@@ -536,13 +728,32 @@
             }))
           };
         }
-        return { breakpoints: this.breakpoints.set(args.source.path, requested) };
+        const breakpoints = this.breakpoints.set(
+          args.source.path,
+          requested.map((breakpoint) => ({
+            ...breakpoint,
+            line: this.lineFromClient(breakpoint.line),
+            column: this.columnFromClient(breakpoint.column)
+          }))
+        );
+        return { breakpoints: breakpoints.map((breakpoint) => this.breakpointToClient(breakpoint)) };
       });
       this.on("breakpointLocations", (request) => {
         const args = request.arguments;
         const path = args?.source.path;
+        if (args === void 0 || path === void 0) {
+          return { breakpoints: [] };
+        }
+        const locations = this.breakpoints.locations(
+          path,
+          this.lineFromClient(args.line),
+          args.endLine === void 0 ? void 0 : this.lineFromClient(args.endLine)
+        );
         return {
-          breakpoints: args === void 0 || path === void 0 ? [] : this.breakpoints.locations(path, args.line, args.endLine)
+          breakpoints: locations.map((location) => ({
+            line: location.line - this.lineOffset,
+            column: location.column === void 0 ? void 0 : location.column - this.columnOffset
+          }))
         };
       });
       this.on("continue", () => {
@@ -587,7 +798,7 @@
         if (container === void 0) {
           throw new Error("Unknown variables reference");
         }
-        return { variables: variablesOf(container, this.refs) };
+        return { variables: variablesOf(container, this.refs, args) };
       });
       this.on(
         "setVariable",
@@ -595,9 +806,16 @@
       );
       this.on("evaluate", (request) => {
         const args = request.arguments;
-        const completion = this.pausedFrame !== void 0 ? this.frame(args.frameId).eval(args.expression) : this.contentGlobal.executeInGlobal(args.expression);
-        const { value, type, variablesReference } = describe2(this.completionValue(completion), this.refs);
-        return { result: value, type, variablesReference };
+        const frame = this.pausedFrame !== void 0 ? this.frame(args.frameId) : void 0;
+        const completion = args.context === "hover" ? evaluateWithoutSideEffects(args.expression, frame, this.rawContentGlobal) : frame !== void 0 ? frame.eval(args.expression) : this.contentGlobal.executeInGlobal(args.expression);
+        if (completion === null && args.context === "hover") {
+          throw new Error("Evaluation stopped before a possible side effect");
+        }
+        const { value, type, variablesReference, indexedVariables } = describe2(
+          this.completionValue(completion),
+          this.refs
+        );
+        return { result: value, type, variablesReference, indexedVariables };
       });
       this.on("source", (request) => {
         const args = request.arguments;
@@ -613,6 +831,7 @@
       }));
     }
     dbg;
+    rawContentGlobal;
     handlers = /* @__PURE__ */ new Map();
     afterResponseActions = [];
     detachActions = [];
@@ -628,6 +847,12 @@
     launchArguments = {};
     /** The global `evaluate` and `setVariable` run in while nothing is paused. */
     contentGlobal;
+    /**
+     * How much the client's line and column numbers are below the adapter's, which start at 1.
+     * `initialize` sets them.
+     */
+    lineOffset = 0;
+    columnOffset = 0;
     on(command, handler) {
       this.handlers.set(command, handler);
     }
@@ -747,8 +972,8 @@
       if (this.sources.add(script.source)) {
         this.sendEvent("loadedSource", { reason: "new", source: this.sources.dapSource(script.source) });
       }
-      for (const breakpoint of this.breakpoints.scriptLoaded(script.url)) {
-        this.sendEvent("breakpoint", { reason: "changed", breakpoint });
+      for (const breakpoint of this.breakpoints.scriptLoaded(script)) {
+        this.sendEvent("breakpoint", { reason: "changed", breakpoint: this.breakpointToClient(breakpoint) });
       }
     }
     attach(request) {
@@ -808,9 +1033,22 @@
       return {
         id,
         name,
-        line: position.lineNumber,
-        column: position.columnNumber,
+        line: position.lineNumber - this.lineOffset,
+        column: position.columnNumber - this.columnOffset,
         source: this.sources.dapSource(frame.script.source)
+      };
+    }
+    lineFromClient(line) {
+      return line + this.lineOffset;
+    }
+    columnFromClient(column) {
+      return column === void 0 ? void 0 : column + this.columnOffset;
+    }
+    breakpointToClient(breakpoint) {
+      return {
+        ...breakpoint,
+        line: breakpoint.line === void 0 ? void 0 : breakpoint.line - this.lineOffset,
+        column: breakpoint.column === void 0 ? void 0 : breakpoint.column - this.columnOffset
       };
     }
     /** The value of a completion, or an `Error` describing why there is none. */
@@ -827,6 +1065,9 @@
       const container = this.refs.get(args.variablesReference);
       if (container === void 0) {
         throw new Error("Unknown variables reference");
+      }
+      if (container.kind === "getter") {
+        throw new Error("The value a getter returned cannot be set");
       }
       const value = this.completionValue(
         this.pausedFrame !== void 0 ? this.frame(void 0).eval(args.value) : this.contentGlobal.executeInGlobal(args.value)

@@ -4288,71 +4288,33 @@ fn parse_const_export(const_item: &syn::ItemConst) -> ModuleConstExport {
     }
 }
 
-/// Remove a `#[js_length = N]` attribute from `fn_item`, and return the `.length` it gives, if it
-/// has one.
-fn take_js_length_attr(fn_item: &mut syn::ItemFn) -> syn::Result<Option<u32>> {
-    let mut length = None;
+/// Remove a `#[function(name = "...", length = N)]` attribute from `fn_item`, and return the
+/// options it sets. `name` replaces the function's camelCased JS name, and `length` replaces the
+/// count of required parameters as its `.length`.
+fn take_function_attr(fn_item: &mut syn::ItemFn) -> syn::Result<AttrOpts> {
+    let mut opts = None;
     let mut error = None;
     fn_item.attrs.retain(|attr| {
-        if !attr.path().is_ident("js_length") {
+        if !attr.path().is_ident("function") {
             return true;
         }
-        let parsed = match &attr.meta {
-            syn::Meta::NameValue(syn::MetaNameValue {
-                value:
-                    syn::Expr::Lit(syn::ExprLit {
-                        lit: syn::Lit::Int(lit),
-                        ..
-                    }),
-                ..
-            }) => lit.base10_parse::<u32>(),
-            other => Err(syn::Error::new_spanned(
-                other,
-                "expected `#[js_length = N]`",
-            )),
-        };
-        match parsed {
-            Ok(value) => length = Some(value),
-            Err(e) => error = Some(e),
+        if opts.is_some() {
+            error.get_or_insert(syn::Error::new_spanned(
+                attr,
+                "a function takes at most one `#[function(...)]` attribute",
+            ));
         }
-        false
-    });
-    match error {
-        Some(error) => Err(error),
-        None => Ok(length),
-    }
-}
-
-/// Remove a `#[js_name = "..."]` attribute from `fn_item`, and return the JS name it gives, if
-/// it has one.
-fn take_js_name_attr(fn_item: &mut syn::ItemFn) -> syn::Result<Option<String>> {
-    let mut name = None;
-    let mut error = None;
-    fn_item.attrs.retain(|attr| {
-        if !attr.path().is_ident("js_name") {
-            return true;
-        }
-        match &attr.meta {
-            syn::Meta::NameValue(syn::MetaNameValue {
-                value:
-                    syn::Expr::Lit(syn::ExprLit {
-                        lit: syn::Lit::Str(lit),
-                        ..
-                    }),
-                ..
-            }) => name = Some(lit.value()),
-            other => {
-                error = Some(syn::Error::new_spanned(
-                    other,
-                    "expected `#[js_name = \"...\"]`",
-                ))
+        match parse_marker_opts(attr, &["name", "length"]) {
+            Ok(parsed) => opts = Some(parsed),
+            Err(e) => {
+                error.get_or_insert(e);
             }
         }
         false
     });
     match error {
         Some(error) => Err(error),
-        None => Ok(name),
+        None => Ok(opts.unwrap_or_default()),
     }
 }
 
@@ -4415,14 +4377,13 @@ fn collect_mod_exports(
             syn::Item::Fn(fn_item) if matches!(fn_item.vis, syn::Visibility::Public(_)) => {
                 let mut fn_item = fn_item.clone();
                 let fn_name = fn_item.sig.ident.clone();
-                let js_name = take_js_name_attr(&mut fn_item)?;
-                let length = take_js_length_attr(&mut fn_item)?;
+                let opts = take_function_attr(&mut fn_item)?;
                 rewrite_rest_args_in_sig(&mut fn_item.sig, &fn_name)?;
                 let mut export = parse_free_fn_export(&fn_item);
-                if let Some(js_name) = js_name {
+                if let Some(js_name) = opts.name {
                     export.js_name = js_name;
                 }
-                export.length = length;
+                export.length = opts.length.map(|length| length as u32);
                 out.fns.push(export);
                 out.items.push(quote! { #fn_item });
             }
@@ -4491,9 +4452,9 @@ fn gen_free_fn_native(
 /// Attribute macro that transforms a `mod` block into a native ES module.
 ///
 /// Public functions become callable JS exports renamed to camelCase while
-/// remaining callable from Rust under their original name. `#[js_name = "..."]`
-/// on a function sets its JS name instead. Their `.length` is the count of
-/// parameters that aren't `Option<T>`, or `N` with `#[js_length = N]`.
+/// remaining callable from Rust under their original name. Their `.length` is
+/// the count of parameters that aren't `Option<T>`. `#[function(name = "...",
+/// length = N)]` on a function sets its JS name, its `.length`, or both instead.
 /// Public `const` items become value exports without camelCasing:
 /// `PI` is exported as `PI`, not `pi`.
 ///
@@ -4715,8 +4676,8 @@ struct ModuleFnExport {
     /// function declared one.
     rest_arg_name: Option<Ident>,
     rest_inner_type: Option<Type>,
-    /// The JS-visible `.length` from `#[js_length = N]`, which replaces the count of required
-    /// arguments.
+    /// The JS-visible `.length` from `#[function(length = N)]`, which replaces the count of
+    /// required arguments.
     length: Option<u32>,
 }
 
@@ -5409,7 +5370,8 @@ fn gen_function_class(
 /// Attribute macro that transforms a `mod` block into a set of global JS definitions.
 ///
 /// Public functions become callable JS functions on the global object, renamed
-/// to camelCase. `#[js_name = "..."]` on a function sets its JS name instead.
+/// to camelCase. `#[function(name = "...", length = N)]` on a function sets its
+/// JS name, its `.length`, or both instead.
 /// Public `const` items become properties on the global object
 /// under their declared name: `PI` stays `PI`, not `pi`.
 /// `pub use ClassName;` items register `#[jsclass]` classes on the global.
@@ -5579,7 +5541,8 @@ impl NamespaceConfig {
 /// installed on the global.
 ///
 /// Public functions become methods on the namespace object, renamed to
-/// camelCase. `#[js_name = "..."]` on a function sets its JS name instead.
+/// camelCase. `#[function(name = "...", length = N)]` on a function sets its JS
+/// name, its `.length`, or both instead.
 /// No constructor, no prototype chain.
 ///
 /// # Usage

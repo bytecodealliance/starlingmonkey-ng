@@ -345,11 +345,19 @@ check "a snapshot of an -e module calls its run export" \
     "eval run called" \
     "$(wasmtime run --dir=. "${WASI_FLAGS[@]}" snap-eval-tool.wasm 2>&1)"
 
-# Running the same module as a plain script evaluates its top level and calls no export.
-plain_output="$(wasmtime run --dir=. "${WASI_FLAGS[@]}" "$COMPONENT" tool.mjs 2>&1)"
-if [[ "$plain_output" == *"run called"* ]]; then
+# Running such a module as a plain script evaluates its top level and calls no export.
+cat >plain-tool.mjs <<'JS'
+console.log('top level evaluated');
+export function run() {
+  console.log('run called');
+}
+JS
+plain_status=0
+plain_output="$(wasmtime run --dir=. "${WASI_FLAGS[@]}" "$COMPONENT" plain-tool.mjs 2>&1)" || plain_status=$?
+if (( plain_status != 0 )) || [[ "$plain_output" != *"top level evaluated"* || "$plain_output" == *"run called"* ]]; then
     echo "FAIL - a plain script's run export is not called"
-    echo "         got: $plain_output"
+    echo "         expected exit status 0 and output with only the top level's line"
+    echo "         got exit status $plain_status: $plain_output"
     failures=$((failures + 1))
 else
     echo "ok   - a plain script's run export is not called"

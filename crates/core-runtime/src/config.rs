@@ -29,6 +29,15 @@ pub struct RuntimeConfig {
     #[arg(short = 'e', long = "eval")]
     pub eval_script: Option<String>,
 
+    /// Evaluate inline script instead of a file, and with `--node-compat`, print its completion
+    /// value when the process exits. Parsing moves it to `eval_script` and sets `print_eval`.
+    #[arg(short = 'p', long = "print", conflicts_with = "eval_script")]
+    pub print_script: Option<String>,
+
+    /// Whether `eval_script` came from `-p`.
+    #[arg(skip)]
+    pub print_eval: bool,
+
     /// Path to an initialization script (runs in the default global, as a
     /// classic script, before the content script; must complete synchronously).
     #[arg(short = 'i', long = "initializer-script")]
@@ -94,15 +103,16 @@ pub struct RuntimeConfig {
 
     /// Enforce the browser-security Fetch constraints (forbidden
     /// request/response headers and methods, no-CORS safelisting, origin/mode
-    /// enforcement). Defaults to off except in `--wpt-mode`, which needs the
+    /// enforcement), and coarsen the HR-Time clocks, such as `performance.now()`,
+    /// to 100 microseconds. Defaults to off except in `--wpt-mode`, which needs the
     /// browser-observable behavior.
     /// Pass `=true`/`=false` to override either default.
     #[arg(
-        long = "enforce-fetch-restrictions",
+        long = "web-security-restrictions",
         num_args = 0..=1,
         default_missing_value = "true"
     )]
-    pub enforce_fetch_restrictions: Option<bool>,
+    pub web_security_restrictions: Option<bool>,
 
     /// Override the location URL for initialization.
     #[arg(long = "init-location")]
@@ -209,10 +219,10 @@ impl RuntimeConfig {
     }
 
     /// The effective request-restrictions setting: an explicit
-    /// `--enforce-fetch-restrictions[=bool]` wins, otherwise restrictions are
+    /// `--web-security-restrictions[=bool]` wins, otherwise restrictions are
     /// on in WPT mode and off everywhere else.
-    pub fn enforce_fetch_restrictions(&self) -> bool {
-        self.enforce_fetch_restrictions.unwrap_or(self.wpt_mode)
+    pub fn web_security_restrictions(&self) -> bool {
+        self.web_security_restrictions.unwrap_or(self.wpt_mode)
     }
 
     /// The effective `--dispatch-timeout`, or `None` for no limit.
@@ -298,7 +308,11 @@ impl RuntimeConfig {
         let matches = <Self as clap::CommandFactory>::command().try_get_matches_from(args)?;
         let mut config = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
         config.node_runtime_flags = node_flags;
-        // With `-e`, every positional argument is a script argument.
+        if let Some(script) = config.print_script.take() {
+            config.eval_script = Some(script);
+            config.print_eval = true;
+        }
+        // With `-e` or `-p`, every positional argument is a script argument.
         if config.eval_script.is_some()
             && matches.value_source("script_path") == Some(clap::parser::ValueSource::CommandLine)
         {
@@ -662,20 +676,21 @@ impl Default for RuntimeConfig {
 // contexts these policies are usually unwanted, so they're disabled by default.
 
 js::instance_local! {
-    static ENFORCE_REQUEST_RESTRICTIONS: Cell<bool> = const { Cell::new(false) };
+    static WEB_SECURITY_RESTRICTIONS: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Enable or disable enforcement of the browser-security Fetch constraints.
-/// `Runtime::init` sets this from the [`RuntimeConfig`], embedders can override
+/// Enable or disable enforcement of the browser-security Fetch constraints and the coarsening of
+/// the HR-Time clocks. `Runtime::init` sets this from the [`RuntimeConfig`], embedders can override
 /// it at any point after.
-pub fn set_enforce_fetch_restrictions(enabled: bool) {
-    ENFORCE_REQUEST_RESTRICTIONS.with(|cell| cell.set(enabled));
+pub fn set_web_security_restrictions(enabled: bool) {
+    WEB_SECURITY_RESTRICTIONS.with(|cell| cell.set(enabled));
 }
 
-/// Whether the browser-security Fetch constraints are currently enforced.
+/// Whether the browser-security Fetch constraints are currently enforced. While they are, the
+/// HR-Time clocks are coarsened too.
 #[inline]
-pub fn enforce_fetch_restrictions() -> bool {
-    ENFORCE_REQUEST_RESTRICTIONS.with(|cell| cell.get())
+pub fn web_security_restrictions() -> bool {
+    WEB_SECURITY_RESTRICTIONS.with(|cell| cell.get())
 }
 
 /// How long a serve-mode timeout given as `--…-timeout SECONDS` runs for: the value if it was
@@ -1156,6 +1171,11 @@ mod tests {
         assert_eq!(config.node_runtime_flags, ["--pending-deprecation"]);
         let config = RuntimeConfig::from_arg_string("--node-compat -e 1+1 a b").unwrap();
         assert_eq!(config.script_args, ["a", "b"]);
+        let config = RuntimeConfig::from_arg_string("--node-compat -p 1+1 a").unwrap();
+        assert_eq!(config.eval_script.as_deref(), Some("1+1"));
+        assert!(config.print_eval);
+        assert_eq!(config.script_args, ["a"]);
+        assert!(RuntimeConfig::from_arg_string("-e 1 -p 2").is_err());
     }
 
     #[test]
@@ -1200,20 +1220,20 @@ mod tests {
     }
 
     #[test]
-    fn enforce_fetch_restrictions_defaults_off_wpt_on_flag_wins() {
-        assert!(!RuntimeConfig::default().enforce_fetch_restrictions());
+    fn web_security_restrictions_defaults_off_wpt_on_flag_wins() {
+        assert!(!RuntimeConfig::default().web_security_restrictions());
         assert!(RuntimeConfig::from_arg_string("--wpt-mode")
             .unwrap()
-            .enforce_fetch_restrictions());
+            .web_security_restrictions());
         assert!(
-            !RuntimeConfig::from_arg_string("--wpt-mode --enforce-fetch-restrictions=false")
+            !RuntimeConfig::from_arg_string("--wpt-mode --web-security-restrictions=false")
                 .unwrap()
-                .enforce_fetch_restrictions()
+                .web_security_restrictions()
         );
         assert!(
-            RuntimeConfig::from_arg_string("--enforce-fetch-restrictions")
+            RuntimeConfig::from_arg_string("--web-security-restrictions")
                 .unwrap()
-                .enforce_fetch_restrictions()
+                .web_security_restrictions()
         );
     }
 

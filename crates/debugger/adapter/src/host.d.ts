@@ -21,8 +21,6 @@ declare function pause(): boolean;
 declare function resume(): void;
 /** Whether `pause` would block. */
 declare function mayPause(): boolean;
-/** Write a line to the process's stderr. */
-declare function print(message: string): void;
 /** Send `exited` and `terminated`, flush the transport and exit the process. */
 declare function terminate(): void;
 
@@ -41,12 +39,23 @@ declare class Debugger {
   addAllGlobalsAsDebuggees(): void;
   addDebuggee(global: unknown): Debugger.Object;
   removeAllDebuggees(): void;
-  findScripts(query?: { url?: string; line?: number }): Debugger.Script[];
+  findScripts(query?: { url?: string; line?: number; global?: Debugger.Object }): Debugger.Script[];
+  /** The frame of this debugger that refers to the same stack frame as `frame`. */
+  adoptFrame(frame: Debugger.Frame): Debugger.Frame;
   onNewScript: ((script: Debugger.Script) => void) | undefined;
   onEnterFrame: ((frame: Debugger.Frame) => ResumptionValue) | undefined;
   onDebuggerStatement: ((frame: Debugger.Frame) => ResumptionValue) | undefined;
   onNewGlobalObject: ((global: Debugger.Object) => void) | undefined;
+  /**
+   * Called before a native function runs inside an evaluation this debugger performs. `reason` is
+   * `"get"`, `"set"`, `"call"` or another call reason.
+   */
+  onNativeCall: ((callee: Debugger.Object, reason: string) => ResumptionValue) | undefined;
   uncaughtExceptionHook: ((error: unknown) => ResumptionValue) | undefined;
+  /** Whether the hooks of other debuggers are not called during this debugger's evaluations. */
+  exclusiveDebuggerOnEval: boolean;
+  /** Whether natives that check it avoid side effects. */
+  shouldAvoidSideEffects: boolean;
 }
 
 declare namespace Debugger {
@@ -77,7 +86,12 @@ declare namespace Debugger {
     }): BreakpointPosition[];
     getOffsetMetadata(offset: number): OffsetMetadata;
     setBreakpoint(offset: number, handler: BreakpointHandler): void;
+    /** The handlers of this debugger's breakpoints at `offset`. */
+    getBreakpoints(offset: number): BreakpointHandler[];
     clearBreakpoint(handler: BreakpointHandler): void;
+    /** The offsets of the bytecodes that can have side effects outside the running frame. */
+    getEffectfulOffsets(): number[];
+    readonly global: Object;
   }
 
   class Source {
@@ -118,10 +132,19 @@ declare namespace Debugger {
     readonly name: string | undefined;
     readonly displayName: string | undefined;
     readonly proto: Object | null;
+    readonly isProxy: boolean;
+    /** The target of a scripted proxy: `null` once it is revoked, `undefined` for other objects. */
+    readonly proxyTarget: Object | null | undefined;
+    /** The handler of a scripted proxy, like `proxyTarget`. */
+    readonly proxyHandler: Object | null | undefined;
     getOwnPropertyNames(): string[];
+    getOwnPropertyNamesLength(): number;
     getOwnPropertyDescriptor(name: string): PropertyDescriptor | undefined;
     setProperty(name: string, value: unknown): CompletionValue;
+    call(thisValue: unknown, ...args: unknown[]): CompletionValue;
     executeInGlobal(code: string): CompletionValue;
+    /** The referent itself, wrapped for the debugger's realm. */
+    unsafeDereference(): object;
   }
 
   interface PropertyDescriptor {

@@ -326,15 +326,12 @@ fn deliver_bytes(
 ) -> Result<Option<Vec<u8>>, ExnThrown> {
     if let Some(request) = controller.byob_request(scope) {
         if let Some(view) = request.view(scope) {
-            // SAFETY: nothing runs between taking the slice and the copy, so no
-            // GC can move or detach the buffer while the slice is live.
-            let written = unsafe {
-                let target = view.bytes_mut();
+            let written = view.with_bytes_mut(|target| {
                 (target.len() >= bytes.len()).then(|| {
                     target[..bytes.len()].copy_from_slice(&bytes);
                     bytes.len()
                 })
-            };
+            });
             if let Some(written) = written {
                 request.respond(scope, js::conversion::EnforceRange(written as u64))?;
                 return Ok(Some(bytes));
@@ -751,10 +748,8 @@ fn pump_chunk(
             Batch::Bytes(batch) => append_chunk_bytes(scope, chunk, batch),
             Batch::Values(_) => unreachable!("checked above"),
         };
-        if !appended {
-            state.data_mut().end = Some(End::Errored(
-                "a stream<u8> chunk must be an ArrayBufferView or an ArrayBuffer".to_string(),
-            ));
+        if let Err(reason) = appended {
+            state.data_mut().end = Some(End::Errored(reason.to_string()));
         }
     } else {
         // A chunk is checked here, where a mismatch can end the stream. The
@@ -782,23 +777,27 @@ fn pump_chunk(
     Ok(())
 }
 
-/// Append the bytes of a `stream<u8>` chunk to `batch`, returning `false` if it
-/// is neither an `ArrayBufferView` nor an `ArrayBuffer`.
-fn append_chunk_bytes(scope: &Scope<'_>, chunk: HandleValue<'_>, batch: &mut Vec<u8>) -> bool {
-    // SAFETY: growing `batch` runs no JS, so no GC can move or detach the
-    // buffer while its slice is live.
-    unsafe {
-        if let Ok(view) = js::ArrayBufferView::from_jsval(scope, chunk, ()) {
-            batch.extend_from_slice(view.bytes());
-            return true;
-        }
-        match js::ArrayBuffer::from_jsval(scope, chunk, ()) {
-            Ok(buffer) => {
-                batch.extend_from_slice(buffer.bytes());
-                true
-            }
-            Err(_) => false,
-        }
+/// Append the bytes of a `stream<u8>` chunk to `batch`. Fails with the reason
+/// the stream ends if the chunk is neither an `ArrayBufferView` nor an
+/// `ArrayBuffer`, or if growing `batch` fails.
+fn append_chunk_bytes(
+    scope: &Scope<'_>,
+    chunk: HandleValue<'_>,
+    batch: &mut Vec<u8>,
+) -> Result<(), &'static str> {
+    let append = |bytes: &[u8]| {
+        batch
+            .try_reserve(bytes.len())
+            .map_err(|_| "out of memory while buffering a stream<u8> chunk")?;
+        batch.extend_from_slice(bytes);
+        Ok(())
+    };
+    if let Ok(view) = js::ArrayBufferView::from_jsval(scope, chunk, ()) {
+        return view.with_bytes(append);
+    }
+    match js::ArrayBuffer::from_jsval(scope, chunk, ()) {
+        Ok(buffer) => buffer.with_bytes(append),
+        Err(_) => Err("a stream<u8> chunk must be an ArrayBufferView or an ArrayBuffer"),
     }
 }
 

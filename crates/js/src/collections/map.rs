@@ -140,7 +140,18 @@ impl<'s> Stack<'s, Map> {
         &self,
         scope: &'r Scope<'_>,
     ) -> Result<Vec<(HandleValue<'r>, HandleValue<'r>)>, ExnThrown> {
-        let values = super::collect_for_each(scope, self.handle(), wrappers2::MapForEach, 2)?;
+        self.first_entries(scope, u32::MAX)
+    }
+
+    /// The map's first `limit` entries as `(key, value)` pairs, in insertion order. Runs no code
+    /// the script can change.
+    pub fn first_entries<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+        limit: u32,
+    ) -> Result<Vec<(HandleValue<'r>, HandleValue<'r>)>, ExnThrown> {
+        let values =
+            super::collect_for_each(scope, self.handle(), wrappers2::MapForEach, 2, limit)?;
         Ok(values
             .as_chunks::<2>()
             .0

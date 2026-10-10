@@ -898,3 +898,211 @@ fn remote_root_maps_client_paths() {
     dap.request("continue", json!({ "threadId": 1 }));
     assert_eq!(dap.run_to_end().output, "mapped\n");
 }
+
+/// The variable named `name` in the body of a `variables` response.
+fn variable<'a>(variables: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    variables["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == name)
+        .unwrap_or_else(|| panic!("no variable `{name}` in {variables}"))
+}
+
+/// The `variables` of `reference`, with `arguments` added to the request.
+fn variables_of(
+    dap: &mut Dap,
+    reference: &serde_json::Value,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let mut request = json!({ "variablesReference": reference });
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(arguments.as_object().unwrap().clone());
+    dap.request("variables", request)
+}
+
+#[test]
+fn next_at_the_end_of_a_timer_callback_stops_in_the_next_callback() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = [
+        "setTimeout(() => {",
+        "  console.log('a');",
+        "}, 0);",
+        "setTimeout(() => {",
+        "  console.log('b');",
+        "}, 0);",
+    ];
+    let mut dap = stopped_at(dir.path(), &lines, 2);
+    let mut line = 2;
+    for _ in 0..4 {
+        step(&mut dap, "next");
+        line = dap.top_frame().1;
+        if line >= 4 {
+            break;
+        }
+    }
+    assert!((4..=5).contains(&line), "stopped on line {line}");
+    dap.request("continue", json!({ "threadId": 1 }));
+    assert_eq!(dap.run_to_end().output, "a\nb\n");
+}
+
+#[test]
+fn hover_evaluation_stops_before_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut dap, _) = stopped_in_add(dir.path());
+    let hover = |dap: &mut Dap, expression: &str| {
+        let seq = dap.send_request(
+            "evaluate",
+            json!({ "expression": expression, "context": "hover", "frameId": 1 }),
+        );
+        dap.response(seq)
+    };
+    assert_eq!(hover(&mut dap, "sum")["body"]["result"], "42");
+    assert_eq!(hover(&mut dap, "point.x")["body"]["result"], "1");
+    for expression in [
+        "sum++",
+        "point.x = 5",
+        "point.y.push(4)",
+        "console.log('hovered')",
+    ] {
+        let response = hover(&mut dap, expression);
+        assert_eq!(response["success"], false, "{expression}: {response}");
+    }
+    assert_eq!(dap.evaluate("sum")["result"], "42");
+    assert_eq!(dap.evaluate("point.x + point.y.length")["result"], "3");
+    dap.request("continue", json!({ "threadId": 1 }));
+    assert_eq!(dap.run_to_end().output, "42\n");
+}
+
+#[test]
+fn expanding_variables_runs_no_getters_or_proxy_traps() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = [
+        "let calls = 0;",
+        "const obj = { get g() { calls++; return 7; } };",
+        "const handler = { ownKeys() { calls++; return []; } };",
+        "const proxy = new Proxy({ a: 1 }, handler);",
+        "new Function('obj', 'proxy', 'with (obj) { debugger; }')(obj, proxy);",
+        "console.log(calls);",
+    ];
+    let script = write_script(dir.path(), "main.js", &lines);
+    let mut dap = Dap::spawn(&script);
+    dap.start(json!({}));
+    dap.request("configurationDone", json!({}));
+    dap.event("stopped");
+    let scopes = dap.request("scopes", json!({ "frameId": 1 }));
+    assert_eq!(scopes["scopes"][0]["name"], "Local");
+    let local = variables_of(
+        &mut dap,
+        &scopes["scopes"][0]["variablesReference"],
+        json!({}),
+    );
+    assert_eq!(
+        variable(&local, "g")["presentationHint"]["lazy"],
+        true,
+        "{local}"
+    );
+    let proxy = variables_of(
+        &mut dap,
+        &variable(&local, "proxy")["variablesReference"],
+        json!({}),
+    );
+    assert_eq!(variable(&proxy, "[[Target]]")["value"], "{…}");
+    assert_eq!(variable(&proxy, "[[Handler]]")["value"], "{…}");
+    let obj = variables_of(
+        &mut dap,
+        &variable(&local, "obj")["variablesReference"],
+        json!({}),
+    );
+    let getter = variable(&obj, "g").clone();
+    assert_eq!(getter["presentationHint"]["lazy"], true, "{getter}");
+    let global = scopes["scopes"].as_array().unwrap().last().unwrap().clone();
+    variables_of(&mut dap, &global["variablesReference"], json!({}));
+    let value = variables_of(&mut dap, &getter["variablesReference"], json!({}));
+    assert_eq!(values(&value), [("g".to_string(), "7".to_string())]);
+    dap.request("continue", json!({ "threadId": 1 }));
+    assert_eq!(dap.run_to_end().output, "1\n");
+}
+
+#[test]
+fn arrays_and_typed_arrays_are_paged() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = [
+        "const bytes = new Uint8Array(100000);",
+        "bytes[12] = 7;",
+        "const list = [1, 2, 3];",
+        "debugger;",
+    ];
+    let script = write_script(dir.path(), "main.mjs", &lines);
+    let mut dap = Dap::spawn(&script);
+    dap.start(json!({}));
+    dap.request("configurationDone", json!({}));
+    dap.event("stopped");
+    let bytes = dap.evaluate("bytes");
+    assert_eq!(bytes["indexedVariables"], 100000, "{bytes}");
+    let page = variables_of(
+        &mut dap,
+        &bytes["variablesReference"],
+        json!({ "filter": "indexed", "start": 10, "count": 5 }),
+    );
+    assert_eq!(
+        values(&page),
+        [
+            ("10", "0"),
+            ("11", "0"),
+            ("12", "7"),
+            ("13", "0"),
+            ("14", "0")
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+    );
+    let named = variables_of(
+        &mut dap,
+        &bytes["variablesReference"],
+        json!({ "filter": "named" }),
+    );
+    let names: Vec<_> = values(&named).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["[[Prototype]]"]);
+    let list = dap.evaluate("list");
+    assert_eq!(list["indexedVariables"], 3, "{list}");
+    let named = variables_of(
+        &mut dap,
+        &list["variablesReference"],
+        json!({ "filter": "named" }),
+    );
+    let names: Vec<_> = values(&named).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["length", "[[Prototype]]"]);
+    dap.request("continue", json!({ "threadId": 1 }));
+    dap.run_to_end();
+}
+
+#[test]
+fn zero_based_lines_and_columns_are_converted() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_script(dir.path(), "main.mjs", &["const a = 1;", "console.log(a);"]);
+    let mut dap = Dap::spawn(&script);
+    dap.request(
+        "initialize",
+        json!({ "adapterID": "starling", "linesStartAt1": false, "columnsStartAt1": false }),
+    );
+    dap.request("attach", json!({}));
+    dap.event("initialized");
+    let breakpoints = dap.set_breakpoints(&script, &[1]);
+    dap.request("configurationDone", json!({}));
+    let bound = dap.event("breakpoint");
+    assert_eq!(bound["breakpoint"]["line"], 1, "{bound} {breakpoints:?}");
+    assert_eq!(bound["breakpoint"]["column"], 0, "{bound}");
+    dap.event("stopped");
+    let trace = dap.request("stackTrace", json!({ "threadId": 1 }));
+    assert_eq!(trace["stackFrames"][0]["line"], 1);
+    assert_eq!(trace["stackFrames"][0]["column"], 0);
+    let locations = dap.request(
+        "breakpointLocations",
+        json!({ "source": { "path": script }, "line": 1 }),
+    );
+    assert_eq!(locations["breakpoints"][0]["line"], 1, "{locations}");
+    dap.request("continue", json!({ "threadId": 1 }));
+    assert_eq!(dap.run_to_end().output, "1\n");
+}

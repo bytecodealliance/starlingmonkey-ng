@@ -11,13 +11,13 @@ use std::rc::Rc;
 use core_runtime::event_loop::{with_active_event_loop, Task, TaskId};
 use core_runtime::{jsclass, jsmethods, webidl_interface, webidl_methods};
 use js::error::ExnThrown;
-use js::gc::handle::{Heap, OptionHeapExt};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::heap::Trace;
 use js::native::JSTracer;
 use js::prelude::HandleValue;
 use js::structured_clone::{CloneError, NoHostTransfer, Serialized};
-use js::Callable;
+use js::Object;
 
 use crate::dom_exception::throw_dom_exception;
 use crate::events::algorithms::{self as event_algorithms, ScriptStackState};
@@ -60,10 +60,6 @@ pub struct BroadcastChannel {
     /// Whether `unref()` was called after the last `ref()`.
     #[no_trace]
     unreferenced: bool,
-    /// The `onmessage` event handler.
-    onmessage_handler: Option<Heap<js::function::Callable>>,
-    /// The `onmessageerror` event handler.
-    onmessageerror_handler: Option<Heap<js::function::Callable>>,
     /// The task that keeps the event loop alive while the channel is open and referenced, if
     /// ports behave as in Node.js. See [`super::set_node_ports`].
     #[no_trace]
@@ -172,36 +168,26 @@ impl BroadcastChannel {
 
     /// <https://html.spec.whatwg.org/multipage/web-messaging.html#handler-broadcastchannel-onmessage>
     #[getter]
-    fn onmessage<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onmessage_handler.get(scope)
+    fn onmessage<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        crate::events::event_handler(scope, self, "message")
     }
 
     /// <https://html.spec.whatwg.org/multipage/web-messaging.html#handler-broadcastchannel-onmessage>
     #[setter]
     fn set_onmessage(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
-        let old = self.data().onmessage_handler.get(scope);
-        let handler = crate::events::replace_event_handler(scope, self, "message", old, value);
-        match handler {
-            Some(handler) => self.data_mut().onmessage_handler.set(handler),
-            None => self.data_mut().onmessage_handler = None,
-        }
+        crate::events::set_event_handler(scope, self, "message", value);
     }
 
     /// <https://html.spec.whatwg.org/multipage/web-messaging.html#handler-broadcastchannel-onmessageerror>
     #[getter]
-    fn onmessageerror<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onmessageerror_handler.get(scope)
+    fn onmessageerror<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        crate::events::event_handler(scope, self, "messageerror")
     }
 
     /// <https://html.spec.whatwg.org/multipage/web-messaging.html#handler-broadcastchannel-onmessageerror>
     #[setter]
     fn set_onmessageerror(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
-        let old = self.data().onmessageerror_handler.get(scope);
-        let handler = crate::events::replace_event_handler(scope, self, "messageerror", old, value);
-        match handler {
-            Some(handler) => self.data_mut().onmessageerror_handler.set(handler),
-            None => self.data_mut().onmessageerror_handler = None,
-        }
+        crate::events::set_event_handler(scope, self, "messageerror", value);
     }
 
     /// Node.js's `broadcastChannel.ref()`: let the channel keep the event loop alive again. See

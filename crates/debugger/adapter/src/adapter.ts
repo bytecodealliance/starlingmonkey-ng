@@ -4,6 +4,7 @@ import type { DebugProtocol } from "@vscode/debugprotocol";
 import { Breakpoints } from "./breakpoints";
 import { CAPABILITIES } from "./capabilities";
 import { Sources } from "./sources";
+import { evaluateWithoutSideEffects } from "./side-effects";
 import { Stepper, type StepKind } from "./stepping";
 import { References, describe, scopesOf, variablesOf } from "./values";
 
@@ -42,10 +43,19 @@ export class Adapter {
   launchArguments: LaunchArguments = {};
   /** The global `evaluate` and `setVariable` run in while nothing is paused. */
   private readonly contentGlobal: Debugger.Object;
+  /**
+   * How much the client's line and column numbers are below the adapter's, which start at 1.
+   * `initialize` sets them.
+   */
+  private lineOffset = 0;
+  private columnOffset = 0;
 
-  constructor(readonly dbg: Debugger, contentGlobal: object) {
+  constructor(
+    readonly dbg: Debugger,
+    private readonly rawContentGlobal: object,
+  ) {
     dbg.addAllGlobalsAsDebuggees();
-    this.contentGlobal = dbg.addDebuggee(contentGlobal);
+    this.contentGlobal = dbg.addDebuggee(rawContentGlobal);
     dbg.onNewGlobalObject = (global) => {
       dbg.addDebuggee(global);
     };
@@ -54,7 +64,12 @@ export class Adapter {
       return undefined;
     };
 
-    this.on("initialize", () => CAPABILITIES);
+    this.on("initialize", (request) => {
+      const args = (request as DebugProtocol.InitializeRequest).arguments;
+      this.lineOffset = args.linesStartAt1 === false ? 1 : 0;
+      this.columnOffset = args.columnsStartAt1 === false ? 1 : 0;
+      return CAPABILITIES;
+    });
     this.on("launch", (request) => this.attach(request));
     this.on("attach", (request) => this.attach(request));
     this.on("configurationDone", () => {
@@ -93,16 +108,32 @@ export class Adapter {
           })),
         };
       }
-      return { breakpoints: this.breakpoints.set(args.source.path, requested) };
+      const breakpoints = this.breakpoints.set(
+        args.source.path,
+        requested.map((breakpoint) => ({
+          ...breakpoint,
+          line: this.lineFromClient(breakpoint.line),
+          column: this.columnFromClient(breakpoint.column),
+        })),
+      );
+      return { breakpoints: breakpoints.map((breakpoint) => this.breakpointToClient(breakpoint)) };
     });
     this.on("breakpointLocations", (request) => {
       const args = (request as DebugProtocol.BreakpointLocationsRequest).arguments;
       const path = args?.source.path;
+      if (args === undefined || path === undefined) {
+        return { breakpoints: [] };
+      }
+      const locations = this.breakpoints.locations(
+        path,
+        this.lineFromClient(args.line),
+        args.endLine === undefined ? undefined : this.lineFromClient(args.endLine),
+      );
       return {
-        breakpoints:
-          args === undefined || path === undefined
-            ? []
-            : this.breakpoints.locations(path, args.line, args.endLine),
+        breakpoints: locations.map((location) => ({
+          line: location.line - this.lineOffset,
+          column: location.column === undefined ? undefined : location.column - this.columnOffset,
+        })),
       };
     });
     this.on("continue", () => {
@@ -151,19 +182,28 @@ export class Adapter {
       if (container === undefined) {
         throw new Error("Unknown variables reference");
       }
-      return { variables: variablesOf(container, this.refs) };
+      return { variables: variablesOf(container, this.refs, args) };
     });
     this.on("setVariable", (request) =>
       this.setVariable((request as DebugProtocol.SetVariableRequest).arguments),
     );
     this.on("evaluate", (request) => {
       const args = (request as DebugProtocol.EvaluateRequest).arguments;
+      const frame = this.pausedFrame !== undefined ? this.frame(args.frameId) : undefined;
       const completion =
-        this.pausedFrame !== undefined
-          ? this.frame(args.frameId).eval(args.expression)
-          : this.contentGlobal.executeInGlobal(args.expression);
-      const { value, type, variablesReference } = describe(this.completionValue(completion), this.refs);
-      return { result: value, type, variablesReference };
+        args.context === "hover"
+          ? evaluateWithoutSideEffects(args.expression, frame, this.rawContentGlobal)
+          : frame !== undefined
+            ? frame.eval(args.expression)
+            : this.contentGlobal.executeInGlobal(args.expression);
+      if (completion === null && args.context === "hover") {
+        throw new Error("Evaluation stopped before a possible side effect");
+      }
+      const { value, type, variablesReference, indexedVariables } = describe(
+        this.completionValue(completion),
+        this.refs,
+      );
+      return { result: value, type, variablesReference, indexedVariables };
     });
     this.on("source", (request) => {
       const args = (request as DebugProtocol.SourceRequest).arguments;
@@ -311,8 +351,8 @@ export class Adapter {
     if (this.sources.add(script.source)) {
       this.sendEvent("loadedSource", { reason: "new", source: this.sources.dapSource(script.source) });
     }
-    for (const breakpoint of this.breakpoints.scriptLoaded(script.url)) {
-      this.sendEvent("breakpoint", { reason: "changed", breakpoint });
+    for (const breakpoint of this.breakpoints.scriptLoaded(script)) {
+      this.sendEvent("breakpoint", { reason: "changed", breakpoint: this.breakpointToClient(breakpoint) });
     }
   }
 
@@ -381,9 +421,25 @@ export class Adapter {
     return {
       id,
       name,
-      line: position.lineNumber,
-      column: position.columnNumber,
+      line: position.lineNumber - this.lineOffset,
+      column: position.columnNumber - this.columnOffset,
       source: this.sources.dapSource(frame.script.source),
+    };
+  }
+
+  private lineFromClient(line: number): number {
+    return line + this.lineOffset;
+  }
+
+  private columnFromClient(column: number | undefined): number | undefined {
+    return column === undefined ? undefined : column + this.columnOffset;
+  }
+
+  private breakpointToClient(breakpoint: DebugProtocol.Breakpoint): DebugProtocol.Breakpoint {
+    return {
+      ...breakpoint,
+      line: breakpoint.line === undefined ? undefined : breakpoint.line - this.lineOffset,
+      column: breakpoint.column === undefined ? undefined : breakpoint.column - this.columnOffset,
     };
   }
 
@@ -402,6 +458,9 @@ export class Adapter {
     const container = this.refs.get(args.variablesReference);
     if (container === undefined) {
       throw new Error("Unknown variables reference");
+    }
+    if (container.kind === "getter") {
+      throw new Error("The value a getter returned cannot be set");
     }
     const value = this.completionValue(
       this.pausedFrame !== undefined

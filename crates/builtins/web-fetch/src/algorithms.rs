@@ -97,10 +97,10 @@ pub(crate) fn extract_body<'r>(
         }
         // Step 10 `BufferSource`: Set _source_ to a `copy of the bytes` held by _object_.
         BodyInitOrBytes::BodyInit(BodyInit::ArrayBuffer(buffer)) => {
-            source = BodySource::Bytes(bytes::Bytes::from(buffer.copy_bytes()));
+            source = BodySource::Bytes(bytes::Bytes::from(buffer.copy_bytes(scope)?));
         }
         BodyInitOrBytes::BodyInit(BodyInit::ArrayBufferView(view)) => {
-            source = BodySource::Bytes(bytes::Bytes::from(view.copy_bytes()));
+            source = BodySource::Bytes(bytes::Bytes::from(view.copy_bytes(scope)?));
         }
         // Step 10 `Blob`: Set _source_ to _object_. Set _length_ to _object_’s `size`. If
         //     _object_’s `type` attribute is not the empty byte sequence, set _type_ to its value.
@@ -812,7 +812,7 @@ pub(crate) fn append_to_headers(
     //     return.
     // Steps 3.1–3.4 run inside `is_no_cors_safelisted_request_header_after_append`, which checks
     // the combined value without materializing it.
-    if core_runtime::config::enforce_fetch_restrictions()
+    if core_runtime::config::web_security_restrictions()
         && headers.data().guard == Guard::RequestNoCors
     {
         let safelisted = {
@@ -858,7 +858,7 @@ pub(crate) fn validate_header_name(
     //     request-header`, then return false.
     // Forbidden request-headers are a browser-security policy; skip when an embedder has disabled
     // request restrictions (server-side mode).
-    if core_runtime::config::enforce_fetch_restrictions()
+    if core_runtime::config::web_security_restrictions()
         && headers.data().guard == Guard::Request
         && forbidden_request_header(name, value)
     {
@@ -866,7 +866,7 @@ pub(crate) fn validate_header_name(
     }
     // Step 4: If _headers_’s `guard` is "`response`" and _name_ is a `forbidden response-header
     //     name`, then return false.
-    if core_runtime::config::enforce_fetch_restrictions()
+    if core_runtime::config::web_security_restrictions()
         && headers.data().guard == Guard::Response
         && is_forbidden_response_header_name(name)
     {
@@ -934,7 +934,7 @@ pub fn fill_headers(
 pub(crate) fn refill_headers_from_own_list(headers: &Headers<'_>) {
     // With request restrictions off, both filters below are disabled, and re-appending an
     // existing header list's entries results in the same list. So we can just do nothing.
-    if !core_runtime::config::enforce_fetch_restrictions() {
+    if !core_runtime::config::web_security_restrictions() {
         return;
     }
 

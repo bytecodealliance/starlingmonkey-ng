@@ -318,7 +318,7 @@ impl Runtime {
     /// Returns `Err` with a description if the configured initializer script can't
     /// be read, throws, or leaves asynchronous work behind.
     pub fn init(config: &RuntimeConfig) -> Result<Rc<Self>, String> {
-        crate::config::set_enforce_fetch_restrictions(config.enforce_fetch_restrictions());
+        crate::config::set_web_security_restrictions(config.web_security_restrictions());
         event_loop::set_blocking_host_io_while_serving(config.allow_blocking_host_io);
         // SAFETY: no parent runtime is given, which is the only condition.
         let mut mozjs_rt =

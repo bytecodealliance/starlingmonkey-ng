@@ -661,7 +661,25 @@ impl<'s> Stack<'s, Object> {
                 ids.handle_mut(),
             ))?;
             (0..ids.len())
-                .map(|i| crate::id::id_to_value(scope, ids[i]))
+                .map(|i| crate::id::id_to_key(scope, ids[i]))
+                .collect()
+        }
+    }
+
+    /// The enumerable string keys of this object and of the objects on its prototype chain, as
+    /// `for...in` visits them.
+    pub fn for_in_keys<'r>(&self, scope: &'r Scope<'_>) -> Result<Vec<HandleValue<'r>>, ExnThrown> {
+        // SAFETY: as in `own_keys`.
+        unsafe {
+            let mut ids = mozjs::rust::IdVector::new(scope.cx_mut());
+            ExnThrown::check(wrappers2::GetPropertyKeys(
+                scope.cx_mut(),
+                self.handle(),
+                0,
+                ids.handle_mut(),
+            ))?;
+            (0..ids.len())
+                .map(|i| crate::id::id_to_key(scope, ids[i]))
                 .collect()
         }
     }
@@ -682,7 +700,7 @@ impl<'s> Stack<'s, Object> {
                 ids.handle_mut(),
             ))?;
             (0..ids.len())
-                .map(|i| crate::id::id_to_value(scope, ids[i]))
+                .map(|i| crate::id::id_to_key(scope, ids[i]))
                 .collect()
         }
     }
@@ -1124,6 +1142,15 @@ impl<'s> Stack<'s, Object> {
     ) -> Result<(), ExnThrown> {
         let ok = unsafe { wrappers2::JS_PreventExtensions(scope.cx_mut(), self.handle(), result) };
         ExnThrown::check(ok)
+    }
+
+    /// Prevent extensions on this object, as `Reflect.preventExtensions` does, and return whether
+    /// the object accepted it. An ordinary object always does.
+    pub fn try_prevent_extensions(&self, scope: &Scope<'_>) -> Result<bool, ExnThrown> {
+        // The `Uninitialized` code has all bits set.
+        let mut result = ObjectOpResult { code_: usize::MAX };
+        self.prevent_extensions(scope, &mut result)?;
+        Ok(result.code_ == mozjs::jsapi::ObjectOpResult_SpecialCodes::OkCode as usize)
     }
 
     /// Freeze this object (make all properties non-configurable and

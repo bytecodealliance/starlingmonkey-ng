@@ -39,6 +39,16 @@ pub fn id_to_value<'r>(scope: &'r Scope<'_>, id: jsid) -> Result<HandleValue<'r>
     Ok(vp.handle())
 }
 
+/// The property key `id` as `Reflect.ownKeys` returns it: a string or a symbol. An integer key
+/// becomes its decimal string.
+pub fn id_to_key<'r>(scope: &'r Scope<'_>, id: jsid) -> Result<HandleValue<'r>, ExnThrown> {
+    if id.is_int() {
+        let string = crate::JSString::from_str(scope, &id.to_int().to_string())?;
+        return Ok(scope.root_value(string.as_value()));
+    }
+    id_to_value(scope, id)
+}
+
 /// Convert a numeric index to a property key.
 pub fn index_to_id(scope: &Scope<'_>, index: u32) -> Result<jsid, ExnThrown> {
     rooted!(in(unsafe { scope.raw_cx_no_gc() }) let mut idp = jsid::default());

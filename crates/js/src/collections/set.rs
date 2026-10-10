@@ -113,7 +113,16 @@ impl<'s> Stack<'s, Set> {
 
     /// The set's values, in insertion order. Runs no code the script can change.
     pub fn values_vec<'r>(&self, scope: &'r Scope<'_>) -> Result<Vec<HandleValue<'r>>, ExnThrown> {
-        super::collect_for_each(scope, self.handle(), wrappers2::SetForEach, 1)
+        self.first_values(scope, u32::MAX)
+    }
+
+    /// The set's first `limit` values, in insertion order. Runs no code the script can change.
+    pub fn first_values<'r>(
+        &self,
+        scope: &'r Scope<'_>,
+        limit: u32,
+    ) -> Result<Vec<HandleValue<'r>>, ExnThrown> {
+        super::collect_for_each(scope, self.handle(), wrappers2::SetForEach, 1, limit)
     }
 
     /// Check whether an object is a `Set`.

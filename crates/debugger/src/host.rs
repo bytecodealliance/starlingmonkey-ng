@@ -45,11 +45,6 @@ pub mod host_globals {
         crate::session::may_pause()
     }
 
-    /// Write `message` and a newline to stderr.
-    pub fn print(message: String) {
-        eprintln!("{message}");
-    }
-
     /// Send `exited` and `terminated`, flush the transport and exit the process.
     pub fn terminate() {
         crate::session::terminate()

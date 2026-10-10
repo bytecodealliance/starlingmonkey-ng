@@ -93,11 +93,14 @@ own diagnostics appear in the client's debug console.
 
 Supported: line breakpoints (bound when their module loads), `debugger;` statements, pausing,
 stepping (including over `await`), call stacks, scopes, variables and `setVariable`, evaluation
-while paused or running, and source text for code without a file path. A `fetch` or timer an
-`evaluate` starts while paused makes progress once the debuggee resumes. A promise reaction it
-queues while paused, as in `Promise.resolve().then(f)`, runs at the next microtask checkpoint
-after the debuggee resumes. An `evaluate` before `configurationDone` can start timers and `fetch`,
-but only serve modes run them (see [Serving](#serving)).
+while paused or running, and source text for code without a file path. Expanding scopes and
+objects runs no debuggee code: a getter runs when its property is expanded, and a proxy shows its
+target and handler. An `evaluate` for a hover fails once the expression reaches code that can have
+a side effect outside its frame, calls a native function, or has run for 100 ms. A `fetch` or
+timer an `evaluate` starts while paused makes progress once the debuggee resumes. A promise
+reaction it queues while paused, as in `Promise.resolve().then(f)`, runs at the next microtask
+checkpoint after the debuggee resumes. An `evaluate` before `configurationDone` can start timers
+and `fetch`, but only serve modes run them (see [Serving](#serving)).
 
 ### Transports
 
@@ -107,6 +110,7 @@ but only serve modes run them (see [Serving](#serving)).
 - `listen:<port>` or `listen:<addr>:<port>`: a TCP listener on `<addr>`, or on `127.0.0.1` without
   one. Once bound, it prints `debugger listening on <addr>:<port>` to stderr, and port `0` picks a
   free port. It serves one client at a time, and accepts the next client after one disconnects.
+  Clients that connect meanwhile wait in the listen backlog.
   With `,wait` (`listen:9229,wait`), the script starts once a client has attached and sent
   `configurationDone`. Without it, the script starts at once and a client can attach at any time.
 - `connect:<host>:<port>`: a TCP connection to a client listening on `<host>`. The connection
@@ -114,9 +118,10 @@ but only serve modes run them (see [Serving](#serving)).
   (`connect:127.0.0.1:9230,timeout=250`). If no client accepts it, the failure is printed to
   stderr and the script runs without debugging.
 
-`stdio` and `connect` start the script once the client sends `configurationDone`. An IPv6 address
-is written without brackets (`listen:::1:9229`, `connect:::1:9230`), and `listen` needs a port
-after it. The `debugger listening on` line prints an IPv6 address in brackets (`[::1]:9229`).
+`stdio` and `connect` start the script once the client sends `configurationDone`. Natively, a TCP
+client that accepts no data for 10 seconds while the debugger writes to it is disconnected. An IPv6
+address is written without brackets (`listen:::1:9229`, `connect:::1:9230`), and `listen` needs a
+port after it. The `debugger listening on` line prints an IPv6 address in brackets (`[::1]:9229`).
 
 A debug session can evaluate arbitrary code in the debuggee, and the connection is unauthenticated
 plain TCP. Bind `listen` to a loopback address unless everyone who can reach the port is trusted,
@@ -296,9 +301,11 @@ starlingmonkey [OPTIONS] [SCRIPT_PATH]
 
 Arguments:
   [SCRIPT_PATH]   Path to the entry JS/MJS file (default: ./index.js)
+  [ARGS]...       Arguments for the script, in `process.argv` with `--node-compat`
 
 Options:
   -e, --eval <SCRIPT>                Evaluate inline script instead of a file
+  -p, --print <SCRIPT>               As -e, and with --node-compat print the result at exit
   -i, --initializer-script <PATH>    Run an init script (classic, synchronous) before the content script
       --legacy-script                Run as a classic script instead of an ES module
       --node-compat                  Enable Node.js compatibility (node: modules, process, CommonJS)
@@ -613,7 +620,7 @@ math_utils::register(&scope);
 ```
 
 Exported functions are renamed to camelCase, or to the name given with
-`#[js_name = "fileURLToPath"]`; constants keep their declared name.
+`#[function(name = "fileURLToPath")]`; constants keep their declared name.
 The import specifier is the `mod` name camelCased, so `mod math_utils` is
 imported as `"mathUtils"`:
 
@@ -976,7 +983,7 @@ script links the core module, copies its `component-type` sections under
 `starling:`-prefixed names, and wraps it with `wasm-tools component new`. The
 componentizer needs those copies, so it refuses a `starling.wasm` a plain
 `cargo build` wrote. `just test-runtime` runs a JS hello-world (console output,
-`setTimeout`) with it under wasmtime.
+`setTimeout`) and the Node.js compatibility scripts that use host I/O with it under wasmtime.
 
 Running a script calls no `run` export: the script's top level and the event loop
 it starts are the whole program. The `run` export of the main module is called only

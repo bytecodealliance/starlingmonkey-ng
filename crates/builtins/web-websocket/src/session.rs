@@ -120,9 +120,19 @@ pub struct Opening<'a> {
     pub protocols: &'a [String],
     /// `Origin`'s value, if there is one.
     pub origin: Option<String>,
-    /// Further headers, as names and values.
+    /// Further headers, as names and values. Those named like one of [`HANDSHAKE_HEADERS`] are
+    /// left out, since the handshake sets its own.
     pub headers: &'a [(String, String)],
 }
+
+/// The headers whose values every opening handshake sets itself.
+const HANDSHAKE_HEADERS: [&str; 5] = [
+    "Host",
+    "Connection",
+    "Upgrade",
+    "Sec-WebSocket-Version",
+    "Sec-WebSocket-Key",
+];
 
 impl Session {
     /// A session that starts the opening handshake for `opening`, and the TLS handshake first
@@ -164,7 +174,12 @@ impl Session {
         if let Some(origin) = opening.origin {
             request = request.header("Origin", origin);
         }
-        for (name, value) in opening.headers {
+        let further = opening.headers.iter().filter(|(name, _)| {
+            !HANDSHAKE_HEADERS
+                .iter()
+                .any(|own| own.eq_ignore_ascii_case(name))
+        });
+        for (name, value) in further {
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?;
             let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|e| e.to_string())?;
             request = request.header(name, value);

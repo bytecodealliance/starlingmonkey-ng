@@ -48,13 +48,10 @@ fn buffer_source_bytes(
     chunk: HandleValue<'_>,
     interface: &'static str,
 ) -> Result<Vec<u8>, ExnThrown> {
-    // SAFETY: the slices are copied before anything can run a GC.
-    let bytes = match ArrayBufferViewOrArrayBuffer::from_jsval(scope, chunk, ()) {
-        Ok(ArrayBufferViewOrArrayBuffer::Buffer(buffer)) => unsafe { buffer.bytes() },
-        Ok(ArrayBufferViewOrArrayBuffer::View(view)) if !view.is_shared() => unsafe {
-            view.bytes()
-        },
-        Err(js::conversion::ConversionError::ExnPending) => return Err(ExnThrown),
+    match ArrayBufferViewOrArrayBuffer::from_jsval(scope, chunk, ()) {
+        Ok(ArrayBufferViewOrArrayBuffer::Buffer(buffer)) => buffer.copy_bytes(scope),
+        Ok(ArrayBufferViewOrArrayBuffer::View(view)) if !view.is_shared() => view.copy_bytes(scope),
+        Err(js::conversion::ConversionError::ExnPending) => Err(ExnThrown),
         _ => {
             let site = BindingSite {
                 interface,
@@ -66,16 +63,9 @@ fn buffer_source_bytes(
                 value: chunk,
                 message: c"The chunk is not an ArrayBuffer or ArrayBufferView",
             };
-            return Err(throw_binding_error(scope, &site, error));
+            Err(throw_binding_error(scope, &site, error))
         }
-    };
-    let mut copy = Vec::new();
-    if copy.try_reserve_exact(bytes.len()).is_err() {
-        js::exception::report_out_of_memory(scope);
-        return Err(ExnThrown);
     }
-    copy.extend_from_slice(bytes);
-    Ok(copy)
 }
 
 /// Run a codec on `input` with `flush` until it consumed `input` and produced all output, and

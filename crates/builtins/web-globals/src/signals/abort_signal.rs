@@ -8,11 +8,11 @@
 use core_runtime::{webidl_interface, webidl_methods};
 use js::conversion::{ConversionError, FromJSVal};
 use js::error::{throw_binding_error, BindingError, ExnThrown, MemberKind};
-use js::gc::handle::{Heap, OptionHeapExt};
+use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::{ExceptionStackBehavior, Value};
 use js::prelude::HandleValue;
-use js::Callable;
+use js::Object;
 
 use super::algorithms;
 use crate::dom_exception::DOMException;
@@ -76,11 +76,6 @@ pub struct AbortSignal {
 
     /// <https://dom.spec.whatwg.org/#abortsignal-abort-algorithms>
     pub(crate) abort_algorithms: Vec<AbortAlgorithm>,
-
-    /// The `onabort` event handler attribute.
-    ///
-    /// <https://dom.spec.whatwg.org/#dom-abortsignal-onabort>
-    pub(crate) onabort_handler: Option<Heap<js::function::Callable>>,
 }
 
 #[webidl_methods]
@@ -93,7 +88,6 @@ impl AbortSignal {
             source_signals: Vec::new(),
             dependent_signals: Vec::new(),
             abort_algorithms: Vec::new(),
-            onabort_handler: None,
         }
     }
 
@@ -130,42 +124,14 @@ impl AbortSignal {
     ///
     /// IDL event handler attribute: `attribute EventHandler onabort;`
     #[getter]
-    fn onabort<'r>(&self, scope: &'r Scope<'_>) -> Option<Callable<'r>> {
-        self.data().onabort_handler.get(scope)
+    fn onabort<'r>(&self, scope: &'r Scope<'_>) -> Option<Object<'r>> {
+        event_algorithms::event_handler(scope, self, "abort")
     }
 
     /// <https://dom.spec.whatwg.org/#dom-abortsignal-onabort>
     #[setter]
     fn set_onabort(&self, scope: &Scope<'_>, val: HandleValue<'_>) {
-        // Remove the old handler listener, if any. Root it before taking the
-        // mutable borrow of `self`.
-        let old_callback = self.data().onabort_handler.get(scope);
-        if let Some(func) = old_callback {
-            event_algorithms::remove_an_event_listener(
-                &mut self.data_mut().parent,
-                "abort",
-                &func,
-                false,
-            );
-        }
-
-        // If the new value is a function, store it and add as listener.
-        match Callable::from_jsval(scope, val, ()) {
-            Ok(func) => {
-                // The onabort handler is registered without an abort signal.
-                event_algorithms::add_an_event_listener(
-                    self,
-                    "abort".to_string(),
-                    *func,
-                    false,
-                    None,
-                    false,
-                    None,
-                );
-                self.data_mut().onabort_handler.set(func);
-            }
-            Err(_) => self.data_mut().onabort_handler = None,
-        }
+        event_algorithms::set_event_handler(scope, self, "abort", val);
     }
 
     /// <https://dom.spec.whatwg.org/#dom-abortsignal-abort>

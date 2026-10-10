@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! The debug session: where its clients come from, and for each client the debugger realm, the
+//! The debug session: the source of its clients, and for each client the debugger realm, the
 //! adapter evaluated in it, and the state the host functions share.
 
 use std::cell::{Cell, RefCell};
@@ -34,7 +34,7 @@ const ADAPTER_SOURCE: &str = include_str!("../adapter/dist/adapter.js");
 /// Passed to the adapter when the client closes the connection without sending `disconnect`.
 const DISCONNECT: &str = r#"{"type":"request","seq":0,"command":"disconnect","arguments":{}}"#;
 
-/// Where a session's clients come from.
+/// The source of a session's clients.
 pub(crate) enum Source {
     /// The process's stdin and stdout.
     Stdio,
@@ -684,9 +684,12 @@ impl Client {
         });
     }
 
+    /// The debugger global's address, or `None` once the runtime's shutdown hook released it.
     fn global_ptr(&self) -> Option<NonNull<js::native::JSObject>> {
         let global = self.global.borrow();
-        // SAFETY: the pointer is only used to enter the realm while the root is held.
+        // SAFETY: `self.global` roots the object while `self` is alive, until `release` takes it.
+        // `release` runs only when the runtime is dropped, so not while `in_debugger_realm` uses
+        // the pointer.
         global
             .as_ref()
             .and_then(|global| NonNull::new(unsafe { global.as_ptr() }))

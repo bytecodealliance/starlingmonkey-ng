@@ -6,10 +6,10 @@
 # embedded, and the npm packages `componentize/npm/package.mjs` assembles from them.
 #
 # A `v<version>` tag, which must name the workspace's version, publishes the npm packages and
-# creates a GitHub release with `starling.wasm` and each platform's `starling-componentize`. A
-# manual run publishes the npm packages only with `publish` set, and otherwise runs
-# `npm publish --dry-run`. Every run uploads the packages' tarballs as the `npm-tarballs`
-# artifact, which the Spin JS SDK's preview kits are built from.
+# creates a GitHub release with `starling.wasm`, each platform's `starling-componentize` and a
+# `SHA256SUMS` file of their digests. A manual run publishes the npm packages only with `publish`
+# set, and otherwise runs `npm publish --dry-run`. Every run uploads the packages' tarballs as the
+# `npm-tarballs` artifact, which the Spin JS SDK's preview kits are built from.
 
 name: Release
 
@@ -33,12 +33,16 @@ defaults:
   run:
     shell: bash
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   WASI_SDK_VERSION: "34"
   WASMTIME_VERSION: "49.0.0"
   WASM_TOOLS_VERSION: "1.258.0"
   STARLING_NIGHTLY: nightly-2026-09-24
+  NODE_VERSION: "24.21.0"
   RUSTC_WRAPPER: sccache
   CCACHE: sccache
   SCCACHE_GHA_VERSION: 1
@@ -48,7 +52,7 @@ jobs:
     name: Build the runtime
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The release tags `check-init-wit.sh` compares with.
           fetch-depth: 0
@@ -75,7 +79,7 @@ jobs:
       - name: Build the static runtime
         run: just build-runtime
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runtime
           path: target/wasm32-wasip3/release/starling.wasm
@@ -100,12 +104,12 @@ jobs:
       RUSTC_WRAPPER: ""
       CCACHE: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install the Rust toolchain
         run: rustup show
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: runtime
           path: runtime
@@ -114,9 +118,15 @@ jobs:
         if: matrix.zigbuild
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
-          "$RUNNER_TEMP/zig/bin/pip" install ziglang
+          # The wheels for x86_64 and aarch64 Linux.
+          cat > "$RUNNER_TEMP/zig-requirements.txt" <<'EOF'
+          ziglang==0.17.0 \
+            --hash=sha256:97079827064a7492cce5541ceb438ae8003ce1e54e399676da2d62fb7a5dc08b \
+            --hash=sha256:d2804f94f54f7fcf8169f4b212a619ad688a4e2e6592e976f0cf2e58e2cd8af3
+          EOF
+          "$RUNNER_TEMP/zig/bin/pip" install --require-hashes -r "$RUNNER_TEMP/zig-requirements.txt"
           echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
-          cargo install --locked cargo-zigbuild
+          cargo install --locked cargo-zigbuild --version 0.23.4
 
       - name: Build starling-componentize
         working-directory: componentize
@@ -142,7 +152,7 @@ jobs:
           mkdir -p out
           cp "$exe" out/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binary-${{ matrix.platform }}
           path: out/
@@ -157,14 +167,14 @@ jobs:
       # For npm's provenance statement.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "lts/*"
+          node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: binary-*
           path: binaries
@@ -186,7 +196,7 @@ jobs:
             (cd "$dir" && npm pack --pack-destination ../../npm-tarballs)
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npm-tarballs
           path: npm-tarballs/
@@ -214,12 +224,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: runtime
           path: assets
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: binary-*
           path: binaries
@@ -236,5 +246,6 @@ jobs:
               cp "$exe" "assets/starling-componentize-${platform}${name#starling-componentize}"
             done
           done
+          (cd assets && sha256sum -- * > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" --title "StarlingMonkey $GITHUB_REF_NAME" \
             --generate-notes assets/*

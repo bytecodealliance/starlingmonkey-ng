@@ -38,7 +38,7 @@ use std::ffi::CStr;
 use std::os::raw::c_uint;
 use std::ptr::NonNull;
 
-use super::error::{report_error_ascii, ExnThrown};
+use super::error::{report_error_ascii, ExnThrown, ThrowException};
 use crate::builtins::JSType;
 use crate::conversion::ToJSVal;
 use crate::gc::handle::Stack;
@@ -181,13 +181,17 @@ impl<'s> Stack<'s, Function> {
     // Function calling
     // ---------------------------------------------------------------------------
 
-    /// Call a function value with the given `this` object and arguments.
+    /// Call a function value with the given `this` object and arguments. A `fval` that isn't
+    /// callable throws the `TypeError` of [`throw_not_callable`].
     pub fn call_value<'a>(
         scope: &'a Scope<'_>,
         this: HandleObject,
         fval: HandleValue,
         args: &[impl ToJSVal<'a>],
     ) -> Result<HandleValue<'a>, ExnThrown> {
+        if !is_callable(fval) {
+            return Err(throw_not_callable(scope, fval));
+        }
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
         let mut rval = scope.root_value_mut(UndefinedValue());
@@ -205,7 +209,8 @@ impl<'s> Stack<'s, Function> {
     }
 
     /// Call a named method on an object. The method is looked up through the global's interned
-    /// key for `name` (see [`get_or_init_property_id`](crate::class::get_or_init_property_id)).
+    /// key for `name` (see [`get_or_init_property_id`](crate::class::get_or_init_property_id)). A
+    /// property that isn't callable throws a `TypeError` that `name` is not a function.
     pub fn call_by_name<'a>(
         scope: &'a Scope<'_>,
         obj: HandleObject,
@@ -216,6 +221,10 @@ impl<'s> Stack<'s, Function> {
         let mut fval = scope.root_value_mut(UndefinedValue());
         let ok = unsafe { wrappers2::JS_GetPropertyById(scope.cx_mut(), obj, id, fval.reborrow()) };
         ExnThrown::check(ok)?;
+        if !is_callable(fval.handle()) {
+            let message = format!("{} is not a function", name.to_string_lossy());
+            return Err(crate::error::TypeError(message).throw(scope));
+        }
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
         let mut rval = scope.root_value_mut(UndefinedValue());
@@ -232,13 +241,18 @@ impl<'s> Stack<'s, Function> {
         Ok(rval.handle())
     }
 
-    /// Call a function object with a given `this` value.
+    /// Call a function object with a given `this` value. A `fun` that isn't callable throws the
+    /// `TypeError` of [`throw_not_callable`].
     pub fn call<'a>(
         scope: &'a Scope<'_>,
         this: impl ToJSVal<'a>,
         fun: impl ToJSVal<'a>,
         args: &[impl ToJSVal<'a>],
     ) -> Result<HandleValue<'a>, ExnThrown> {
+        let fun = fun.to_jsval_throwing(scope)?;
+        if !is_callable(fun) {
+            return Err(throw_not_callable(scope, fun));
+        }
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
         let mut rval = scope.root_value_mut(UndefinedValue());
@@ -246,7 +260,7 @@ impl<'s> Stack<'s, Function> {
             wrappers2::Call(
                 scope.cx_mut(),
                 this.to_jsval_throwing(scope)?,
-                fun.to_jsval_throwing(scope)?,
+                fun,
                 &args.handles(),
                 rval.reborrow(),
             )
@@ -607,6 +621,25 @@ impl<'a> CallbackArgs<'a> {
 pub fn is_callable(value: HandleValue<'_>) -> bool {
     // SAFETY: `value` is rooted, so an object it holds is live.
     value.is_object() && unsafe { mozjs::jsapi::JS::IsCallable(value.to_object()) }
+}
+
+/// Throw the `TypeError` for a call of `value`, which isn't callable: `undefined`, or `value`'s
+/// source as `JS_ValueToSource` gives it, followed by `is not a function`.
+///
+/// Note: SpiderMonkey's own report of a call from native code names an expression it finds in the
+/// calling script's frame, which is an unrelated expression of that script.
+pub fn throw_not_callable(scope: &Scope<'_>, value: HandleValue<'_>) -> ExnThrown {
+    let source = if value.is_undefined() {
+        "undefined".to_string()
+    } else {
+        // SAFETY: `value` is rooted.
+        let source = unsafe { wrappers2::JS_ValueToSource(scope.cx_mut(), value) };
+        let Some(source) = NonNull::new(source) else {
+            return ExnThrown;
+        };
+        crate::conversion::jsstr_to_string(scope, source)
+    };
+    crate::error::TypeError(format!("{source} is not a function")).throw(scope)
 }
 
 /// Type-erased callback stored in a helper function's reserved slot.

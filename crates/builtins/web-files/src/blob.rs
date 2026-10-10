@@ -2,7 +2,9 @@
 
 //! <https://w3c.github.io/FileAPI/#blob-section>
 
-use bytes::{Bytes, BytesMut};
+use std::collections::TryReserveError;
+
+use bytes::Bytes;
 use core_runtime::{webidl_dictionary, webidl_interface, webidl_methods, webidl_union};
 use js::conversion::{Clamp, ToJSVal};
 use js::error::ExnThrown;
@@ -56,18 +58,19 @@ impl BlobImpl {
     }
 
     /// <https://w3c.github.io/FileAPI/#constructorBlob>, after the arguments are converted: a blob
-    /// of the bytes of `blob_parts` and the type of `options`.
+    /// of the bytes of `blob_parts` and the type of `options`, or the error of a failed
+    /// allocation of the bytes.
     pub fn from_parts(
         blob_parts: Option<Vec<BlobPart<'_>>>,
         options: Option<&BlobPropertyBag>,
-    ) -> Self {
+    ) -> Result<Self, TryReserveError> {
         // Step 1: If invoked with zero parameters, return a new ``Blob`` object consisting of 0
         //     bytes, with `size` set to 0, and with `type` set to the empty string.
         // (The other steps produce such a blob for no parts and no options too.)
         // Step 2: Let _bytes_ be the result of `processing blob parts` given _blobParts_ and
         //     _options_.
         let endings = options.and_then(|options| options.endings);
-        let bytes = process_blob_parts(blob_parts.unwrap_or_default(), endings);
+        let bytes = process_blob_parts(blob_parts.unwrap_or_default(), endings)?;
         // Step 3: If the ``type`` member of the _options_ argument is not the empty string, run
         //     the following sub-steps:
         // Step 3.1: Let _t_ be the ``type`` dictionary member. If _t_ contains any characters
@@ -80,7 +83,7 @@ impl BlobImpl {
         // Step 4: Return a ``Blob`` object referring to _bytes_ as its associated `byte
         //     sequence`, with its `size` set to the length of _bytes_, and its `type` set to the
         //     value of _t_ from the substeps above.
-        BlobImpl::with_bytes(bytes, t)
+        Ok(BlobImpl::with_bytes(bytes, t))
     }
 }
 
@@ -94,10 +97,14 @@ pub fn normalize_type(t: &str) -> String {
     }
 }
 
-/// <https://w3c.github.io/FileAPI/#process-blob-parts>
-pub fn process_blob_parts(parts: Vec<BlobPart<'_>>, endings: Option<EndingType>) -> Bytes {
+/// <https://w3c.github.io/FileAPI/#process-blob-parts>, or the error of a failed allocation of
+/// the bytes.
+pub fn process_blob_parts(
+    parts: Vec<BlobPart<'_>>,
+    endings: Option<EndingType>,
+) -> Result<Bytes, TryReserveError> {
     // Step 1: Let _bytes_ be an empty sequence of bytes.
-    let mut bytes = BytesMut::new();
+    let mut bytes = Vec::new();
     // Step 2: For each _element_ in _parts_:
     for element in parts {
         match element {
@@ -109,32 +116,41 @@ pub fn process_blob_parts(parts: Vec<BlobPart<'_>>, endings: Option<EndingType>)
                 //     to native` of _element_.
                 // Step 2.1.3: Append the result of `UTF-8 encoding` _s_ to _bytes_.
                 if endings == Some(EndingType::Native) {
-                    bytes.extend_from_slice(convert_line_endings_to_native(&s).as_bytes());
+                    append(&mut bytes, convert_line_endings_to_native(&s)?.as_bytes())?;
                 } else {
-                    bytes.extend_from_slice(s.as_bytes());
+                    append(&mut bytes, s.as_bytes())?;
                 }
             }
             // Step 2.2: If _element_ is a ``BufferSource``, `get a copy of the bytes held by the
             //     buffer source`, and append those bytes to _bytes_.
-            BlobPart::ArrayBuffer(buffer) => bytes.extend_from_slice(&buffer.copy_bytes()),
-            BlobPart::ArrayBufferView(view) => bytes.extend_from_slice(&view.copy_bytes()),
+            BlobPart::ArrayBuffer(buffer) => buffer.with_bytes(|data| append(&mut bytes, data))?,
+            BlobPart::ArrayBufferView(view) => view.with_bytes(|data| append(&mut bytes, data))?,
             // Step 2.3: If _element_ is a ``Blob``, append the bytes it represents to _bytes_.
-            BlobPart::Blob(blob) => bytes.extend_from_slice(&blob.data().bytes),
+            BlobPart::Blob(blob) => append(&mut bytes, &blob.data().bytes)?,
         }
     }
     // Step 3: Return _bytes_.
-    bytes.freeze()
+    Ok(Bytes::from(bytes))
 }
 
-/// <https://w3c.github.io/FileAPI/#convert-line-endings-to-native>
-fn convert_line_endings_to_native(s: &str) -> String {
+/// Append `data` to `bytes`, reserving the room for it fallibly.
+fn append(bytes: &mut Vec<u8>, data: &[u8]) -> Result<(), TryReserveError> {
+    bytes.try_reserve(data.len())?;
+    bytes.extend_from_slice(data);
+    Ok(())
+}
+
+/// <https://w3c.github.io/FileAPI/#convert-line-endings-to-native>, or the error of a failed
+/// allocation of the result.
+fn convert_line_endings_to_native(s: &str) -> Result<String, TryReserveError> {
     // Step 1: Let _native line ending_ be the `code point` U+000A LF.
     // Step 2: If the underlying platform’s conventions are to represent newlines as a carriage
     //     return and line feed sequence, set _native line ending_ to the `code point` U+000D CR
     //     followed by the `code point` U+000A LF.
     let native_line_ending = if cfg!(windows) { "\r\n" } else { "\n" };
     // Step 3: Set _result_ to the empty `string`.
-    let mut result = String::with_capacity(s.len());
+    let mut result = String::new();
+    result.try_reserve_exact(s.len())?;
     // Step 4: Let _position_ be a `position variable` for _s_, initially pointing at the start
     //     of _s_.
     let mut rest = s;
@@ -170,7 +186,7 @@ fn convert_line_endings_to_native(s: &str) -> String {
         rest = &rest[end..];
     }
     // Step 8: Return _result_.
-    result
+    Ok(result)
 }
 
 /// <https://w3c.github.io/FileAPI/#slice-blob>: the bytes of `bytes` from `start` to `end`, and
@@ -235,17 +251,24 @@ fn slice_blob(
 
 /// <https://encoding.spec.whatwg.org/#utf-8-decode>: strip a leading UTF-8 BOM, then decode,
 /// replacing malformed sequences with U+FFFD.
-fn utf8_decode(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+fn utf8_decode<'r>(scope: &'r Scope<'_>, bytes: &[u8]) -> Result<js::JSString<'r>, ExnThrown> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    String::from_utf8_lossy(bytes)
+    js::JSString::from_utf8_lossy(scope, bytes)
 }
 
 #[webidl_methods]
 impl Blob {
     /// <https://w3c.github.io/FileAPI/#constructorBlob>
     #[constructor]
-    fn new(blob_parts: Option<Vec<BlobPart<'_>>>, options: Option<&BlobPropertyBag>) -> Self {
-        BlobImpl::from_parts(blob_parts, options)
+    fn new(
+        scope: &Scope<'_>,
+        blob_parts: Option<Vec<BlobPart<'_>>>,
+        options: Option<&BlobPropertyBag>,
+    ) -> Result<Self, ExnThrown> {
+        BlobImpl::from_parts(blob_parts, options).map_err(|_| {
+            js::exception::report_out_of_memory(scope);
+            ExnThrown
+        })
     }
 
     /// <https://w3c.github.io/FileAPI/#dfn-size>
@@ -303,8 +326,8 @@ impl Blob {
         //     returns the result of running `UTF-8 decode` on its first argument.
         // (The blob's bytes are in memory, so the promise is resolved with their decoding
         // without a stream.)
-        let text = utf8_decode(&self.data().bytes).into_owned();
-        let value = text.to_jsval_throwing(scope)?;
+        let bytes = self.data().bytes.clone();
+        let value = utf8_decode(scope, &bytes)?.to_jsval_throwing(scope)?;
         Promise::new_resolved_with_value(scope, value)
     }
 
