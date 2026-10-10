@@ -1,0 +1,5 @@
+{
+  "Send unpaired surrogates on a WebSocket - Connection should be closed": {
+    "status": "PASS"
+  }
+}

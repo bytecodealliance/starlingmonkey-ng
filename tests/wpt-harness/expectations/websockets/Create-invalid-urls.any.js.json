@@ -1,0 +1,26 @@
+{
+  "new WebSocket(\"ws://foo bar.com/\") should throw a \"SyntaxError\" DOMException": {
+    "status": "PASS"
+  },
+  "new WebSocket(\"wss://foo bar.com/\") should throw a \"SyntaxError\" DOMException": {
+    "status": "PASS"
+  },
+  "new WebSocket(\"ftp://web-platform.test:8000/\") should throw a \"SyntaxError\" DOMException": {
+    "status": "PASS"
+  },
+  "new WebSocket(\"mailto:example@example.org\") should throw a \"SyntaxError\" DOMException": {
+    "status": "PASS"
+  },
+  "new WebSocket(\"about:blank\") should throw a \"SyntaxError\" DOMException": {
+    "status": "PASS"
+  },
+  "new WebSocket(\"http://web-platform.test:8000/#\") should throw a \"SyntaxError\" DOMException": {
+    "status": "PASS"
+  },
+  "new WebSocket(\"http://web-platform.test:8000/#test\") should throw a \"SyntaxError\" DOMException": {
+    "status": "PASS"
+  },
+  "new WebSocket(\"#test\") should throw a \"SyntaxError\" DOMException": {
+    "status": "PASS"
+  }
+}

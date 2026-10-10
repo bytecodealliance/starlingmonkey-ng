@@ -1,0 +1,5 @@
+{
+  "Create WebSocket - wsocket.protocol should be empty before connection is established": {
+    "status": "PASS"
+  }
+}

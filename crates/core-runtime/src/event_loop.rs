@@ -724,6 +724,11 @@ impl EventLoop {
         }
     }
 
+    /// The loop's process-unique id.
+    pub fn id(&self) -> u64 {
+        self.loop_id
+    }
+
     /// The [`platform::clock::monotonic_ns`] reading at the loop's first [`step`](Self::step), or
     /// `None` before it.
     pub fn started_ns(&self) -> Option<u64> {

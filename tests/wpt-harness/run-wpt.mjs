@@ -383,7 +383,7 @@ const WPT_PATH_ALIASES = {
 // ensureWptServer passes to `wpt serve`.
 const WPT_HOST = "web-platform.test";
 const WPT_ALT_HOST = "not-web-platform.test";
-const WPT_PORTS = { http: [8000, 8001], https: [8443, 8444] };
+const WPT_PORTS = { http: [8000, 8001], https: [8443, 8444], ws: [49001], wss: [49002] };
 
 function isSubstitutedPath(filePath) {
   return path.basename(filePath).includes(".sub.");
@@ -694,8 +694,9 @@ function mergeExpectations(previous, results) {
 const WASMTIME_CODEGEN_FLAGS = ["-C", "native-unwind-info=n"];
 
 // The WASI capabilities the runtime needs: environment (its configuration arrives there in serve
-// mode), and the network/HTTP stack the `fetch` tests exercise.
-const WASI_FLAGS = "inherit-env=y,inherit-network=y,http=y,tcp=y,udp=y,p3=y";
+// mode), the network/HTTP stack the `fetch` tests exercise, and the sockets and host name lookups
+// of the `websockets` tests.
+const WASI_FLAGS = "inherit-env=y,inherit-network=y,allow-ip-name-lookup=y,http=y,tcp=y,udp=y,p3=y";
 
 // Pre-initialize the wasm runtime with Wizer, baking the serve-mode WPT harness and its
 // configuration into the snapshot.
@@ -1215,18 +1216,24 @@ function isWptPortReachable(port) {
 }
 
 /**
- * Every HTTP port in `WPT_PORTS` must answer, not just the first: those are the
- * ports `substituteWptTemplates` bakes into `.sub.` tests, and a server missing
- * one still serves everything else. Short-circuits, so the usual case costs a
- * single probe.
+ * Every HTTP and WebSocket port in `WPT_PORTS` must answer, not just the first:
+ * those are the ports `substituteWptTemplates` bakes into `.sub.` tests, and a
+ * server missing one still serves everything else. The WebSocket server answers
+ * a plain HTTP request too. Short-circuits, so the usual case costs a single
+ * probe.
  */
 function isWptServerReachable() {
-  return WPT_PORTS.http.every(port => isWptPortReachable(port));
+  return probedWptPorts().every(port => isWptPortReachable(port));
 }
 
-/** The HTTP ports that are not being served, for diagnostics. */
+/** The HTTP and WebSocket ports that are not being served, for diagnostics. */
 function unreachableWptPorts() {
-  return WPT_PORTS.http.filter(port => !isWptPortReachable(port));
+  return probedWptPorts().filter(port => !isWptPortReachable(port));
+}
+
+/** The ports whose server answers plain HTTP: the HTTP ports and the `ws` ports. */
+function probedWptPorts() {
+  return [...WPT_PORTS.http, ...WPT_PORTS.ws];
 }
 
 /**

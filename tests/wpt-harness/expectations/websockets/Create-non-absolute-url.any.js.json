@@ -1,0 +1,14 @@
+{
+  "Create WebSocket - Pass a non absolute URL: test": {
+    "status": "PASS"
+  },
+  "Create WebSocket - Pass a non absolute URL: ?": {
+    "status": "PASS"
+  },
+  "Create WebSocket - Pass a non absolute URL: null": {
+    "status": "PASS"
+  },
+  "Create WebSocket - Pass a non absolute URL: 123": {
+    "status": "PASS"
+  }
+}

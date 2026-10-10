@@ -1,0 +1,5 @@
+{
+  "Send binary data on a WebSocket - ArrayBufferView - Int16Array with offset - Connection should be closed": {
+    "status": "PASS"
+  }
+}

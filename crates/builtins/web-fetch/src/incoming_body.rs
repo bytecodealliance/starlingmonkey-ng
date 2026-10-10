@@ -30,7 +30,7 @@ use web_streams::AlgorithmArg;
 /// uniquely owned. A shared chunk (another `Bytes` clone alive, e.g. a body
 /// source retained elsewhere) is copied instead: JS gets write access to the
 /// buffer, so it must not alias memory other owners can still read.
-pub(crate) fn array_buffer_from_body_bytes<'r>(
+pub fn array_buffer_from_body_bytes<'r>(
     scope: &'r Scope<'_>,
     bytes: platform::http::BodyBytes,
 ) -> Result<js::ArrayBuffer<'r>, ExnThrown> {

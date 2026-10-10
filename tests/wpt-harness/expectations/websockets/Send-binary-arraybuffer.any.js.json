@@ -1,0 +1,5 @@
+{
+  "Send binary data on a WebSocket - ArrayBuffer - Connection should be closed": {
+    "status": "PASS"
+  }
+}

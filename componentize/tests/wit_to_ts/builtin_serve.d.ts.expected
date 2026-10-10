@@ -487,5 +487,6 @@ declare module 'wasi:random/insecure-seed@0.3.0' {
 
 declare module 'wasi:random/random@0.3.0' {
   export function getRandomBytes(maxLen: bigint): Uint8Array;
+  export function getRandomU64(): bigint;
 }
 

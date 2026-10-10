@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 
-use core_runtime::event_loop::{with_active_event_loop, InterestHandle, Task, TaskId};
+use core_runtime::event_loop::{with_active_event_loop, Task, TaskId};
 use core_runtime::{webidl_interface, webidl_methods};
 use js::conversion::{ConversionError, FromJSVal};
 use js::error::ExnThrown;
@@ -61,10 +61,10 @@ pub struct MessagePort {
     onmessage_handler: Option<Heap<js::function::Callable>>,
     /// The `onmessageerror` event handler.
     onmessageerror_handler: Option<Heap<js::function::Callable>>,
-    /// The interest that keeps the event loop alive while the port can receive messages. See
+    /// The task that keeps the event loop alive while the port can receive messages. See
     /// [`super::set_node_ports`].
     #[no_trace]
-    keep_alive: Option<InterestHandle>,
+    keep_alive: Option<super::KeepAlive>,
 }
 
 #[webidl_methods]
@@ -159,7 +159,13 @@ impl MessagePort {
     #[method]
     fn close(&self, scope: &Scope<'_>) {
         // Step 1: Set `this`'s `[[Detached]]` internal slot value to true.
-        self.data_mut().detached = true;
+        // As in Node.js, the messages in the port message queue are dropped, and their tasks find
+        // the queue empty.
+        {
+            let mut data = self.data_mut();
+            data.detached = true;
+            data.queue.clear();
+        }
         // Step 2: If `this` is `entangled`, `disentangle` it.
         if self.data().entangled.is_some() {
             self.disentangle(scope);
@@ -230,7 +236,7 @@ impl MessagePort {
             "message" => self.data().onmessage_handler.get(scope),
             _ => self.data().onmessageerror_handler.get(scope),
         };
-        let handler = super::replace_event_handler(scope, self, event_type, old, value);
+        let handler = crate::events::replace_event_handler(scope, self, event_type, old, value);
         let mut data = self.data_mut();
         let slot = match event_type {
             "message" => &mut data.onmessage_handler,
@@ -382,7 +388,7 @@ impl MessagePort {
         Ok(())
     }
 
-    /// Acquire or release the interest that keeps the event loop alive while the port can receive
+    /// Queue or cancel the task that keeps the event loop alive while the port can receive
     /// messages: while ports behave as in Node.js, and the port is started, referenced, entangled
     /// and not detached, and has a `message` listener.
     pub(crate) fn update_keep_alive(&self) {
@@ -400,11 +406,11 @@ impl MessagePort {
         };
         let held = self.data().keep_alive.is_some();
         if wanted && !held {
-            let interest =
-                with_active_event_loop(|event_loop| event_loop.acquire_interest_handle());
-            self.data_mut().keep_alive = interest;
+            let keep_alive = super::KeepAlive::hold("MessagePort");
+            self.data_mut().keep_alive = keep_alive;
         } else if !wanted && held {
-            self.data_mut().keep_alive = None;
+            let keep_alive = self.data_mut().keep_alive.take();
+            keep_alive.expect("checked above").release();
         }
     }
 }

@@ -1,0 +1,5 @@
+{
+  "Create WebSocket - Pass a valid URL - Connection should be closed": {
+    "status": "PASS"
+  }
+}

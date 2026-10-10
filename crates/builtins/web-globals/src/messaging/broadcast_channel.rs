@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use core_runtime::event_loop::{with_active_event_loop, InterestHandle, Task, TaskId};
+use core_runtime::event_loop::{with_active_event_loop, Task, TaskId};
 use core_runtime::{jsclass, jsmethods, webidl_interface, webidl_methods};
 use js::error::ExnThrown;
 use js::gc::handle::{Heap, OptionHeapExt};
@@ -64,10 +64,10 @@ pub struct BroadcastChannel {
     onmessage_handler: Option<Heap<js::function::Callable>>,
     /// The `onmessageerror` event handler.
     onmessageerror_handler: Option<Heap<js::function::Callable>>,
-    /// The interest that keeps the event loop alive while the channel is open and referenced, if
+    /// The task that keeps the event loop alive while the channel is open and referenced, if
     /// ports behave as in Node.js. See [`super::set_node_ports`].
     #[no_trace]
-    keep_alive: Option<InterestHandle>,
+    keep_alive: Option<super::KeepAlive>,
 }
 
 #[webidl_methods]
@@ -180,7 +180,7 @@ impl BroadcastChannel {
     #[setter]
     fn set_onmessage(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
         let old = self.data().onmessage_handler.get(scope);
-        let handler = super::replace_event_handler(scope, self, "message", old, value);
+        let handler = crate::events::replace_event_handler(scope, self, "message", old, value);
         match handler {
             Some(handler) => self.data_mut().onmessage_handler.set(handler),
             None => self.data_mut().onmessage_handler = None,
@@ -197,7 +197,7 @@ impl BroadcastChannel {
     #[setter]
     fn set_onmessageerror(&self, scope: &Scope<'_>, value: HandleValue<'_>) {
         let old = self.data().onmessageerror_handler.get(scope);
-        let handler = super::replace_event_handler(scope, self, "messageerror", old, value);
+        let handler = crate::events::replace_event_handler(scope, self, "messageerror", old, value);
         match handler {
             Some(handler) => self.data_mut().onmessageerror_handler.set(handler),
             None => self.data_mut().onmessageerror_handler = None,
@@ -220,8 +220,8 @@ impl BroadcastChannel {
         self.update_keep_alive();
     }
 
-    /// Acquire or release the interest that keeps the event loop alive while ports behave as in
-    /// Node.js and the channel is open and referenced.
+    /// Queue or cancel the task that keeps the event loop alive while ports behave as in Node.js
+    /// and the channel is open and referenced.
     fn update_keep_alive(&self) {
         let wanted = super::node_ports() && {
             let data = self.data();
@@ -229,11 +229,11 @@ impl BroadcastChannel {
         };
         let held = self.data().keep_alive.is_some();
         if wanted && !held {
-            let interest =
-                with_active_event_loop(|event_loop| event_loop.acquire_interest_handle());
-            self.data_mut().keep_alive = interest;
+            let keep_alive = super::KeepAlive::hold("BroadcastChannel");
+            self.data_mut().keep_alive = keep_alive;
         } else if !wanted && held {
-            self.data_mut().keep_alive = None;
+            let keep_alive = self.data_mut().keep_alive.take();
+            keep_alive.expect("checked above").release();
         }
     }
 

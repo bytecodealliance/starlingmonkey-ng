@@ -10,13 +10,10 @@ pub mod message_port;
 
 use std::cell::Cell;
 
-use js::conversion::FromJSVal;
+use core_runtime::event_loop::{with_active_event_loop, Task, TaskId};
+use js::error::ExnThrown;
 use js::gc::scope::Scope;
-use js::prelude::HandleValue;
-use js::{Callable, Object};
-
-use crate::events::algorithms as event_algorithms;
-use crate::events::event_target::EventTarget;
+use js::Object;
 
 js::instance_local! {
     /// Whether ports behave as in Node.js. See [`set_node_ports`].
@@ -36,32 +33,45 @@ fn node_ports() -> bool {
     NODE_PORTS.with(Cell::get)
 }
 
-/// Replace the listener of the event handler of `target` for `event_type`: remove the listener of
-/// `old`, the current handler, and add `value` as a listener if it is callable. Returns the new
-/// handler, which is `value` if it is callable and `None` otherwise.
-pub(crate) fn replace_event_handler<'s>(
-    scope: &'s Scope<'_>,
-    target: &EventTarget<'_>,
-    event_type: &str,
-    old: Option<Callable<'_>>,
-    value: HandleValue<'_>,
-) -> Option<Callable<'s>> {
-    if let Some(old) = old {
-        event_algorithms::remove_an_event_listener(&mut target.data_mut(), event_type, &old, false);
+/// A task that never becomes ready. While it is queued, it keeps its event loop running, as a
+/// referenced timer does, and like a timer it doesn't extend the lifetime of a served request.
+struct KeepAliveTask(&'static str);
+
+impl Task for KeepAliveTask {
+    fn kind(&self) -> &'static str {
+        self.0
     }
-    let handler = Callable::from_jsval(scope, value, ()).ok();
-    if let Some(handler) = handler {
-        event_algorithms::add_an_event_listener(
-            target,
-            event_type.to_string(),
-            *handler,
-            false,
-            None,
-            false,
-            None,
-        );
+
+    fn run(self: Box<Self>, _scope: &Scope<'_>, _id: TaskId) -> Result<(), ExnThrown> {
+        Ok(())
     }
-    handler
+}
+
+/// The [`KeepAliveTask`] of a port or channel: the id of the event loop it is queued in, and its
+/// own id there.
+struct KeepAlive {
+    loop_id: u64,
+    task: TaskId,
+}
+
+impl KeepAlive {
+    /// Queue a [`KeepAliveTask`] of `kind` in the active event loop. `None` if there is none.
+    fn hold(kind: &'static str) -> Option<KeepAlive> {
+        with_active_event_loop(|event_loop| KeepAlive {
+            loop_id: event_loop.id(),
+            task: event_loop.queue(Box::new(KeepAliveTask(kind))),
+        })
+    }
+
+    /// Cancel the task if the active event loop is the one it is queued in. A task queued in
+    /// another loop stays queued until that loop ends.
+    fn release(self) {
+        with_active_event_loop(|event_loop| {
+            if event_loop.id() == self.loop_id {
+                event_loop.cancel_if_queued(self.task);
+            }
+        });
+    }
 }
 
 pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {

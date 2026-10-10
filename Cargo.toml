@@ -56,10 +56,13 @@ libstarling = { path = "crates/libstarling" }
 md-5 = "0.11"
 memchr = "2.7"
 oxc_resolver = "11"
+percent-encoding = "2"
 platform = { path = "crates/platform" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 ripemd = "0.2"
 ruzstd = "0.9"
+# Native TLS uses aws-lc-rs, the provider reqwest already builds. See `platform::tls`.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 serve-test-support = { path = "crates/serve-test-support" }
 serde_json = "1.0.151"
 sha1 = "0.11"
@@ -68,9 +71,11 @@ sha3 = "0.11"
 smallvec = "1.16"
 starling-macro = { path = "crates/starling-macro" }
 tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 url = "2.5.8"
 urlpattern = "0.6"
 wasip3 = { version = "0.9.0", features = ["http-compat"] }
+webpki-roots = "1"
 # Must equal the `wit-bindgen` version `wasip3` depends on. See `starling/Cargo.toml`.
 wit-bindgen = { version = "=0.62.0", features = ["macros"] }
 wpt-support = { path = "crates/wpt-support" }
@@ -84,6 +89,7 @@ web-files = { path = "crates/builtins/web-files" }
 web-globals = { path = "crates/builtins/web-globals" }
 web-streams = { path = "crates/builtins/web-streams" }
 web-url = { path = "crates/builtins/web-url" }
+web-websocket = { path = "crates/builtins/web-websocket" }
 cpp-builtins = { path = "crates/builtins/cpp-builtins" }
 
 # `block_on_detached` for the debugger's pause on wasm. The fork is wit-bindgen 0.62.0 plus that

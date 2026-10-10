@@ -33,6 +33,7 @@ web-globals.workspace = true
 wpt-support.workspace = true
 web-streams.workspace = true
 web-url.workspace = true
+web-websocket.workspace = true
 cpp-builtins.workspace = true
 debugger.workspace = true
 
