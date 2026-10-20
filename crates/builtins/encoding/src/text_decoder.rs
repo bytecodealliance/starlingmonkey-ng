@@ -110,10 +110,8 @@ impl TextDecoder<'_> {
 
         // Step 3: If _input_ is given, then `push` a `copy of` _input_ to `this`'s `I/O queue`.
         //         (We decode directly from _input_'s bytes. Nothing retains them after this call.)
-        // SAFETY: `input` is rooted via the Uint8Array handle and the slice
-        // is only borrowed for the duration of the decode call below, which
-        // is pure CPU work in `encoding_rs` and cannot trigger GC or detach
-        // the underlying buffer.
+        // SAFETY: `input` is rooted, and the helper consumes the slice or copies it into
+        // Rust-owned output before any JS allocation can GC and move the input buffer.
         let bytes: &[u8] = match input {
             Some(ArrayBufferViewOrArrayBuffer::Buffer(input)) => unsafe { input.bytes() },
             Some(ArrayBufferViewOrArrayBuffer::View(input)) => unsafe { input.bytes() },
@@ -137,7 +135,9 @@ pub(crate) fn decode_bytes_to_js_string<'r>(
     // value, and its decoder keeps no state between calls, so such input is its own
     // Latin-1 output.
     if encoding == encoding_rs::WINDOWS_1252 && !bytes.iter().any(|b| (0x80..=0x9F).contains(b)) {
-        return JSString::from_latin1(scope, bytes);
+        // GC during string allocation can move inline input buffer data.
+        let output = bytes.to_vec();
+        return JSString::from_latin1(scope, &output);
     }
     // A fresh decoder that decodes its whole input at once turns ASCII into the same
     // characters in every ASCII-compatible encoding.
@@ -146,7 +146,8 @@ pub(crate) fn decode_bytes_to_js_string<'r>(
         && encoding.is_ascii_compatible()
         && encoding_rs::Encoding::ascii_valid_up_to(bytes) == bytes.len()
     {
-        return JSString::from_latin1(scope, bytes);
+        let output = bytes.to_vec();
+        return JSString::from_latin1(scope, &output);
     }
 
     // Step 4: Let _output_ be the `I/O queue` of scalar values « `end-of-queue` ».
