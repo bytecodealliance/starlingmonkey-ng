@@ -392,6 +392,42 @@ fn text_decoder_windows_1252() {
     );
 }
 
+#[test]
+fn text_decoder_latin1_fast_paths_gc_safe() {
+    assert_eq!(
+        eval(
+            r#"
+            for (const encoding of ["utf-8", "windows-1252"]) {
+                for (const fatal of [false, true]) {
+                    const decoder = new TextDecoder(encoding, { fatal });
+                    for (const length of [0, 1, 24, 25, 64, 256]) {
+                        const bytes = new Uint8Array(length);
+                        for (let i = 0; i < length; i++) {
+                            bytes[i] = encoding === "utf-8" ? 65 + i % 26 : 0xA0 + i % 96;
+                        }
+                        const padded = new Uint8Array(length + 4);
+                        padded.set(bytes, 2);
+                        const expected = String.fromCharCode(...bytes);
+                        for (const input of [
+                            bytes,
+                            bytes.buffer,
+                            padded.subarray(2, length + 2),
+                            new DataView(padded.buffer, 2, length),
+                        ]) {
+                            if (decoder.decode(input) !== expected) {
+                                throw new Error(`Incorrect ${encoding} fast-path output`);
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        "#,
+        ),
+        "true"
+    );
+}
+
 // ── WebIDL interface compliance ──
 
 #[test]
@@ -704,4 +740,37 @@ fn text_decoder_stream_windows_1252() {
         "#
     ));
     assert_eq!(out, "é");
+}
+
+#[test]
+fn text_decoder_stream_windows_1252_gc_safe() {
+    let out = run_async(&format!(
+        r#"{DRAIN_STR}
+        globalThis.__out = "pending";
+        const inputs = [];
+        const expected = [];
+        for (const length of [1, 24, 25, 64]) {{
+            const bytes = new Uint8Array(length).fill(0xE9);
+            const padded = new Uint8Array(length + 4);
+            padded.set(bytes, 2);
+            inputs.push(
+                bytes,
+                bytes.buffer,
+                padded.subarray(2, length + 2),
+                new DataView(padded.buffer, 2, length),
+            );
+            expected.push("\u00E9".repeat(length * 4));
+        }}
+        const rs = new ReadableStream({{
+            start(c) {{
+                for (const input of inputs) c.enqueue(input);
+                c.close();
+            }}
+        }});
+        drainStr(rs.pipeThrough(new TextDecoderStream("windows-1252")))
+            .then(a => {{ globalThis.__out = String(a.join("") === expected.join("")); }})
+            .catch(e => {{ globalThis.__out = String(e); }});
+        "#
+    ));
+    assert_eq!(out, "true");
 }

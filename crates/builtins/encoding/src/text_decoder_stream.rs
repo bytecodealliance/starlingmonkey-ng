@@ -176,11 +176,8 @@ fn decoder_transform_cb(
         // affect future decode calls. The slice is consumed synchronously here and
         // `encoding_rs::Decoder` retains only its own state. `decode_bytes_to_js_string` performs
         // steps 3-4 with `last = false`, preserving decoder state for the next chunk.
-        // SAFETY: `buffer_source` is rooted, and the slice is only borrowed for the decode call
-        // below, which matches `TextDecoder::decode`.
-        // TODO: `decode_bytes_to_js_string`'s windows-1252 fast path creates the JS string
-        // directly from `bytes`. That allocation can GC and move a small buffer's inline data
-        // while the slice is still in use. Copy the bytes before allocating in that fast path.
+        // SAFETY: `buffer_source` is rooted, and the helper consumes the slice or copies it into
+        // Rust-owned output before any JS allocation can GC and move the input buffer.
         let bytes = match buffer_source {
             ArrayBufferViewOrArrayBuffer::View(view) => unsafe { view.bytes() },
             ArrayBufferViewOrArrayBuffer::Buffer(buffer) => unsafe { buffer.bytes() },
