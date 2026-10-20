@@ -1,0 +1,8 @@
+{
+  "TextEncoderStream readable and writable properties must pass brand checks": {
+    "status": "PASS"
+  },
+  "TextDecoderStream readable and writable properties must pass brand checks": {
+    "status": "PASS"
+  }
+}

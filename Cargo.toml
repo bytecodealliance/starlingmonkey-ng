@@ -56,6 +56,7 @@ web-globals = { path = "crates/builtins/web-globals" }
 web-streams = { path = "crates/builtins/web-streams" }
 web-url = { path = "crates/builtins/web-url" }
 cpp-builtins = { path = "crates/builtins/cpp-builtins" }
+encoding = { path = "crates/builtins/encoding" }
 
 
 [profile.release]

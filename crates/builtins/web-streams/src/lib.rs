@@ -5,6 +5,7 @@ pub mod queuing;
 pub mod readable;
 pub(crate) mod support;
 pub mod transform;
+pub use transform::{TransformStream, TransformStreamImpl};
 pub mod writable;
 
 pub use support::AlgorithmArg;

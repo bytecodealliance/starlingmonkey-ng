@@ -21,6 +21,7 @@ event-listener.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
 http.workspace = true
+encoding.workspace = true
 js.workspace = true
 platform.workspace = true
 fetch-event.workspace = true

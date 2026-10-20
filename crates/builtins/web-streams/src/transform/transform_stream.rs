@@ -11,6 +11,7 @@ use crate::algorithms::extract_size_algorithm;
 use crate::queuing::QueuingStrategy;
 use crate::readable::readable_stream::ReadableStreamImpl;
 use crate::readable::ReadableStream;
+use crate::support::AlgorithmArg;
 use crate::writable::writable_stream::WritableStreamImpl;
 use crate::writable::WritableStream;
 use core_runtime::{webidl_interface, webidl_methods};
@@ -174,15 +175,80 @@ impl TransformStream {
 
     /// <https://streams.spec.whatwg.org/#ts-readable>
     #[getter]
-    fn readable<'r>(&self, scope: &'r Scope<'_>) -> ReadableStream<'r> {
+    pub fn readable<'r>(&self, scope: &'r Scope<'_>) -> ReadableStream<'r> {
         // Step 1: Return `this`.`[[readable]]`.
         self.data().readable.get(scope)
     }
 
     /// <https://streams.spec.whatwg.org/#ts-writable>
     #[getter]
-    fn writable<'r>(&self, scope: &'r Scope<'_>) -> WritableStream<'r> {
+    pub fn writable<'r>(&self, scope: &'r Scope<'_>) -> WritableStream<'r> {
         // Step 1: Return `this`.`[[writable]]`.
         self.data().writable.get(scope)
+    }
+}
+
+/// Helpers for the encoding crate — not part of the WebIDL interface.
+impl TransformStream<'_> {
+    /// <https://streams.spec.whatwg.org/#transformstream-set-up>
+    ///
+    /// Create a TransformStream driven by native algorithms, without exposing a transformer
+    /// object to JavaScript.
+    pub fn new_native<'r>(
+        scope: &'r Scope<'_>,
+        transform: AlgorithmArg<'r>,
+        flush: AlgorithmArg<'r>,
+        cancel: AlgorithmArg<'r>,
+    ) -> Result<TransformStream<'r>, ExnThrown> {
+        let stream = js::class::create_instance_with::<TransformStreamImpl>(scope, |_| {
+            TransformStreamImpl::default()
+        })?;
+        // Step 1: Let writableHighWaterMark be 1.
+        // Step 2: Let writableSizeAlgorithm be an algorithm that returns 1.
+        // Step 3: Let readableHighWaterMark be 0.
+        // Step 4: Let readableSizeAlgorithm be an algorithm that returns 1.
+        // Steps 5-7: Let transformAlgorithmWrapper, flushAlgorithmWrapper, and
+        //            cancelAlgorithmWrapper run the given algorithms, converting their results
+        //            and exceptions to promises.
+        //            (The controller's algorithm invocation performs this wrapping.)
+        // Step 8: Let startPromise be a promise resolved with undefined.
+        let start_promise = Promise::new_resolved_with_value(scope, HandleValue::undefined())?;
+        // Step 9: Perform ! InitializeTransformStream(stream, startPromise,
+        //         writableHighWaterMark, writableSizeAlgorithm, readableHighWaterMark,
+        //         readableSizeAlgorithm).
+        algorithms::initialize_transform_stream(
+            scope,
+            &stream,
+            &start_promise,
+            1.0,
+            HandleValue::undefined(),
+            0.0,
+            HandleValue::undefined(),
+        )?;
+        // Step 10: Let controller be a new TransformStreamDefaultController.
+        let controller = TransformStreamDefaultController::new(scope, stream)?;
+        // Step 11: Perform ! SetUpTransformStreamDefaultController(stream, controller,
+        //          transformAlgorithmWrapper, flushAlgorithmWrapper, cancelAlgorithmWrapper).
+        algorithms::set_up_transform_stream_default_controller(
+            scope,
+            &stream,
+            &controller,
+            transform,
+            flush,
+            cancel,
+            HandleValue::undefined(),
+        );
+        Ok(stream)
+    }
+
+    /// Enqueue a chunk into the readable side of this TransformStream.
+    pub fn enqueue(&self, scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<(), ExnThrown> {
+        let ctrl = self
+            .data()
+            .controller
+            .as_ref()
+            .expect("controller must be set")
+            .get(scope);
+        algorithms::transform_stream_default_controller_enqueue(scope, &ctrl, chunk)
     }
 }

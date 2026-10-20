@@ -14,7 +14,6 @@
 pub mod base64;
 // pub mod console;
 pub mod dom_exception;
-pub mod encoding;
 pub mod events;
 pub mod navigator;
 pub mod performance;
@@ -26,7 +25,6 @@ pub fn add_to_global(scope: &js::prelude::Scope<'_>, global: js::Object<'_>) {
     // Note: the Rust console builtin isn't currently used: we use the C++ version for now.
     // console::console_ns::add_to_global(scope, global);
     dom_exception::DOMException::add_to_global(scope, global);
-    encoding::add_to_global(scope, global);
     events::add_to_global(scope, global);
     performance::add_to_global(scope, global);
     signals::add_to_global(scope, global);

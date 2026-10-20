@@ -10,7 +10,6 @@ edition.workspace = true
 bitflags.workspace = true
 core-runtime.workspace = true
 data-url.workspace = true
-encoding_rs.workspace = true
 js.workspace = true
 platform.workspace = true
 smallvec.workspace = true
