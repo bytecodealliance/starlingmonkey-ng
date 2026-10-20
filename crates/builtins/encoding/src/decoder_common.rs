@@ -16,7 +16,6 @@ pub fn new_decoder(
     }
 }
 
-
 /// Options dictionary for TextDecoder and TextDecoderStream constructors.
 #[core_runtime::webidl_dictionary]
 #[derive(Default)]
