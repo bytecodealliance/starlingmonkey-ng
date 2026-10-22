@@ -14,7 +14,7 @@ use crate::conversion::{ConversionError, ToJSVal};
 use crate::gc::scope::Scope;
 use crate::heap::{MozHeap, Trace};
 use crate::native::{JSObject, JSTracer, RawHandle};
-use mozjs::gc::{GCMethods, Handle, RootedTraceableBox};
+use mozjs::gc::{GCMethods, Handle};
 use mozjs_sys::jsval::ObjectValue;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -546,31 +546,59 @@ impl ToJSVal<'_> for Heap<crate::native::Value> {
     }
 }
 
-/// A GC-rooted boxed handle not tied to any `Scope`'s lifetime.
+/// A GC-rooted boxed reference not tied to any `Scope`'s lifetime: a [`Heap`] that roots itself.
 ///
-/// Use this to store a GC reference in locations that aren't traced themselves.
+/// Use this to store a GC reference in locations that aren't traced themselves. `T` is a
+/// [`JSType`] for an object reference or [`Value`](crate::native::Value) for any JS value, as for
+/// `Heap`. Creating and dropping one takes constant time, whatever order they are dropped in.
 #[crate::allow_unrooted_interior]
-pub struct RootedHeap<T: JSType> {
-    boxed: RootedTraceableBox<MozHeap<*mut JSObject>>,
+pub struct RootedHeap<T: HeapCell> {
+    heap: Pin<Box<MozHeap<T::Cell>>>,
+    /// The slot the heap cell is registered in, or `None` if it was created after the thread's
+    /// state was destroyed.
+    slot: Option<u32>,
     _marker: PhantomData<T>,
+}
+
+#[crate::allow_unrooted]
+impl<T: HeapCell> RootedHeap<T>
+where
+    T::Cell: 'static,
+    MozHeap<T::Cell>: Trace + Default,
+{
+    fn from_cell(cell: T::Cell) -> Self {
+        let heap = Box::pin(MozHeap::default());
+        (*heap).set(cell);
+        let traced: &(dyn Trace + 'static) = &*heap;
+        // SAFETY: the box keeps the cell at this address until `drop` unregisters it.
+        let slot = unsafe { super::rooted::register(NonNull::from(traced)) };
+        RootedHeap {
+            heap,
+            slot,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: HeapCell> Drop for RootedHeap<T> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot {
+            super::rooted::unregister(slot);
+        }
+    }
 }
 
 impl<T: JSType> RootedHeap<T> {
     /// Create a rooted boxed handle for the given stack-rooted object.
     pub fn new<'s>(object: impl Into<Stack<'s, T>>) -> Self {
-        let boxed = RootedTraceableBox::new(MozHeap::default());
-        boxed.set(object.into().handle().get());
-        Self {
-            boxed,
-            _marker: PhantomData,
-        }
+        Self::from_cell(object.into().as_raw())
     }
 
     /// Root the referenced object, returning a stack-rooted handle.
     ///
     /// Returns `T::Rooted<'s>`, the stack-rooted type for `Heap<T>`.
     pub fn get<'s>(&self, scope: &'s Scope<'_>) -> T::Rooted<'s> {
-        let obj = self.boxed.get();
+        let obj = self.heap.get();
         let handle = scope.root_object(NonNull::new(obj).expect("RootedHeap holds an object"));
         T::Rooted::from(Stack {
             handle,
@@ -585,7 +613,32 @@ impl<T: JSType> RootedHeap<T> {
     /// The returned pointer is not rooted. It must not be dereferenced or held across anything
     /// that can GC. Use [`get`](Self::get) for any other use.
     pub unsafe fn as_ptr(&self) -> *mut JSObject {
-        self.boxed.get()
+        self.heap.get()
+    }
+}
+
+#[crate::allow_unrooted]
+impl RootedHeap<crate::native::Value> {
+    /// Root the stored value in `scope`, returning a rooted handle.
+    pub fn get<'s>(&self, scope: &'s Scope<'_>) -> Handle<'s, crate::native::Value> {
+        scope.root_value(self.heap.get())
+    }
+
+    /// The stored value without rooting it.
+    ///
+    /// # Safety
+    ///
+    /// The returned [`Value`](crate::native::Value) is not rooted. The caller must consume it
+    /// before any allocation can trigger a GC, or root it via [`get`](Self::get).
+    pub unsafe fn as_raw(&self) -> crate::native::Value {
+        self.heap.get()
+    }
+}
+
+#[crate::allow_unrooted]
+impl From<crate::native::Value> for RootedHeap<crate::native::Value> {
+    fn from(value: crate::native::Value) -> Self {
+        Self::from_cell(value)
     }
 }
 

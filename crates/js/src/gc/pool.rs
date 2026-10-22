@@ -647,6 +647,9 @@ unsafe impl CustomTrace for HandlePool {
             // values of their tags.
             unsafe { trace_page(trc, page, (top - start).min(PAGE_SIZE)) };
         }
+        // SAFETY: `trc` is valid per this function's contract, and tracing runs with JS execution
+        // paused.
+        unsafe { super::rooted::trace(trc) };
         // SAFETY: Single-threaded access. Registration does not run during tracing.
         for tracer in unsafe { &*self.root_tracers.get() } {
             // SAFETY: `trc` is valid per this function's contract.
