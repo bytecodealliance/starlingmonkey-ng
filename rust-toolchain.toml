@@ -3,9 +3,9 @@ channel = "1.98"
 
 components = [
     "clippy",
-    # For support/crown
+    # For crown
     "llvm-tools",
-    # For support/crown
+    # For crown
     "rustc-dev",
     # For formatting
     "rustfmt",

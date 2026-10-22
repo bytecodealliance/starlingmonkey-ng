@@ -3,9 +3,7 @@
 # Test the Wizer pre-initialization path end to end.
 #
 # The component exports `wizer-initialize`, which `wasmtime wizer` runs before snapshotting the
-# instance's state. That path has no unit-test seam: it only exists as a component export, run by
-# an external tool, and what it produces is only meaningfully checked by serving it. So this
-# builds the component, snapshots it, and serves the snapshot.
+# instance's state. This script builds the component, snapshots it, and serves the snapshot.
 #
 # Usage:
 #   ./scripts/test-wizer.sh            # build the component, then run every case
@@ -67,24 +65,24 @@ check() {
 # Snapshot $2 (a config for STARLINGMONKEY_CONFIG) into $1. Prints wizer's own output; returns
 # wizer's exit status.
 #
-# `--keep-init-func` because dropping the init export — wizer's default — leaves the component
-# referring to a core export that is no longer there ("core instance N has no export named
-# `wizer-initialize`"), and the snapshot then fails to load at all.
+# `--keep-init-func` keeps the init export. Wizer drops it by default, which leaves the component
+# referring to a core export that no longer exists ("core instance N has no export named
+# `wizer-initialize`"), and the snapshot then fails to load.
 snapshot() {
     local out="$1" config="$2"
     wasmtime wizer --keep-init-func=true -o "$out" --dir=.::/cwd --dir=. "${WASI_FLAGS[@]}" \
         --env STARLINGMONKEY_CONFIG="$config" "$COMPONENT" 2>&1
 }
 
-# Serve $1 on a free-ish port and GET /; prints the response body, or a marker if it never came.
+# Serve $1 with config $2 on port $3 and GET /. Prints the response body, or a marker if none came.
 serve_and_get() {
-    local component="$1" config="$2" port="$3" path="${4:-/}"
+    local component="$1" config="$2" port="$3"
     STARLINGMONKEY_CONFIG="$config" wasmtime serve --dir=.::/cwd --dir=. "${WASI_FLAGS[@]}" \
         --addr "127.0.0.1:$port" "$component" >"serve-$port.log" 2>&1 &
     local server=$!
     local body="<no response>"
     for _ in $(seq 1 100); do
-        if body="$(curl -sf --max-time 5 "http://127.0.0.1:$port$path" 2>/dev/null)"; then
+        if body="$(curl -sf --max-time 5 "http://127.0.0.1:$port/" 2>/dev/null)"; then
             break
         fi
         body="<no response>"
@@ -97,8 +95,7 @@ serve_and_get() {
 
 echo "# wizer snapshots"
 
-# A snapshot has to produce a component that still loads. It did not always: dropping the init
-# export leaves a dangling reference, and the failure only shows when something tries to run it.
+# A snapshot has to produce a component that still loads.
 cat >handler.js <<'JS'
 addEventListener('fetch', (event) => event.respondWith(new Response('from-snapshot')));
 JS
@@ -127,8 +124,8 @@ check "a top-level await finishes before the snapshot rather than being refused"
     "after-await" \
     "$(serve_and_get snap-awaited.wasm "awaited.mjs" 18352)"
 
-# Evaluation having finished by snapshot time is what lets the gate judge this one at all: before,
-# a module that awaited first had registered nothing *yet* and had to be let through.
+# Evaluation has finished by snapshot time, so the gate also refuses a listener-less module that
+# awaits first.
 cat >awaited-no-listener.mjs <<'JS'
 await new Promise((resolve) => setTimeout(resolve, 50));
 globalThis.ready = true;
@@ -168,10 +165,10 @@ check "a snapshot taken after a top-level write can write again" \
     "logged" \
     "$(serve_and_get snap-stdio.wasm "stdio.mjs" 18354)"
 
-# Host I/O still running when evaluation ends is a handle belonging to the snapshotting process,
-# and the snapshot carries memory rather than handles — so it is refused rather than resumed into a
-# dangling reference. The upstream is this same component, answering with a promise that never
-# settles, which leaves the fetch genuinely in flight instead of failing fast.
+# Host I/O still running when evaluation ends uses a handle of the snapshotting process. A snapshot
+# holds memory but no handles, so the snapshot is refused. The upstream is this same component,
+# answering with a promise that never settles, which keeps the fetch in flight instead of failing
+# fast.
 cat >hang.js <<'JS'
 addEventListener('fetch', (event) => event.respondWith(new Promise(() => {})));
 JS
@@ -216,9 +213,9 @@ check "a resumed instance's performance.now() is rebased" \
     "startup=sane now=sane" \
     "$(serve_and_get snap-clock.wasm "--legacy-script clock.js" 18353)"
 
-# Post-`await` startup code is startup code: it runs in the snapshotting process, so it reads that
-# process's clock, and the resumed instance's own reading is rebased. Both are small numbers —
-# what must not happen is either of them carrying the other process's origin.
+# Startup code after an `await` runs in the snapshotting process and reads that process's clock,
+# and the resumed instance's own reading is rebased. Neither reading may use the other process's
+# time origin.
 cat >clock-awaited.mjs <<'JS'
 await new Promise((resolve) => setTimeout(resolve, 50));
 const afterAwait = performance.now();

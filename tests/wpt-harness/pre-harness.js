@@ -21,17 +21,11 @@ globalThis.Window = {
   prototype: {}
 };
 
-// Where a finished test's results go. post-harness.js calls this and nothing else, so the running
-// mode is expressed by which sink is installed rather than by the epilogue sniffing for one.
-//
-// Serve mode (wpt-server.js) installs its own — delivering into the response it is holding open —
-// before evaluating this script, so this only supplies command mode's default.
+// Where post-harness.js passes a finished test's results. Serve mode (wpt-server.js) installs its
+// own before this script runs, so this is command mode's.
 globalThis.__wptReportResults ??= function(json) {
-  // The runner reads this line off stdout.
+  // The runner reads this line from stdout.
   console.log("WPT_RESULTS_JSON:" + json);
-  // Stop the event loop now that the results are out: a finished test may have left a live
-  // setInterval (or other pending timer) running, which would otherwise keep the process alive
-  // until the harness timeout. Serve mode's sink deliberately does not do this — there the
-  // response is still to be sent, and this test's loop is the one carrying that work.
+  // Stop the event loop, since a finished test may have left a timer running.
   if (typeof __wptDone === "function") __wptDone();
 };

@@ -27,7 +27,6 @@ JS modules, and functions and properties on the global object.
 - [Building and Testing](#building-and-testing)
 - [Web Platform Tests (WPT)](#web-platform-tests-wpt)
 - [GC Rooting Checks](#gc-rooting-checks)
-- [Key Design Points](#key-design-points)
 
 ---
 
@@ -83,18 +82,14 @@ starlingmonkey --legacy-script old-code.js
 
 ## Built-in APIs
 
-StarlingMonkey's suite of builtins is a work in progress for now.
-
 ### C++ built-ins
 
-The previous incarnation of StarlingMonkey was written in C++. This one has
-support for running built-ins from that version, in the
-[crates/builtins/cpp-builtins](crates/builtins/cpp-builtins) crate. Only the old
-`console` builtin is added right now.
+[crates/builtins/cpp-builtins](crates/builtins/cpp-builtins) runs builtins written for
+StarlingMonkey's earlier C++ implementation through a compatibility layer. It provides `console`.
 
 Builtins are tested against the
 [Web Platform Tests](https://github.com/web-platform-tests/wpt) suite running
-on both native and `wasm32-wasip2` targets.
+on both native and wasm targets.
 
 ---
 
@@ -104,44 +99,41 @@ on both native and `wasm32-wasip2` targets.
 starlingmonkey [OPTIONS] [SCRIPT_PATH]
 
 Arguments:
-  [SCRIPT_PATH]   Path to the entry JS/MJS file (default: ./index.js)
+  [SCRIPT_PATH]     Path to the entry JS/MJS file (default: ./index.js)
 
 Options:
-  -e, --eval <SCRIPT>                Evaluate inline script instead of a file
-  -i, --initializer-script <PATH>    Run an init script (classic, synchronous) before the content script
-      --legacy-script                Run as a classic script instead of an ES module
-  -v, --verbose                      Enable verbose logging
-  -d, --debug                        Enable script debugging via socket
-      --async-stacks                 Show async parent frames in Error.stack (always on under a debugger)
-      --wpt-mode                     Enable WPT (Web Platform Tests) mode
-      --init-location <URL>          Override the location URL for initialization
-      --strip-path-prefix <PREFIX>   Strip this prefix from script paths
-      --serve <PORT>                 Serve HTTP on this port, dispatching fetch events
-      --serve-isolated               Handle each served request in its own global
-      --dispatch-timeout <SECONDS>   Give up on a request whose respondWith hasn't settled (0 = no limit)
-      --response-body-timeout <SECONDS>   Cut a response body not fully sent by then, truncating it visibly (0 = no limit)
-      --waituntil-timeout <SECONDS>   Stop driving a served request's leftover waitUntil work (0 = no limit)
-      --end-to-end-timeout <SECONDS>   Wall-clock ceiling over all of a request's phases together (0 = no limit)
-      --request-read-timeout <SECONDS>   Give up on a client that stopped sending (default 30, 0 = no limit)
-      --keepalive-timeout <SECONDS>   Close an idle kept-alive connection (default 30, 0 = no limit)
-      --max-connection-buffer-size <BYTES>   The maximum number of bytes the server will read from the client's connection at once. (default ca 400KiB, minimum 8KiB)
-      --max-request-headers <COUNT>   Cap the number of header fields (default 128)
-      --max-request-body-bytes <BYTES>   Cap a request body (default 512MiB)
-      --max-body-drain-bytes <BYTES>   Spend at most this reading a body the handler ignored (default 256KiB)
-      --max-connections <COUNT>      Serve at most this many connections at once (default 1024)
-  -h, --help                         Print help
+  -e, --eval <SCRIPT>                  Evaluate inline script instead of a file
+  -i, --initializer-script <PATH>      Run an init script (classic, synchronous) before the content script
+      --async-stacks                   Show async parent frames in Error.stack (always on under a debugger)
+      --legacy-script                  Run as a classic script instead of an ES module
+      --wpt-mode                       Enable WPT (Web Platform Tests) mode
+      --web-security-restrictions[=<BOOL>]  Enforce the browser-security Fetch constraints and coarsen performance.now() and Event.timeStamp (default: only with --wpt-mode)
+      --init-location <URL>            Override the location URL for initialization
+      --serve <PORT>                   Serve HTTP on this port, dispatching fetch events
+      --serve-isolated                 Handle each served request in its own global
+      --dispatch-timeout <SECONDS>     Give up on a request whose respondWith hasn't settled
+      --response-body-timeout <SECONDS>  Truncate a response body not fully sent by then
+      --waituntil-timeout <SECONDS>    Stop driving a served request's leftover waitUntil work
+      --end-to-end-timeout <SECONDS>   Wall-clock ceiling over all of a request's phases together
+      --max-connection-buffer-size <BYTES>  Bytes read from a connection at once (default 408KiB, minimum 8KiB)
+      --max-request-headers <COUNT>    Cap the number of header fields (default 128)
+      --max-request-body-bytes <BYTES> Cap a request body (default 512MiB)
+      --max-body-drain-bytes <BYTES>   Read at most this much of a body the handler ignored (default 256KiB)
+      --max-connections <COUNT>        Serve at most this many connections at once (default 1024)
+      --request-read-timeout <SECONDS> Give up on a client that stopped sending (default 30)
+      --keepalive-timeout <SECONDS>    Close an idle kept-alive connection (default 30)
+  -v, --verbose                        No effect
+  -d, --debug                          No effect
+      --strip-path-prefix <PREFIX>     No effect
+  -h, --help                           Print help
 ```
 
-The serve timeouts are unlimited by default, except under `--wpt-mode`, where the
-per-phase ones default to 120s. The per-phase timeouts each bound their own phase,
-while `--end-to-end-timeout` caps the whole request regardless of how the phases
-divide it.
-
-The `--max-…` limits, `--request-read-timeout` and `--keepalive-timeout` bound
-guest controlled allocation and wait times.
-
-All transport related limits exist in native builds only, since on wasm, the host
-runtime enforces equivalent limits.
+`starlingmonkey --help` describes each option in full. The serve timeouts take whole or
+fractional seconds, and `0` means no limit. Without a value, `--dispatch-timeout`,
+`--response-body-timeout` and `--waituntil-timeout` have no limit, or 120 seconds under
+`--wpt-mode`. A phase timeout longer than `--end-to-end-timeout` is rejected. The `--max-…`
+limits, `--request-read-timeout`, `--keepalive-timeout` and `--serve-isolated` exist in native
+builds only.
 
 **Module mode** (default) — strict mode, `import`/`export` supported, `this`
 is `undefined` at the top level.
@@ -166,7 +158,9 @@ or whose top-level `await` rejects, fails startup. The native server exits with
 status 1 once that happens, which for a top-level `await` can be after it began
 listening. A wasm instance logs the error once and answers every request with a
 500. With `--serve-isolated`, the script is evaluated for each request, and a
-request whose evaluation fails is answered with a 500.
+request whose evaluation fails is answered with a 500. The native server prints
+`serving on http://127.0.0.1:<PORT>` on stderr once it listens. With `--serve 0`, it listens on
+a port the OS assigns, which that line names.
 
 ---
 
@@ -174,6 +168,9 @@ request whose evaluation fails is answered with a 500.
 
 StarlingMonkey provides proc macros for exposing Rust code to JavaScript. All
 builtins in the `web-globals` crate are implemented using these macros.
+
+[docs/builtin-development.md](docs/builtin-development.md) describes the practices builtins
+follow, and [docs/rooting.md](docs/rooting.md) describes GC rooting.
 
 ### `#[jsclass]` / `#[jsmethods]`
 
@@ -213,10 +210,8 @@ fields are reached through `self.data()` and `self.data_mut()` rather than
 directly. From Rust, the generated constructor allocates a JS object and so
 returns `Result<Counter<'s>, ExnThrown>`.
 
-Note: `self.data()` and `self.data_mut()` should only ever be used ephemerally.
-Otherwise there's a risk of having multiple incompatible borrows, which we
-can't statically guard against. There's a dynamic check, but it results in
-slightly opaque error stacks and is hence hard to debug.
+A borrow from `self.data()` or `self.data_mut()` must not be held across a call into JavaScript
+(see [Borrows and re-entrancy](docs/builtin-development.md#borrows-and-re-entrancy)).
 
 The `#[jsclass]` macro generates two types from the annotated struct, allowing
 the type to be used from JS and Rust while ensuring proper GC rooting:
@@ -224,11 +219,10 @@ the type to be used from JS and Rust while ensuring proper GC rooting:
 | Generated type | Purpose |
 |----------------|---------|
 | `CounterImpl` | Inner data struct implementing `ClassDef` (`#[doc(hidden)]`). |
-| `Counter<'s>` | Stack newtype wrapping `Stack<'s, CounterImpl>` — use within a GC scope. |
+| `Counter<'s>` | Stack newtype wrapping `Stack<'s, CounterImpl>`, for use within a GC scope. |
 
-To store a reference to an instance in a long-lived struct, hold a
-`Heap<CounterImpl>` inside a `#[derive(Traceable)]` struct — see
-[`#[derive(Traceable)]`](#derivetraceable).
+A long-lived reference to an instance is a `Heap<CounterImpl>` in a traced struct (see
+[docs/rooting.md](docs/rooting.md)).
 
 **`#[jsclass]` options:**
 
@@ -237,6 +231,7 @@ To store a reference to an instance in a long-lived struct, hold a
 #[jsclass(extends = Parent)]           // set up a prototype chain
 #[jsclass(js_proto = "Error")]         // inherit from a built-in JS prototype
 #[jsclass(to_string_tag = "MyClass")]  // set Symbol.toStringTag
+#[jsclass(hidden)]                     // register without defining the constructor on the global
 ```
 
 **`#[jsmethods]` attributes:**
@@ -255,11 +250,11 @@ To store a reference to an instance in a long-lived struct, hold a
 | Rust return type | JS behaviour |
 |------------------|-------------|
 | `()` | `undefined` |
-| `T: ToJSValConvertible` | Value returned to JS. |
+| `T: ToJSVal` | Value returned to JS. |
 | `Result<T, E>` where `E: ThrowException` | `Ok` → value; `Err` → typed JS exception. |
 | `Self` (from `#[static_method]` / `#[method]`) | New JS instance of the same class. |
 | `PromiseFuture` | JS `Promise` resolved to the result of a Rust future. |
-| `Ref<'_, T>` where `T: ToJSValConvertible + ?Sized` | Value returned to JS, converted from data the class still owns. |
+| `Ref<'_, T>` where `T: ToJSVal + ?Sized` | Value returned to JS, converted from data the class still owns. |
 
 **Returning borrowed data:**
 
@@ -405,7 +400,7 @@ mod math_utils {
 }
 
 // Register before evaluating any JS that imports it:
-unsafe { math_utils::register(&scope); }
+math_utils::register(&scope);
 ```
 
 Exported functions are renamed to camelCase; constants keep their declared name.
@@ -488,7 +483,7 @@ Pair it with `#[webidl_methods]` rather than `#[jsmethods]`: it takes the same
 member attributes, but registers methods with WebIDL's property flags (they're
 enumerable, unlike JS builtins').
 
-Same options as `#[jsclass]`: `name`, `extends`, `js_proto`, `to_string_tag`.
+Same options as `#[jsclass]`: `name`, `extends`, `js_proto`, `to_string_tag`, `hidden`.
 
 ### `#[derive(Traceable)]`
 
@@ -504,10 +499,7 @@ struct AppState {
 }
 ```
 
-Whenever a JS object reference outlives the GC scope it was created in, store
-it as `Heap<MyClassImpl>` (naming the inner data type from `#[jsclass]`) inside
-a `#[derive(Traceable)]` struct. Root it back onto the stack with
-`Heap::get(&scope)`, which hands back the stack newtype (`MyClass<'s>`).
+[docs/rooting.md](docs/rooting.md) describes when and how to store JS references.
 
 ---
 
@@ -612,7 +604,7 @@ let back: Result<Circle<'s>, _> = shape.cast::<Circle<'_>>(); // narrowing
 
 ## Promise / Async
 
-Return `PromiseFuture` from any method to create a JS `Promise` that resolves 
+Return `PromiseFuture` from any method to create a JS `Promise` that resolves
 to the result of a Rust future:
 
 ```rust
@@ -622,9 +614,9 @@ use js::promise::PromiseFuture;
 impl Fetcher {
     #[method]
     fn fetch(&self, url: String) -> PromiseFuture {
-        PromiseFuture::new(async move {
+        PromiseFuture::from_value(async move {
             // ... async work ...
-            Ok("response body".to_string())
+            Ok::<_, String>("response body".to_string())
         })
     }
 }
@@ -633,9 +625,9 @@ impl Fetcher {
 The method returns the `Promise` to JS immediately, and the future is queued on
 the event loop. `ScriptEvaluation::run_to_completion`, which
 `libstarling::run` drives for you, polls it and settles the `Promise` with the
-future's `Ok`/`Err`. Two other constructors cover the cases `new` doesn't:
-`PromiseFuture::new_void` for futures resolving to `()`, and `PromiseFuture::from_value`
-for futures resolving to a value.
+future's `Ok`/`Err`. `PromiseFuture::new_void` takes a future resolving to
+`Result<(), E>`, and `PromiseFuture::new` one resolving to a `PromiseOutcome`, for
+settling that needs the scope.
 
 ---
 
@@ -673,8 +665,7 @@ just test-wasm         # all Rust tests, on wasm32-wasip2
 just check-wasm        # fmt-check + clippy + wasm tests
 ```
 
-`WASM_TARGET` retargets those recipes and the wasm WPT recipes. It accepts `p2`, `p3`, or a
-full triple, and defaults to `p2`:
+`WASM_TARGET` selects the wasm target, as `p2`, `p3` or a full triple. It defaults to `p2`:
 
 ```bash
 WASM_TARGET=p3 just test-wasm
@@ -684,12 +675,8 @@ WASM_TARGET=p3 just wpt-test-wasm
 `rust-toolchain.toml` pins a toolchain that ships no wasm32-wasip3 std, so `p3` builds through
 `cargo +nightly`, and `p3` needs wasi-sdk 34, the first with a wasm32-wasip3 sysroot.
 
-The package builds two targets. `cargo build` produces the native binary
-`target/debug/starlingmonkey`. A wasm build produces the component
-`target/wasm32-wasip2/debug/starling.wasm` from the crate's `cdylib` target. The binary is
-not the wasm entry point, because a binary links `crt1-command.o`, which exports
-`wasi:cli/run` itself and collides with the component's own export on wasm32-wasip3. It is
-still built on wasm targets, where it does nothing.
+`cargo build` produces the native binary `target/debug/starlingmonkey`. A wasm build produces the
+component `target/wasm32-wasip2/debug/starling.wasm` from the crate's `cdylib` target.
 
 ---
 
@@ -727,7 +714,7 @@ just wpt-test DOMException # only DOMException tests
 just wpt-update            # run and update expectation files
 ```
 
-use `just wpt-test-wasm` to run under WebAssembly instead of native, and
+Use `just wpt-test-wasm` to run under WebAssembly instead of native, and
 `just wpt-update-wasm` to update wasm-specific expectations.
 
 Tests run concurrently (defaulting to number of CPUs * 2 since many aren't
@@ -759,59 +746,10 @@ skipping a whole file gives up the subtests that would have passed.
 
 ## GC Rooting Checks
 
-StarlingMonkey's `js` API tries hard to provide everything needed to write code that's
-GC safe, i.e. doesn't run the risk of GC causing use-after-free, etc. The correctness
-of these APIs depends on annotations that are statically checked by a custom linter
-called [crown](./crown), adapted from [Servo's lint of the same name][crown].
-
-`crown` uses annotations that enable tracking of GC references, and enforces that wherever a
-GC reference is held or stored, it's properly rooted. All core types representing GC references
-are annotated with `#[js::must_root]`, which means they must be stored in `Stack`, `Handle`,
-`Heap`, or more advanced types such as `RootedTraceableBox`. Builtins created using one of the 
-macros such as `#[jsclass]` or `#[jsmodule]` are automatically annotated with `#[js::must_root]`.
-
-The analysis can be run using `just check-gc`, and is also part of `just check-all`.
+The `js` crate's GC-safety guarantees rest on annotations that a custom linter,
+[crown](./crown) (adapted from [Servo's lint of the same name][crown]), checks
+statically, and on SpiderMonkey's dynamic GC checks. `just check-gc` runs crown
+and `just gc-zeal` the dynamic checks, and `just check-all` runs both.
+[docs/rooting.md](docs/rooting.md) describes them.
 
 [crown]: https://github.com/servo/servo/tree/main/support/crown
-
-Usually that check should be sufficient when working on anything but the `js` and `core-runtime`
-crates, but to suss out rooting issues not caught by the static analysis, StarlingMonkey also uses
-SpiderMonkey's dynamic GC rooting checks:
-
-```bash
-just gc-zeal                               # quick mode, covering the `js` and `core-runtime` crates
-just gc-zeal full                          # exhaustive checks for the same crates, takes a few minutes
-just gc-zeal full --workspace --examples   # check all the things. Please file a bug if this finds anything!
-```
-
-If the dynamic GC checks find anything outside of the `js` and `core-runtime` crates, that indicates a bug
-in either of those crates. Please file a bug report!
-
----
-
-## Key Design Points
-
-**GC-safe value ownership**
-
-StarlingMonkey provides safe abstractions that ensure GC references are
-properly rooted on both the stack and the heap:
-
-- *Stack* — `Foo<'s>` wrapping `Stack<'s, FooImpl>` with lifetime tied to the GC scope.
-- *Heap* — `Heap<FooImpl>` inside a `Trace`-implementing struct for persistent references.
-
-These make proper rooting the default and much easier to get right. The
-GC rooting linter will additionally catch almost all violations of GC rooting.
-
-**Safe, high-level JS API**
-
-Built on top of `mozjs`, the `js` crate provides a higher-level API designed to
-make use of SpiderMonkey easier and safer.
-
-While there are some cases where lower-level constructs leak through for now,
-the goal is to eventually make `js` a full abstraction layer.
-
-**Proc-macro code generation**
-
-As described above, StarlingMonkey has an extensive suite of proc macros to
-make implementation and use of additional builtins as easy and safe as
-possible.
