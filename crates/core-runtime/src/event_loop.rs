@@ -1353,7 +1353,8 @@ impl Drop for EventLoop {
 ///
 /// Any `FinalizationRegistry` cleanup a collection queued runs first, so a
 /// callback's own microtasks are drained in the same turn. A promise rejected
-/// with no handler attached by the end of the drain is reported on stderr.
+/// with no handler attached by the end of the drain is reported on stderr. The
+/// messages [`crate::diagnostics::report_later`] queued are reported last.
 pub fn run_microtasks(scope: &Scope<'_>) {
     debug_assert!(
         !js::exception::is_pending(scope),
@@ -1363,6 +1364,7 @@ pub fn run_microtasks(scope: &Scope<'_>) {
     jobs::run_jobs(scope);
     // Weak-ref set is cleared by run_jobs.
     report_unhandled_rejections(scope);
+    crate::diagnostics::report_queued();
 }
 
 /// Report each promise that was rejected with no handler attached, and still has none, on
