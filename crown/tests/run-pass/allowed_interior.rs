@@ -13,4 +13,10 @@ struct CanBeUnrooted {
     val: MustBeRooted,
 }
 
+#[crown::unrooted_must_root_lint::allow_unrooted_interior]
+enum CanBeUnrootedEnum {
+    Tuple(MustBeRooted),
+    Struct { val: MustBeRooted },
+}
+
 fn main() {}

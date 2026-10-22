@@ -171,6 +171,7 @@ fn is_unrooted_ty<'tcx>(
             sym.VacantEntry,
         ],
         &[sym::std, sym.collections, sym.hash, sym.map, sym.Iter],
+        &[sym::std, sym.collections, sym.hash, sym.map, sym.Values],
         &[sym::std, sym.collections, sym.hash, sym.set, sym.Iter],
     ];
     let mut ret = false;
@@ -325,15 +326,18 @@ impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
     }
 
     /// All enums containing #[js::must_root] types
-    /// must be #[js::must_root] themselves
+    /// must be #[js::must_root] or #[js::allow_unrooted_interior] themselves
     fn check_variant(&mut self, cx: &LateContext, var: &hir::Variant) {
         let parent = cx.tcx.hir_get_parent_item(var.hir_id).def_id;
         let parent_item = cx.tcx.hir_expect_item(parent);
         let sym = &self.symbols;
-        if !cx.tcx.has_attrs_with_path(
-            parent_item.hir_id().expect_owner(),
-            &[sym.crown, sym.unrooted_must_root_lint, sym.must_root],
-        ) {
+        let has_attr = |symbol| {
+            cx.tcx.has_attrs_with_path(
+                parent_item.hir_id().expect_owner(),
+                &[sym.crown, sym.unrooted_must_root_lint, symbol],
+            )
+        };
+        if !has_attr(sym.must_root) && !has_attr(sym.allow_unrooted_interior) {
             // `VariantData::fields()` yields the fields of both tuple-like
             // (`V(Heap<T>)`) and struct-like (`V { f: Heap<T> }`) variants, and
             // is empty for unit variants. Checking every field here closes a gap
@@ -609,6 +613,7 @@ symbols! {
     RefMut
     Iter
     IterMut
+    Values
     collections
     hash
     map

@@ -79,13 +79,17 @@ wpt-update-permissive *PATTERN:
     @just build
     node tests/wpt-harness/run-wpt.mjs --permissive --update-expectations {{PATTERN}}
 
+# Crown is formatted with the runtime workspace's toolchain.
+#
 # Format all code.
 fmt:
     cargo fmt
+    cargo fmt --manifest-path crown/Cargo.toml
 
 # Check formatting without modifying files.
 fmt-check *ARGS:
     cargo fmt --check {{ARGS}}
+    cargo fmt --manifest-path crown/Cargo.toml --check
 
 # Run clippy lints, failing on any warning.
 clippy *ARGS:
@@ -98,9 +102,15 @@ clippy *ARGS:
 gc-zeal *ARGS:
     ./scripts/test-gc-zeal.sh {{ARGS}}
 
+# It checks every workspace library and example natively, then the runtime and its dependencies
+# for wasm32-wasip2, which includes the code only wasm builds compile. Then it runs crown's own
+# tests.
+#
 # Run crown static GC analysis.
 check-gc:
-    ./scripts/check-crown.sh --workspace --all --examples
+    ./scripts/check-crown.sh --workspace --lib --examples
+    ./scripts/check-crown.sh -p starlingmonkey --target wasm32-wasip2
+    cd crown && RUSTC_BOOTSTRAP=1 cargo test
 
 # Run basic checks: formatting, clippy, tests.
 check:

@@ -10,6 +10,7 @@
 #   ./scripts/check-crown.sh                # Check the default workspace member (starling)
 #   ./scripts/check-crown.sh -p core-runtime # Check a specific package
 #   ./scripts/check-crown.sh --workspace     # Check the entire workspace
+#   ./scripts/check-crown.sh -p starlingmonkey --target wasm32-wasip2  # Check the wasm-only code
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +19,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Crown is built, and its sysroot found, from the crown/ directory so cargo
 # picks up crown/rust-toolchain.toml.
 CROWN_DIR="$ROOT_DIR/crown"
-CROWN_BIN="$CROWN_DIR/target/release/crown"
+CROWN_BIN="${CARGO_TARGET_DIR:-$CROWN_DIR/target}/release/crown"
 CROWN_SYSROOT="$(cd "$CROWN_DIR" && rustc --print sysroot)"
 CROWN_LIB="$CROWN_SYSROOT/lib"
 
