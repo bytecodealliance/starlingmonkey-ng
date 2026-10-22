@@ -31,17 +31,3 @@ fn main() {
 fn main() {
     unreachable!("On wasm targets the `starling` cdylib is the entry point, not this binary");
 }
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[test]
-fn cli_runs() {
-    let config = libstarling::config::RuntimeConfig::from_args(
-        ["starlingmonkey", "-e", "1 + 1"]
-            .iter()
-            .map(|s| s.to_string()),
-    )
-    .unwrap();
-    libstarling::run(config)
-        .map_err(|e| println!("{e}"))
-        .expect("Run failed");
-}

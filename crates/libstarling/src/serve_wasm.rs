@@ -9,8 +9,8 @@
 //! Requests therefore share one global, and are separated by their event loops rather than their
 //! realms.
 //!
-//! Shares [`serve_native`](crate::serve_native)'s dispatch core and the request/response bridging
-//! in `platform::http`.
+//! Shares the dispatch core in `serve_common` with `serve_native`, and the request/response
+//! bridging in `platform::http`.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -46,8 +46,8 @@ js::instance_local! {
     static STARTUP: RefCell<Startup> = const { RefCell::new(Startup::Done) };
 
     /// Signalled on every [`STARTUP`] transition a waiting request cares about: driven to
-    /// completion, or handed back by a driver that was cancelled. Every write of `Startup` other
-    /// than `Driving` must notify, or a waiter in [`ensure_started`] sleeps through it.
+    /// completion, or handed back by a driver that was cancelled. Every transition out of
+    /// `Driving` must notify, or a waiter in [`ensure_started`] sleeps through it.
     static STARTUP_CHANGED: event_listener::Event = const { event_listener::Event::new() };
 
     /// Set while a Wizer snapshot is being taken, so it is set in the snapshot and the resumed
@@ -70,8 +70,8 @@ enum Startup {
 /// The held reference is never released, so the runtime is never dropped. Nothing here tears an
 /// instance down except thread-local destruction, and `Runtime::drop` reaches thread-locals in the
 /// `js` crate (the scope handle pool among them) that the same destruction may already have run,
-/// which traps. Dropping it would reclaim nothing either, since the instance's memory goes away
-/// whole. `serve_native` runs the real `Drop`.
+/// which traps. Dropping it wouldn't reclaim any memory either, since the instance's memory goes
+/// away whole. `serve_native` runs the real `Drop`.
 fn install_runtime(pair: (Rc<Runtime>, *mut js::native::RawJSContext, ServeTimeouts)) {
     std::mem::forget(Rc::clone(&pair.0));
     RUNTIME.with(|cell| *cell.borrow_mut() = Some(pair));
@@ -94,8 +94,8 @@ fn runtime() -> Result<(Rc<Runtime>, *mut js::native::RawJSContext, ServeTimeout
     })
 }
 
-/// [`runtime`], creating a runtime configured for a Wizer snapshot if `pre_initialize` is set and
-/// none exists yet.
+/// Like [`runtime`], but creates a runtime configured for a Wizer snapshot if `pre_initialize` is
+/// set and no runtime exists yet.
 fn runtime_for(
     pre_initialize: bool,
 ) -> Result<(Rc<Runtime>, *mut js::native::RawJSContext, ServeTimeouts), String> {
@@ -183,9 +183,17 @@ pub fn prepare_for_snapshot() {
 /// behind once its top level has finished.
 pub async fn pre_initialize() -> Result<(), String> {
     let (_runtime, raw_cx, _) = runtime_for(true)?;
-    let Startup::Pending(invocation, evaluation) =
-        STARTUP.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), Startup::Driving))
-    else {
+    let pending = STARTUP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        match std::mem::replace(&mut *state, Startup::Driving) {
+            Startup::Pending(invocation, evaluation) => Some((invocation, evaluation)),
+            other => {
+                *state = other;
+                None
+            }
+        }
+    });
+    let Some((invocation, evaluation)) = pending else {
         // Nothing to evaluate: `runtime` was already stood up, so this is a second call.
         prepare_for_snapshot();
         return Ok(());
@@ -214,7 +222,7 @@ pub async fn pre_initialize() -> Result<(), String> {
 /// Whether the content script has finished evaluating without registering a `fetch` listener, in
 /// which case every request it could ever receive is a 500 (see
 /// [`NO_FETCH_LISTENER`](crate::serve_common::NO_FETCH_LISTENER)). A script still evaluating (a
-/// top-level `await` that never settles) has registered nothing yet and cannot be judged.
+/// top-level `await` that never settles) may still register a listener and cannot be judged.
 fn evaluated_without_listener(
     scope: &js::gc::scope::Scope<'_>,
     evaluation: &core_runtime::ScriptEvaluation,
@@ -224,7 +232,7 @@ fn evaluated_without_listener(
 
 /// Some state, such as process time origins, needs fixing up after snapshot resumption.
 ///
-/// The monotonic clock comes first: its offset puts the timestamps the snapshot holds in the
+/// The monotonic clock comes first: its offset puts the timestamps held by the snapshot in the
 /// resumed instance's past, and both the engine's timing and every fixup below read the clock
 /// through it.
 fn fix_up_after_resume() {
@@ -346,7 +354,7 @@ async fn drive_startup(
 }
 
 /// Report, once evaluation completes, that the content script registered no `fetch` listener, so
-/// the 500s every request will get have a stated reason. We can't decline to serve
+/// the 500 response sent to every request has a stated reason. We can't decline to serve
 /// at all, since the host owns the instance's lifecycle. Only applies to non-snapshot configs,
 /// since [`pre_initialize`] refuses to snapshot a script without a listener.
 fn report_missing_fetch_listener(
@@ -523,10 +531,10 @@ async fn dispatch_request(
                     outcome,
                 );
             }
-            // Drained regardless of how the send ended. The writer's `TimedOut` and the limit above
-            // expiring are the same deadline enforced in two places, so on an ordinary body
-            // timeout they expire together and either may be reported first. The request's
-            // `waitUntil` window must not depend on which.
+            // Lifetime work is drained regardless of how the send ended. The writer's `TimedOut`
+            // and the limit above expiring are the same deadline enforced in two places, so on an
+            // ordinary body timeout they expire together and either may be reported first. The
+            // request's `waitUntil` window must not depend on which.
             crate::serve_common::drain_lifetime_work(
                 raw_cx,
                 invocation.state().event_loop(),
@@ -546,7 +554,7 @@ async fn dispatch_request(
 /// `response_body` time limit expires first.
 ///
 /// If the loop runs out of work before the body has been fully sent out, that means it's
-/// effectively abandoned and can't be completed anymore. In that case, [`abandon`] is called,
+/// effectively abandoned and can't be completed anymore. In that case, `abandon` is called,
 /// and must close the transport.
 ///
 /// The timeout here is a backstop: the same limit is applied to `spawn_body_writer`, which reports
@@ -609,9 +617,7 @@ fn body_framing(method: &str, headers: &http::HeaderMap) -> (bool, Option<u64>) 
 }
 
 /// A minimal text error response. Its body is written out by a task of its own like any other
-/// response's, and also bounded by a timeout like any other: otherwise a client that doesn't
-/// read the response could stall indefinitely. (At least I think it might: chances are the
-/// host runtime takes care of this.)
+/// response's, and bounded by a timeout like any other.
 // TODO: unify with `status_response` in `serve_native`.
 fn error_response(
     status: u16,

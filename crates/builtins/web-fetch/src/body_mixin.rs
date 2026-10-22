@@ -5,9 +5,7 @@
 //! The `Body` interface mixin, which both `Request` and `Response` include.
 
 use crate::algorithms::{self, Body, BodySource, ConsumeType};
-use crate::incoming_body::{
-    consume_host_body, materialize_host_body, HostBackedBodyOwner, HostBodySourceImpl,
-};
+use crate::incoming_body::{consume_host_body, materialize_host_body, HostBackedBodyOwner};
 use core_runtime::webidl_union;
 use js::error::{throw_type_error, ExnThrown};
 use js::gc::handle::Heap;
@@ -16,6 +14,7 @@ use js::prelude::HandleValue;
 use js::{ArrayBuffer, ArrayBufferView, Promise};
 use platform::http::IncomingBody;
 use std::ffi::CStr;
+use web_streams::readable::native_byte_source::NativeByteSourceImpl;
 use web_streams::readable::readable_stream::ReadableStream;
 use web_streams::readable::readable_stream::ReadableStreamImpl;
 use web_url::url_search_params::URLSearchParams;
@@ -35,7 +34,7 @@ pub(crate) struct BodyStorage {
     pub(crate) host: Option<IncomingBody>,
     /// The `.body` stream's native host source, kept so an abort can cancel an in-flight host
     /// read. Set when `.body` materializes a host-backed stream.
-    pub(crate) source: Option<Heap<HostBodySourceImpl>>,
+    pub(crate) source: Option<Heap<NativeByteSourceImpl>>,
     /// The record's byte source, attributed to the owning object for the GC. Kept in sync by
     /// [`sync_accounting`](Self::sync_accounting).
     #[no_trace]

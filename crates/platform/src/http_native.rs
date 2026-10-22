@@ -10,37 +10,20 @@ use crate::http::{
 };
 
 thread_local! {
-    // Redirects are followed by the fetch layer (so native and wasm behave identically and
-    // per spec), so the client itself must not follow them.
+    // The fetch layer follows redirects, so the client must not.
     //
-    // TODO(keep-alive robustness): idle connection pooling is left enabled (reqwest's
-    // default) for performance, but it has a known robustness gap against non-compliant
-    // servers. hyper applies RFC 7230 §3.3.3 strictly: a body-exempt response (HEAD, 1xx,
-    // 204, 304) has a zero-length body regardless of any `Content-Length`. A server that
-    // nevertheless *sends* a body with such a status, such as WPT `status.py`,
-    // leaves those bytes unread on the socket; hyper treats the message as
-    // complete and returns the connection to the pool. The next request to reuse that
-    // connection reads the stale bytes as a status line and fails with a parse error
-    // (`hyper::Error(Parse(Version))`). hyper auto-retries idempotent methods on a fresh
-    // connection, but a POST is not retried (it may already have been processed), so it
-    // surfaces as a spurious network error. Symptom: the `response-null-body` WPT subtests
-    // for 204/304 fail intermittently (see their FLAKY expectations).
-    //
-    // This cannot be fixed through reqwest: it exposes no connection-eviction or
-    // idle-flush API, and dropping a body-exempt `Response` unread does not close its
-    // connection (hyper considers a length-0 body already complete and pools it anyway).
-    // Instead, fixing this would require building our own pool directly on hyper.
-    // See wasmtime PR #12635 for the related "ignore a connection error that arrives after
-    // the response" technique.
-    // Ideally this is fixed upstream in reqwest/hyper (detect leftover bytes after a
-    // body-exempt response and refuse to pool that connection) rather than by hand-rolling
-    // a client here.
+    // TODO: a server that sends a body with a body-exempt response (HEAD, 1xx, 204, 304) leaves
+    // those bytes unread on a pooled connection, and the next request on it fails to parse its
+    // response. hyper retries idempotent methods but not a POST, which makes the
+    // `response-null-body` WPT subtests for 204 and 304 flaky. reqwest has no API to evict such a
+    // connection, so fixing this needs a pool built on hyper or a fix upstream.
     static CLIENT: reqwest::Client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("failed to build HTTP client");
 }
 
+/// Send `request` with reqwest, returning once the response status and headers are available.
 pub async fn send(request: Request) -> Result<Response, Error> {
     let client = CLIENT.with(|c| c.clone());
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
@@ -52,11 +35,9 @@ pub async fn send(request: Request) -> Result<Response, Error> {
     match request.body {
         OutgoingBody::Bytes(bytes) if !bytes.is_empty() => builder = builder.body(bytes),
         OutgoingBody::Bytes(_) | OutgoingBody::Consumed => {}
-        // Stream the body chunks (read from the channel) as they arrive.
         OutgoingBody::Stream(receiver) => {
             builder = builder.body(reqwest::Body::wrap_stream(receiver))
         }
-        // Incoming→outgoing shortcut: stream a host body straight through.
         OutgoingBody::Host(host_body) => {
             builder = match host_body.0 {
                 NativeBody::Transport(response) => {
@@ -66,7 +47,7 @@ pub async fn send(request: Request) -> Result<Response, Error> {
             }
         }
     }
-    let response = builder.send().await.map_err(|e| Error(e.to_string()))?;
+    let response = builder.send().await.map_err(|e| transport_error(&e))?;
     let status = response.status().as_u16();
     let headers = response
         .headers()
@@ -85,14 +66,8 @@ pub async fn send(request: Request) -> Result<Response, Error> {
     })
 }
 
-/// The write end of a channel-backed [`IncomingBody`]: the native serve loop's
-/// connection reader sends the request-body chunks it decodes here, and the
-/// handler's `request.body` reads them out. The send awaits channel capacity, so
-/// a client uploading faster than the handler consumes is paced by TCP
-/// backpressure rather than buffered whole. Dropping it ends the body.
-///
-/// Native-only: on wasm an incoming body is already a `wasi:http` stream, which
-/// [`IncomingBody`] wraps directly.
+/// The write end of a channel-backed [`IncomingBody`]. Sends await channel capacity, and
+/// dropping it ends the body.
 pub struct IncomingBodySender(futures_channel::mpsc::Sender<Result<BodyBytes, Error>>);
 
 impl IncomingBodySender {
@@ -126,9 +101,8 @@ pub struct IncomingBody(NativeBody);
 enum NativeBody {
     /// A response from the HTTP client, read straight off its connection.
     Transport(reqwest::Response),
-    /// Chunks delivered on a channel by whoever owns the connection — the serve
-    /// loop reading an incoming request body. A final `Err` aborts the body; the
-    /// channel closing ends it. Created via [`incoming_body_channel`].
+    /// Chunks delivered on a channel created by [`incoming_body_channel`]. A final `Err` aborts
+    /// the body, and closing the channel ends it.
     Channel(futures_channel::mpsc::Receiver<Result<BodyBytes, Error>>),
 }
 
@@ -137,7 +111,7 @@ impl IncomingBody {
     pub async fn read_all(self) -> Result<BodyBytes, Error> {
         match self.0 {
             NativeBody::Transport(response) => {
-                response.bytes().await.map_err(|e| Error(e.to_string()))
+                response.bytes().await.map_err(|e| transport_error(&e))
             }
             NativeBody::Channel(mut receiver) => {
                 let mut buffer = bytes::BytesMut::new();
@@ -149,13 +123,40 @@ impl IncomingBody {
         }
     }
 
+    /// Read the next chunk, or return `Ok(None)` at the end of the body. A chunk is read whole, so
+    /// it can hold more bytes than `buf` has capacity for. It is returned in its own allocation if
+    /// it is the only reference to it, and copied into an allocation of its size otherwise, so
+    /// `buf` is unused. Empty chunks are skipped.
+    pub async fn read_into(&mut self, _buf: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
+        loop {
+            let Some(chunk) = self.next_chunk().await? else {
+                return Ok(None);
+            };
+            if !chunk.is_empty() {
+                return Ok(Some(Vec::from(chunk)));
+            }
+        }
+    }
+
     /// Read the next chunk, or `Ok(None)` at end of body.
     pub async fn next_chunk(&mut self) -> Result<Option<BodyBytes>, Error> {
         match &mut self.0 {
             NativeBody::Transport(response) => {
-                response.chunk().await.map_err(|e| Error(e.to_string()))
+                response.chunk().await.map_err(|e| transport_error(&e))
             }
             NativeBody::Channel(receiver) => receiver.next().await.transpose(),
         }
     }
+}
+
+/// The transport error for `error`: its message, followed by the messages of its sources.
+fn transport_error(error: &reqwest::Error) -> Error {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    Error(message)
 }

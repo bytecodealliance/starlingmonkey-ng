@@ -14,10 +14,14 @@ test = false
 smallvec.workspace = true
 core-runtime.workspace = true
 js.workspace = true
+platform.workspace = true
 web-globals.workspace = true
 
 [dev-dependencies]
 libstarling.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

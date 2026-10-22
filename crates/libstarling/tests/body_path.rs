@@ -10,7 +10,7 @@
 //! These run in a test binary of their own because they read process-wide counters
 //! (`web_fetch::outgoing_body::paths_taken`), which any other request in flight would perturb. The
 //! counters belong to the process, and this file holds a single test, so the counts always belong
-//! to the request that just ran. The ports below are this binary's own for the same reason.
+//! to the request that just ran.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -20,8 +20,9 @@ use common::{dechunk, request, start_chunked_upstream, start_echo_upstream, star
 use web_fetch::outgoing_body::paths_taken;
 
 /// Serve one request against `handler` and report `(response body, shortcuts, pumps)`.
-fn serve_once(handler: &str, port: u16, path: &str) -> (String, usize, usize) {
-    let handle = start_serve(handler, port);
+fn serve_once(handler: &str, path: &str) -> (String, usize, usize) {
+    let handle = start_serve(handler);
+    let port = handle.port();
     paths_taken::reset();
     let body = request(port, "GET", path, "");
     let (shortcut, pumped) = paths_taken::counts();
@@ -32,7 +33,6 @@ fn serve_once(handler: &str, port: u16, path: &str) -> (String, usize, usize) {
 #[test]
 fn outgoing_bodies_take_the_route_they_should() {
     single_bodies_take_the_route_they_should();
-    many_bodies_through_one_transform_keep_every_byte();
     piping_many_bodies_into_one_transform_keeps_every_byte();
     a_queued_chunk_survives_a_pipe_that_is_still_running();
     a_pipe_that_keeps_the_transform_open_forfeits_the_shortcut();
@@ -49,10 +49,11 @@ fn outgoing_bodies_take_the_route_they_should() {
 /// shows.
 fn a_byte_response_body_leaves_its_owner_holding_nothing() {
     let handler = "addEventListener('fetch', (e) => e.respondWith(new Response('payload')))";
-    let handle = start_serve(handler, 18531);
+    let handle = start_serve(handler);
+    let port = handle.port();
     paths_taken::reset();
 
-    let body = request(18531, "GET", "/", "");
+    let body = request(port, "GET", "/", "");
     let (sole, shared) = paths_taken::byte_counts();
     handle.stop();
 
@@ -77,10 +78,11 @@ fn a_byte_request_body_leaves_no_copy_behind_on_the_request_it_came_from() {
             }})));
         }})"#
     );
-    let handle = start_serve(&handler, 18533);
+    let handle = start_serve(&handler);
+    let port = handle.port();
     paths_taken::reset();
 
-    let body = request(18533, "GET", "/", "");
+    let body = request(port, "GET", "/", "");
     let (sole, shared) = paths_taken::byte_counts();
     handle.stop();
 
@@ -121,13 +123,14 @@ fn a_head_request_cancels_the_body_it_will_not_send() {
             ? source.pipeThrough(new TransformStream(undefined, { highWaterMark: 0 }))
             : source));
     })"#;
-    let handle = start_serve(handler, 18521);
+    let handle = start_serve(handler);
+    let port = handle.port();
     paths_taken::reset();
 
-    let direct = request(18521, "HEAD", "/direct", "");
-    let piped = request(18521, "HEAD", "/piped", "");
+    let direct = request(port, "HEAD", "/direct", "");
+    let piped = request(port, "HEAD", "/piped", "");
     let (shortcut, pumped) = paths_taken::counts();
-    let seen = request(18521, "GET", "/seen", "");
+    let seen = request(port, "GET", "/seen", "");
     handle.stop();
 
     assert_eq!(
@@ -156,10 +159,11 @@ fn a_head_request_still_claims_a_proxied_body() {
     let handler = format!(
         "addEventListener('fetch', (e) => e.respondWith(fetch('http://127.0.0.1:{upstream}/')))"
     );
-    let handle = start_serve(&handler, 18519);
+    let handle = start_serve(&handler);
+    let port = handle.port();
     paths_taken::reset();
 
-    let response = request(18519, "HEAD", "/", "");
+    let response = request(port, "HEAD", "/", "");
     let (shortcut, pumped) = paths_taken::counts();
     handle.stop();
 
@@ -182,10 +186,11 @@ fn a_head_request_still_claims_a_proxied_body() {
             }})());
         }})"#
     );
-    let handle = start_serve(&handler, 18523);
+    let handle = start_serve(&handler);
+    let port = handle.port();
     paths_taken::reset();
 
-    let response = request(18523, "HEAD", "/", "");
+    let response = request(port, "HEAD", "/", "");
     let (shortcut, pumped) = paths_taken::counts();
     handle.stop();
 
@@ -200,9 +205,9 @@ fn a_head_request_still_claims_a_proxied_body() {
 /// A pipe that leaves the transform open (`preventClose`) must not let the body be claimed whole.
 ///
 /// Claiming it hands the wire that one body and bypasses the transform, so whatever is written in
-/// afterwards goes to a readable end nobody reads: the second pipe stalls forever and its bytes are
-/// dropped without a word. Worse, it made the choice of route observable — the same handler
-/// delivered `AAA` when the body was claimed and `AAABBB` when it was pumped.
+/// afterwards goes to a readable end that nothing reads: the second pipe stalls forever and its
+/// bytes are dropped without a word. Worse, it made the choice of route observable: the same
+/// handler delivered `AAA` when the body was claimed and `AAABBB` when it was pumped.
 fn a_pipe_that_keeps_the_transform_open_forfeits_the_shortcut() {
     let first = start_chunked_upstream(&["AAA"]);
     let second = start_chunked_upstream(&["BBB"]);
@@ -227,10 +232,11 @@ fn a_pipe_that_keeps_the_transform_open_forfeits_the_shortcut() {
             }})());
         }})"#
     );
-    let handle = start_serve(&handler, 18517);
+    let handle = start_serve(&handler);
+    let port = handle.port();
     paths_taken::reset();
 
-    let body = request(18517, "GET", "/", "");
+    let body = request(port, "GET", "/", "");
     let (shortcut, pumped) = paths_taken::counts();
 
     assert_eq!(
@@ -280,7 +286,6 @@ fn a_queued_chunk_survives_a_pipe_that_is_still_running() {
                 }})());
             }})"#
         ),
-        18515,
         "/",
     );
 
@@ -306,7 +311,6 @@ fn single_bodies_take_the_route_they_should() {
         &format!(
             "addEventListener('fetch', (e) => e.respondWith(fetch('http://127.0.0.1:{upstream}/')))"
         ),
-        18501,
         "/",
     );
     assert_eq!(dechunk(&body), "one two", "got: {body}");
@@ -328,7 +332,6 @@ fn single_bodies_take_the_route_they_should() {
                 }})());
             }})"#
         ),
-        18503,
         "/",
     );
     assert_eq!(dechunk(&body), "one two", "got: {body}");
@@ -350,7 +353,6 @@ fn single_bodies_take_the_route_they_should() {
                 }})());
             }})"#
         ),
-        18505,
         "/",
     );
     assert_eq!(dechunk(&body), "one two", "got: {body}");
@@ -372,7 +374,6 @@ fn single_bodies_take_the_route_they_should() {
                 start(c) { c.enqueue(new TextEncoder().encode('made up')); c.close(); }
             })));
         })"#,
-        18507,
         "/",
     );
     assert_eq!(dechunk(&body), "made up", "got: {body}");
@@ -405,7 +406,6 @@ fn single_bodies_take_the_route_they_should() {
                 }})());
             }})"#
         ),
-        18509,
         "/",
     );
     assert_eq!(dechunk(&body), "abcd", "got: {body}");
@@ -416,75 +416,20 @@ fn single_bodies_take_the_route_they_should() {
     );
 }
 
-/// Several incoming bodies funnelled through one `TransformStream`, with the handler's own chunks
-/// interleaved between them.
+/// Several upstream bodies fed into one `TransformStream`, with the handler's own chunks written
+/// between them. The response mixes host bytes from two upstreams with bytes JS made up, so it
+/// cannot be handed to the wire whole, and every byte has to arrive in order. Piping into an
+/// identity transform moves a native source to its readable side, so two of them arriving at the
+/// same transform would overwrite each other.
 ///
-/// The response is a mixture — host bytes from two upstreams and bytes JS made up — so it cannot be
-/// handed to the wire whole, and every byte has to survive the trip in order. This is the shape that
-/// would break silently if a native source were carried across the transform and then claimed: the
-/// claim would forward one upstream's host body and drop everything queued alongside it.
-fn many_bodies_through_one_transform_keep_every_byte() {
-    let upstream = start_chunked_upstream(&["AB", "CD"]);
-    let handler = format!(
-        r#"addEventListener('fetch', (event) => {{
-            event.respondWith((async () => {{
-                const encoder = new TextEncoder();
-                const transform = new TransformStream();
-                const writer = transform.writable.getWriter();
-                const response = new Response(transform.readable);
-
-                // Filled after the response is committed: a JS chunk, an upstream body, another JS
-                // chunk, a second upstream body, a last JS chunk.
-                (async () => {{
-                    await writer.write(encoder.encode('<'));
-                    for (const round of [1, 2]) {{
-                        const upstream = await fetch('http://127.0.0.1:{upstream}/?round=' + round);
-                        const reader = upstream.body.getReader();
-                        while (true) {{
-                            const {{ done, value }} = await reader.read();
-                            if (done) break;
-                            await writer.write(value);
-                        }}
-                        await writer.write(encoder.encode('|'));
-                    }}
-                    await writer.write(encoder.encode('>'));
-                    await writer.close();
-                }})();
-
-                return response;
-            }})());
-        }})"#
-    );
-    let handle = start_serve(&handler, 18511);
-    paths_taken::reset();
-
-    let body = request(18511, "GET", "/", "");
-    let (shortcut, pumped) = paths_taken::counts();
-
-    assert_eq!(
-        dechunk(&body),
-        "<ABCD|ABCD|>",
-        "every byte from both upstreams and the handler's own chunks must arrive in order: {body}"
-    );
-    assert_eq!(
-        (shortcut, pumped),
-        (0, 1),
-        "a response mixing several bodies with JS chunks cannot be handed over whole"
-    );
-
-    handle.stop();
-}
-
-/// The same funnel, but the upstream bodies are *piped* in rather than read chunk by chunk — the
-/// route on which an identity transform does carry a native source across, and on which two of them
-/// arriving at the same transform would overwrite each other.
-///
-/// Piping into a writable locks it, so the bodies go in one after another with the transform held
-/// open in between, and the handler's own chunks are written around them.
+/// `/piped` pipes each body in. Piping into a writable locks it, so the bodies go in one after
+/// another with the transform held open in between, and the handler's own chunks are written around
+/// them. `/read` reads each body with a reader and writes its chunks with a writer.
 fn piping_many_bodies_into_one_transform_keeps_every_byte() {
     let upstream = start_chunked_upstream(&["AB", "CD"]);
     let handler = format!(
         r#"addEventListener('fetch', (event) => {{
+            const route = new URL(event.request.url).pathname;
             event.respondWith((async () => {{
                 const encoder = new TextEncoder();
                 const transform = new TransformStream();
@@ -493,18 +438,26 @@ fn piping_many_bodies_into_one_transform_keeps_every_byte() {
                 (async () => {{
                     let writer = transform.writable.getWriter();
                     await writer.write(encoder.encode('<'));
-                    writer.releaseLock();
 
                     for (const round of [1, 2]) {{
                         const upstream = await fetch('http://127.0.0.1:{upstream}/?round=' + round);
-                        // The pipe owns the writable until it finishes; keep it open for the next.
-                        await upstream.body.pipeTo(transform.writable, {{ preventClose: true }});
-                        writer = transform.writable.getWriter();
+                        if (route === '/piped') {{
+                            writer.releaseLock();
+                            // The pipe owns the writable until it finishes. Keep it open for the
+                            // next.
+                            await upstream.body.pipeTo(transform.writable, {{ preventClose: true }});
+                            writer = transform.writable.getWriter();
+                        }} else {{
+                            const reader = upstream.body.getReader();
+                            while (true) {{
+                                const {{ done, value }} = await reader.read();
+                                if (done) break;
+                                await writer.write(value);
+                            }}
+                        }}
                         await writer.write(encoder.encode('|'));
-                        writer.releaseLock();
                     }}
 
-                    writer = transform.writable.getWriter();
                     await writer.write(encoder.encode('>'));
                     await writer.close();
                 }})();
@@ -513,23 +466,26 @@ fn piping_many_bodies_into_one_transform_keeps_every_byte() {
             }})());
         }})"#
     );
-    let handle = start_serve(&handler, 18513);
-    paths_taken::reset();
+    let handle = start_serve(&handler);
+    let port = handle.port();
 
-    let body = request(18513, "GET", "/", "");
-    let (shortcut, pumped) = paths_taken::counts();
+    for route in ["/piped", "/read"] {
+        paths_taken::reset();
+        let body = request(port, "GET", route, "");
+        let (shortcut, pumped) = paths_taken::counts();
 
-    assert_eq!(
-        dechunk(&body),
-        "<ABCD|ABCD|>",
-        "piping two bodies into one transform must not lose either, nor the chunks around them: \
-         {body}"
-    );
-    assert_eq!(
-        (shortcut, pumped),
-        (0, 1),
-        "a transform fed by more than one body cannot be handed to the wire whole"
-    );
+        assert_eq!(
+            dechunk(&body),
+            "<ABCD|ABCD|>",
+            "{route}: feeding two bodies into one transform must not lose either, nor the chunks \
+             around them: {body}"
+        );
+        assert_eq!(
+            (shortcut, pumped),
+            (0, 1),
+            "{route}: a transform fed by more than one body cannot be handed to the wire whole"
+        );
+    }
 
     handle.stop();
 }

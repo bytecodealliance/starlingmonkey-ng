@@ -296,6 +296,34 @@ fn fetch_pipes_a_response_body_through_an_identity_transform() {
 }
 
 #[test]
+fn a_pipe_whose_body_is_taken_before_it_reads_still_finishes() {
+    // `fetch()` takes the host body before the pipe's first read, so the pipe's read finds the
+    // body gone and must close the stream rather than wait for demand that never comes.
+    let source = start_server(vec![ok("taken before the pipe reads")]);
+    let echo = start_echo_server();
+    let out = run_and_get_out(&format!(
+        r#"
+        globalThis.__out = "pending";
+        fetch("{source}")
+            .then(async (response) => {{
+                const transform = new TransformStream();
+                const piped = response.body.pipeTo(transform.writable);
+                const echoed = await fetch("{echo}", {{
+                    method: "POST",
+                    body: transform.readable,
+                    duplex: "half",
+                }});
+                const text = await echoed.text();
+                await piped;
+                globalThis.__out = text;
+            }})
+            .catch(e => {{ globalThis.__out = "error:" + e; }});
+        "#
+    ));
+    assert_eq!(out, "taken before the pipe reads");
+}
+
+#[test]
 fn fetch_pumps_a_piped_multichunk_body_without_dropping_chunks() {
     // The request-body *pump* path (as opposed to the incoming→outgoing shortcut): a multi-chunk
     // host response body is piped through a TransformStream carrying an explicit pass-through
@@ -550,16 +578,63 @@ fn redirect_with_credentialed_location_is_a_network_error() {
 }
 
 #[test]
+fn a_transport_error_message_includes_its_causes() {
+    // Nothing listens on port 1, so connecting to it is refused.
+    let out = run_and_get_out(
+        r#"
+        globalThis.__out = "pending";
+        fetch("http://127.0.0.1:1/")
+            .then(r => { globalThis.__out = "resolved:" + r.status; })
+            .catch(e => { globalThis.__out = e.constructor.name + ":" + e.message; });
+        "#,
+    );
+    assert!(
+        out.starts_with("TypeError:Failed to fetch: ") && out.contains("refused"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_network_body_is_a_byte_stream() {
+    // A body read into views of 4 bytes arrives in chunks larger than the view. A view of 64 bytes
+    // holds the whole body.
+    let url = start_server(vec![ok("seventeen bytes!!"), ok("seventeen bytes!!")]);
+    let out = run_and_get_out(&format!(
+        r#"
+        globalThis.__out = "pending";
+        async function readInto(viewLength) {{
+            const response = await fetch("{url}");
+            const reader = response.body.getReader({{ mode: "byob" }});
+            const dec = new TextDecoder();
+            const reads = [];
+            for (;;) {{
+                const {{ value, done }} = await reader.read(new Uint8Array(viewLength));
+                if (done) break;
+                reads.push(dec.decode(value));
+            }}
+            return reads.join("|");
+        }}
+        (async () => {{
+            const small = await readInto(4);
+            const large = await readInto(64);
+            globalThis.__out = small + " / " + large;
+        }})().catch(e => {{ globalThis.__out = "error:" + e; }});
+        "#
+    ));
+    assert_eq!(out, "seve|ntee|n by|tes!|! / seventeen bytes!!");
+}
+
+#[test]
 fn response_body_unaffected_by_patched_controller_enqueue() {
     // A network response body is delivered through the controller abstract
-    // operation, not the author-visible ReadableStreamDefaultController.prototype
-    // methods. Patching prototype.enqueue to drop chunks must not affect the
-    // body's bytes.
+    // operation, not the author-visible controller prototypes' methods. Patching
+    // their `enqueue` to drop chunks must not affect the body's bytes.
     let url = start_server(vec![ok("untampered body bytes")]);
     let out = run_and_get_out(&format!(
         r#"
         globalThis.__out = "pending";
         ReadableStreamDefaultController.prototype.enqueue = function () {{ /* drop */ }};
+        ReadableByteStreamController.prototype.enqueue = function () {{ /* drop */ }};
         fetch("{url}")
             .then(async (response) => {{
                 const reader = response.body.getReader();

@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 // The transport helpers and upstream servers are shared with the wasm end-to-end suite through
-// `serve-test-support`. Only the serve starters, which link the engine, remain here.
+// `serve-test-support`. Only the serve starters and their config and script helpers remain here.
 pub use serve_test_support::*;
 
 // `serve-test-support` duplicates `IDLE_TRACE` rather than depend on `core-runtime`. This fails
@@ -25,62 +25,96 @@ const _: () = {
 };
 
 use libstarling::config::RuntimeConfig;
-use std::net::TcpStream;
-use std::time::Duration;
+use std::net::TcpListener;
 
 /// A running serve loop; [`ServeHandle::stop`] shuts it down and joins the thread so the runtime
 /// drops cleanly (a leaked runtime aborts at process teardown with outstanding engine handles).
 pub struct ServeHandle {
+    port: u16,
     shutdown: futures_channel::oneshot::Sender<()>,
     thread: std::thread::JoinHandle<()>,
 }
 
 impl ServeHandle {
+    /// The port the server listens on.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     pub fn stop(self) {
         let _ = self.shutdown.send(());
         let _ = self.thread.join();
     }
 }
 
-/// Start a serve loop with `handler` on `port` in a background thread, and wait until it accepts
-/// connections.
-pub fn start_serve(handler: &str, port: u16) -> ServeHandle {
-    start_serve_with(handler, port, false)
+/// Start a serve loop with `handler` on a port the system picks, in a background thread.
+pub fn start_serve(handler: &str) -> ServeHandle {
+    start_serve_with(handler, false)
 }
 
 /// Like [`start_serve`], but chooses whether each request gets its own global.
-pub fn start_serve_with(handler: &str, port: u16, isolated: bool) -> ServeHandle {
-    start_serve_config(
-        RuntimeConfig {
-            eval_script: Some(handler.to_string()),
-            legacy_script: true,
-            serve: Some(port),
-            serve_isolated: isolated,
-            ..Default::default()
-        },
-        port,
-    )
+pub fn start_serve_with(handler: &str, isolated: bool) -> ServeHandle {
+    start_serve_config(RuntimeConfig {
+        serve_isolated: isolated,
+        ..legacy_script(handler)
+    })
 }
 
-/// Start a serve loop from a fully-specified config — for the cases that need more than an inline
-/// script, such as a module entry point on disk.
-pub fn start_serve_config(config: RuntimeConfig, port: u16) -> ServeHandle {
+/// A config that runs `handler` as an inline classic script.
+pub fn legacy_script(handler: &str) -> RuntimeConfig {
+    RuntimeConfig {
+        eval_script: Some(handler.to_string()),
+        legacy_script: true,
+        ..Default::default()
+    }
+}
+
+/// Start a serve loop from `config` on a port the system picks, for the cases that need more than
+/// an inline script, such as a module entry point on disk.
+pub fn start_serve_config(config: RuntimeConfig) -> ServeHandle {
+    start_serve_on(bind_local().0, config)
+}
+
+/// Start a serve loop from `config` on `listener`, for a handler that needs to know its own port
+/// before the server starts.
+///
+/// The listener is bound before this returns, so a request made right away waits in its backlog
+/// until the script has finished evaluating.
+pub fn start_serve_on(listener: TcpListener, config: RuntimeConfig) -> ServeHandle {
+    let port = listener.local_addr().unwrap().port();
     let (shutdown_tx, shutdown_rx) = futures_channel::oneshot::channel();
     let thread = std::thread::spawn(move || {
         // `run` does this before serving; the test calls `serve` directly, so register here.
+        libstarling::apply_pre_init_config(&config).expect("valid config");
         libstarling::register_builtins();
-        let _ = libstarling::serve_native::serve_with_shutdown(config, port, async {
+        let _ = libstarling::serve_native::serve_with_shutdown(config, listener, async {
             let _ = shutdown_rx.await;
         });
     });
-    for _ in 0..200 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return ServeHandle {
-                shutdown: shutdown_tx,
-                thread,
-            };
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    ServeHandle {
+        port,
+        shutdown: shutdown_tx,
+        thread,
     }
-    panic!("serve did not start on port {port}");
+}
+
+/// A temporary directory of content-script files, removed on drop.
+pub struct ScriptDir(tempfile::TempDir);
+
+impl ScriptDir {
+    /// Create a directory holding `files`, given as `(relative path, contents)`.
+    pub fn new(files: &[(&str, &str)]) -> Self {
+        let dir = libstarling::test_util::test_tempdir();
+        for (path, contents) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        ScriptDir(dir)
+    }
+
+    /// The path of `file` in this directory.
+    pub fn path(&self, file: &str) -> String {
+        self.0.path().join(file).to_string_lossy().into_owned()
+    }
 }

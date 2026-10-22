@@ -4,16 +4,22 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::process::Command;
+use std::ffi::OsStr;
+use std::process::{Command, Output};
+
+/// Run `starlingmonkey <args>`, and return the process output.
+fn run(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .args(args)
+        .output()
+        .expect("failed to run starling")
+}
 
 /// An error before the event loop runs, here an unreadable `-i` initializer
 /// script, exits with code 1 rather than aborting.
 #[test]
 fn initializer_error_exits_with_code_one() {
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .args(["-i", "/nonexistent/init.js", "/nonexistent/app.js"])
-        .output()
-        .expect("failed to run starling");
+    let out = run(["-i", "/nonexistent/init.js", "/nonexistent/app.js"]);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -23,9 +29,9 @@ fn initializer_error_exits_with_code_one() {
     );
 }
 
-/// Scheduling APIs work during initializer evaluation, and the initializer's
-/// microtasks drain before the content script runs — but async work left
-/// behind has nothing to drive it and must be a hard error.
+/// Scheduling APIs work during initializer evaluation. The initializer's
+/// microtasks drain before the content script runs. Async work left behind by
+/// the initializer has nothing to drive it, so the run fails.
 #[test]
 fn initializer_event_loop_semantics() {
     let dir = tempfile::tempdir().unwrap();
@@ -43,10 +49,7 @@ fn initializer_event_loop_semantics() {
         "if (globalThis._fromInit !== 'ready') { throw new Error('initializer microtask not drained'); }",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .args(["-i", &init.to_string_lossy(), &main.to_string_lossy()])
-        .output()
-        .expect("failed to run starling");
+    let out = run([OsStr::new("-i"), init.as_os_str(), main.as_os_str()]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -54,14 +57,10 @@ fn initializer_event_loop_semantics() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // setTimeout no longer throws "No active event loop" — but a timer left
-    // pending when the initializer ends is an error.
+    // A timer left pending when the initializer ends fails the run.
     let init_timer = dir.path().join("init_timer.js");
     std::fs::write(&init_timer, "setTimeout(() => {}, 1000);").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .args(["-i", &init_timer.to_string_lossy(), &main.to_string_lossy()])
-        .output()
-        .expect("failed to run starling");
+    let out = run([OsStr::new("-i"), init_timer.as_os_str(), main.as_os_str()]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -76,14 +75,7 @@ fn initializer_event_loop_semantics() {
         "globalThis._fromInit = 'ready'; var t = setTimeout(() => {}, 1000); clearTimeout(t);",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .args([
-            "-i",
-            &init_cleared.to_string_lossy(),
-            &main.to_string_lossy(),
-        ])
-        .output()
-        .expect("failed to run starling");
+    let out = run([OsStr::new("-i"), init_cleared.as_os_str(), main.as_os_str()]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -92,40 +84,27 @@ fn initializer_event_loop_semantics() {
     );
 }
 
-/// A content script that throws reports the error on stderr and exits with 1.
+/// A top-level throw in a module file reports the error and where it was thrown on stderr, and
+/// exits with 1.
 #[test]
-fn throwing_script_exits_with_code_one() {
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .args(["-e", "throw new Error('boom')"])
-        .output()
-        .expect("failed to run starling");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
-    assert!(stderr.contains("boom"), "stderr: {stderr}");
-    assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("boom"),
-        "the error must not go to stdout"
-    );
-}
-
-/// A top-level throw in a module file reports where it was thrown.
-#[test]
-fn top_level_throw_reports_its_location() {
+fn top_level_throw_exits_with_code_one_and_reports_its_location() {
     let dir = tempfile::tempdir().unwrap();
     let main = dir.path().join("main.mjs");
     std::fs::write(&main, "const x = 1;\nthrow new Error('located');").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .arg(&main)
-        .output()
-        .expect("failed to run starling");
+    let out = run([&main]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(stderr.contains("located"), "stderr: {stderr}");
     assert!(stderr.contains("main.mjs:2:"), "stderr: {stderr}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("located"),
+        "the error must not go to stdout"
+    );
 }
 
 /// A top level that rejects once a timer has fired, after evaluation handed off to the event
-/// loop, reports the error and exits with 1.
+/// loop, reports the error and exits with 1. The module file case has no other work. The `-e`
+/// case also checks that the exit does not wait for an interval that keeps the event loop busy.
 #[test]
 fn late_top_level_rejection_exits_with_code_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -136,49 +115,29 @@ fn late_top_level_rejection_exits_with_code_one() {
          throw new Error('late failure');",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .arg(&main)
-        .output()
-        .expect("failed to run starling");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
-    assert!(stderr.contains("late failure"), "stderr: {stderr}");
-}
-
-/// A top level that rejects while an interval keeps the event loop busy reports the error and
-/// exits with 1, without waiting for the interval.
-#[test]
-fn late_rejection_with_work_left_exits_with_code_one() {
-    let dir = tempfile::tempdir().unwrap();
-    let main = dir.path().join("main.mjs");
-    std::fs::write(
-        &main,
+    let from_file = run([&main]);
+    let from_eval = run([
+        "-e",
         "setInterval(() => {}, 5);\n\
          await new Promise((resolve) => setTimeout(resolve, 10));\n\
          throw new Error('late failure');",
-    )
-    .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .arg(&main)
-        .output()
-        .expect("failed to run starling");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
-    assert!(stderr.contains("late failure"), "stderr: {stderr}");
+    ]);
+    for (case, out) in [("module file", from_file), ("-e", from_eval)] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{case}: stderr: {stderr}");
+        assert!(stderr.contains("late failure"), "{case}: stderr: {stderr}");
+    }
 }
 
-/// A top-level `await` on a promise nothing settles exits with 1, whether or not the event loop
-/// had other work first.
+/// A top-level `await` on a promise that never settles exits with 1, whether or not the event
+/// loop had other work first.
 #[test]
 fn unsettled_top_level_await_exits_with_code_one() {
     for source in [
         "await new Promise(() => {});",
         "setTimeout(() => {}, 10);\nawait new Promise(() => {});",
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-            .args(["-e", source])
-            .output()
-            .expect("failed to run starling");
+        let out = run(["-e", source]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{source}: stderr: {stderr}");
         assert!(
@@ -191,16 +150,8 @@ fn unsettled_top_level_await_exits_with_code_one() {
 /// `--help` exits with 0 and an unknown flag with clap's usage-error status 2.
 #[test]
 fn argument_errors_use_clap_exit_statuses() {
-    let help = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .arg("--help")
-        .output()
-        .expect("failed to run starling");
-    assert_eq!(help.status.code(), Some(0));
-    let bad = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .arg("--no-such-flag")
-        .output()
-        .expect("failed to run starling");
-    assert_eq!(bad.status.code(), Some(2));
+    assert_eq!(run(["--help"]).status.code(), Some(0));
+    assert_eq!(run(["--no-such-flag"]).status.code(), Some(2));
 }
 
 /// A syntax error in an imported file module is reported with its own message
@@ -211,10 +162,7 @@ fn imported_module_syntax_error_keeps_its_location() {
     let main = dir.path().join("main.mjs");
     std::fs::write(&main, "import './bad.mjs';").unwrap();
     std::fs::write(dir.path().join("bad.mjs"), "export const x = ;").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
-        .arg(&main)
-        .output()
-        .expect("failed to run starling");
+    let out = run([&main]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(stderr.contains("expected expression"), "stderr: {stderr}");

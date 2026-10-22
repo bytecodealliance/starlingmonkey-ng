@@ -12,7 +12,7 @@ edition.workspace = true
 # builds only this crate and the component, not the native engine.
 
 [lib]
-# No unit tests; the integration test in `tests/` links the lib.
+# No unit tests. The integration test in `tests/` links the lib.
 test = false
 
 [lints]

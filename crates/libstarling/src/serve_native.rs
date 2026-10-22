@@ -54,7 +54,7 @@ enum RequestHandlingMode {
 }
 
 /// Everything a connection needs that outlives the requests it serves: the runtime to dispatch in,
-/// where each request's JS runs, and the time limits each request runs under.
+/// where each request's JS runs, and the time limits under which each request runs.
 struct ServeContext {
     runtime: Rc<Runtime>,
     request_handling_mode: RequestHandlingMode,
@@ -90,25 +90,28 @@ impl ServeContext {
     }
 }
 
-/// Run the serve loop on the given TCP port: evaluate the script (registering handlers), then
-/// accept and dispatch requests until the process is killed.
+/// Bind `127.0.0.1:port`, or a port the system picks when `port` is `0`, and run the serve loop on
+/// it until the process is killed. See [`serve_with_shutdown`].
 pub fn serve(config: RuntimeConfig, port: u16) -> Result<(), String> {
-    serve_with_shutdown(config, port, std::future::pending())
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("Failed to bind 127.0.0.1:{port}: {e}"))?;
+    serve_with_shutdown(config, listener, std::future::pending())
 }
 
-/// Like [`serve`], but stops accepting and returns once `shutdown` resolves (any in-flight requests
-/// are abandoned). Lets a caller (a test, or a future signal handler) shut the server down
-/// gracefully so the runtime drops cleanly.
+/// Run the serve loop on `listener`: print the listener's address on stderr, evaluate the script
+/// (registering handlers), then accept and dispatch requests until `shutdown` resolves. Requests
+/// still in flight at that point are abandoned. A caller that shuts the server down this way, such
+/// as a test, lets the runtime drop cleanly.
 pub fn serve_with_shutdown(
     config: RuntimeConfig,
-    port: u16,
+    listener: std::net::TcpListener,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), String> {
     config.validate_serve_timeouts()?;
     config.serve_limits.validate()?;
     // Isolated mode has no process-wide content script: the script belongs to each request's own
     // global, and every request evaluates it there. Evaluating it here as well would run it (and
-    // its side effects) one extra time, in a global that goes on to serve nothing, so that mode
+    // its side effects) one extra time, in a global that never serves a request, so that mode
     // only sets up the runtime itself.
     let (runtime, startup) = if config.serve_isolated {
         (Runtime::init(&config)?, None)
@@ -120,7 +123,7 @@ pub fn serve_with_shutdown(
         .enable_all()
         .build()
         .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
-    tokio_rt.block_on(run_server(runtime, startup, config, port, shutdown))
+    tokio_rt.block_on(run_server(runtime, startup, config, listener, shutdown))
 }
 
 /// One step of the accept loop.
@@ -136,7 +139,7 @@ async fn run_server(
     runtime: Rc<Runtime>,
     startup: Option<(InvocationState, core_runtime::ScriptEvaluation)>,
     config: RuntimeConfig,
-    port: u16,
+    listener: std::net::TcpListener,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), String> {
     // An isolated request serves from a global of its own, not the default global, but the
@@ -159,10 +162,14 @@ async fn run_server(
         RequestHandlingMode::Shared
     };
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| format!("Failed to bind 127.0.0.1:{port}: {e}"))?;
-    eprintln!("serving on http://127.0.0.1:{port}");
+    let bound = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to read the listener's bound address: {e}"))?;
+    let listener = listener
+        .set_nonblocking(true)
+        .and_then(|()| TcpListener::from_std(listener))
+        .map_err(|e| format!("Failed to listen on {bound}: {e}"))?;
+    eprintln!("serving on http://{bound}");
 
     // Let the script finish evaluating before serving, so a handler registered after a top-level
     // `await` is in place for the first request. Binding first leaves a client that connects
@@ -192,9 +199,10 @@ async fn run_server(
             return Err(crate::serve_common::NO_FETCH_LISTENER.to_string());
         }
     }
-    // Borrowed for the rest of the function. `background` is not touched again, only released and
-    // dropped on the way out. Isolated mode has none of this: with a per-request global entered
-    // for each request, there is no single realm a background loop could be stepped in.
+    // The background loop is borrowed for the rest of the function. `background` is not touched
+    // again, only released and dropped on the way out. Isolated mode has none of this: with a
+    // per-request global entered for each request, there is no single realm a background loop
+    // could be stepped in.
     let background_loop = background
         .as_mut()
         .map(|(invocation, _)| invocation.state().event_loop());
@@ -285,11 +293,17 @@ async fn run_server(
                             // Keep the content script's own loop running alongside serving, so a
                             // `setInterval` it left running actually fires. This arm never yields
                             // a `Step`: it runs for as long as the server does, and its timers
-                            // wake this task when they come due.
+                            // wake this task when they come due. A `setInterval(…, 0)` cannot
+                            // starve the accept loop, since the re-queued timer is clamped to a
+                            // non-zero delay.
                             // TODO: same as in wasm: should reconsider this and abort work not
                             // added to waitUntil.
                             if let Some(event_loop) = background_loop {
-                                run_background_work(raw_cx, event_loop).await;
+                                // SAFETY: `raw_cx` is valid, with the serve loop's realm entered,
+                                // for the server's life.
+                                unsafe {
+                                    run_to_completion(raw_cx, event_loop, tokio::time::sleep).await
+                                };
                             }
                             std::future::pending::<Step>().await
                         },
@@ -322,20 +336,6 @@ async fn run_server(
             Step::ConnectionDone | Step::WorkDone => {}
         }
     }
-}
-
-/// Keep the content script's own event loop running for as long as the server runs: the
-/// `setInterval`s it left behind, and whatever they start.
-///
-/// Never returns while that loop still has work (with a repeating timer it never will), so this
-/// is raced against the accept loop rather than awaited.
-///
-/// Between firings it waits on the next deadline like any idle loop, leaving the thread free to
-/// accept and serve. A `setInterval(…, 0)` cannot starve that: the re-queued timer is clamped to
-/// a non-zero delay, so the loop reports idle rather than finding ready work every step.
-async fn run_background_work(raw_cx: *mut js::native::RawJSContext, event_loop: &EventLoop) {
-    // SAFETY: `raw_cx` is valid, with the serve loop's realm entered, for the server's life.
-    unsafe { run_to_completion(raw_cx, event_loop, tokio::time::sleep).await };
 }
 
 /// A request's event loop, released once all work related to the request is done or abandoned.
@@ -419,59 +419,30 @@ async fn serve_connection<'a>(
         builder.header_read_timeout(silence);
     }
 
-    let serving = std::pin::pin!(builder.serve_connection(
+    let mut serving = std::pin::pin!(builder.serve_connection(
         hyper_util::rt::TokioIo::new(stream),
         hyper::service::service_fn(|request| serve_request(&request_context, request)),
     ));
-    if let Err(e) = drive_connection(serving, &mut closed).await {
-        // Ignore clients that disconnect mid-request.
-        if !e.is_incomplete_message() {
-            eprintln!("serve: connection error: {e}");
-        }
-    }
-}
-
-/// Drive hyper's connection future to the connection's close.
-///
-/// An unfinished response body or a request body left unread results in the connection being
-/// closed: it stops taking requests and ends once the one in flight is done.
-async fn drive_connection<C>(
-    mut serving: Pin<&mut C>,
-    closed: &mut futures_channel::mpsc::UnboundedReceiver<()>,
-) -> hyper::Result<()>
-where
-    C: Future<Output = hyper::Result<()>> + GracefulShutdown,
-{
+    // An unfinished response body or a request body left unread results in the connection being
+    // closed: it stops taking requests and ends once the one in flight is done.
     let mut ending = false;
-    std::future::poll_fn(|cx| {
+    let served = std::future::poll_fn(|cx| {
         // Checked before hyper is polled, so a close signal sent by this connection's request
         // work takes effect before hyper can start on a request already sitting in its read buffer.
         if !ending {
             if let Poll::Ready(Some(())) = closed.poll_next_unpin(cx) {
-                serving.as_mut().shut_down_gracefully();
+                serving.as_mut().graceful_shutdown();
                 ending = true;
             }
         }
         serving.as_mut().poll(cx)
     })
-    .await
-}
-
-/// Close a connection once the request in flight completes, rather than immediately.
-trait GracefulShutdown {
-    fn shut_down_gracefully(self: Pin<&mut Self>);
-}
-
-impl<I, S> GracefulShutdown for hyper::server::conn::http1::Connection<I, S>
-where
-    S: hyper::service::HttpService<Incoming>,
-    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    I: hyper::rt::Read + hyper::rt::Write + Unpin,
-    S::ResBody: Body + 'static,
-    <S::ResBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    fn shut_down_gracefully(self: Pin<&mut Self>) {
-        self.graceful_shutdown();
+    .await;
+    if let Err(e) = served {
+        // Ignore clients that disconnect mid-request.
+        if !e.is_incomplete_message() {
+            eprintln!("serve: connection error: {e}");
+        }
     }
 }
 
@@ -993,7 +964,7 @@ type BodyAbort = Rc<std::cell::RefCell<Option<String>>>;
 
 /// The response body hyper writes.
 enum WireBody {
-    /// A body already in memory. Empty where the status or the method leaves no content to send.
+    /// A body already in memory. Empty if the status or the method leaves no content to send.
     Complete(bytes::Bytes),
     /// Chunks the connection's background work feeds in as the handler's body produces them.
     Streamed {

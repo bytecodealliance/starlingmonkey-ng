@@ -31,14 +31,16 @@ pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     queuing::ByteLengthQueuingStrategy::add_to_global(scope, global);
     queuing::CountQueuingStrategy::add_to_global(scope, global);
 
-    // Internal classes holding the state of tee, pipe, from-iterable and read-all-bytes
-    // operations. Creating instances needs their prototypes registered, and `hidden` keeps
-    // their constructors off the global.
+    // Internal classes holding the state of tee, pipe, from-iterable, read-all-bytes, native
+    // source and native pump operations. Creating instances needs their prototypes registered,
+    // and `hidden` keeps their constructors off the global.
     readable::algorithms::TeeState::add_to_global(scope, global);
     readable::algorithms::ByteTeeState::add_to_global(scope, global);
     readable::algorithms::PipeState::add_to_global(scope, global);
     readable::algorithms::FromIterableState::add_to_global(scope, global);
     readable::read_all_bytes::ReadAllBytesState::add_to_global(scope, global);
+    readable::native_byte_source::NativeByteSource::add_to_global(scope, global);
+    readable::native_pump::NativePump::add_to_global(scope, global);
     js::iteration::AsyncIteratorRecord::add_to_global(scope, global);
 
     // Chain the async iterator's prototype under `%AsyncIteratorPrototype%` so it

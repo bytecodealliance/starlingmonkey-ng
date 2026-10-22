@@ -1513,6 +1513,7 @@ dependencies = [
  "js",
  "platform",
  "serve-test-support",
+ "tempfile",
  "tokio",
  "url",
  "wasip3",
@@ -3085,7 +3086,9 @@ dependencies = [
  "core-runtime",
  "js",
  "libstarling",
+ "platform",
  "smallvec",
+ "tokio",
  "web-globals",
 ]
 

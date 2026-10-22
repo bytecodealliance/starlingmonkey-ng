@@ -7,14 +7,13 @@ authors.workspace = true
 edition.workspace = true
 
 [lib]
-# No unit tests; skip building the (SpiderMonkey-sized) lib test harness binary.
+# No unit tests. This skips building the (SpiderMonkey-sized) lib test harness binary.
 test = false
 
 [dependencies]
 bytes.workspace = true
 futures-channel.workspace = true
 futures-lite.workspace = true
-url.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2"
@@ -22,6 +21,7 @@ reqwest.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 http.workspace = true
+url.workspace = true
 wasip3.workspace = true
 wit-bindgen.workspace = true
 

@@ -16,9 +16,10 @@
 use serve_test_support as common;
 
 use common::read_until_eof;
-use common::wasm_serve::{Ready, Serve};
+use common::wasm_serve::{Ready, Serve, WasmServer};
 use std::io::Write;
 use std::net::TcpStream;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 /// Counts the requests one instance has served, so a test can tell whether it is still talking to
@@ -38,7 +39,7 @@ addEventListener('fetch', (event) => {
 /// as they do in the native server's default mode.
 #[test]
 fn sequential_requests_share_one_instance() {
-    let Some(server) = Serve::new(18402)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .script(REQUEST_COUNTER)
         .start()
@@ -71,11 +72,11 @@ fn sequential_requests_share_one_instance() {
 }
 
 /// The other side of that contract: reuse is the host's choice, and a host that declines it hands
-/// every request a global of its own — the property the native server offers as `--serve-isolated`
-/// and the WPT serve harness asks `wasmtime serve` for.
+/// every request a global of its own. The native server offers this as `--serve-isolated`, and
+/// the WPT serve harness requests it from `wasmtime serve`.
 #[test]
 fn a_host_that_retires_instances_gives_each_request_a_fresh_global() {
-    let Some(server) = Serve::new(18403)
+    let Some(server) = Serve::new()
         .wasmtime_flags(["--max-instance-reuse-count", "1"])
         .script(REQUEST_COUNTER)
         .start()
@@ -103,11 +104,7 @@ fn a_repeating_timer_keeps_running_between_requests() {
     addEventListener('fetch', (event) => {
         event.respondWith(new Response('ticks=' + globalThis.ticks));
     });"#;
-    let Some(server) = Serve::new(18404)
-        .reusing_one_instance()
-        .script(TICKER)
-        .start()
-    else {
+    let Some(server) = Serve::new().reusing_one_instance().script(TICKER).start() else {
         return;
     };
 
@@ -120,7 +117,7 @@ fn a_repeating_timer_keeps_running_between_requests() {
 
     let first = ticks(&server);
     // Idle time with no requests at all: the interval has to fire on its own.
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(200));
     let second = ticks(&server);
     assert!(
         second > first,
@@ -139,7 +136,7 @@ fn an_unawaited_top_level_fetch_does_not_break_the_instance() {
         "fetch('http://127.0.0.1:{upstream}/');
         addEventListener('fetch', (event) => event.respondWith(new Response('served')));"
     );
-    let Some(server) = Serve::new(18405).script(&handler).start() else {
+    let Some(server) = Serve::new().script(&handler).start() else {
         return;
     };
 
@@ -152,7 +149,7 @@ fn an_unawaited_top_level_fetch_does_not_break_the_instance() {
 /// host paths — goes to the log.
 #[test]
 fn a_runtime_that_will_not_start_keeps_its_reasons_off_the_wire() {
-    let Some(server) = Serve::new(18406)
+    let Some(server) = Serve::new()
         .flags(["--legacy-script", "not-a-real-script.js"])
         .ready(Ready::AnyResponse)
         .start()
@@ -180,7 +177,7 @@ fn a_runtime_that_will_not_start_keeps_its_reasons_off_the_wire() {
 /// once.
 #[test]
 fn a_failed_startup_is_not_retried_by_later_requests() {
-    let Some(server) = Serve::new(18461)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .script("console.error('startup-ran'); throw new Error('startup failed');")
         .ready(Ready::AnyResponse)
@@ -211,32 +208,6 @@ fn a_failed_startup_is_not_retried_by_later_requests() {
     );
 }
 
-/// A `fetch` whose request has a header the host refuses rejects with a `TypeError` naming
-/// that header. `http2-settings` is allowed by Fetch but refused by `wasi:http`.
-#[test]
-fn a_fetch_with_a_header_the_host_refuses_rejects_naming_it() {
-    let upstream = common::start_upstream("UPSTREAM-BODY");
-    let handler = format!(
-        r#"addEventListener('fetch', (event) => {{
-            if (new URL(event.request.url).pathname === '/ready') {{
-                event.respondWith(new Response('ready'));
-                return;
-            }}
-            event.respondWith(
-                fetch('http://127.0.0.1:{upstream}/', {{ headers: {{ 'http2-settings': 'AAMAAABk' }} }})
-                    .then(() => new Response('sent'), (e) => new Response(e.name + ': ' + e.message))
-            );
-        }});"#
-    );
-    let Some(server) = Serve::new(18462).script(&handler).start() else {
-        return;
-    };
-
-    let body = server.get("/");
-    assert!(body.starts_with("TypeError: "), "{body}");
-    assert!(body.contains("http2-settings"), "{body}");
-}
-
 /// An unusual status is the handler's to choose: it reaches the client as itself, and the host
 /// must not act on it behind the handler's back — a `421` invites a client to retry elsewhere, not
 /// the server to re-dispatch (`serve_delivers_an_unusual_status_without_retrying_it`). That the
@@ -257,11 +228,7 @@ fn serve_delivers_an_unusual_status_without_retrying_it() {
         globalThis.dispatches++;
         event.respondWith(new Response('misdirected', { status: 421 }));
     });"#;
-    let Some(server) = Serve::new(18407)
-        .reusing_one_instance()
-        .script(HANDLER)
-        .start()
-    else {
+    let Some(server) = Serve::new().reusing_one_instance().script(HANDLER).start() else {
         return;
     };
 
@@ -281,26 +248,6 @@ fn serve_delivers_an_unusual_status_without_retrying_it() {
     );
 }
 
-/// A handler returning `Response.error()` — a network-error response with status 0 — must not
-/// serialize the protocol-illegal status line `HTTP/1.1 0`; the status is surfaced as a 500
-/// (`serve_maps_invalid_status_to_500`).
-#[test]
-fn serve_maps_invalid_status_to_500() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        if (new URL(event.request.url).pathname === '/ready') {
-            event.respondWith(new Response('ready'));
-            return;
-        }
-        event.respondWith(Response.error());
-    });"#;
-    let Some(server) = Serve::new(18408).script(HANDLER).start() else {
-        return;
-    };
-
-    let response = server.full_request("GET", "/", "");
-    assert!(response.starts_with("HTTP/1.1 500"), "got: {response}");
-}
-
 /// A script that registers no `fetch` listener can only ever serve 500s. Native refuses to serve
 /// at all (`a_script_with_no_fetch_listener_refuses_to_serve`) and wizer refuses to snapshot it,
 /// but a wasm server cannot decline the host's requests, so it reports the reason once and the
@@ -308,7 +255,7 @@ fn serve_maps_invalid_status_to_500() {
 /// follow each say why too.
 #[test]
 fn a_script_with_no_fetch_listener_reports_itself_and_answers_500s() {
-    let Some(server) = Serve::new(18409)
+    let Some(server) = Serve::new()
         .script("globalThis.ready = true;")
         .ready(Ready::AnyResponse)
         .start()
@@ -334,7 +281,7 @@ fn a_script_with_no_fetch_listener_reports_itself_and_answers_500s() {
 /// rejection is logged once, and every request is answered with a 500.
 #[test]
 fn a_late_top_level_rejection_fails_startup() {
-    let Some(server) = Serve::new(18474)
+    let Some(server) = Serve::new()
         .module(
             "entry.mjs",
             "addEventListener('fetch', (event) => event.respondWith(new Response('served')));
@@ -356,7 +303,7 @@ fn a_late_top_level_rejection_fails_startup() {
         "{}",
         server.log()
     );
-    // Logged when startup fails, not again for each request.
+    // The rejection is logged once when startup fails, and not again for each request.
     let log = server.log();
     assert_eq!(
         log.matches("top-level `await` rejected").count(),
@@ -390,7 +337,7 @@ fn a_reused_instance_shares_its_global_and_starts_up_once() {
         state.count += 1;
         event.respondWith(new Response('ok'));
     });"#;
-    let Some(server) = Serve::new(18410)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .file("dep.mjs", "export const state = { count: 0 };")
         .module("entry.mjs", ENTRY)
@@ -446,9 +393,9 @@ fn a_later_request_gets_a_fresh_event_and_signal() {
             start(c) { setInterval(() => c.enqueue(new TextEncoder().encode('tick ')), 50); },
         })));
     });"#;
-    let Some(server) = Serve::new(18411)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
-        .flags(["--response-body-timeout", "1"])
+        .flags(["--response-body-timeout", "0.2"])
         .script(HANDLER)
         .start()
     else {
@@ -491,7 +438,7 @@ fn a_later_request_gets_its_own_response_body_window() {
             })));
             return;
         }
-        // Three chunks over ~900ms: comfortably inside a fresh 3s window, and nowhere near one
+        // Three chunks over ~300ms: comfortably inside a fresh 900ms window, and nowhere near one
         // that a previous request had already spent.
         event.respondWith(new Response(new ReadableStream({
             start(c) {
@@ -502,13 +449,13 @@ fn a_later_request_gets_its_own_response_body_window() {
                         clearInterval(timer);
                         c.close();
                     }
-                }, 300);
+                }, 100);
             },
         })));
     });"#;
-    let Some(server) = Serve::new(18412)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
-        .flags(["--response-body-timeout", "3"])
+        .flags(["--response-body-timeout", "0.9"])
         .script(HANDLER)
         .start()
     else {
@@ -526,7 +473,7 @@ fn a_later_request_gets_its_own_response_body_window() {
 
 /// A handler that proxies `/fetch` from an upstream slow enough to still be in flight while
 /// another request's post-response work finishes, and serves `/lifetime` at once while leaving
-/// two seconds of `waitUntil` work behind it.
+/// 600ms of `waitUntil` work behind it.
 fn overlapping_work_handler(upstream: u16) -> String {
     format!(
         r#"addEventListener('fetch', (event) => {{
@@ -539,7 +486,7 @@ fn overlapping_work_handler(upstream: u16) -> String {
             event.waitUntil(new Promise((resolve) => setTimeout(() => {{
                 console.error('lifetime-done');
                 resolve();
-            }}, 2000)));
+            }}, 600)));
             event.respondWith(new Response('lifetime-started'));
             return;
         }}
@@ -564,8 +511,8 @@ fn overlapping_work_handler(upstream: u16) -> String {
 /// is what keeps the second request's in-flight `fetch` out of it.
 #[test]
 fn post_response_work_does_not_disturb_the_next_request() {
-    let upstream = common::start_slow_upstream(Duration::from_secs(3), "upstream-body");
-    let Some(server) = Serve::new(18413)
+    let upstream = common::start_slow_upstream(Duration::from_millis(1200), "upstream-body");
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .script(&overlapping_work_handler(upstream))
         .start()
@@ -575,7 +522,7 @@ fn post_response_work_does_not_disturb_the_next_request() {
 
     // Both have to run in one instance for the first request's drain to reach the second.
     let (started, proxied) = met_in_one_instance(&server, || {
-        // Answered at once, with two seconds of lifetime work left running behind it.
+        // This request is answered at once, with 600ms of lifetime work left running behind it.
         let started = server.get("/lifetime");
         // Its own `fetch` outlasts that window, so the first request's drain ends, releasing what
         // its loop still holds, while this one is still waiting on the upstream.
@@ -590,15 +537,15 @@ fn post_response_work_does_not_disturb_the_next_request() {
     );
 }
 
-/// The same overlap with the harsher ending: the first request's response-body clock runs out —
-/// aborting its signal from its drain task, on the realm the second request is running JS in —
-/// while the second is parked mid-dispatch. Each has to see only its own outcome.
+/// The same overlap with the harsher ending: the first request's response-body clock runs out
+/// while the second is parked mid-dispatch, and the first request's drain task aborts its signal
+/// on the realm in which the second is running JS. Each has to see only its own outcome.
 #[test]
 fn a_truncated_response_body_does_not_disturb_a_concurrent_request() {
-    let upstream = common::start_slow_upstream(Duration::from_millis(2500), "upstream-body");
-    let Some(server) = Serve::new(18414)
+    let upstream = common::start_slow_upstream(Duration::from_millis(1000), "upstream-body");
+    let Some(server) = Serve::new()
         .reusing_one_instance()
-        .flags(["--response-body-timeout", "1"])
+        .flags(["--response-body-timeout", "0.3"])
         .script(&overlapping_work_handler(upstream))
         .start()
     else {
@@ -646,7 +593,7 @@ fn instance_of(response: &str) -> &str {
 }
 
 /// Fail unless every response came from the same instance — otherwise the requests never met, and
-/// whatever the test asserts about them not interfering proves nothing.
+/// the test's assertions that they don't interfere are meaningless.
 fn assert_met_in_one_instance(responses: &[&str]) {
     let ids: Vec<&str> = responses.iter().map(|r| instance_of(r)).collect();
     assert!(
@@ -688,6 +635,16 @@ fn met_in_one_instance<T>(
         );
     }
     unreachable!("the loop returns or asserts")
+}
+
+/// Request `path` from `server` until the body is `settled`, and return the last body. See
+/// [`common::eventually`].
+fn eventually(
+    server: &common::wasm_serve::WasmServer,
+    path: &str,
+    settled: impl Fn(&str) -> bool,
+) -> String {
+    common::eventually(|| server.get(path), settled)
 }
 
 /// Wait until a handler has parked on `gate` and the instance has reported an idle event loop, so
@@ -773,12 +730,12 @@ fn concurrent_requests_in_one_instance_keep_their_own_state() {
     }});"#,
         gate = gate.port()
     );
-    let Some(server) = Serve::new(18415)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
-        // Pinned to the ordinary collector. Every request is sent only once the instance has
-        // reported an idle loop, but under mode 4 the verifier wakes it again between that report
-        // and the request landing, often enough that the host gives the request an instance of its
-        // own.
+        // This server runs with the ordinary collector. Every request is sent only once the
+        // instance has reported an idle loop, but under mode 4 the verifier wakes it again between
+        // that report and the request landing, often enough that the host gives the request an
+        // instance of its own.
         .without_gc_zeal()
         .script(&format!("{INSTANCE_ID}\n{handler}"))
         .start()
@@ -824,6 +781,16 @@ fn concurrent_requests_in_one_instance_keep_their_own_state() {
     assert_met_in_one_instance(&[&slow, &quick, &streamed_body]);
 }
 
+/// How long a request in the interleaving case below may take. Its own patience, since that case
+/// runs its JS with the collector in the way.
+const WORK_PATIENCE: Duration = Duration::from_secs(180);
+
+/// The rounds of await-then-allocate run by each request, and how much each round allocates. The
+/// rounds are enough that every request is still working while the others are. The allocation is
+/// enough to give the collector real work to do in the middle of one request's JS.
+const ROUNDS: usize = 12;
+const PER_ROUND: usize = 1000;
+
 /// The realm-stack worry the `RUNTIME` thread-local is written around: entering the global's realm
 /// per request would mean `JSAutoRealm` scopes dropping out of order under interleaving, restoring
 /// the wrong realm under whichever requests are still in flight. Requests here are deliberately
@@ -833,22 +800,22 @@ fn concurrent_requests_in_one_instance_keep_their_own_state() {
 /// Held to five concurrent requests: past `--max-instance-concurrent-reuse-count`'s default of 16
 /// the host would spread them over instances, and interleaving is the whole point.
 ///
-/// Its own patience, since the GC-stress variant runs the same JS with the collector in the way.
-const WORK_PATIENCE: Duration = Duration::from_secs(180);
-
-/// Rounds of await-then-allocate each request runs, and how much each round allocates. The rounds
-/// are enough that every request is still working while the others are. The allocation is enough
-/// to give the GC-stress variant's collector real work to do in the middle of one request's JS.
-const ROUNDS: usize = 12;
-const PER_ROUND: usize = 1000;
-
-fn interleaved_requests_all_get_their_own_answer(port: u16, zeal: Option<&str>) {
+/// The collector runs constantly (zeal mode 2: collect every N allocations), since a rooting or
+/// realm mistake surfaces when GC lands in the middle of one request's JS while others are parked.
+/// Only a `debugmozjs` component acts on the zeal mode. Against any other component this runs the
+/// same interleaving under the ordinary collector.
+#[test]
+fn deeply_interleaved_requests_keep_the_realm_stack_intact() {
     let gate = common::start_held_upstream("go");
     let handler = format!(
         r#"addEventListener('fetch', (event) => {{
         const url = new URL(event.request.url);
         if (url.pathname === '/ready') {{
             event.respondWith(new Response('ready'));
+            return;
+        }}
+        if (url.pathname === '/instance') {{
+            event.respondWith(new Response('instance=' + globalThis.instance));
             return;
         }}
         const n = Number(url.searchParams.get('n'));
@@ -872,15 +839,16 @@ fn interleaved_requests_all_get_their_own_answer(port: u16, zeal: Option<&str>) 
     }});"#,
         gate = gate.port()
     );
-    // `zeal` is this case's collector, not the run's. Twelve rounds of allocate-then-await across
+    // The zeal mode is this case's own, not the run's. Twelve rounds of allocate-then-await across
     // five requests make many event loop turns over a large live heap, and mode 4 (verify
     // pre-barriers) walks that heap at every one, measured at roughly 8 seconds per turn. Mode 2
     // and the ordinary collector both finish the whole workload in about five.
-    let server = Serve::new(port)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
-        .without_gc_zeal()
-        .script(&format!("{INSTANCE_ID}\n{handler}"));
-    let Some(server) = zeal.into_iter().fold(server, Serve::gc_zeal).start() else {
+        .gc_zeal("2,200")
+        .script(&format!("{INSTANCE_ID}\n{handler}"))
+        .start()
+    else {
         return;
     };
 
@@ -921,34 +889,12 @@ fn interleaved_requests_all_get_their_own_answer(port: u16, zeal: Option<&str>) 
     assert_met_in_one_instance(&answers.iter().map(String::as_str).collect::<Vec<_>>());
 
     // Still serving after all that, rather than having taken the process down with it.
-    let after = common::full_request_within(port, "GET", "/work?n=9", "", WORK_PATIENCE)
-        .expect("the server must still be serving");
     assert_eq!(
-        common::wasm_serve::message_body(&after),
-        format!(
-            "n=9 allocated={allocated} instance={}",
-            instance_of(&answers[0])
-        )
+        server.get("/instance"),
+        format!("instance={}", instance_of(&answers[0]))
     );
 }
 
-#[test]
-fn deeply_interleaved_requests_keep_the_realm_stack_intact() {
-    interleaved_requests_all_get_their_own_answer(18416, None);
-}
-
-/// The same interleaving with the collector running constantly (zeal mode 2: collect every N
-/// allocations). GC landing in the middle of one request's JS while others are parked is exactly
-/// where a rooting or realm mistake surfaces, and nothing else in this suite arranges it.
-#[test]
-fn deeply_interleaved_requests_survive_gc_stress() {
-    interleaved_requests_all_get_their_own_answer(18417, Some("2,200"));
-}
-
-/// A content script that is still evaluating for a second and a half after the instance starts, so
-/// the requests that arrive meanwhile have to wait it out. Its instance id is drawn before the
-/// `await`, so a request served from a half-evaluated script would still name the instance it ran
-/// in — what marks the script as fully evaluated is the listener, registered after.
 /// A content script whose startup waits on a [`common::HeldUpstream`] rather than on a timer. The
 /// upstream is handed the request the guest made reaching its top-level `await`, which pins
 /// exactly when the instance got there.
@@ -973,7 +919,7 @@ addEventListener('fetch', (event) => {{
 #[test]
 fn concurrent_first_requests_all_wait_out_one_startup() {
     let gate = common::start_held_upstream("go");
-    let Some(server) = Serve::new(18418)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         // Not `/ready`: a readiness probe would itself be the first request and drive the very
         // startup this test is about.
@@ -1045,7 +991,7 @@ fn concurrent_first_requests_all_wait_out_one_startup() {
 #[test]
 fn a_client_that_leaves_mid_startup_does_not_strand_the_instance() {
     let gate = common::start_held_upstream("go");
-    let Some(server) = Serve::new(18419)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .ready(Ready::Listening)
         .module("startup.mjs", &slow_startup(gate.port()))
@@ -1078,26 +1024,37 @@ fn a_client_that_leaves_mid_startup_does_not_strand_the_instance() {
 
 /// A wizened instance serves many requests, so the repairs a resumed instance needs have to happen
 /// exactly once, on the first of them. The main one rebases the monotonic clock's origin, which is
-/// anchored to the process the snapshot was taken in. Running them again on a later request would rebase
-/// the clock under a handler that had already read it, so `performance.now()` is checked for going
-/// forwards across requests rather than merely being plausible on the first. The shared global
-/// carries across requests here exactly as it does without a snapshot.
+/// anchored to the process the snapshot was taken in. Running them again on a later request would
+/// rebase the clock under a handler that had already read it, so `performance.now()` is checked for
+/// going forwards across requests rather than merely being plausible on the first. The shared
+/// global persists across requests here exactly as it does without a snapshot.
+///
+/// The content script's top-level `await` finishes before the snapshot is taken, so the listener
+/// registered after it is in place for the first request (`test-wizer.sh`'s `awaited.mjs` case,
+/// extended here with the ordering the response reports).
 #[test]
 fn a_wizened_instance_keeps_its_clock_and_global_across_requests() {
-    const HANDLER: &str = r#"const atStartup = performance.now();
+    // The ordering is recorded in a global and reported in the response rather than through the
+    // usual stderr markers: writing to stdio before the snapshot is taken leaves the resumed
+    // instance with a stale stream handle, and every later write traps.
+    const SCRIPT: &str = r#"globalThis.order = ['evaluating'];
+    const atStartup = performance.now();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    globalThis.order.push('evaluated');
     globalThis.served = 0;
     addEventListener('fetch', (event) => {
-        if (new URL(event.request.url).pathname === '/ready') {
-            event.respondWith(new Response('ready'));
-            return;
-        }
+        globalThis.order.push('dispatched');
         event.respondWith(new Response('n=' + (++globalThis.served)
-            + ' startup=' + atStartup.toFixed(0) + ' now=' + performance.now().toFixed(0)));
+            + ' startup=' + atStartup.toFixed(0) + ' now=' + performance.now().toFixed(0)
+            + ' order=' + globalThis.order.join(',')));
     });"#;
-    let Some(server) = Serve::new(18420)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .wizen()
-        .script(HANDLER)
+        // Not `/ready`: the listener would serve a readiness probe, which would change the
+        // `order` and `n` values this test asserts on.
+        .ready(Ready::Listening)
+        .module("awaited.mjs", SCRIPT)
         .start()
     else {
         return;
@@ -1105,20 +1062,31 @@ fn a_wizened_instance_keeps_its_clock_and_global_across_requests() {
 
     let mut previous = 0.0;
     for expected in 1..=3 {
-        // Spaced out so a rebased clock is unmistakable rather than within the few milliseconds
-        // back-to-back requests are apart — and still far inside the pinned idle timeout.
-        std::thread::sleep(Duration::from_millis(300));
+        // The requests are spaced out so a rebased clock is unmistakable rather than within the
+        // few milliseconds between back-to-back requests, and still far inside the pinned idle
+        // timeout.
+        std::thread::sleep(Duration::from_millis(100));
         let body = server.get("/served");
-        let field = |name: &str| -> f64 {
+        let field = |name: &str| -> &str {
             body.split(&format!("{name}="))
                 .nth(1)
                 .and_then(|rest| rest.split(' ').next())
-                .and_then(|value| value.parse().ok())
                 .unwrap_or_else(|| panic!("no {name} in {body:?}"))
         };
+        let number = |name: &str| -> f64 {
+            field(name)
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a number in {body:?}"))
+        };
         assert!(body.starts_with(&format!("n={expected} ")), "{body}");
+        let dispatched = vec!["dispatched"; expected].join(",");
+        assert_eq!(
+            field("order"),
+            format!("evaluating,evaluated,{dispatched}"),
+            "the script must finish evaluating once, before the first dispatch: {body}"
+        );
         // A clock still reading from the snapshot's time origin would be hours out.
-        let (startup, now) = (field("startup"), field("now"));
+        let (startup, now) = (number("startup"), number("now"));
         assert!((0.0..60_000.0).contains(&startup), "{body}");
         assert!((0.0..60_000.0).contains(&now), "{body}");
         assert!(
@@ -1130,173 +1098,19 @@ fn a_wizened_instance_keeps_its_clock_and_global_across_requests() {
     }
 }
 
-/// A header value is a byte sequence, not text: Fetch isomorphic-encodes it, so `U+00DF U+00C0
-/// U+00BF` has to leave as `DF C0 BF` rather than as their UTF-8 encodings
-/// (`a_response_header_value_is_sent_as_bytes_not_utf8`). The neighbouring header is there to catch
-/// the *other* way this can go wrong: a header list the host refuses must not take the rest with
-/// it.
+/// Snapshotting a snapshot runs its init export again, in an instance whose script has already
+/// been evaluated. The instance resumed from that snapshot still serves.
 #[test]
-fn a_response_header_value_is_sent_as_bytes_not_utf8() {
-    let handler = "addEventListener('fetch', (event) => {\n\
-        if (new URL(event.request.url).pathname === '/ready') {\n\
-            event.respondWith(new Response('ready'));\n\
-            return;\n\
-        }\n\
-        event.respondWith(new Response('x', { headers: {\n\
-            'x-test': '\u{df}\u{c0}\u{bf}',\n\
-            'x-other': 'kept',\n\
-        } }));\n\
-    });";
-    let Some(server) = Serve::new(18421).script(handler).start() else {
+fn a_twice_wizened_instance_serves() {
+    let Some(server) = Serve::new()
+        .wizen()
+        .wizen()
+        .script("addEventListener('fetch', (event) => event.respondWith(new Response('ok')));")
+        .start()
+    else {
         return;
     };
-
-    let raw = common::raw_response_within(server.port(), "GET", "/", "", Duration::from_secs(20))
-        .expect("a complete response");
-    let needle = b"x-test: \xdf\xc0\xbf\r\n";
-    assert!(
-        raw.windows(needle.len()).any(|window| window == needle),
-        "the header must be the three bytes DF C0 BF, got: {:?}",
-        String::from_utf8_lossy(&raw)
-    );
-    assert!(
-        raw.windows(14).any(|window| window == b"x-other: kept\r"),
-        "the other headers must survive: {:?}",
-        String::from_utf8_lossy(&raw)
-    );
-}
-
-/// `wasi:http` refuses the connection-management headers it writes itself, which
-/// `prepare_wire_response` does not filter and a handler — or an upstream whose response is being
-/// proxied — may perfectly well set. Only that header may be lost.
-#[test]
-fn a_response_header_the_host_refuses_does_not_take_the_others_with_it() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        if (new URL(event.request.url).pathname === '/ready') {
-            event.respondWith(new Response('ready'));
-            return;
-        }
-        event.respondWith(new Response('body', { headers: {
-            'x-before': 'kept',
-            'keep-alive': 'timeout=5',
-            'x-after': 'kept',
-        } }));
-    });"#;
-    let Some(server) = Serve::new(18422).script(HANDLER).start() else {
-        return;
-    };
-
-    let response = server.full_request("GET", "/", "");
-    assert!(response.contains("x-before: kept"), "{response}");
-    assert!(response.contains("x-after: kept"), "{response}");
-    assert!(
-        !response.to_lowercase().contains("keep-alive"),
-        "the refused header must not be on the wire: {response}"
-    );
-    assert_eq!(
-        common::wasm_serve::message_body(&response),
-        "body",
-        "{response}"
-    );
-    assert!(
-        server.wait_for_marker(
-            "dropping the response header `keep-alive`",
-            Duration::from_secs(5)
-        ),
-        "{}",
-        server.log()
-    );
-}
-
-/// A header carrying a byte that would split the response never gets as far as the transport:
-/// `Headers` refuses it at construction (`a_response_header_value_with_a_null_byte_is_refused`).
-#[test]
-fn a_response_header_value_with_a_null_byte_is_refused() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        let outcome;
-        try {
-            new Response('x', { headers: { 'x-test': 'b\0r' } });
-            outcome = 'constructed';
-        } catch (e) {
-            outcome = e.name;
-        }
-        event.respondWith(new Response(outcome));
-    });"#;
-    let Some(server) = Serve::new(18424).script(HANDLER).start() else {
-        return;
-    };
-
-    assert_eq!(server.get("/"), "TypeError");
-}
-
-/// What the wire's headers look like from JS: a field that arrived in mixed case is found by any
-/// casing, the incoming set is immutable — it describes what was received, which nothing can change
-/// after the fact — and headers put on the response come back out with `set-cookie` kept as
-/// separate fields while everything else combines
-/// (`serve_exposes_incoming_headers_and_keeps_them_immutable`).
-#[test]
-fn serve_exposes_incoming_headers_and_keeps_them_immutable() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        const incoming = event.request.headers;
-        if (new URL(event.request.url).pathname === '/ready') {
-            event.respondWith(new Response('ready'));
-            return;
-        }
-        let immutable = 'mutable';
-        try {
-            incoming.delete('user-agent');
-        } catch (e) {
-            immutable = e.constructor.name;
-        }
-        const response = new Response('ok', {
-            headers: [
-                ['x-seen', incoming.get('EXAMPLE-HEADER') ?? 'missing'],
-                ['x-agent', incoming.get('User-Agent') ?? 'missing'],
-                ['x-immutable', immutable],
-            ],
-        });
-        response.headers.append('set-cookie', 'A');
-        response.headers.append('set-cookie', 'B');
-        response.headers.append('another', 'A');
-        response.headers.append('another', 'B');
-        event.respondWith(response);
-    });"#;
-    let Some(server) = Serve::new(18423).script(HANDLER).start() else {
-        return;
-    };
-
-    let response = common::raw_request_within(
-        server.port(),
-        b"GET / HTTP/1.1\r\nHost: x\r\neXample-hEader: Header Value\r\nUser-Agent: test-agent\r\n\
-          Connection: close\r\n\r\n",
-        Duration::from_secs(20),
-    )
-    .expect("a complete response");
-
-    assert!(
-        response.contains("x-seen: Header Value"),
-        "a mixed-case field must be found by any casing: {response}"
-    );
-    assert!(response.contains("x-agent: test-agent"), "got: {response}");
-    assert!(
-        response.contains("x-immutable: TypeError"),
-        "an incoming request's headers must not be mutable: {response}"
-    );
-    // `set-cookie` must stay one field per cookie: combining two cookies into one field changes
-    // what they mean. Other repeats may go out either as separate fields or as one comma list —
-    // RFC 9110 §5.2 makes those equivalent — but both values have to survive.
-    assert_eq!(
-        response.matches("set-cookie: ").count(),
-        2,
-        "each cookie needs a field of its own: {response}"
-    );
-    assert!(response.contains("set-cookie: A"), "got: {response}");
-    assert!(response.contains("set-cookie: B"), "got: {response}");
-    assert!(
-        response.contains("another: A, B")
-            || (response.contains("another: A") && response.contains("another: B")),
-        "both values of a repeated header must reach the client: {response}"
-    );
+    assert_eq!(server.get("/"), "ok");
 }
 
 /// A `ReadableStream` whose `start()` neither enqueues nor closes leaves the pump's read pending in
@@ -1316,11 +1130,7 @@ fn an_abandoned_response_body_does_not_hang_the_request() {
         }
         event.respondWith(new Response('still serving'));
     });"#;
-    let Some(server) = Serve::new(18425)
-        .reusing_one_instance()
-        .script(HANDLER)
-        .start()
-    else {
+    let Some(server) = Serve::new().reusing_one_instance().script(HANDLER).start() else {
         return;
     };
 
@@ -1375,7 +1185,7 @@ fn an_abandoned_body_is_told_apart_from_a_complete_one() {
             },
         })));
     });"#;
-    let Some(server) = Serve::new(18426)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .ready(Ready::AnyResponse)
         .script(HANDLER)
@@ -1400,7 +1210,7 @@ fn an_abandoned_body_is_told_apart_from_a_complete_one() {
 
 /// `--dispatch-timeout` bounds a `respondWith` that never settles — without one, the default, the
 /// request would wait for as long as the handler takes
-/// (`a_dispatch_timeout_answers_a_never_settling_respond_with`). Giving up is step 17.4.20's
+/// (`a_dispatch_timeout_frees_the_slot_it_held`). Giving up is step 17.4.20's
 /// "terminated", so the handler is told through its request signal, and the `waitUntil` window is
 /// its own on the 500 path as on any other.
 #[test]
@@ -1418,8 +1228,8 @@ fn a_dispatch_timeout_answers_a_never_settling_respond_with() {
         }, 300)));
         event.respondWith(new Promise(() => {}));
     });"#;
-    let Some(server) = Serve::new(18427)
-        .flags(["--dispatch-timeout", "1", "--waituntil-timeout", "2"])
+    let Some(server) = Serve::new()
+        .flags(["--dispatch-timeout", "0.2", "--waituntil-timeout", "2"])
         .script(HANDLER)
         .start()
     else {
@@ -1460,11 +1270,11 @@ fn a_waituntil_timeout_ends_only_the_work_that_overruns_it() {
         event.waitUntil(new Promise((resolve) => setTimeout(() => {
             console.error('finished:' + label);
             resolve();
-        }, path === '/short' ? 300 : 5000)));
+        }, path === '/short' ? 100 : 1000)));
         event.respondWith(new Response('started'));
     });"#;
-    let Some(server) = Serve::new(18428)
-        .flags(["--waituntil-timeout", "1"])
+    let Some(server) = Serve::new()
+        .flags(["--waituntil-timeout", "0.4"])
         .script(HANDLER)
         .start()
     else {
@@ -1479,8 +1289,9 @@ fn a_waituntil_timeout_ends_only_the_work_that_overruns_it() {
     );
 
     assert_eq!(server.get("/long"), "started");
+    // Past the long work's own second, so an ignored bound shows up as its marker.
     assert!(
-        !server.wait_for_marker("finished:long", Duration::from_secs(4)),
+        !server.wait_for_marker("finished:long", Duration::from_millis(1500)),
         "lifetime work past the window must be cut: {}",
         server.log()
     );
@@ -1518,9 +1329,9 @@ fn an_end_to_end_timeout_bounds_every_phase() {
         event.waitUntil(new Promise(() => {}));
         event.respondWith(new Response('started'));
     });"#;
-    let Some(server) = Serve::new(18429)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
-        .flags(["--end-to-end-timeout", "1"])
+        .flags(["--end-to-end-timeout", "0.3"])
         .script(HANDLER)
         .start()
     else {
@@ -1534,7 +1345,8 @@ fn an_end_to_end_timeout_bounds_every_phase() {
     );
 
     // The 500 has to reach the client in full: its body is measured against the `response_body`
-    // limit alone (`RequestClock::error_body_bound`), since the window that prompted it is spent.
+    // limit alone (`RequestClock::error_body_time_limit`), since the window that prompted it is
+    // spent.
     let never = server.full_request("GET", "/never", "");
     assert!(
         never.starts_with("HTTP/1.1 500"),
@@ -1546,50 +1358,52 @@ fn an_end_to_end_timeout_bounds_every_phase() {
     );
 
     assert_eq!(server.get("/leftover"), "started");
-    // Well past the deadline, the interval must have stopped: two samples with a gap between them
-    // read the same count.
-    std::thread::sleep(Duration::from_millis(2000));
+    // Past the deadline, the interval must have stopped: two samples with a gap between them read
+    // the same count, and that count shows the interval ran before the deadline.
+    std::thread::sleep(Duration::from_millis(600));
     let first = server.get("/ticks");
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         server.get("/ticks"),
         first,
         "the deadline must drop the request's loop, timers and all"
     );
+    assert_ne!(first, "0", "the interval must run until the deadline");
 }
 
 /// Where the end-to-end clock opens differs from native, and deliberately: on wasm it starts after
 /// `ensure_started`, since standing the instance up is the host's business and it bounds that
-/// itself (`serve_wasm.rs`'s `dispatch_request`). So a content script that spends a second and a
-/// half on a top-level `await` does not spend the first request's window. There is no wasm analog
-/// of `an_end_to_end_timeout_bounds_isolated_startup`, and this case replaces it.
+/// itself (`serve_wasm.rs`'s `dispatch_request`). So a content script that spends 800ms on a
+/// top-level `await` does not spend the first request's window. There is no wasm analog of
+/// `an_end_to_end_timeout_bounds_isolated_startup`, and this case replaces it.
 #[test]
 fn a_slow_startup_stays_outside_the_first_requests_end_to_end_window() {
-    const SCRIPT: &str = r#"await new Promise((resolve) => setTimeout(resolve, 1500));
+    const SCRIPT: &str = r#"await new Promise((resolve) => setTimeout(resolve, 800));
     addEventListener('fetch', (event) => {
         event.respondWith(new Promise((resolve) =>
-            setTimeout(() => resolve(new Response('served')), 600)));
+            setTimeout(() => resolve(new Response('served')), 200)));
     });"#;
-    let Some(server) = Serve::new(18430)
+    let Some(server) = Serve::new()
         .ready(Ready::Listening)
-        .flags(["--end-to-end-timeout", "1"])
+        .flags(["--end-to-end-timeout", "0.6"])
         .module("startup.mjs", SCRIPT)
         .start()
     else {
         return;
     };
 
-    // 1.5s of startup plus 600ms of handler, against a 1s window that only the latter is inside.
+    // 800ms of startup plus 200ms of handler, against a 600ms window that only the latter is
+    // inside.
     assert_eq!(server.get("/first"), "served");
 }
 
 /// A configuration that cannot be satisfied — a phase allowed to outlast the whole request — is
 /// refused. The native server refuses to start at all; a wasm one cannot decline the host's
-/// requests, so it responds to each of them with the same bare 500 any unstartable runtime gets, and
-/// reports why in the log.
+/// requests, so it responds to each of them with the same bare 500 returned by any unstartable
+/// runtime, and reports why in the log.
 #[test]
 fn a_contradictory_timeout_config_refuses_to_serve() {
-    let Some(server) = Serve::new(18431)
+    let Some(server) = Serve::new()
         .flags([
             "--end-to-end-timeout",
             "5",
@@ -1623,230 +1437,6 @@ fn a_contradictory_timeout_config_refuses_to_serve() {
     );
 }
 
-/// `wasmtime serve` forwards a `HEAD` to the guest and sends what the guest produced: no body, and
-/// the `Content-Length` a `GET` would have had, which `prepare_wire_response` can supply only for an
-/// in-memory body, since learning a streamed one's length means producing it
-/// (`serve_answers_a_head_request_without_a_body`).
-#[test]
-fn serve_answers_a_head_request_without_a_body() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        if (new URL(event.request.url).pathname === '/ready') {
-            event.respondWith(new Response('ready'));
-            return;
-        }
-        if (new URL(event.request.url).pathname === '/stream') {
-            event.respondWith(new Response(new ReadableStream({
-                start(c) {
-                    c.enqueue(new TextEncoder().encode('BODYBYTES'));
-                    c.close();
-                },
-            })));
-            return;
-        }
-        event.respondWith(new Response('BODYBYTES', { status: 201 }));
-    });"#;
-    let Some(server) = Serve::new(18432).script(HANDLER).start() else {
-        return;
-    };
-
-    let response = server.full_request("HEAD", "/", "");
-    let (head, body) = response.split_once("\r\n\r\n").expect("a complete head");
-    assert!(
-        head.starts_with("HTTP/1.1 201 "),
-        "the head is still the handler's: {response}"
-    );
-    assert_eq!(
-        body, "",
-        "a HEAD response must carry no body, but got: {response}"
-    );
-    assert!(
-        head.to_lowercase().contains("content-length: 9"),
-        "a HEAD must declare the length a GET would have sent: {head}"
-    );
-
-    let streamed = server.full_request("HEAD", "/stream", "");
-    let (head, body) = streamed.split_once("\r\n\r\n").expect("a complete head");
-    assert_eq!(body, "", "got: {streamed}");
-    assert!(
-        !head.to_lowercase().contains("content-length"),
-        "a streamed body's length is only knowable by producing it: {head}"
-    );
-}
-
-/// A `204 No Content` is framed by its status: no `Content-Length`, no `Transfer-Encoding` (RFC
-/// 9110 §8.6, RFC 9112 §6.2). The same holds for `304`
-/// (`a_bodiless_status_has_no_framing_headers`).
-#[test]
-fn a_bodiless_status_has_no_framing_headers() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        const status = Number(new URL(event.request.url).pathname.slice(1));
-        event.respondWith(new Response(null, { status: status || 200 }));
-    });"#;
-    let Some(server) = Serve::new(18433).script(HANDLER).start() else {
-        return;
-    };
-
-    for status in [204, 304] {
-        let response = server.full_request("GET", &format!("/{status}"), "");
-        let head = response
-            .split_once("\r\n\r\n")
-            .map_or(&*response, |(head, _)| head)
-            .to_lowercase();
-        assert!(
-            !head.contains("content-length"),
-            "a {status} must not be framed with Content-Length: {response}"
-        );
-        assert!(
-            !head.contains("transfer-encoding"),
-            "a {status} must not be framed with Transfer-Encoding: {response}"
-        );
-    }
-}
-
-/// A handler's own `Content-Length` never frames content already in memory: `prepare_wire_response`
-/// measures the body instead
-/// (`serve_frames_a_response_by_its_body_not_the_handlers_content_length`). A streamed body has no
-/// length until it is produced, so there the declaration does frame it — see
-/// `a_streamed_body_is_framed_by_its_declared_content_length`.
-///
-/// Where native then writes a `Content-Length` of its own, `wasi:http` picks the framing itself and
-/// chooses chunked — the host writes the framing bytes, which is exactly the division of labour the
-/// `prepare_wire_response` call in `serve_wasm.rs` describes. What the two targets share, and what
-/// this asserts, is that the handler's claim is gone and the body is intact.
-#[test]
-fn a_fixed_length_body_is_framed_by_its_length() {
-    // Native declares the length of an in-memory body rather than chunking it (`serve.rs`,
-    // `serve_delivers_a_response_body`), so the guest declares it here too: the host frames by
-    // what the guest hands it, and with no length that is chunked for every such response.
-    let Some(server) = Serve::new(18436)
-        .script("addEventListener('fetch', (e) => e.respondWith(new Response('BODYBYTES')));")
-        .start()
-    else {
-        return;
-    };
-
-    let response = server.full_request("GET", "/", "");
-    let head = response
-        .split_once("\r\n\r\n")
-        .expect("a complete response")
-        .0
-        .to_lowercase();
-    assert!(head.contains("content-length: 9"), "got: {head}");
-    assert!(!head.contains("transfer-encoding"), "got: {head}");
-    assert_eq!(server.get("/"), "BODYBYTES");
-}
-
-#[test]
-fn serve_frames_a_response_by_its_body_not_the_handlers_content_length() {
-    const HANDLER: &str = r#"const cases = {
-        // Longer than the body.
-        '/larger': () => new Response('short', { headers: { 'content-length': '10000' } }),
-        // Not a number at all.
-        '/bogus': () => new Response('short', { headers: { 'content-length': 'test' } }),
-        // Two of them, which combine into one comma-joined value.
-        '/duplicate': () => {
-            const headers = new Headers();
-            headers.append('content-length', '10000');
-            headers.append('content-length', '10000');
-            return new Response('short', { headers });
-        },
-    };
-    addEventListener('fetch', (event) => {
-        const make = cases[new URL(event.request.url).pathname];
-        event.respondWith(make ? make() : new Response('ready'));
-    });"#;
-    let Some(server) = Serve::new(18434).script(HANDLER).start() else {
-        return;
-    };
-
-    for path in ["/larger", "/bogus", "/duplicate"] {
-        let response = server.full_request("GET", path, "");
-        let head = response
-            .split_once("\r\n\r\n")
-            .expect("a complete response")
-            .0;
-        assert_eq!(server.request("GET", path, ""), "short", "body for {path}");
-        assert!(
-            !head.contains("10000") && !head.to_lowercase().contains("content-length: test"),
-            "the handler's own length must not reach the wire for {path}: {head}"
-        );
-    }
-}
-
-/// A streamed body's length is not knowable before it is produced, so a handler that declares one
-/// frames its own response by it, on this target as on native
-/// (`serve_frames_a_streamed_body_by_its_declared_content_length`). The guest writes the body here,
-/// so it is the guest that holds it to the declared length: content past it is never handed to the
-/// host. A declaration that is not a single `1*DIGIT` is refused and the host frames as it likes.
-#[test]
-fn a_streamed_body_is_framed_by_its_declared_content_length() {
-    const HANDLER: &str = r#"function stream(parts) {
-        return new ReadableStream({
-            start(c) {
-                for (const part of parts) c.enqueue(new TextEncoder().encode(part));
-                c.close();
-            },
-        });
-    }
-    const cases = {
-        '/exact': () => new Response(stream(['abc', 'de']), {
-            headers: { 'content-length': '5' },
-        }),
-        '/longer': () => new Response(stream(['abcde', 'XXXXX']), {
-            headers: { 'content-length': '5' },
-        }),
-        // Less than it declared: the guest ends the body as an abort, so the host cannot present
-        // the truncation as a complete response.
-        '/shorter': () => new Response(stream(['ab']), {
-            headers: { 'content-length': '5' },
-        }),
-        '/bogus': () => new Response(stream(['abcde']), {
-            headers: { 'content-length': 'test' },
-        }),
-    };
-    addEventListener('fetch', (event) => {
-        const make = cases[new URL(event.request.url).pathname];
-        event.respondWith(make ? make() : new Response('ready'));
-    });"#;
-    let Some(server) = Serve::new(18436).script(HANDLER).start() else {
-        return;
-    };
-
-    for path in ["/exact", "/longer"] {
-        let response = server.full_request("GET", path, "");
-        let (head, body) = response
-            .split_once("\r\n\r\n")
-            .expect("a complete response");
-        assert!(
-            head.to_lowercase().contains("content-length: 5"),
-            "the declared length must frame {path}: {head}"
-        );
-        assert!(
-            !head.to_lowercase().contains("transfer-encoding"),
-            "got for {path}: {head}"
-        );
-        assert_eq!(body, "abcde", "body for {path}: {response}");
-    }
-
-    let short = server.full_request("GET", "/shorter", "");
-    let sent = short
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("");
-    assert!(
-        sent.len() < 5,
-        "the body must stop short of the length it declared: {short:?}"
-    );
-
-    let response = server.full_request("GET", "/bogus", "");
-    let head = response
-        .split_once("\r\n\r\n")
-        .expect("a complete response")
-        .0;
-    assert!(!head.contains("test"), "got: {head}");
-    assert_eq!(server.get("/bogus"), "abcde");
-}
-
 /// A handler responding with a `fetch` response hands the transport an `OutgoingBody::Host`: the
 /// upstream's body stream goes to the host untouched, with no guest writer in between. Two
 /// concurrent proxies must each get the upstream's body, since `respondWith` resolves from a
@@ -1859,11 +1449,7 @@ fn serve_proxies_via_fetch() {
         "addEventListener('fetch', (event) => \
              event.respondWith(fetch('http://127.0.0.1:{upstream}/')));"
     );
-    let Some(server) = Serve::new(18435)
-        .reusing_one_instance()
-        .script(&handler)
-        .start()
-    else {
+    let Some(server) = Serve::new().reusing_one_instance().script(&handler).start() else {
         return;
     };
 
@@ -1874,27 +1460,6 @@ fn serve_proxies_via_fetch() {
     let b = spawn_request(server.port(), "/b");
     assert!(a.join().unwrap().contains("UPSTREAM-BODY"));
     assert!(b.join().unwrap().contains("UPSTREAM-BODY"));
-}
-
-/// The upstream body forwarded as a stream rather than collected first: the handler builds its own
-/// `Response` around `upstream.body`, and the chunks — which the upstream sends with pauses between
-/// them — have to reach the client (`serve_forwards_an_upstream_body_as_a_stream`).
-#[test]
-fn serve_forwards_an_upstream_body_as_a_stream() {
-    let upstream = common::start_chunked_upstream(&["one ", "two ", "three"]);
-    let handler = format!(
-        r#"addEventListener('fetch', (event) => {{
-            event.respondWith((async () => {{
-                const upstream = await fetch('http://127.0.0.1:{upstream}/');
-                return new Response(upstream.body, upstream);
-            }})());
-        }});"#
-    );
-    let Some(server) = Serve::new(18436).script(&handler).start() else {
-        return;
-    };
-
-    assert_eq!(server.get("/"), "one two three");
 }
 
 /// A proxied response body is out of `--response-body-timeout`'s reach, and deliberately: the
@@ -1912,8 +1477,8 @@ fn a_proxied_body_outlives_the_response_body_timeout() {
         "addEventListener('fetch', (event) => \
              event.respondWith(fetch('http://127.0.0.1:{upstream}/')));"
     );
-    let Some(server) = Serve::new(18437)
-        .flags(["--response-body-timeout", "1"])
+    let Some(server) = Serve::new()
+        .flags(["--response-body-timeout", "0.2"])
         // Every route proxies the endless upstream, so no probe of it could ever come back.
         .ready(Ready::Listening)
         .script(&handler)
@@ -1926,8 +1491,8 @@ fn a_proxied_body_outlives_the_response_body_timeout() {
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
-    // Several times over the bound, and still streaming.
-    let ended = read_until_eof(&mut stream, Duration::from_secs(5));
+    // Well over the bound, and still streaming.
+    let ended = read_until_eof(&mut stream, Duration::from_millis(500));
     assert!(
         ended.is_none(),
         "the guest must not cut a body the host is pumping: {:?}",
@@ -1935,542 +1500,12 @@ fn a_proxied_body_outlives_the_response_body_timeout() {
     );
 }
 
-/// An upstream that dies mid-body has to reach the client as the truncation it is, not as a body
-/// that ended cleanly a few bytes short: the terminating chunk asserts completeness (RFC 9112
-/// §7.1). The piped trailers carry that, the guest never having seen a byte of the body.
-#[test]
-fn a_dying_upstream_truncates_the_proxied_body() {
-    let upstream = common::start_truncated_upstream(&["one ", "two "]);
-    let handler = format!(
-        "addEventListener('fetch', (event) => \
-             event.respondWith(fetch('http://127.0.0.1:{upstream}/')));"
-    );
-    let Some(server) = Serve::new(18438)
-        .ready(Ready::AnyResponse)
-        .script(&handler)
-        .start()
-    else {
-        return;
-    };
-
-    let response = server.full_request("GET", "/", "");
-    assert!(
-        response.contains("one ") && response.contains("two "),
-        "what the upstream did send must arrive: {response:?}"
-    );
-    assert!(
-        !response.ends_with("0\r\n\r\n"),
-        "a truncated upstream must not be forwarded as a complete body: {response:?}"
-    );
-}
-
-/// A response body that errors after sending bytes: the client gets what was produced, and then
-/// the body ends *without* the terminating chunk, so a truncation cannot be mistaken for a complete
-/// response (`a_response_stream_that_errors_mid_flight_leaves_the_body_unterminated`).
-///
-/// The error comes from a timer, and a generous one: a body cannot outlive its request's event
-/// loop going idle, so the stream has to hold the loop open until it errors rather than wait for
-/// the client to say when. The delay only has to outlast the pump reaching the wire, which a GC
-/// zeal build makes far slower than an ordinary one.
-#[test]
-fn a_response_stream_that_errors_mid_flight_leaves_the_body_unterminated() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        const encoder = new TextEncoder();
-        // A route of its own for the readiness probe. The body below is slow to end, and a probe
-        // waiting for one would not see a response inside its window.
-        if (new URL(event.request.url).pathname === '/ready') {
-            event.respondWith(new Response('ready'));
-            return;
-        }
-        event.respondWith(new Response(new ReadableStream({
-            start(c) {
-                c.enqueue(encoder.encode('first-chunk-'));
-                setTimeout(() => c.error(new Error('stream broke')), 1000);
-            },
-        })));
-    });"#;
-    let Some(server) = Serve::new(18440).script(HANDLER).start() else {
-        return;
-    };
-
-    let errored = server.full_request("GET", "/mid-flight", "");
-    let (_, body) = errored.split_once("\r\n\r\n").expect("a complete head");
-    assert!(
-        body.contains("first-chunk-"),
-        "the bytes produced before the error must still arrive: {errored}"
-    );
-    assert!(
-        !body.ends_with("0\r\n\r\n"),
-        "an errored body must not be terminated as if it were complete: {errored}"
-    );
-}
-
-/// A stream that enqueues something that is not a `Uint8Array` aborts its body before a single byte
-/// is written (WPT
-/// `resources/fetch-event-respond-with-response-body-with-invalid-chunk-worker.js`).
-///
-/// Host-owned divergence: native writes the head itself, so it sends a `200` and then closes
-/// unterminated; `wasmtime serve` has not committed the head by the time the body aborts and sends
-/// nothing at all. Which of the two a client sees is the host's call — see the comment where
-/// `dispatch_request` hands the response over — and what both guarantee is what is asserted here:
-/// the client cannot come away with a response that looks complete.
-#[test]
-fn a_response_stream_with_an_invalid_chunk_is_not_answered_as_a_success() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        if (new URL(event.request.url).pathname === '/ready') {
-            event.respondWith(new Response('ready'));
-            return;
-        }
-        event.respondWith(new Response(new ReadableStream({
-            start(c) {
-                c.enqueue('a string, not a Uint8Array');
-                c.close();
-            },
-        })));
-    });"#;
-    let Some(server) = Serve::new(18445).script(HANDLER).start() else {
-        return;
-    };
-
-    // The control, since the response under test is nothing at all: the same server sends a
-    // normal request, so an empty reply below is the invalid chunk's doing and not a server that
-    // never came up.
-    assert_eq!(server.get("/ready"), "ready");
-
-    let response = server.full_request("GET", "/invalid-chunk", "");
-    assert!(
-        response.is_empty() || !response.ends_with("0\r\n\r\n"),
-        "a body that never produced a valid chunk must reach the client as nothing at all, or as \
-         an unterminated one — never as a complete response: {response:?}"
-    );
-}
-
-/// An empty chunk is a chunk like any other on this side: it neither ends the body nor corrupts the
-/// framing (`serve_streams_an_empty_chunk_without_ending_the_body`). Worth pinning because
-/// `spawn_body_writer`'s dropped-reader check cannot see a drop through one — an empty write leaves
-/// an empty remainder either way, so what happens to it turns on everything except that
-/// check.
-#[test]
-fn serve_streams_an_empty_chunk_without_ending_the_body() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        const encoder = new TextEncoder();
-        event.respondWith(new Response(new ReadableStream({
-            start(c) {
-                c.enqueue(new Uint8Array(0));
-                c.enqueue(encoder.encode('chunk one '));
-                c.enqueue(new Uint8Array(0));
-                c.enqueue(encoder.encode('chunk two'));
-                c.close();
-            },
-        })));
-    });"#;
-    let Some(server) = Serve::new(18441)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    assert_eq!(server.get("/"), "chunk one chunk two");
-}
-
-/// A streamed response's head reaches the client when it is ready, not when the first chunk is: a
-/// handler that streams may take a while to produce anything, and the status and headers are what
-/// the client acts on meanwhile (`a_streamed_response_sends_its_head_before_the_first_chunk`).
-#[test]
-fn a_streamed_response_sends_its_head_before_the_first_chunk() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        const stream = new ReadableStream({
-            start(c) {
-                setTimeout(() => {
-                    c.enqueue(new TextEncoder().encode('late'));
-                    c.close();
-                }, 2000);
-            },
-        });
-        event.respondWith(new Response(stream, { headers: { 'x-marker': 'early' } }));
-    });"#;
-    let Some(server) = Serve::new(18442)
-        // Every route takes two seconds to produce anything, so no probe of it could come back
-        // inside the harness's own patience.
-        .ready(Ready::Listening)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    let mut stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
-    stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .unwrap();
-    let started = std::time::Instant::now();
-
-    // Read just enough to have seen the head, and time how long that took.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut buf = [0u8; 256];
-    let read = std::io::Read::read(&mut stream, &mut buf).unwrap();
-    let elapsed = started.elapsed();
-    let head = String::from_utf8_lossy(&buf[..read]).to_string();
-
-    assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
-    assert!(head.contains("x-marker: early"), "got: {head}");
-    assert!(
-        elapsed < Duration::from_millis(1500),
-        "the head must not wait for the first chunk (took {elapsed:?})"
-    );
-}
-
-/// A body produced by a timer is served to completion: the pump runs on the request's own loop, and
-/// that loop has to keep being driven for as long as the body needs it
-/// (`an_interval_driven_stream_is_served_to_completion`).
-#[test]
-fn an_interval_driven_stream_is_served_to_completion() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        let ticks = 0;
-        event.respondWith(new Response(new ReadableStream({
-            start(c) {
-                const id = setInterval(() => {
-                    c.enqueue(new TextEncoder().encode('tick ' + ++ticks + ' '));
-                    if (ticks === 5) {
-                        clearInterval(id);
-                        c.close();
-                    }
-                }, 50);
-            },
-        })));
-    });"#;
-    let Some(server) = Serve::new(18443)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    assert_eq!(server.get("/"), "tick 1 tick 2 tick 3 tick 4 tick 5 ");
-}
-
-/// A streamed response must not be held open by `waitUntil` work either: the body's pump runs on
-/// the request's loop, so the send drives that loop — but only for as long as the body needs it, or
-/// the client waits on an open connection for lifetime work it has no interest in
-/// (`wait_until_does_not_delay_a_streamed_response`).
-#[test]
-fn wait_until_does_not_delay_a_streamed_response() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        const stream = new ReadableStream({
-            start(c) {
-                c.enqueue(new TextEncoder().encode('streamed body'));
-                c.close();
-            },
-        });
-        event.respondWith(new Response(stream));
-        event.waitUntil(new Promise((resolve) => setTimeout(resolve, 4000)));
-    });"#;
-    let Some(server) = Serve::new(18444)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    let started = std::time::Instant::now();
-    let body = server.get("/");
-    let elapsed = started.elapsed();
-    assert_eq!(body, "streamed body");
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "a streamed response must not wait for waitUntil work (took {elapsed:?})"
-    );
-}
-
-/// A handler reading `request.body` sees chunks as they arrive, not after the upload ends: the
-/// first chunk's echo has to come back before the rest is even sent
-/// (`serve_streams_an_incoming_request_body`).
-#[test]
-fn serve_streams_an_incoming_request_body() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        if (new URL(event.request.url).pathname === '/ready') {
-            event.respondWith(new Response('ready'));
-            return;
-        }
-        const reader = event.request.body.getReader();
-        event.respondWith(new Response(new ReadableStream({
-            async pull(controller) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    controller.close();
-                    return;
-                }
-                controller.enqueue(value);
-            },
-        })));
-    });"#;
-    let Some(server) = Serve::new(18446).script(HANDLER).start() else {
-        return;
-    };
-
-    let mut stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
-        .unwrap();
-    stream
-        .write_all(
-            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-        )
-        .unwrap();
-
-    /// Read from `stream` until the response body so far contains `expected`.
-    fn read_until(stream: &mut TcpStream, raw: &mut Vec<u8>, expected: &str) -> String {
-        for _ in 0..200 {
-            let body = String::from_utf8_lossy(raw)
-                .split_once("\r\n\r\n")
-                .map(|(_, body)| common::dechunk(body))
-                .unwrap_or_default();
-            if body.contains(expected) {
-                return body;
-            }
-            let mut buf = [0u8; 1024];
-            let read = std::io::Read::read(stream, &mut buf).unwrap();
-            assert_ne!(read, 0, "connection closed while waiting for {expected:?}");
-            raw.extend_from_slice(&buf[..read]);
-        }
-        panic!("never received {expected:?}");
-    }
-
-    let mut raw = Vec::new();
-    // First chunk: the echo must come back before the rest of the request is sent.
-    stream.write_all(b"5\r\nfirst\r\n").unwrap();
-    read_until(&mut stream, &mut raw, "first");
-
-    // Only now send the second chunk and the terminator.
-    stream.write_all(b"6\r\nsecond\r\n0\r\n\r\n").unwrap();
-    let body = read_until(&mut stream, &mut raw, "second");
-    assert_eq!(body, "firstsecond", "got: {body}");
-}
-
-/// Which methods reach the handler with a body. `wasi:http` gives a request with no body the same
-/// empty stream as one whose body is empty, so `body_framing` goes by the method: `GET` gets
-/// `null`, and a `POST` without a body gets an empty stream rather than `null`.
-///
-/// Host-owned divergence: native reads the framing headers the client sent, so a bodyless `POST`
-/// there gets `null`.
-#[test]
-fn a_bodyless_post_still_reaches_the_handler_with_a_body() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        const body = event.request.body;
-        event.respondWith(new Response(body === null ? 'null' : 'stream'));
-    });"#;
-    let Some(server) = Serve::new(18460)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    assert_eq!(server.request("GET", "/", ""), "null");
-    assert_eq!(server.request("POST", "/", ""), "stream");
-    assert_eq!(server.request("POST", "/", "payload"), "stream");
-}
-
-/// A chunked upload reaches the handler decoded: the host undoes the framing, and `body_framing`
-/// exposes a body where there is no `Content-Length` to go by, since `wasi:http` does not pass
-/// `Transfer-Encoding` on to the guest (`serve_decodes_a_chunked_request_body`).
-///
-/// Host-owned divergence: native also refuses `Transfer-Encoding` together with `Content-Length`
-/// (RFC 9112 §6.3, a request-smuggling vector) with a 400. On wasm the host parses the request, so
-/// no such ambiguity reaches the guest, as `body_framing`'s own comment records, and refusing it is
-/// the host's business, not something the guest could do differently.
-#[test]
-fn serve_decodes_a_chunked_request_body() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        event.respondWith(event.request.text().then((body) => new Response('got:' + body)));
-    });"#;
-    let Some(server) = Serve::new(18447)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    // "hello world" as two chunks: "hello " (0x6) then "world" (0x5).
-    let response = common::raw_request_within(
-        server.port(),
-        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
-          6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n",
-        Duration::from_secs(20),
-    )
-    .expect("a complete response");
-    assert!(response.contains("got:hello world"), "got: {response}");
-
-    // Both framings at once, with bytes after the chunked terminator that only the `Content-Length`
-    // reading would take for body: the smuggled request either way is the one that gets two
-    // different response out of two hops. Native refuses it outright with a 400. `wasmtime serve`
-    // resolves it in favour of the chunked framing, which RFC 9112 §6.3 also allows a server to do
-    // — what neither may do is let those bytes through as a body.
-    let smuggle = common::raw_request_within(
-        server.port(),
-        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\
-          Connection: close\r\n\r\n0\r\n\r\nSMUGGLED",
-        Duration::from_secs(20),
-    )
-    .unwrap_or_default();
-    assert!(
-        !smuggle.contains("SMUGGLED"),
-        "the second framing's bytes must not reach the handler: {smuggle:?}"
-    );
-    assert!(
-        smuggle.is_empty() || common::wasm_serve::message_body(&smuggle) == "got:",
-        "an ambiguous request is either refused or read one way: {smuggle:?}"
-    );
-}
-
-/// A client that closes mid-body must not present the truncation to the handler as a complete
-/// body: the request's stream errors, so `text()` rejects (`serve_rejects_a_truncated_request_body`).
-/// On wasm that abort arrives through the incoming body's trailers, which is the only channel a
-/// `wasi:http` body has for saying it ended badly rather than early.
-#[test]
-fn serve_rejects_a_truncated_request_body() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        event.respondWith(event.request.text().then(
-            (body) => new Response('complete:' + body),
-            () => new Response('truncated'),
-        ));
-    });"#;
-    let Some(server) = Serve::new(18448)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    let mut stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
-    // Set before the half-close below, and read by hand rather than through `read_until_eof`:
-    // macOS refuses a read timeout on a socket whose write half is already shut down, and
-    // `read_until_eof` re-sets one each iteration to keep its patience a total.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
-        .unwrap();
-    // Declare ten bytes, send four, then close the sending side.
-    stream
-        .write_all(
-            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfour",
-        )
-        .unwrap();
-    stream.shutdown(std::net::Shutdown::Write).unwrap();
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 1024];
-    while let Ok(read) = std::io::Read::read(&mut stream, &mut buf) {
-        if read == 0 {
-            break;
-        }
-        raw.extend_from_slice(&buf[..read]);
-    }
-    let response = String::from_utf8_lossy(&raw).into_owned();
-    assert!(
-        response.contains("truncated"),
-        "a truncated upload must make the handler's read reject: {response:?}"
-    );
-}
-
-/// An incoming request body used directly as the response body is handed to the wire without being
-/// pumped through JS — the incoming-to-outgoing shortcut, which applies because the incoming body
-/// is a host body rather than bytes (`serve_pipes_an_incoming_request_body_to_the_response`).
-#[test]
-fn serve_pipes_an_incoming_request_body_to_the_response() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        event.respondWith(new Response(event.request.body ?? 'no body'));
-    });"#;
-    let Some(server) = Serve::new(18449)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    assert_eq!(server.request("POST", "/", "hello world"), "hello world");
-}
-
-/// The same body going two ways at once: forwarded upstream as an outgoing request's body while
-/// the handler reads the other half of the `tee`
-/// (`serve_forwards_an_incoming_body_upstream_while_reading_it`). Both halves have to see the whole
-/// upload, which is travelling from one connection to another while a second reader pulls on it.
-#[test]
-fn serve_forwards_an_incoming_body_upstream_while_reading_it() {
-    let upstream = common::start_echo_upstream();
-    let handler = format!(
-        r#"addEventListener('fetch', (event) => {{
-            event.respondWith((async () => {{
-                const [forward, inspect] = event.request.body.tee();
-                const sent = fetch('http://127.0.0.1:{upstream}/', {{
-                    method: 'POST',
-                    body: forward,
-                    duplex: 'half',
-                }});
-                let seen = '';
-                const reader = inspect.getReader();
-                const decoder = new TextDecoder();
-                while (true) {{
-                    const {{ done, value }} = await reader.read();
-                    if (done) break;
-                    seen += decoder.decode(value, {{ stream: true }});
-                }}
-                const echoed = await (await sent).text();
-                return new Response('upstream=' + echoed + ' local=' + seen);
-            }})());
-        }});"#
-    );
-    let Some(server) = Serve::new(18450)
-        .ready(Ready::AnyResponse)
-        .script(&handler)
-        .start()
-    else {
-        return;
-    };
-
-    assert_eq!(
-        server.request("POST", "/", "payload bytes"),
-        "upstream=payload bytes local=payload bytes"
-    );
-}
-
-/// `clone()` on an incoming request tees its body, and both halves have to see all of it
-/// (`serve_clones_an_incoming_request_body`).
-#[test]
-fn serve_clones_an_incoming_request_body() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        const copy = event.request.clone();
-        event.respondWith(Promise.all([event.request.text(), copy.text()])
-            .then(([a, b]) => new Response(a + '|' + b)));
-    });"#;
-    let Some(server) = Serve::new(18451)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    assert_eq!(
-        server.request("POST", "/", "payload"),
-        "payload|payload",
-        "both halves of the tee must see the body"
-    );
-}
-
-/// `respondWith(response)` consumes the response's body, so `bodyUsed` reads true afterwards — and
-/// responding with one whose body is already gone is a network error, refused before the head is
-/// committed since there is no way to report it after (`respond_with_marks_the_response_body_used`,
+/// `respondWith(response)` consumes the response's body, so `bodyUsed` reads true afterwards.
+/// Responding with one whose body is already gone is a network error, refused before the head is
+/// committed since there is no way to report it after
+/// (`a_sent_byte_body_reads_as_consumed_rather_than_absent`,
 /// `responding_with_a_used_stream_backed_response_is_a_network_error`). Both read the flag back on
-/// a later request, which the reused instance is what makes possible.
+/// a later request, which only a reused instance makes possible.
 #[test]
 fn respond_with_marks_the_response_body_used() {
     const HANDLER: &str = r#"globalThis.stored = null;
@@ -2492,7 +1527,7 @@ fn respond_with_marks_the_response_body_used() {
         }));
         event.respondWith(globalThis.stored);
     });"#;
-    let Some(server) = Serve::new(18452)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .ready(Ready::AnyResponse)
         .script(HANDLER)
@@ -2526,11 +1561,16 @@ fn fetch_event_handled_reports_the_outcome() {
             globalThis.state = undefined;
             return;
         }
+        if (url.pathname === '/ready') {
+            // Not hooked, so the readiness probe records no outcome for `/check` to read.
+            event.respondWith(new Response('ok'));
+            return;
+        }
         const identical = event.handled === event.handled;
         event.handled.then(
             () => { globalThis.state = 'resolved,same=' + identical; },
             (e) => { globalThis.state = 'rejected:' + e.name + ',same=' + identical; });
-        if (url.pathname === '/responds' || url.pathname === '/ready') {
+        if (url.pathname === '/responds') {
             event.respondWith(new Response('ok'));
         } else if (url.pathname === '/rejects') {
             event.respondWith(Promise.reject(new Error('no response for you')));
@@ -2539,7 +1579,7 @@ fn fetch_event_handled_reports_the_outcome() {
         }
         // /silent falls through without calling respondWith at all.
     });"#;
-    let Some(server) = Serve::new(18453)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .ready(Ready::AnyResponse)
         .script(HANDLER)
@@ -2552,14 +1592,7 @@ fn fetch_event_handled_reports_the_outcome() {
     // loop is drained afterwards, so ask until they have recorded something.
     let settled = |path: &str| {
         let _ = server.full_request("GET", path, "");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let state = server.get("/check");
-            if state != "never settled" || std::time::Instant::now() >= deadline {
-                return state;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        eventually(&server, "/check", |state| state != "never settled")
     };
 
     // Each case reads back what its own request recorded, so every request here has to reach the
@@ -2580,67 +1613,6 @@ fn fetch_event_handled_reports_the_outcome() {
     assert_eq!(outcomes[2], "rejected:NetworkError,same=true");
     // So is never responding at all.
     assert_eq!(outcomes[3], "rejected:NetworkError,same=true");
-}
-
-/// A handler that throws instead of responding gets a 500 rather than a hung connection
-/// or an empty 200, and the throw does not take the dispatch down: a listener after it still gets
-/// the event (`a_throwing_handler_is_answered_with_500`). The same holds for `preventDefault`,
-/// which cancels the event without stopping a later listener from responding — and, on its own,
-/// leaves nothing to respond with (`prevent_default_does_not_stop_a_later_listener_responding`).
-#[test]
-fn a_failing_listener_does_not_stop_a_later_one_responding() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        if (new URL(event.request.url).pathname === '/boom') {
-            throw new Error('handler blew up');
-        }
-        if (new URL(event.request.url).pathname === '/cancel-only') {
-            event.preventDefault();
-        }
-    });
-    addEventListener('fetch', (event) => {
-        const path = new URL(event.request.url).pathname;
-        if (path === '/boom' || path === '/cancel-only') {
-            return;
-        }
-        event.respondWith(new Response(path === '/ready' ? 'ready' : 'recovered'));
-    });"#;
-    let Some(server) = Serve::new(18454).script(HANDLER).start() else {
-        return;
-    };
-
-    assert!(
-        server
-            .full_request("GET", "/boom", "")
-            .starts_with("HTTP/1.1 500"),
-        "a throwing listener is answered with a 500"
-    );
-    assert!(
-        server
-            .full_request("GET", "/cancel-only", "")
-            .starts_with("HTTP/1.1 500 "),
-        "cancelling without responding is a network error"
-    );
-    // Neither takes the dispatch down: a listener after them still gets the event and responds.
-    assert_eq!(server.get("/ok"), "recovered");
-}
-
-/// A `waitUntil` promise that rejects is the handler's business, not the response's
-/// (`a_rejected_wait_until_does_not_break_the_response`).
-#[test]
-fn a_rejected_wait_until_does_not_break_the_response() {
-    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
-        event.waitUntil(Promise.reject(new Error('waitUntil failed')));
-        event.respondWith(new Response('answered anyway'));
-    });"#;
-    let Some(server) = Serve::new(18455)
-        .ready(Ready::AnyResponse)
-        .script(HANDLER)
-        .start()
-    else {
-        return;
-    };
-
-    assert_eq!(server.get("/"), "answered anyway");
 }
 
 /// `waitUntil` may only extend an event that is still `active`. Once the event is over there is
@@ -2672,7 +1644,7 @@ fn wait_until_throws_once_the_event_is_over() {
             },
         })));
     });"#;
-    let Some(server) = Serve::new(18456)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .ready(Ready::AnyResponse)
         .script(HANDLER)
@@ -2682,9 +1654,11 @@ fn wait_until_throws_once_the_event_is_over() {
     };
 
     assert_eq!(server.get("/"), "during=allowed");
-    // The timer runs while the request's loop is drained after its response, so give it time.
-    std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(server.get("/check"), "InvalidStateError");
+    // The timer runs while the request's loop is drained after its response.
+    assert_eq!(
+        eventually(&server, "/check", |late| late != "never ran"),
+        "InvalidStateError"
+    );
 }
 
 /// What keeps a request alive past its response is `waitUntil` and nothing else: a bare timer goes
@@ -2699,7 +1673,7 @@ fn nothing_but_wait_until_extends_the_event_lifetime() {
     // outlived the request. The loop is driven while the body goes out, as a streamed body needs,
     // and an upstream that responds inside that window settles without the event's lifetime having
     // been extended.
-    let upstream = common::start_slow_upstream(Duration::from_secs(1), "UPSTREAM-BODY");
+    let upstream = common::start_slow_upstream(Duration::from_millis(300), "UPSTREAM-BODY");
     let handler = format!(
         r#"addEventListener('fetch', (event) => {{
             const path = new URL(event.request.url).pathname;
@@ -2710,12 +1684,12 @@ fn nothing_but_wait_until_extends_the_event_lifetime() {
             setTimeout(() => {{
                 globalThis.ran = 'the timer ran';
                 console.error('leftover-timer-ran');
-            }}, 300);
+            }}, 100);
             fetch('http://127.0.0.1:{upstream}/').then(() => console.error('leftover-fetch-settled'));
             event.respondWith(new Response('answered'));
         }});"#
     );
-    let Some(server) = Serve::new(18457)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .ready(Ready::AnyResponse)
         .script(&handler)
@@ -2729,7 +1703,7 @@ fn nothing_but_wait_until_extends_the_event_lifetime() {
         let answered = server.get("/");
         // Well past both the timer's delay and the time the upstream takes to reply: a loop still
         // being driven would have run them by now.
-        std::thread::sleep(Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_millis(800));
         (answered, server.get("/check"))
     });
     assert_eq!(answered, "answered");
@@ -2746,35 +1720,6 @@ fn nothing_but_wait_until_extends_the_event_lifetime() {
     );
 }
 
-/// The first request waits for the content script's top-level `await`, so a handler registered
-/// after one is in place for it — including on a snapshot, where wizer captures the script
-/// mid-evaluation and the resumed instance's first request drives the rest (`test-wizer.sh`'s
-/// `awaited.mjs` case, extended here with the ordering the marker pins).
-#[test]
-fn a_wizened_instance_waits_for_the_scripts_top_level_await() {
-    // The ordering is recorded in a global and reported in the response rather than through the
-    // usual stderr markers: writing to stdio before the snapshot is taken leaves the resumed
-    // instance with a stale stream handle, and every later write traps (see the wizer item in
-    // `docs/wasm-serve-parity-todo.md`).
-    const SCRIPT: &str = r#"globalThis.order = ['evaluating'];
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    globalThis.order.push('evaluated');
-    addEventListener('fetch', (event) => {
-        globalThis.order.push('dispatched');
-        event.respondWith(new Response(globalThis.order.join(',')));
-    });"#;
-    let Some(server) = Serve::new(18458)
-        .wizen()
-        .ready(Ready::Listening)
-        .module("awaited.mjs", SCRIPT)
-        .start()
-    else {
-        return;
-    };
-
-    assert_eq!(server.get("/first"), "evaluating,evaluated,dispatched");
-}
-
 /// A handler fetching its own server: guest-out through `wasi:http`'s client, host-in through the
 /// same listener (`a_handler_can_fetch_its_own_server`).
 ///
@@ -2784,10 +1729,10 @@ fn a_wizened_instance_waits_for_the_scripts_top_level_await() {
 /// event loop makes it arrive while that instance is blocked on the fetch.
 #[test]
 fn a_handler_can_fetch_its_own_server() {
-    // The handler addresses itself by port rather than by `request.url`'s origin: what the guest
-    // sees there is built from the `Host` header, which carries no port here.
-    const PORT: u16 = 18459;
-    let gate = common::start_forwarding_gate(PORT);
+    // The handler addresses its own server through the gate rather than by `request.url`'s
+    // origin: what the guest sees there is built from the `Host` header, which has no port
+    // here.
+    let gate = common::start_forwarding_gate();
     let handler = format!(
         r#"addEventListener('fetch', (event) => {{
             const path = new URL(event.request.url).pathname;
@@ -2805,7 +1750,7 @@ fn a_handler_can_fetch_its_own_server() {
     // No readiness probe, so `/outer` is the request that stands the instance up and the only
     // instance there is. A probe would leave a second one idle beside it, and the inner request
     // could be handed to either.
-    let Some(server) = Serve::new(PORT)
+    let Some(server) = Serve::new()
         .reusing_one_instance()
         .ready(Ready::Listening)
         .script(&format!("{INSTANCE_ID}\n{handler}"))
@@ -2829,7 +1774,7 @@ fn a_handler_can_fetch_its_own_server() {
             server.log()
         );
         server.await_new_idle(&mut seen, IDLE_PATIENCE);
-        gate.release();
+        gate.release(port);
         common::wasm_serve::message_body(&outer.join().unwrap())
     });
     assert!(
@@ -2851,7 +1796,7 @@ fn a_handler_can_fetch_its_own_server() {
 }
 
 /// How long the two cases below wait for what the guest reports after its response is gone. The
-/// work itself takes two seconds, and the rest is room for a machine running the whole suite.
+/// work itself takes 600ms, and the rest is room for a machine running the whole suite.
 const MARKER_PATIENCE: Duration = Duration::from_secs(60);
 
 /// A handler whose response body never ends, reporting the request signal's abort and its
@@ -2869,28 +1814,33 @@ const ENDLESS_STREAM: &str = r#"addEventListener('fetch', (event) => {
     event.waitUntil(new Promise((resolve) => setTimeout(() => {
         console.error('lifetime-work-finished');
         resolve();
-    }, 2000)));
+    }, 600)));
     event.respondWith(new Response(new ReadableStream({
         start(c) { setInterval(() => c.enqueue(new TextEncoder().encode('tick ')), 50); },
     })));
 });"#;
 
 /// The guest never performs the response write itself, so how a send ending badly reaches the
-/// handler — step 17.4.20's abort, raised from the drain task off the body writer's reported
-/// outcome — exists only against a real host. Here the body burns its 1s window, and the writer's
-/// verdict must come back as a `TimeoutError` on the request's signal, with the `waitUntil` window
-/// still its own: the 2s of lifetime work finishes inside its 4s bound, as on the native path
-/// (`wait_until_gets_its_own_window_after_the_body_is_truncated`).
+/// handler exists only against a real host: step 17.4.20's abort, raised from the drain task from
+/// the body writer's reported outcome. Here the body spends its 200ms window, and the writer's
+/// outcome must reach the request's signal as a `TimeoutError`, with the `waitUntil` window still
+/// its own: the 600ms of lifetime work finishes inside its 20s bound, as on the native path
+/// (`a_response_body_timeout_truncates_a_body_that_never_ends`).
 #[test]
 fn a_spent_response_body_clock_aborts_the_request_signal() {
-    let Some(server) = Serve::new(18400)
+    let Some(server) = Serve::new()
         // The lifetime work runs after the response is gone, past the point the host counts the
         // request as done. Under the default one-second idle timeout the host may drop the
         // instance while that work is still running, and the marker never arrives.
         .reusing_one_instance()
-        // The bound only has to clear the 2s of lifetime work, with room for a loaded machine.
+        // The bound only has to clear the 600ms of lifetime work, with room for a loaded machine.
         // Under test is that truncating the body left the window intact.
-        .flags(["--response-body-timeout", "1", "--waituntil-timeout", "20"])
+        .flags([
+            "--response-body-timeout",
+            "0.2",
+            "--waituntil-timeout",
+            "20",
+        ])
         .script(ENDLESS_STREAM)
         .start()
     else {
@@ -2917,14 +1867,14 @@ fn a_spent_response_body_clock_aborts_the_request_signal() {
 
 /// The other way a send ends badly, with no clock involved: the client walks away mid-stream, the
 /// host drops the body stream's read end, and the writer's verdict must come back as an
-/// `AbortError`. This is the wasm side of `a_lost_connection_aborts_the_request_signal`. Losing
-/// the client leaves the `waitUntil` window intact, as truncating the body does above.
+/// `AbortError`. This is the wasm side of `a_client_disconnect_does_not_cancel_wait_until_work`.
+/// Losing the client leaves the `waitUntil` window intact, as truncating the body does above.
 #[test]
 fn a_client_hanging_up_mid_body_aborts_the_request_signal() {
-    let Some(server) = Serve::new(18401)
+    let Some(server) = Serve::new()
         // The instance has to outlive the response for the same reason as above.
         .reusing_one_instance()
-        // Clears the 2s of lifetime work with room for a loaded machine. See above.
+        // Clears the 600ms of lifetime work with room for a loaded machine. See above.
         .flags(["--waituntil-timeout", "20"])
         .script(ENDLESS_STREAM)
         .start()
@@ -2954,5 +1904,951 @@ fn a_client_hanging_up_mid_body_aborts_the_request_signal() {
         server.wait_for_marker("lifetime-work-finished", MARKER_PATIENCE),
         "{}",
         server.log()
+    );
+}
+
+/// One case of a server that several cases share: the route it serves and the check that requests
+/// it.
+struct Case {
+    /// The first segment of every path the case requests, which also names the case in a failure.
+    name: &'static str,
+    /// A JS function `(event, rest) => ...` that handles `/<name><rest>`. `rest` is the rest of the
+    /// path: empty, or starting with `/`.
+    route: String,
+    /// Requests the route, and panics if the outcome is wrong.
+    check: fn(&WasmServer),
+}
+
+/// A classic script that serves `/ready`, and hands every other request to the route of the case
+/// that its path's first segment names.
+fn routed_script(cases: &[Case]) -> String {
+    let routes: String = cases
+        .iter()
+        .map(|case| format!("'{}': {},\n", case.name, case.route))
+        .collect();
+    format!(
+        r#"const routes = {{
+{routes}}};
+addEventListener('fetch', (event) => {{
+    const path = new URL(event.request.url).pathname;
+    if (path === '/ready') {{
+        event.respondWith(new Response('ready'));
+        return;
+    }}
+    const name = path.split('/')[1];
+    routes[name](event, path.slice(name.length + 1));
+}});"#
+    )
+}
+
+/// Run every check against `server`, and fail naming every check that panicked, so one failing
+/// case does not hide the others.
+fn check_all(
+    server: &WasmServer,
+    checks: impl IntoIterator<Item = (&'static str, fn(&WasmServer))>,
+) {
+    let mut ran = 0;
+    let mut failed = Vec::new();
+    for (name, check) in checks {
+        ran += 1;
+        if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| check(server))) {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("<no message>");
+            failed.push(format!("{name}: {message}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of {ran} cases failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
+/// Cases about the response a handler builds and how it reaches the client. None of them depends
+/// on what an earlier request left in the instance, so they share one server with default flags.
+#[test]
+fn response_cases_share_one_server() {
+    let cases = response_cases();
+    let Some(server) = Serve::new().script(&routed_script(&cases)).start() else {
+        return;
+    };
+    check_all(&server, cases.iter().map(|case| (case.name, case.check)));
+}
+
+fn response_cases() -> Vec<Case> {
+    let upstream = common::start_upstream("UPSTREAM-BODY");
+    let chunked_upstream = common::start_chunked_upstream(&["one ", "two ", "three"]);
+    let truncated_upstream = common::start_truncated_upstream(&["one ", "two "]);
+    vec![
+        // `Response.error()` is a network error with status 0, which must not be serialized as the
+        // status line `HTTP/1.1 0`. It is sent as a 500 (`serve_maps_invalid_status_to_500`).
+        Case {
+            name: "invalid-status",
+            route: "(event) => event.respondWith(Response.error())".into(),
+            check: |server| {
+                let response = server.full_request("GET", "/invalid-status", "");
+                assert!(response.starts_with("HTTP/1.1 500"), "got: {response}");
+            },
+        },
+        // Fetch isomorphic-encodes a header value, so `U+00DF U+00C0 U+00BF` is sent as the bytes
+        // `DF C0 BF` rather than as their UTF-8 encodings
+        // (`a_response_header_value_is_sent_as_bytes_not_utf8`). The second header must survive
+        // too, in case the host refuses the header list as a whole.
+        Case {
+            name: "header-bytes",
+            route: r#"(event) => event.respondWith(new Response('x', { headers: {
+                'x-test': 'ßÀ¿',
+                'x-other': 'kept',
+            } }))"#
+                .into(),
+            check: |server| {
+                let raw = common::raw_response_within(
+                    server.port(),
+                    "GET",
+                    "/header-bytes",
+                    "",
+                    Duration::from_secs(20),
+                )
+                .expect("a complete response");
+                let needle = b"x-test: \xdf\xc0\xbf\r\n";
+                assert!(
+                    raw.windows(needle.len()).any(|window| window == needle),
+                    "the header must be the three bytes DF C0 BF, got: {:?}",
+                    String::from_utf8_lossy(&raw)
+                );
+                assert!(
+                    raw.windows(14).any(|window| window == b"x-other: kept\r"),
+                    "the other headers must survive: {:?}",
+                    String::from_utf8_lossy(&raw)
+                );
+            },
+        },
+        // `wasi:http` refuses the connection-management headers it writes itself.
+        // `prepare_wire_response` does not filter them, and a handler, or an upstream whose
+        // response is proxied, may set one. Only that header may be lost.
+        Case {
+            name: "refused-header",
+            route: r#"(event) => event.respondWith(new Response('body', { headers: {
+                'x-before': 'kept',
+                'keep-alive': 'timeout=5',
+                'x-after': 'kept',
+            } }))"#
+                .into(),
+            check: |server| {
+                let response = server.full_request("GET", "/refused-header", "");
+                assert!(response.contains("x-before: kept"), "{response}");
+                assert!(response.contains("x-after: kept"), "{response}");
+                assert!(
+                    !response.to_lowercase().contains("keep-alive"),
+                    "the refused header must not be on the wire: {response}"
+                );
+                assert_eq!(
+                    common::wasm_serve::message_body(&response),
+                    "body",
+                    "{response}"
+                );
+                assert!(
+                    server.wait_for_marker(
+                        "dropping the response header `keep-alive`",
+                        Duration::from_secs(5)
+                    ),
+                    "{}",
+                    server.log()
+                );
+            },
+        },
+        // A field that arrived in mixed case is found by any casing. The incoming headers are
+        // immutable. Headers put on the response keep `set-cookie` as separate fields, while
+        // everything else combines (`serve_exposes_incoming_headers_and_keeps_them_immutable`).
+        Case {
+            name: "incoming-headers",
+            route: r#"(event) => {
+                const incoming = event.request.headers;
+                let immutable = 'mutable';
+                try {
+                    incoming.delete('user-agent');
+                } catch (e) {
+                    immutable = e.constructor.name;
+                }
+                const response = new Response('ok', {
+                    headers: [
+                        ['x-seen', incoming.get('EXAMPLE-HEADER') ?? 'missing'],
+                        ['x-agent', incoming.get('User-Agent') ?? 'missing'],
+                        ['x-immutable', immutable],
+                    ],
+                });
+                response.headers.append('set-cookie', 'A');
+                response.headers.append('set-cookie', 'B');
+                response.headers.append('another', 'A');
+                response.headers.append('another', 'B');
+                event.respondWith(response);
+            }"#
+            .into(),
+            check: |server| {
+                let response = common::raw_request_within(
+                    server.port(),
+                    b"GET /incoming-headers HTTP/1.1\r\nHost: x\r\neXample-hEader: Header Value\r\n\
+                      User-Agent: test-agent\r\nConnection: close\r\n\r\n",
+                    Duration::from_secs(20),
+                )
+                .expect("a complete response");
+                assert!(
+                    response.contains("x-seen: Header Value"),
+                    "a mixed-case field must be found by any casing: {response}"
+                );
+                assert!(response.contains("x-agent: test-agent"), "got: {response}");
+                assert!(
+                    response.contains("x-immutable: TypeError"),
+                    "an incoming request's headers must not be mutable: {response}"
+                );
+                // `set-cookie` must stay one field per cookie, since combining two cookies into
+                // one field changes what they mean. Other repeats may be sent as separate fields
+                // or as one comma list, which RFC 9110 §5.2 makes equivalent, but both values have
+                // to survive.
+                assert_eq!(
+                    response.matches("set-cookie: ").count(),
+                    2,
+                    "each cookie needs a field of its own: {response}"
+                );
+                assert!(response.contains("set-cookie: A"), "got: {response}");
+                assert!(response.contains("set-cookie: B"), "got: {response}");
+                assert!(
+                    response.contains("another: A, B")
+                        || (response.contains("another: A") && response.contains("another: B")),
+                    "both values of a repeated header must reach the client: {response}"
+                );
+            },
+        },
+        // `wasmtime serve` forwards a `HEAD` to the guest and sends what the guest produced: no
+        // body, and the `Content-Length` a `GET` would have had. `prepare_wire_response` can supply
+        // that length only for an in-memory body, since a streamed body's length is known only
+        // once it is produced (`serve_answers_a_head_request_without_a_body`).
+        Case {
+            name: "head",
+            route: r#"(event, rest) => {
+                if (rest === '/stream') {
+                    event.respondWith(new Response(new ReadableStream({
+                        start(c) {
+                            c.enqueue(new TextEncoder().encode('BODYBYTES'));
+                            c.close();
+                        },
+                    })));
+                    return;
+                }
+                event.respondWith(new Response('BODYBYTES', { status: 201 }));
+            }"#
+            .into(),
+            check: |server| {
+                let response = server.full_request("HEAD", "/head", "");
+                let (head, body) = response.split_once("\r\n\r\n").expect("a complete head");
+                assert!(
+                    head.starts_with("HTTP/1.1 201 "),
+                    "the head is still the handler's: {response}"
+                );
+                assert_eq!(
+                    body, "",
+                    "a HEAD response must not include a body, but got: {response}"
+                );
+                assert!(
+                    head.to_lowercase().contains("content-length: 9"),
+                    "a HEAD must declare the length a GET would have sent: {head}"
+                );
+
+                let streamed = server.full_request("HEAD", "/head/stream", "");
+                let (head, body) = streamed.split_once("\r\n\r\n").expect("a complete head");
+                assert_eq!(body, "", "got: {streamed}");
+                assert!(
+                    !head.to_lowercase().contains("content-length"),
+                    "a streamed body's length is only knowable by producing it: {head}"
+                );
+            },
+        },
+        // A `204` or `304` is framed by its status, with no `Content-Length` and no
+        // `Transfer-Encoding` (RFC 9110 §8.6, RFC 9112 §6.2,
+        // `a_bodiless_status_has_no_framing_headers`).
+        Case {
+            name: "bodiless",
+            route: "(event, rest) => \
+                    event.respondWith(new Response(null, { status: Number(rest.slice(1)) }))"
+                .into(),
+            check: |server| {
+                for status in [204, 304] {
+                    let response = server.full_request("GET", &format!("/bodiless/{status}"), "");
+                    let head = response
+                        .split_once("\r\n\r\n")
+                        .map_or(&*response, |(head, _)| head)
+                        .to_lowercase();
+                    assert!(
+                        !head.contains("content-length"),
+                        "a {status} must not be framed with Content-Length: {response}"
+                    );
+                    assert!(
+                        !head.contains("transfer-encoding"),
+                        "a {status} must not be framed with Transfer-Encoding: {response}"
+                    );
+                }
+            },
+        },
+        // A handler's own `Content-Length` never frames content already in memory.
+        // `prepare_wire_response` measures the body instead
+        // (`serve_frames_a_response_by_its_body_not_the_handlers_content_length`).
+        Case {
+            name: "handler-length",
+            route: r#"(event, rest) => {
+                const declared = {
+                    // Longer than the body.
+                    '/larger': ['10000'],
+                    // Not a number at all.
+                    '/bogus': ['test'],
+                    // Two of them, which combine into one comma-joined value.
+                    '/duplicate': ['10000', '10000'],
+                }[rest];
+                const headers = new Headers();
+                for (const value of declared) headers.append('content-length', value);
+                event.respondWith(new Response('short', { headers }));
+            }"#
+            .into(),
+            check: |server| {
+                for path in [
+                    "/handler-length/larger",
+                    "/handler-length/bogus",
+                    "/handler-length/duplicate",
+                ] {
+                    let response = server.full_request("GET", path, "");
+                    let head = response
+                        .split_once("\r\n\r\n")
+                        .expect("a complete response")
+                        .0;
+                    assert_eq!(server.request("GET", path, ""), "short", "body for {path}");
+                    let lower = head.to_lowercase();
+                    assert!(
+                        !lower.contains("10000") && !lower.contains("content-length: test"),
+                        "the handler's own length must not reach the wire for {path}: {head}"
+                    );
+                }
+            },
+        },
+        // The guest declares the length of an in-memory body, as native does
+        // (`serve_frames_a_response_by_its_body_not_the_handlers_content_length`). The host frames
+        // by what the guest hands it, and without a declared length it chunks every such response.
+        Case {
+            name: "fixed-length",
+            route: "(event) => event.respondWith(new Response('BODYBYTES'))".into(),
+            check: |server| {
+                let response = server.full_request("GET", "/fixed-length", "");
+                let head = response
+                    .split_once("\r\n\r\n")
+                    .expect("a complete response")
+                    .0
+                    .to_lowercase();
+                assert!(head.contains("content-length: 9"), "got: {head}");
+                assert!(!head.contains("transfer-encoding"), "got: {head}");
+                assert_eq!(server.get("/fixed-length"), "BODYBYTES");
+            },
+        },
+        // A streamed body's length is not known before it is produced, so a length the handler
+        // declares frames the response, as on native
+        // (`serve_frames_a_streamed_body_by_its_declared_content_length`). The guest writes the
+        // body, so content past the declared length is never handed to the host. A declaration
+        // that is not a single `1*DIGIT` is refused, and the host picks the framing.
+        Case {
+            name: "declared-length",
+            route: r#"(event, rest) => {
+                const [parts, length] = {
+                    '/exact': [['abc', 'de'], '5'],
+                    '/longer': [['abcde', 'XXXXX'], '5'],
+                    // Less than it declared: the guest ends the body as an abort, so the host
+                    // cannot present the truncation as a complete response.
+                    '/shorter': [['ab'], '5'],
+                    '/bogus': [['abcde'], 'test'],
+                }[rest];
+                event.respondWith(new Response(new ReadableStream({
+                    start(c) {
+                        for (const part of parts) c.enqueue(new TextEncoder().encode(part));
+                        c.close();
+                    },
+                }), { headers: { 'content-length': length } }));
+            }"#
+            .into(),
+            check: |server| {
+                for path in ["/declared-length/exact", "/declared-length/longer"] {
+                    let response = server.full_request("GET", path, "");
+                    let (head, body) = response
+                        .split_once("\r\n\r\n")
+                        .expect("a complete response");
+                    assert!(
+                        head.to_lowercase().contains("content-length: 5"),
+                        "the declared length must frame {path}: {head}"
+                    );
+                    assert!(
+                        !head.to_lowercase().contains("transfer-encoding"),
+                        "got for {path}: {head}"
+                    );
+                    assert_eq!(body, "abcde", "body for {path}: {response}");
+                }
+
+                let short = server.full_request("GET", "/declared-length/shorter", "");
+                let sent = short
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or("");
+                assert!(
+                    sent.len() < 5,
+                    "the body must stop short of the length it declared: {short:?}"
+                );
+
+                let response = server.full_request("GET", "/declared-length/bogus", "");
+                let head = response
+                    .split_once("\r\n\r\n")
+                    .expect("a complete response")
+                    .0;
+                assert!(!head.contains("test"), "got: {head}");
+                assert_eq!(server.get("/declared-length/bogus"), "abcde");
+            },
+        },
+        // A body that errors after sending bytes delivers what was produced, and then ends without
+        // the terminating chunk, so the truncation cannot be mistaken for a complete response
+        // (`a_response_stream_that_errors_mid_flight_leaves_the_body_unterminated`).
+        Case {
+            name: "errors-mid-flight",
+            // The error comes from a timer. A body cannot outlive its request's event loop going
+            // idle, so the stream holds the loop open until it errors. The delay only has to
+            // outlast the first chunk reaching the wire: a host that has not flushed a chunk when
+            // the body aborts may discard it.
+            route: r#"(event) => event.respondWith(new Response(new ReadableStream({
+                start(c) {
+                    c.enqueue(new TextEncoder().encode('first-chunk-'));
+                    setTimeout(() => c.error(new Error('stream broke')), 300);
+                },
+            })))"#
+                .into(),
+            check: |server| {
+                let errored = server.full_request("GET", "/errors-mid-flight", "");
+                let (_, body) = errored.split_once("\r\n\r\n").expect("a complete head");
+                assert!(
+                    body.contains("first-chunk-"),
+                    "the bytes produced before the error must still arrive: {errored}"
+                );
+                assert!(
+                    !body.ends_with("0\r\n\r\n"),
+                    "an errored body must not be terminated as if it were complete: {errored}"
+                );
+            },
+        },
+        // A stream that enqueues something other than a `Uint8Array` aborts its body before a byte
+        // is written (WPT
+        // `resources/fetch-event-respond-with-response-body-with-invalid-chunk-worker.js`).
+        //
+        // Host-owned divergence: native sends a `200` head and then closes the body unterminated.
+        // `wasmtime serve` has not committed the head when the body aborts, and sends no response
+        // (see the comment where `dispatch_request` hands the response over). Either way, the
+        // client must not get a response that looks complete.
+        Case {
+            name: "invalid-chunk",
+            route: r#"(event) => event.respondWith(new Response(new ReadableStream({
+                start(c) {
+                    c.enqueue('a string, not a Uint8Array');
+                    c.close();
+                },
+            })))"#
+                .into(),
+            check: |server| {
+                // The control, since the response under test may be empty: an empty reply below is
+                // the invalid chunk's doing, not a server that stopped responding.
+                assert_eq!(server.get("/ready"), "ready");
+                let response = server.full_request("GET", "/invalid-chunk", "");
+                assert!(
+                    response.is_empty() || !response.ends_with("0\r\n\r\n"),
+                    "a body that never produced a valid chunk must reach the client as nothing at \
+                     all, or as an unterminated one, never as a complete response: {response:?}"
+                );
+            },
+        },
+        // An empty chunk neither ends the body nor corrupts the framing
+        // (`serve_streams_an_empty_chunk_without_ending_the_body`). `spawn_body_writer`'s
+        // dropped-reader check does not apply to it, since an empty write leaves an empty
+        // remainder either way.
+        Case {
+            name: "empty-chunk",
+            route: r#"(event) => {
+                const encoder = new TextEncoder();
+                event.respondWith(new Response(new ReadableStream({
+                    start(c) {
+                        c.enqueue(new Uint8Array(0));
+                        c.enqueue(encoder.encode('chunk one '));
+                        c.enqueue(new Uint8Array(0));
+                        c.enqueue(encoder.encode('chunk two'));
+                        c.close();
+                    },
+                })));
+            }"#
+            .into(),
+            check: |server| assert_eq!(server.get("/empty-chunk"), "chunk one chunk two"),
+        },
+        // A body produced by a timer is served to completion. The pump runs on the request's own
+        // loop, which is driven for as long as the body needs it
+        // (`an_interval_driven_stream_is_served_to_completion`).
+        Case {
+            name: "interval-stream",
+            route: r#"(event) => {
+                let ticks = 0;
+                event.respondWith(new Response(new ReadableStream({
+                    start(c) {
+                        const id = setInterval(() => {
+                            c.enqueue(new TextEncoder().encode('tick ' + ++ticks + ' '));
+                            if (ticks === 5) {
+                                clearInterval(id);
+                                c.close();
+                            }
+                        }, 50);
+                    },
+                })));
+            }"#
+            .into(),
+            check: |server| {
+                assert_eq!(
+                    server.get("/interval-stream"),
+                    "tick 1 tick 2 tick 3 tick 4 tick 5 "
+                );
+            },
+        },
+        // An upstream body forwarded as a stream rather than collected first. The handler builds
+        // its own `Response` around `upstream.body`, and the chunks, which the upstream sends with
+        // pauses between them, reach the client (`body_path.rs`'s
+        // `single_bodies_take_the_route_they_should`).
+        Case {
+            name: "upstream-stream",
+            route: format!(
+                "(event) => event.respondWith((async () => {{
+                    const upstream = await fetch('http://127.0.0.1:{chunked_upstream}/');
+                    return new Response(upstream.body, upstream);
+                }})())"
+            ),
+            check: |server| assert_eq!(server.get("/upstream-stream"), "one two three"),
+        },
+        // An upstream that dies mid-body reaches the client as a truncation, not as a body that
+        // ended cleanly a few bytes short, since the terminating chunk asserts completeness (RFC
+        // 9112 §7.1). The guest never sees the body's bytes, and the truncation reaches the client
+        // through the piped trailers.
+        Case {
+            name: "dying-upstream",
+            route: format!(
+                "(event) => event.respondWith(fetch('http://127.0.0.1:{truncated_upstream}/'))"
+            ),
+            check: |server| {
+                let response = server.full_request("GET", "/dying-upstream", "");
+                assert!(
+                    response.contains("one ") && response.contains("two "),
+                    "what the upstream did send must arrive: {response:?}"
+                );
+                assert!(
+                    !response.ends_with("0\r\n\r\n"),
+                    "a truncated upstream must not be forwarded as a complete body: {response:?}"
+                );
+            },
+        },
+        // A `fetch` whose request has a header the host refuses rejects with a `TypeError` naming
+        // that header. `http2-settings` is allowed by Fetch but refused by `wasi:http`.
+        Case {
+            name: "refused-fetch-header",
+            route: format!(
+                "(event) => event.respondWith(
+                    fetch('http://127.0.0.1:{upstream}/', {{
+                        headers: {{ 'http2-settings': 'AAMAAABk' }},
+                    }}).then(
+                        () => new Response('sent'),
+                        (e) => new Response(e.name + ': ' + e.message)))"
+            ),
+            check: |server| {
+                let body = server.get("/refused-fetch-header");
+                assert!(body.starts_with("TypeError: "), "{body}");
+                assert!(body.contains("http2-settings"), "{body}");
+            },
+        },
+        // A streamed response's head is sent when it is ready, not with the first chunk. A handler
+        // that streams may take a while to produce anything, and the client acts on the status and
+        // headers meanwhile (`a_streamed_response_sends_its_head_before_the_first_chunk`).
+        Case {
+            name: "head-first",
+            route: r#"(event) => {
+                const stream = new ReadableStream({
+                    start(c) {
+                        setTimeout(() => {
+                            c.enqueue(new TextEncoder().encode('late'));
+                            c.close();
+                        }, 2000);
+                    },
+                });
+                event.respondWith(new Response(stream, { headers: { 'x-marker': 'early' } }));
+            }"#
+            .into(),
+            check: |server| {
+                let mut stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+                stream
+                    .write_all(b"GET /head-first HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let started = std::time::Instant::now();
+
+                // Read just enough to have seen the head, and time how long that took.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut buf = [0u8; 256];
+                let read = std::io::Read::read(&mut stream, &mut buf).unwrap();
+                let elapsed = started.elapsed();
+                let head = String::from_utf8_lossy(&buf[..read]).to_string();
+
+                assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+                assert!(head.contains("x-marker: early"), "got: {head}");
+                assert!(
+                    elapsed < Duration::from_millis(1500),
+                    "the head must not wait for the first chunk (took {elapsed:?})"
+                );
+            },
+        },
+        // `waitUntil` work does not hold a streamed response open. The send drives the request's
+        // loop only for as long as the body needs it
+        // (`wait_until_does_not_delay_a_streamed_response`).
+        Case {
+            name: "streamed-wait-until",
+            route: r#"(event) => {
+                const stream = new ReadableStream({
+                    start(c) {
+                        c.enqueue(new TextEncoder().encode('streamed body'));
+                        c.close();
+                    },
+                });
+                event.respondWith(new Response(stream));
+                event.waitUntil(new Promise((resolve) => setTimeout(resolve, 4000)));
+            }"#
+            .into(),
+            check: |server| {
+                let started = std::time::Instant::now();
+                let body = server.get("/streamed-wait-until");
+                let elapsed = started.elapsed();
+                assert_eq!(body, "streamed body");
+                assert!(
+                    elapsed < Duration::from_secs(3),
+                    "a streamed response must not wait for waitUntil work (took {elapsed:?})"
+                );
+            },
+        },
+    ]
+}
+
+/// Cases about the request body a handler reads. None of them depends on what an earlier request
+/// left in the instance, so they share one server with default flags.
+#[test]
+fn request_body_cases_share_one_server() {
+    let cases = request_body_cases();
+    let Some(server) = Serve::new().script(&routed_script(&cases)).start() else {
+        return;
+    };
+    check_all(&server, cases.iter().map(|case| (case.name, case.check)));
+}
+
+fn request_body_cases() -> Vec<Case> {
+    let echo_upstream = common::start_echo_upstream();
+    vec![
+        // A handler reading `request.body` sees chunks as they arrive, not after the upload ends.
+        // The first chunk's echo comes back before the rest is sent
+        // (`serve_streams_an_incoming_request_body`).
+        Case {
+            name: "upload-stream",
+            route: r#"(event) => {
+                const reader = event.request.body.getReader();
+                event.respondWith(new Response(new ReadableStream({
+                    async pull(controller) {
+                        const { done, value } = await reader.read();
+                        if (done) {
+                            controller.close();
+                            return;
+                        }
+                        controller.enqueue(value);
+                    },
+                })));
+            }"#
+            .into(),
+            check: |server| {
+                /// Read from `stream` until the response body so far contains `expected`.
+                fn read_until(stream: &mut TcpStream, raw: &mut Vec<u8>, expected: &str) -> String {
+                    for _ in 0..200 {
+                        let body = String::from_utf8_lossy(raw)
+                            .split_once("\r\n\r\n")
+                            .map(|(_, body)| common::dechunk(body))
+                            .unwrap_or_default();
+                        if body.contains(expected) {
+                            return body;
+                        }
+                        let mut buf = [0u8; 1024];
+                        let read = std::io::Read::read(stream, &mut buf).unwrap();
+                        assert_ne!(read, 0, "connection closed while waiting for {expected:?}");
+                        raw.extend_from_slice(&buf[..read]);
+                    }
+                    panic!("never received {expected:?}");
+                }
+
+                let mut stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .unwrap();
+                stream
+                    .write_all(
+                        b"POST /upload-stream HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                let mut raw = Vec::new();
+                // First chunk: the echo must come back before the rest of the request is sent.
+                stream.write_all(b"5\r\nfirst\r\n").unwrap();
+                read_until(&mut stream, &mut raw, "first");
+                // Only now send the second chunk and the terminator.
+                stream.write_all(b"6\r\nsecond\r\n0\r\n\r\n").unwrap();
+                let body = read_until(&mut stream, &mut raw, "second");
+                assert_eq!(body, "firstsecond", "got: {body}");
+            },
+        },
+        // `wasi:http` gives a request with no body the same empty stream as one whose body is
+        // empty, so `body_framing` goes by the method: `GET` gets `null`, and a `POST` without a
+        // body gets an empty stream rather than `null`.
+        //
+        // Host-owned divergence: native reads the framing headers the client sent, so a bodyless
+        // `POST` there gets `null`.
+        Case {
+            name: "bodyless-post",
+            route: "(event) => event.respondWith(\
+                    new Response(event.request.body === null ? 'null' : 'stream'))"
+                .into(),
+            check: |server| {
+                assert_eq!(server.request("GET", "/bodyless-post", ""), "null");
+                assert_eq!(server.request("POST", "/bodyless-post", ""), "stream");
+                assert_eq!(
+                    server.request("POST", "/bodyless-post", "payload"),
+                    "stream"
+                );
+            },
+        },
+        // A chunked upload reaches the handler decoded. The host undoes the framing, and
+        // `body_framing` exposes a body although there is no `Content-Length` to go by, since
+        // `wasi:http` does not pass `Transfer-Encoding` on to the guest
+        // (`serve_decodes_a_chunked_request_body`).
+        //
+        // Host-owned divergence: native also refuses `Transfer-Encoding` together with
+        // `Content-Length` (RFC 9112 §6.3, a request-smuggling vector) with a 400. On wasm the host
+        // parses the request, so refusing it is the host's business.
+        Case {
+            name: "chunked-upload",
+            route: "(event) => event.respondWith(\
+                    event.request.text().then((body) => new Response('got:' + body)))"
+                .into(),
+            check: |server| {
+                // "hello world" as two chunks: "hello " (0x6) then "world" (0x5).
+                let response = common::raw_request_within(
+                    server.port(),
+                    b"POST /chunked-upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n",
+                    Duration::from_secs(20),
+                )
+                .expect("a complete response");
+                assert!(response.contains("got:hello world"), "got: {response}");
+
+                // Both framings at once, with bytes after the chunked terminator that only the
+                // `Content-Length` reading would take for body. `wasmtime serve` reads the request
+                // as chunked, which RFC 9112 §6.3 allows a server to do. Either way, those bytes
+                // must not reach the handler as a body.
+                let smuggle = common::raw_request_within(
+                    server.port(),
+                    b"POST /chunked-upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\
+                      Content-Length: 5\r\nConnection: close\r\n\r\n0\r\n\r\nSMUGGLED",
+                    Duration::from_secs(20),
+                )
+                .unwrap_or_default();
+                assert!(
+                    !smuggle.contains("SMUGGLED"),
+                    "the second framing's bytes must not reach the handler: {smuggle:?}"
+                );
+                assert!(
+                    smuggle.is_empty() || common::wasm_serve::message_body(&smuggle) == "got:",
+                    "an ambiguous request is either refused or read one way: {smuggle:?}"
+                );
+            },
+        },
+        // A client that closes mid-body must not present the truncation to the handler as a
+        // complete body. The request's stream errors, so `text()` rejects
+        // (`serve_rejects_a_truncated_request_body`). On wasm the abort arrives through the
+        // incoming body's trailers.
+        Case {
+            name: "truncated-upload",
+            route: r#"(event) => event.respondWith(event.request.text().then(
+                (body) => new Response('complete:' + body),
+                () => new Response('truncated'),
+            ))"#
+            .into(),
+            check: |server| {
+                let mut stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+                // Set before the half-close below, and read by hand rather than through
+                // `read_until_eof`: macOS refuses a read timeout on a socket whose write half is
+                // already shut down, and `read_until_eof` sets one on each iteration to keep its
+                // patience a total.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .unwrap();
+                // Declare ten bytes, send four, then close the sending side.
+                stream
+                    .write_all(
+                        b"POST /truncated-upload HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\
+                          Connection: close\r\n\r\nfour",
+                    )
+                    .unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(read) = std::io::Read::read(&mut stream, &mut buf) {
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                }
+                let response = String::from_utf8_lossy(&raw).into_owned();
+                assert!(
+                    response.contains("truncated"),
+                    "a truncated upload must make the handler's read reject: {response:?}"
+                );
+            },
+        },
+        // An incoming request body used directly as the response body is handed to the wire
+        // without being pumped through JS, since the incoming body is a host body rather than
+        // bytes (`serve_pipes_an_incoming_request_body_to_the_response`).
+        Case {
+            name: "piped-body",
+            route: "(event) => event.respondWith(new Response(event.request.body ?? 'no body'))"
+                .into(),
+            check: |server| {
+                assert_eq!(
+                    server.request("POST", "/piped-body", "hello world"),
+                    "hello world"
+                );
+            },
+        },
+        // The same body forwarded upstream as an outgoing request's body while the handler reads
+        // the other half of the `tee`. Both halves see the whole upload
+        // (`serve_forwards_an_incoming_body_upstream_while_reading_it`).
+        Case {
+            name: "tee-upstream",
+            route: format!(
+                r#"(event) => event.respondWith((async () => {{
+                    const [forward, inspect] = event.request.body.tee();
+                    const sent = fetch('http://127.0.0.1:{echo_upstream}/', {{
+                        method: 'POST',
+                        body: forward,
+                        duplex: 'half',
+                    }});
+                    let seen = '';
+                    const reader = inspect.getReader();
+                    const decoder = new TextDecoder();
+                    while (true) {{
+                        const {{ done, value }} = await reader.read();
+                        if (done) break;
+                        seen += decoder.decode(value, {{ stream: true }});
+                    }}
+                    const echoed = await (await sent).text();
+                    return new Response('upstream=' + echoed + ' local=' + seen);
+                }})())"#
+            ),
+            check: |server| {
+                assert_eq!(
+                    server.request("POST", "/tee-upstream", "payload bytes"),
+                    "upstream=payload bytes local=payload bytes"
+                );
+            },
+        },
+        // `clone()` on an incoming request tees its body, and both halves see all of it
+        // (`serve_clones_an_incoming_request_body`).
+        Case {
+            name: "cloned-body",
+            route: r#"(event) => {
+                const copy = event.request.clone();
+                event.respondWith(Promise.all([event.request.text(), copy.text()])
+                    .then(([a, b]) => new Response(a + '|' + b)));
+            }"#
+            .into(),
+            check: |server| {
+                assert_eq!(
+                    server.request("POST", "/cloned-body", "payload"),
+                    "payload|payload",
+                    "both halves of the tee must see the body"
+                );
+            },
+        },
+    ]
+}
+
+/// Cases about how the event's listeners and their failures turn into a response, on one server
+/// with two listeners.
+#[test]
+fn listener_cases_share_one_server() {
+    const HANDLER: &str = r#"addEventListener('fetch', (event) => {
+        const path = new URL(event.request.url).pathname;
+        if (path === '/boom' || path === '/throw-then-respond') {
+            throw new Error('handler blew up');
+        }
+        if (path === '/cancel-only' || path === '/cancel-then-respond') {
+            event.preventDefault();
+        }
+    });
+    addEventListener('fetch', (event) => {
+        const path = new URL(event.request.url).pathname;
+        if (path === '/boom' || path === '/cancel-only') {
+            return;
+        }
+        if (path === '/rejected-wait-until') {
+            event.waitUntil(Promise.reject(new Error('waitUntil failed')));
+            event.respondWith(new Response('answered anyway'));
+            return;
+        }
+        event.respondWith(new Response(path === '/ready' ? 'ready' : 'recovered'));
+    });"#;
+    let Some(server) = Serve::new().script(HANDLER).start() else {
+        return;
+    };
+    check_all(
+        &server,
+        [
+            // A handler that throws instead of responding gets a 500, not a hung connection or an
+            // empty 200 (`a_throwing_handler_is_answered_with_500`).
+            ("boom", |server: &WasmServer| {
+                assert!(
+                    server
+                        .full_request("GET", "/boom", "")
+                        .starts_with("HTTP/1.1 500"),
+                    "a throwing listener is answered with a 500"
+                );
+            }),
+            // `preventDefault` cancels the event, and on its own leaves nothing to respond with
+            // (`prevent_default_does_not_stop_a_later_listener_responding`).
+            ("cancel-only", |server: &WasmServer| {
+                assert!(
+                    server
+                        .full_request("GET", "/cancel-only", "")
+                        .starts_with("HTTP/1.1 500 "),
+                    "cancelling without responding is a network error"
+                );
+            }),
+            // Neither a throw nor `preventDefault` takes the dispatch down: a listener after them
+            // still gets the event and responds.
+            ("later-listener", |server: &WasmServer| {
+                assert_eq!(server.get("/throw-then-respond"), "recovered");
+                assert_eq!(server.get("/cancel-then-respond"), "recovered");
+            }),
+            // A `waitUntil` promise that rejects does not affect the response
+            // (`a_rejected_wait_until_does_not_break_the_response`).
+            ("rejected-wait-until", |server: &WasmServer| {
+                assert_eq!(server.get("/rejected-wait-until"), "answered anyway");
+            }),
+        ] as [(&'static str, fn(&WasmServer)); 4],
     );
 }

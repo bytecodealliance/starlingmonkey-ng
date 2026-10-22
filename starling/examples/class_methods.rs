@@ -2,6 +2,10 @@
 
 //! Demonstrates defining a JS class with methods using `#[jsclass]` and `#[jsmethods]`.
 
+// `showcase` covers what this example shows, so `cargo test --examples` builds it as an empty
+// test harness.
+#![cfg(not(test))]
+
 use js::compile::evaluate_with_filename;
 use js::error::ExnThrown;
 use js::prelude::FromJSVal;
@@ -102,9 +106,4 @@ c.data
     println!("  Result: {}", result_str);
 
     println!("All tests passed!");
-}
-
-#[test]
-fn class_methods_proc_example() {
-    main()
 }

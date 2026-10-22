@@ -15,20 +15,21 @@
 //! internal reader are sent through a channel which the platform transport reads
 //! as it sends the body.
 
-use core_runtime::jsclass;
-use core_runtime::jsmethods;
+use std::future::Future;
+
 use js::conversion::FromJSVal;
 use js::error::ExnThrown;
-use js::gc::handle::{Heap, RootedHeap};
 use js::gc::scope::Scope;
 use js::prelude::HandleValue;
 use js::promise::{PromiseFuture, PromiseOutcome};
-use js::{Object, Promise, Uint8Array};
-use platform::http::{BodySender, OutgoingBody};
-use web_streams::readable::default_reader::{DefaultReader, DefaultReaderImpl};
-use web_streams::readable::native_read::{
-    acquire_native_reader, native_reader_read, NativeReadSteps,
+use js::{Promise, Uint8Array};
+use platform::http::{BodySender, IncomingBody, OutgoingBody};
+use web_streams::readable::default_reader::DefaultReader;
+use web_streams::readable::native_byte_source::take_untouched_reader;
+use web_streams::readable::native_pump::{
+    append_bytes, NativePump, PumpBatch, PumpEnd, PumpSink, PUMP_BATCH_BYTES,
 };
+use web_streams::readable::native_read::acquire_native_reader;
 use web_streams::readable::readable_stream::ReadableStream;
 
 use crate::incoming_body::HostBackedBodyOwner;
@@ -128,49 +129,6 @@ fn outgoing_body_inner(
     }
 }
 
-/// State for the body pump: the reader being drained, the channel's write end, and the bytes read
-/// but not yet sent. The sender is taken out while a send waits for channel capacity, and dropped
-/// (closing the body) when the stream ends or errors.
-#[jsclass(hidden)]
-pub struct OutgoingBodyPump {
-    reader: Heap<DefaultReaderImpl>,
-    #[no_trace]
-    sender: Option<BodySender>,
-    /// Bytes of the chunks read since the last send.
-    #[no_trace]
-    batch: Vec<u8>,
-    /// How the stream ended, once its close or error steps ran, or a chunk was not a
-    /// `Uint8Array`.
-    #[no_trace]
-    end: Option<StreamEnd>,
-    /// Whether a read request is waiting for a chunk.
-    #[no_trace]
-    reading: bool,
-    /// Whether [`run`] is on the stack.
-    #[no_trace]
-    running: bool,
-}
-
-/// How a pumped stream ended.
-enum StreamEnd {
-    Closed,
-    Errored(String),
-}
-
-#[jsmethods]
-impl OutgoingBodyPump {
-    fn new(reader: DefaultReader, sender: BodySender) -> Self {
-        OutgoingBodyPumpImpl {
-            reader: Heap::from(reader),
-            sender: Some(sender),
-            batch: Vec::new(),
-            end: None,
-            reading: false,
-            running: false,
-        }
-    }
-}
-
 /// Turn a body's materialized `ReadableStream` into a [`OutgoingBody`].
 ///
 /// A host body that has never been read is handed straight through; anything
@@ -191,21 +149,11 @@ pub(crate) fn outgoing_body_from_stream(
     // buffer the shortcut cannot see (a transform's queue), and bypassing the stream would
     // drop those bytes. The pump drains the stream in order instead. A pipe that has merely
     // _asked_ for a chunk does not count: that pull is deferred without touching the host body
-    // (see `incoming_body::host_pull`).
-    let host_body = stream
-        .native_source(scope)
-        .and_then(|source| source.cast::<crate::incoming_body::HostBodySource>().ok())
-        .and_then(|source| source.take_host_body(scope));
+    // (see `NativeByteSource`). Taking the host body leaves the stream locked and disturbed, as
+    // the pump would: author code can no longer read it and `bodyUsed` reports true.
+    let host_body = take_untouched_reader::<IncomingBody>(scope, &stream);
     match host_body {
-        Some(host_body) => {
-            // The bytes are transmitted directly, bypassing the stream, so leave the donor
-            // stream in the same locked + disturbed state the pump path (acquiring a reader)
-            // would: author code can no longer read it and `bodyUsed` reports true.
-            stream
-                .lock_and_disturb(scope)
-                .expect("If this happens, there's a bug in the runtime");
-            OutgoingBody::Host(host_body)
-        }
+        Some(host_body) => OutgoingBody::Host(host_body),
         // Cancelled rather than left alone: nothing will read this stream now, and cancelling is
         // what makes it release whatever it draws from — an upstream response feeding a transform,
         // say. It runs the handler's `cancel()`, not its `pull()`, so no content is produced.
@@ -238,249 +186,92 @@ fn pump_body_from_stream(
         Some(reader) => reader,
         None => acquire_native_reader(scope, &stream)?,
     };
-    let state = OutgoingBodyPump::new(scope, reader, sender)?;
-    run(scope, &state);
+    let pump = NativePump::create(scope, reader, BodySink(sender), BodyBatch::default())?;
+    pump.start(scope);
     Ok(body)
 }
 
-/// The maximum number of bytes the pump reads into one batch before sending it.
-const BATCH_LIMIT: usize = 64 * 1024;
+/// The bytes of the chunks read since the last send.
+#[derive(Default)]
+struct BodyBatch(Vec<u8>);
 
-/// The pump's native read-request steps. Each records what it received in the pump's state and
-/// then calls [`run`], which does nothing when the step ran from inside it.
-const PUMP_STEPS: NativeReadSteps = NativeReadSteps {
-    chunk: pump_chunk_step,
-    close: pump_close_step,
-    error: pump_error_step,
-};
-
-/// Advance the pump. Reads chunks into the batch for as long as reads complete synchronously and
-/// the batch is below [`BATCH_LIMIT`], then sends the batch once a read has to wait, the batch is
-/// full, or the stream has ended. A batch the channel accepts right away is followed by more
-/// reads. Otherwise the pump waits until the channel accepts it (`spawn_send` resumes it), so it
-/// never outruns the peer. At most one read or send is outstanding at a time.
-fn run(scope: &Scope<'_>, state: &OutgoingBodyPump<'_>) {
-    if state.data().running {
-        return;
-    }
-    state.data_mut().running = true;
-    loop {
-        while can_read(state) {
-            state.data_mut().reading = true;
-            if read_next(scope, state).is_err() {
-                js::exception::report_and_clear(scope, "reading a request or response body");
-                state.data_mut().reading = false;
-                // A failed body fails the send instead of completing it.
-                let sender = state.data_mut().sender.take();
-                if let Some(sender) = sender {
-                    sender.fail("the body stream could not be read".to_string());
-                }
-            }
-            if state.data().reading {
-                break;
-            }
-        }
-        if !send_batch(scope, state) {
-            break;
-        }
-    }
-    state.data_mut().running = false;
-}
-
-/// Whether the pump may issue another read: the channel is not waiting for a send, the stream has
-/// not ended, no read is outstanding, and the batch has room.
-fn can_read(state: &OutgoingBodyPump<'_>) -> bool {
-    let data = state.data();
-    data.sender.is_some() && data.end.is_none() && !data.reading && data.batch.len() < BATCH_LIMIT
-}
-
-/// Send the batch, or end the body, if there is reason to. Returns whether [`run`] should continue
-/// reading: true if the channel accepted the batch right away.
-fn send_batch(scope: &Scope<'_>, state: &OutgoingBodyPump<'_>) -> bool {
-    let mut data = state.data_mut();
-    if data.sender.is_none() {
-        // A send is waiting for capacity, or the body is done.
-        return false;
-    }
-    let ready = data.reading || data.end.is_some() || data.batch.len() >= BATCH_LIMIT;
-    if !data.batch.is_empty() && ready {
-        let batch = std::mem::take(&mut data.batch);
-        let sent = data
-            .sender
-            .as_mut()
-            .expect("checked above")
-            .try_send_chunk(batch);
-        drop(data);
-        return match sent {
-            Ok(()) => true,
-            Err(batch) => {
-                spawn_send(scope, state, Send::Chunk(batch));
-                false
-            }
+impl PumpBatch for BodyBatch {
+    /// Append a `Uint8Array` chunk's bytes. Any other chunk ends the body with an error, since the
+    /// spec's transmit-body chunk steps treat a non-`Uint8Array` chunk as a fatal error.
+    fn append(&mut self, scope: &Scope<'_>, chunk: HandleValue<'_>) -> Result<(), String> {
+        let Ok(array) = Uint8Array::from_jsval(scope, chunk, ()) else {
+            return Err("Body stream chunks must be of type Uint8Array".to_string());
         };
-    }
-    if data.batch.is_empty() {
-        match data.end.take() {
-            // End of body: dropping the sender closes the channel.
-            Some(StreamEnd::Closed) => data.sender = None,
-            Some(StreamEnd::Errored(message)) => {
-                drop(data);
-                spawn_send(scope, state, Send::Error(message));
-            }
-            None => {}
-        }
-    }
-    false
-}
-
-/// Issue the next internal read, delivering to the pump's steps.
-fn read_next(scope: &Scope<'_>, state: &OutgoingBodyPump<'_>) -> Result<(), ExnThrown> {
-    let reader = state.data().reader.get(scope);
-    native_reader_read(scope, reader, PUMP_STEPS, state.as_object())
-}
-
-/// A pending send to the body channel: a batch of bytes (after which the pump reads on) or a
-/// terminal error (after which the pump stops).
-enum Send {
-    Chunk(Vec<u8>),
-    Error(String),
-}
-
-/// Chunk steps: append a `Uint8Array` chunk's bytes to the batch. Anything else ends the body with
-/// an error, since the spec's transmit-body chunk steps treat a non-`Uint8Array` chunk as a fatal
-/// error.
-fn pump_chunk_step(
-    scope: &Scope<'_>,
-    payload: Object<'_>,
-    chunk: HandleValue<'_>,
-) -> Result<(), ExnThrown> {
-    let state = payload
-        .cast::<OutgoingBodyPump>()
-        .expect("payload is an OutgoingBodyPump");
-    let mut data = state.data_mut();
-    data.reading = false;
-    match Uint8Array::from_jsval(scope, chunk, ()) {
         // The spec's "a copy of chunk": the chunk's bytes are copied once, into the batch.
-        Ok(array) => {
-            let batch = &mut data.batch;
-            let appended = array.with_slice(|bytes| {
-                // Appending to a batch reserves room up to the limit, so the batch is copied once
-                // rather than through every doubling of its capacity.
-                if batch.capacity() - batch.len() < bytes.len() {
-                    let wanted = if batch.is_empty() {
-                        bytes.len()
-                    } else {
-                        BATCH_LIMIT.max(batch.len() + bytes.len()) - batch.len()
-                    };
-                    batch.try_reserve_exact(wanted)?;
-                }
-                batch.extend_from_slice(bytes);
-                Ok::<(), std::collections::TryReserveError>(())
-            });
-            if appended.is_err() {
-                data.end = Some(StreamEnd::Errored(
-                    "The body chunk could not be allocated".to_string(),
-                ));
-            }
-        }
-        Err(_) => {
-            data.end = Some(StreamEnd::Errored(
-                "Body stream chunks must be of type Uint8Array".to_string(),
-            ))
+        array
+            .with_slice(|bytes| append_bytes(&mut self.0, bytes))
+            .map_err(|_| "The body chunk could not be allocated".to_string())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.0.len() >= PUMP_BATCH_BYTES
+    }
+
+    fn take(&mut self) -> Self {
+        BodyBatch(std::mem::take(&mut self.0))
+    }
+}
+
+/// The write end of the channel from which the platform transport reads the body. A batch that the
+/// channel doesn't accept right away waits for capacity, so the pump never outruns the peer.
+struct BodySink(BodySender);
+
+impl PumpSink for BodySink {
+    type Batch = BodyBatch;
+
+    fn try_write(&mut self, batch: BodyBatch) -> Result<(), BodyBatch> {
+        self.0.try_send_chunk(batch.0).map_err(BodyBatch)
+    }
+
+    fn write(mut self, batch: BodyBatch) -> impl Future<Output = Option<Self>> + 'static {
+        // The event loop is kept alive until the receiver accepts the batch.
+        let interest =
+            core_runtime::event_loop::with_active_event_loop(|el| el.acquire_interest_handle());
+        async move {
+            let accepted = self.0.send_chunk(batch.0).await;
+            drop(interest);
+            accepted.then_some(self)
         }
     }
-    drop(data);
-    run(scope, &state);
-    Ok(())
+
+    fn describe_source_error(_scope: &Scope<'_>, _error: HandleValue<'_>) -> String {
+        "body stream errored".to_string()
+    }
+
+    /// End the body. A failed pump aborts it with the failure's message, which fails the send.
+    /// Otherwise, dropping the sender closes the channel.
+    fn finish(self, scope: &Scope<'_>, end: &PumpEnd) {
+        if let PumpEnd::Failed(message) = end {
+            spawn_send_error(scope, self.0, message.clone());
+        }
+    }
 }
 
-/// Close steps: end of body, after the batch is sent.
-fn pump_close_step(scope: &Scope<'_>, payload: Object<'_>) -> Result<(), ExnThrown> {
-    let state = payload
-        .cast::<OutgoingBodyPump>()
-        .expect("payload is an OutgoingBodyPump");
-    let mut data = state.data_mut();
-    data.reading = false;
-    data.end = Some(StreamEnd::Closed);
-    drop(data);
-    run(scope, &state);
-    Ok(())
-}
-
-/// Error steps: abort the body with the stream's error, after the batch is sent.
-fn pump_error_step(
-    scope: &Scope<'_>,
-    payload: Object<'_>,
-    _error: HandleValue<'_>,
-) -> Result<(), ExnThrown> {
-    let state = payload
-        .cast::<OutgoingBodyPump>()
-        .expect("payload is an OutgoingBodyPump");
-    let mut data = state.data_mut();
-    data.reading = false;
-    data.end = Some(StreamEnd::Errored("body stream errored".to_string()));
-    drop(data);
-    run(scope, &state);
-    Ok(())
-}
-
-/// Send `item` to the body channel (taking the sender out of the pump), awaiting
-/// channel capacity for backpressure. After a batch is accepted, the pump runs again.
-/// After an error, the pump stops and the sender is dropped (closing the channel after
-/// the queued error).
-fn spawn_send(scope: &Scope<'_>, state: &OutgoingBodyPump<'_>, item: Send) {
-    let Some(sender) = state.data_mut().sender.take() else {
-        return;
-    };
+/// Abort the body with `message`, waiting for channel capacity so the error is queued after the
+/// chunks already sent. The sender is dropped afterwards, which closes the channel.
+fn spawn_send_error(scope: &Scope<'_>, mut sender: BodySender, message: String) {
     let Ok(promise) = Promise::new_pending(scope) else {
         js::exception::report_and_clear(scope, "sending a request or response body");
-        sender.fail("the body could not be sent".to_string());
+        sender.fail(message);
         return;
     };
     let _ = promise.set_any_is_handled(scope);
-    let state = RootedHeap::new(*state);
-    let is_chunk = matches!(item, Send::Chunk(_));
-    // Ensure the event loop stays alive until the receiver accepts the chunk or error.
+    // The event loop is kept alive until the receiver accepts the error.
     let interest =
         core_runtime::event_loop::with_active_event_loop(|el| el.acquire_interest_handle());
     let future = async move {
-        let mut sender = sender;
-        let accepted = match item {
-            Send::Chunk(bytes) => sender.send_chunk(bytes).await,
-            Send::Error(message) => {
-                sender.send_error(message).await;
-                false
-            }
-        };
-        PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
-            drop(interest);
-            if is_chunk {
-                let state = state.get(scope);
-                if accepted {
-                    state.data_mut().sender = Some(sender);
-                    run(scope, &state);
-                } else {
-                    // A refused chunk means the receiver is gone: the peer stopped reading the
-                    // body, typically because the client disconnected. Cancel the stream, and
-                    // transitively the underlying source, so it can stop producing chunks.
-                    let reader = state.data().reader.get(scope);
-                    match reader.cancel(scope, None) {
-                        // Cancelling rejects if the underlying source's `cancel()` throws.
-                        // There is no caller left to report that to: the body is already
-                        // undeliverable. Mark it handled so it is not announced as an unhandled
-                        // rejection on top.
-                        Ok(promise) => {
-                            let _ = promise.set_any_is_handled(scope);
-                        }
-                        Err(_) => js::exception::report_and_clear(
-                            scope,
-                            "cancelling an abandoned response body",
-                        ),
-                    }
-                }
-            }
-            Ok(HandleValue::undefined())
-        }))
+        sender.send_error(message).await;
+        drop(interest);
+        PromiseOutcome::Resolve(Box::new(|_scope: &Scope<'_>| Ok(HandleValue::undefined())))
     };
     promise.spawn(PromiseFuture::new(future));
 }

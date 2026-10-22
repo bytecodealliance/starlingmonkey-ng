@@ -5,6 +5,10 @@
 //! Defines a native module with constants and functions, registers it,
 //! imports from JS, and also calls the functions from Rust.
 
+// `showcase` covers what this example shows, so `cargo test --examples` builds it as an empty
+// test harness.
+#![cfg(not(test))]
+
 use js::compile::evaluate_with_filename;
 use libstarling::config::RuntimeConfig;
 use libstarling::jsmodule;
@@ -198,9 +202,4 @@ fn main() {
     println!("  PASSED: verified by tests 2, 5, 6");
 
     println!("\nAll 7 tests passed!");
-}
-
-#[test]
-fn native_module_example() {
-    main()
 }

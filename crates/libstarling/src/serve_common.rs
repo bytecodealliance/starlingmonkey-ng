@@ -102,7 +102,7 @@ impl RequestClock {
     }
 }
 
-/// Run `work` under `limit`: `Some(output)` if it finished, `None` if `time_limit` was reached
+/// Run `work` under `time_limit`: `Some(output)` if it finished, `None` if the limit was reached
 /// and `work` interrupted as a result.
 pub(crate) async fn with_timeout<S, F, W>(
     sleep: &S,
@@ -548,7 +548,7 @@ pub(crate) fn signal_body_outcome(
 }
 
 /// The `Create Fetch Event and Dispatch` step 17.4.20 abort a body send calls for, as
-/// `(DOMException name, message)`, or `None` where the send needs no abort.
+/// `(DOMException name, message)`, or `None` if the send needs no abort.
 ///
 /// The reason is logged here as well, since the response is already on its way and there is
 /// no status left to report a failed, stalled, or abandoned body with.
@@ -588,11 +588,11 @@ fn abort_for_outcome(outcome: BodySendOutcome) -> Option<(&'static str, &'static
 
 /// A response reduced to what may go on the wire: the header fields that may be sent, the body to
 /// send, and the content length.
-pub(crate) struct WireResponse {
-    pub(crate) status: u16,
-    pub(crate) headers: http::HeaderMap,
-    /// The content to send, empty where the status or the method rules content out.
-    pub(crate) body: platform::http::OutgoingBody,
+pub struct WireResponse {
+    pub status: u16,
+    pub headers: http::HeaderMap,
+    /// The content to send, which is empty if the status or the method rules content out.
+    pub body: platform::http::OutgoingBody,
     /// The response's `Content-Length`. For non-streaming bodies, it's derived from the buffer.
     /// For forwarded incoming bodies, the incoming `Content-Length` header is used. For bodies
     /// backed by a JS `ReadableStream`, the guest-set `Content-Length` header is used, if any.
@@ -605,7 +605,7 @@ pub(crate) struct WireResponse {
     /// connection is closed.
     ///
     /// Always `None` for body-less status responses.
-    pub(crate) declared_length: Option<u64>,
+    pub declared_length: Option<u64>,
 }
 
 /// Whether a status is framed by the status alone: no `Content-Length`, no `Transfer-Encoding`, no
@@ -679,7 +679,7 @@ fn declared_content_length(headers: &[(String, String)]) -> Option<u64> {
 ///
 /// A `HEAD` still declares the length of the body a `GET` would have produced, where that is known
 /// without producing the content. RFC 9110 §9.3.2 allows omitting it otherwise.
-pub(crate) fn prepare_wire_response(
+pub fn prepare_wire_response(
     head_request: bool,
     status: u16,
     headers: Vec<(String, String)>,
@@ -729,187 +729,5 @@ pub(crate) fn prepare_wire_response(
             body
         },
         declared_length,
-    }
-}
-
-#[cfg(test)]
-mod wire_response_tests {
-    use super::*;
-    use platform::http::OutgoingBody;
-
-    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.to_string()))
-            .collect()
-    }
-
-    fn names(response: &WireResponse) -> Vec<String> {
-        response
-            .headers
-            .iter()
-            .map(|(name, _)| name.as_str().to_string())
-            .collect()
-    }
-
-    #[test]
-    fn framing_headers_are_dropped_whoever_set_them() {
-        let response = prepare_wire_response(
-            false,
-            200,
-            headers(&[
-                ("Content-Length", "10000"),
-                ("transfer-encoding", "chunked"),
-                ("CONNECTION", "keep-alive"),
-                ("x-keep", "me"),
-            ]),
-            OutgoingBody::Bytes(bytes::Bytes::from_static(b"short")),
-        );
-        assert_eq!(names(&response), ["x-keep"]);
-    }
-
-    #[test]
-    fn headers_that_could_split_the_response_are_dropped() {
-        let response = prepare_wire_response(
-            false,
-            200,
-            headers(&[
-                ("x-cr", "a\rb"),
-                ("x-lf", "a\nb"),
-                ("x-nul", "a\0b"),
-                ("x-na\rme", "fine"),
-                ("x-keep", "me"),
-            ]),
-            OutgoingBody::Bytes(bytes::Bytes::new()),
-        );
-        assert_eq!(names(&response), ["x-keep"]);
-    }
-
-    /// The body a response sends, for a test that only ever builds in-memory ones.
-    fn content(response: &WireResponse) -> &[u8] {
-        match &response.body {
-            OutgoingBody::Bytes(bytes) => bytes,
-            _ => panic!("the test built an in-memory body"),
-        }
-    }
-
-    #[test]
-    fn a_bodiless_status_has_no_content_even_for_a_get() {
-        for status in [204, 304] {
-            let response = prepare_wire_response(
-                false,
-                status,
-                headers(&[("x-keep", "me")]),
-                OutgoingBody::Bytes(bytes::Bytes::from_static(b"ignored")),
-            );
-            assert!(content(&response).is_empty(), "{status}");
-            assert_eq!(response.declared_length, None, "{status}");
-            assert_eq!(names(&response), ["x-keep"], "{status}");
-        }
-    }
-
-    #[test]
-    fn a_head_request_declares_the_length_it_would_have_sent() {
-        let response = prepare_wire_response(
-            true,
-            200,
-            Vec::new(),
-            OutgoingBody::Bytes(bytes::Bytes::from_static(b"BODYBYTES")),
-        );
-        assert!(content(&response).is_empty());
-        assert_eq!(response.declared_length, Some(9));
-    }
-
-    #[test]
-    fn a_head_request_declares_no_length_it_would_have_to_produce() {
-        // A streamed body's length is only knowable by generating the content.
-        let (_sender, streamed) = platform::http::body_channel();
-        let response = prepare_wire_response(true, 200, Vec::new(), streamed);
-        assert!(content(&response).is_empty());
-        assert_eq!(response.declared_length, None);
-    }
-
-    /// A streamed body has no length until it is produced, so the handler's declaration is the
-    /// only thing that can frame it. The transport then enforces it against the body.
-    #[test]
-    fn a_streamed_body_takes_the_declared_length() {
-        let (_sender, streamed) = platform::http::body_channel();
-        let response =
-            prepare_wire_response(false, 200, headers(&[("content-length", "42")]), streamed);
-        assert_eq!(response.declared_length, Some(42));
-        assert_eq!(names(&response), Vec::<String>::new());
-    }
-
-    /// Content already in memory is measured. A declaration that disagrees with it would frame the
-    /// response as something other than what it sends.
-    #[test]
-    fn an_in_memory_body_is_measured_not_declared() {
-        let response = prepare_wire_response(
-            false,
-            200,
-            headers(&[("content-length", "10000")]),
-            OutgoingBody::Bytes(bytes::Bytes::from_static(b"short")),
-        );
-        assert_eq!(response.declared_length, Some(5));
-        assert_eq!(content(&response), b"short");
-    }
-
-    /// Only an unambiguous `1*DIGIT` frames a response. A `Headers` object joins repeated fields
-    /// into one comma-separated value, which lands here as a value that is not a number.
-    #[test]
-    fn a_declared_length_that_is_not_one_number_is_refused() {
-        for value in ["", "x", "10000, 10000", " 5", "+5", "5.0", "0x5", "-1"] {
-            let (_sender, streamed) = platform::http::body_channel();
-            let response =
-                prepare_wire_response(false, 200, headers(&[("content-length", value)]), streamed);
-            assert_eq!(response.declared_length, None, "{value:?}");
-        }
-    }
-
-    /// RFC 9110 §9.3.2: a `HEAD` may report the length its `GET` would have had.
-    #[test]
-    fn a_head_declares_the_length_it_was_given() {
-        let response = prepare_wire_response(
-            true,
-            200,
-            headers(&[("content-length", "12345")]),
-            OutgoingBody::Bytes(bytes::Bytes::new()),
-        );
-        assert!(content(&response).is_empty());
-        assert_eq!(response.declared_length, Some(12345));
-    }
-
-    /// The status still outranks the declaration, so nothing frames a response that has no
-    /// content.
-    #[test]
-    fn a_bodiless_status_ignores_a_declared_length() {
-        let (_sender, streamed) = platform::http::body_channel();
-        let response =
-            prepare_wire_response(false, 204, headers(&[("content-length", "42")]), streamed);
-        assert_eq!(response.declared_length, None);
-    }
-
-    #[test]
-    fn an_in_memory_body_declares_its_length() {
-        let response = prepare_wire_response(
-            false,
-            200,
-            Vec::new(),
-            OutgoingBody::Bytes(bytes::Bytes::from_static(b"BODYBYTES")),
-        );
-        assert_eq!(content(&response), b"BODYBYTES");
-        assert_eq!(response.declared_length, Some(9));
-    }
-
-    #[test]
-    fn a_bodiless_status_outranks_the_method() {
-        let response = prepare_wire_response(
-            true,
-            204,
-            Vec::new(),
-            OutgoingBody::Bytes(bytes::Bytes::from_static(b"ignored")),
-        );
-        assert!(content(&response).is_empty());
-        assert_eq!(response.declared_length, None);
     }
 }

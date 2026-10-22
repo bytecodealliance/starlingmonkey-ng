@@ -8,10 +8,6 @@
 //! instance's future. [`record_snapshot_reading`] captures the clock as the snapshot is made and
 //! [`resume_from_snapshot`] adds that reading to every reading afterwards, so a resumed instance
 //! continues the timeline the snapshot ended on instead of restarting it.
-//!
-//! SpiderMonkey keeps the same kind of state (GC phase timestamps, the last collection's end) and
-//! reads its own copy of the same host clock, so an embedder passes the value
-//! [`resume_from_snapshot`] returns on to the engine as well.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -86,7 +82,7 @@ pub fn coarse_monotonic_ns() -> u64 {
 
 /// Record where the clock stood as a snapshot was made.
 ///
-/// Must be the last thing an instance being wizened does, since a reading taken afterwards
+/// An instance being wizened must call this last, since a reading taken afterwards
 /// would sit past the recorded one and so still be in a resumed instance's future.
 pub fn record_snapshot_reading() {
     SNAPSHOT_NS.store(host_monotonic_ns(), Ordering::Relaxed);
@@ -114,8 +110,7 @@ pub async fn sleep(duration: std::time::Duration) {
 ///
 /// `std::time::Instant` reads the host clock directly, so a deadline taken before a snapshot sits
 /// in the resumed instance's future by however long the wizened instance ran. This reads
-/// [`monotonic_ns`] instead, whose offset makes a resumed instance continue the timeline the
-/// snapshot ended on, so such a deadline is already past when the instance resumes.
+/// [`monotonic_ns`] instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 

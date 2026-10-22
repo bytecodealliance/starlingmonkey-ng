@@ -5,6 +5,10 @@
 //!
 //! This is useful for APIs like `atob`, `self`, etc.
 
+// `showcase` covers what this example shows, so `cargo test --examples` builds it as an empty
+// test harness.
+#![cfg(not(test))]
+
 use js::compile::evaluate_with_filename;
 use js::prelude::FromJSVal;
 use libstarling::config::RuntimeConfig;
@@ -151,9 +155,4 @@ fn main() {
     println!("  PASSED: sumAll(1, 2, 3, 4) = 10, sumAll() = 0");
 
     println!("\nAll jsglobals tests passed!");
-}
-
-#[test]
-fn globals_example() {
-    main()
 }

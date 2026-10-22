@@ -11,6 +11,8 @@ pub mod byte_stream_controller;
 pub mod default_controller;
 pub mod default_reader;
 pub mod enums;
+pub mod native_byte_source;
+pub mod native_pump;
 pub mod native_read;
 pub mod options;
 pub mod read_all_bytes;

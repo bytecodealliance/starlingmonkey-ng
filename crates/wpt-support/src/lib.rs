@@ -14,15 +14,7 @@ use js::native::{Handle, RawJSContext};
 use js::prelude::FromJSVal;
 use js::Object;
 
-/// Install WPT-specific globals on the given global object.
-///
-/// Currently installs:
-/// - `evalScript(source)` — evaluate a script in non-syntactic scope
-/// - `__setLocation(url)` — configure the URL backing `globalThis.location`
-///
-/// # Safety
-///
-/// Must be called with a valid scope and global object.
+/// Install `evalScript`, `__setLocation` and `__wptDone` on `global`.
 pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     js::Function::define(
         scope,
@@ -59,8 +51,7 @@ pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
 /// top-level `let`/`const` bindings visible to subsequent calls. This is
 /// how the WPT harness loads `META: script=...` dependencies.
 ///
-/// `url` names the script in stack traces and error messages; it is what tells
-/// a failure in a META dependency apart from one in the test itself.
+/// `url` names the script in stack traces and error messages.
 unsafe extern "C" fn eval_script_native(
     raw_cx: *mut RawJSContext,
     argc: u32,
@@ -80,11 +71,8 @@ unsafe extern "C" fn eval_script_native(
             Err(_) => return false,
         };
 
-    // The harness passes the script's URL; fall back to the function's own name when it is absent
-    // (a hand-written `evalScript(source)` call). The argument count is what says "absent": the
-    // conversion is WebIDL's DOMString one, which turns a missing argument into the *string*
-    // "undefined" rather than failing, and traces attributed to a script called "undefined" read
-    // as corrupted rather than as an eval'd script.
+    // Without a `url` argument, the script is named after the function. This checks the argument
+    // count because the DOMString conversion turns a missing argument into the string "undefined".
     let filename = if argc >= 2 {
         match String::from_jsval(&scope, Handle::from_raw(args.get(1)), ()) {
             Ok(filename) => filename,
@@ -101,7 +89,7 @@ unsafe extern "C" fn eval_script_native(
             true
         }
         Err(_) => {
-            println!("Eval failed");
+            eprintln!("Eval failed");
             false
         }
     }

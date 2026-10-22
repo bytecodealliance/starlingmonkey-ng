@@ -5,11 +5,8 @@
 //!
 //! Builtins call the backend-agnostic APIs here; each capability holds its
 //! platform-agnostic parts in one module and its backends in `<capability>_native`
-//! / `<capability>_wasm` modules, selected with `#[cfg(target_arch)]`. The first
-//! capability is HTTP ([`http`]), used by `fetch`: native uses an async HTTP
-//! client, wasm uses the WASIp3 outgoing-handler. The other is the monotonic
-//! clock ([`clock`]). Future host capabilities (sockets, filesystem, …) follow
-//! the same shape.
+//! / `<capability>_wasm` modules, selected with `#[cfg(target_arch)]`. The capabilities
+//! are HTTP ([`http`]), used by `fetch`, and the monotonic clock ([`clock`]).
 
 pub mod clock;
 pub mod http;

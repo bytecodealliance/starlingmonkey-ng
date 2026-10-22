@@ -2505,14 +2505,22 @@ fn byte_tee_default_microtask(
     // If _canceled1_ is false, perform ! `ReadableByteStreamControllerEnqueue`(branch1, chunk1).
     if !canceled1 {
         let b1 = byte_tee_branch_controller(scope, state, false);
-        readable_byte_stream_controller_enqueue(scope, &b1, byte_tee_view(scope, chunk))
-            .expect(BYTE_TEE_ENQUEUE_INFALLIBLE);
+        readable_byte_stream_controller_enqueue(
+            scope,
+            &b1,
+            EnqueueChunk::View(byte_tee_view(scope, chunk)),
+        )
+        .expect(BYTE_TEE_ENQUEUE_INFALLIBLE);
     }
     // If _canceled2_ is false, perform ! `ReadableByteStreamControllerEnqueue`(branch2, chunk2).
     if !canceled2 {
         let b2 = byte_tee_branch_controller(scope, state, true);
-        readable_byte_stream_controller_enqueue(scope, &b2, byte_tee_view(scope, chunk2))
-            .expect(BYTE_TEE_ENQUEUE_INFALLIBLE);
+        readable_byte_stream_controller_enqueue(
+            scope,
+            &b2,
+            EnqueueChunk::View(byte_tee_view(scope, chunk2)),
+        )
+        .expect(BYTE_TEE_ENQUEUE_INFALLIBLE);
     }
     state.data_mut().reading = false;
     if state.data().read_again_for_branch1 {
@@ -2631,7 +2639,7 @@ fn byte_tee_byob_microtask(
                 readable_byte_stream_controller_enqueue(
                     scope,
                     &oc,
-                    byte_tee_view(scope, cloned_chunk),
+                    EnqueueChunk::View(byte_tee_view(scope, cloned_chunk)),
                 )
                 .expect(BYTE_TEE_ENQUEUE_INFALLIBLE);
             }
@@ -3960,12 +3968,40 @@ fn readable_byte_stream_controller_convert_pull_into_descriptor<'r>(
     )
 }
 
+/// The chunk passed to [`readable_byte_stream_controller_enqueue`].
+#[derive(Clone, Copy)]
+pub(crate) enum EnqueueChunk<'v, 's> {
+    /// A view that JavaScript can hold. Its buffer is transferred.
+    View(js::ArrayBufferView<'v>),
+    /// A buffer created by [`ReadableByteStreamController::enqueue_bytes`], which no JavaScript
+    /// has seen. It is queued without being transferred.
+    Owned(js::ArrayBuffer<'s>),
+}
+
+impl EnqueueChunk<'_, '_> {
+    /// The chunk's length in bytes.
+    pub(crate) fn byte_length(&self) -> usize {
+        match self {
+            EnqueueChunk::View(view) => view.byte_length(),
+            EnqueueChunk::Owned(buffer) => buffer.byte_length(),
+        }
+    }
+
+    /// The length in bytes of the buffer holding the chunk.
+    pub(crate) fn buffer_byte_length(&self, scope: &Scope<'_>) -> Result<usize, ExnThrown> {
+        match self {
+            EnqueueChunk::View(view) => Ok(view.viewed_buffer(scope)?.byte_length()),
+            EnqueueChunk::Owned(buffer) => Ok(buffer.byte_length()),
+        }
+    }
+}
+
 /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-enqueue>
 /// ByteStreamControllerEnqueue(controller, chunk) performs the following steps:
-pub(crate) fn readable_byte_stream_controller_enqueue(
-    scope: &Scope<'_>,
+pub(crate) fn readable_byte_stream_controller_enqueue<'s>(
+    scope: &'s Scope<'_>,
     controller: &ReadableByteStreamController<'_>,
-    chunk: js::ArrayBufferView<'_>,
+    chunk: EnqueueChunk<'_, 's>,
 ) -> Result<(), ExnThrown> {
     // Step 1: Let _stream_ be _controller_.`[[stream]]`.
     let stream = controller.stream(scope);
@@ -3974,21 +4010,28 @@ pub(crate) fn readable_byte_stream_controller_enqueue(
     if controller.data().close_requested || stream.data().state != ReadableStreamState::Readable {
         return Ok(());
     }
-    // Step 3: Let _buffer_ be _chunk_.[[ViewedArrayBuffer]].
-    let buffer = chunk.viewed_buffer(scope)?;
-    // Step 4: Let _byteOffset_ be _chunk_.[[ByteOffset]].
-    let byte_offset = chunk.byte_offset();
-    // Step 5: Let _byteLength_ be _chunk_.[[ByteLength]].
-    let byte_length = chunk.byte_length();
-    // Step 6: If ! `IsDetachedBuffer`(_buffer_) is true, throw a ``TypeError`` exception.
-    if buffer.is_detached() {
-        return Err(js::error::throw_type_error(
-            scope,
-            c"enqueue() view's buffer is detached",
-        ));
-    }
-    // Step 7: Let _transferredBuffer_ be ? `TransferArrayBuffer`(_buffer_).
-    let transferred_buffer = buffer.transfer(scope)?;
+    let (transferred_buffer, byte_offset, byte_length) = match chunk {
+        EnqueueChunk::View(chunk) => {
+            // Step 3: Let _buffer_ be _chunk_.[[ViewedArrayBuffer]].
+            let buffer = chunk.viewed_buffer(scope)?;
+            // Step 4: Let _byteOffset_ be _chunk_.[[ByteOffset]].
+            let byte_offset = chunk.byte_offset();
+            // Step 5: Let _byteLength_ be _chunk_.[[ByteLength]].
+            let byte_length = chunk.byte_length();
+            // Step 6: If ! `IsDetachedBuffer`(_buffer_) is true, throw a ``TypeError`` exception.
+            if buffer.is_detached() {
+                return Err(js::error::throw_type_error(
+                    scope,
+                    c"enqueue() view's buffer is detached",
+                ));
+            }
+            // Step 7: Let _transferredBuffer_ be ? `TransferArrayBuffer`(_buffer_).
+            (buffer.transfer(scope)?, byte_offset, byte_length)
+        }
+        // Step 7 transfers the buffer, which JavaScript holds, so that it can't change the queued
+        // bytes. No JavaScript holds an owned buffer, so it is queued whole without a transfer.
+        EnqueueChunk::Owned(buffer) => (buffer, 0, buffer.byte_length()),
+    };
     // Step 8: If _controller_.`[[pendingPullIntos]]` is not `empty`, Let _firstPendingPullInto_ be
     //         _controller_.`[[pendingPullIntos]]`[0]. If !
     //         `IsDetachedBuffer`(_firstPendingPullInto_’s `buffer`) is true, throw a

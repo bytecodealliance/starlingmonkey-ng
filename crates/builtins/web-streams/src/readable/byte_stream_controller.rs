@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 
 use crate::readable::ReadableStream;
 
+use super::algorithms::EnqueueChunk;
 use super::byob_request::ReadableStreamBYOBRequest;
 use super::byob_request::ReadableStreamBYOBRequestImpl;
 use super::readable_stream::ReadableStreamImpl;
@@ -212,8 +213,43 @@ impl ReadableByteStreamController {
         scope: &Scope<'_>,
         view: js::ArrayBufferView<'_>,
     ) -> Result<(), ExnThrown> {
+        self.enqueue_chunk(scope, EnqueueChunk::View(view))
+    }
+
+    /// <https://streams.spec.whatwg.org/#rbs-controller-error>
+    #[method]
+    pub fn error(&self, scope: &Scope<'_>, e: Option<HandleValue<'_>>) -> Result<(), ExnThrown> {
+        // Step 1: Perform ! `ByteStreamControllerError`(`this`, _e_).
+        let e = e.unwrap_or(HandleValue::undefined());
+        super::algorithms::readable_byte_stream_controller_error(scope, self, e);
+        Ok(())
+    }
+
+    pub(crate) fn stream<'r>(&self, scope: &'r Scope<'_>) -> ReadableStream<'r> {
+        self.data().stream.get(scope)
+    }
+}
+
+impl ReadableByteStreamController<'_> {
+    /// Enqueue `bytes` as a chunk, as [`enqueue`](Self::enqueue) does for a `Uint8Array` holding
+    /// them. The chunk's buffer is created from `bytes`, without copying where possible (see
+    /// [`js::ArrayBuffer::from_external`]). No JavaScript has seen it, so it is queued without
+    /// being transferred. Throws a `TypeError` in the cases in which `enqueue` throws one: for
+    /// empty `bytes`, after `close()`, and if the stream isn't readable.
+    pub fn enqueue_bytes(&self, scope: &Scope<'_>, bytes: Vec<u8>) -> Result<(), ExnThrown> {
+        let buffer = js::ArrayBuffer::from_external(scope, bytes)?;
+        self.enqueue_chunk(scope, EnqueueChunk::Owned(buffer))
+    }
+
+    /// The steps of [`enqueue`](Self::enqueue), for a chunk from JavaScript or from
+    /// [`enqueue_bytes`](Self::enqueue_bytes).
+    fn enqueue_chunk<'s>(
+        &self,
+        scope: &'s Scope<'_>,
+        chunk: EnqueueChunk<'_, 's>,
+    ) -> Result<(), ExnThrown> {
         // Step 1: If _chunk_.[[ByteLength]] is 0, throw a ``TypeError`` exception.
-        if view.byte_length() == 0 {
+        if chunk.byte_length() == 0 {
             return Err(js::error::throw_type_error(
                 scope,
                 c"enqueue() view has a byte length of 0",
@@ -221,7 +257,7 @@ impl ReadableByteStreamController {
         }
         // Step 2: If _chunk_.[[ViewedArrayBuffer]].[[ByteLength]] is 0, throw a ``TypeError``
         //         exception.
-        if view.viewed_buffer(scope)?.byte_length() == 0 {
+        if chunk.buffer_byte_length(scope)? == 0 {
             return Err(js::error::throw_type_error(
                 scope,
                 c"enqueue() view's buffer has a byte length of 0",
@@ -244,19 +280,6 @@ impl ReadableByteStreamController {
             ));
         }
         // Step 5: Return ? `ByteStreamControllerEnqueue`(`this`, _chunk_).
-        super::algorithms::readable_byte_stream_controller_enqueue(scope, self, view)
-    }
-
-    /// <https://streams.spec.whatwg.org/#rbs-controller-error>
-    #[method]
-    pub fn error(&self, scope: &Scope<'_>, e: Option<HandleValue<'_>>) -> Result<(), ExnThrown> {
-        // Step 1: Perform ! `ByteStreamControllerError`(`this`, _e_).
-        let e = e.unwrap_or(HandleValue::undefined());
-        super::algorithms::readable_byte_stream_controller_error(scope, self, e);
-        Ok(())
-    }
-
-    pub(crate) fn stream<'r>(&self, scope: &'r Scope<'_>) -> ReadableStream<'r> {
-        self.data().stream.get(scope)
+        super::algorithms::readable_byte_stream_controller_enqueue(scope, self, chunk)
     }
 }
