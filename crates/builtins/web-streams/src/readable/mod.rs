@@ -19,7 +19,6 @@ pub mod readable_stream;
 pub mod underlying_source;
 pub(crate) mod unions;
 
-pub use async_iterator::ReadableStreamAsyncIterator as AsyncIterator;
 pub use byob_reader::BYOBReader;
 pub use byob_request::ReadableStreamBYOBRequest;
 pub use byte_stream_controller::ReadableByteStreamController;

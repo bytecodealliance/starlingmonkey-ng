@@ -70,9 +70,7 @@ pub mod globals {
             // Step 4.2: Return _p_.
             return Ok(p);
         }
-        let abort_state = Some(crate::abort::register_fetch_abort(
-            scope, signal, p, request,
-        )?);
+        let abort_state = crate::abort::register_fetch_abort(scope, signal, p, request)?;
 
         // Step 5: Let _globalObject_ be _request_’s `client`’s `global object`.
         // Step 6: If _globalObject_ is a `ServiceWorkerGlobalScope` object, then set _request_’s
@@ -114,9 +112,7 @@ pub mod globals {
             // object, given _response_, "`immutable`", and _relevantRealm_ — done by `scheme
             // fetch`'s "`data`" arm — then `Resolve` _p_ with _responseObject_.
             crate::algorithms::FetchOutcome::Response(response_object) => {
-                if let Some(state) = &abort_state {
-                    state.deliver(scope, &response_object);
-                }
+                abort_state.deliver(scope, &response_object);
                 p.resolve(scope, response_object)?;
                 return Ok(p);
             }
@@ -124,9 +120,7 @@ pub mod globals {
             // `TypeError` and abort these steps. Throw one to set the pending exception, then
             // take it as the rejection value.
             crate::algorithms::FetchOutcome::NetworkError => {
-                if let Some(state) = &abort_state {
-                    state.detach(scope);
-                }
+                abort_state.detach(scope);
                 throw_type_error(scope, c"Failed to fetch");
                 p.reject_with_pending(scope)?;
                 return Ok(p);
@@ -142,17 +136,17 @@ pub mod globals {
         // error`, rejecting _p_ with a `TypeError`.
         let platform_request = request.platform_request(scope);
         let url = request.current_url();
-        let redirect_mode = request.redirect_mode();
-        let mode = request.request_mode();
+        let redirect_mode = request.redirect();
+        let mode = request.mode();
         // The request's `origin` is "`client`", i.e. the requester's own origin, which is the
-        // worker location's, when one is set. It feeds `main fetch`'s origin/mode switch in
+        // worker location's origin when one is set. It feeds `main fetch`'s origin/mode switch in
         // `send_following_redirects`.
         let request_origin =
             web_globals::worker_location::current_location_url().map(|url| url.origin());
         let method = platform_request.method.clone();
         // Root the abort state across the host fetch, so the resolve callback can
         // deliver the response to it, or detach it if the response fails.
-        let abort_state = abort_state.map(RootedHeap::new);
+        let abort_state = RootedHeap::new(abort_state);
         let future = async move {
             match crate::transport::send_following_redirects(
                 platform_request,
@@ -173,20 +167,18 @@ pub mod globals {
                             redirect_mode,
                             tainting,
                         );
-                        if let Some(state) = &abort_state {
-                            match &response {
-                                Ok(response) => state.get(scope).deliver(scope, response),
-                                Err(_) => {
-                                    // Detaching runs with no exception pending.
-                                    let error = js::exception::take_pending(scope);
-                                    state.get(scope).detach(scope);
-                                    if let Some(error) = error {
-                                        js::exception::set_pending(
-                                            scope,
-                                            error,
-                                            js::native::ExceptionStackBehavior::DoNotCapture,
-                                        );
-                                    }
+                        match &response {
+                            Ok(response) => abort_state.get(scope).deliver(scope, response),
+                            Err(_) => {
+                                // Detaching runs with no exception pending.
+                                let error = js::exception::take_pending(scope);
+                                abort_state.get(scope).detach(scope);
+                                if let Some(error) = error {
+                                    js::exception::set_pending(
+                                        scope,
+                                        error,
+                                        js::native::ExceptionStackBehavior::DoNotCapture,
+                                    );
                                 }
                             }
                         }
@@ -194,9 +186,7 @@ pub mod globals {
                     }))
                 }
                 Err(error) => PromiseOutcome::Resolve(Box::new(move |scope: &Scope<'_>| {
-                    if let Some(state) = &abort_state {
-                        state.get(scope).detach(scope);
-                    }
+                    abort_state.get(scope).detach(scope);
                     Err(TypeError(format!("Failed to fetch: {error}")).throw(scope))
                 })),
             }

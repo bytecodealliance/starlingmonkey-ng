@@ -234,7 +234,7 @@ fn request_init_if_not_empty(init: Option<RequestInit>) -> Option<RequestInit> {
 #[webidl_interface]
 pub struct Request {
     /// <https://fetch.spec.whatwg.org/#concept-request-request>
-    /// Note: The header list lives in `headers` and the body in `body`/`body_stream`.
+    /// Note: The header list lives in `headers` and the body in `body`.
     #[no_trace]
     request: RequestRecord,
     /// <https://fetch.spec.whatwg.org/#concept-request-body>, with its stream and host body.
@@ -260,7 +260,7 @@ pub type RequestInputAdapter =
     for<'s> fn(&'s Scope<'_>, HandleValue<'_>) -> Result<Option<Request<'s>>, ExnThrown>;
 
 js::instance_local! {
-    /// The adapter [`register_request_input_adapter`] registered.
+    /// The adapter registered by [`register_request_input_adapter`].
     static REQUEST_INPUT_ADAPTER: std::cell::Cell<Option<RequestInputAdapter>> =
         const { std::cell::Cell::new(None) };
 }
@@ -565,11 +565,8 @@ impl Request {
             // Step 33.4: If _headers_ is a `Headers` object, then `for each` _header_ of its
             //     `header list`, `append` _header_ to `this`’s `headers`.
             // Step 33.5: Otherwise, `fill` `this`’s `headers` with _headers_.
-            // (Filling from _init_["`headers`"] is user input and goes through the fully
-            // validating `fill`. Without it, steps 33.1/33.3/33.4 amount to re-filtering the
-            // headers' own former list — already validated and normalized, so it needs only the
-            // guard's policy filtering, which is skipped entirely when request restrictions are
-            // off; see `refill_headers_from_own_list`.)
+            // Without _init_["`headers`"], `refill_headers_from_own_list` runs steps 33.1, 33.3
+            // and 33.4.
             match init.headers.take() {
                 Some(init_headers) => {
                     headers.data_mut().header_list.clear();
@@ -710,9 +707,7 @@ impl Request {
             // bytes, so the input's own handle on them holds the buffer for a body it can no
             // longer read.
             let _ = input_request.take_byte_source();
-            if let Some(body) = input_request.data_mut().body.record.as_mut() {
-                body.source_disturbed = true;
-            }
+            input_request.set_source_disturbed();
         }
         Ok(())
     }
@@ -760,7 +755,7 @@ impl Request {
 
     /// <https://fetch.spec.whatwg.org/#dom-request-method>
     #[getter]
-    fn method(&self) -> Ref<'_, str> {
+    pub(crate) fn method(&self) -> Ref<'_, str> {
         // Step 1: Return `this`’s `request`’s `method`.
         Ref::map(self.data(), |data| data.request.method.as_str())
     }
@@ -809,7 +804,7 @@ impl Request {
 
     /// <https://fetch.spec.whatwg.org/#dom-request-mode>
     #[getter]
-    fn mode(&self) -> RequestMode {
+    pub(crate) fn mode(&self) -> RequestMode {
         // Step 1: Return `this`’s `request`’s `mode`.
         self.data().request.mode
     }
@@ -830,7 +825,7 @@ impl Request {
 
     /// <https://fetch.spec.whatwg.org/#dom-request-redirect>
     #[getter]
-    fn redirect(&self) -> RequestRedirect {
+    pub(crate) fn redirect(&self) -> RequestRedirect {
         // Step 1: Return `this`’s `request`’s `redirect mode`.
         self.data().request.redirect_mode
     }
@@ -925,9 +920,8 @@ impl Request {
         //     and `guard` is _guard_.
         let (header_list, guard) = {
             let headers = self.data().headers.get(scope);
-            let header_list = headers.data().header_list.clone();
             let guard = headers.data().guard;
-            (header_list, guard)
+            (headers.list(), guard)
         };
         let cloned_headers = Headers::from_list(scope, header_list, guard)?;
         // [inlined create a Request object] Steps 1, 2, 4: Let _requestObject_ be a `new`
@@ -1055,21 +1049,6 @@ impl Request<'_> {
     /// The request's current URL.
     pub(crate) fn current_url(&self) -> Url {
         self.data().request.current_url().clone()
-    }
-
-    /// The request's method (e.g. `"GET"`, `"HEAD"`).
-    pub(crate) fn http_method(&self) -> String {
-        self.data().request.method.clone()
-    }
-
-    /// The request's redirect mode.
-    pub(crate) fn redirect_mode(&self) -> RequestRedirect {
-        self.data().request.redirect_mode
-    }
-
-    /// The request's mode (the concept-record field, distinct from the JS `mode` getter).
-    pub(crate) fn request_mode(&self) -> RequestMode {
-        self.data().request.mode
     }
 }
 

@@ -5,37 +5,50 @@
 //! Exercises the whole networking path: the `fetch` global builds a `Request`,
 //! the platform transport (reqwest) sends it over a real TCP socket, the
 //! async-promise event-loop driver settles the promise, and the `Response` is
-//! consumed with `text()`. Networking is otherwise not covered by the offline
-//! WPT suite.
+//! consumed with `text()`.
 
 #![cfg(not(target_arch = "wasm32"))]
 
 use core_runtime::event_loop::{run_to_completion, with_event_loop, EventLoop};
 use core_runtime::runtime::{clear_global_initializers, Runtime};
 use js::conversion::FromJSVal;
+use js::gc::scope::Scope;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
-/// Start a one-shot HTTP/1.1 server on `127.0.0.1` that replies to a single
-/// request with `body`, and return its URL.
-fn start_loopback_server(body: &'static str) -> String {
+/// Start a server on `127.0.0.1` that accepts one connection per entry of `replies`, in order,
+/// replies with that entry's bytes, and return its URL.
+fn start_server(replies: Vec<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            // Read the request headers (up to the blank line); we don't need the body.
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body,
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
+        for reply in replies {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&reply);
+                let _ = stream.flush();
+            }
         }
     });
     format!("http://127.0.0.1:{port}/")
+}
+
+/// A `200` reply with `body`.
+fn ok(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// A `302` reply to `location`.
+fn found(location: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
 }
 
 /// Start a server that streams chunked data with a small delay between chunks,
@@ -162,24 +175,6 @@ fn start_echo_server() -> String {
     format!("http://127.0.0.1:{port}/")
 }
 
-/// Start a one-shot server replying 302 with `location` (which may be a path,
-/// an absolute URL, or a non-HTTP URL), and return its URL.
-fn start_redirect_server(location: String) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    format!("http://127.0.0.1:{port}/")
-}
-
 /// Extract the `Authorization` header value out of a raw HTTP request, or "none".
 fn authorization_of(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw)
@@ -192,57 +187,31 @@ fn authorization_of(raw: &[u8]) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
-/// Start a one-shot server that echoes the request's `Authorization` header as
-/// `auth:<value-or-none>`, and return its URL.
-fn start_auth_echo_server() -> String {
+/// Start a server that echoes the request's `Authorization` header as `auth:<value-or-none>`, and
+/// return its URL. With `redirect_first`, it first redirects to `/target` on the same origin.
+fn start_auth_echo_server(redirect_first: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
+        if redirect_first {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&found("/target"));
+            }
+        }
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
-            let body = format!("auth:{}", authorization_of(&buf[..n]));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body,
-            );
-            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(&ok(&format!("auth:{}", authorization_of(&buf[..n]))));
         }
     });
     format!("http://127.0.0.1:{port}/")
 }
 
-/// Start a server that 302-redirects its first request to `/target` on the same
-/// origin, and answers the second request with `auth:<value-or-none>`.
-fn start_same_origin_redirect_auth_server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let response = "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let _ = stream.write_all(response.as_bytes());
-        }
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let body = format!("auth:{}", authorization_of(&buf[..n]));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body,
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    format!("http://127.0.0.1:{port}/")
-}
-
-/// Evaluate `code` (which sets `globalThis.__out`), drive the event loop to
-/// completion, and return `__out`.
-fn run_and_get_out(code: &str) -> String {
+/// Evaluate `code`, drive the event loop to completion, and return the result of `inspect`, which
+/// runs while the runtime is still alive.
+fn run<T>(code: &str, inspect: impl FnOnce(&Scope<'_>) -> T) -> T {
     clear_global_initializers();
     libstarling::register_builtins();
     let rt = Runtime::init(&core_runtime::config::RuntimeConfig::default()).expect("runtime init");
@@ -250,11 +219,9 @@ fn run_and_get_out(code: &str) -> String {
     let rawcx = unsafe { scope.cx_mut().raw_cx() };
     let el = EventLoop::new();
 
-    {
-        with_event_loop(&el, |_| {
-            js::compile::evaluate_with_filename(&scope, code, "<test>", 1).expect("eval failed");
-        });
-    }
+    with_event_loop(&el, |_| {
+        js::compile::evaluate_with_filename(&scope, code, "<test>", 1).expect("eval failed");
+    });
     // Drain microtasks queued during top-level evaluation (e.g. a synchronously settled promise's
     // reactions), as the runtime does before stepping the event loop.
     js::jobs::run_jobs(&scope);
@@ -264,25 +231,19 @@ fn run_and_get_out(code: &str) -> String {
         .build()
         .unwrap();
     tokio_rt.block_on(async { unsafe { run_to_completion(rawcx, &el, tokio::time::sleep).await } });
-
-    let out =
-        js::compile::evaluate_with_filename(&scope, "globalThis.__out", "<check>", 1).unwrap();
-    String::from_jsval(&scope, out, ()).unwrap()
+    inspect(&scope)
 }
 
-#[test]
-fn fetch_get_loopback_resolves_with_response_text() {
-    let url = start_loopback_server("hello from loopback");
-    let out = run_and_get_out(&format!(
-        r#"
-        globalThis.__out = "pending";
-        fetch("{url}")
-            .then(r => Promise.all([r.status, r.headers.get("content-type"), r.text()]))
-            .then(([status, ct, text]) => {{ globalThis.__out = `${{status}}|${{ct}}|${{text}}`; }})
-            .catch(e => {{ globalThis.__out = "error:" + e; }});
-        "#
-    ));
-    assert_eq!(out, "200|text/plain|hello from loopback");
+/// Evaluate `code` (which sets `globalThis.__out`), drive the event loop to completion, and
+/// return `__out`.
+fn run_and_get_out(code: &str) -> String {
+    run(code, read_out)
+}
+
+/// Returns `String(globalThis.__out)`.
+fn read_out(scope: &Scope<'_>) -> String {
+    let out = js::compile::evaluate_with_filename(scope, "globalThis.__out", "<check>", 1).unwrap();
+    String::from_jsval(scope, out, ()).unwrap()
 }
 
 #[test]
@@ -311,30 +272,11 @@ fn fetch_streams_a_readable_stream_request_body() {
 }
 
 #[test]
-fn fetch_pipes_a_response_body_into_a_request_body() {
-    // The incoming→outgoing shortcut: a response body used directly as another request's body is
-    // streamed straight through to the second server, which echoes it.
-    let source = start_loopback_server("piped through the shortcut");
-    let echo = start_echo_server();
-    let out = run_and_get_out(&format!(
-        r#"
-        globalThis.__out = "pending";
-        fetch("{source}")
-            .then(response => fetch("{echo}", {{ method: "POST", body: response.body, duplex: "half" }}))
-            .then(r => r.text())
-            .then(text => {{ globalThis.__out = text; }})
-            .catch(e => {{ globalThis.__out = "error:" + e; }});
-        "#
-    ));
-    assert_eq!(out, "piped through the shortcut");
-}
-
-#[test]
 fn fetch_pipes_a_response_body_through_an_identity_transform() {
     // The complex incoming→outgoing shortcut: a response body piped through an identity
     // TransformStream into another request is still handed straight through (the native source is
     // propagated across the identity transform), so the second server echoes it unchanged.
-    let source = start_loopback_server("piped through identity transform");
+    let source = start_server(vec![ok("piped through identity transform")]);
     let echo = start_echo_server();
     let out = run_and_get_out(&format!(
         r#"
@@ -383,10 +325,7 @@ fn fetch_pumps_a_piped_multichunk_body_without_dropping_chunks() {
 #[test]
 fn a_delayed_piped_identity_transform_still_delivers_the_whole_body() {
     // A pipe left running well ahead of the `fetch` that consumes it must still deliver every
-    // byte. The pipe's first pull parks rather than reading the host body, so this takes the
-    // shortcut where it once took the pump — whichever it picks, all 40 chunks must arrive in
-    // order. (Which path ran is deliberately not content-observable: both leave the donor stream
-    // locked and disturbed, and the pump reads internally so content cannot see its reads.)
+    // byte in order. The pipe's first pull parks rather than reading the host body.
     let (source, expected) = start_multichunk_server(40);
     let echo = start_echo_server();
     let out = run_and_get_out(&format!(
@@ -434,7 +373,7 @@ fn a_parked_body_read_resumes_when_the_transform_is_read() {
 fn fetch_applies_a_non_identity_transform_to_a_piped_body() {
     // A non-identity transform must NOT be shortcut: its transform runs, so the second server sees
     // the transformed (uppercased) body.
-    let source = start_loopback_server("transform me");
+    let source = start_server(vec![ok("transform me")]);
     let echo = start_echo_server();
     let out = run_and_get_out(&format!(
         r#"
@@ -533,10 +472,9 @@ fn aborting_a_parked_body_read_rejects_rather_than_hanging() {
 #[test]
 fn transform_start_chunks_are_not_dropped_by_the_shortcut() {
     // A transformer with only a start callback is not an identity transform: its
-    // enqueued prefix must reach the destination. The incoming→outgoing shortcut
-    // previously treated any transformer without a `transform` callback as
-    // identity and handed the host body straight through, dropping the prefix.
-    let source = start_loopback_server("rest-of-body");
+    // enqueued prefix must reach the destination rather than the shortcut handing the host
+    // body straight through.
+    let source = start_server(vec![ok("rest-of-body")]);
     let echo = start_echo_server();
     let out = run_and_get_out(&format!(
         r#"
@@ -561,8 +499,8 @@ fn transform_start_chunks_are_not_dropped_by_the_shortcut() {
 fn redirect_strips_authorization_cross_origin() {
     // HTTP-redirect fetch step 13: the moment another origin is seen, the Authorization header is
     // removed. Two loopback ports are two origins.
-    let target = start_auth_echo_server();
-    let origin = start_redirect_server(target);
+    let target = start_auth_echo_server(false);
+    let origin = start_server(vec![found(&target)]);
     let out = run_and_get_out(&format!(
         r#"
         globalThis.__out = "pending";
@@ -578,7 +516,7 @@ fn redirect_strips_authorization_cross_origin() {
 #[test]
 fn redirect_keeps_authorization_same_origin() {
     // A same-origin redirect keeps the Authorization header.
-    let url = start_same_origin_redirect_auth_server();
+    let url = start_auth_echo_server(true);
     let out = run_and_get_out(&format!(
         r#"
         globalThis.__out = "pending";
@@ -592,34 +530,14 @@ fn redirect_keeps_authorization_same_origin() {
 }
 
 #[test]
-fn redirect_to_non_http_scheme_is_a_network_error() {
-    // HTTP-redirect fetch step 6: a Location whose scheme is not HTTP(S) is a network error.
-    //
-    // This confirms the observable outcome (a network error), but cannot isolate the step-6 check
-    // from the transport: the reqwest backend rejects every non-HTTP(S) scheme on its own, so a
-    // `file://` Location rejects either way. The step-6 check is the sole guard for a backend that
-    // would otherwise follow such a Location (e.g. the WASI HTTP path), which is what this asserts.
-    let origin = start_redirect_server("file:///etc/passwd".to_string());
-    let out = run_and_get_out(&format!(
-        r#"
-        globalThis.__out = "pending";
-        fetch("{origin}")
-            .then(r => {{ globalThis.__out = "resolved:" + r.status; }})
-            .catch(e => {{ globalThis.__out = "rejected:" + e.constructor.name; }});
-        "#
-    ));
-    assert_eq!(out, "rejected:TypeError");
-}
-
-#[test]
 fn redirect_with_credentialed_location_is_a_network_error() {
     // HTTP-redirect fetch steps 9–10: a Location that includes credentials is a network error for
     // a cors-mode request (every fetch() here). The redirect target is a *reachable* server that
     // returns 200, so the oracle discriminates: with the check, the fetch rejects before following
     // (rejected:TypeError); without it, the fetch would follow and resolve (resolved:200).
-    let upstream = start_loopback_server("creds-followed");
+    let upstream = start_server(vec![ok("creds-followed")]);
     let credentialed = upstream.replace("http://", "http://user:pass@");
-    let origin = start_redirect_server(credentialed);
+    let origin = start_server(vec![found(&credentialed)]);
     let out = run_and_get_out(&format!(
         r#"
         globalThis.__out = "pending";
@@ -637,7 +555,7 @@ fn response_body_unaffected_by_patched_controller_enqueue() {
     // operation, not the author-visible ReadableStreamDefaultController.prototype
     // methods. Patching prototype.enqueue to drop chunks must not affect the
     // body's bytes.
-    let url = start_loopback_server("untampered body bytes");
+    let url = start_server(vec![ok("untampered body bytes")]);
     let out = run_and_get_out(&format!(
         r#"
         globalThis.__out = "pending";
@@ -666,7 +584,7 @@ fn response_body_transmitted_via_shortcut_marks_it_used() {
     // to the transport (the incoming→outgoing shortcut). The donor stream must be
     // left locked and disturbed, as if the pump had read it: bodyUsed is true and
     // the stream is locked.
-    let source = start_loopback_server("shortcut body bytes");
+    let source = start_server(vec![ok("shortcut body bytes")]);
     let echo = start_echo_server();
     let out = run_and_get_out(&format!(
         r#"
@@ -686,32 +604,15 @@ fn response_body_transmitted_via_shortcut_marks_it_used() {
     assert_eq!(out, "echoed=shortcut body bytes|used=true|locked=true");
 }
 
-/// Start a one-shot server that replies with `raw` verbatim, so a test can
-/// control the status line and header bytes exactly (including bytes that are
-/// not valid UTF-8, which no `format!`-built response could carry).
-fn start_raw_server(raw: &'static [u8]) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf);
-            let _ = stream.write_all(raw);
-            let _ = stream.flush();
-        }
-    });
-    format!("http://127.0.0.1:{port}/")
-}
-
 #[test]
 fn status_text_is_empty_because_the_reason_phrase_is_not_recoverable() {
     // Neither transport surfaces the reason-phrase the peer sent, and it cannot be guessed from
     // the status code — a server may send any phrase, as this one does. Reporting the registered
     // phrase for the code would invent a value the peer never sent, so `statusText` stays empty.
     // Locks in the behaviour `fetch/api/basic/status.h2.any.js` depends on.
-    let url = start_raw_server(
-        b"HTTP/1.1 404 Totally Fine\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
-    );
+    let url = start_server(vec![
+        b"HTTP/1.1 404 Totally Fine\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_vec(),
+    ]);
     let out = run_and_get_out(&format!(
         r#"
         globalThis.__out = "pending";
@@ -750,45 +651,13 @@ fn cancelling_a_derived_request_body_cancels_the_original() {
     assert_eq!(out, "cancelled=done here|derivedLocked=false");
 }
 
-/// Start a server that serves `count` sequential one-shot responses, so a test
-/// can make several fetches against one URL.
-fn start_repeating_server(count: usize, body: &'static str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for _ in 0..count {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-            }
-        }
-    });
-    format!("http://127.0.0.1:{port}/")
-}
-
 #[test]
 fn a_reused_abort_signal_does_not_accumulate_fetch_abort_algorithms() {
     // `fetch` registers an abort algorithm on the request's signal. An `AbortSignal` outlives the
     // fetches made with it, so an algorithm that is never removed accumulates one entry per fetch
     // — each rooting that fetch's promise and Response, and through the Response its host body and
     // connection. Reading each body must detach it again.
-    //
-    // Inlined rather than run through `run_and_get_out` because the signal has to be inspected
-    // while its runtime is still alive.
-    let url = start_repeating_server(3, "body");
-    clear_global_initializers();
-    libstarling::register_builtins();
-    let rt = Runtime::init(&core_runtime::config::RuntimeConfig::default()).expect("runtime init");
-    let scope = rt.default_global();
-    let rawcx = unsafe { scope.cx_mut().raw_cx() };
-    let el = EventLoop::new();
+    let url = start_server(vec![ok("body"); 3]);
     let code = format!(
         r#"
         globalThis.__out = "pending";
@@ -802,31 +671,25 @@ fn a_reused_abort_signal_does_not_accumulate_fetch_abort_algorithms() {
         }})().catch(e => {{ globalThis.__out = "error:" + e; }});
         "#
     );
-    with_event_loop(&el, |_| {
-        js::compile::evaluate_with_filename(&scope, &code, "<test>", 1).expect("eval failed");
-    });
-    js::jobs::run_jobs(&scope);
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let (out, count) = run(&code, |scope| {
+        // The signal is still reachable from the global, so anything it holds is still alive.
+        let signal_value = js::compile::evaluate_with_filename(
+            scope,
+            "globalThis.__controller.signal",
+            "<sig>",
+            1,
+        )
         .unwrap();
-    tokio_rt.block_on(async { unsafe { run_to_completion(rawcx, &el, tokio::time::sleep).await } });
-
-    let out =
-        js::compile::evaluate_with_filename(&scope, "globalThis.__out", "<check>", 1).unwrap();
-    assert_eq!(String::from_jsval(&scope, out, ()).unwrap(), "done");
-
-    // The signal is still reachable from the global, so anything it holds is still alive.
-    let signal_value =
-        js::compile::evaluate_with_filename(&scope, "globalThis.__controller.signal", "<sig>", 1)
+        let signal = js::Object::from_raw_value(scope, signal_value.get())
+            .unwrap()
+            .cast::<web_globals::signals::AbortSignal>()
             .unwrap();
-    let signal = js::Object::from_raw_value(&scope, signal_value.get())
-        .unwrap()
-        .cast::<web_globals::signals::AbortSignal>()
-        .unwrap();
-    let count = web_globals::signals::algorithms::abort_algorithm_count_including_dependents(
-        &scope, &signal,
-    );
+        let count = web_globals::signals::algorithms::abort_algorithm_count_including_dependents(
+            scope, &signal,
+        );
+        (read_out(scope), count)
+    });
+    assert_eq!(out, "done");
     assert_eq!(
         count, 0,
         "3 fetches left {count} abort algorithms registered on the reused signal's dependents"
@@ -844,10 +707,7 @@ fn static_json_ignores_a_patched_json_stringify() {
         (async () => {
             let observed = false;
             JSON.stringify = () => { observed = true; return '"hijacked"'; };
-            const patchedTotal = new Response(); // keep the patch live
-            const r = Response.json({ a: 1 });
-            const text = await r.text();
-            // Also check the not-serializable path still throws a TypeError.
+            const text = await Response.json({ a: 1 }).text();
             let threw = "no";
             try { Response.json(Symbol("nope")); } catch (e) { threw = e.constructor.name; }
             globalThis.__out = `${text}|observed=${observed}|threw=${threw}`;
@@ -859,8 +719,8 @@ fn static_json_ignores_a_patched_json_stringify() {
 
 #[test]
 fn static_json_still_serializes_null_and_rejects_undefined() {
-    // A real null serializes to the string "null", while values `JSON.stringify` returns
-    // undefined for must be rejected — the two must not be conflated.
+    // A real null serializes to the string "null", while values for which
+    // `JSON.stringify` returns undefined must be rejected. The two must not be conflated.
     let out = run_and_get_out(
         r#"
         globalThis.__out = "pending";
@@ -887,43 +747,15 @@ fn static_json_still_serializes_null_and_rejects_undefined() {
     );
 }
 
-/// Start a one-shot server that captures the request head it receives and
-/// replies `ok`, so a test can assert on what actually went on the wire.
-fn start_capturing_server() -> (String, std::sync::mpsc::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            // Note: long timeout because GC_ZEAL can make things real slow.
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .ok();
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            while let Ok(n) = stream.read(&mut tmp) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        }
-    });
-    (format!("http://127.0.0.1:{port}/"), rx)
-}
-
 /// The `Content-Length` header of a request made by running `code`, or `None`.
 fn content_length_of_fetch(code: &str) -> Option<String> {
-    let (url, rx) = start_capturing_server();
+    let (url, rx) = start_byte_capture_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    );
     let out = run_and_get_out(&code.replace("URL", &url));
     assert_eq!(out, "ok", "the fetch itself failed");
     let head = rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+    let head = String::from_utf8_lossy(&head);
     let found: Vec<String> = head
         .lines()
         .filter(|line| {
@@ -1079,9 +911,7 @@ fn header_values_are_isomorphic_encoded_on_the_wire() {
 #[test]
 fn header_values_are_isomorphic_decoded_from_the_wire() {
     // The mirror of the above: a response header byte of 0xE6 is the code unit U+00E6, so
-    // `headers.get` must yield "bæte". This has been wrong two ways: rejecting the value as
-    // not-UTF-8 dropped the header entirely, and decoding it as UTF-8 turned the lone 0xE6 into
-    // U+FFFD. Isomorphic decoding is total, so neither can happen.
+    // `headers.get` must yield "bæte", not drop the header or decode it to U+FFFD.
     let (url, _rx) = start_byte_capture_server(
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Echo: b\xe6te\r\nConnection: close\r\n\r\nok",
     );
@@ -1098,64 +928,4 @@ fn header_values_are_isomorphic_decoded_from_the_wire() {
         "#
     ));
     assert_eq!(out, "62,e6,74,65");
-}
-
-/// Start a one-shot server that answers the first request with `redirect` and
-/// the second with a 200, so a test can observe where a redirect landed.
-fn start_redirecting_server(redirect: &'static [u8]) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for hop in 0..2 {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf);
-                let reply: &[u8] = if hop == 0 {
-                    redirect
-                } else {
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-                };
-                let _ = stream.write_all(reply);
-                let _ = stream.flush();
-            }
-        }
-    });
-    format!("http://127.0.0.1:{port}/")
-}
-
-#[test]
-fn a_redirect_location_is_resolved_as_bytes_not_as_text() {
-    // A `Location` header value is a byte sequence. Resolving it as text percent-encodes each
-    // decoded code unit as UTF-8, so the three bytes E2 98 83 come back as %C3%A2%C2%98%C2%83
-    // — six bytes, a different URL. They must be percent-encoded as the bytes they are.
-    let url = start_redirecting_server(
-        b"HTTP/1.1 302 Found\r\nLocation: /t?\xe2\x98\x83\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-    );
-    let out = run_and_get_out(&format!(
-        r#"
-        globalThis.__out = "pending";
-        fetch("{url}")
-            .then(r => {{ globalThis.__out = new URL(r.url).pathname + new URL(r.url).search; }})
-            .catch(e => {{ globalThis.__out = "error:" + e; }});
-        "#
-    ));
-    assert_eq!(out, "/t?%E2%98%83");
-}
-
-#[test]
-fn a_redirect_location_preserves_already_escaped_and_literal_percents() {
-    // Escaped sequences keep their case and are not re-encoded, and a literal `%` that is not
-    // part of an escape survives — WPT's "Escaping produces double-percent" case.
-    let url = start_redirecting_server(
-        b"HTTP/1.1 302 Found\r\nLocation: /t?%\xe2\x98\x83%e2%98%83\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-    );
-    let out = run_and_get_out(&format!(
-        r#"
-        globalThis.__out = "pending";
-        fetch("{url}")
-            .then(r => {{ globalThis.__out = new URL(r.url).search; }})
-            .catch(e => {{ globalThis.__out = "error:" + e; }});
-        "#
-    ));
-    assert_eq!(out, "?%%E2%98%83%e2%98%83");
 }

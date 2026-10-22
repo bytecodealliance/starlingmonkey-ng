@@ -172,18 +172,15 @@ pub(crate) fn invoke_algorithm<'r>(
     }
 }
 
-/// Attach native fulfillment/rejection reactions to `promise`, each carrying a
+/// Attach native fulfillment/rejection reactions to `promise`, each called with a
 /// single payload value (typically the controller or reader the reaction
-/// operates on). Mirrors the spec's "upon fulfillment / upon rejection of
-/// promise" and "react to promise" phrasing.
+/// operates on). Implements the spec's "upon fulfillment / upon rejection of
+/// promise" and "react to promise".
 ///
-/// These are internal reactions: the dependent promise is discarded and never
-/// surfaced to author code, so it must not participate in unhandled-rejection
-/// tracking. A fulfillment-only reaction on a promise that later rejects (e.g.
-/// pipeTo's forward-close reaction on `reader.[[closedPromise]]`) would
-/// otherwise produce a spurious unhandled rejection. Attaching the reaction also
-/// marks `promise` itself handled, which is correct — the stream is consuming
-/// it.
+/// The dependent promise is never exposed to author code, so it is excluded from
+/// unhandled-rejection tracking. Otherwise a fulfillment-only reaction on a
+/// promise that later rejects would report a spurious unhandled rejection.
+/// Attaching the reactions also marks `promise` handled.
 pub(crate) fn react<'r, P: ToJSVal<'r>>(
     scope: &'r Scope<'_>,
     promise: &Promise<'_>,

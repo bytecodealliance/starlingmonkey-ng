@@ -484,20 +484,16 @@ impl ReadableStream {
         self.data().disturbed
     }
 
-    /// Whether the stream is still readable — neither closed nor errored, so
-    /// closing or erroring it would still have an observable effect.
+    /// Whether the stream is still readable: neither closed nor errored.
     pub fn is_readable(&self) -> bool {
         self.data().state == ReadableStreamState::Readable
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-cancel>
     /// Cancel the stream with `reason`, running its underlying source's cancel
-    /// steps. This is `ReadableStreamCancel`, the internal algorithm, so — unlike
-    /// the author-facing `cancel()` method — it applies to a locked stream too.
-    /// Callers that hold a reader should prefer
+    /// steps. Unlike the author-facing [`cancel`](Self::cancel) method, this
+    /// applies to a locked stream too. Callers that hold a reader should prefer
     /// [`native_read::native_reader_cancel`](crate::readable::native_read::native_reader_cancel).
-    /// Distinct from the author-facing [`cancel`](Self::cancel) method above,
-    /// which rejects when the stream is locked.
     pub fn cancel_internal<'r>(
         &self,
         scope: &'r Scope<'_>,
@@ -568,18 +564,11 @@ impl ReadableStream {
     /// `None` once that demand has arrived, or if this stream is not piped to such
     /// a transform.
     ///
-    /// This allows native underlying stream sources to hold off on performing an
-    /// actual read operation until a `pull` happens on the pipeline's readable end,
-    /// without deviating from the spec. Instead of immediately performing the
-    /// operation, it can subscribe to this promise and get notified once a `pull`
-    /// happens, or on the next tick if one is already pending.
-    ///
-    /// Why is this needed at all? The fact that a `TransformStream`'s writable side
-    /// has a high-water mark of `1` means that a `pull` is enqueued upon the TS's
-    /// creation. When a `ReadableStream` is later piped to the TS, that `pull` is
-    /// applied to it. Without this kind of mechanism, the source would have no
-    /// choice but to immediately perform the operation, only for the result to be
-    /// parked in the `TransformStream`.
+    /// A native source can wait on this promise instead of reading at once, so it
+    /// reads only when a `pull` happens on the pipeline's readable end. A
+    /// `TransformStream`'s writable side has a high-water mark of `1`, so piping
+    /// into it pulls from the source before anything reads the transform's
+    /// readable end.
     pub fn deferred_demand<'r>(&self, scope: &'r Scope<'_>) -> Option<Promise<'r>> {
         let transform = self.data().piped_to_identity_transform.get(scope)?;
         // Backpressure is set while the readable end holds no demand, and

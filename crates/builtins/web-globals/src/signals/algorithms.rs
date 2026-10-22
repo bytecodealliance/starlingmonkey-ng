@@ -26,13 +26,9 @@ use crate::events::event_target::EventTarget;
 /// To create a dependent abort signal, given a list `signals`, returns a new
 /// `AbortSignal` that is aborted when any of the source signals is aborted.
 ///
-/// The spec keeps the source/dependent links as *weak* references to avoid
-/// keeping signals alive through each other. Here they are ordinary traced
-/// `Heap` fields: because they are traced as object slots rather than held as
-/// independent roots, SpiderMonkey's cycle-collecting GC still reclaims an
-/// unreachable source↔dependent pair. The only difference is `WeakRef`/
-/// `FinalizationRegistry` observability, which is not exercised by the enabled
-/// tests; revisit this if the GC-oriented abort-signal tests get enabled.
+/// The spec's links between source and dependent signals are weak references. Here they are
+/// traced `Heap` fields, which a tracing GC still collects when the linked signals are all
+/// unreachable. A reachable source signal keeps every signal in its `dependent_signals` alive.
 pub fn create_dependent_abort_signal<'r>(
     scope: &'r Scope<'_>,
     signals: &[AbortSignal<'_>],
@@ -330,11 +326,7 @@ impl Task for AbortTimeoutTask {
 ///
 /// Steps 2-3 of the `AbortSignal.timeout()` algorithm: run steps after a
 /// timeout to signal abort with a "TimeoutError" DOMException.
-pub(crate) fn schedule_abort_timeout(
-    _scope: &Scope<'_>,
-    signal: &AbortSignal<'_>,
-    milliseconds: f64,
-) {
+pub(crate) fn schedule_abort_timeout(signal: &AbortSignal<'_>, milliseconds: f64) {
     let delay = Duration::from_millis(milliseconds.max(0.0) as u64);
     let deadline = Instant::now() + delay;
     let task = AbortTimeoutTask {

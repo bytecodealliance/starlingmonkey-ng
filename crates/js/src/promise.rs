@@ -19,7 +19,7 @@ use mozjs::jsapi::{JSObject, PromiseState};
 use mozjs::rust::wrappers2;
 use mozjs::rust::{HandleObject, HandleValue};
 
-use super::error::ExnThrown;
+use super::error::{ExnThrown, OutOfMemory, ThrowException};
 use crate::Object;
 
 /// Marker type for JavaScript `Promise` objects.
@@ -335,8 +335,7 @@ impl<'s> Stack<'s, Promise> {
         let vector = mozjs::rust::RootedObjectVectorWrapper::new(scope.cx_mut());
         for promise in promises {
             if !vector.append(promise.get()) {
-                crate::exception::report_out_of_memory(scope);
-                return Err(ExnThrown);
+                return Err(OutOfMemory.throw(scope));
             }
         }
         // SAFETY: `vector` is a live, valid ObjectVector for the duration of the call;

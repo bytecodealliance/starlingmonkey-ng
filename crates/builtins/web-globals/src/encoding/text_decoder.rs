@@ -3,7 +3,7 @@
 //! <https://encoding.spec.whatwg.org/#textdecoder>
 
 use core_runtime::{webidl_dictionary, webidl_interface, webidl_methods, webidl_union};
-use js::error::{ExnThrown, RangeError};
+use js::error::{ExnThrown, OutOfMemory, RangeError, ThrowException};
 use js::gc::scope::Scope;
 use js::{ArrayBuffer, ArrayBufferView, JSString};
 
@@ -106,81 +106,135 @@ impl TextDecoder<'_> {
         let decoder = data.decoder.as_mut().expect("set by step 1");
 
         // Step 3: If _input_ is given, then `push` a `copy of` _input_ to `this`'s `I/O queue`.
-        let bytes: &[u8] = &match input {
-            Some(ArrayBufferViewOrArrayBuffer::Buffer(input)) => input.copy_bytes(scope)?,
-            Some(ArrayBufferViewOrArrayBuffer::View(input)) => input.copy_bytes(scope)?,
-            None => Vec::new(),
-        };
-
-        // windows-1252 decodes every byte outside 0x80..=0x9F to the code point of the same
-        // value, and its decoder keeps no state between calls, so such input is its own
-        // Latin-1 output.
-        if encoding == encoding_rs::WINDOWS_1252 && !bytes.iter().any(|b| (0x80..=0x9F).contains(b))
-        {
-            return JSString::from_latin1(scope, bytes);
-        }
-        // A fresh decoder that decodes its whole input at once turns ASCII into the same
-        // characters in every ASCII-compatible encoding.
-        if fresh
-            && last
-            && encoding.is_ascii_compatible()
-            && encoding_rs::Encoding::ascii_valid_up_to(bytes) == bytes.len()
-        {
-            return JSString::from_latin1(scope, bytes);
-        }
-
-        // Step 4: Let _output_ be the `I/O queue` of scalar values « `end-of-queue` ».
-        // Step 5: While true:
-        // Step 5.1: Let _item_ be the result of `reading` from `this`'s `I/O queue`.
-        // Step 5.2: If _item_ is `end-of-queue` and `this`'s `do not flush` is true, then return
-        //           the result of running `serialize I/O queue` with `this` and _output_.
-        // Step 5.3: Otherwise:
-        // Step 5.3.1: Let _result_ be the result of `processing an item` with _item_, `this`'s
-        //             `decoder`, `this`'s `I/O queue`, _output_, and `this`'s `error mode`.
-        // Step 5.3.2: If _result_ is `finished`, then return the result of running `serialize
-        //             I/O queue` with `this` and _output_.
-        // Step 5.3.3: Otherwise, if _result_ is `error`, `throw` a ``TypeError``.
-        //
-        // (One `encoding_rs` call processes every item. `last` is true when `end-of-queue` is
-        // processed rather than returned at step 5.2. The decoder's BOM removal performs
-        // `serialize I/O queue`'s BOM handling. We decode to UTF-16, which SpiderMonkey copies
-        // as is, or narrows to Latin-1 if every code unit fits.)
-        let max_len = decoder
-            .max_utf16_buffer_length(bytes.len())
-            .unwrap_or(bytes.len().saturating_add(1));
-        let mut output = vec![0u16; max_len];
-        if fatal {
-            let (result, _read, written) =
-                decoder.decode_to_utf16_without_replacement(bytes, &mut output, last);
-
-            match result {
-                encoding_rs::DecoderResult::InputEmpty => {
-                    JSString::from_utf16(scope, &output[..written])
-                }
-                encoding_rs::DecoderResult::Malformed(_, _) => Err(js::error::throw_type_error(
-                    scope,
-                    c"The encoded data was not valid.",
-                )),
-                encoding_rs::DecoderResult::OutputFull => {
-                    unreachable!("output buffer was pre-allocated to max size");
-                }
+        //         (We decode directly from _input_'s bytes. Nothing retains them after this call.)
+        let mut decode = |bytes: &[u8]| {
+            // windows-1252 decodes every byte outside 0x80..=0x9F to the code point of the same
+            // value, and its decoder keeps no state between calls, so such input is its own
+            // Latin-1 output.
+            if encoding == encoding_rs::WINDOWS_1252
+                && !bytes.iter().any(|b| (0x80..=0x9F).contains(b))
+            {
+                return Decoded::Latin1(js::typedarray::try_copy(bytes));
             }
-        } else {
-            // Malformed sequences become U+FFFD.
-            let (_result, _read, written, _had_errors) =
-                decoder.decode_to_utf16(bytes, &mut output, last);
+            // A fresh decoder that decodes its whole input at once turns ASCII into the same
+            // characters in every ASCII-compatible encoding.
+            if fresh
+                && last
+                && encoding.is_ascii_compatible()
+                && encoding_rs::Encoding::ascii_valid_up_to(bytes) == bytes.len()
+            {
+                return Decoded::Latin1(js::typedarray::try_copy(bytes));
+            }
 
-            JSString::from_utf16(scope, &output[..written])
+            // Step 4: Let _output_ be the `I/O queue` of scalar values « `end-of-queue` ».
+            // Step 5: While true:
+            // Step 5.1: Let _item_ be the result of `reading` from `this`'s `I/O queue`.
+            // Step 5.2: If _item_ is `end-of-queue` and `this`'s `do not flush` is true, then
+            //           return the result of running `serialize I/O queue` with `this` and
+            //           _output_.
+            // Step 5.3: Otherwise:
+            // Step 5.3.1: Let _result_ be the result of `processing an item` with _item_,
+            //             `this`'s `decoder`, `this`'s `I/O queue`, _output_, and `this`'s `error
+            //             mode`.
+            // Step 5.3.2: If _result_ is `finished`, then return the result of running
+            //             `serialize I/O queue` with `this` and _output_.
+            // Step 5.3.3: Otherwise, if _result_ is `error`, `throw` a ``TypeError``.
+            //
+            // (One `encoding_rs` call processes every item. `last` is true when `end-of-queue`
+            // is processed rather than returned at step 5.2. The decoder's BOM removal performs
+            // `serialize I/O queue`'s BOM handling. We decode to UTF-16, which SpiderMonkey
+            // copies as is, or narrows to Latin-1 if every code unit fits.)
+            Decoded::Utf16(decode_to_utf16(decoder, bytes, last, fatal))
+        };
+        let decoded = match input {
+            Some(ArrayBufferViewOrArrayBuffer::Buffer(input)) => input.with_bytes(decode),
+            Some(ArrayBufferViewOrArrayBuffer::View(input)) => input.with_bytes(decode),
+            None => decode(&[]),
+        };
+        drop(data);
+        match decoded {
+            Decoded::Latin1(Some(chars)) => JSString::from_latin1(scope, &chars),
+            Decoded::Latin1(None) => Err(OutOfMemory.throw(scope)),
+            Decoded::Utf16(output) => {
+                let output = output.map_err(|error| error.throw(scope))?;
+                JSString::from_utf16(scope, &output)
+            }
         }
     }
 }
 
+/// The result of decoding the input of `TextDecoder.decode`.
+enum Decoded {
+    /// A copy of the input, which is its own Latin-1 output. `None` means that allocating the
+    /// copy failed.
+    Latin1(Option<Vec<u8>>),
+    /// The UTF-16 output.
+    Utf16(Result<Vec<u16>, DecodeError>),
+}
+
+/// A new decoder of `encoding`, which removes a byte order mark at the start of its input unless
+/// `ignore_bom` is true.
 fn new_decoder(encoding: &'static encoding_rs::Encoding, ignore_bom: bool) -> encoding_rs::Decoder {
     if ignore_bom {
         encoding.new_decoder_without_bom_handling()
     } else {
         encoding.new_decoder_with_bom_removal()
     }
+}
+
+/// Why [`decode_to_utf16`] failed.
+enum DecodeError {
+    /// The input is malformed, in the "fatal" error mode.
+    Malformed,
+    /// The output can't be allocated.
+    OutOfMemory,
+}
+
+impl DecodeError {
+    /// Throw the `TypeError` of malformed input, or report the failed allocation.
+    fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+        match self {
+            DecodeError::Malformed => {
+                js::error::throw_type_error(scope, c"The encoded data was not valid.")
+            }
+            DecodeError::OutOfMemory => OutOfMemory.throw(scope),
+        }
+    }
+}
+
+/// Decode `bytes` with `decoder` to UTF-16. `last` is true for the end of the input, which the
+/// decoder then flushes. With `fatal`, malformed input fails, and otherwise it becomes U+FFFD.
+fn decode_to_utf16(
+    decoder: &mut encoding_rs::Decoder,
+    bytes: &[u8],
+    last: bool,
+    fatal: bool,
+) -> Result<Vec<u16>, DecodeError> {
+    let max_len = decoder
+        .max_utf16_buffer_length(bytes.len())
+        .ok_or(DecodeError::OutOfMemory)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(max_len)
+        .map_err(|_| DecodeError::OutOfMemory)?;
+    output.resize(max_len, 0);
+    let written = if fatal {
+        let (result, _read, written) =
+            decoder.decode_to_utf16_without_replacement(bytes, &mut output, last);
+        match result {
+            encoding_rs::DecoderResult::InputEmpty => written,
+            encoding_rs::DecoderResult::Malformed(_, _) => return Err(DecodeError::Malformed),
+            encoding_rs::DecoderResult::OutputFull => {
+                unreachable!("output buffer was pre-allocated to max size");
+            }
+        }
+    } else {
+        let (_result, _read, written, _had_errors) =
+            decoder.decode_to_utf16(bytes, &mut output, last);
+        written
+    };
+    output.truncate(written);
+    Ok(output)
 }
 
 #[webidl_union]

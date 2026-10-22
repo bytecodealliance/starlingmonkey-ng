@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[lib]
+# No unit tests. This skips building the (SpiderMonkey-sized) lib test harness binary.
+test = false
+
 [features]
 # For `cargo test --features debugmozjs`.
 debugmozjs = ["js/debugmozjs"]

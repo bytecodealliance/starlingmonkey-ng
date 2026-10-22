@@ -273,15 +273,6 @@ impl URLSearchParams<'_> {
     }
 }
 
-/// Define `Symbol.iterator` on URLSearchParams.prototype.
-pub fn install_symbol_iterator(scope: &Scope<'_>) {
-    js::class::add_symbol_alias::<URLSearchParamsImpl>(
-        scope,
-        c"entries",
-        js::native::SymbolCode::iterator,
-    );
-}
-
 impl URLSearchParams<'_> {
     /// <https://url.spec.whatwg.org/#concept-urlsearchparams-update>
     pub(crate) fn update(&self, scope: &Scope<'_>) -> Result<(), ExnThrown> {

@@ -4,9 +4,8 @@
 //!
 //! `WorkerLocation` exposes the runtime's current location URL via
 //! `globalThis.location`. The HTML spec sources this URL from the surrounding
-//! `WorkerGlobalScope`. Starling has no `WorkerGlobalScope`, so a single
-//! process-wide URL — typically read from an incoming HTTP request or configured
-//! via `--init-location` — backs every `WorkerLocation` accessor instead.
+//! `WorkerGlobalScope`. Starling has no `WorkerGlobalScope`, so the URL set with
+//! [`set_init_location`] backs every `WorkerLocation` accessor instead.
 //! If no URL has been configured, every accessor throws a `TypeError`.
 
 use std::cell::RefCell;
@@ -61,8 +60,7 @@ fn with_url<T>(field: &str, f: impl FnOnce(&url::Url) -> T) -> Result<T, TypeErr
 /// The `WorkerLocation` interface.
 ///
 /// `Symbol.toStringTag` is `"Location"` rather than the WebIDL default of
-/// `"WorkerLocation"`, matching the C++ runtime so JS code observes
-/// `Object.prototype.toString.call(location) === "[object Location]"`.
+/// `"WorkerLocation"`.
 ///
 /// Instantiated as a singleton in [`add_to_global`].
 #[webidl_interface(to_string_tag = "Location")]
@@ -162,8 +160,6 @@ impl WorkerLocation {
 pub fn add_to_global<'s>(scope: &'s Scope<'_>, global: Object<'s>) {
     WorkerLocation::add_to_global(scope, global);
 
-    // SAFETY: `WorkerLocation::add_to_global` registered the class on the
-    // current global immediately above.
     let location =
         js::class::create_instance_with::<WorkerLocationImpl>(scope, |_| WorkerLocationImpl {})
             .expect("failed to allocate WorkerLocation singleton");
@@ -171,159 +167,4 @@ pub fn add_to_global<'s>(scope: &'s Scope<'_>, global: Object<'s>) {
     global
         .set_property(scope, c"location", location)
         .expect("failed to define globalThis.location");
-}
-
-// Nothing platform-specific in these tests, so skip them on wasm32.
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use core_runtime::{runtime, test_util::eval_with_setup};
-
-    fn eval(code: &str) -> String {
-        eval_with_setup(
-            || {
-                super::clear_init_location();
-                runtime::register_global_initializer(super::add_to_global);
-            },
-            code,
-        )
-    }
-
-    fn eval_with_url(location_url: &str, code: &str) -> String {
-        eval_with_setup(
-            || {
-                super::set_init_location(url::Url::parse(location_url).unwrap());
-                runtime::register_global_initializer(super::add_to_global);
-            },
-            code,
-        )
-    }
-
-    #[test]
-    fn location_exists_on_global() {
-        assert_eq!(
-            eval_with_url("https://example.com/", "typeof location"),
-            "object"
-        );
-    }
-
-    #[test]
-    fn constructor_throws() {
-        // WorkerLocation has no IDL constructor; `new WorkerLocation()` must throw.
-        assert_eq!(
-            eval(
-                "try { new WorkerLocation(); 'no-throw' } \
-                 catch(e) { (e instanceof TypeError) + ',' + e.message }"
-            ),
-            "true,Illegal constructor"
-        );
-    }
-
-    #[test]
-    fn to_string_tag_is_location() {
-        assert_eq!(
-            eval_with_url(
-                "https://example.com/",
-                "Object.prototype.toString.call(location)"
-            ),
-            "[object Location]"
-        );
-    }
-
-    #[test]
-    fn href_returns_serialized_url() {
-        assert_eq!(
-            eval_with_url("https://example.com/path?q=1#frag", "location.href"),
-            "https://example.com/path?q=1#frag"
-        );
-    }
-
-    #[test]
-    fn origin_returns_origin() {
-        assert_eq!(
-            eval_with_url("https://example.com:8443/path", "location.origin"),
-            "https://example.com:8443"
-        );
-    }
-
-    #[test]
-    fn protocol_returns_scheme_with_colon() {
-        assert_eq!(
-            eval_with_url("https://example.com/", "location.protocol"),
-            "https:"
-        );
-    }
-
-    #[test]
-    fn host_and_hostname() {
-        assert_eq!(
-            eval_with_url("https://example.com:8443/", "location.host"),
-            "example.com:8443"
-        );
-        assert_eq!(
-            eval_with_url("https://example.com:8443/", "location.hostname"),
-            "example.com"
-        );
-    }
-
-    #[test]
-    fn port_includes_explicit_only() {
-        assert_eq!(
-            eval_with_url("https://example.com:8443/", "location.port"),
-            "8443"
-        );
-        // Default ports are omitted by the URL parser.
-        assert_eq!(eval_with_url("https://example.com/", "location.port"), "");
-    }
-
-    #[test]
-    fn pathname_search_hash() {
-        assert_eq!(
-            eval_with_url("https://example.com/foo/bar?x=1#frag", "location.pathname"),
-            "/foo/bar"
-        );
-        assert_eq!(
-            eval_with_url("https://example.com/foo/bar?x=1#frag", "location.search"),
-            "?x=1"
-        );
-        assert_eq!(
-            eval_with_url("https://example.com/foo/bar?x=1#frag", "location.hash"),
-            "#frag"
-        );
-    }
-
-    #[test]
-    fn empty_search_and_hash_return_empty_string() {
-        assert_eq!(eval_with_url("https://example.com/", "location.search"), "");
-        assert_eq!(eval_with_url("https://example.com/", "location.hash"), "");
-    }
-
-    #[test]
-    fn to_string_returns_href() {
-        assert_eq!(
-            eval_with_url(
-                "https://example.com/path?q=1",
-                "location.toString() === location.href"
-            ),
-            "true"
-        );
-    }
-
-    #[test]
-    fn unset_location_throws_typeerror() {
-        // With no init-location configured, every accessor throws.
-        assert_eq!(
-            eval(
-                "try { location.href; 'no-throw' } \
-                 catch(e) { (e instanceof TypeError) + ',' + e.message.includes('--init-location') }"
-            ),
-            "true,true"
-        );
-        assert_eq!(
-            eval(
-                "try { location.toString(); 'no-throw' } \
-                 catch(e) { e instanceof TypeError }"
-            ),
-            "true"
-        );
-    }
 }

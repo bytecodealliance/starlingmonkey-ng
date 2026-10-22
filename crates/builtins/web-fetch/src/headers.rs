@@ -138,6 +138,11 @@ impl Headers {
         }
     }
 
+    /// The header list: every header in the order it was added, duplicates included.
+    pub(crate) fn list(&self) -> Vec<(String, String)> {
+        self.data().header_list.to_vec()
+    }
+
     /// <https://fetch.spec.whatwg.org/#dom-headers-append>
     #[method]
     pub fn append(
@@ -314,17 +319,6 @@ impl Headers {
     }
 }
 
-impl Headers<'_> {
-    /// Define `Symbol.iterator` on `Headers.prototype` (an alias of `entries`).
-    fn install_symbol_iterator(scope: &Scope<'_>) {
-        js::class::add_symbol_alias::<HeadersImpl>(
-            scope,
-            c"entries",
-            js::native::SymbolCode::iterator,
-        );
-    }
-}
-
 /// <https://webidl.spec.whatwg.org/#dfn-default-iterator-object>
 #[webidl_interface(hidden, name = "Headers Iterator")]
 pub struct HeadersIterator {
@@ -374,7 +368,8 @@ impl HeadersIterator {
 
 pub(crate) fn add_to_global(scope: &Scope, global: Object) {
     Headers::add_to_global(scope, global);
-    Headers::install_symbol_iterator(scope);
+    // `Headers.prototype[Symbol.iterator]` is `entries`.
+    js::class::add_symbol_alias::<HeadersImpl>(scope, c"entries", js::native::SymbolCode::iterator);
     HeadersIterator::add_to_global(scope, global);
     js::class::inherit_from_iterator_prototype::<HeadersIteratorImpl>(scope)
         .expect("setting a class prototype's prototype can only fail due to OOM");

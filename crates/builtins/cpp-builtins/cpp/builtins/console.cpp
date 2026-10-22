@@ -2,6 +2,7 @@
 #include "encode.h"
 #include <chrono>
 #include <map>
+#include <string_view>
 
 #include <js/Array.h>
 #include <js/experimental/TypedData.h>
@@ -406,23 +407,28 @@ JS::Result<mozilla::Ok> ToSource(JSContext *cx, std::string &sourceOut, JS::Hand
 namespace builtins::web::console {
 
 // `log`, `info` and `debug` print the bare message on stdout. `warn` and `error` print it on
-// stderr, prefixed with the level.
+// stderr, prefixed with the level. The message is written with its length, so NUL characters in
+// it are printed too.
 __attribute__((weak))
-void builtin_impl_console_log(Console::LogType log_ty, const char *msg) {
+void builtin_impl_console_log(Console::LogType log_ty, std::string_view msg) {
+  FILE *stream = stdout;
+  const char *prefix = "";
   switch (log_ty) {
   case Console::LogType::Warn:
-    fprintf(stderr, "Warn: %s\n", msg);
-    fflush(stderr);
-    return;
+    stream = stderr;
+    prefix = "Warn: ";
+    break;
   case Console::LogType::Error:
-    fprintf(stderr, "Error: %s\n", msg);
-    fflush(stderr);
-    return;
+    stream = stderr;
+    prefix = "Error: ";
+    break;
   default:
-    fprintf(stdout, "%s\n", msg);
-    fflush(stdout);
-    return;
+    break;
   }
+  fputs(prefix, stream);
+  fwrite(msg.data(), 1, msg.size(), stream);
+  fputc('\n', stream);
+  fflush(stream);
 }
 
 template <Console::LogType log_ty>
@@ -450,7 +456,7 @@ static bool console_out(JSContext *cx, unsigned argc, JS::Value *vp) {
     }
   }
 
-  builtin_impl_console_log(log_ty, fullLogLine.c_str());
+  builtin_impl_console_log(log_ty, fullLogLine);
 
   args.rval().setUndefined();
   return true;
@@ -502,7 +508,7 @@ static bool assert_(JSContext *cx, unsigned argc, JS::Value *vp) {
   }
 
   // 5. Perform Logger("assert", data).
-  builtin_impl_console_log(Console::LogType::Error, message.c_str());
+  builtin_impl_console_log(Console::LogType::Error, message);
   return true;
 }
 
@@ -535,7 +541,7 @@ static bool count(JSContext *cx, unsigned argc, JS::Value *vp) {
   concat += ": ";
   concat += std::to_string(count);
   // 5. Perform Logger("count", « concat »).
-  builtin_impl_console_log(Console::LogType::Log, concat.c_str());
+  builtin_impl_console_log(Console::LogType::Log, concat);
   args.rval().setUndefined();
   return true;
 }
@@ -566,7 +572,7 @@ static bool countReset(JSContext *cx, unsigned argc, JS::Value *vp) {
     std::string message = "Count for '";
     message += label;
     message += "' does not exist";
-    builtin_impl_console_log(Console::LogType::Warn, message.c_str());
+    builtin_impl_console_log(Console::LogType::Warn, message);
   }
 
   args.rval().setUndefined();
@@ -623,7 +629,7 @@ static bool timeLog(JSContext *cx, unsigned argc, JS::Value *vp) {
     std::string message = "No such label '";
     message += label;
     message += "' for console.timeLog()";
-    builtin_impl_console_log(Console::LogType::Warn, message.c_str());
+    builtin_impl_console_log(Console::LogType::Warn, message);
     args.rval().setUndefined();
     return true;
   }
@@ -672,7 +678,7 @@ static bool timeLog(JSContext *cx, unsigned argc, JS::Value *vp) {
   concat += data;
 
   // 6. Perform Printer("timeLog", « concat »).
-  builtin_impl_console_log(Console::LogType::Log, concat.c_str());
+  builtin_impl_console_log(Console::LogType::Log, concat);
 
   args.rval().setUndefined();
   return true;
@@ -696,7 +702,7 @@ static bool timeEnd(JSContext *cx, unsigned argc, JS::Value *vp) {
     std::string message = "No such label '";
     message += label;
     message += "' for console.timeEnd()";
-    builtin_impl_console_log(Console::LogType::Warn, message.c_str());
+    builtin_impl_console_log(Console::LogType::Warn, message);
     args.rval().setUndefined();
     return true;
   }
@@ -717,7 +723,7 @@ static bool timeEnd(JSContext *cx, unsigned argc, JS::Value *vp) {
   concat += "ms";
 
   // 6. Perform Printer("timeEnd", « concat »).
-  builtin_impl_console_log(Console::LogType::Info, concat.c_str());
+  builtin_impl_console_log(Console::LogType::Info, concat);
 
   args.rval().setUndefined();
   return true;
@@ -744,7 +750,7 @@ static bool dir(JSContext *cx, unsigned argc, JS::Value *vp) {
     fullLogLine += source;
   }
 
-  builtin_impl_console_log(Console::LogType::Log, fullLogLine.c_str());
+  builtin_impl_console_log(Console::LogType::Log, fullLogLine);
 
   args.rval().setUndefined();
   return true;
@@ -795,7 +801,7 @@ static bool trace(JSContext *cx, unsigned argc, JS::Value *vp) {
   fullLogLine += stack_string.begin();
 
   // 3. Perform Printer("trace", « trace »).
-  builtin_impl_console_log(Console::LogType::Log, fullLogLine.c_str());
+  builtin_impl_console_log(Console::LogType::Log, fullLogLine);
   args.rval().setUndefined();
   return true;
 }

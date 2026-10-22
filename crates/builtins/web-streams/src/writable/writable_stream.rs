@@ -22,13 +22,6 @@ use js::Promise;
 use web_globals::events::algorithms::ScriptStackState;
 
 /// A traced slot holding a `Promise`.
-///
-/// `must_root`: the slot wraps a `Heap<Promise>`, so crown rejects holding a
-/// `PromiseSlot` by value in a plain local across an allocation — the
-/// untraced-`Heap`-across-GC hazard. While it lives inside a traced container (a
-/// stream's write-request queue or an in-flight/close slot) its `Heap` is traced
-/// normally; once moved out via `take`/`pop_front` it must be consumed
-/// immediately (`into_promise`) or kept in a `RootedTraceableBox`.
 #[js::must_root]
 #[derive(core_runtime::Traceable, Default, js::ScopeRoot)]
 pub(crate) struct PromiseSlot(Heap<js::promise::Promise>);
@@ -50,10 +43,6 @@ impl<'s> StackPromiseSlot<'s> {
 /// A pending abort request.
 ///
 /// <https://streams.spec.whatwg.org/#writablestream-pendingabortrequest>
-///
-/// `must_root`: holds `Heap` fields, so crown rejects holding it by value across
-/// an allocation. It lives in the stream's traced `[[pendingAbortRequest]]`
-/// slot; once moved out it must be consumed immediately or kept rooted.
 #[js::must_root]
 #[derive(core_runtime::Traceable, Default, js::ScopeRoot)]
 pub(crate) struct PendingAbortRequest {

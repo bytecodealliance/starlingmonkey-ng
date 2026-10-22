@@ -910,7 +910,7 @@ pub(crate) fn fill_headers(
 /// entries taken from an existing header list most of it is already known to
 /// hold, so this runs only what can still change the result:
 ///
-/// - `append` Step 1 (`normalize`) and `validate` step 1 is a no-op: entries are already normalized.
+/// - `append` Step 1 (`normalize`) and `validate` Step 1 are no-ops: entries are already normalized.
 /// - `validate` Steps 1 & 2 cannot throw: the guard here is "`request`" or
 ///   "`request-no-cors`" (constructor steps 31–32), never "`immutable`".
 /// - `append` Step 5 (`remove privileged no-CORS request-headers`) is a no-op:
@@ -988,10 +988,9 @@ pub(crate) fn get_the_mime_type() {
 
 /// The `convertBytesToJSValue` algorithm a `consume body` caller supplies: how the
 /// fully-read byte sequence becomes the resolved value.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) enum ConsumeType {
     /// `arrayBuffer()` — an `ArrayBuffer` over the bytes.
-    #[default]
     ArrayBuffer,
     /// `bytes()` — a `Uint8Array` over the bytes.
     Bytes,
@@ -999,10 +998,9 @@ pub(crate) enum ConsumeType {
     Text,
     /// `json()` — `parse JSON from bytes`.
     Json,
-    /// `blob()` — a `Blob` over the bytes. Blob is not yet available in this runtime, so the
-    /// conversion fails; the body is still consumed (disturbed) first, per `consume body`.
+    /// `blob()`: not implemented, so the conversion fails after the body is consumed.
     Blob,
-    /// `formData()` — parse the body as form data. Not yet supported; consumes then fails.
+    /// `formData()`: not implemented, so the conversion fails after the body is consumed.
     FormData,
 }
 
@@ -1329,9 +1327,6 @@ fn main_fetch<'r>(
     // The HTTP(S) arm of Step 12 runs on a future; the "`data`" arm is synchronous and needs none.
     // Step 12: If _response_ is null, then set _response_ to the result of running the steps
     //     corresponding to the first matching statement:
-    // The switch keys on `origin`, `response tainting` and `mode`. This runtime has no requester
-    // `origin`, so no arm that compares one can be evaluated; what is left is a dispatch on the
-    // `current URL`’s `scheme`, and only two arms are reachable.
     let current_url = request.current_url();
     match current_url.scheme() {
         // Step 12 _request_’s `current URL`’s `scheme` is "`data`".1: Set _request_’s `response
@@ -1356,7 +1351,7 @@ fn main_fetch<'r>(
             //     status`, set _internalResponse_’s `body` to null and disregard any enqueuing
             //     toward it (if any).
             // A `data:` response is always 200, so only the method matters here.
-            let method = request.http_method();
+            let method = request.method();
             if method.eq_ignore_ascii_case("HEAD") || method.eq_ignore_ascii_case("CONNECT") {
                 response.clear_body();
             }

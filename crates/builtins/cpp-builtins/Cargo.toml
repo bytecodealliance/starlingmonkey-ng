@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[lib]
+# No unit tests. This skips building the (SpiderMonkey-sized) lib test harness binary.
+test = false
+
 [features]
 debugmozjs = []
 
@@ -25,7 +29,3 @@ mozjs_sys = { git = "https://github.com/tschneidereit/mozjs.git", branch = "main
 
 [build-dependencies]
 cc = "1.2.56"
-
-[dev-dependencies]
-core-runtime.workspace = true
-libstarling.workspace = true

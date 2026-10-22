@@ -7,7 +7,7 @@ authors.workspace = true
 edition.workspace = true
 
 [lib]
-# No unit tests; skip building the (SpiderMonkey-sized) lib test harness binary.
+# No unit tests. This skips building the (SpiderMonkey-sized) lib test harness binary.
 test = false
 
 [dependencies]

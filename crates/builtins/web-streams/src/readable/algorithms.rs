@@ -160,7 +160,7 @@ impl GenericReader for BYOBReader<'_> {
 /// Construct a view over `buffer` and return it as a rooted value, panicking on
 /// failure. Used where the spec performs an infallible `! Construct(...)` (e.g.
 /// the empty view handed to a read-into request's close steps).
-fn construct_view_or_throw<'r>(
+fn construct_view_or_panic<'r>(
     scope: &'r Scope<'_>,
     kind: js::typedarray::ViewKind,
     buffer: js::ArrayBuffer<'_>,
@@ -190,9 +190,7 @@ fn error_controller_with_pending(
     )
 }
 
-/// A native fulfillment reaction that ignores its argument and returns
-/// undefined, used to implement the spec's "react to `p` with a fulfillment
-/// step that returns undefined".
+/// A native reaction that ignores its argument and returns undefined.
 fn return_undefined(
     _scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
@@ -438,9 +436,6 @@ fn tee_closed_rejected(
     Ok(value::undefined())
 }
 
-/// Tee branches are created with the default (constant-1) size algorithm, so
-/// their controllers' `enqueue` can never run the size algorithm and therefore
-/// never throws — matching the spec's `! ReadableStreamDefaultControllerEnqueue`.
 const TEE_ENQUEUE_INFALLIBLE: &str =
     "tee branch enqueue is infallible: branches use the default constant-1 size algorithm";
 
@@ -1064,13 +1059,9 @@ pub(crate) fn readable_stream_pipe_to<'r>(
     if let Some(host_source) = source.native_source(scope) {
         let transform = dest.data().identity_transform.get(scope);
         if let Some(transform) = transform {
-            // Only when this pipe will close the destination behind it. Handing the native source
-            // on says "the whole of what comes out of this transform is that one body", and a sink
-            // that takes it up bypasses the transform entirely — so anything written into the
-            // transform afterwards would go to a readable end nobody reads, stalling its writer and
-            // never reaching the wire. This pipe holds the writer lock until it is done and then
-            // closes the destination, so nothing can follow it; `preventClose` is precisely the
-            // author saying they intend to write more, and disqualifies the claim.
+            // A sink that takes up the native source bypasses the transform, so chunks written
+            // into the transform after this pipe would never be read. Without `preventClose`,
+            // this pipe holds the writer lock until it closes the destination.
             if !prevent_close {
                 transform
                     .data()
@@ -1184,9 +1175,7 @@ pub(crate) fn readable_stream_pipe_to<'r>(
 
 // ---------------------------------------------------------------------------
 // `ReadableStreamPipeTo` propagation reactions, shutdown machinery, and the
-// read-write loop. See `readable_stream_pipe_to` above; the shared state is a
-// `PipeState` (its fields read/written through `state.data()`/`data_mut()`), and
-// every reaction receives the state object as its payload.
+// read-write loop.
 // ---------------------------------------------------------------------------
 
 /// The action a pipe shutdown performs once pending writes finish.
@@ -1336,7 +1325,7 @@ fn pipe_step(scope: &Scope<'_>, state: PipeState<'_>) {
 
     // Backpressure must be enforced: wait until the writer is ready before
     // reading. The reactions are the per-pipe callbacks created in
-    // `PipeState::new`; attaching them directly allocates nothing per loop turn.
+    // `PipeState::new`. Attaching them directly doesn't allocate per loop turn.
     let writer = pipe_writer(scope, state);
     let ready = writer.data().ready_promise.get(scope);
     let fulfilled = state.data().ready_fulfilled_fn.get(scope);
@@ -1369,30 +1358,14 @@ fn pipe_ready_fulfilled(
     Ok(value::undefined())
 }
 
-/// The writer's ready promise rejected (the destination errored). The backward
-/// error-propagation reaction drives shutdown; nothing to do here, but consuming
-/// the rejection keeps it from surfacing as unhandled.
-fn pipe_ready_rejected(
-    _scope: &Scope<'_>,
-    _args: CallbackArgs<'_>,
-    _payload: HandleValue<'_>,
-) -> Result<Value, ExnThrown> {
-    Ok(value::undefined())
-}
-
 /// The pipe read request's chunk steps: park the chunk, count its pending
 /// write, and schedule the deferred write that will write it to the destination
 /// and continue the loop.
 ///
-/// The write and the next read are deliberately deferred by one microtask rather
-/// than run synchronously here. The spec's pipe step 15 is informal about timing
-/// (whatwg/streams#1243), but every browser defers: Gecko's `OnReadFulfilled`
-/// does `Promise.resolve().then(() => { write(chunk); readNext(); })`. Deferring
-/// matters because a chunk can be delivered to these chunk steps synchronously
-/// (e.g. when `enqueue()` fulfils a pending read in the same turn); running the
-/// sink's `write()` synchronously from `enqueue()` is observable and forbidden
-/// (`streams/piping/general-addition.any.js`: "enqueue() must not synchronously
-/// call write algorithm").
+/// The write and the next read are deferred by one microtask. These chunk steps
+/// can run synchronously from `enqueue()`, and running the sink's `write()`
+/// synchronously from `enqueue()` is observable (WPT
+/// `streams/piping/general-addition.any.js`).
 pub(crate) fn pipe_read_request_chunk_steps(
     scope: &Scope<'_>,
     state: PipeState<'_>,
@@ -1405,9 +1378,8 @@ pub(crate) fn pipe_read_request_chunk_steps(
 }
 
 /// Runs one microtask after a chunk reaches the pipe read request: writes the
-/// parked chunk to the destination and continues the loop. Deferring to here is
-/// what keeps `enqueue()` from synchronously invoking the sink's write algorithm
-/// (see `pipe_read_request_chunk_steps`).
+/// parked chunk to the destination and continues the loop (see
+/// `pipe_read_request_chunk_steps`).
 fn pipe_deferred_write(
     scope: &Scope<'_>,
     _args: CallbackArgs<'_>,
@@ -1739,10 +1711,8 @@ fn pipe_finalize(scope: &Scope<'_>, state: PipeState<'_>, error: Option<HandleVa
     support::report_failure(scope, result, "pipeTo");
     let signal = state.data().signal.get(scope);
     if let Some(signal) = signal {
-        // Detach the abort algorithm registered in `PipeState::new`, so a later
-        // abort of a still-live signal does not run it after the pipe has
-        // finished. (Harmless if it did since shutdown is idempotent, but this avoids
-        // keeping the finished pipe reachable from the signal.)
+        // Detach the abort algorithm registered in `PipeState::new`, so the signal
+        // no longer keeps the finished pipe reachable.
         let abort_fn = state.data().abort_algorithm.get(scope);
         if let Some(abort_fn) = abort_fn {
             web_globals::signals::algorithms::remove_abort_algorithm(&signal, &abort_fn);
@@ -1796,7 +1766,6 @@ pub(crate) struct TeeState {
     chunk_microtask_fn: Heap<js::function::Function>,
 }
 
-/// Steps 4-18 of `ReadableStreamDefaultTee` are algorithm.
 #[jsmethods]
 impl TeeState<'_> {
     fn new(
@@ -1825,7 +1794,6 @@ impl TeeState<'_> {
         self.data_mut().stream.set(stream);
         self.data_mut().reader.set(reader);
 
-        // The chunk-steps microtask callback, reused for every chunk.
         let microtask = Function::new_callback(scope, c"", 0, tee_chunk_microtask, self)?;
         self.data_mut().chunk_microtask_fn.set(microtask);
 
@@ -1879,11 +1847,8 @@ pub(crate) struct PipeState {
     /// `pipe_read_request_chunk_steps`).
     pending_chunk: Heap<Value>,
     /// The number of chunks that have been read but whose writes have not yet
-    /// settled. Counted eagerly at the read request's chunk steps; decremented
-    /// by each write's settle reaction (`pipe_write_settled`). Shutdown's "wait
-    /// until every chunk that has been read has been written" is implemented as
-    /// waiting for this count to drain. The count is pipe-internal, so the
-    /// difference from the spec's promise chaining is unobservable.
+    /// settled. Incremented by the read request's chunk steps and decremented
+    /// by each write's settle reaction (`pipe_write_settled`).
     pending_writes: u32,
     /// The loop's reaction callbacks, allocated once in the constructor, so the
     /// steady-state loop allocates no callback objects per chunk.
@@ -1924,11 +1889,12 @@ impl PipeState<'_> {
         self.data_mut().write_settled_fn.set(settled);
         let ready_ok = Function::new_callback(scope, c"", 1, pipe_ready_fulfilled, self)?;
         self.data_mut().ready_fulfilled_fn.set(ready_ok);
-        // The ready-rejection swallower uses no per-pipe state; share one per global.
+        // A rejected ready promise means the destination errored, which the backward
+        // error-propagation reaction handles. The rejection only needs consuming.
         let ready_err = js::class::get_or_init_shared_function(
             scope,
-            pipe_ready_rejected as *const () as usize,
-            |scope| Function::new_callback(scope, c"", 1, pipe_ready_rejected, ()),
+            return_undefined as *const () as usize,
+            |scope| Function::new_callback(scope, c"", 1, return_undefined, ()),
         )?;
         self.data_mut().ready_rejected_fn.set(ready_err);
         self.data_mut().promise.set(Promise::new_pending(scope)?);
@@ -2141,10 +2107,9 @@ pub(crate) fn readable_byte_stream_tee<'r>(
     Ok((branch1, branch2))
 }
 
-/// The shared state backing `ReadableByteStreamTee`. Not exposed to JS
-/// (`hidden`); created internally and reached through each callback's payload.
-/// The `reader` holds whichever reader type (default or BYOB) is currently in
-/// use; it is swapped by `pullWithDefaultReader` / `pullWithBYOBReader`.
+/// The shared state backing `ReadableByteStreamTee`, passed as each callback's
+/// payload. The `reader` holds whichever reader type (default or BYOB) is
+/// currently in use. `pullWithDefaultReader` and `pullWithBYOBReader` swap it.
 #[jsclass(hidden)]
 pub(crate) struct ByteTeeState {
     stream: Heap<ReadableStreamImpl>,
@@ -2164,7 +2129,7 @@ pub(crate) struct ByteTeeState {
     pending_chunk: Heap<Value>,
     pending_for_branch2: bool,
     /// The two chunk-steps microtask callbacks, allocated once in the constructor
-    /// and queued directly on the job queue per chunk, so delivery allocates nothing.
+    /// and queued directly on the job queue per chunk, so delivery doesn't allocate.
     default_microtask_fn: Heap<js::function::Function>,
     byob_microtask_fn: Heap<js::function::Function>,
 }
@@ -2184,7 +2149,6 @@ impl ByteTeeState<'_> {
             .cancel_promise
             .set(Promise::new_pending(scope)?);
 
-        // The chunk-steps microtask callbacks, reused for every chunk.
         let default_mt = Function::new_callback(scope, c"", 0, byte_tee_default_microtask, self)?;
         self.data_mut().default_microtask_fn.set(default_mt);
         let byob_mt = Function::new_callback(scope, c"", 0, byte_tee_byob_microtask, self)?;
@@ -2210,10 +2174,7 @@ impl ByteTeeState<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// `ReadableByteStreamTee` reader switching and callbacks. The shared state is a
-// `ByteTeeState` (above), passed as every callback's payload. Its `reader` holds
-// whichever reader type (default or BYOB) is currently in use; it is swapped by
-// `pullWithDefaultReader` / `pullWithBYOBReader`.
+// `ReadableByteStreamTee` reader switching and callbacks.
 // ---------------------------------------------------------------------------
 
 fn byte_tee_stream<'r>(scope: &'r Scope<'_>, state: ByteTeeState<'_>) -> ReadableStream<'r> {
@@ -2493,24 +2454,15 @@ pub(crate) fn byte_tee_default_chunk_steps(
     js::jobs::queue_microtask(scope, &microtask)
 }
 
-/// The chunk enqueued into a byte-tee branch is always a fresh, non-detached,
-/// transferable view (the original read result or a `CloneAsUint8Array` clone),
-/// so `ReadableByteStreamControllerEnqueue` never throws — matching the spec's
-/// `! ReadableByteStreamControllerEnqueue`.
 const BYTE_TEE_ENQUEUE_INFALLIBLE: &str =
     "byte tee branch enqueue is infallible: the chunk is a fresh, transferable view";
 
-/// `ReadableByteStreamTee` closes each branch and responds to its pending
-/// pull-into using the branch's own created descriptor and an aligned
-/// (zero-length) view, so these never throw — matching the spec's
-/// `! ReadableByteStreamControllerClose` / `! …Respond` / `! …RespondWithNewView`.
 const BYTE_TEE_SETTLE_INFALLIBLE: &str =
     "byte tee branch close/respond is infallible: created descriptor, aligned view (spec `!`)";
 
 /// Error both branches with `error`, cancel the underlying source, and resolve
-/// the tee's cancel promise — the byte-tee read-request steps' shared failure
-/// path. It backs the chunk steps' chunk-clone failure, and the close steps'
-/// fallible branch close/respond (see [`byte_tee_default_close_steps`]).
+/// the tee's cancel promise. Called when a chunk clone fails and when a branch
+/// close/respond fails (see [`byte_tee_default_close_steps`]).
 fn byte_tee_error_both_branches_and_cancel(
     scope: &Scope<'_>,
     state: ByteTeeState<'_>,
@@ -2730,12 +2682,7 @@ pub(crate) fn byte_tee_byob_close_steps(
     } else {
         state.data().canceled2
     };
-    // The branch close/respond steps are infallible in the spec, but a
-    // branch whose pending BYOB pull-into is partially filled below its element
-    // size (reachable when a consumer does a multi-byte-element BYOB read and the
-    // source delivers a non-aligned remainder) makes `…ControllerClose` throw its
-    // "insufficient bytes" `TypeError`. Run them as a fallible unit; on failure,
-    // error both branches and cancel the source rather than aborting.
+    // The branch close/respond steps can throw, as in `byte_tee_default_close_steps`.
     let settle = (|| -> Result<(), ExnThrown> {
         // If _byobCanceled_ is false, perform ! `ReadableByteStreamControllerClose`(byobBranch).
         if !byob_canceled {
@@ -3245,14 +3192,8 @@ pub(crate) fn readable_stream_byob_reader_read(
     min: usize,
     read_into_request: ReadIntoRequest,
 ) {
-    // The read-into request carries a `Heap` — the `read()` promise, or the
-    // byte-tee state — that nothing else traces while this synchronous path
-    // runs. The steps below transfer the view's buffer and construct views,
-    // any of which can move that referent under a compacting GC; an untraced
-    // `Heap` would then be left pointing at freed memory and its settling
-    // (`*_steps` → `Heap::take`) would dereference it. Root it for the duration
-    // so the GC keeps its pointer current, and hand it to each consumer via
-    // `take` (leaving the box empty, which traces to nothing).
+    // The steps below allocate and can move the request's referent, so the request
+    // stays rooted until a consumer `take`s it.
     let mut request = RootedTraceableBox::new(Some(read_into_request));
     // Step 1: Let _stream_ be _reader_.`[[stream]]`.
     // Step 2: Assert: _stream_ is not undefined.
@@ -3332,12 +3273,8 @@ pub(crate) fn readable_stream_default_reader_read(
     reader: DefaultReader<'_>,
     read_request: ReadRequest,
 ) {
-    // The read request carries an untraced `Heap` (the `read()` promise, or the
-    // tee/pipe/async-iterator state). The steps below — `stream`/controller
-    // lookups, `[[PullSteps]]`, queue fills — all allocate and can compact,
-    // which would stale that `Heap`. Root it for the duration and hand it to
-    // each consumer via `take` (see `readable_stream_byob_reader_read` for the
-    // same pattern on the BYOB side).
+    // The steps below allocate and can move the request's referent, so the request
+    // stays rooted until a consumer `take`s it.
     let mut read_request = RootedTraceableBox::new(Some(read_request));
     // Step 1: Let _stream_ be _reader_.`[[stream]]`.
     // Step 2: Assert: _stream_ is not undefined.
@@ -4312,9 +4249,6 @@ fn copy_data_block_bytes(
     src_start: usize,
     count: usize,
 ) {
-    if count == 0 {
-        return;
-    }
     dest.copy_region_from(dest_start, src, src_start, count);
 }
 
@@ -4764,7 +4698,7 @@ pub(crate) fn readable_byte_stream_controller_pull_into(
         // constructed and the close steps run (both can GC).
         let buffer = descriptor_buffer(scope, pull_into_descriptor.as_ref().unwrap());
         let byte_offset = pull_into_descriptor.as_ref().unwrap().byte_offset;
-        let empty_view = construct_view_or_throw(scope, view_kind, buffer, byte_offset, 0);
+        let empty_view = construct_view_or_panic(scope, view_kind, buffer, byte_offset, 0);
         read_into_request
             .take()
             .unwrap()
@@ -4914,19 +4848,11 @@ pub(crate) fn readable_byte_stream_controller_respond_in_closed_state(
     let stream = controller.stream(scope);
     if readable_stream_has_byob_reader(scope, &stream) {
         // The spec collects all the descriptors into `filledPullIntos` and then
-        // commits them. A descriptor shifted out of `[[pendingPullIntos]]` is no
-        // longer traced by the controller, and `CommitPullIntoDescriptor` runs
-        // steps that can GC (`TransferArrayBuffer`, constructing the view). A
-        // shifted descriptor must therefore stay rooted for the whole commit —
-        // both so its `buffer` survives until it is transferred, and so its
-        // `Heap`'s drop write barrier sees a live pointer — so each is held in a
-        // `RootedTraceableBox` while committed. Capture the count up front, then
-        // shift and commit one descriptor at a time so the remaining descriptors
-        // stay traced in `[[pendingPullIntos]]`. This is not observable: the count
-        // is only reduced by these commits (which fulfill read-into requests via
-        // queued reactions, never synchronous author code), so committing each
-        // descriptor as it is shifted is equivalent to shifting all then
-        // committing all.
+        // commits them. A shifted descriptor is no longer traced by the controller
+        // and committing it can GC, so we shift and commit one descriptor at a time,
+        // each in a `RootedTraceableBox`. Only these commits reduce the count, and
+        // they fulfill read-into requests through queued reactions, so the order is
+        // not observable.
         let num_read_into_requests = readable_stream_get_num_read_into_requests(scope, &stream);
         for _ in 0..num_read_into_requests {
             let descriptor = RootedTraceableBox::new(

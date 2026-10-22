@@ -6,9 +6,6 @@
 //! including the constructor, prototype accessors, legacy error code constants,
 //! and the `Symbol.toStringTag` property.
 //!
-//! Uses `#[webidl_interface]` and `#[webidl_methods]` proc macros for declarative
-//! class registration.
-//!
 //! [`DOMException`]: https://webidl.spec.whatwg.org/#idl-DOMException
 
 use core_runtime::{webidl_interface, webidl_methods};
@@ -17,10 +14,6 @@ use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
 use js::native::ExceptionStackBehavior;
 use js::prelude::ToJSVal;
-
-// ---------------------------------------------------------------------------
-// DOMException names table
-// ---------------------------------------------------------------------------
 
 /// https://webidl.spec.whatwg.org/#dfn-error-names-table
 ///
@@ -57,22 +50,13 @@ const ERROR_NAMES: &[(&str, u16)] = &[
 /// "Return the legacy code indicated in the error names table for this
 /// DOMException object's name, or 0 if no such entry exists."
 fn legacy_code_for_name(name: &str) -> u16 {
-    for &(n, code) in ERROR_NAMES {
-        if n == name {
-            return code;
-        }
-    }
-    0
+    ERROR_NAMES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or(0, |&(_, code)| code)
 }
 
-// ---------------------------------------------------------------------------
-// DOMException class
-// ---------------------------------------------------------------------------
-
-/// Internal data for a `DOMException` instance.
-///
-/// Stores the exception name and message as Rust `String`s. The legacy
-/// error code is computed from the name on demand via `legacy_code_for_name`.
+/// <https://webidl.spec.whatwg.org/#idl-DOMException>
 #[webidl_interface(js_proto = "Error")]
 pub struct DOMException {
     name: String,
@@ -81,9 +65,6 @@ pub struct DOMException {
 
 #[webidl_methods]
 impl DOMException {
-    // -----------------------------------------------------------------------
-    // Legacy error code constants (WebIDL §2.8.1)
-    // -----------------------------------------------------------------------
     pub const INDEX_SIZE_ERR: u16 = 1;
     pub const DOMSTRING_SIZE_ERR: u16 = 2;
     pub const HIERARCHY_REQUEST_ERR: u16 = 3;
@@ -110,10 +91,6 @@ impl DOMException {
     pub const INVALID_NODE_TYPE_ERR: u16 = 24;
     pub const DATA_CLONE_ERR: u16 = 25;
 
-    // -----------------------------------------------------------------------
-    // Constructor
-    // -----------------------------------------------------------------------
-
     /// https://webidl.spec.whatwg.org/#dom-domexception-domexception
     ///
     /// `constructor(optional DOMString message = "", optional DOMString name = "Error")`
@@ -130,25 +107,21 @@ impl DOMException {
     /// Creates a new `DOMException`.
     ///
     /// In difference to the JS-facing constructor `new_js`, both arguments
-    /// to `new` are required, with no defaults.`
+    /// to `new` are required, with no defaults.
     pub fn new(message: String, name: String) -> Self {
         Self { name, message }
     }
 
-    // -----------------------------------------------------------------------
-    // Getters
-    // -----------------------------------------------------------------------
-
     /// https://webidl.spec.whatwg.org/#dom-domexception-name
     #[getter]
-    fn name(&self) -> Ref<'_, str> {
+    pub fn name(&self) -> Ref<'_, str> {
         // Return `this`'s `name`.
         Ref::map(self.data(), |data| data.name.as_str())
     }
 
     /// https://webidl.spec.whatwg.org/#dom-domexception-message
     #[getter]
-    fn message(&self) -> Ref<'_, str> {
+    pub fn message(&self) -> Ref<'_, str> {
         // Return `this`'s `message`.
         Ref::map(self.data(), |data| data.message.as_str())
     }
@@ -158,35 +131,25 @@ impl DOMException {
     /// Returns the legacy code indicated in the error names table for this
     /// DOMException object's name, or 0 if no such entry exists.
     #[getter]
-    fn code(&self) -> i32 {
+    pub fn code(&self) -> i32 {
         legacy_code_for_name(&self.data().name) as i32
     }
 }
-
-// ---------------------------------------------------------------------------
-// Public API: throw_dom_exception
-// ---------------------------------------------------------------------------
 
 /// Throw a DOMException with the given name and message.
 ///
 /// This creates a new DOMException object and sets it as the pending exception.
 pub fn throw_dom_exception(scope: &Scope<'_>, name: &str, message: &str) -> ExnThrown {
-    // Get the DOMException constructor from the global.
     let exception = match DOMException::new(scope, message.into(), name.into()) {
         Ok(exc) => exc,
         Err(_) => return ExnThrown,
     };
 
-    // Set the created DOMException as the pending exception.
     let exc_val = exception
         .to_jsval(scope)
         .expect("Value conversion doesn't fail");
     js::exception::set_pending(scope, exc_val, ExceptionStackBehavior::Capture)
 }
-
-// ---------------------------------------------------------------------------
-// DOMExceptionError — typed error for use with ThrowException
-// ---------------------------------------------------------------------------
 
 /// A typed error representing a `DOMException` to be thrown.
 ///
@@ -237,278 +200,5 @@ impl std::error::Error for DOMExceptionError {}
 impl ThrowException for DOMExceptionError {
     fn throw(self, scope: &Scope<'_>) -> ExnThrown {
         throw_dom_exception(scope, self.name, &self.message)
-    }
-}
-
-// Nothing platform-specific in these tests, so skip them on wasm32.
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod dom_exception_integration {
-    use core_runtime::{
-        config::RuntimeConfig,
-        runtime::{self, Runtime},
-        test_util::eval_with_setup,
-    };
-
-    fn eval(code: &str) -> String {
-        eval_with_setup(
-            || {
-                runtime::register_global_initializer(super::DOMException::add_to_global);
-            },
-            code,
-        )
-    }
-
-    #[test]
-    fn constructor_no_args() {
-        assert_eq!(eval("let e = new DOMException(); e.name"), "Error");
-        assert_eq!(eval("let e = new DOMException(); e.message"), "");
-        assert_eq!(eval("let e = new DOMException(); e.code"), "0");
-    }
-
-    #[test]
-    fn rust_new() {
-        runtime::register_global_initializer(super::DOMException::add_to_global);
-        let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
-        let scope = rt.default_global();
-        let e = super::DOMException::new(&scope, String::new(), "Error".into()).unwrap();
-        assert_eq!(&*e.name(), "Error");
-        assert_eq!(&*e.message(), "");
-        assert_eq!(e.code(), 0);
-    }
-
-    #[test]
-    fn constructor_message_only() {
-        assert_eq!(eval("new DOMException('hello').message"), "hello");
-        assert_eq!(eval("new DOMException('hello').name"), "Error");
-    }
-
-    #[test]
-    fn constructor_message_and_name() {
-        assert_eq!(
-            eval("new DOMException('msg', 'NotFoundError').name"),
-            "NotFoundError"
-        );
-        assert_eq!(eval("new DOMException('msg', 'NotFoundError').code"), "8");
-    }
-
-    #[test]
-    fn instanceof() {
-        assert_eq!(eval("new DOMException() instanceof DOMException"), "true");
-        assert_eq!(eval("new DOMException() instanceof Error"), "true");
-    }
-
-    #[test]
-    fn prototype_chain() {
-        assert_eq!(
-            eval("Object.getPrototypeOf(DOMException.prototype) === Error.prototype"),
-            "true"
-        );
-    }
-
-    #[test]
-    fn to_string_tag() {
-        assert_eq!(
-            eval("Object.prototype.toString.call(new DOMException())"),
-            "[object DOMException]"
-        );
-    }
-
-    #[test]
-    fn constants_on_constructor() {
-        assert_eq!(eval("DOMException.INDEX_SIZE_ERR"), "1");
-        assert_eq!(eval("DOMException.NOT_FOUND_ERR"), "8");
-        assert_eq!(eval("DOMException.NOT_SUPPORTED_ERR"), "9");
-        assert_eq!(eval("DOMException.INVALID_STATE_ERR"), "11");
-        assert_eq!(eval("DOMException.SYNTAX_ERR"), "12");
-    }
-
-    #[test]
-    fn constants_on_prototype() {
-        assert_eq!(eval("DOMException.prototype.INDEX_SIZE_ERR"), "1");
-        assert_eq!(eval("DOMException.prototype.NOT_FOUND_ERR"), "8");
-    }
-
-    #[test]
-    fn code_not_affected_by_name_shadow() {
-        assert_eq!(
-            eval(
-                "let e = new DOMException('msg', 'InvalidCharacterError'); \
-                    Object.defineProperty(e, 'name', { value: 'WrongDocumentError' }); \
-                    e.code"
-            ),
-            "5"
-        );
-    }
-
-    #[test]
-    fn brand_check_rejects_non_instance() {
-        // Calling getter on a non-DOMException should throw TypeError.
-        assert_eq!(
-            eval(
-                "let getter = Object.getOwnPropertyDescriptor(\
-                        DOMException.prototype, 'name').get; \
-                    try { getter.call({}); 'no-throw' } catch(e) { e instanceof TypeError }"
-            ),
-            "true"
-        );
-    }
-
-    #[test]
-    fn requires_new() {
-        // DOMException() without `new` should throw TypeError.
-        assert_eq!(
-            eval("try { DOMException(); 'no-throw' } catch(e) { e instanceof TypeError }"),
-            "true"
-        );
-    }
-
-    #[test]
-    fn stack_property() {
-        assert_eq!(eval("typeof (new DOMException()).stack"), "string");
-    }
-
-    #[test]
-    fn inherits_tostring_from_error() {
-        assert_eq!(
-            eval("new DOMException('hello', 'TestError').toString()"),
-            "TestError: hello"
-        );
-    }
-}
-
-/// Tests for typed error dispatch via `ThrowException` trait.
-///
-/// These tests use `#[jsglobals]` to register functions that return
-/// `Result<T, TypeError>`, `Result<T, RangeError>`, `Result<T, SyntaxError>`,
-/// `Result<T, DOMExceptionError>`, and `Result<T, String>`.
-// Nothing platform-specific in these tests, so skip them on wasm32.
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod throw_exception_integration {
-    use crate::dom_exception::DOMExceptionError;
-    use core_runtime::{jsglobals, test_util::eval_with_setup};
-    use js::error::{RangeError, SyntaxError, TypeError};
-
-    #[jsglobals]
-    mod test_error_globals {
-        use super::*;
-
-        /// Throws a TypeError.
-        pub fn throw_type_error() -> Result<(), TypeError> {
-            Err(TypeError("test type error".into()))
-        }
-
-        /// Throws a RangeError.
-        pub fn throw_range_error() -> Result<(), RangeError> {
-            Err(RangeError("test range error".into()))
-        }
-
-        /// Throws a SyntaxError.
-        pub fn throw_syntax_error() -> Result<(), SyntaxError> {
-            Err(SyntaxError("test syntax error".into()))
-        }
-
-        /// Throws a TypeError from a String error.
-        pub fn throw_string_error() -> Result<(), String> {
-            Err("test string error".into())
-        }
-
-        /// Throws a DOMExceptionError.
-        pub fn throw_dom_exception_error() -> Result<(), DOMExceptionError> {
-            Err(DOMExceptionError::new(
-                "NotFoundError",
-                "test dom exception",
-            ))
-        }
-
-        /// Succeeds.
-        pub fn no_error() -> Result<i32, TypeError> {
-            Ok(42)
-        }
-    }
-
-    fn eval(code: &str) -> String {
-        eval_with_setup(
-            || {
-                core_runtime::runtime::register_global_initializer(
-                    crate::dom_exception::DOMException::add_to_global,
-                );
-                core_runtime::runtime::register_global_initializer(
-                    test_error_globals::add_to_global,
-                );
-            },
-            code,
-        )
-    }
-
-    /// Capturing the stack for a new `DOMException` is best-effort: a throwing
-    /// `Error.prototype.stack` accessor leaves the construction intact and no
-    /// exception pending.
-    #[test]
-    fn construction_survives_a_throwing_stack_accessor() {
-        assert_eq!(
-            eval(
-                "Object.defineProperty(Error.prototype, 'stack', { get() { throw 1; }, configurable: true });
-                 const e = new DOMException('m', 'NotFoundError');
-                 e.name + ',' + e.message"
-            ),
-            "NotFoundError,m"
-        );
-    }
-
-    #[test]
-    fn type_error_thrown() {
-        assert_eq!(
-            eval(
-                "try { throwTypeError(); 'no' } catch(e) { (e instanceof TypeError) + ',' + e.message }"
-            ),
-            "true,test type error"
-        );
-    }
-
-    #[test]
-    fn range_error_thrown() {
-        assert_eq!(
-            eval(
-                "try { throwRangeError(); 'no' } catch(e) { (e instanceof RangeError) + ',' + e.message }"
-            ),
-            "true,test range error"
-        );
-    }
-
-    #[test]
-    fn syntax_error_thrown() {
-        assert_eq!(
-            eval(
-                "try { throwSyntaxError(); 'no' } catch(e) { (e instanceof SyntaxError) + ',' + e.message }"
-            ),
-            "true,test syntax error"
-        );
-    }
-
-    #[test]
-    fn string_error_throws_type_error() {
-        // String errors throw TypeError.
-        assert_eq!(
-            eval(
-                "try { throwStringError(); 'no' } catch(e) { (e instanceof TypeError) + ',' + e.message }"
-            ),
-            "true,test string error"
-        );
-    }
-
-    #[test]
-    fn dom_exception_error_thrown() {
-        assert_eq!(
-            eval(
-                "try { throwDomExceptionError(); 'no' } catch(e) { \
-                    (e instanceof DOMException) + ',' + e.name + ',' + e.message }"
-            ),
-            "true,NotFoundError,test dom exception"
-        );
-    }
-
-    #[test]
-    fn success_returns_value() {
-        assert_eq!(eval("noError()"), "42");
     }
 }

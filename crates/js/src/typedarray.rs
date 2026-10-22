@@ -62,7 +62,7 @@ use mozjs::typedarray::{
     Uint16, Uint32, Uint8,
 };
 
-use super::error::ExnThrown;
+use super::error::{ExnThrown, OutOfMemory, ThrowException};
 
 // ---------------------------------------------------------------------------
 // ArrayBuffer
@@ -1014,10 +1014,7 @@ unsafe fn slice_from_parts_mut<'a, T>((ptr, len): (*mut T, usize)) -> &'a mut [T
 
 /// Returns `copy`, or, if it is `None`, an out-of-memory error reported on `scope`.
 fn copy_or_report(scope: &Scope<'_>, copy: Option<Vec<u8>>) -> Result<Vec<u8>, ExnThrown> {
-    copy.ok_or_else(|| {
-        crate::exception::report_out_of_memory(scope);
-        ExnThrown
-    })
+    copy.ok_or_else(|| OutOfMemory.throw(scope))
 }
 
 /// Get the data pointer of a freshly created (and therefore non-detached,

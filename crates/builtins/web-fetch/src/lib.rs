@@ -26,8 +26,8 @@ pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     // `fetchLater()` / `FetchLaterResult` are deliberately not exposed: the API is
     // `[Exposed=Window]`-only and unimplemented here.
 
-    // `AbortFetchState` is an internal state object (the fetch abort algorithm), created via
-    // `create_instance_with` (so its prototype must be registered) but not web-exposed.
+    // The internal classes below are registered so instances can be created, and are not
+    // web-exposed.
     abort::AbortFetchState::add_to_global(scope, global);
     incoming_body::HostBodySource::add_to_global(scope, global);
     outgoing_body::OutgoingBodyPump::add_to_global(scope, global);

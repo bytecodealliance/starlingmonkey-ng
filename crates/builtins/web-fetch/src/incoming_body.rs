@@ -81,8 +81,8 @@ pub(crate) fn consume_host_body<'r>(
 /// in-flight chunk read, kept so an abort can cancel that read (dropping it
 /// closes the host connection).
 ///
-/// A pull can be deferred: if this body feeds an identity transform nobody has
-/// read yet, the host body is left whole. If the TS's readable end ends up being
+/// A pull can be deferred: if this body feeds an identity transform that has not
+/// been read yet, the host body is left whole. If the TS's readable end ends up being
 /// used as an outgoing body (or otherwise as a stream passed to the host), this
 /// body's stream can be used directly. See [`host_pull`].
 #[jsclass(hidden)]
@@ -144,12 +144,6 @@ impl HostBodySource<'_> {
         self.data_mut().host_body = None;
     }
 
-    /// See [`ReadableStream::deferred_demand`].
-    fn deferred_demand<'r>(&self, scope: &'r Scope<'_>) -> Option<Promise<'r>> {
-        let stream = self.data().stream.get(scope)?;
-        stream.deferred_demand(scope)
-    }
-
     /// Settle a deferred pull, if there is one, so the stream stops waiting on a
     /// read that is no longer coming.
     fn settle_deferred_pull(&self, scope: &Scope<'_>, close: CloseStream) {
@@ -199,15 +193,6 @@ pub(crate) trait HostBackedBodyOwner {
     /// stream exists it owns the body, and the caller has nothing to do.
     fn take_unread_host_body(&self) -> Option<IncomingBody> {
         self.with_body(|body| body.stream.is_none().then(|| body.host.take())?)
-    }
-
-    /// Store the stream the host body materialized into, and its native source.
-    fn set_host_body_stream(&self, stream: ReadableStream<'_>, source: HostBodySource<'_>) {
-        self.with_body(|body| {
-            debug_assert!(body.stream.is_none());
-            body.stream = Some(Heap::from(stream));
-            body.source = Some(Heap::from(source));
-        });
     }
 
     /// The body record, if this object has a body. A copy: a [`BodySource::Bytes`] it carries is
@@ -297,7 +282,11 @@ pub(crate) fn materialize_host_body(
         return Ok(());
     };
     let (stream, source) = host_body_stream(scope, host_body)?;
-    object.set_host_body_stream(stream, source);
+    object.with_body(|body| {
+        debug_assert!(body.stream.is_none());
+        body.stream = Some(Heap::from(stream));
+        body.source = Some(Heap::from(source));
+    });
     Ok(())
 }
 
@@ -334,12 +323,13 @@ fn host_pull(
 ) -> Result<Value, ExnThrown> {
     let state = cast_payload::<HostBodySource>(scope, payload);
     let promise = Promise::new_pending(scope)?;
-    // Only an active event loop drives the host read, and a rejected pull errors the stream.
+    // Only an active event loop drives the host read. A rejected pull errors the stream.
     if core_runtime::event_loop::reject_without_event_loop(scope, &promise, "reading a body")? {
         return Ok(promise.as_value());
     }
     let controller = ReadableStreamDefaultController::from_jsval_throwing(scope, args.get(0), ())?;
-    if let Some(demand) = state.deferred_demand(scope) {
+    let stream = state.data().stream.get(scope);
+    if let Some(demand) = stream.and_then(|stream| stream.deferred_demand(scope)) {
         state.data_mut().deferred_pull = Some(Heap::from(promise));
         state.data_mut().deferred_controller = Some(Heap::from(controller));
         let resume = Function::new_callback(scope, c"", 0, host_pull_resume, state)?;

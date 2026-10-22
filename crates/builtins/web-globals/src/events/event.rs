@@ -284,7 +284,7 @@ impl Event {
     }
 
     /// Whether the event's dispatch flag is set (it is currently being
-    /// dispatched). Read by guards like `FetchEvent.respondWith` step 2.
+    /// dispatched).
     pub fn is_dispatching(&self) -> bool {
         self.data().flags.contains(EventFlags::DISPATCH)
     }

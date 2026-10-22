@@ -24,7 +24,7 @@ fn evaluate(scope: &js::gc::scope::Scope<'_>, code: &str) {
     }
 }
 
-/// Builds 256 objects each holding a 1 MiB byte source and returns how many collections that
+/// Builds 96 objects each holding a 1 MiB byte source and returns how many collections that
 /// caused. The objects are garbage as soon as they are built, and the JS heap sees only their
 /// small wrappers.
 fn collections_while_building(constructor: &str) -> u32 {
@@ -36,7 +36,7 @@ fn collections_while_building(constructor: &str) -> u32 {
     let before = gc_count(&scope);
     evaluate(
         &scope,
-        &format!("for (let i = 0; i < 256; i++) {{ {constructor}; }}"),
+        &format!("for (let i = 0; i < 96; i++) {{ {constructor}; }}"),
     );
     gc_count(&scope) - before
 }

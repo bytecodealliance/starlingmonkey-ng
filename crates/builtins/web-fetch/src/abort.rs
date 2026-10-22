@@ -56,10 +56,10 @@ impl AbortFetchState<'_> {
     /// One with a body detaches it once that body has been read (see
     /// `Response::consume`), since aborting mid-read must still error the stream.
     pub(crate) fn deliver(&self, scope: &Scope<'_>, response: &Response<'_>) {
-        if response_body_is_abortable(scope, response) {
+        if response.body_is_abortable(scope) {
             debug_assert!(self.data().response.is_none());
             self.data_mut().response = Some(Heap::from(*response));
-            response.set_abort_state(self);
+            response.data_mut().abort_state = Some(Heap::from(*self));
         } else {
             self.detach(scope);
         }
@@ -83,14 +83,6 @@ impl AbortFetchState<'_> {
     }
 }
 
-/// Whether a delivered response still has something an abort could act on: an
-/// unread host body, or a `.body` stream that has not finished.
-///
-/// Once neither is true, aborting is a no-op, so the algorithm can be detached.
-pub(crate) fn response_body_is_abortable(scope: &Scope<'_>, response: &Response<'_>) -> bool {
-    response.has_unread_host_body() || response.body_stream_is_unfinished(scope)
-}
-
 /// <https://fetch.spec.whatwg.org/#abort-fetch>
 /// To abort a fetch() call with a promise, request, responseObject, and an error:
 pub(crate) fn abort_fetch(
@@ -101,7 +93,7 @@ pub(crate) fn abort_fetch(
     error: HandleValue<'_>,
 ) -> Result<(), ExnThrown> {
     // Step 1: `Reject` _promise_ with _error_.
-    // Note: This is a no-op if _promise_ has already fulfilled.
+    // Note: This does nothing if _promise_ has already fulfilled.
     promise.reject(scope, error)?;
 
     // Step 2: If _request_’s `body` is non-null and is `readable`, then `cancel` _request_’s `body`

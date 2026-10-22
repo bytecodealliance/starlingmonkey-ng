@@ -409,9 +409,7 @@ name = "cpp-builtins"
 version = "0.3.0"
 dependencies = [
  "cc",
- "core-runtime",
  "js",
- "libstarling",
  "mozjs",
  "mozjs_sys",
 ]

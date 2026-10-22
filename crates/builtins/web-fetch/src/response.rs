@@ -196,7 +196,7 @@ impl Response {
         })
     }
 
-    /// Returns a reference to the [`Url`] of this response.
+    /// The response's URL.
     pub fn url(&self) -> Option<Url> {
         self.data().response.url().cloned()
     }
@@ -273,12 +273,11 @@ impl Response {
         // Step 3: Return the result of `creating` a `Response` object, given _clonedResponse_,
         //     `this`’s `headers`’s `guard`, and `this`’s `relevant realm`.
         let headers = self.headers(scope);
-        let header_list = headers.data().header_list.clone();
         let guard = headers.data().guard;
         algorithms::create_a_response_object(
             scope,
             new_response,
-            header_list,
+            headers.list(),
             guard,
             cloned_body,
             cloned_stream,
@@ -458,33 +457,16 @@ impl Response<'_> {
         self.sync_body_accounting();
     }
 
-    /// Whether a host body is still sitting unread on this response.
-    pub(crate) fn has_unread_host_body(&self) -> bool {
-        self.data().body.host.is_some()
-    }
-
-    /// Remember the `fetch` abort algorithm's state, so consuming the body can detach it.
-    pub(crate) fn set_abort_state(&self, state: &crate::abort::AbortFetchState<'_>) {
-        self.data_mut().abort_state = Some(Heap::from(*state));
-    }
-
-    /// The body has been consumed, so an abort can no longer affect it: detach the `fetch` abort
-    /// algorithm from its signal.
-    fn detach_abort_state(&self, scope: &Scope<'_>) {
-        let state = self.data_mut().abort_state.take_rooted(scope);
-        if let Some(state) = state {
-            state.detach(scope);
-        }
-    }
-
-    /// Whether this response's `.body` stream exists and has not finished, i.e. erroring it
-    /// would still have an observable effect.
-    pub(crate) fn body_stream_is_unfinished(&self, scope: &Scope<'_>) -> bool {
-        self.data()
-            .body
-            .stream
-            .get(scope)
-            .is_some_and(|stream| stream.is_readable())
+    /// Whether an abort can still act on this response's body: it has an unread host body, or a
+    /// `.body` stream that is still readable.
+    pub(crate) fn body_is_abortable(&self, scope: &Scope<'_>) -> bool {
+        let data = self.data();
+        data.body.host.is_some()
+            || data
+                .body
+                .stream
+                .get(scope)
+                .is_some_and(|stream| stream.is_readable())
     }
 
     /// Abort this response's body: error its `.body` stream with `reason` (so pending reads
@@ -671,7 +653,10 @@ impl BodyMixin for Response<'_> {
     /// The body is being read to completion, so an abort can no longer error it:
     /// drop the `fetch` abort algorithm that was keeping this response alive.
     fn on_body_consumed(&self, scope: &Scope<'_>) {
-        self.detach_abort_state(scope);
+        let state = self.data_mut().abort_state.take_rooted(scope);
+        if let Some(state) = state {
+            state.detach(scope);
+        }
     }
 }
 
@@ -692,12 +677,7 @@ impl HostBackedBodyOwner for Response<'_> {
 impl Response<'_> {
     /// Returns a copy of the response's header list.
     pub fn headers_list(&self, scope: &Scope<'_>) -> Vec<(String, String)> {
-        self.headers(scope)
-            .data()
-            .header_list
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
+        self.headers(scope).list()
     }
 
     /// The response's body as a [`platform::http::OutgoingBody`] for sending on the wire, on the

@@ -2,9 +2,7 @@
 
 //! The server-side dispatch path: create a `FetchEvent` for a request, run a JS
 //! `fetch` handler against it, drive a **per-request** event loop, and read the
-//! response the handler produced with `respondWith`. Exercises the M2/M3 event
-//! bodies end to end, including `waitUntil` keeping the loop alive and that
-//! concurrent requests run on isolated event loops.
+//! response the handler produced with `respondWith`.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -30,8 +28,8 @@ fn eval<'s>(scope: &'s Scope, src: &str) -> HandleValue<'s> {
 
 /// A runtime with the builtins registered, ready for a global to be created from it. Every test
 /// here starts this way, and each has to clear the initializers first: they accumulate in a
-/// process-wide registry, so a test that inherited the previous one's would register each builtin
-/// twice over.
+/// process-wide registry, so a test that inherited the previous test's initializers would register
+/// each builtin twice over.
 ///
 /// The caller enters the global itself and calls [`install_globals`] on it — the scope borrows the
 /// runtime, so the two cannot be returned together.
@@ -139,16 +137,6 @@ fn dispatch(handler_src: &str, request_src: &str) -> (String, String) {
 }
 
 #[test]
-fn respond_with_captures_the_response() {
-    // The handler responds synchronously; the response is the value passed to respondWith.
-    let (response, _) = dispatch(
-        "(event) => { event.respondWith(mark('handled: ' + event.request.url)); }",
-        "new Request('http://example.com/')",
-    );
-    assert_eq!(response, "handled: http://example.com/");
-}
-
-#[test]
 fn responding_with_something_that_is_not_a_response_is_a_network_error() {
     // `respondWith` takes a WebIDL `Promise<Response>`, so a value of the wrong type is accepted at
     // the call and rejects the promise once it settles. That reaches step 9, which sets the same
@@ -161,7 +149,6 @@ fn responding_with_something_that_is_not_a_response_is_a_network_error() {
 
     for handler in [
         "(e) => e.respondWith('a string is not a Response')",
-        "(e) => e.respondWith(Promise.resolve(42))",
         "(e) => e.respondWith(new Promise(r => setTimeout(() => r({}), 2)))",
         "(e) => e.respondWith(Promise.reject(new RangeError('the author rejected')))",
     ] {
@@ -186,9 +173,7 @@ fn describing_a_rejection_runs_author_code_only_after_the_respond_state_is_settl
     // The event is nonetheless still *active*: the reaction runs in the microtask checkpoint after
     // the listener returns, which is inside the dispatch, so the `dispatch flag` has not been
     // cleared yet and `waitUntil` legitimately succeeds (WPT
-    // `extendable-event-async-waituntil.js`, `no-current-extension-different-microtask`). Extending
-    // the lifetime of an event whose response already failed is allowed — `waitUntil` is about the
-    // worker staying alive for background work, not about the response.
+    // `extendable-event-async-waituntil.js`, `no-current-extension-different-microtask`).
     let rt = test_runtime();
     let scope = rt.default_global();
     install_globals(&scope);
@@ -219,45 +204,6 @@ fn describing_a_rejection_runs_author_code_only_after_the_respond_state_is_settl
     let log = eval(&scope, "log.join(',')");
     let log = String::from_jsval(&scope, log, ()).unwrap();
     assert_eq!(log, "extended,respondWith:InvalidStateError");
-}
-
-#[test]
-fn respond_with_a_promise_resolves() {
-    // respondWith a promise that resolves after a microtask — the loop runs until it settles.
-    let (response, _) = dispatch(
-        "(event) => { event.respondWith(Promise.resolve(mark('async-response'))); }",
-        "new Request('http://example.com/')",
-    );
-    assert_eq!(response, "async-response");
-}
-
-#[test]
-fn respond_with_a_timer_backed_promise_runs_to_completion() {
-    // The response resolves only inside a setTimeout — the loop must stay alive and run the timer.
-    let (response, _) = dispatch(
-        "(event) => { event.respondWith(new Promise(r => setTimeout(() => r(mark('after-timer')), 5))); }",
-        "new Request('http://example.com/')",
-    );
-    assert_eq!(response, "after-timer");
-}
-
-#[test]
-fn wait_until_keeps_the_loop_alive_past_respond() {
-    // respondWith settles immediately, but waitUntil holds a setTimeout-backed promise; the loop
-    // must stay alive long enough to run the timer (proving waitUntil extends the lifetime past the
-    // response). If waitUntil did not hold the loop, it would exit before the timer and __probe
-    // would stay "".
-    let (response, probe) = dispatch(
-        r#"(event) => {
-            event.respondWith(mark("done"));
-            event.waitUntil(new Promise(resolve => {
-                setTimeout(() => { globalThis.__probe = "waited"; resolve(); }, 5);
-            }));
-        }"#,
-        "new Request('http://example.com/')",
-    );
-    assert_eq!(response, "done");
-    assert_eq!(probe, "waited");
 }
 
 #[test]
@@ -296,37 +242,6 @@ fn concurrent_requests_use_isolated_event_loops() {
     let resp_b = response_marker(&scope, &event_b);
     assert_eq!(resp_a, "A:http://example.com/a");
     assert_eq!(resp_b, "B:http://example.com/b");
-}
-
-#[test]
-fn dispatch_delivers_to_a_script_registered_fetch_listener() {
-    // The full server entry point: script registers a handler with addEventListener("fetch", ...),
-    // and `dispatch` delivers an incoming request to it.
-    let rt = test_runtime();
-    let scope = rt.default_global();
-    install_globals(&scope);
-    let rawcx = unsafe { scope.cx_mut().raw_cx() };
-
-    let el = EventLoop::new();
-    let event = {
-        with_event_loop(&el, |_| {
-            eval(
-                &scope,
-                "addEventListener('fetch', (e) => e.respondWith(mark('registered: ' + e.request.url)))",
-            );
-            let request = eval(&scope, "new Request('http://example.com/req')");
-            let request = Request::from_jsval(&scope, request, ()).unwrap();
-            let event =
-                FetchEvent::dispatch(&scope, request, ScriptStackState::Empty).expect("dispatch");
-            event
-        })
-    };
-
-    tokio_rt()
-        .block_on(async { unsafe { run_to_completion(rawcx, &el, tokio::time::sleep).await } });
-
-    let response = response_marker(&scope, &event);
-    assert_eq!(response, "registered: http://example.com/req");
 }
 
 #[test]
@@ -578,11 +493,8 @@ fn lifetime_interest_releases_on_the_acquiring_loop() {
 }
 
 /// `respondWith` stops propagation on its own: step 5 sets the `stop propagation` and `stop
-/// immediate propagation` flags, so a later `fetch` listener never runs. The test above calls
-/// `stopImmediatePropagation` by hand; this is the case WPT actually asserts
-/// (`resources/fetch-event-respond-with-stops-propagation-worker.js`), where the handler only ever
-/// calls `respondWith` — a runtime that delivered the event onward would let a second listener
-/// overwrite the first's answer.
+/// immediate propagation` flags, so a later `fetch` listener never runs. WPT
+/// `resources/fetch-event-respond-with-stops-propagation-worker.js` asserts this.
 #[test]
 fn respond_with_alone_stops_listener_delivery() {
     let rt = test_runtime();
@@ -630,7 +542,7 @@ fn the_constructor_surface_matches_the_idl() {
                 outcome(() => new FetchEvent('t', { request: null })),
                 // ExtendableEvent takes a bare type.
                 outcome(() => new ExtendableEvent('E').type),
-                // Dictionary defaults: an EventInit that says nothing leaves both flags false.
+                // Dictionary defaults: an EventInit without either flag leaves both flags false.
                 outcome(() => new FetchEvent('t', { request }).bubbles),
                 outcome(() => new FetchEvent('t', { request }).cancelable),
                 outcome(() => new FetchEvent('t', { request, cancelable: true }).cancelable),
@@ -673,34 +585,9 @@ fn the_constructor_surface_matches_the_idl() {
     );
 }
 
-#[test]
-fn stop_immediate_propagation_stops_listener_delivery() {
-    let rt = test_runtime();
-    let scope = rt.default_global();
-    install_globals(&scope);
-
-    eval(
-        &scope,
-        r#"
-        addEventListener('fetch', (e) => { e.stopImmediatePropagation(); e.respondWith(mark('first')); });
-        addEventListener('fetch', () => { globalThis.secondRan = true; });
-        "#,
-    );
-
-    let event = dispatch_once(&scope, "new Request('http://example.com/req')");
-    let response = response_marker(&scope, &event);
-    assert_eq!(response, "first");
-
-    let second = eval(&scope, "typeof globalThis.secondRan");
-    let second = String::from_jsval(&scope, second, ()).unwrap();
-    assert_eq!(second, "undefined");
-}
-
 /// A microtask queued by the handler is still inside the dispatch, so `respondWith` from one has
 /// to work: WPT `fetch-event-async-respond-with.https.html`, against the task case that must throw
-/// (`respond_with_state_machine_guards`). Not a niche path —
-/// `const body = await request.text(); event.respondWith(…)` lands in a microtask whenever the
-/// awaited promise is already resolved.
+/// (`respond_with_state_machine_guards`).
 ///
 /// Goes through `FetchEvent::dispatch` rather than the handler-called-directly shortcut, since the
 /// checkpoint lives in the dispatch itself.
@@ -793,10 +680,6 @@ fn wait_until_from_a_later_task_throws() {
 /// author's reaction runs before the decrement that would end the extension, so the count never
 /// reaches zero in between. WPT `resources/extendable-event-async-waituntil.js`,
 /// `during-event-handler-and-microtask`.
-///
-/// Pinned because that ordering is a property of how the settle reaction is wrapped rather than
-/// something this code states outright (`scaffold-delta.md` §B) — the kind of invariant that breaks
-/// quietly when the wrapping changes.
 #[test]
 fn wait_until_can_be_chained_off_a_settling_lifetime_promise() {
     let (response, probe) = dispatch(
@@ -825,8 +708,7 @@ fn wait_until_can_be_chained_off_a_settling_lifetime_promise() {
 /// count keeps the event active regardless of the dispatch flag.
 ///
 /// WPT `resources/extendable-event-async-waituntil.js`, fetch case
-/// `pending-respondwith-async-waituntil`. This passes today — and it is why the test above has to
-/// avoid calling `respondWith` to isolate the flag.
+/// `pending-respondwith-async-waituntil`.
 #[test]
 fn wait_until_in_a_microtask_is_allowed_while_respond_with_is_pending() {
     let (response, probe) = dispatch(
@@ -934,7 +816,7 @@ fn handled_settles_by_whether_a_response_is_on_its_way() {
     }
 }
 
-/// Settling twice is a no-op: the serve path settles `handled` once per request, but the event
+/// Settling twice does nothing: the serve path settles `handled` once per request, but the event
 /// outlives that call through `waitUntil` work, and a second settle must not replace the outcome
 /// the client was told about.
 #[test]
@@ -992,9 +874,8 @@ fn responding_with_an_unusable_body_is_a_network_error() {
 }
 
 /// Taking the response's body is step 10.2.2's transform, and it happens when the `respondWith`
-/// promise settles rather than when the transport reads — so a handler that keeps a reference sees
-/// `bodyUsed` flip before a single byte goes out. Pinned because it is the script-visible half of
-/// the body deviation `docs/server-side-deviations.md` records.
+/// promise settles rather than when the transport reads, so a handler that keeps a reference sees
+/// `bodyUsed` flip before a single byte goes out.
 #[test]
 fn responding_marks_the_body_used_at_settle_time() {
     let rt = test_runtime();

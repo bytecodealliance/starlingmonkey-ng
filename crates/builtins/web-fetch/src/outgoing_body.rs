@@ -17,7 +17,6 @@
 
 use core_runtime::jsclass;
 use core_runtime::jsmethods;
-use js::class::create_instance_with;
 use js::conversion::FromJSVal;
 use js::error::ExnThrown;
 use js::gc::handle::{Heap, RootedHeap};
@@ -34,16 +33,10 @@ use web_streams::readable::readable_stream::ReadableStream;
 
 use crate::incoming_body::HostBackedBodyOwner;
 
-/// A running tally of how outgoing bodies reached the transport.
+/// Counts of how outgoing bodies reached the transport, for tests.
 ///
-/// Whether a host body is handed to the wire whole or pumped through JS chunk by chunk is
-/// deliberately not observable from content — both deliver the same bytes, leave the donor stream
-/// locked and disturbed, and read only internally. That also means losing the shortcut is invisible:
-/// every byte would start travelling through JS and nothing would fail. These counters are the one
-/// place that difference is visible, so a test can hold the choice in place.
-///
-/// Whether an in-memory body's owner let go of its buffer on the way out is invisible the same way:
-/// the same bytes reach the wire either way, and only how long the buffer outlives them differs.
+/// Content cannot observe whether a host body was handed to the transport whole or pumped through
+/// JS, or whether an in-memory body's owner released its buffer when handing it over.
 pub mod paths_taken {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -85,8 +78,8 @@ pub mod paths_taken {
         match body {
             platform::http::OutgoingBody::Host(_) => &SHORTCUT,
             platform::http::OutgoingBody::Stream(_) => &PUMPED,
-            // Empty ones sit out: there is no buffer to hold on to, and `Bytes::is_unique` answers
-            // for the static one an empty body carries as though it were shared.
+            // Empty ones sit out: there is no buffer to hold on to, and `Bytes::is_unique` returns
+            // `false` for the static buffer of an empty body.
             platform::http::OutgoingBody::Bytes(bytes) if !bytes.is_empty() => {
                 if bytes.is_unique() {
                     &SOLE_BYTES
@@ -166,12 +159,10 @@ enum StreamEnd {
 
 #[jsmethods]
 impl OutgoingBodyPump {
-    fn new() -> Self {
-        // Internal type, always created with a real reader/sender via `create_instance_with`; this
-        // hidden constructor exists only so the prototype is registered.
+    fn new(reader: DefaultReader, sender: BodySender) -> Self {
         OutgoingBodyPumpImpl {
-            reader: Heap::default(),
-            sender: None,
+            reader: Heap::from(reader),
+            sender: Some(sender),
             batch: Vec::new(),
             end: None,
             reading: false,
@@ -183,7 +174,7 @@ impl OutgoingBodyPump {
 /// Turn a body's materialized `ReadableStream` into a [`OutgoingBody`].
 ///
 /// A host body that has never been read is handed straight through; anything
-/// else is pumped through a `DefaultReader`, or cancelled unsent where
+/// else is pumped through a `DefaultReader`, or cancelled unsent if
 /// `start_reading` is false. The pump reads through `reader` when the caller
 /// already locked the stream with one, and acquires its own otherwise.
 ///
@@ -247,19 +238,12 @@ fn pump_body_from_stream(
         Some(reader) => reader,
         None => acquire_native_reader(scope, &stream)?,
     };
-    let state = create_instance_with::<OutgoingBodyPumpImpl>(scope, |_| OutgoingBodyPumpImpl {
-        reader: Heap::from(reader),
-        sender: Some(sender),
-        batch: Vec::new(),
-        end: None,
-        reading: false,
-        running: false,
-    })?;
+    let state = OutgoingBodyPump::new(scope, reader, sender)?;
     run(scope, &state);
     Ok(body)
 }
 
-/// The most bytes the pump reads into one batch before sending it.
+/// The maximum number of bytes the pump reads into one batch before sending it.
 const BATCH_LIMIT: usize = 64 * 1024;
 
 /// The pump's native read-request steps. Each records what it received in the pump's state and
@@ -286,7 +270,11 @@ fn run(scope: &Scope<'_>, state: &OutgoingBodyPump<'_>) {
             if read_next(scope, state).is_err() {
                 js::exception::report_and_clear(scope, "reading a request or response body");
                 state.data_mut().reading = false;
-                fail_body(state, "the body stream could not be read");
+                // A failed body fails the send instead of completing it.
+                let sender = state.data_mut().sender.take();
+                if let Some(sender) = sender {
+                    sender.fail("the body stream could not be read".to_string());
+                }
             }
             if state.data().reading {
                 break;
@@ -375,15 +363,25 @@ fn pump_chunk_step(
         // The spec's "a copy of chunk": the chunk's bytes are copied once, into the batch.
         Ok(array) => {
             let batch = &mut data.batch;
-            array.as_array_buffer_view().with_bytes(|bytes| {
+            let appended = array.with_slice(|bytes| {
                 // Appending to a batch reserves room up to the limit, so the batch is copied once
                 // rather than through every doubling of its capacity.
-                if !batch.is_empty() && batch.capacity() - batch.len() < bytes.len() {
-                    let wanted = BATCH_LIMIT.max(batch.len() + bytes.len()) - batch.len();
-                    batch.reserve_exact(wanted);
+                if batch.capacity() - batch.len() < bytes.len() {
+                    let wanted = if batch.is_empty() {
+                        bytes.len()
+                    } else {
+                        BATCH_LIMIT.max(batch.len() + bytes.len()) - batch.len()
+                    };
+                    batch.try_reserve_exact(wanted)?;
                 }
                 batch.extend_from_slice(bytes);
+                Ok::<(), std::collections::TryReserveError>(())
             });
+            if appended.is_err() {
+                data.end = Some(StreamEnd::Errored(
+                    "The body chunk could not be allocated".to_string(),
+                ));
+            }
         }
         Err(_) => {
             data.end = Some(StreamEnd::Errored(
@@ -426,28 +424,17 @@ fn pump_error_step(
     Ok(())
 }
 
-/// End the pump's body with an error, so the transport fails the send instead of treating the
-/// body as complete.
-fn fail_body(state: &OutgoingBodyPump<'_>, message: &str) {
-    if let Some(sender) = state.data_mut().sender.take() {
-        sender.fail(message.to_string());
-    }
-}
-
 /// Send `item` to the body channel (taking the sender out of the pump), awaiting
 /// channel capacity for backpressure. After a batch is accepted, the pump runs again.
 /// After an error, the pump stops and the sender is dropped (closing the channel after
 /// the queued error).
 fn spawn_send(scope: &Scope<'_>, state: &OutgoingBodyPump<'_>, item: Send) {
-    if state.data().sender.is_none() {
-        return;
-    }
-    let Ok(promise) = Promise::new_pending(scope) else {
-        js::exception::report_and_clear(scope, "sending a request or response body");
-        fail_body(state, "the body could not be sent");
+    let Some(sender) = state.data_mut().sender.take() else {
         return;
     };
-    let Some(sender) = state.data_mut().sender.take() else {
+    let Ok(promise) = Promise::new_pending(scope) else {
+        js::exception::report_and_clear(scope, "sending a request or response body");
+        sender.fail("the body could not be sent".to_string());
         return;
     };
     let _ = promise.set_any_is_handled(scope);

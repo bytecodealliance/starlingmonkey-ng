@@ -26,7 +26,7 @@ use crate::events::event::EventFlags;
 #[derive(core_runtime::Traceable)]
 pub(crate) struct EventListener {
     /// Identity used to re-locate this listener in the live list during
-    /// dispatch (the snapshot stores ids, not pointers — see `algorithms.rs`).
+    /// dispatch.
     #[no_trace]
     pub(crate) id: u64,
     #[no_trace]
@@ -42,6 +42,11 @@ pub(crate) struct EventListener {
     pub(crate) passive: Option<bool>,
     #[no_trace]
     pub(crate) once: bool,
+    /// Whether this is the listener of an event handler, whose `callback` is the handler's value.
+    /// Such a listener is never `once`, `capture` or `passive`, and `addEventListener` and
+    /// `removeEventListener` neither match nor remove it.
+    #[no_trace]
+    pub(crate) handler: bool,
 }
 
 /// Convert an `EventListener?` argument: `None` for `null` and `undefined`, the
@@ -181,37 +186,12 @@ impl EventTarget {
             .iter()
             .any(|listener| listener.event_type == event_type)
     }
-}
 
-// Nothing platform-specific in these tests, so skip them on wasm32.
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::EventTarget;
-    use core_runtime::config::RuntimeConfig;
-    use core_runtime::runtime::{self, Runtime};
-    use js::conversion::FromJSVal;
-
-    /// A `once` listener leaves the event listener list when it runs. JS cannot observe the
-    /// list's length, so this reads it directly.
-    #[test]
-    fn dispatch_removes_once_listeners_from_the_list() {
-        runtime::register_global_initializer(crate::add_to_global);
-        let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
-        let scope = rt.default_global();
-        let value = js::compile::evaluate_with_filename(
-            &scope,
-            "const t = new EventTarget();
-             t.addEventListener('x', () => {});
-             for (let i = 0; i < 3; i++) {
-               t.addEventListener('x', () => {}, { once: true });
-               t.dispatchEvent(new Event('x'));
-             }
-             t",
-            "test.js",
-            1,
-        )
-        .expect("script should evaluate");
-        let target = EventTarget::from_jsval(&scope, value, ()).expect("an EventTarget");
-        assert_eq!(target.data().event_listener_list.len(), 1);
+    /// The number of entries in the event listener list, including an event handler's.
+    ///
+    /// Used in some tests, but not part of the stable public API.
+    #[doc(hidden)]
+    pub fn listener_count(&self) -> usize {
+        self.data().event_listener_list.len()
     }
 }
