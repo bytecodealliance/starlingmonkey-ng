@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 pub mod config;
+pub mod diagnostics;
 pub mod event_loop;
 pub mod finalization;
 pub mod invocation;
