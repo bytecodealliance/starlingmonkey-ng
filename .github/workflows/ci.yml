@@ -16,6 +16,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -24,6 +27,8 @@ env:
   # Both are pinned, so a new release changes nothing until these are bumped.
   WASMTIME_VERSION: "49.0.0"
   STARLING_NIGHTLY: nightly-2026-09-24
+  # The Node.js version that the jobs needing Node.js install.
+  NODE_VERSION: "24.21.0"
   RUSTC_WRAPPER: sccache
   CCACHE: sccache
   # Bump to purge the sccache GHA cache.
@@ -37,7 +42,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
@@ -74,7 +79,7 @@ jobs:
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
@@ -102,15 +107,15 @@ jobs:
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
           target: ${{ matrix.target }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "lts/*"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Clone WPT suite
         run: ./scripts/clone-wpt.sh
@@ -135,21 +140,19 @@ jobs:
 
   gc_rooting:
     name: GC Rooting Checks
-    strategy:
-      fail-fast: false
     runs-on: ubuntu-latest
     env:
       RUST_BACKTRACE: full
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup
         with:
           target: native
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "lts/*"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Crown static analysis
         run: |

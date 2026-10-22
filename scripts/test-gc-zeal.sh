@@ -4,18 +4,6 @@
 #
 # SpiderMonkey's GC zeal is controlled by the JS_GC_ZEAL environment variable:
 #   JS_GC_ZEAL="mode,frequency" or "mode1;mode2,frequency"
-# This script sets that env var as follows.
-#
-# Productive zeal modes:
-#   1  - GC on roots change
-#   2  - GC on every N-th allocation (most aggressive)
-#   4  - Verify pre-barriers
-#   5  - Verify post-barriers
-#   7  - Generational GC stress
-#  10  - Incremental GC (multiple slices)
-#  14  - Compact on every GC
-#  15  - Check heap after GC
-#  18  - Check gray marking
 #
 # Usage:
 #   ./scripts/test-gc-zeal.sh                             # Defaults: quick zeal, js and core-runtime tests
@@ -114,12 +102,9 @@ echo "  cargo test ${CARGO_ARGS[*]}"
 echo ""
 
 for zeal in "${CONFIGS[@]}"; do
-    # printf "  JS_GC_ZEAL=%-25s " "\"$zeal\""
     if JS_GC_ZEAL="$zeal" cargo test "${CARGO_ARGS[@]}"; then
-        # echo "✓ pass"
         PASSED=$((PASSED + 1))
     else
-        # echo "✗ FAIL"
         FAILED=$((FAILED + 1))
         FAILURES+=("$zeal")
     fi

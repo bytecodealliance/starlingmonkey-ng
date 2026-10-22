@@ -1,19 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
-#
-# Starling-NG justfile
-#
-# Usage:
-#   just build           Build the project (debug mode)
-#   just test            Run all Rust tests
-#   just clone-wpt-tests Clone the WPT test suite
-#   just wpt-setup       Add the WPT hosts entries to /etc/hosts
-#   just wpt-test        Run all WPT tests
-#   just wpt-test base64 Run WPT tests matching "base64"
-#   just wpt-update      Run WPT tests and update expectations
-#   just test-wizer      Snapshot the wasm component with wizer and serve it
-#   just fmt             Format all code
-#   just clippy          Run clippy lints
-#   just check           Run fmt check + clippy + tests
 
 # The wasm target the `-wasm` recipes build for. `WASM_TARGET=p3 just test-wasm` retargets them;
 # `p2`, `p3` and full triples are all accepted. The pinned toolchain in `rust-toolchain.toml`
@@ -23,7 +8,10 @@ _wasm_target_arg := env_var_or_default("WASM_TARGET", "p2")
 WASM_TARGET := if _wasm_target_arg == "p2" { "wasm32-wasip2" } else if _wasm_target_arg == "p3" { "wasm32-wasip3" } else { _wasm_target_arg }
 NIGHTLY := env_var_or_default("STARLING_NIGHTLY", "nightly")
 _wasm_cargo := if WASM_TARGET == "wasm32-wasip3" { "cargo +" + NIGHTLY } else { "cargo" }
-_wasm_out := "${CARGO_TARGET_DIR:-" + justfile_directory() + "/target}/" + WASM_TARGET
+
+# The cargo build directory, as a shell expression.
+_target := "${CARGO_TARGET_DIR:-" + justfile_directory() + "/target}"
+_wasm_out := _target + "/" + WASM_TARGET
 
 # Build in debug mode.
 build *TARGET:
@@ -61,7 +49,7 @@ wpt-test *PATTERN:
     @just build
     node tests/wpt-harness/run-wpt.mjs {{PATTERN}}
 
-# Run WPT tests, optionally filtering by pattern.
+# Run WPT tests against the release build, optionally filtering by pattern.
 [group('wpt')]
 wpt-test-release *PATTERN:
     @just build-release
@@ -99,13 +87,14 @@ fmt:
 fmt-check *ARGS:
     cargo fmt --check {{ARGS}}
 
-# Run clippy lints.
+# Run clippy lints, failing on any warning.
 clippy *ARGS:
-    cargo clippy --features debugmozjs --all-targets {{ARGS}}
+    cargo clippy --features debugmozjs --all-targets {{ARGS}} -- -D warnings
 
+# Defaults to quick tests on the `js` and `core-runtime` packages. `scripts/test-gc-zeal.sh`
+# documents the arguments.
+#
 # Run GC zeal stress tests.
-# Defaults to quick tests on the `js` and `core-runtime` packages.
-# See `./scripts/test-gc-zeal.sh` for usage info.
 gc-zeal *ARGS:
     ./scripts/test-gc-zeal.sh {{ARGS}}
 
@@ -125,7 +114,7 @@ check-all:
     just check-gc
     just gc-zeal
 
-# Run basic checks: formatting, clippy, tests.
+# Run basic checks: formatting, clippy, and the tests on the wasm target.
 check-wasm:
     just fmt-check --all
     just clippy --all
@@ -139,14 +128,17 @@ build-wasm *TARGET:
 build-wasm-release *TARGET:
     {{_wasm_cargo}} build --target {{WASM_TARGET}} --release {{TARGET}}
 
-# Run all Rust tests. A run with no arguments also runs the wasm serve end-to-end suite;
-# arguments (a filter, `--examples`) reach only the cargo tests and leave that suite out.
+# A run with no arguments also runs the wasm serve end-to-end suite. Arguments (a filter,
+# `--examples`) reach only the cargo tests and leave that suite out.
+#
+# Run all Rust tests on the wasm target.
 test-wasm *TARGET:
     {{_wasm_cargo}} test --target {{WASM_TARGET}} --features debugmozjs --workspace {{TARGET}}
     @{{ if TARGET == "" { "just test-serve-wasm" } else { "echo 'Skipped the wasm serve end-to-end suite; run it with: just test-serve-wasm'" } }}
 
-# Run all Rust tests in the `test-release` profile: release optimizations without LTO. A run with
-# no arguments also runs the wasm serve end-to-end suite against the full release build.
+# A run with no arguments also runs the wasm serve end-to-end suite against the release build.
+#
+# Run all Rust tests on the wasm target in the `test-release` profile.
 test-wasm-release *TARGET:
     {{_wasm_cargo}} test --target {{WASM_TARGET}} --profile test-release --workspace {{TARGET}}
     @{{ if TARGET == "" { "just test-serve-wasm-release" } else { "echo 'Skipped the wasm serve end-to-end suite; run it with: just test-serve-wasm-release'" } }}
@@ -155,10 +147,10 @@ test-wasm-release *TARGET:
 test-wizer *ARGS:
     ./scripts/test-wizer.sh {{ARGS}}
 
-# Serve the component under `wasmtime serve` and assert the same observables the native serve
-# suite does, plus the behaviors only a real `wasi:http` host exercises. Builds the component
-# first, so the suite never tests a stale one. Needs wasmtime on PATH; without it the suite
-# skips loudly.
+# The recipe builds the component first. The suite runs it with the wasmtime on PATH, and is
+# skipped if there is none.
+#
+# Run the serve end-to-end suite against the component under `wasmtime serve`.
 test-serve-wasm *ARGS:
     @just build-wasm -p starlingmonkey
     STARLING_WASM_COMPONENT="{{_wasm_out}}/debug/starling.wasm" \
@@ -188,29 +180,27 @@ wpt-update-wasm *PATTERN:
     @just build-wasm
     node tests/wpt-harness/run-wpt.mjs --target=wasm --runtime="{{_wasm_out}}/debug/starling.wasm" --update-expectations {{PATTERN}}
 
-# Run WPT tests through a serve-mode runtime: each test runs inside a `fetch` handler rather than
-# as a one-shot command, which is the shape a deployed server has. Same binary as the command-mode
-# recipes above — the component exports `wasi:cli/run` and `wasi:http/handler` both.
+# Each test runs inside a `fetch` handler rather than as a one-shot command. The server runs each
+# request in its own global (`--serve-isolated`) and one at a time, so tests can't collide through
+# shared global state.
 #
-# The native server runs each request in its own global (`--serve-isolated`) and one at a time, so
-# tests can't collide through shared global state. The wasm server asks its host for the same
-# property with `--max-instance-reuse-count 1`, which it has to: a WASIp3 host reuses an instance
-# for many requests by default.
+# Run WPT tests through a native serve-mode runtime.
 [group('wpt')]
 wpt-test-serve *PATTERN:
     @just build
     node tests/wpt-harness/run-wpt.mjs --mode=serve {{PATTERN}}
 
+# Each test runs inside a `fetch` handler of a Wizer snapshot. The harness passes
+# `--max-instance-reuse-count 1` to `wasmtime serve`, since a WASIp3 host reuses an instance for
+# many requests by default. Drop `--wizen` to skip the snapshot step.
+#
 # Run WPT tests against the wasm binary through a serve-mode runtime, pre-initialized with Wizer.
-# This is the configuration a deployed server has: inside a request handler, against a snapshot
-# whose engine and content script are already stood up. Drop `--wizen` to skip the snapshot step.
 [group('wpt')]
 wpt-test-wasm-serve *PATTERN:
     @just build-wasm
     node tests/wpt-harness/run-wpt.mjs --target=wasm --runtime="{{_wasm_out}}/debug/starling.wasm" --mode=serve --wizen {{PATTERN}}
 
-# Run WPT across every configuration: both targets, each as a command and as a server, from one
-# build per target.
+# Run WPT across every configuration: both targets, each as a command and as a server.
 [group('wpt')]
 wpt-test-all *PATTERN:
     @just wpt-test {{PATTERN}}

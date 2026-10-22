@@ -16,13 +16,10 @@ runs:
         sudo apt-get update
         sudo apt-get install -y build-essential python3 m4 libclang-dev llvm
 
+    # `install-tool.sh` checks each download's SHA-256 digest.
     - name: Install just
       shell: bash
-      run: |
-        mkdir -p "$HOME/.just/bin"
-        curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
-          | bash -s -- --to "$HOME/.just/bin"
-        echo "$HOME/.just/bin" >> "$GITHUB_PATH"
+      run: ${{ github.action_path }}/install-tool.sh just 1.58.0
 
     - name: Install Rust toolchain
       shell: bash
@@ -46,18 +43,12 @@ runs:
     - name: Install WASI SDK
       if: inputs.target != 'native'
       shell: bash
-      run: |
-        sudo mkdir -p /opt/wasi-sdk
-        curl -sSfL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz" \
-          | sudo tar xz --strip-components=1 -C /opt/wasi-sdk
-        echo "WASI_SDK_PATH=/opt/wasi-sdk" >> "$GITHUB_ENV"
+      run: ${{ github.action_path }}/install-tool.sh wasi-sdk "$WASI_SDK_VERSION"
 
     - name: Install wasmtime
       if: inputs.target != 'native'
       shell: bash
-      run: |
-        curl -sSf https://wasmtime.dev/install.sh | bash -s -- --version "v$WASMTIME_VERSION"
-        echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      run: ${{ github.action_path }}/install-tool.sh wasmtime "$WASMTIME_VERSION"
 
     - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9

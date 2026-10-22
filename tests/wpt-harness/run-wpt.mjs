@@ -29,14 +29,10 @@
 //   native, restrictions disabled   `permissive_status`  --permissive
 //
 // An override field is written only where that configuration's result differs
-// from the baseline, so the vast majority of subtests — which behave the same
-// everywhere — are still recorded once.
-//
-// The permissive dimension exists because the browser-security Fetch
-// constraints are off by default, except in WPT mode. Without it, the whole
-// suite would only ever cover the configuration that ordinary users do not run.
+// from the baseline. The browser-security Fetch restrictions are off by default
+// outside WPT mode, so `--permissive` covers the configuration users run.
 
-import { execFileSync, spawn, spawnSync } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import {
   existsSync,
   readFileSync,
@@ -56,27 +52,20 @@ function relativePath(p) {
   return new URL(p, import.meta.url).pathname;
 }
 
-// tests.json line prefixes:
-//   "SKIP "      — never run, on any target.
-//   "SLOW "      — skipped when --skip-slow-tests is passed.
-//   "SKIP-WASM " — run on native, skipped on the wasm target. For tests that
-//                  depend on JS APIs the wasm build does not expose (e.g.
-//                  `WebAssembly`, which the SpiderMonkey-in-wasm build omits).
-//   "SKIP-NATIVE " — run on wasm, skipped on the native target. The mirror of
-//                  SKIP-WASM, for tests only the wasm host can run at all.
-//   "NET "       — needs the live WPT server; see NET_PREFIX below.
+// tests.json line prefixes, each optionally followed by a `(comment)`:
+//   "SKIP "        never run, on any target.
+//   "SLOW "        skipped when --skip-slow-tests is passed.
+//   "SKIP-WASM "   run on native, skipped on the wasm target.
+//   "SKIP-NATIVE " run on wasm, skipped on the native target.
+//   "NET "         needs the live WPT server, which the harness starts if no
+//                  server is running.
 //
-// Reach for SKIP-WASM/SKIP-NATIVE only when a test cannot run on that target at
-// all. When it runs but some subtests behave differently — the two HTTP stacks
-// do not have identical capabilities — record that per subtest with
-// `wasm_status` instead (see getExpectedResults), so the subtests that *do*
-// pass stay covered on both targets.
+// SKIP-WASM and SKIP-NATIVE are for tests that cannot run on that target at all.
+// Subtests that behave differently per target get a `wasm_status` instead.
 const SKIP_PREFIX = "SKIP";
 const SLOW_PREFIX = "SLOW";
 const SKIP_WASM_PREFIX = "SKIP-WASM";
 const SKIP_NATIVE_PREFIX = "SKIP-NATIVE";
-// Tests that need the live WPT server (they call `fetch()` over the network).
-// When any selected test is `NET`, the harness ensures `wpt serve` is running.
 const NET_PREFIX = "NET";
 
 const LogLevel = { Quiet: 0, Verbose: 1, VeryVerbose: 2 };
@@ -85,10 +74,9 @@ const config = {
   // Default automatically adjusted to "target/wasm32-wasip2/debug/starling.wasm" for wasm target.
   runtime: "target/debug/starlingmonkey",
   target: "native", // "native" or "wasm"
-  // How the runtime executes each test: "cli" runs it as a one-shot command, "serve" POSTs it to a
-  // long-running server built from the same binary (see wpt-server.js). Serve mode is the
-  // production-shaped configuration: the test runs inside a request handler.
-  mode: "cli", // "cli" or "serve"
+  // "cli" runs each test as a one-shot command, "serve" POSTs it to a long-running server built
+  // from the same binary (see wpt-server.js).
+  mode: "cli",
   servePort: 7877,
   wptRoot: process.env.WPT_ROOT || "deps/wpt",
   tmpDir: "target/tmp/wpt",
@@ -99,30 +87,19 @@ const config = {
     pattern: "",
   },
   skipSlowTests: false,
-  // Run with the browser-security request restrictions disabled (the runtime's
-  // default outside WPT mode), checking `permissive_status` expectation
-  // overrides. See getExpectedResults.
+  // Run with the request restrictions disabled, checking `permissive_status`.
   permissive: false,
-  // How many tests to have in flight at once. Defaults to number of CPUs * 2,
-  // because many tests aren't CPU-bound, and can execute in parallel without
-  // incurring compute contention.
+  // Twice the number of CPUs, since many tests aren't CPU-bound.
   jobs: Math.max(1, cpus().length * 2),
-  // Path to an ahead-of-time compiled runtime, set up for the wasm target
-  // unless --no-precompile is passed. See ensurePrecompiledRuntime.
+  // The ahead-of-time compiled wasm runtime, unless --no-precompile is passed.
   precompiled: null,
   usePrecompiled: true,
-  // Pre-initialize the wasm runtime with Wizer before serving it, so the engine and the content
-  // script are already stood up in the snapshot. This harness retires an instance after every
-  // request, so without this each test pays for the whole runtime again.
+  // The wasm runtime pre-initialized with Wizer, with --wizen in serve mode.
   wizen: false,
   wizened: null,
   logLevel: LogLevel.Quiet,
-  // Per-test timeout for a serial run, scaled by --jobs. This is the outermost of three nested
-  // limits, and has to stay the largest of them or it preempts the ones that can say something
-  // useful: testharness.js times a test out internally at 10s (60s for `META: timeout=long`) and
-  // reports per-subtest TIMEOUT statuses, and serve mode's server backstop
-  // (`WAIT_LIMIT_MS` in wpt-server.js) sits between the two. Reaching *this* one means the
-  // runtime hung with nothing to report, so it is a hard kill.
+  // Per-test timeout for a serial run, scaled by --jobs. It has to stay above testharness.js's own
+  // test timeout and `WAIT_LIMIT_MS` in wpt-server.js, so that those fire first.
   timeout: 30000,
 };
 
@@ -275,12 +252,8 @@ function applyConfig(argv) {
     config.runtime = "target/wasm32-wasip2/debug/starling.wasm";
   }
 
-  // The native server answers one request at a time: `--serve-isolated` (which serveCommand
-  // passes, so each test does get its own global) has every request enter its own realm and hold
-  // it across awaits, which only works serialized. Sending more in flight than it will serve just
-  // queues them inside the server while inflating the per-test budget, which scales with --jobs.
-  // The wasm server needs none of this: `wasmtime serve` is told to retire each instance after a
-  // single request, so its tests are isolated even in flight.
+  // The native server runs each request in its own realm with `--serve-isolated`, which only works
+  // with one request at a time. The wasm server uses one instance per request instead.
   if (config.mode === "serve" && config.target !== "wasm" && config.jobs !== 1) {
     if (config.logLevel > LogLevel.Quiet) {
       console.log("The native serve-mode server is serial; running tests one at a time.");
@@ -288,9 +261,8 @@ function applyConfig(argv) {
     config.jobs = 1;
   }
 
-  // The permissive dimension records one `permissive_status` override per
-  // subtest, with no per-target variant of it, because the fetch code the switch
-  // gates is shared between the targets, so the native run covers both.
+  // The restrictions are implemented in fetch code both targets share, so there is no
+  // per-target `permissive_status`.
   if (config.permissive && config.target === "wasm") {
     console.error("--permissive runs are native-only; drop --target=wasm.");
     return false;
@@ -353,17 +325,6 @@ function getBaseHarness() {
   return cachedBaseHarness;
 }
 
-/**
- * Assemble the complete test script for a given WPT test path.
- *
- * The assembled script:
- * 1. Runs the base harness (pre-harness + testharness.js + post-harness)
- *    in the global scope (via legacy script mode).
- * 2. Uses evalScript() for each META: script= dependency.
- * 3. Uses evalScript() for the test source itself.
- * 4. Calls done() to trigger the completion callback.
- */
-
 // Legacy WPT path aliases. The WPT HTTP server handles some redirects that
 // aren't present when loading files directly from disk.
 const WPT_PATH_ALIASES = {
@@ -374,16 +335,15 @@ const WPT_PATH_ALIASES = {
 // wptserve `{{...}}` template substitution
 // ---------------------------------------------------------------------------
 //
-// The WPT server fills `{{host}}`-style placeholders into any `.sub.` file it
-// serves. This harness loads files from disk, so without doing the same here,
-// scripts like get-host-info.sub.js hand tests literal `{{host}}` strings.
-//
-// The values must describe the server the NET tests talk to. Host and domains
-// are wptserve defaults; the ports come from wpt-server-config.json, which
-// ensureWptServer passes to `wpt serve`.
+// The WPT server fills `{{host}}`-style placeholders into the `.sub.` files it
+// serves. This harness loads files from disk, so it substitutes them itself,
+// with the values of the server the NET tests talk to: wptserve's default hosts,
+// and the ports of wpt-server-config.json, which ensureWptServer passes to
+// `wpt serve`.
 const WPT_HOST = "web-platform.test";
 const WPT_ALT_HOST = "not-web-platform.test";
-const WPT_PORTS = { http: [8000, 8001], https: [8443, 8444] };
+const WPT_SERVER_CONFIG = relativePath("wpt-server-config.json");
+const WPT_PORTS = JSON.parse(readFileSync(WPT_SERVER_CONFIG, "utf-8")).ports;
 
 function isSubstitutedPath(filePath) {
   return path.basename(filePath).includes(".sub.");
@@ -399,11 +359,13 @@ function substituteWptTemplates(source) {
       domain(WPT_ALT_HOST, sub),
     )
     .replace(
-      // Unknown scheme/index (e.g. `{{ports[ws][0]}}`) is left as-is rather
-      // than guessed at: a placeholder that survives is an obvious failure,
-      // a wrong port number a baffling one.
+      // A port the config doesn't list as a number, such as wptserve's "auto", is left as a
+      // placeholder.
       /\{\{ports\[(\w+)\]\[(\d+)\]\}\}/g,
-      (match, scheme, index) => WPT_PORTS[scheme]?.[index]?.toString() ?? match,
+      (match, scheme, index) => {
+        const port = WPT_PORTS[scheme]?.[index];
+        return Number.isInteger(port) ? String(port) : match;
+      },
     );
 }
 
@@ -428,41 +390,18 @@ function assembleTestScript(testPath) {
   script += getBaseHarness();
 
   // If the test uses idl_test(), inject a minimal fetch polyfill that serves
-  // IDL files from the WPT /interfaces/ directory on disk. This avoids
-  // needing a real fetch() implementation or WPT HTTP server.
-  const idlTestMatch = testSource.match(/idl_test\(\s*\[([^\]]*)\]/);
+  // the IDL files of its first two arguments from the WPT /interfaces/ directory.
+  const idlTestMatch = testSource.match(/idl_test\(\s*\[([^\]]*)\](?:\s*,\s*\[([^\]]*)\])?/);
   if (idlTestMatch) {
-    const idlSpecs = idlTestMatch[1]
-      .split(",")
+    const idlSpecs = [idlTestMatch[1], idlTestMatch[2] ?? ""]
+      .flatMap((list) => list.split(","))
       .map((s) => s.trim().replace(/^['"]|['"]$/g, ""))
       .filter(Boolean);
-
-    // Pre-read all referenced IDL files and build a fetch polyfill.
     const idlMap = {};
     for (const spec of idlSpecs) {
       const idlPath = path.join(config.wptRoot, "interfaces", spec + ".idl");
       if (existsSync(idlPath)) {
         idlMap["/interfaces/" + spec + ".idl"] = readFileSync(idlPath, "utf-8");
-      }
-    }
-
-    // Also check for dependency IDL specs (second argument to idl_test).
-    const depsMatch = testSource.match(
-      /idl_test\(\s*\[[^\]]*\]\s*,\s*\[([^\]]*)\]/,
-    );
-    if (depsMatch) {
-      const depSpecs = depsMatch[1]
-        .split(",")
-        .map((s) => s.trim().replace(/^['"]|['"]$/g, ""))
-        .filter(Boolean);
-      for (const spec of depSpecs) {
-        const idlPath = path.join(config.wptRoot, "interfaces", spec + ".idl");
-        if (existsSync(idlPath)) {
-          idlMap["/interfaces/" + spec + ".idl"] = readFileSync(
-            idlPath,
-            "utf-8",
-          );
-        }
       }
     }
 
@@ -598,24 +537,10 @@ function readExpectationsFile(testPath) {
   }
 }
 
-// The expectations for the configuration being run, from one file shared by
-// all of them.
-//
-// A subtest is stored as `{"status": "PASS"}` when every configuration agrees,
-// and gains override fields where one does not:
-//
-//     "some subtest": { "status": "PASS", "wasm_status": "FAIL" }
-//     "another":      { "status": "FAIL", "permissive_status": "PASS" }
-//
-// `status` is the native enforced-mode status and the default; `wasm_status`
-// overrides it on the wasm target, and `permissive_status` overrides it when
-// the request restrictions are disabled (`--permissive`). Keeping all of them
-// in one file means a subtest that behaves the same everywhere — the
-// overwhelming majority — is still written once.
-//
-// An entry with no status for this configuration (say, a `wasm_status`-only
-// entry seen on native) is dropped, so the subtest reads as having no
-// expectation rather than as an expectation that can never be met.
+// The expectations for the configuration being run. `wasm_status` overrides
+// `status` on the wasm target, and `permissive_status` with `--permissive`. An
+// entry with no status for this configuration (say, a `wasm_status`-only entry
+// seen on native) is dropped, so the subtest has no expectation.
 function getExpectedResults(testPath) {
   const raw = readExpectationsFile(testPath);
   const expectations = {};
@@ -632,23 +557,18 @@ function getExpectedResults(testPath) {
 }
 
 // Fold this run's results into the stored expectations, touching only the
-// field for the configuration that ran. Running on wasm or permissive must not
-// overwrite the native enforced statuses, and vice versa, so that updating one
-// configuration never silently invents results for another.
+// field for the configuration that ran.
 function mergeExpectations(previous, results) {
   const field = runStatusField();
   const merged = {};
   for (const result of results) {
     const prev = previous[result.name] ?? {};
     const observed = result.status === 0 ? "PASS" : "FAIL";
-    // Preserve a FLAKY marker: it records a deliberate known-intermittent
-    // subtest, not the outcome of any single run.
+    // A FLAKY marker is kept.
     const keep = (stored) => (stored === "FLAKY" ? "FLAKY" : undefined);
 
     const values = { ...prev, [field]: keep(prev[field]) ?? observed };
-    // Only record an override where it actually differs from the baseline, so
-    // the file does not fill up with redundant duplicates. (After a baseline
-    // run this also drops overrides the new baseline has caught up with.)
+    // An override is recorded only where it differs from the baseline.
     for (const override of [WASM_STATUS, PERMISSIVE_STATUS]) {
       if (values[override] !== undefined && values[override] === values.status) {
         delete values[override];
@@ -660,8 +580,7 @@ function mergeExpectations(previous, results) {
     }
     merged[result.name] = entry;
   }
-  // Carry over what the *other* configurations recorded for subtests this run
-  // did not observe, dropping only this run's own stale field.
+  // Subtests this run did not observe keep the other configurations' fields.
   for (const [name, prev] of Object.entries(previous)) {
     if (merged[name]) continue;
     const entry = {};
@@ -675,37 +594,20 @@ function mergeExpectations(previous, results) {
   return merged;
 }
 
-// Codegen options passed to both `wasmtime compile` and `wasmtime run`; a
-// precompiled artifact is only loadable by a runtime configured the same way.
+// Codegen options passed to both `wasmtime compile` and `wasmtime run`, since a
+// precompiled artifact only loads in a runtime configured the same way.
 //
-// Native unwind information is off because registering and — far worse —
-// deregistering it dominates every wasm test. A sample of the wasmtime process
-// during a trivial run puts essentially all of the ~1.1s of host time in
-// `CodeMemory::drop` calling `__deregister_frame`, whose macOS implementation
-// walks the registered frames linearly; with a module this size that is
-// quadratic and swamps everything else. The runtime module is ~120MB with a
-// correspondingly huge function count, so it hits this hard: dropping the
-// unwind tables takes a wasm test from ~1.4s to ~0.35s.
-//
-// What it costs: native profilers and debuggers can no longer unwind through
-// wasm frames. Guest-level diagnostics are unaffected — JS exceptions and their
-// stacks come from SpiderMonkey, and wasm traps from wasmtime's own frame
-// information — so error reporting in the harness is unchanged.
+// Native unwind information is off because deregistering it on macOS is
+// quadratic in the function count: with it, a wasm test took ~1.4s instead of
+// ~0.35s. Native profilers and debuggers then can't unwind through wasm frames.
 const WASMTIME_CODEGEN_FLAGS = ["-C", "native-unwind-info=n"];
 
 // The WASI capabilities the runtime needs: environment (its configuration arrives there in serve
 // mode), and the network/HTTP stack the `fetch` tests exercise.
 const WASI_FLAGS = "inherit-env=y,inherit-network=y,http=y,tcp=y,udp=y,p3=y";
 
-// Pre-initialize the wasm runtime with Wizer, baking the serve-mode WPT harness and its
-// configuration into the snapshot.
-//
-// This is the configuration a deployed server has: the engine is initialized and the content
-// script evaluated at build time, so serving a request does neither. It matters most exactly here,
-// because this harness retires each instance after one request (see `serveCommand`).
-//
-// Rebuilt whenever the runtime or the baked configuration changes, on the same stamp scheme the
-// precompiled artifact uses.
+// Pre-initialize the wasm runtime with Wizer, with the serve-mode WPT harness and its
+// configuration in the snapshot. Rebuilt whenever the runtime or the configuration changes.
 function ensureWizenedRuntime() {
   if (config.target !== "wasm" || config.mode !== "serve" || !config.wizen) return null;
 
@@ -730,9 +632,8 @@ function ensureWizenedRuntime() {
         "wizer",
         `-S${WASI_FLAGS},cli=y`,
         "-Wcomponent-model-async=y",
-        // The component's `wizer-initialize` export is declared by a world of its own, so the
-        // component type still names it after the snapshot. Dropping the core function (the
-        // default) would leave that declaration dangling and the component unloadable.
+        // The component type still declares `wizer-initialize` after the snapshot, so dropping the
+        // core function would make the component unloadable.
         "--keep-init-func=true",
         "--dir=.::/",
         "--env",
@@ -751,17 +652,9 @@ function ensureWizenedRuntime() {
   }
 }
 
-// Compile the wasm runtime ahead of time, once, and run the tests against the
-// result.
-//
-// Roughly a fifth of each wasm test's wall clock is wasmtime compiling the
-// runtime module — it is ~120 MB, and the compilation is not cached between
-// processes, so every test paid for it again. Compiling once up front and
-// passing `--allow-precompiled` moves that cost from per-test to per-run.
-//
-// The artifact is tied to both the runtime build and the wasmtime version, so
-// it is rebuilt whenever either is newer than it. On any failure we fall back
-// to running the module directly rather than failing the run.
+// Compile the wasm runtime ahead of time, once per runtime build and wasmtime
+// version, and run the tests against the result. On failure, the tests run the
+// module directly.
 function ensurePrecompiledRuntime() {
   if (config.target !== "wasm" || !config.usePrecompiled) return null;
 
@@ -807,9 +700,8 @@ function ensurePrecompiledRuntime() {
   }
 }
 
-/// Spawn `command`, collecting stdout/stderr, with the same timeout and
-/// output-cap semantics `spawnSync` gave us — but without blocking the loop, so
-/// several tests can be in flight at once.
+/// Spawn `command`, collecting stdout and stderr, and kill it after `timeout` ms
+/// or once stdout exceeds `maxBuffer` bytes.
 function spawnCollecting(command, args, { timeout, maxBuffer }) {
   return new Promise((resolve) => {
     let child;
@@ -819,11 +711,7 @@ function spawnCollecting(command, args, { timeout, maxBuffer }) {
       resolve({ error: e, stdout: "", stderr: "" });
       return;
     }
-    // Collect raw chunks and decode once at the end. Decoding each chunk as it
-    // arrives corrupts any multi-byte UTF-8 sequence that straddles a chunk
-    // boundary, turning it into replacement characters — which shows up as a
-    // subtest whose name no longer matches its expectation, and only
-    // intermittently, since where the boundaries fall depends on timing.
+    // Decoded once at the end, since a chunk can end inside a UTF-8 sequence.
     const stdoutChunks = [];
     const stderrChunks = [];
     let stdoutBytes = 0;
@@ -868,21 +756,14 @@ function runScriptPath(testPath) {
   );
 }
 
-/// The runtime flags that carry the run's restriction dimension. Every mode that starts a runtime
-/// has to pass these: expectation lookup switches to `permissive_status` on `--permissive`, so a
-/// mode that silently kept the restrictions on would check permissive expectations against a
-/// restricted runtime — and `--update-expectations` would then write those results into the
-/// `permissive_status` fields, corrupting them for the runs that do disable the restrictions.
+/// The runtime flags for `--permissive`, which every mode that starts a runtime passes.
 function restrictionFlags() {
   return config.permissive ? ["--web-security-restrictions=false"] : [];
 }
 
-// Build the command that runs `scriptFile` as a one-shot command: the runtime binary directly on
-// native, and the same component under `wasmtime run` on wasm — the component exports
-// `wasi:cli/run` alongside `wasi:http/handler`, so this is the very binary serve mode uses.
-//
-// `optimized` selects the flags a measured run uses (ahead-of-time compiled runtime, no native
-// unwind information); `reproLine` turns it off so the command it prints stays runnable by hand.
+// Build the command that runs `scriptFile` as a one-shot command: the runtime binary on native,
+// and the component under `wasmtime run` on wasm. `optimized` adds the precompiled runtime and the
+// codegen flags, which `reproLine` leaves out.
 function testCommand(scriptFile, { optimized = true } = {}) {
   const runtimeArgs = [
     "--legacy-script",
@@ -918,18 +799,8 @@ function testCommand(scriptFile, { optimized = true } = {}) {
 async function runSingleTest(testPath) {
   const script = assembleTestScript(testPath);
 
-  // Write the assembled script to a temp file of its own.
-  //
-  // The name carries the target and the test, which is what keeps tests in flight within a run
-  // — and a wasm suite alongside a native spot-check — from overwriting each other's script
-  // between the write and the spawn and reporting one test's results under another's name.
-  //
-  // These files are deliberately left behind, so the "To reproduce" command printed for a
-  // failure stays runnable. Naming them by target and test alone bounds that to one file per
-  // test per target, which the directory can carry indefinitely. The name used to carry the
-  // pid as well, isolating concurrent runs of the same target; that made the directory grow
-  // without limit for a case where both runs write the same bytes anyway — the script is a
-  // pure function of the test path and the WPT checkout.
+  // The script file is named by target and test, so concurrent tests and runs of the other target
+  // don't overwrite it. It is left behind for the "To reproduce" command.
   mkdirSync(config.tmpDir, { recursive: true });
   const tmpFile = runScriptPath(testPath);
   writeFileSync(tmpFile, script);
@@ -942,17 +813,12 @@ async function runSingleTest(testPath) {
   try {
 
     const result = await spawnCollecting(command, args, {
-      // A test's wall clock includes time spent waiting for a core, so with N
-      // tests in flight the budget has to grow with N or the slowest legitimate
-      // tests start timing out purely from contention. `--timeout` is therefore
-      // the budget for a serial run; the limit scales from there. The point of
-      // the timeout is to catch a hang, which no amount of contention explains.
+      // A test's wall clock includes waiting for a core, so the budget grows with --jobs.
       timeout: config.timeout * Math.max(1, config.jobs),
       maxBuffer: 10 * 1024 * 1024,
     });
 
-    const stdout = result.stdout || "";
-    const stderr = result.stderr || "";
+    const { stdout, stderr } = result;
 
     if (result.error) {
       return { error: result.error, stdout, stderr };
@@ -964,10 +830,8 @@ async function runSingleTest(testPath) {
       return { error: new Error(reason), stdout, stderr };
     }
 
-    // Parse results from stdout — look for the WPT_RESULTS_JSON marker.
     const marker = "WPT_RESULTS_JSON:";
-    const lines = stdout.split("\n");
-    for (const line of lines) {
+    for (const line of stdout.split("\n")) {
       if (line.startsWith(marker)) {
         return { results: JSON.parse(line.slice(marker.length)), stdout, stderr };
       }
@@ -980,13 +844,8 @@ async function runSingleTest(testPath) {
 }
 
 // Run `testPaths` with up to `config.jobs` in flight, handing each result to
-// `report` strictly in test order.
-//
-// Ordering matters more than it looks: `report` prints, accumulates the totals
-// and rewrites expectation files, so letting it run in completion order would
-// make both the output and `--update-expectations` depend on which test
-// happened to finish first. Only the spawning is concurrent; everything that
-// has an effect stays sequential and deterministic.
+// `report` in test order, so the output and the expectation updates don't
+// depend on which test finished first.
 async function runTestsConcurrently(testPaths, report) {
   const jobs = Math.max(1, config.jobs);
   const outcomes = new Array(testPaths.length);
@@ -1003,9 +862,7 @@ async function runTestsConcurrently(testPaths, report) {
         outcomes[index] = { ...outcome, duration: Date.now() - started };
       })();
       running.add(task);
-      task.finally(
-        () => running.delete(task),
-      );
+      task.finally(() => running.delete(task));
     }
 
     if (outcomes[nextToReport] === undefined) {
@@ -1038,12 +895,8 @@ function pad(v, n) {
 // Serve mode (`--mode=serve`): one runtime server, one request per test
 // ---------------------------------------------------------------------------
 //
-// The runtime runs `wpt-server.js` as its content script, which registers a `fetch` handler that
-// evaluates the assembled test script a request carries and answers with its results. Nothing
-// here is WPT-specific on the runtime side: it is the ordinary serve path, which is the point —
-// this exercises the tests inside a request handler, the configuration that ships.
-//
-// The same component provides command mode's `wasi:cli/run`, so both modes run the one binary.
+// The runtime runs `wpt-server.js` as its content script, whose `fetch` handler evaluates the
+// assembled test script in the request body and responds with its results.
 
 const SERVE_HOST = "127.0.0.1";
 let serveUrl = null;
@@ -1064,9 +917,7 @@ function serveCommand() {
         "--serve",
         String(config.servePort),
         "--wpt-mode",
-        // Each request in its own global, so one test's top-level declarations are not still
-        // there for the next. Without it tests collide and the run is simply wrong; the wasm
-        // server asks its host for the same property with `--max-instance-reuse-count` below.
+        // Each request in its own global, so tests don't see each other's declarations.
         "--serve-isolated",
         "--legacy-script",
         ...restrictionFlags(),
@@ -1075,12 +926,8 @@ function serveCommand() {
       ready: /serving on (http:\/\/[\d.]+:\d+)/,
     };
   }
-  // `wasmtime serve` passes the guest no arguments, so the runtime's configuration goes through
-  // the environment — except on a wizened runtime, which already holds an initialized engine with
-  // the harness evaluated, and so needs neither the configuration nor the script.
-  //
-  // No `restrictionFlags()` here: `--permissive` runs are native-only (applyConfig rejects the
-  // combination), and a wizened runtime takes no configuration at all to carry them in.
+  // `wasmtime serve` passes the guest no arguments, so the configuration goes through the
+  // environment, unless the wizened runtime already has it. `--permissive` is native-only.
   const precompiled = config.precompiled;
   const wizened = config.wizened !== null;
   return {
@@ -1100,9 +947,8 @@ function serveCommand() {
             "--env",
             `STARLINGMONKEY_CONFIG=--wpt-mode --legacy-script ${guestServerScript()}`,
           ]),
-      // One request per instance, so each test gets a fresh global — what a fresh process gives
-      // command mode. WASIp3 components default to 128 requests per instance, so this is load
-      // bearing, and it holds under concurrency: an instance is retired after its one request.
+      // One request per instance, so each test gets a fresh global. WASIp3 components default to
+      // 128 requests per instance.
       "--max-instance-reuse-count",
       "1",
       "--addr",
@@ -1126,8 +972,7 @@ function startServer() {
       () => reject(new Error(`serve-mode runtime did not start within 60s. Output:\n${output}`)),
       60000,
     );
-    // The readiness line goes to stderr for both runtimes; watch stdout too, so a runtime that
-    // logs it elsewhere still starts rather than hanging until the timeout.
+    // Both runtimes print the readiness line to stderr. stdout is watched too.
     const watch = (chunk) => {
       output += chunk.toString();
       const match = output.match(ready);
@@ -1215,10 +1060,8 @@ function isWptPortReachable(port) {
 }
 
 /**
- * Every HTTP port in `WPT_PORTS` must answer, not just the first: those are the
- * ports `substituteWptTemplates` bakes into `.sub.` tests, and a server missing
- * one still serves everything else. Short-circuits, so the usual case costs a
- * single probe.
+ * Whether a server responds on every HTTP port in `WPT_PORTS`, since `.sub.`
+ * tests use all of them.
  */
 function isWptServerReachable() {
   return WPT_PORTS.http.every(port => isWptPortReachable(port));
@@ -1243,16 +1086,13 @@ async function ensureWptServer() {
     return;
   }
 
-  // An external server holding the first port but not the rest is reported rather
-  // than used: it cannot be replaced (the port is taken) and its failures are
-  // indistinguishable from test regressions — `.sub.` tests substituting an
-  // unserved port fail with a bare connection error.
+  // An external server on the first port that doesn't serve the others fails the run.
   if (isWptPortReachable(WPT_PORTS.http[0])) {
     const missing = unreachableWptPorts();
     console.error(
       `A WPT server is running on ${WPT_HOST}:${WPT_PORTS.http[0]} but is not serving ` +
         `port(s) ${missing.join(", ")}, which '.sub.' tests are substituted to use.\n` +
-        `It was most likely started without '--config ${relativePath("wpt-server-config.json")}', ` +
+        `It was most likely started without '--config ${WPT_SERVER_CONFIG}', ` +
         `which pins the ports; without it wptserve picks the second HTTP port at random.\n` +
         `Stop it (e.g. 'pkill -f \"wpt serve\"') and re-run, to let this harness start its own.`,
     );
@@ -1262,12 +1102,10 @@ async function ensureWptServer() {
   if (config.logLevel > LogLevel.Quiet) {
     console.info(`Starting WPT server (cmd: ${config.wptRoot}/wpt serve)...`);
   }
-  // The config pins every port so that substituteWptTemplates' static table
-  // matches the running server; the default config picks the second HTTP port
-  // at random ("auto").
+  // The config pins every port, which wptserve's default config doesn't.
   managedWptServer = spawn(
     path.join(config.wptRoot, "wpt"),
-    ["serve", "--config", relativePath("wpt-server-config.json")],
+    ["serve", "--config", WPT_SERVER_CONFIG],
     {
       detached: true,
     },
@@ -1293,10 +1131,7 @@ async function ensureWptServer() {
       }
       return;
     }
-    let resolve;
-    let promise = new Promise((r) => (resolve = r));
-    setTimeout(() => {resolve();}, 1000);
-    await promise;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   const missing = unreachableWptPorts();
   stopWptServer();
@@ -1396,8 +1231,7 @@ async function run() {
         if (config.logLevel > LogLevel.Quiet) {
           lines.push(runtimeOutputBlocks(stdout, stderr));
         } else if (stdout || stderr) {
-          // Show the tail rather than the head: WPT_RESULTS_JSON would be at the
-          // end on success, and crash diagnostics from stderr are appended last.
+          // The tail, which has the crash diagnostics from stderr.
           const output = stdout + (stderr ? "\n--- stderr ---\n" + stderr : "");
           const limit = 30;
           const outputLines = output.trim().split("\n");
@@ -1442,9 +1276,7 @@ async function run() {
         stats.pass++;
       }
 
-      // A FLAKY expectation marks a known-intermittent subtest (e.g. one that
-      // depends on connection-reuse timing against a non-compliant server):
-      // both outcomes are tolerated, so neither is reported as unexpected.
+      // A FLAKY subtest's result is not compared.
       if (expectation && expectation.status === "FLAKY") {
         continue;
       }
@@ -1487,8 +1319,7 @@ async function run() {
       if (config.tests.updateExpectations) {
         const expectPath = expectationsPath(testPath);
         lines.push(`  Writing expectations to ${expectPath}`);
-        // Merge against the file as stored, not against `expectations` (which has
-        // already been narrowed to this target), so the other target's statuses survive.
+        // Merged with the file as stored, so the other configurations' statuses stay.
         const newExpectations = mergeExpectations(
           readExpectationsFile(testPath),
           results,
@@ -1509,18 +1340,12 @@ async function run() {
     emit();
   });
 
-  // Stop a server this run started, explicitly rather than from the "exit"
-  // handler: its open stdout/stderr pipes hold the event loop open, so node
-  // never begins exiting on its own and the handler never runs. (The failure
-  // paths below force the issue with process.exit, but a fully green run
-  // would hang here.)
+  // The servers' open pipes keep the event loop alive, so they are stopped here
+  // rather than only from the "exit" handler.
   stopWptServer();
   stopServer();
 
-  // Report the suite's wall-clock time, not the sum of the per-test durations:
-  // with tests running concurrently that sum exceeds the elapsed time, and it
-  // grows as concurrency rises because each test's own duration absorbs the
-  // contention. The per-test figures above stay as measured.
+  // The suite's wall-clock time, since concurrent tests' durations overlap.
   totalStats.duration = Date.now() - suiteStart;
   console.log(
     `\n${"Done. Stats:".padEnd(pathLength)} ${formatStats(totalStats)}`,
@@ -1542,9 +1367,7 @@ async function run() {
 
 run();
 
-/// The full output the runtime produced, as fenced blocks per stream. Printed
-/// for unexpected results when the log level asks for it, so a CI log carries
-/// enough to diagnose a result that doesn't reproduce locally.
+/// The full output the runtime produced, as fenced blocks per stream.
 function runtimeOutputBlocks(stdout, stderr) {
   const block = (name, contents) =>
     `StarlingMonkey ${name}:\n=====\n${contents ? stripTrailingNewline(contents) + "\n" : ""}=====`;
@@ -1556,9 +1379,6 @@ function reproLine(testPath) {
     // Needs a serve-mode runtime running; `just wpt-test-*-serve` starts one.
     return `  To reproduce, run $ curl --data-binary @${runScriptPath(testPath)} ${serveUrl ?? `http://${SERVE_HOST}:${config.servePort}`}`;
   }
-  // Name the script the run actually used. Its name is stable across runs, so it
-  // stays valid in a command someone runs later; it used to carry a pid, which is
-  // why this once had to copy it to a stable name of its own first.
   const { command, args } = testCommand(runScriptPath(testPath), {
     optimized: false,
   });
