@@ -141,13 +141,10 @@ impl TransformStream {
             // Step 13: Otherwise, `resolve` _startPromise_ with undefined.
             start_promise.resolve(scope, HandleValue::undefined())?;
         }
-        // Not a spec step: mark an identity transform by linking its writable to its readable,
+        // Not a spec step: mark an identity transform by linking its writable to the transform,
         // so a native byte source piped into the writable can be propagated to the readable
-        // directly. Only a transform that runs no content code per chunk qualifies, so the
-        // shortcut has no content-visible effect: a transformer with any callback
-        // (`transform`/`start`/`flush`/`cancel` — which could enqueue extra chunks, or expect a
-        // cancel hook), or either strategy carrying a `size` function (invoked once per chunk on
-        // the non-shortcut path), disqualifies it.
+        // directly. The shortcut has no content-visible effect only if no content code runs per
+        // chunk, so any transformer callback or strategy `size` function disqualifies it.
         let no_strategy_size = readable_strategy
             .as_ref()
             .and_then(|s| s.size.as_ref())

@@ -4,13 +4,6 @@
 //! controllers.
 //!
 //! <https://streams.spec.whatwg.org/#queue-with-sizes>
-//!
-//! The spec models these containers as having `[[queue]]` (a list of
-//! "value-with-size" records) and `[[queueTotalSize]]` (a number) internal
-//! slots, and defines the queue operations (`EnqueueValueWithSize`,
-//! `DequeueValue`, `PeekQueueValue`, `ResetQueue`) generically over any such
-//! container. The [`QueueWithSizes`] trait captures that shared shape so the
-//! operations in [`crate::algorithms`] can run against either controller.
 
 use std::collections::VecDeque;
 

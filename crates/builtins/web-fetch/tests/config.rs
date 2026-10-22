@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! Keystone test for the request-restrictions configuration.
-//!
-//! The browser-security constraints — forbidden request headers, forbidden
-//! methods, no-CORS safelisting, origin/mode enforcement — are off by default:
-//! StarlingMonkey is primarily a server runtime, where a script must be able to
-//! set `Host` or use `CONNECT`. WPT mode turns them on by default, and an
-//! explicit `--web-security-restrictions[=bool]` overrides either default.
-//! `Runtime::init` applies the configured value, which is what these tests
-//! exercise end to end: with restrictions off, a forbidden header (`Host`) and
-//! a forbidden method (`CONNECT`) are accepted; with them on, they are
-//! filtered/rejected.
+//! The web security restrictions configuration: off by default, on by default in WPT mode, and
+//! overridable by `--web-security-restrictions[=bool]`. With restrictions off, a forbidden header
+//! (`Host`) and a forbidden method (`CONNECT`) are accepted. With them on, they are filtered or
+//! rejected.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]

@@ -4,14 +4,18 @@
 //!
 //! These tests deliberately cover only behavior that the enabled, passing WPT
 //! suite (see `tests/wpt-harness/tests.json`) doesn't exercise. What remains is
-//! coverage for behaviors whose only WPT home is a `.html` test (which this
-//! headless harness cannot run), an idlharness test that is not enabled, or —
-//! in the case of GC interaction — something WPT cannot express at all.
+//! coverage for behaviors whose only WPT home is a `.html` test, which this
+//! headless harness cannot run, and for GC interaction, which WPT cannot
+//! express.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
 
+use core_runtime::config::RuntimeConfig;
+use core_runtime::runtime::{self, Runtime};
 use core_runtime::test_util::eval_with_setup;
+use js::conversion::FromJSVal;
+use web_globals::events::EventTarget;
 
 fn setup() {
     core_runtime::runtime::register_global_initializer(|scope, global| {
@@ -32,22 +36,6 @@ fn event_composed_default() {
 }
 
 #[test]
-fn event_phase_constants() {
-    // Only Event-constants.html asserts the numeric values; the enabled
-    // any.js tests reference Event.NONE without pinning it to 0.
-    assert_eq!(eval("Event.NONE"), "0");
-    assert_eq!(eval("Event.CAPTURING_PHASE"), "1");
-    assert_eq!(eval("Event.AT_TARGET"), "2");
-    assert_eq!(eval("Event.BUBBLING_PHASE"), "3");
-}
-
-#[test]
-fn event_instance_phase_constants() {
-    assert_eq!(eval("new Event('x').NONE"), "0");
-    assert_eq!(eval("new Event('x').AT_TARGET"), "2");
-}
-
-#[test]
 fn event_prevent_default_non_cancelable() {
     // preventDefault on a non-cancelable event has no effect. The passive WPT
     // test only exercises the cancelable case.
@@ -58,28 +46,15 @@ fn event_prevent_default_non_cancelable() {
 }
 
 #[test]
-fn event_stop_propagation() {
+fn event_stop_propagation_and_cancel_bubble() {
     // stopPropagation()/cancelBubble live only in Event-cancelBubble.html.
     assert_eq!(
         eval("var e = new Event('x'); e.stopPropagation(); e.cancelBubble"),
         "true"
     );
-}
-
-#[test]
-fn event_cancel_bubble_setter() {
     assert_eq!(
         eval("var e = new Event('x'); e.cancelBubble = true; e.cancelBubble"),
         "true"
-    );
-}
-
-#[test]
-fn event_to_string_tag() {
-    // No idlharness for dom/events is enabled, so the brand check lives here.
-    assert_eq!(
-        eval("Object.prototype.toString.call(new Event('x'))"),
-        "[object Event]"
     );
 }
 
@@ -88,28 +63,15 @@ fn event_to_string_tag() {
 #[test]
 fn event_init_event() {
     assert_eq!(
-        eval("var e = new Event(''); e.initEvent('click', true, true); e.type"),
-        "click"
-    );
-}
-
-#[test]
-fn event_init_event_bubbles() {
-    assert_eq!(
-        eval("var e = new Event(''); e.initEvent('click', true, false); e.bubbles"),
-        "true"
+        eval(
+            "var e = new Event(''); e.initEvent('click', true, false); \
+             e.type + ',' + e.bubbles + ',' + e.cancelable"
+        ),
+        "click,true,false"
     );
 }
 
 // ── EventTarget ──
-
-#[test]
-fn event_target_to_string_tag() {
-    assert_eq!(
-        eval("Object.prototype.toString.call(new EventTarget())"),
-        "[object EventTarget]"
-    );
-}
 
 #[test]
 fn dispatch_event_at_target_phase() {
@@ -224,49 +186,56 @@ fn dispatch_redispatch_used_event() {
     );
 }
 
+/// A `once` listener leaves the event listener list when it runs. JS cannot observe the
+/// list's length, so this reads it directly.
+#[test]
+fn dispatch_removes_once_listeners_from_the_list() {
+    runtime::register_global_initializer(web_globals::add_to_global);
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let value = js::compile::evaluate_with_filename(
+        &scope,
+        "const t = new EventTarget();
+         t.addEventListener('x', () => {});
+         for (let i = 0; i < 3; i++) {
+           t.addEventListener('x', () => {}, { once: true });
+           t.dispatchEvent(new Event('x'));
+         }
+         t",
+        "test.js",
+        1,
+    )
+    .expect("script should evaluate");
+    let target = EventTarget::from_jsval(&scope, value, ()).expect("an EventTarget");
+    assert_eq!(target.listener_count(), 1);
+}
+
 // ── CustomEvent ──
 //
 // The only enabled WPT touching CustomEvent is one assertion in
 // Event-constructors.any.js (`detail: 54`) plus a subclass dispatch in
 // EventTarget-constructible.any.js. CustomEvent.html is not runnable here, so
-// detail typing, defaults, the brand, and initCustomEvent are covered below.
-
-#[test]
-fn custom_event_construct() {
-    assert_eq!(eval("new CustomEvent('x') instanceof CustomEvent"), "true");
-}
+// detail typing, defaults, and initCustomEvent are covered below.
 
 #[test]
 fn custom_event_extends_event() {
-    assert_eq!(eval("new CustomEvent('x') instanceof Event"), "true");
-}
-
-#[test]
-fn custom_event_detail_default_is_null() {
-    assert_eq!(eval("new CustomEvent('x').detail"), "null");
-}
-
-#[test]
-fn custom_event_detail_string() {
     assert_eq!(
-        eval("new CustomEvent('x', { detail: 'hello' }).detail"),
-        "hello"
+        eval(
+            "var e = new CustomEvent('x'); (e instanceof CustomEvent) + ',' + (e instanceof Event)"
+        ),
+        "true,true"
     );
 }
 
 #[test]
-fn custom_event_detail_object() {
+fn custom_event_detail() {
     assert_eq!(
-        eval("JSON.stringify(new CustomEvent('x', { detail: { a: 1 } }).detail)"),
-        r#"{"a":1}"#
-    );
-}
-
-#[test]
-fn custom_event_to_string_tag() {
-    assert_eq!(
-        eval("Object.prototype.toString.call(new CustomEvent('x'))"),
-        "[object CustomEvent]"
+        eval(
+            "JSON.stringify([new CustomEvent('x').detail, \
+                             new CustomEvent('x', { detail: 'hello' }).detail, \
+                             new CustomEvent('x', { detail: { a: 1 } }).detail])"
+        ),
+        r#"[null,"hello",{"a":1}]"#
     );
 }
 
@@ -284,18 +253,8 @@ fn custom_event_init_custom_event() {
     );
 }
 
-/// Listener identity must survive a compacting GC.
-///
-/// Listeners are compared by the live, barrier-updated pointer of their stored
-/// `Heap<Function>` rather than a cached raw pointer. A full GC promotes the
-/// callback out of the nursery and may compact it, changing its address — so a
-/// cached pointer captured at registration time would go stale. This drives a
-/// real collection *between* listener operations and checks that both
-/// deduplication and removal still match the relocated callback. (With a cached
-/// raw pointer this would observe a count of 4: dedup fails, both listeners
-/// fire twice, and removal matches neither.)
-///
-/// WPT cannot express this: it has no control over garbage collection.
+/// Listener identity survives a compacting GC, which moves the callback between the listener
+/// operations: deduplication and removal still match the relocated callback.
 #[test]
 fn listener_identity_survives_compacting_gc() {
     use core_runtime::config::RuntimeConfig;
@@ -329,14 +288,14 @@ fn listener_identity_survives_compacting_gc() {
 
     // After relocation: a duplicate add must still be recognised (dedup), a
     // dispatch must fire the single listener once, and removal must match the
-    // relocated callback so the final dispatch fires nothing.
+    // relocated callback so the final dispatch doesn't call a listener.
     let val = evaluate_with_filename(
         &scope,
         r#"
         globalThis.t.addEventListener('e', globalThis.handler); // dedup
         globalThis.t.dispatchEvent(new Event('e'));             // fires once
         globalThis.t.removeEventListener('e', globalThis.handler);
-        globalThis.t.dispatchEvent(new Event('e'));             // fires nothing
+        globalThis.t.dispatchEvent(new Event('e'));             // calls no listener
         String(globalThis.count)
         "#,
         "test.js",
@@ -488,7 +447,7 @@ fn add_event_listener_accepts_handle_event_objects() {
     );
 }
 
-/// A non-object callback is a TypeError, while `null` adds nothing.
+/// A non-object callback is a TypeError, while `null` doesn't add a listener.
 #[test]
 fn add_event_listener_rejects_non_object_callbacks() {
     assert_eq!(

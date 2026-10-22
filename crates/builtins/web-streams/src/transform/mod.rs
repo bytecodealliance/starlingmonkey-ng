@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! <https://streams.spec.whatwg.org/#rs-model>
+//! <https://streams.spec.whatwg.org/#ts-model>
 
 pub(crate) mod algorithms;
 
@@ -11,5 +11,5 @@ pub mod transformer;
 
 pub use readable_writable_pair::ReadableWritablePair;
 pub use transform_stream::TransformStream;
-pub use transform_stream_default_controller::TransformStreamDefaultController as ReadableStreamDefaultController;
+pub use transform_stream_default_controller::TransformStreamDefaultController;
 pub use transformer::Transformer;

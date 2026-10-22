@@ -21,11 +21,8 @@ struct TimeOriginSnapshot {
     epoch_ms: f64,
 }
 
-/// Held behind a lock rather than in a `OnceLock` because it has to be replaceable: an origin
-/// captured before a Wizer snapshot holds the wall-clock time of the machine that took the
-/// snapshot, which bears no relation to when the resumed instance runs. [`reset_time_origin`]
-/// re-establishes that half on resume. The monotonic half stays as captured, since
-/// [`platform::clock`](platform::clock) already puts a resumed instance's readings past it.
+/// Held behind a lock rather than in a `OnceLock` because [`reset_time_origin`] replaces its
+/// wall-clock half.
 static TIME_ORIGIN: std::sync::RwLock<Option<TimeOriginSnapshot>> = std::sync::RwLock::new(None);
 
 /// The current wall-clock time as an ECMA-262 timestamp (ms since Unix epoch).
@@ -49,8 +46,21 @@ fn elapsed_ms(origin: &TimeOriginSnapshot) -> f64 {
     platform::clock::monotonic_ns().saturating_sub(origin.monotonic_ns) as f64 / 1_000_000.
 }
 
-fn init_time_origin() {
-    let _ = time_origin();
+/// The resolution, in nanoseconds, that [`relative_ms`] coarsens timestamps to: 100
+/// microseconds, the resolution of <https://w3c.github.io/hr-time/#dfn-coarsen-time> without
+/// cross-origin isolated capability.
+const COARSENED_RESOLUTION_NS: u64 = 100_000;
+
+/// The timestamp `ns` nanoseconds after the time origin, in milliseconds. While the web security
+/// restrictions apply (see [`core_runtime::config::web_security_restrictions`]), it is coarsened
+/// to [`COARSENED_RESOLUTION_NS`], rounding down.
+fn relative_ms(ns: u64) -> f64 {
+    let ns = if core_runtime::config::web_security_restrictions() {
+        ns / COARSENED_RESOLUTION_NS * COARSENED_RESOLUTION_NS
+    } else {
+        ns
+    };
+    ns as f64 / 1_000_000.
 }
 
 /// Re-anchor the time origin's wall clock to the instance running now.
@@ -69,6 +79,7 @@ pub fn reset_time_origin() {
     }
 }
 
+/// The time origin, captured on the first call.
 fn time_origin() -> TimeOriginSnapshot {
     if let Some(origin) = *TIME_ORIGIN.read().expect("time origin lock poisoned") {
         return origin;
@@ -85,35 +96,29 @@ pub struct Performance {
     parent: EventTargetImpl,
 }
 
+/// <https://w3c.github.io/hr-time/#dfn-current-high-resolution-time>: the milliseconds since the
+/// time origin, coarsened as [`relative_ms`] describes.
 pub fn now() -> f64 {
-    elapsed_ms(&time_origin())
+    let origin = time_origin().monotonic_ns;
+    relative_ms(platform::clock::monotonic_ns().saturating_sub(origin))
 }
 
 /// [`now`] from [`platform::clock::coarse_monotonic_ns`], for timestamps that don't need the
 /// precise clock, such as `Event.timeStamp`.
 pub fn coarse_now() -> f64 {
-    let origin = time_origin();
-    platform::clock::coarse_monotonic_ns().saturating_sub(origin.monotonic_ns) as f64 / 1_000_000.
+    let origin = time_origin().monotonic_ns;
+    relative_ms(platform::clock::coarse_monotonic_ns().saturating_sub(origin))
 }
 
 #[webidl_methods]
 impl Performance {
     /// <https://www.w3.org/TR/hr-time-3/#now-method>
-    ///
-    /// Return the number of milliseconds since the time origin, as a `double`.
-    ///
-    /// The IDL defines the return as `DOMHighResTimeStamp` which is a
-    /// `double` in JS (64-bit float).
     #[method]
     pub fn now(&self) -> f64 {
         now()
     }
 
     /// <https://www.w3.org/TR/hr-time-3/#timeorigin-attribute>
-    ///
-    /// Return the time origin as an ECMA-262 timestamp (ms since Unix epoch).
-    /// This is a fixed value: the wall-clock time (in ms since Unix epoch)
-    /// at which the runtime's time origin was established.
     #[getter]
     fn time_origin(&self) -> f64 {
         time_origin().epoch_ms
@@ -135,9 +140,8 @@ impl Performance {
 /// Register the `Performance` class on `global` and install the singleton
 /// `performance` instance as a property on it.
 pub fn add_to_global<'s>(scope: &'s Scope<'_>, global: Object<'s>) {
-    // An embedder that snapshots the initialized runtime (Wizer) captures a time origin belonging
-    // to the snapshotting process; it calls `reset_time_origin` on resume to re-establish one.
-    init_time_origin();
+    // The time origin is captured when the first global is set up, not at the first clock read.
+    time_origin();
 
     Performance::add_to_global(scope, global);
 
@@ -150,39 +154,4 @@ pub fn add_to_global<'s>(scope: &'s Scope<'_>, global: Object<'s>) {
     global
         .set_property(scope, c"performance", performance)
         .expect("failed to define globalThis.performance");
-}
-
-#[cfg(test)]
-mod tests {
-    use core_runtime::{runtime, test_util::eval_with_setup};
-
-    fn eval(code: &str) -> String {
-        eval_with_setup(
-            || {
-                runtime::register_global_initializer(super::add_to_global);
-            },
-            code,
-        )
-    }
-
-    #[test]
-    fn performance_to_string_tag() {
-        assert_eq!(
-            eval("Object.prototype.toString.call(performance)"),
-            "[object Performance]"
-        );
-    }
-
-    #[test]
-    fn to_json_returns_object() {
-        assert!(eval(
-            "(() => {
-                const json = performance.toJSON();
-                return typeof json === 'object' &&
-                       typeof json.timeOrigin === 'number';
-            })()"
-        )
-        .parse::<bool>()
-        .unwrap());
-    }
 }

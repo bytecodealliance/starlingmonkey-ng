@@ -43,8 +43,8 @@ pub(crate) enum ResponseTainting {
 /// recurse through `main fetch`, so `send_following_redirects` re-runs it for
 /// the initial URL and for every redirect target.
 ///
-/// The request's origin is its client's. For us: the worker location's. Without
-/// one there is nothing to compare against, and in permissive server mode the
+/// The request's origin is that of its client, which here is the worker location.
+/// Without one there is nothing to compare against, and in permissive server mode the
 /// browser security policies are off wholesale, so in both cases every hop
 /// proceeds as "basic".
 fn apply_main_fetch_switch(
@@ -66,8 +66,8 @@ fn apply_main_fetch_switch(
     //     "`websocket`" → set _request_'s `response tainting` to "`basic`" (and run `scheme
     //     fetch`).
     // `data:` URLs never reach the transport, "`navigate`" is rewritten to "`same-origin`" by
-    // the `Request` constructor, and there are no WebSockets, so the arm reduces to the origin
-    // check.
+    // the `Request` constructor, and no request has mode "`websocket`", so the arm reduces to the
+    // origin check.
     if *tainting == ResponseTainting::Basic && url.origin() == *request_origin {
         return Ok(());
     }
@@ -131,19 +131,15 @@ pub(crate) async fn send_following_redirects(
     let mut url_list = vec![initial_url];
     loop {
         // Build this attempt's request, taking the body: a byte body is kept for replay on a
-        // body-preserving redirect (its clone is a refcount bump, not a copy); a stream body is
-        // moved (and cannot be replayed).
-        let body_is_stream = matches!(
-            request.body,
-            OutgoingBody::Stream(_) | OutgoingBody::Host(_)
-        );
-        let send_body = match &mut request.body {
-            OutgoingBody::Bytes(bytes) => OutgoingBody::Bytes(bytes.clone()),
-            // A streamed or host-piped body is consumed by the send and cannot be replayed.
-            OutgoingBody::Stream(_) | OutgoingBody::Host(_) => {
-                std::mem::replace(&mut request.body, OutgoingBody::Consumed)
-            }
-            OutgoingBody::Consumed => OutgoingBody::Consumed,
+        // body-preserving redirect (its clone is a refcount bump, not a copy). A streamed or
+        // host-piped body is moved, since the send consumes it.
+        let (send_body, body_is_stream) = match &mut request.body {
+            OutgoingBody::Bytes(bytes) => (OutgoingBody::Bytes(bytes.clone()), false),
+            OutgoingBody::Stream(_) | OutgoingBody::Host(_) => (
+                std::mem::replace(&mut request.body, OutgoingBody::Consumed),
+                true,
+            ),
+            OutgoingBody::Consumed => (OutgoingBody::Consumed, false),
         };
         let attempt = Request {
             method: request.method.clone(),
@@ -196,8 +192,8 @@ pub(crate) async fn send_following_redirects(
         // Established above: a non-redirect status already returned as the final response.
         // [inlined location URL] Step 2: Let _location_ be the result of `extracting header list
         //     values` given `Location` and _response_'s `header list`.
-        // The `ABNF` for `Location` allows a single `header`, so a second one (identical or not)
-        // is an error.
+        // The `ABNF` for `Location` allows a single `header`, so a second one, identical or not,
+        // makes the location URL a failure.
         let mut locations = response
             .headers
             .iter()
@@ -256,10 +252,8 @@ pub(crate) async fn send_following_redirects(
         //     `includes credentials`, then return a `network error`. This catches a cross-origin
         //     resource redirecting to a same-origin URL.
         //
-        // There is no origin or response-tainting model in this runtime — the requester has no
-        // origin — so the same-origin conditions cannot be evaluated. A credentialed Location on
-        // a cors-mode request is rejected outright: the strictest reading of steps 9–10, and what
-        // browsers observe for `fetch()` (always cors-mode here) of cross-origin resources.
+        // The origin conditions are not evaluated: a credentialed Location on a cors-mode request
+        // is rejected regardless of origin, the strictest reading of steps 9 and 10.
         let includes_credentials =
             !location_url.username().is_empty() || location_url.password().is_some();
         if mode == RequestMode::Cors && includes_credentials {
@@ -303,13 +297,9 @@ pub(crate) async fn send_following_redirects(
         //     moment another origin is seen after the initial request, the `Authorization` header
         //     is removed.
         if current_url.origin() != location_url.origin() {
-            // The spec's `CORS non-wildcard request-header name` list is just
-            // `Authorization`, because in a browser `Cookie`/`Proxy-Authorization`
-            // are forbidden request headers a script cannot set. This runtime's
-            // server mode lets a handler set them (forbidden-header enforcement
-            // off), so also strip them on a cross-origin redirect — defense in
-            // depth against leaking credentials to another origin. This only ever
-            // strips *more* than the spec, never fewer.
+            // `Cookie` and `Proxy-Authorization` are stripped as well. The spec leaves them out
+            // because they are forbidden request headers, but scripts can set them when
+            // forbidden-header enforcement is off.
             request.headers.retain(|(name, _)| {
                 !name.eq_ignore_ascii_case("authorization")
                     && !name.eq_ignore_ascii_case("cookie")
@@ -347,21 +337,13 @@ pub(crate) async fn send_following_redirects(
     }
 }
 
-/// Percent-encode the non-ASCII bytes of a `Location` header value, so the URL
-/// parser resolves it as the byte sequence it is.
+/// Percent-encode the non-ASCII code units of an isomorphic-decoded `Location` header value as the
+/// bytes they represent, so the URL parser resolves the byte sequence rather than encoding each
+/// code unit as UTF-8 (`E2 98 83` becomes `%E2%98%83`, not `%C3%A2%C2%98%C2%83`). ASCII, including
+/// `%`, is left as is.
 ///
-/// A header value is bytes, and the platform layer hands it over isomorphic-
-/// decoded, one code unit per byte. Passing that straight to the URL parser
-/// would have it treat those code units as *text* and percent-encode each one's
-/// UTF-8 encoding — so a `Location` of the three bytes `E2 98 83` would resolve
-/// to `%C3%A2%C2%98%C2%83` rather than `%E2%98%83`, a different URL. Encoding
-/// them here as the bytes they are avoids that.
-///
-/// ASCII is left untouched, so an already-escaped `%e2` keeps its spelling and
-/// a literal `%` stays literal — the URL parser does not re-encode either.
-///
-/// <https://github.com/whatwg/fetch/issues/883> — the behaviour
-/// `redirect-location-escape.tentative.any.js` covers, not yet in the spec.
+/// <https://github.com/whatwg/fetch/issues/883>, tested by
+/// `redirect-location-escape.tentative.any.js`.
 fn percent_encode_location_bytes(location: &str) -> std::borrow::Cow<'_, str> {
     use std::fmt::Write;
 

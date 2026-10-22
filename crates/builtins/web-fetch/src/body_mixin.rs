@@ -90,14 +90,6 @@ pub(crate) trait BodyMixin: HostBackedBodyOwner + Sized {
     /// The `TypeError` message for the not-yet-supported `textStream()`.
     const TEXT_STREAM_UNSUPPORTED: &'static CStr;
 
-    /// Store the `.body` stream materialized from the body's byte source.
-    fn set_body_stream(&self, stream: ReadableStream<'_>) {
-        self.with_body(|body| {
-            debug_assert!(body.stream.is_none());
-            body.stream = Some(Heap::from(stream));
-        });
-    }
-
     /// Mark the body's byte source as read — the `disturbed` of the stream it
     /// would have materialized into.
     fn set_source_disturbed(&self) {
@@ -164,7 +156,10 @@ pub(crate) trait BodyMixin: HostBackedBodyOwner + Sized {
             // body to expose.
             BodySource::Null => return Ok(None),
         };
-        self.set_body_stream(stream);
+        self.with_body(|body| {
+            debug_assert!(body.stream.is_none());
+            body.stream = Some(Heap::from(stream));
+        });
         Ok(Some(stream))
     }
 
@@ -280,8 +275,7 @@ pub(crate) trait BodyMixin: HostBackedBodyOwner + Sized {
         //     value of a ``Content-Type`` header and regardless of the presence or the value of a
         //     ``charset`` parameter.
         // Step 6: Return the result of _stream_, `piped through` _decoder_.
-        // `textStream()` depends on `TextDecoderStream` piping, deferred to a later milestone;
-        // throw for now.
+        // `textStream()` is not implemented.
         Err(throw_type_error(scope, Self::TEXT_STREAM_UNSUPPORTED))
     }
 }

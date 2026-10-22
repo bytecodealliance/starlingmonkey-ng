@@ -445,6 +445,17 @@ pub trait ThrowException {
     fn throw(self, scope: &Scope<'_>) -> ExnThrown;
 }
 
+/// A failed allocation. Throwing it reports out of memory, which no script can catch.
+#[derive(Debug, PartialEq)]
+pub struct OutOfMemory;
+
+impl ThrowException for OutOfMemory {
+    fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+        crate::exception::report_out_of_memory(scope);
+        ExnThrown
+    }
+}
+
 impl ThrowException for String {
     /// Throw a `TypeError` with this string as the message.
     fn throw(self, scope: &Scope<'_>) -> ExnThrown {

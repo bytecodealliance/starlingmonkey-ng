@@ -24,8 +24,7 @@ use crate::signals::algorithms as signal_algorithms;
 ///
 /// <https://dom.spec.whatwg.org/#event-flatten-more>
 ///
-/// Note: while this *looks* like it should be a WebIDL dictionary, the coercion rules are
-/// slightly different, which is why *flatten-more* is a thing in the spec and this implementation.
+/// Note: this isn't a WebIDL dictionary because flatten-more converts its members differently.
 pub(crate) struct ListenerOptions<'s> {
     pub(crate) capture: bool,
     pub(crate) passive: Option<bool>,
@@ -35,7 +34,6 @@ pub(crate) struct ListenerOptions<'s> {
 
 js::instance_local! {
     /// Monotonic source of event-listener ids.
-    /// Would theoretically overflow after 2^64 listeners, but that's not a realistic concern.
     static NEXT_LISTENER_ID: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -48,9 +46,6 @@ fn next_listener_id() -> u64 {
 }
 
 /// <https://dom.spec.whatwg.org/#concept-flatten-options>
-///
-/// (Note: while the spec presents this as a WebIDL spec concept, it's entirely
-/// specific to event handling, so this file is indeed the right place for it.)
 ///
 /// `options` is converted as the WebIDL union `(EventListenerOptions or boolean)`:
 /// `undefined`, `null` and objects become the dictionary, and any other value is
@@ -225,7 +220,10 @@ pub(crate) fn add_an_event_listener(
         .event_listener_list
         .iter()
         .find(|l| {
-            l.event_type == event_type && l.capture == capture && l.callback.eq_stack(&callback)
+            !l.handler
+                && l.event_type == event_type
+                && l.capture == capture
+                && l.callback.eq_stack(&callback)
         })
         .map(|l| l.id);
     let listener_id = match existing_id {
@@ -239,6 +237,7 @@ pub(crate) fn add_an_event_listener(
                 capture,
                 passive,
                 once,
+                handler: false,
             });
             id
         }
@@ -269,8 +268,65 @@ pub(crate) fn remove_an_event_listener(
     //         Listeners have no `removed` flag: dispatch re-locates each listener in the live
     //         list by id, so it skips any listener that is no longer in the list.
     target.event_listener_list.retain(|l| {
-        !(l.event_type == event_type && l.capture == capture && l.callback.eq_stack(callback))
+        l.handler
+            || !(l.event_type == event_type
+                && l.capture == capture
+                && l.callback.eq_stack(callback))
     });
+}
+
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler>:
+/// the value of the event handler of `target` for `event_type`, which is the callback of its
+/// listener, or `None` if the handler is null.
+pub(crate) fn event_handler<'s>(
+    scope: &'s Scope<'_>,
+    target: &EventTarget<'_>,
+    event_type: &str,
+) -> Option<Object<'s>> {
+    let data = target.data();
+    data.event_listener_list
+        .iter()
+        .find(|l| l.handler && l.event_type == event_type)
+        .map(|l| l.callback.get(scope))
+}
+
+/// The setter steps of an `EventHandler` IDL attribute of `target` for `event_type`, whose
+/// callback type is `[LegacyTreatNonObjectAsNull]`: an object, callable or not, becomes the
+/// handler, and any other value sets it to null.
+///
+/// A handler set while the handler is null appends its listener to the event listener list
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#activate-an-event-handler>).
+/// Replacing a handler keeps the listener's place in the list, and setting it to null removes the
+/// listener (<https://html.spec.whatwg.org/multipage/webappapis.html#deactivate-an-event-handler>).
+/// A handler that isn't callable does nothing when an event is dispatched.
+pub(crate) fn set_event_handler(
+    scope: &Scope<'_>,
+    target: &EventTarget<'_>,
+    event_type: &str,
+    value: HandleValue<'_>,
+) {
+    let handler = Object::from_raw_value(scope, value.get()).ok();
+    let mut data = target.data_mut();
+    let list = &mut data.event_listener_list;
+    let position = list
+        .iter()
+        .position(|l| l.handler && l.event_type == event_type);
+    match (handler, position) {
+        (Some(handler), Some(position)) => list[position].callback.set(handler),
+        (Some(handler), None) => list.push(EventListener {
+            id: next_listener_id(),
+            event_type: event_type.to_string(),
+            callback: Heap::from(handler),
+            capture: false,
+            passive: None,
+            once: false,
+            handler: true,
+        }),
+        (None, Some(position)) => {
+            list.remove(position);
+        }
+        (None, None) => {}
+    }
 }
 
 /// Remove the event listener with the given id from an EventTarget.
@@ -303,7 +359,8 @@ pub enum ScriptStackState {
 impl ScriptStackState {
     /// [Clean up after running script] step 3: if the JavaScript execution context stack is now
     /// empty, perform a microtask checkpoint. Run after every `call a user object's operation`.
-    /// The checkpoint also reports the promises rejected with no handler, as HTML's does.
+    /// The checkpoint also reports the promises rejected with no handler, as the HTML microtask
+    /// checkpoint does.
     ///
     /// [Clean up after running script]: https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
     pub fn clean_up_after_running_script(self, scope: &Scope<'_>) {
@@ -370,10 +427,9 @@ fn invoke_listeners(
         return;
     }
 
-    // Snapshot the listener list for a specific type to avoid issues with listeners added or
-    // removed during dispatch. We capture only listener `id`s and metadata; the
-    // live list is re-consulted by `id` each iteration, so callbacks are always
-    // fetched fresh and rooted (no stored GC pointers, no rooting gap).
+    // Snapshot the ids and options of the listeners for the event's type, so listeners added
+    // during dispatch don't run. Listeners removed during dispatch are skipped, and each callback
+    // is read from the live list when it runs.
     struct ListenerSnapshot {
         id: u64,
         passive: Option<bool>,
@@ -408,7 +464,11 @@ fn invoke_listeners(
         };
 
         // Root the callback before a `once` removal drops the listener's `Heap`.
-        let callback: Object<'_> = target.data().event_listener_list[pos].callback.get(scope);
+        let (callback, handler) = {
+            let data = target.data();
+            let listener = &data.event_listener_list[pos];
+            (listener.callback.get(scope), listener.handler)
+        };
 
         // If listener's `once` is true, remove it.
         if snap.once {
@@ -420,8 +480,9 @@ fn invoke_listeners(
             event.set_in_passive_listener(true);
         }
 
-        // Call the listener.
-        if call_event_listener(scope, target, callback, event).is_err() {
+        // Call the listener. An event handler that isn't callable does nothing.
+        let call = !handler || callback.is_callable();
+        if call && call_event_listener(scope, target, callback, event).is_err() {
             // Per the spec, exceptions from event listeners are "reported"
             // but do not stop event dispatch.
             js::exception::report_and_clear(scope, "event listener");

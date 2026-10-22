@@ -22,11 +22,6 @@ use js::prelude::HandleValue;
 /// `ArrayBuffer`.
 ///
 /// <https://streams.spec.whatwg.org/#readable-byte-stream-queue-entry>
-///
-/// `must_root`: holds a `Heap`, so crown rejects holding it by value across an
-/// allocation. It is traced inside the controller's `[[queue]]`; once
-/// `pop_front`'d it must be consumed (extract its buffer, then drop it) before
-/// anything allocates, or kept in a `RootedTraceableBox`.
 #[js::must_root]
 #[derive(Traceable, Default, js::ScopeRoot)]
 pub(crate) struct ByteQueueEntry {
@@ -68,11 +63,6 @@ pub(crate) enum ReaderType {
 /// a view of the requested type.
 ///
 /// <https://streams.spec.whatwg.org/#pull-into-descriptor>
-///
-/// `must_root`: holds a `Heap` (the buffer), so crown rejects holding it by
-/// value across an allocation. It is traced inside the controller's
-/// `[[pendingPullIntos]]`; once moved out it must be consumed immediately or
-/// kept in a `RootedTraceableBox`.
 #[js::must_root]
 #[derive(Traceable)]
 pub(crate) struct PullIntoDescriptor {

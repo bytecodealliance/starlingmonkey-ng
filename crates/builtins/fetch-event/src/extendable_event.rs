@@ -96,8 +96,6 @@ impl ExtendableEvent {
                 &format!("`{caller}`"),
             ));
         };
-        // Note: if the allocation of `on_settled` were to fail, this would leak `handle` until
-        // the event loop is dropped. Working around that would be more trouble than it's worth.
         let holder = LifetimePromisePayload::new(scope, handle, *self)?;
         let on_settled =
             Function::new_callback(scope, c"", 1, lifetime_promise_settled_cb, holder)?;

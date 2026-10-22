@@ -159,7 +159,7 @@ fn proxy_close_step(scope: &Scope<'_>, payload: Object<'_>) -> Result<(), ExnThr
         .cast::<BodyProxySource>()
         .expect("payload is a BodyProxySource");
     let controller = state.controller(scope);
-    // The proxy can already be closed or cancelled by the time the stream it proxies closes:
+    // The proxy can already be closed or cancelled by the time the proxied stream closes:
     // `abort the fetch() call` cancels the request body, and cancelling the proxy cancels the
     // proxied stream, whose close re-enters here through any read request still pending on it
     // (a host-backed body always has one — its chunk read is in flight). Closing again is
@@ -183,8 +183,9 @@ fn proxy_error_step(
         .cast::<BodyProxySource>()
         .expect("payload is a BodyProxySource");
     let controller = state.controller(scope);
-    // Already-closed/cancelled proxy: erroring it is a no-op that fails. Ignore it for the
-    // same reason as the close step — these are a read request's `error steps`.
+    // Erroring an already closed or cancelled proxy fails without any effect. The failure
+    // is ignored for the same reason as in the close step: these are a read request's
+    // `error steps`.
     if controller.error(scope, Some(error)).is_err() {
         js::exception::clear(scope);
     }

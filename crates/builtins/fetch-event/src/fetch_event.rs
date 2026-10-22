@@ -23,9 +23,7 @@ use web_globals::events::algorithms::ScriptStackState;
 use web_globals::events::EventTarget;
 
 /// <https://w3c.github.io/ServiceWorker/#dictdef-fetcheventinit>
-// Note: the missing fields are intentionally omitted. The only difference that makes is that
-// validation will accept things the spec wouldn't, but that's really marginal: it'd reject
-// e.g. a `resultingClientId` property where `toString()` throws, but not much else.
+// Note: the other members are omitted, so their values are not converted.
 #[webidl_dictionary(extends = ExtendableEventInit)]
 pub struct FetchEventInit<'a> {
     parent: ExtendableEventInit,
@@ -63,8 +61,8 @@ pub struct FetchEvent {
     wait_to_respond: bool,
     /// <https://w3c.github.io/ServiceWorker/#fetchevent-respond-with-error-flag>
     respond_with_error: bool,
-    // Note: `preloadResponse`, `resultingClientId`, and `replacesClientId` omitted intentionally.
-    // The first isn't supported anywhere, and all three don't really matter to our use cases.
+    // Note: `preloadResponse` and `replacesClientId` are not implemented, and `resultingClientId`
+    // is always empty.
 }
 
 #[webidl_methods]
@@ -76,7 +74,7 @@ impl FetchEvent {
         r#type: &str,
         event_init_dict: &FetchEventInit<'_>,
     ) -> Result<Self, ExnThrown> {
-        // The spec-defined script constructor; the runtime creates its events via
+        // The spec-defined script constructor. The runtime creates its events with
         // `create_for_request` instead, and only those events are ever dispatched.
         // WPT still contains tests for the JS constructor though.
         let handled = Promise::new_pending(scope)?;
@@ -196,9 +194,9 @@ impl FetchEvent {
     /// <https://w3c.github.io/ServiceWorker/#dom-fetchevent-respondwith>
     // `r` is a WebIDL `Promise<Response>`: the trampoline accepts any value, hands over a promise
     // resolved with it, and rejects that promise if what it settles with isn't a `Response`. That
-    // rejection lands in step 9 below, which sets the `respond-with error flag` — the same flag
-    // step 10.1 sets for a non-`Response` fulfillment, which is why step 10.1 is unreachable here
-    // (see `on_respond_fulfilled`).
+    // rejection lands in step 9 below, which sets the `respond-with error flag`. Step 10.1 sets the
+    // same flag for a non-`Response` fulfillment, which is why step 10.1 is unreachable here (see
+    // `on_respond_fulfilled`).
     #[method]
     pub fn respond_with(
         &self,
@@ -295,8 +293,8 @@ fn on_respond_fulfilled(
     let unusable = response.is_body_unusable(scope);
     if !unusable {
         // Steps 10.2.2 to 10.2.5 are implemented at the platform layer instead of here, except
-        // for the effect step 10.2.2's transform has on the response handed in, which is to take
-        // its body, and step 10.2.5.1's getting a reader for the body's stream, which
+        // for the effect that step 10.2.2's transform has on the response handed in, which is to
+        // take its body, and step 10.2.5.1's getting a reader for the body's stream, which
         // `reserve_body_for_sending` acquires now so author code can no longer read from it.
         response.reserve_body_for_sending(scope)?;
     }
@@ -373,20 +371,15 @@ impl<'s> FetchEvent<'s> {
         self.data().respond_with_entered
     }
 
-    /// Settle the `handled` promise: steps 21–23 of
-    /// [Create Fetch Event and Dispatch](https://w3c.github.io/ServiceWorker/#create-fetch-event-and-dispatch),
-    /// where the event's outcome becomes final. `responded` says whether a `Response` is on its way
-    /// to the client.
+    /// Settle the `handled` promise, per steps 21–23 of
+    /// [Create Fetch Event and Dispatch](https://w3c.github.io/ServiceWorker/#create-fetch-event-and-dispatch):
+    /// resolve it if `responded` (a `Response` is on its way to the client), and reject it with a
+    /// "NetworkError" `DOMException` otherwise. Does nothing once `handled` is settled.
     ///
-    /// The spec settles `handled` three ways: resolve once a response is on its way (step 23),
-    /// reject when the event failed (steps 21.1.1 and 22.1), and, when the handler never called
-    /// `respondWith`, resolve (step 21.2), because that case returns null, which tells `Fetch`
-    /// to go get the response from the network itself.
-    ///
-    /// There is no network to fall back to here, so that third case ends in a `500` like the
-    /// failures do, and resolving would tell the handler its request was served. So this resolves
-    /// only when `responded`, and rejects otherwise. Which failure it was only affects the
-    /// rejection's message, which [`respond_with_error`](Self::respond_with_error_set) selects.
+    /// When the handler never called `respondWith`, the spec resolves `handled` (step 21.2), since
+    /// `Fetch` then falls back to the network. There is no network fallback here, so that case ends
+    /// in a `500` and rejects like the failures. The rejection's message depends on
+    /// [`Self::respond_with_error_set`].
     pub fn settle_handled(&self, scope: &'s Scope<'_>, responded: bool) {
         let handled = self.data().handled.get(scope);
         if !handled.is_pending() {

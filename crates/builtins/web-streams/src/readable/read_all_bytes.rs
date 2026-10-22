@@ -4,19 +4,9 @@
 //!
 //! <https://streams.spec.whatwg.org/#readablestreamdefaultreader-read-all-bytes>
 //!
-//! Drains a default reader to a single byte sequence using *internal* read
-//! requests, then hands the bytes to a caller-supplied success callback. Fetch's
-//! `fully read a body` is the sole consumer: it acquires an internal reader for a
-//! body's stream and reads all the bytes, converting them to the requested value
-//! (text, JSON, an `ArrayBuffer`, …) in the success callback.
-//!
-//! Reading via internal read requests — rather than the author-facing
-//! `reader.read()` — is what makes this immune to a hijacked `Object.prototype.then`:
-//! the chunk steps receive the chunk directly and accumulate its bytes, never
-//! building an `{ value, done }` iterator-result object nor resolving a promise
-//! with one, so the engine never performs thenable assimilation that would look up
-//! and invoke an author-installed `then`. (The same property is why `pipeTo`
-//! survives that attack.)
+//! Drains a default reader to a single byte sequence using internal read
+//! requests (see [`native_read`](super::native_read) for why), then hands the
+//! bytes to a caller-supplied success callback.
 
 use super::algorithms::{
     acquire_readable_stream_default_reader, readable_stream_default_reader_read,
@@ -27,7 +17,7 @@ use super::readable_stream::ReadableStream;
 use crate::readable::DefaultReader;
 use core_runtime::{jsclass, jsmethods};
 use js::conversion::FromJSVal;
-use js::error::ExnThrown;
+use js::error::{ExnThrown, OutOfMemory, ThrowException};
 use js::function::cast_payload;
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
@@ -38,9 +28,8 @@ use js::{Function, Promise, Uint8Array};
 
 /// The completion of a read-all-bytes drain (the caller's `successSteps`):
 /// receives the payload value given to [`read_all_bytes`] and the assembled
-/// bytes **by value** — no intermediate JS `Uint8Array` round-trip — and
-/// returns the value the result promise resolves with (or throws to reject
-/// it).
+/// bytes, and returns the value the result promise resolves with (or throws to
+/// reject it).
 pub type ReadAllBytesComplete =
     for<'r> fn(&'r Scope<'r>, HandleValue<'_>, Vec<u8>) -> Result<HandleValue<'r>, ExnThrown>;
 
@@ -62,11 +51,10 @@ pub(crate) struct ReadAllBytesState {
     /// [`read_all_bytes`] right after the state is created (`Option` only
     /// because the callback's payload is the state object, which must exist
     /// first) and queued directly on the job queue per chunk, so the read
-    /// loop allocates nothing per chunk.
+    /// loop doesn't allocate per chunk.
     read_next_fn: Option<Heap<js::function::Function>>,
 }
 
-// Needed to fully initialize the class. Intentionally left blank.
 #[jsmethods]
 impl ReadAllBytesState {
     fn new(
@@ -97,20 +85,9 @@ pub fn read_all_bytes<'r>(
     payload: HandleValue<'_>,
 ) -> Result<Promise<'r>, ExnThrown> {
     let promise = Promise::new_pending(scope)?;
-    // Acquire an *internal* default reader (not the author-facing `getReader()`),
-    // so its read requests deliver chunks to native steps rather than to author
-    // code via promise resolution.
-    //
-    // The reader is deliberately never released (neither close nor error steps do
-    // so): the sole caller is the Fetch "fully read a body" path, which consumes a
-    // body exactly once and must leave the stream locked-and-disturbed so it
-    // cannot be re-read (mirroring `body::readable_stream_consumed`). A future
-    // non-fetch caller that wants the stream reusable afterward must release it
-    // itself.
+    // The reader is never released, so the stream stays locked afterwards.
     let reader = acquire_readable_stream_default_reader(scope, &stream)?;
     let state = ReadAllBytesState::new(scope, reader, promise, on_complete, payload)?;
-    // The deferred-read callback, reused for every chunk. Created here (not in
-    // the closure above) because its payload is the state object.
     let read_next_fn = Function::new_callback(scope, c"", 0, read_next_microtask, state)?;
     state.data_mut().read_next_fn.set(read_next_fn);
     read_next(scope, state);
@@ -142,8 +119,7 @@ fn read_next(scope: &Scope<'_>, state: ReadAllBytesState<'_>) {
 /// synchronously (`readable_stream_default_reader_read`'s pull steps run the
 /// chunk steps on the same stack), so issuing the next read directly from here
 /// recurses once per queued chunk and overflows the stack on a body with many
-/// queued chunks. One flat microtask per chunk keeps the loop iterative, the
-/// same way the tee and pipe read requests defer their per-chunk work.
+/// queued chunks. One flat microtask per chunk keeps the loop iterative.
 pub(crate) fn read_all_bytes_chunk_steps(
     scope: &Scope<'_>,
     state: ReadAllBytesState<'_>,
@@ -159,8 +135,19 @@ pub(crate) fn read_all_bytes_chunk_steps(
     // Step 2: Append the bytes represented by chunk to bytes.
     let mut data = state.data_mut();
     let bytes = &mut data.bytes;
-    array.with_slice(|chunk_bytes| bytes.extend_from_slice(chunk_bytes));
+    let appended = array.with_slice(|chunk| {
+        let reserved = bytes.try_reserve(chunk.len()).is_ok();
+        if reserved {
+            bytes.extend_from_slice(chunk);
+        }
+        reserved
+    });
     drop(data);
+    if !appended {
+        OutOfMemory.throw(scope);
+        let promise = state.data().promise.get(scope);
+        return promise.reject_with_pending(scope);
+    }
     // Step 3: Read-loop — deferred one microtask (see above): queue the
     // state's deferred-read callback directly on the job queue.
     let microtask = state
@@ -183,9 +170,9 @@ fn read_next_microtask(
     Ok(value::undefined())
 }
 
-/// The `Consume` read request's close steps: hand the accumulated bytes (by
-/// value — no `Uint8Array` round-trip) to the native success callback, and
-/// resolve the result promise with its return value (or reject if it throws).
+/// The `Consume` read request's close steps: hand the accumulated bytes to the
+/// native success callback, and resolve the result promise with its return
+/// value (or reject if it throws).
 pub(crate) fn read_all_bytes_close_steps(
     scope: &Scope<'_>,
     state: ReadAllBytesState<'_>,

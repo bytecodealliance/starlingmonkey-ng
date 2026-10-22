@@ -31,13 +31,9 @@ pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     queuing::ByteLengthQueuingStrategy::add_to_global(scope, global);
     queuing::CountQueuingStrategy::add_to_global(scope, global);
 
-    // The tee/pipe/from-iterable algorithms keep their cross-callback state in
-    // internal `#[jsclass]` objects (so the state is GC-traced and reachable
-    // through each callback's payload). They are created via `create_instance_with`,
-    // which needs the prototype registered per-global — but they are not
-    // web-exposed interfaces, so the named constructor that `add_to_global`
-    // installs is deleted from the global afterward (the prototype registry, keyed
-    // by TypeId, is unaffected).
+    // Internal classes holding the state of tee, pipe, from-iterable and read-all-bytes
+    // operations. Creating instances needs their prototypes registered, and `hidden` keeps
+    // their constructors off the global.
     readable::algorithms::TeeState::add_to_global(scope, global);
     readable::algorithms::ByteTeeState::add_to_global(scope, global);
     readable::algorithms::PipeState::add_to_global(scope, global);
@@ -71,7 +67,7 @@ pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     // (auto-allocation and `ReadableStreamBYOBRequest.view`). Resolve those standard
     // constructors now, while no stream state is live, so their lazy
     // first-construction never runs mid-operation with byte-stream objects
-    // reachable — which otherwise trips a GC tracer assertion under moving GC.
+    // reachable. That trips a GC tracer assertion under moving GC.
     for key in [
         js::class_spec::JSProtoKey::JSProto_ArrayBuffer,
         js::class_spec::JSProtoKey::JSProto_Uint8Array,

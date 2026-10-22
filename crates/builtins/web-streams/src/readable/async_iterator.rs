@@ -26,9 +26,6 @@ use js::prelude::{CallbackArgs, HandleValue};
 use js::{Function, Object, Promise};
 
 /// <https://streams.spec.whatwg.org/#rs-asynciterator>
-///
-/// The prototype's `[[Prototype]]` is set to `%AsyncIteratorPrototype%` at
-/// registration (see `add_to_global`), which supplies `[Symbol.asyncIterator]`.
 // WebIDL §3.7.10: the class string of an asynchronous iterator prototype object
 // is the interface identifier followed by " AsyncIterator" (with a space).
 #[webidl_interface(hidden, to_string_tag = "ReadableStream AsyncIterator")]
@@ -220,8 +217,8 @@ fn run_next_steps<'r>(
     // Step 7: Let _rejectSteps_ be the following steps, given _reason_: (implemented in
     //         `next_rejected`)
     // Step 8: Let _onRejected_ be CreateBuiltinFunction(_rejectSteps_, 1, "", « »).
-    // The unique sentinel the close steps resolve the next-iteration promise
-    // with (recognized by identity in `next_fulfilled`) and the reaction
+    // The unique sentinel with which the close steps resolve the next-iteration
+    // promise (recognized by identity in `next_fulfilled`) and the reaction
     // callbacks are per-iterator; create them on the first `next()` and reuse
     // them for every subsequent chunk.
     if iter.data().next_fulfilled_fn.is_none() {
@@ -396,16 +393,6 @@ fn iter_reader<'r>(
 }
 
 // --- ReadRequest::AsyncIter step bodies (called from `read_request.rs`) -------
-
-/// Chunk steps: resolve `promise` with the raw chunk.
-/// Wrapping in `{ value, done }` happens in `next()`'s fulfill steps.
-pub(crate) fn async_iter_chunk_steps(
-    scope: &Scope<'_>,
-    promise: Promise<'_>,
-    chunk: HandleValue<'_>,
-) -> Result<(), ExnThrown> {
-    promise.resolve(scope, chunk)
-}
 
 /// Close steps: release the reader, then resolve `promise` with the end-of-iteration
 /// sentinel (recognised by `next()`'s fulfill steps).

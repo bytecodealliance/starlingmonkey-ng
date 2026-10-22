@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! Read requests.
+//! Read requests and read-into requests, one enum variant per consumer.
 //!
 //! <https://streams.spec.whatwg.org/#read-request>
-//!
-//! A read request is a spec struct bundling three native step-algorithms —
-//! `chunk steps` (given a chunk), `close steps`, and `error steps` (given an
-//! error). Each consumer of a `DefaultReader` (a `read()` call,
-//! `pipeTo`, `tee`, the async iterator) supplies its own. They are modelled as
-//! an enum — one variant per consumer — rather than as JS values, because the
-//! steps are native and the `[[readRequests]]` list must trace whatever rooted
-//! state they hold.
 
-use js::error::ExnThrown;
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::iteration::create_iter_result;
@@ -30,14 +21,9 @@ use crate::readable::read_all_bytes::{
     read_all_bytes_chunk_steps, read_all_bytes_close_steps, read_all_bytes_error_steps,
     ReadAllBytesStateImpl,
 };
+use crate::support::report_failure;
 
 /// An entry in a reader's `[[readRequests]]` list.
-///
-/// Marked `#[js::must_root]` because each variant holds a `Heap` (the read
-/// promise, or tee/pipe/iterator state): crown then rejects holding a
-/// `ReadRequest` by value in a plain local across an allocation — the exact
-/// untraced-`Heap`-across-GC hazard — forcing callers to keep it traced
-/// (`RootedTraceableBox`) until they settle it.
 #[js::must_root]
 #[derive(core_runtime::Traceable, js::ScopeRoot)]
 pub(crate) enum ReadRequest {
@@ -100,10 +86,6 @@ pub(crate) enum ReadRequest {
     /// its error steps reject the result promise. The shared state is a
     /// `ReadAllBytesState` (see `crate::readable::read_all_bytes`).
     ///
-    /// Unlike a `Read` request, the chunk never becomes an `{ value, done }`
-    /// object resolved into a promise, so a hijacked `Object.prototype.then`
-    /// cannot intercept it.
-    ///
     /// <https://streams.spec.whatwg.org/#readablestreamdefaultreader-read-all-bytes>
     Consume {
         /// The read-all-bytes state object.
@@ -111,9 +93,7 @@ pub(crate) enum ReadRequest {
     },
     /// An out-of-crate native consumer's read request (see
     /// `crate::readable::native_read`): the steps are plain fn pointers
-    /// receiving the rooted `payload`. Like `Consume`, delivery never builds an
-    /// `{ value, done }` object or resolves a promise, so author code cannot
-    /// observe it.
+    /// receiving the rooted `payload`.
     Native {
         /// The consumer's step functions.
         #[no_trace]
@@ -131,16 +111,15 @@ impl<'s> StackReadRequest<'s> {
                 .and_then(|result| promise.resolve(scope, result)),
             StackReadRequest::Tee { state } => tee_read_request_chunk_steps(scope, state, chunk),
             StackReadRequest::Pipe { state } => pipe_read_request_chunk_steps(scope, state, chunk),
-            StackReadRequest::AsyncIter { promise, .. } => {
-                super::async_iterator::async_iter_chunk_steps(scope, promise, chunk)
-            }
+            // `next()`'s fulfill steps wrap the raw chunk in `{ value, done }`.
+            StackReadRequest::AsyncIter { promise, .. } => promise.resolve(scope, chunk),
             StackReadRequest::ByteTeeDefault { state } => {
                 byte_tee_default_chunk_steps(scope, state, chunk)
             }
             StackReadRequest::Consume { state } => read_all_bytes_chunk_steps(scope, state, chunk),
             StackReadRequest::Native { steps, payload } => (steps.chunk)(scope, payload, chunk),
         };
-        report_failed_steps(scope, result, "read request chunk steps");
+        report_failure(scope, result, "read request chunk steps");
     }
 
     /// Perform the read request's `close steps`.
@@ -170,7 +149,7 @@ impl<'s> StackReadRequest<'s> {
             StackReadRequest::Consume { state } => read_all_bytes_close_steps(scope, state),
             StackReadRequest::Native { steps, payload } => (steps.close)(scope, payload),
         };
-        report_failed_steps(scope, result, "read request close steps");
+        report_failure(scope, result, "read request close steps");
     }
 
     /// Perform the read request's `error steps` given `e`.
@@ -194,7 +173,7 @@ impl<'s> StackReadRequest<'s> {
             StackReadRequest::Consume { state } => read_all_bytes_error_steps(scope, state, e),
             StackReadRequest::Native { steps, payload } => (steps.error)(scope, payload, e),
         };
-        report_failed_steps(scope, result, "read request error steps");
+        report_failure(scope, result, "read request error steps");
     }
 }
 
@@ -205,9 +184,6 @@ impl<'s> StackReadRequest<'s> {
 /// Like [`ReadRequest`] but for `BYOBReader.read(view)`. Its
 /// `chunk`/`close` steps both receive a view (the filled or empty destination),
 /// unlike a default read request whose close step produces `undefined`.
-///
-/// Marked `#[js::must_root]` for the same reason as [`ReadRequest`]: its
-/// variants hold a `Heap`, so crown forbids holding one untraced across a GC.
 #[js::must_root]
 #[derive(core_runtime::Traceable, js::ScopeRoot)]
 pub(crate) enum ReadIntoRequest {
@@ -244,7 +220,7 @@ impl<'s> StackReadIntoRequest<'s> {
                 byte_tee_byob_chunk_steps(scope, state, for_branch2, chunk)
             }
         };
-        report_failed_steps(scope, result, "read-into request chunk steps");
+        report_failure(scope, result, "read-into request chunk steps");
     }
 
     /// Perform the read-into request's `close steps` given `chunk`.
@@ -256,7 +232,7 @@ impl<'s> StackReadIntoRequest<'s> {
                 byte_tee_byob_close_steps(scope, state, for_branch2, chunk)
             }
         };
-        report_failed_steps(scope, result, "read-into request close steps");
+        report_failure(scope, result, "read-into request close steps");
     }
 
     /// Perform the read-into request's `error steps` given `e`.
@@ -271,15 +247,6 @@ impl<'s> StackReadIntoRequest<'s> {
                 Ok(())
             }
         };
-        report_failed_steps(scope, result, "read-into request error steps");
-    }
-}
-
-/// Read request steps have no caller to throw to, so an exception one of them
-/// leaves (from a consumer's native step, or running out of memory) is reported
-/// and cleared.
-fn report_failed_steps(scope: &Scope<'_>, result: Result<(), ExnThrown>, context: &str) {
-    if result.is_err() {
-        js::exception::report_and_clear(scope, context);
+        report_failure(scope, result, "read-into request error steps");
     }
 }

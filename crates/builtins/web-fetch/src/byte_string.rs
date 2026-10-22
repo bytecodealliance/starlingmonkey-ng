@@ -38,12 +38,6 @@ impl AsRef<str> for ByteString {
     }
 }
 
-impl From<ByteString> for String {
-    fn from(value: ByteString) -> Self {
-        value.0
-    }
-}
-
 impl<'s, 'v> FromJSVal<'s, 'v> for ByteString {
     type Config = ();
 

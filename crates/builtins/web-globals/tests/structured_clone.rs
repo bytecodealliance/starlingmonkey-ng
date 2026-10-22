@@ -19,198 +19,53 @@ fn throws(code: &str) -> bool {
     throws_with_setup(setup, code)
 }
 
-// ── structuredClone exists ──
-
 #[test]
-fn structured_clone_exists() {
-    assert_eq!(eval("typeof structuredClone"), "function");
-}
-
-#[test]
-fn structured_clone_length_excludes_optional() {
-    // WebIDL `.length` counts required arguments only: the optional `options`
-    // dictionary must not be counted.
-    assert_eq!(eval("structuredClone.length"), "1");
-}
-
-// ── Primitives ──
-
-#[test]
-fn clone_undefined() {
-    assert_eq!(eval("structuredClone(undefined)"), "undefined");
-}
-
-#[test]
-fn clone_null() {
-    assert_eq!(eval("structuredClone(null)"), "null");
-}
-
-#[test]
-fn clone_boolean_true() {
-    assert_eq!(eval("structuredClone(true)"), "true");
-}
-
-#[test]
-fn clone_boolean_false() {
-    assert_eq!(eval("structuredClone(false)"), "false");
-}
-
-#[test]
-fn clone_number() {
-    assert_eq!(eval("structuredClone(42)"), "42");
-}
-
-#[test]
-fn clone_negative_zero() {
-    assert_eq!(eval("Object.is(structuredClone(-0), -0)"), "true");
-}
-
-#[test]
-fn clone_nan() {
-    assert_eq!(eval("Number.isNaN(structuredClone(NaN))"), "true");
-}
-
-#[test]
-fn clone_infinity() {
-    assert_eq!(eval("structuredClone(Infinity)"), "Infinity");
-}
-
-#[test]
-fn clone_string() {
-    assert_eq!(eval("structuredClone('hello')"), "hello");
-}
-
-#[test]
-fn clone_empty_string() {
-    assert_eq!(eval("structuredClone('')"), "");
-}
-
-#[test]
-fn clone_bigint() {
-    assert_eq!(eval("structuredClone(42n).toString()"), "42");
-}
-
-// ── Objects ──
-
-#[test]
-fn clone_plain_object() {
+fn structured_clone_is_a_function_of_one_argument() {
+    // WebIDL `.length` counts required arguments only, so the optional `options` dictionary isn't
+    // counted.
     assert_eq!(
-        eval("JSON.stringify(structuredClone({a: 1, b: 'hello'}))"),
-        r#"{"a":1,"b":"hello"}"#
+        eval("typeof structuredClone + ',' + structuredClone.length"),
+        "function,1"
     );
 }
 
 #[test]
-fn clone_is_deep_copy() {
-    assert_eq!(
-        eval("let o = {a: {b: 1}}; let c = structuredClone(o); o.a.b = 2; c.a.b"),
-        "1"
-    );
-}
-
-#[test]
-fn clone_preserves_identity() {
-    // The clone should be a different object.
-    assert_eq!(eval("let o = {}; structuredClone(o) === o"), "false");
-}
-
-// ── Arrays ──
-
-#[test]
-fn clone_array() {
-    assert_eq!(
-        eval("JSON.stringify(structuredClone([1, 2, 3]))"),
-        "[1,2,3]"
-    );
-}
-
-#[test]
-fn clone_nested_array() {
-    assert_eq!(
-        eval("JSON.stringify(structuredClone([[1], [2, [3]]]))"),
-        "[[1],[2,[3]]]"
-    );
-}
-
-// ── Date ──
-
-#[test]
-fn clone_date() {
-    assert_eq!(
-        eval("structuredClone(new Date('2024-01-01T00:00:00Z')).toISOString()"),
-        "2024-01-01T00:00:00.000Z"
-    );
-}
-
-// ── RegExp ──
-
-#[test]
-fn clone_regexp() {
-    assert_eq!(
-        eval("let r = structuredClone(/abc/gi); r.source + ',' + r.flags"),
-        "abc,gi"
-    );
-}
-
-// ── Map ──
-
-#[test]
-fn clone_map() {
+fn clone_primitives() {
     assert_eq!(
         eval(
-            "let m = new Map([['a', 1], ['b', 2]]); \
-             let c = structuredClone(m); \
-             c.get('a') + ',' + c.get('b') + ',' + (c !== m)"
+            "[undefined, null, true, false, 42, Infinity, 'hello', '', 42n]
+               .map((v) => String(structuredClone(v)))
+               .concat(Object.is(structuredClone(-0), -0), Number.isNaN(structuredClone(NaN)))
+               .join()"
         ),
-        "1,2,true"
+        "undefined,null,true,false,42,Infinity,hello,,42,true,true"
     );
 }
-
-// ── Set ──
 
 #[test]
-fn clone_set() {
+fn clone_wrapped_primitives() {
     assert_eq!(
         eval(
-            "let s = new Set([1, 2, 3]); \
-             let c = structuredClone(s); \
-             c.has(1) + ',' + c.has(2) + ',' + c.has(3) + ',' + (c !== s)"
+            "[Object(true), Object(42), Object('hello')]
+               .map((v) => { const c = structuredClone(v); return typeof c + ':' + (c == v.valueOf()); })
+               .join()"
         ),
-        "true,true,true,true"
+        "object:true,object:true,object:true"
     );
 }
-
-// ── ArrayBuffer ──
 
 #[test]
-fn clone_arraybuffer() {
+fn clone_objects_and_arrays_deeply() {
     assert_eq!(
         eval(
-            "let buf = new ArrayBuffer(4); \
-             new Uint8Array(buf).set([1, 2, 3, 4]); \
-             let clone = structuredClone(buf); \
-             let arr = new Uint8Array(clone); \
-             arr[0] + ',' + arr[1] + ',' + arr[2] + ',' + arr[3] + ',' + (clone !== buf)"
+            "let o = {a: {b: 1}, s: 'hello', arr: [[1], [2, [3]]]}; \
+             let c = structuredClone(o); \
+             o.a.b = 2; \
+             [c !== o, c.a.b, c.s, JSON.stringify(c.arr)].join(' ')"
         ),
-        "1,2,3,4,true"
+        "true 1 hello [[1],[2,[3]]]"
     );
 }
-
-// ── TypedArray ──
-
-#[test]
-fn clone_uint8array() {
-    assert_eq!(
-        eval(
-            "let a = new Uint8Array([10, 20, 30]); \
-             let c = structuredClone(a); \
-             c[0] + ',' + c[1] + ',' + c[2] + ',' + (c !== a)"
-        ),
-        "10,20,30,true"
-    );
-}
-
-// ── Circular references ──
 
 #[test]
 fn clone_circular_reference() {
@@ -224,48 +79,68 @@ fn clone_circular_reference() {
     );
 }
 
-// ── Error ──
-
 #[test]
-fn clone_error() {
+fn clone_date_and_regexp() {
     assert_eq!(
         eval(
-            "let e = new Error('test'); \
-             let c = structuredClone(e); \
-             (c instanceof Error) + ',' + c.message"
+            "let r = structuredClone(/abc/gi); \
+             structuredClone(new Date('2024-01-01T00:00:00Z')).toISOString() + ',' + \
+             r.source + ',' + r.flags"
         ),
-        "true,test"
+        "2024-01-01T00:00:00.000Z,abc,gi"
     );
 }
 
 #[test]
-fn clone_type_error() {
+fn clone_map_and_set() {
     assert_eq!(
         eval(
-            "let e = new TypeError('bad'); \
-             let c = structuredClone(e); \
-             (c instanceof TypeError) + ',' + c.message"
+            "let m = new Map([['a', 1], ['b', 2]]); \
+             let s = new Set([1, 2, 3]); \
+             let cm = structuredClone(m); \
+             let cs = structuredClone(s); \
+             [cm.get('a'), cm.get('b'), cm !== m, cs.has(1), cs.has(2), cs.has(3), cs !== s].join()"
         ),
-        "true,bad"
+        "1,2,true,true,true,true,true"
     );
 }
 
-// ── Non-cloneable types ──
+#[test]
+fn clone_arraybuffer_and_typed_array() {
+    assert_eq!(
+        eval(
+            "let buf = new ArrayBuffer(4); \
+             new Uint8Array(buf).set([1, 2, 3, 4]); \
+             let clone = structuredClone(buf); \
+             let a = new Uint8Array([10, 20, 30]); \
+             let c = structuredClone(a); \
+             [...new Uint8Array(clone), clone !== buf, ...c, c !== a].join()"
+        ),
+        "1,2,3,4,true,10,20,30,true"
+    );
+}
 
 #[test]
-fn clone_function_throws() {
+fn clone_errors() {
+    assert_eq!(
+        eval(
+            "[new Error('test'), new TypeError('bad')] \
+               .map((e) => { const c = structuredClone(e); \
+                             return (c instanceof e.constructor) + ':' + c.message; }) \
+               .join()"
+        ),
+        "true:test,true:bad"
+    );
+}
+
+#[test]
+fn clone_functions_and_symbols_throws() {
     assert!(throws("structuredClone(function() {})"));
-}
-
-#[test]
-fn clone_symbol_throws() {
     assert!(throws("structuredClone(Symbol('test'))"));
 }
 
-// ── Transfer ──
-
 #[test]
-fn transfer_arraybuffer() {
+fn transfer_arraybuffer_detaches_the_source() {
     assert_eq!(
         eval(
             "let buf = new ArrayBuffer(4); \
@@ -275,10 +150,6 @@ fn transfer_arraybuffer() {
         ),
         "1,0"
     );
-}
-
-#[test]
-fn transfer_detaches_source() {
     assert!(throws(
         "let buf = new ArrayBuffer(4); \
          structuredClone(buf, { transfer: [buf] }); \
@@ -286,59 +157,13 @@ fn transfer_detaches_source() {
     ));
 }
 
-// ── Options edge cases ──
-
 #[test]
-fn options_null_is_ok() {
-    assert_eq!(eval("structuredClone(42, null)"), "42");
-}
-
-#[test]
-fn options_undefined_is_ok() {
-    assert_eq!(eval("structuredClone(42, undefined)"), "42");
-}
-
-#[test]
-fn options_empty_object_is_ok() {
-    assert_eq!(eval("structuredClone(42, {})"), "42");
-}
-
-#[test]
-fn options_empty_transfer_is_ok() {
-    assert_eq!(eval("structuredClone(42, { transfer: [] })"), "42");
-}
-
-// ── Wrapped primitives ──
-
-#[test]
-fn clone_boolean_object() {
+fn options_can_be_null_undefined_or_empty() {
     assert_eq!(
         eval(
-            "let b = structuredClone(Object(true)); \
-             (typeof b) + ',' + (b == true)"
+            "[structuredClone(42, null), structuredClone(42, undefined), structuredClone(42, {}), \
+              structuredClone(42, { transfer: [] })].join()"
         ),
-        "object,true"
-    );
-}
-
-#[test]
-fn clone_number_object() {
-    assert_eq!(
-        eval(
-            "let n = structuredClone(Object(42)); \
-             (typeof n) + ',' + (n == 42)"
-        ),
-        "object,true"
-    );
-}
-
-#[test]
-fn clone_string_object() {
-    assert_eq!(
-        eval(
-            "let s = structuredClone(Object('hello')); \
-             (typeof s) + ',' + (s == 'hello')"
-        ),
-        "object,true"
+        "42,42,42,42"
     );
 }
