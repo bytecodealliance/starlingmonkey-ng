@@ -6,7 +6,7 @@
 //! methods, no-CORS safelisting, origin/mode enforcement — are off by default:
 //! StarlingMonkey is primarily a server runtime, where a script must be able to
 //! set `Host` or use `CONNECT`. WPT mode turns them on by default, and an
-//! explicit `--enforce-fetch-restrictions[=bool]` overrides either default.
+//! explicit `--web-security-restrictions[=bool]` overrides either default.
 //! `Runtime::init` applies the configured value, which is what these tests
 //! exercise end to end: with restrictions off, a forbidden header (`Host`) and
 //! a forbidden method (`CONNECT`) are accepted; with them on, they are
@@ -62,17 +62,17 @@ fn wpt_mode_enforces_restrictions() {
     assert_eq!(out, "host=null,connectThrew=true");
 }
 
-/// An explicit `--enforce-fetch-restrictions=false` overrides WPT mode's
-/// default, and `--enforce-fetch-restrictions` (bare) enables them without
+/// An explicit `--web-security-restrictions=false` overrides WPT mode's
+/// default, and `--web-security-restrictions` (bare) enables them without
 /// WPT mode.
 #[test]
 fn explicit_flag_overrides_either_default() {
     let config =
-        RuntimeConfig::from_arg_string("--wpt-mode --enforce-fetch-restrictions=false").unwrap();
+        RuntimeConfig::from_arg_string("--wpt-mode --web-security-restrictions=false").unwrap();
     let out = run(&config, PERMISSIVE_PROBE);
     assert_eq!(out, "host=example.com,method=CONNECT");
 
-    let config = RuntimeConfig::from_arg_string("--enforce-fetch-restrictions").unwrap();
+    let config = RuntimeConfig::from_arg_string("--web-security-restrictions").unwrap();
     let out = run(&config, ENFORCED_PROBE);
     assert_eq!(out, "host=null,connectThrew=true");
 }
@@ -85,21 +85,21 @@ fn setter_overrides_after_init() {
     libstarling::register_builtins();
     let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
     let scope = rt.default_global();
-    core_runtime::config::set_enforce_fetch_restrictions(true);
-    assert!(core_runtime::config::enforce_fetch_restrictions());
+    core_runtime::config::set_web_security_restrictions(true);
+    assert!(core_runtime::config::web_security_restrictions());
     assert_eq!(
         eval_and_read_out(&scope, ENFORCED_PROBE),
         "host=null,connectThrew=true"
     );
     // Restore for other tests on this thread.
-    core_runtime::config::set_enforce_fetch_restrictions(false);
+    core_runtime::config::set_web_security_restrictions(false);
 }
 
 /// `referrerPolicy` is stored and validated whether or not fetch restrictions
 /// are enforced.
 #[test]
 fn referrer_policy_is_kept_without_restrictions() {
-    let config = RuntimeConfig::from_arg_string("--enforce-fetch-restrictions=false").unwrap();
+    let config = RuntimeConfig::from_arg_string("--web-security-restrictions=false").unwrap();
     let out = run(
         &config,
         r#"

@@ -29,11 +29,11 @@ pub struct RuntimeConfig {
     #[arg(short = 'i', long = "initializer-script")]
     pub initializer_script_path: Option<String>,
 
-    /// Enable verbose logging.
+    /// No effect.
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 
-    /// Enable script debugging via socket connection.
+    /// No effect.
     #[arg(short = 'd', long = "debug")]
     pub debugging: bool,
 
@@ -54,21 +54,22 @@ pub struct RuntimeConfig {
 
     /// Enforce the browser-security Fetch constraints (forbidden
     /// request/response headers and methods, no-CORS safelisting, origin/mode
-    /// enforcement). Defaults to off except in `--wpt-mode`, which needs the
+    /// enforcement), and coarsen the HR-Time clocks, such as `performance.now()`,
+    /// to 100 microseconds. Defaults to off except in `--wpt-mode`, which needs the
     /// browser-observable behavior.
     /// Pass `=true`/`=false` to override either default.
     #[arg(
-        long = "enforce-fetch-restrictions",
+        long = "web-security-restrictions",
         num_args = 0..=1,
         default_missing_value = "true"
     )]
-    pub enforce_fetch_restrictions: Option<bool>,
+    pub web_security_restrictions: Option<bool>,
 
     /// Override the location URL for initialization.
     #[arg(long = "init-location")]
     pub init_location: Option<String>,
 
-    /// Strip this prefix from script paths.
+    /// No effect.
     #[arg(long = "strip-path-prefix")]
     pub path_prefix: Option<String>,
 
@@ -94,9 +95,10 @@ pub struct RuntimeConfig {
     /// Give up on a served request whose `respondWith` has not settled after this many seconds and
     /// answer it with a 500.
     ///
-    /// No limit by default, except in `--wpt-mode`, where it's 120 seconds. `0` means no limit.
-    #[arg(long = "dispatch-timeout", value_name = "SECONDS")]
-    pub dispatch_timeout: Option<u64>,
+    /// No limit by default, except in `--wpt-mode`, where it's 120 seconds. Fractions such as
+    /// `0.25` are accepted. `0` means no limit.
+    #[arg(long = "dispatch-timeout", value_name = "SECONDS", value_parser = parse_seconds)]
+    pub dispatch_timeout: Option<Duration>,
 
     /// Give up on a served request's response body after this many seconds, counted from its
     /// headers going out, and truncate it visibly (no terminating chunk natively, error trailers
@@ -106,16 +108,18 @@ pub struct RuntimeConfig {
     /// body and a peer too slow to accept one alike; on wasm it covers handing the body to the
     /// host, which buffers it, so a slow peer is the host's to bound.
     ///
-    /// No limit by default, except in `--wpt-mode`, where it's 120 seconds. `0` means no limit.
-    #[arg(long = "response-body-timeout", value_name = "SECONDS")]
-    pub response_body_timeout: Option<u64>,
+    /// No limit by default, except in `--wpt-mode`, where it's 120 seconds. Fractions such as
+    /// `0.25` are accepted. `0` means no limit.
+    #[arg(long = "response-body-timeout", value_name = "SECONDS", value_parser = parse_seconds)]
+    pub response_body_timeout: Option<Duration>,
 
     /// Stop waiting for the promises a served request passed to `FetchEvent#waitUntil` after this
     /// many seconds, counted from the response being fully sent.
     ///
-    /// No limit by default, except in `--wpt-mode`, where it's 120 seconds. `0` means no limit.
-    #[arg(long = "waituntil-timeout", value_name = "SECONDS")]
-    pub waituntil_timeout: Option<u64>,
+    /// No limit by default, except in `--wpt-mode`, where it's 120 seconds. Fractions such as
+    /// `0.25` are accepted. `0` means no limit.
+    #[arg(long = "waituntil-timeout", value_name = "SECONDS", value_parser = parse_seconds)]
+    pub waituntil_timeout: Option<Duration>,
 
     /// Bound everything a served request runs, dispatch through `waitUntil` work, by this many
     /// seconds of wall clock, however the per-phase timeouts divide it. Each phase runs under the
@@ -123,9 +127,9 @@ pub struct RuntimeConfig {
     /// is rejected.
     ///
     /// No limit by default (also in `--wpt-mode`, whose per-phase defaults already bound a run).
-    /// `0` means no limit.
-    #[arg(long = "end-to-end-timeout", value_name = "SECONDS")]
-    pub end_to_end_timeout: Option<u64>,
+    /// Fractions such as `0.25` are accepted. `0` means no limit.
+    #[arg(long = "end-to-end-timeout", value_name = "SECONDS", value_parser = parse_seconds)]
+    pub end_to_end_timeout: Option<Duration>,
 
     /// Limits applied for native builds. On Wasm, `wasi:http` enforces equivalents.
     #[cfg(not(target_arch = "wasm32"))]
@@ -146,10 +150,10 @@ impl RuntimeConfig {
     }
 
     /// The effective request-restrictions setting: an explicit
-    /// `--enforce-fetch-restrictions[=bool]` wins, otherwise restrictions are
+    /// `--web-security-restrictions[=bool]` wins, otherwise restrictions are
     /// on in WPT mode and off everywhere else.
-    pub fn enforce_fetch_restrictions(&self) -> bool {
-        self.enforce_fetch_restrictions.unwrap_or(self.wpt_mode)
+    pub fn web_security_restrictions(&self) -> bool {
+        self.web_security_restrictions.unwrap_or(self.wpt_mode)
     }
 
     /// The effective `--dispatch-timeout`, or `None` for no limit.
@@ -178,19 +182,20 @@ impl RuntimeConfig {
     /// mistake under a shorter explicit deadline, and `0` on either side means "no bound of its
     /// own", which the deadline caps as a matter of course.
     pub fn validate_serve_timeouts(&self) -> Result<(), String> {
-        let Some(end_to_end) = self.end_to_end_timeout.filter(|&s| s != 0) else {
+        let Some(end_to_end) = self.end_to_end_timeout.filter(|t| !t.is_zero()) else {
             return Ok(());
         };
-        for (flag, seconds) in [
+        for (flag, timeout) in [
             ("--dispatch-timeout", self.dispatch_timeout),
             ("--response-body-timeout", self.response_body_timeout),
             ("--waituntil-timeout", self.waituntil_timeout),
         ] {
-            if seconds.is_some_and(|s| s != 0 && s > end_to_end) {
+            if let Some(timeout) = timeout.filter(|t| !t.is_zero() && *t > end_to_end) {
                 return Err(format!(
-                    "{flag} {} exceeds --end-to-end-timeout {end_to_end}: a phase cannot run \
-                     longer than the whole request",
-                    seconds.unwrap(),
+                    "{flag} {} exceeds --end-to-end-timeout {}: a phase cannot run longer than \
+                     the whole request",
+                    timeout.as_secs_f64(),
+                    end_to_end.as_secs_f64(),
                 ));
             }
         }
@@ -236,18 +241,6 @@ impl RuntimeConfig {
             Ok(config) => Self::from_arg_string(&config),
             Err(_) => Self::try_parse_from(["starling"]),
         }
-    }
-
-    /// Parse from stdin (for wizer pre-initialization).
-    /// Reads a single line of arguments from stdin.
-    pub fn from_stdin() -> Result<Self, clap::Error> {
-        let mut input = String::new();
-        if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
-            return Self::try_parse_from(["starling"]);
-        }
-        let mut config = Self::from_arg_string(input.trim())?;
-        config.pre_initialize = true;
-        Ok(config)
     }
 }
 
@@ -389,39 +382,41 @@ pub struct ServeLimits {
     /// but waiting for a handler that never reads its body does — past it the rest of the body is
     /// drained rather than delivered.
     ///
-    /// `0` means no limit.
+    /// Fractions such as `0.25` are accepted. `0` means no limit.
     #[arg(
         long = "request-read-timeout",
         value_name = "SECONDS",
-        default_value_t = 30
+        value_parser = parse_seconds,
+        default_value = "30"
     )]
-    pub request_read_timeout: u64,
+    pub request_read_timeout: Duration,
 
     /// Close a kept-alive connection that has sat idle for this many seconds without the next
     /// request's first byte. Expiring closes it quietly rather than answering a 408: between
     /// requests, silence is a client that is done with the connection.
     ///
-    /// `0` means no limit.
+    /// Fractions such as `0.25` are accepted. `0` means no limit.
     #[arg(
         long = "keepalive-timeout",
         value_name = "SECONDS",
-        default_value_t = 30
+        value_parser = parse_seconds,
+        default_value = "30"
     )]
-    pub keepalive_timeout: u64,
+    pub keepalive_timeout: Duration,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ServeLimits {
     /// The effective `--request-read-timeout`, or `None` for no limit.
     pub fn request_read_timeout(&self) -> Option<Duration> {
-        let seconds = self.request_read_timeout;
-        (seconds != 0).then(|| Duration::from_secs(seconds))
+        let timeout = self.request_read_timeout;
+        (!timeout.is_zero()).then_some(timeout)
     }
 
     /// The effective `--keepalive-timeout`, or `None` for no limit.
     pub fn keepalive_timeout(&self) -> Option<Duration> {
-        let seconds = self.keepalive_timeout;
-        (seconds != 0).then(|| Duration::from_secs(seconds))
+        let timeout = self.keepalive_timeout;
+        (!timeout.is_zero()).then_some(timeout)
     }
 
     /// Reject a size or count limit of zero for all limits except `--max-body-drain-bytes`, and a
@@ -475,29 +470,30 @@ impl Default for RuntimeConfig {
 // contexts these policies are usually unwanted, so they're disabled by default.
 
 js::instance_local! {
-    static ENFORCE_REQUEST_RESTRICTIONS: Cell<bool> = const { Cell::new(false) };
+    static WEB_SECURITY_RESTRICTIONS: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Enable or disable enforcement of the browser-security Fetch constraints.
-/// `Runtime::init` sets this from the [`RuntimeConfig`], embedders can override
+/// Enable or disable enforcement of the browser-security Fetch constraints and the coarsening of
+/// the HR-Time clocks. `Runtime::init` sets this from the [`RuntimeConfig`], embedders can override
 /// it at any point after.
-pub fn set_enforce_fetch_restrictions(enabled: bool) {
-    ENFORCE_REQUEST_RESTRICTIONS.with(|cell| cell.set(enabled));
+pub fn set_web_security_restrictions(enabled: bool) {
+    WEB_SECURITY_RESTRICTIONS.with(|cell| cell.set(enabled));
 }
 
-/// Whether the browser-security Fetch constraints are currently enforced.
+/// Whether the browser-security Fetch constraints are currently enforced. While they are, the
+/// HR-Time clocks are coarsened too.
 #[inline]
-pub fn enforce_fetch_restrictions() -> bool {
-    ENFORCE_REQUEST_RESTRICTIONS.with(|cell| cell.get())
+pub fn web_security_restrictions() -> bool {
+    WEB_SECURITY_RESTRICTIONS.with(|cell| cell.get())
 }
 
 /// How long a serve-mode timeout given as `--…-timeout SECONDS` runs for: the value if it was
 /// given, otherwise [`WPT_SERVE_TIMEOUT`] in WPT mode and no limit everywhere else. An explicit
 /// `0` is how a WPT run asks for no limit.
-fn serve_timeout(seconds: Option<u64>, wpt_mode: bool) -> Option<Duration> {
-    match seconds {
-        Some(0) => None,
-        Some(seconds) => Some(Duration::from_secs(seconds)),
+fn serve_timeout(timeout: Option<Duration>, wpt_mode: bool) -> Option<Duration> {
+    match timeout {
+        Some(timeout) if timeout.is_zero() => None,
+        Some(timeout) => Some(timeout),
         None if wpt_mode => Some(WPT_SERVE_TIMEOUT),
         None => None,
     }
@@ -506,6 +502,17 @@ fn serve_timeout(seconds: Option<u64>, wpt_mode: bool) -> Option<Duration> {
 /// The serve-mode timeout WPT runs use. Well above the harness's own per-test limit, so a test that
 /// is merely slow still reports a result and only a genuinely stuck one is cut off.
 const WPT_SERVE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Parse a serve-mode timeout given in seconds, whole (`30`) or fractional (`0.25`). Negative,
+/// non-finite and out-of-range values are refused.
+fn parse_seconds(value: &str) -> Result<Duration, String> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .ok_or_else(|| format!("{value:?} is not a number of seconds (try 30 or 0.25)"))
+}
 
 /// Split an argument string into individual arguments, respecting quotes.
 fn split_args(s: &str) -> Result<Vec<String>, clap::Error> {
@@ -537,30 +544,23 @@ mod tests {
     fn serve_timeouts_default_to_no_limit_outside_wpt_mode() {
         let config = RuntimeConfig::default();
         assert_eq!(config.dispatch_timeout(), None);
+        assert_eq!(config.response_body_timeout(), None);
         assert_eq!(config.waituntil_timeout(), None);
 
         // WPT runs want a stuck test cut off rather than stalling the run.
         let wpt = RuntimeConfig::from_arg_string("--wpt-mode").unwrap();
         assert_eq!(wpt.dispatch_timeout(), Some(WPT_SERVE_TIMEOUT));
+        assert_eq!(wpt.response_body_timeout(), Some(WPT_SERVE_TIMEOUT));
         assert_eq!(wpt.waituntil_timeout(), Some(WPT_SERVE_TIMEOUT));
 
-        // An explicit value wins over either default, and `0` is how to ask for no limit at all.
-        let explicit =
-            RuntimeConfig::from_arg_string("--wpt-mode --dispatch-timeout 5 --waituntil-timeout 0")
-                .unwrap();
+        // An explicit value wins over either default. `0` means no limit at all.
+        let explicit = RuntimeConfig::from_arg_string(
+            "--wpt-mode --dispatch-timeout 5 --response-body-timeout 0 --waituntil-timeout 0",
+        )
+        .unwrap();
         assert_eq!(explicit.dispatch_timeout(), Some(Duration::from_secs(5)));
-        assert_eq!(explicit.waituntil_timeout(), None);
-    }
-
-    #[test]
-    fn response_body_timeout_defaults_like_the_other_phase_timeouts() {
-        // No limit by default; WPT mode wants a stuck body cut off like a stuck dispatch.
-        assert_eq!(RuntimeConfig::default().response_body_timeout(), None);
-        let wpt = RuntimeConfig::from_arg_string("--wpt-mode").unwrap();
-        assert_eq!(wpt.response_body_timeout(), Some(WPT_SERVE_TIMEOUT));
-        let explicit =
-            RuntimeConfig::from_arg_string("--wpt-mode --response-body-timeout 0").unwrap();
         assert_eq!(explicit.response_body_timeout(), None);
+        assert_eq!(explicit.waituntil_timeout(), None);
     }
 
     #[test]
@@ -575,8 +575,8 @@ mod tests {
     }
 
     #[test]
-    fn a_phase_timeout_longer_than_end_to_end_is_a_config_error() {
-        // A phase that could never use its full window is a contradiction worth catching.
+    fn a_phase_timeout_longer_than_end_to_end_is_rejected() {
+        // A phase that could never use its full window is rejected.
         for phase in ["dispatch", "response-body", "waituntil"] {
             let config = RuntimeConfig::from_arg_string(&format!(
                 "--end-to-end-timeout 10 --{phase}-timeout 11"
@@ -588,6 +588,14 @@ mod tests {
                 "error should name the offending flag and the limit, got: {error}"
             );
         }
+        let config =
+            RuntimeConfig::from_arg_string("--end-to-end-timeout 0.25 --response-body-timeout 0.3")
+                .unwrap();
+        let error = config.validate_serve_timeouts().unwrap_err();
+        assert!(
+            error.contains("--response-body-timeout 0.3") && error.contains("0.25"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -621,8 +629,8 @@ mod tests {
         assert_eq!(ByteSize::mib(512).to_string(), "512MiB");
         assert_eq!(ByteSize::kib(64).to_string(), "64KiB");
         assert_eq!(ByteSize::new(0).to_string(), "0B");
-        // A size no unit divides stays in bytes rather than rounding: what `--help` prints has to
-        // parse back to the number it printed.
+        // A size not divisible by any unit stays in bytes rather than rounding: what `--help`
+        // prints has to parse back to the number it printed.
         assert_eq!(ByteSize::new(1000).to_string(), "1000B");
         assert_eq!(ByteSize::new(1025).to_string(), "1025B");
     }
@@ -703,7 +711,41 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_size_or_count_limit_is_a_config_error() {
+    fn serve_timeouts_take_fractional_seconds() {
+        let config = RuntimeConfig::from_arg_string(
+            "--dispatch-timeout 0.15 --response-body-timeout 0.25 --waituntil-timeout 1.5 \
+             --end-to-end-timeout 2 --request-read-timeout 0.5 --keepalive-timeout 0.75",
+        )
+        .unwrap();
+        assert_eq!(config.dispatch_timeout(), Some(Duration::from_millis(150)));
+        assert_eq!(
+            config.response_body_timeout(),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            config.waituntil_timeout(),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(config.end_to_end_timeout(), Some(Duration::from_secs(2)));
+        assert_eq!(
+            config.serve_limits.request_read_timeout(),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            config.serve_limits.keepalive_timeout(),
+            Some(Duration::from_millis(750))
+        );
+
+        for bad in ["-1", "abc", "nan", "inf", ""] {
+            assert!(
+                RuntimeConfig::from_arg_string(&format!("--dispatch-timeout={bad}")).is_err(),
+                "{bad:?} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_size_or_count_limit_is_rejected() {
         // Unlike a timeout, a cap of zero is not "no limit" but a server that can accept
         // nothing at all, which is never what was meant.
         for flag in [
@@ -731,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_head_cap_below_the_read_buffer_minimum_is_a_config_error() {
+    fn a_request_head_cap_below_the_read_buffer_minimum_is_rejected() {
         let config = RuntimeConfig::from_arg_string("--max-connection-buffer-size 512").unwrap();
         let error = config.serve_limits.validate().unwrap_err();
         assert!(
@@ -774,47 +816,32 @@ mod tests {
     }
 
     #[test]
-    fn enforce_fetch_restrictions_defaults_off_wpt_on_flag_wins() {
-        assert!(!RuntimeConfig::default().enforce_fetch_restrictions());
+    fn web_security_restrictions_defaults_off_wpt_on_flag_wins() {
+        assert!(!RuntimeConfig::default().web_security_restrictions());
         assert!(RuntimeConfig::from_arg_string("--wpt-mode")
             .unwrap()
-            .enforce_fetch_restrictions());
+            .web_security_restrictions());
         assert!(
-            !RuntimeConfig::from_arg_string("--wpt-mode --enforce-fetch-restrictions=false")
+            !RuntimeConfig::from_arg_string("--wpt-mode --web-security-restrictions=false")
                 .unwrap()
-                .enforce_fetch_restrictions()
+                .web_security_restrictions()
         );
         assert!(
-            RuntimeConfig::from_arg_string("--enforce-fetch-restrictions")
+            RuntimeConfig::from_arg_string("--web-security-restrictions")
                 .unwrap()
-                .enforce_fetch_restrictions()
+                .web_security_restrictions()
         );
     }
 
+    /// The base path is the current directory for `-e`, and otherwise the absolute directory of
+    /// the script.
     #[test]
-    fn base_path_for_eval_is_cwd() {
-        let config = RuntimeConfig::from_arg_string("-e 42").unwrap();
-        assert_eq!(config.base_path(), env::current_dir().unwrap());
-    }
-
-    #[test]
-    fn base_path_for_bare_filename_is_cwd() {
-        let config = RuntimeConfig::from_arg_string("app.js").unwrap();
-        assert_eq!(config.base_path(), env::current_dir().unwrap());
-    }
-
-    #[test]
-    fn base_path_for_absolute_script_is_its_directory() {
-        let config = RuntimeConfig::from_arg_string("/srv/js/app.js").unwrap();
-        assert_eq!(config.base_path(), Path::new("/srv/js"));
-    }
-
-    #[test]
-    fn base_path_for_relative_script_is_absolute() {
-        let config = RuntimeConfig::from_arg_string("sub/dir/app.js").unwrap();
-        assert_eq!(
-            config.base_path(),
-            env::current_dir().unwrap().join("sub/dir")
-        );
+    fn base_path_is_the_script_directory_or_the_current_directory() {
+        let cwd = env::current_dir().unwrap();
+        let base_path = |args| RuntimeConfig::from_arg_string(args).unwrap().base_path();
+        assert_eq!(base_path("-e 42"), cwd);
+        assert_eq!(base_path("app.js"), cwd);
+        assert_eq!(base_path("/srv/js/app.js"), Path::new("/srv/js"));
+        assert_eq!(base_path("sub/dir/app.js"), cwd.join("sub/dir"));
     }
 }

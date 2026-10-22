@@ -49,7 +49,7 @@ pub(crate) fn pair_parts<'r>(
     scope: &'r Scope<'_>,
     payload: HandleValue<'_>,
 ) -> (HandleValue<'r>, HandleValue<'r>) {
-    let arr = Object::from_value(scope, *payload).expect("payload is an array");
+    let arr = Object::from_raw_value(scope, payload.get()).expect("payload is an array");
     (
         arr.get_element(scope, 0).expect("element 0"),
         arr.get_element(scope, 1).expect("element 1"),

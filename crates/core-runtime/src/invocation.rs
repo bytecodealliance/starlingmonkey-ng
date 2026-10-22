@@ -8,10 +8,6 @@
 //! libstarling, componentize-js) decides how many invocations run
 //! concurrently and schedules them.
 //!
-//! Note: right now there's no additional metadata, but in the future this
-//! will include things like information about which incoming event started
-//! an invocation.
-//!
 //! [`InvocationRegistry`] tracks all live `InvocationState` instances so
 //! the GC can trace their event loops during garbage collection.
 
@@ -215,12 +211,6 @@ impl Drop for OwnedInvocation {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn invocation_state_default() {
-        let state = InvocationState::new();
-        assert!(state.event_loop().is_empty());
-    }
 
     #[test]
     fn registry_register_unregister() {

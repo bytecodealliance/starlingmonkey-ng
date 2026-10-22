@@ -184,7 +184,7 @@ macro_rules! from_jsval_via_cast {
                 val: mozjs::gc::HandleValue<'v>,
                 _option: Self::Config,
             ) -> Result<Self, $crate::conversion::ConversionError> {
-                $crate::Object::from_value(scope, *val)?
+                $crate::Object::from_raw_value(scope, val.get())?
                     .cast::<Self>()
                     .map_err(|_| {
                         $crate::conversion::ConversionError::Failure(std::borrow::Cow::Borrowed(

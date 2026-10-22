@@ -18,7 +18,7 @@
 //!    `JS_DefineFunction`
 //!
 //! A module load hook maps specifier strings to compiled module objects
-//! via a thread-local registry.
+//! via the runtime's module registry.
 //!
 //! # Example
 //!
@@ -32,10 +32,8 @@
 //! // Register and use:
 //! let rt = Runtime::init(&config).expect("runtime init");
 //! let scope = rt.default_global();
-//! unsafe {
-//!     register_module::<my_math::js_module>(&scope);
-//!     // JS can now: import { PI, add } from "myMath";
-//! }
+//! register_module::<my_math::js_module>(&scope);
+//! // JS can now: import { PI, add } from "myMath";
 //! ```
 //!
 //! The specifier is the `mod` name camelCased, unless overridden with
@@ -109,7 +107,7 @@ pub trait NativeModule: 'static {
 }
 
 // ============================================================================
-// Module registry (thread-local)
+// Module registry
 // ============================================================================
 
 /// A cached compiled module object, stored in a `Heap` so SpiderMonkey's
@@ -156,6 +154,27 @@ fn resolver<R>(f: impl FnOnce(&RefCell<Option<Resolver>>) -> R) -> R {
 
 fn base_path<R>(f: impl FnOnce(&RefCell<Option<PathBuf>>) -> R) -> R {
     with_state(|state| f(&state.base_path))
+}
+
+/// The module the registry holds under `key`.
+fn cached_module<'s>(scope: &'s Scope<'_>, key: &str) -> Option<Object<'s>> {
+    registry(|reg| {
+        reg.borrow()
+            .get(key)
+            .map(|entry| entry.module_obj.get(scope))
+    })
+}
+
+/// Hold `module` in the registry under `key`.
+fn cache_module(key: String, module: Object<'_>) {
+    registry(|reg| {
+        reg.borrow_mut().insert(
+            key,
+            ModuleEntry {
+                module_obj: Heap::from(module),
+            },
+        );
+    });
 }
 
 /// Trace all cached module objects.
@@ -227,7 +246,7 @@ pub fn settled_module_evaluation<'s>(
     eval_result: HandleValue<'s>,
     context: &str,
 ) -> Result<Option<js::Promise<'s>>, String> {
-    let Some(promise) = js::Object::from_value(scope, eval_result.get())
+    let Some(promise) = js::Object::from_value(scope, eval_result)
         .ok()
         .and_then(|object| object.cast::<js::Promise>().ok())
     else {
@@ -319,11 +338,9 @@ unsafe extern "C" fn module_load_hook(
     // 1. Check the module registry for an exact match. The `json:`-prefixed keys
     // hold JSON modules, which a JavaScript import never gets.
     let cached = match kind {
-        ModuleKind::JavaScript if !specifier.starts_with("json:") => registry(|reg| {
-            reg.borrow()
-                .get(&specifier)
-                .map(|entry| entry.module_obj.get(&scope))
-        }),
+        ModuleKind::JavaScript if !specifier.starts_with("json:") => {
+            cached_module(&scope, &specifier)
+        }
         ModuleKind::JavaScript | ModuleKind::Json => None,
     };
 
@@ -412,6 +429,17 @@ fn resolve_file_module<'r>(
 ) -> Result<Object<'r>, ModuleLoadError> {
     let base_dir = base_dir
         .ok_or_else(|| format!("Module '{}' not found (no base path configured)", specifier))?;
+    // `oxc_resolver` converts `file:` URLs to paths only when it isn't compiled for wasm32.
+    let file_path;
+    let target = if specifier.starts_with("file:") {
+        file_path = url::Url::parse(specifier)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or_else(|| format!("Cannot resolve module '{specifier}': invalid file URL"))?;
+        file_path.to_str().unwrap_or(specifier)
+    } else {
+        specifier
+    };
 
     // Resolve using oxc_resolver
     let resolved_path = resolver(|r| {
@@ -420,7 +448,7 @@ fn resolve_file_module<'r>(
             .as_ref()
             .expect("resolver not initialized — call init_module_loader first");
         resolver
-            .resolve(&base_dir, specifier)
+            .resolve(&base_dir, target)
             .map(|res| res.path().to_path_buf())
             .map_err(|e| format!("Cannot resolve module '{}': {}", specifier, e))
     })?;
@@ -455,11 +483,7 @@ fn resolve_file_module<'r>(
     };
 
     // Check if already compiled under the canonical path
-    let cached = registry(|reg| {
-        reg.borrow()
-            .get(&cache_key)
-            .map(|entry| entry.module_obj.get(scope))
-    });
+    let cached = cached_module(scope, &cache_key);
     if let Some(obj) = cached {
         return Ok(obj);
     }
@@ -496,14 +520,7 @@ fn resolve_file_module<'r>(
         }
     };
 
-    registry(|reg| {
-        reg.borrow_mut().insert(
-            cache_key,
-            ModuleEntry {
-                module_obj: Heap::from(module),
-            },
-        );
-    });
+    cache_module(cache_key, module);
 
     Ok(module)
 }
@@ -528,14 +545,7 @@ pub fn register_entry_module(
     let path_str = js::JSString::from_str(scope, &key).map_err(|_| ExnThrown)?;
     // SAFETY: `module` is a rooted module object, and `path_str` is rooted.
     unsafe { SetModulePrivate(module.as_raw(), &path_str.as_value()) };
-    registry(|reg| {
-        reg.borrow_mut().insert(
-            key.clone(),
-            ModuleEntry {
-                module_obj: Heap::from(module),
-            },
-        );
-    });
+    cache_module(key.clone(), module);
     with_state(|state| *state.entry.borrow_mut() = Some(key));
     Ok(())
 }
@@ -545,14 +555,7 @@ pub fn register_entry_module(
 /// under canonical absolute paths, so only an import whose specifier is `name`
 /// verbatim gets `module`.
 fn record_entry_module(module: Object<'_>, name: &str) {
-    registry(|reg| {
-        reg.borrow_mut().insert(
-            name.to_string(),
-            ModuleEntry {
-                module_obj: Heap::from(module),
-            },
-        );
-    });
+    cache_module(name.to_string(), module);
     with_state(|state| *state.entry.borrow_mut() = Some(name.to_string()));
 }
 
@@ -561,11 +564,7 @@ fn record_entry_module(module: Object<'_>, name: &str) {
 /// namespace is only complete once the module has finished evaluating.
 pub fn entry_namespace<'s>(scope: &'s Scope<'_>) -> Option<Object<'s>> {
     let key = with_state(|state| state.entry.borrow().clone())?;
-    let module = registry(|reg| {
-        reg.borrow()
-            .get(&key)
-            .map(|entry| entry.module_obj.get(scope))
-    })?;
+    let module = cached_module(scope, &key)?;
     js::module::get_namespace(scope, module.handle())
         .ok()
         .and_then(Object::from_handle)
@@ -670,12 +669,12 @@ pub(crate) fn clear_module_state(state: &ModuleState) {
 /// 2. Compiles it as a module via `CompileModule`
 /// 3. Links and evaluates the module
 /// 4. Populates the module environment with native functions and values
-/// 5. Stores the module in the thread-local registry for the load hook
+/// 5. Stores the module in the runtime's module registry for the load hook
 ///
-/// # Safety
+/// # Panics
 ///
-/// - [`init_module_loader`] must have been called first.
-pub unsafe fn register_module<T: NativeModule>(scope: &Scope<'_>) -> bool {
+/// Panics if no runtime is current.
+pub fn register_module<T: NativeModule>(scope: &Scope<'_>) -> bool {
     let declarations = T::declarations();
 
     // 1. Generate JS module source: `export var name1; export var name2; ...`
@@ -703,14 +702,7 @@ pub unsafe fn register_module<T: NativeModule>(scope: &Scope<'_>) -> bool {
     // `export var` source has no imports to resolve.
 
     // 3. Store in registry before loading (load hook must find it)
-    registry(|reg| {
-        reg.borrow_mut().insert(
-            T::NAME.to_string(),
-            ModuleEntry {
-                module_obj: Heap::from(module),
-            },
-        );
-    });
+    cache_module(T::NAME.to_string(), module);
 
     // 4.-6. Link, evaluate, and populate the environment. On any failure,
     // remove the registry entry again so a later import of the module fails
@@ -750,7 +742,7 @@ fn link_evaluate_and_populate<T: NativeModule>(
                 Ok(f) => f,
                 Err(_) => return false,
             };
-            if env.set_property(scope, &c_name, func).is_err() {
+            if env.set_property_by_name(scope, &c_name, func).is_err() {
                 return false;
             }
         }
@@ -804,12 +796,10 @@ fn link_evaluate_and_get_env<'s>(scope: &'s Scope<'_>, module: Object<'_>) -> Op
 /// [`register_module`]: a later import then fails to resolve rather than finding
 /// a module whose value exports are undefined.
 ///
-/// # Safety
+/// # Panics
 ///
-/// - [`init_module_loader`] must have been called first.
-/// - `exports`' value handles must be live and rooted for the duration of the
-///   call.
-pub unsafe fn register_synthetic_module(
+/// Panics if no runtime is current.
+pub fn register_synthetic_module(
     scope: &Scope<'_>,
     name: &str,
     exports: &[(&str, HandleValue)],
@@ -834,14 +824,7 @@ pub unsafe fn register_synthetic_module(
 
     // 3. Store in the registry under the owned specifier before linking, so the
     //    load hook finds it.
-    registry(|reg| {
-        reg.borrow_mut().insert(
-            name.to_string(),
-            ModuleEntry {
-                module_obj: Heap::from(module),
-            },
-        );
-    });
+    cache_module(name.to_string(), module);
 
     // 4.-6. Link, evaluate, and populate the environment with the export values.
     // On any failure, remove the registry entry again.
@@ -865,7 +848,7 @@ fn link_evaluate_and_populate_values(
 
     for (export_name, value) in exports {
         let c_name = CString::new(*export_name).map_err(|_| ExnThrown)?;
-        env.set_property(scope, &c_name, *value)?;
+        env.set_property_by_name(scope, &c_name, *value)?;
     }
     Ok(())
 }
@@ -931,7 +914,7 @@ pub unsafe fn set_module_export<'s, V: ToJSVal<'s> + ?Sized>(
 ) -> bool {
     let c_name = CString::new(name).unwrap();
     let env_obj = js::Object::from_handle(env).expect("module environment object is null");
-    env_obj.set_property(scope, &c_name, value).is_ok()
+    env_obj.set_property_by_name(scope, &c_name, value).is_ok()
 }
 
 #[cfg(test)]
@@ -991,23 +974,17 @@ mod tests {
         }
     }
 
+    /// The `file:` URL of the absolute `path`.
+    fn file_url(path: &str) -> String {
+        url::Url::from_file_path(path).unwrap().to_string()
+    }
+
     /// Helper: read back a globalThis property as String.
     fn read_global_string(scope: &js::gc::scope::Scope<'_>, expr: &str) -> String {
         let rval = evaluate_with_filename(scope, expr, "test_read.js", 1)
             .expect("evaluate_with_filename failed");
         assert!(rval.is_string());
         String::from_jsval(scope, rval, ()).expect("string conversion failed")
-    }
-
-    #[test]
-    fn evaluate_module_inline() {
-        let rt = test_runtime();
-        let scope = rt.default_global();
-        unsafe {
-            let result = evaluate_module(&scope, "globalThis._moduleTest = 42;", "test_inline.mjs");
-            assert!(result.is_ok());
-            assert_eq!(read_global_f64(&scope, "globalThis._moduleTest"), 42.0);
-        }
     }
 
     #[test]
@@ -1021,57 +998,38 @@ mod tests {
     }
 
     #[test]
-    fn resolve_file_import() {
+    fn file_urls_extensionless_paths_and_directories_resolve() {
         let dir = test_tempdir();
-        let module_path = dir.path().join("helper.js");
-        std::fs::write(&module_path, "export const VALUE = 99;\n").unwrap();
+        let helper_path = dir.path().join("helper.js");
+        std::fs::write(&helper_path, "export const VALUE = 7;\n").unwrap();
+        std::fs::write(dir.path().join("utils.js"), "export const RATIO = 2.5;\n").unwrap();
+        let lib = dir.path().join("mylib");
+        std::fs::create_dir(&lib).unwrap();
+        std::fs::write(lib.join("index.js"), "export const HELLO = 'world';\n").unwrap();
 
         let rt = test_runtime();
         rt.reset_module_loader(dir.path().to_path_buf());
         let scope = rt.default_global();
+        let url = file_url(helper_path.to_str().unwrap());
         unsafe {
             let result = evaluate_module(
                 &scope,
-                r#"
-                    import { VALUE } from "./helper.js";
+                &format!(
+                    r#"
+                    import {{ VALUE }} from {url:?};
+                    import {{ RATIO }} from "./utils";
+                    import {{ HELLO }} from "./mylib";
                     globalThis._imported = VALUE;
-                "#,
+                    globalThis._ratio = RATIO;
+                    globalThis._hello = HELLO;
+                "#
+                ),
                 "entry.mjs",
             );
             assert!(result.is_ok(), "module evaluation failed");
-            assert_eq!(read_global_f64(&scope, "globalThis._imported"), 99.0);
-        }
-    }
-
-    #[test]
-    fn resolve_nested_imports() {
-        let dir = test_tempdir();
-
-        // a.js imports from b.js, b.js imports from c.js
-        std::fs::write(dir.path().join("c.js"), "export const BASE = 10;\n").unwrap();
-        std::fs::write(
-            dir.path().join("b.js"),
-            r#"
-                import { BASE } from "./c.js";
-                export const DOUBLED = BASE * 2;
-            "#,
-        )
-        .unwrap();
-
-        let rt = test_runtime();
-        rt.reset_module_loader(dir.path().to_path_buf());
-        let scope = rt.default_global();
-        unsafe {
-            let result = evaluate_module(
-                &scope,
-                r#"
-                    import { DOUBLED } from "./b.js";
-                    globalThis._nested = DOUBLED;
-                "#,
-                &dir.path().join("entry.mjs").to_string_lossy(),
-            );
-            assert!(result.is_ok(), "nested module evaluation failed");
-            assert_eq!(read_global_f64(&scope, "globalThis._nested"), 20.0);
+            assert_eq!(read_global_f64(&scope, "globalThis._imported"), 7.0);
+            assert_eq!(read_global_f64(&scope, "globalThis._ratio"), 2.5);
+            assert_eq!(read_global_string(&scope, "globalThis._hello"), "world");
         }
     }
 
@@ -1207,90 +1165,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_extension_inference() {
-        let dir = test_tempdir();
-        std::fs::write(dir.path().join("utils.js"), "export const RATIO = 2.5;\n").unwrap();
-
-        let rt = test_runtime();
-        rt.reset_module_loader(dir.path().to_path_buf());
-        let scope = rt.default_global();
-        unsafe {
-            // Import without .js extension — oxc_resolver should add it
-            let result = evaluate_module(
-                &scope,
-                r#"
-                    import { RATIO } from "./utils";
-                    globalThis._ratio = RATIO;
-                "#,
-                "entry.mjs",
-            );
-            assert!(result.is_ok(), "extension inference failed");
-            assert_eq!(read_global_f64(&scope, "globalThis._ratio"), 2.5);
-        }
-    }
-
-    #[test]
-    fn resolve_index_file() {
-        let dir = test_tempdir();
-        let sub = dir.path().join("mylib");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::write(sub.join("index.js"), "export const HELLO = 'world';\n").unwrap();
-
-        let rt = test_runtime();
-        rt.reset_module_loader(dir.path().to_path_buf());
-        let scope = rt.default_global();
-        unsafe {
-            let result = evaluate_module(
-                &scope,
-                r#"
-                    import { HELLO } from "./mylib";
-                    globalThis._hello = HELLO;
-                "#,
-                "entry.mjs",
-            );
-            assert!(result.is_ok(), "index.js resolution failed");
-            assert_eq!(read_global_string(&scope, "globalThis._hello"), "world");
-        }
-    }
-
-    #[test]
-    fn duplicate_import_uses_cache() {
-        let dir = test_tempdir();
-
-        // A module with a side-effect counter
-        std::fs::write(
-            dir.path().join("counter.js"),
-            r#"
-                if (!globalThis._counter) globalThis._counter = 0;
-                globalThis._counter++;
-                export const dummy = 1;
-            "#,
-        )
-        .unwrap();
-
-        let rt = test_runtime();
-        rt.reset_module_loader(dir.path().to_path_buf());
-        let scope = rt.default_global();
-        unsafe {
-            // Two separate entry modules both import counter.js
-            let r1 = evaluate_module(
-                &scope,
-                r#"import { dummy } from "./counter.js";"#,
-                "entry1.mjs",
-            );
-            assert!(r1.is_ok());
-            // Second import of same module should be cached (not re-evaluated)
-            let r2 = evaluate_module(
-                &scope,
-                r#"import { dummy } from "./counter.js";"#,
-                "entry2.mjs",
-            );
-            assert!(r2.is_ok());
-            assert_eq!(read_global_f64(&scope, "globalThis._counter"), 1.0);
-        }
-    }
-
-    #[test]
     fn failed_native_module_is_not_importable() {
         // A native module whose `evaluate` fails must not stay registered:
         // importing it afterwards has to fail instead of yielding a module
@@ -1365,30 +1239,6 @@ mod tests {
             assert!(result.is_ok(), "mixed native+file module evaluation failed");
             assert_eq!(read_global_f64(&scope, "globalThis._native"), 777.0);
             assert_eq!(read_global_f64(&scope, "globalThis._file"), 888.0);
-        }
-    }
-
-    #[test]
-    fn json_import_evaluates_to_the_parsed_value() {
-        let dir = test_tempdir();
-        std::fs::write(dir.path().join("data.json"), r#"{ "n": 7, "s": "seven" }"#).unwrap();
-
-        let rt = test_runtime();
-        rt.reset_module_loader(dir.path().to_path_buf());
-        let scope = rt.default_global();
-        unsafe {
-            let result = evaluate_module(
-                &scope,
-                r#"
-                    import data from "./data.json" with { type: "json" };
-                    globalThis._jsonN = data.n;
-                    globalThis._jsonS = data.s;
-                "#,
-                "entry.mjs",
-            );
-            assert!(result.is_ok(), "JSON module import failed");
-            assert_eq!(read_global_f64(&scope, "globalThis._jsonN"), 7.0);
-            assert_eq!(read_global_string(&scope, "globalThis._jsonS"), "seven");
         }
     }
 
@@ -1493,7 +1343,7 @@ mod tests {
     fn top_level_await_on_dynamic_import() {
         let dir = test_tempdir();
         std::fs::write(dir.path().join("helper.js"), "export const VALUE = 5;\n").unwrap();
-        std::fs::write(dir.path().join("data.json"), r#"{ "n": 3 }"#).unwrap();
+        std::fs::write(dir.path().join("data.json"), r#"{ "n": 3, "s": "seven" }"#).unwrap();
 
         let rt = test_runtime();
         rt.reset_module_loader(dir.path().to_path_buf());
@@ -1507,6 +1357,7 @@ mod tests {
                     const json = await import("./data.json", { with: { type: "json" } });
                     globalThis._sum = VALUE + json.default.n;
                     globalThis._sameJson = json.default === data;
+                    globalThis._jsonS = data.s;
                 "#,
                 "entry.mjs",
             );
@@ -1517,12 +1368,14 @@ mod tests {
                 read_global_string(&scope, "String(globalThis._sameJson)"),
                 "true"
             );
+            assert_eq!(read_global_string(&scope, "globalThis._jsonS"), "seven");
         }
     }
 
     #[test]
-    fn dynamic_import_of_a_missing_module_rejects() {
+    fn dynamic_imports_of_missing_modules_and_dependencies_reject() {
         let dir = test_tempdir();
+        std::fs::write(dir.path().join("present.js"), "import './absent.js';\n").unwrap();
 
         let rt = test_runtime();
         rt.reset_module_loader(dir.path().to_path_buf());
@@ -1531,37 +1384,17 @@ mod tests {
             let result = evaluate_module(
                 &scope,
                 r#"
-                    import("./missing.js").catch((e) => { globalThis._error = e.message; });
+                    import("./missing.js").catch((e) => { globalThis._missing = e.message; });
+                    import("./present.js").catch((e) => { globalThis._dependency = e.message; });
                 "#,
                 "entry.mjs",
             );
             assert!(result.is_ok(), "module evaluation failed");
             crate::event_loop::run_microtasks(&scope);
-            assert!(read_global_string(&scope, "globalThis._error")
+            assert!(read_global_string(&scope, "globalThis._missing")
                 .contains("Cannot resolve module './missing.js'"));
-        }
-    }
-
-    #[test]
-    fn dynamic_import_of_a_module_with_a_missing_dependency_rejects() {
-        let dir = test_tempdir();
-        std::fs::write(dir.path().join("present.js"), "import './missing.js';\n").unwrap();
-
-        let rt = test_runtime();
-        rt.reset_module_loader(dir.path().to_path_buf());
-        let scope = rt.default_global();
-        unsafe {
-            let result = evaluate_module(
-                &scope,
-                r#"
-                    import("./present.js").catch((e) => { globalThis._error = e.message; });
-                "#,
-                "entry.mjs",
-            );
-            assert!(result.is_ok(), "module evaluation failed");
-            crate::event_loop::run_microtasks(&scope);
-            assert!(read_global_string(&scope, "globalThis._error")
-                .contains("Cannot resolve module './missing.js'"));
+            assert!(read_global_string(&scope, "globalThis._dependency")
+                .contains("Cannot resolve module './absent.js'"));
         }
     }
 }

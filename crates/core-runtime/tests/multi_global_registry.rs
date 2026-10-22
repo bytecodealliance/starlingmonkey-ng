@@ -70,7 +70,7 @@ fn displaced_global_registry_survives_compacting_gc() {
     let proto_reg = js::class::get_prototype_object_for::<ProbeImpl>(&scope_a)
         .expect("Probe prototype registered in realm A");
     let ctor = scope_a.global().get_property(&scope_a, c"Probe").unwrap();
-    let ctor = js::Object::from_value(&scope_a, *ctor).unwrap();
+    let ctor = js::Object::from_raw_value(&scope_a, ctor.get()).unwrap();
     let proto_js = ctor.get_property(&scope_a, c"prototype").unwrap();
     assert!(proto_js.is_object());
     assert_eq!(

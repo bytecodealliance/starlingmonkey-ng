@@ -116,7 +116,7 @@ impl<'s> Stack<'s, Promise> {
             scope,
             std::ptr::from_ref(&KEY) as usize,
             |scope| {
-                let p = Self::new_resolved_with_value(scope, crate::value::undefined())?;
+                let p = Self::new_resolved_with_value(scope, HandleValue::undefined())?;
                 Ok(*p)
             },
         )?;
@@ -378,8 +378,8 @@ impl<'s> Stack<'s, Promise> {
         pending_futures(|f| f.borrow_mut().push(pending));
     }
 
-    /// [`Promise::spawn`], after polling the future once, now, with a waker that
-    /// does nothing. The work of the future's first poll, such as starting host
+    /// Like [`Promise::spawn`], but polls the future once right away, with a waker
+    /// that does nothing. The work of the future's first poll, such as starting host
     /// I/O, happens before this returns. The event loop's later polls register its
     /// own waker, and settle the promise as for [`Promise::spawn`].
     ///
@@ -445,7 +445,7 @@ impl<'s, T> PromiseOf<'s, T> {
         // microtask; resolving with a thenable defers it to that thenable's resolution.
         let on_fulfilled =
             crate::class::get_or_init_shared_function(scope, check as usize, |scope| {
-                crate::Function::new_callback(scope, c"", 1, check, crate::value::undefined())
+                crate::Function::new_callback(scope, c"", 1, check, HandleValue::undefined())
             })?;
         // A `None` rejection reaction forwards the rejection unchanged, which is what the spec's
         // `onRejectedSteps` amount to for a caller that supplies no rejection steps.

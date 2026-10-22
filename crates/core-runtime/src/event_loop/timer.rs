@@ -77,37 +77,6 @@ pub struct TimerTask {
     timer_id: u64,
 }
 
-impl TimerTask {
-    /// Create a timer task with a function handler and its call arguments.
-    fn function(
-        callback: js::Callable<'_>,
-        args: Vec<RootedTraceableBox<Heap<Value>>>,
-        interval: Option<Duration>,
-        nesting_level: u32,
-        timer_id: u64,
-    ) -> Self {
-        Self {
-            handler: TimerHandler::Function {
-                callback: RootedTraceableBox::new(Heap::from(callback)),
-                args,
-            },
-            interval,
-            nesting_level,
-            timer_id,
-        }
-    }
-
-    /// Create a timer task whose handler is a code string evaluated when it fires.
-    fn code(code: String, interval: Option<Duration>, nesting_level: u32, timer_id: u64) -> Self {
-        Self {
-            handler: TimerHandler::Code(code),
-            interval,
-            nesting_level,
-            timer_id,
-        }
-    }
-}
-
 impl Task for TimerTask {
     fn kind(&self) -> &'static str {
         if self.interval.is_some() {
@@ -146,7 +115,7 @@ impl Task for TimerTask {
         // — even when the handler threw. The spec's task substeps invoke the handler with "report"
         // (the exception is reported, not fatal) and still perform the repeat step, so a transient
         // error must not kill the interval. If the ID was cancelled during the run (via
-        // clearInterval), requeue_timer skips it. The repeat re-enters the timer initialization
+        // clearInterval), requeue_js_timer skips it. The repeat re-enters the timer initialization
         // steps, so the nested-timer clamp applies with this task's nesting level, and the
         // re-queued task is one level deeper.
         if let Some(interval) = interval {
@@ -158,13 +127,13 @@ impl Task for TimerTask {
                 timer_id,
             };
             with_active_event_loop(|el| {
-                el.requeue_js_timer(timer_id, id, Box::new(new_task), Instant::now() + delay);
+                el.requeue_js_timer(id, Box::new(new_task), Instant::now() + delay);
             });
         } else {
             // One-shot: release the timer id, mirroring HTML's "remove
             // global's map of setTimeout and setInterval IDs[id]" substep
             // after the handler ran.
-            with_active_event_loop(|el| el.js_timer_fired(timer_id));
+            with_active_event_loop(|el| el.js_timer_fired(id));
         }
 
         if failed {
@@ -225,15 +194,15 @@ mod timer_globals {
     }
 
     /// <https://html.spec.whatwg.org/#dom-cleartimeout>
-    pub fn clear_timeout(id: Option<u64>) {
+    pub fn clear_timeout(scope: &Scope<'_>, id: Option<u64>) {
         // `remove` `this`'s `map of setTimeout and setInterval IDs`[_id_].
-        super::with_active_event_loop(|el| el.clear_js_timer(id.unwrap_or(0)));
+        super::with_active_event_loop(|el| el.clear_js_timer(scope, id.unwrap_or(0)));
     }
 
     /// <https://html.spec.whatwg.org/#dom-clearinterval>
-    pub fn clear_interval(id: Option<u64>) {
+    pub fn clear_interval(scope: &Scope<'_>, id: Option<u64>) {
         // `remove` `this`'s `map of setTimeout and setInterval IDs`[_id_].
-        super::with_active_event_loop(|el| el.clear_js_timer(id.unwrap_or(0)));
+        super::with_active_event_loop(|el| el.clear_js_timer(scope, id.unwrap_or(0)));
     }
 }
 
@@ -278,21 +247,25 @@ fn timer_initialization_steps(
 
     // Queue on the current event loop.
     let timer_id = with_active_event_loop(|el| {
-        el.queue_js_timer(scope, deadline, |timer_id| match callable {
-            Some(callback) => Box::new(TimerTask::function(
-                callback,
-                extra_args,
-                interval,
-                task_nesting,
-                timer_id,
-            )),
-            None => {
+        el.queue_js_timer(scope, deadline, |timer_id| {
+            let handler = match callable {
+                Some(callback) => TimerHandler::Function {
+                    callback: RootedTraceableBox::new(Heap::from(callback)),
+                    args: extra_args,
+                },
                 // Not callable: run the handler's string as code. The HTML timer initialization
                 // steps create a new classic script from it each time the timer fires, so the
                 // string is kept rather than a compiled script.
-                let code = code.expect("non-callable handler was converted to a string above");
-                Box::new(TimerTask::code(code, interval, task_nesting, timer_id))
-            }
+                None => TimerHandler::Code(
+                    code.expect("non-callable handler was converted to a string above"),
+                ),
+            };
+            Box::new(TimerTask {
+                handler,
+                interval,
+                nesting_level: task_nesting,
+                timer_id,
+            })
         })
     });
 

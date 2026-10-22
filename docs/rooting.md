@@ -201,6 +201,12 @@ at compile time (`just crown`, and part of `just check-all`):
 When crown flags something, the fix is almost always one of: root the value, move
 it straight into a traced container, or wrap it while you need it.
 
+Crown allows bare `Value`s inside the `js` crate. The types cover the case that matters there: a
+raw `Value` doesn't implement `ToJSVal`, so an API taking `impl ToJSVal` only ever receives a
+rooted value or one that holds no GC thing, and can GC before it converts it. Pass a raw value
+read from a handle to an API that takes one directly, such as `Object::from_raw_value`, with
+nothing that can GC in between.
+
 ## Ensuring proper rooting through dynamic checks
 
 The tools and practices described here cut down on rooting complexity and catch most bugs statically, but they're not 100% foolproof. To further improve rooting correctness, StarlingMonkey CI runs parts of the test suite with dynamic checks enabled that are very highly likely to catch any remaining issues. These checks cause tests to run many (in some cases: hundreds of) times more slowly, so they're not enabled for the entire test suite.

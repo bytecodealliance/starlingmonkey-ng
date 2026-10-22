@@ -106,15 +106,10 @@ impl TextDecoder<'_> {
         let decoder = data.decoder.as_mut().expect("set by step 1");
 
         // Step 3: If _input_ is given, then `push` a `copy of` _input_ to `this`'s `I/O queue`.
-        //         (We decode directly from _input_'s bytes. Nothing retains them after this call.)
-        // SAFETY: `input` is rooted via the Uint8Array handle and the slice
-        // is only borrowed for the duration of the decode call below, which
-        // is pure CPU work in `encoding_rs` and cannot trigger GC or detach
-        // the underlying buffer.
-        let bytes: &[u8] = match input {
-            Some(ArrayBufferViewOrArrayBuffer::Buffer(input)) => unsafe { input.bytes() },
-            Some(ArrayBufferViewOrArrayBuffer::View(input)) => unsafe { input.bytes() },
-            None => &[],
+        let bytes: &[u8] = &match input {
+            Some(ArrayBufferViewOrArrayBuffer::Buffer(input)) => input.copy_bytes(scope)?,
+            Some(ArrayBufferViewOrArrayBuffer::View(input)) => input.copy_bytes(scope)?,
+            None => Vec::new(),
         };
 
         // windows-1252 decodes every byte outside 0x80..=0x9F to the code point of the same

@@ -146,15 +146,10 @@ mod tests {
     }
 
     #[test]
-    fn starts_at_zero() {
-        let tracker = tracker();
-        assert!(!tracker.has_interest());
-        assert_eq!(tracker.count(), 0);
-    }
-
-    #[test]
     fn acquire_and_release() {
         let tracker = tracker();
+        assert_eq!(tracker.count(), 0);
+        assert!(!tracker.has_interest());
         let first = tracker.acquire_handle();
         assert!(tracker.has_interest());
         assert_eq!(tracker.count(), 1);

@@ -37,14 +37,9 @@ fn setup() {
 }
 
 #[test]
-fn raw_identifier_getter_uses_keyword_name() {
-    assert_eq!(eval_with_setup(setup, "new Node().type"), "element");
-}
-
-#[test]
-fn raw_identifier_method_uses_keyword_name() {
+fn raw_identifiers_use_the_keyword_name() {
     assert_eq!(
-        eval_with_setup(setup, "String(new Node().match('element'))"),
-        "true"
+        eval_with_setup(setup, "`${new Node().type} ${new Node().match('element')}`"),
+        "element true"
     );
 }

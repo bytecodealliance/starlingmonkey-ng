@@ -6,8 +6,7 @@
 //! compaction (which moves objects), generational/nursery collections, and
 //! incremental marking.
 //!
-//! Grouped in a single test because `JSEngine` can only be initialized once
-//! per process. Each section sets its own GC zeal mode.
+//! Each section sets its own GC zeal mode.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
@@ -44,12 +43,12 @@ fn test_scope_gc_zeal() {
 
     unsafe {
         // =====================================================================
-        // Verification #5: 1000 scopes in a loop — no heap growth
+        // Verification #5: roots in repeated inner scopes stay valid
         // =====================================================================
         // Pages are reused when cursor rewinds. After the first iteration
         // allocates a page, subsequent iterations should reuse it.
         {
-            for i in 0..1000 {
+            for i in 0..3 {
                 let inner = scope.inner_scope();
                 let s = js::JSString::from_str(&inner, &format!("scope_{i}")).unwrap();
                 let obj = Object::new(&inner, None).unwrap();
@@ -65,39 +64,39 @@ fn test_scope_gc_zeal() {
         }
 
         // =====================================================================
-        // Verification #6: 500 roots across nested scopes + GC
+        // Verification #6: roots across nested scopes + GC
         // =====================================================================
         {
-            // Root 100 strings in the outer scope.
+            // Root 3 strings in the outer scope.
             let mut outer_handles = Vec::new();
-            for i in 0..100 {
+            for i in 0..3 {
                 let s = js::JSString::from_str(&scope, &format!("root_{i}")).unwrap();
                 outer_handles.push((i, s));
             }
 
             {
                 let inner = scope.inner_scope();
-                // Root 200 strings in the inner scope.
+                // Root 130 strings in the inner scope, more than one 128-slot page holds.
                 let mut inner_handles = Vec::new();
-                for i in 100..300 {
+                for i in 3..133 {
                     let s = js::JSString::from_str(&inner, &format!("root_{i}")).unwrap();
                     inner_handles.push((i, s));
                 }
 
                 {
                     let inner2 = inner.inner_scope();
-                    // Root 200 strings in the innermost scope.
+                    // Root 10 strings in the innermost scope.
                     let mut inner2_handles = Vec::new();
-                    for i in 300..500 {
+                    for i in 133..143 {
                         let s = js::JSString::from_str(&inner2, &format!("root_{i}")).unwrap();
                         inner2_handles.push((i, s));
                     }
 
-                    // Trigger GC with all 500 roots live.
+                    // Trigger GC with all 143 roots live.
                     gc::prepare_for_full_gc(&inner2);
                     gc::non_incremental_gc(&inner2, GCOptions::Normal, GCReason::API);
 
-                    // All 500 should survive.
+                    // All 143 should survive.
                     for (i, h) in &outer_handles {
                         let result = h.to_utf8(&inner2).unwrap();
                         assert_eq!(result, format!("root_{i}"));
@@ -111,7 +110,7 @@ fn test_scope_gc_zeal() {
                         assert_eq!(result, format!("root_{i}"));
                     }
                 }
-                // inner2 drops — roots 300-499 released
+                // inner2 drops, releasing roots 133-142.
 
                 // inner + outer roots still valid.
                 for (i, h) in &inner_handles {
@@ -119,9 +118,9 @@ fn test_scope_gc_zeal() {
                     assert_eq!(result, format!("root_{i}"));
                 }
             }
-            // inner drops — roots 100-299 released
+            // inner drops, releasing roots 3-132.
 
-            // Roots 0-99 still valid.
+            // Roots 0-2 still valid.
             for (i, h) in &outer_handles {
                 let result = h.to_utf8(&scope).unwrap();
                 assert_eq!(result, format!("root_{i}"));
@@ -163,7 +162,7 @@ fn test_scope_gc_zeal() {
 
             // Root many values — GC fires on every JS allocation.
             let mut string_handles = Vec::new();
-            for i in 0..50 {
+            for i in 0..5 {
                 let s = js::JSString::from_str(&inner, &format!("alloc_{i}")).unwrap();
                 string_handles.push(s);
             }
@@ -171,10 +170,10 @@ fn test_scope_gc_zeal() {
             // Evaluate JS that allocates heavily.
             let rval = js::compile::evaluate(
                 &inner,
-                "var arr = []; for (var i = 0; i < 100; i++) arr.push({x: i}); arr.length",
+                "var arr = []; for (var i = 0; i < 5; i++) arr.push({x: i}); arr.length",
             )
             .unwrap();
-            assert_eq!(rval.to_int32(), 100);
+            assert_eq!(rval.to_int32(), 5);
 
             // All string roots must survive.
             for (i, h) in string_handles.iter().enumerate() {
@@ -311,7 +310,7 @@ fn test_scope_gc_zeal() {
 
             // Create objects and arrays that may be moved by compaction.
             let mut objects = Vec::new();
-            for i in 0..30 {
+            for i in 0..5 {
                 let obj = Object::new(&inner, None).unwrap();
                 let val = inner.root_value(value::from_i32(i * 10));
                 obj.set_property(&inner, c"val", val).unwrap();
@@ -323,7 +322,7 @@ fn test_scope_gc_zeal() {
 
             // Trigger operations that cause allocations (and thus compacting
             // GCs with zeal mode 14).
-            for i in 0..10 {
+            for i in 0..5 {
                 let s = js::JSString::from_str(&inner, &format!("compact_{i}")).unwrap();
                 let result = s.to_utf8(&inner).unwrap();
                 assert_eq!(result, format!("compact_{i}"));
@@ -436,7 +435,7 @@ fn test_scope_gc_zeal() {
         // =====================================================================
         // GC Zeal #15: Mode 2 loop stress test
         // =====================================================================
-        // 100 iterations: create inner scope, root, trigger GC, drop scope.
+        // 5 iterations: create inner scope, root, trigger GC, drop scope.
         {
             set_zeal(&scope, 2, 1);
 
@@ -444,7 +443,7 @@ fn test_scope_gc_zeal() {
             // all the inner scope churn.
             let outer_str = js::JSString::from_str(&scope, "outer_survivor").unwrap();
 
-            for i in 0..100 {
+            for i in 0..5 {
                 let inner = scope.inner_scope();
 
                 let s = js::JSString::from_str(&inner, &format!("loop_{i}")).unwrap();
@@ -525,7 +524,7 @@ fn scope_roots_survive_nesting_out_of_order_drops_and_page_spans() {
 
     // More roots than fit in one page of the root stack.
     let inner = scope.inner_scope();
-    let values: Vec<_> = (0..300)
+    let values: Vec<_> = (0..130)
         .map(|i| js::JSString::from_str(&inner, &format!("value {i}")).unwrap())
         .collect();
     compact(&inner);

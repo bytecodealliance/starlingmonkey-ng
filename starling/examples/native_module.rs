@@ -47,10 +47,7 @@ fn main() {
     let scope = rt.default_global();
 
     // Register native module using the generated convenience function
-    assert!(
-        unsafe { math_utils::register(&scope) },
-        "Failed to register module"
-    );
+    assert!(math_utils::register(&scope), "Failed to register module");
 
     // ====================================================================
     // Test 1: Call functions from Rust

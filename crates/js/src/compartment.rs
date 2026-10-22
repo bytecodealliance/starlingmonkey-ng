@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! Cross-compartment wrapper operations.
-//!
-//! SpiderMonkey uses compartments to isolate different security domains.
-//! When an object from one compartment needs to be accessed from another,
-//! a cross-compartment wrapper (CCW) is used. This module provides safe
-//! wrappers for CCW management and compartment queries.
+//! Cross-compartment wrapper management and compartment queries.
 
 use std::ptr::NonNull;
 
@@ -13,18 +8,8 @@ use crate::gc::scope::Scope;
 use mozjs::gc::HandleObject;
 use mozjs::jsapi::{CompartmentFilter, JSClass, JSObject};
 use mozjs::rust::wrappers2;
-use mozjs::rust::MutableHandleObject;
 
 use super::error::ExnThrown;
-
-/// Wrap an object for use in the current compartment.
-///
-/// If the object is already in the current compartment, this is a no-op.
-/// Otherwise, a cross-compartment wrapper is created or reused.
-pub fn wrap_object(scope: &Scope<'_>, objp: MutableHandleObject) -> Result<(), ExnThrown> {
-    let ok = unsafe { wrappers2::JS_WrapObject(scope.cx_mut(), objp) };
-    ExnThrown::check(ok)
-}
 
 /// Refresh existing cross-compartment wrappers to an object.
 pub fn refresh_cross_compartment_wrappers(

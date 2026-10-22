@@ -31,6 +31,3 @@ pub use super::try_catch::TryCatch;
 
 // Re-export the callback args type for closure-based callbacks.
 pub use super::function::CallbackArgs;
-
-// Re-export the runtime / engine types for convenience.
-pub use mozjs::rust::{JSEngine, Runtime};

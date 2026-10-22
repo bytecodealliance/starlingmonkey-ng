@@ -199,7 +199,7 @@ impl ReadableStream {
             0.0,
             HandleValue::undefined(),
         )?;
-        if let Ok(source) = js::Object::from_value(scope, underlying_source.get()) {
+        if let Ok(source) = js::Object::from_value(scope, underlying_source) {
             stream.set_native_source(&source);
         }
         Ok(stream)
@@ -220,7 +220,7 @@ impl ReadableStream {
         let underlying_source = underlying_source.to_jsval_throwing(scope)?;
         let stream =
             algorithms::create_readable_byte_stream(scope, AlgorithmArg::None, pull, cancel)?;
-        if let Ok(source) = Object::from_value(scope, underlying_source.get()) {
+        if let Ok(source) = Object::from_value(scope, underlying_source) {
             stream.set_native_source(&source);
         }
         Ok(stream)

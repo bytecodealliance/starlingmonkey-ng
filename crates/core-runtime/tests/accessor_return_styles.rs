@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! Accessor return-style codegen regression test.
-//!
-//! A fallible setter whose body returns `Result<T, E>` with a non-unit `T`
-//! (classified `ResultValue`) used to fall into a catch-all arm that ran the
-//! call and discarded the `Result`, silently swallowing the `Err`. The setter
-//! must instead throw the error; its `Ok` value is ignored (a JS setter yields
-//! undefined).
+//! Accessor and method return styles: a fallible setter whose body returns `Result<T, E>` with a
+//! non-unit `T` (classified `ResultValue`) throws the `Err` and ignores the `Ok` value, and a
+//! `Result<Promise, E>` operation or attribute rejects with the `Err`.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
 
 use core_runtime::jsclass;
 use core_runtime::jsmethods;
-use core_runtime::test_util::{eval_out_with_setup, eval_with_setup, throws_with_setup};
+use core_runtime::test_util::{eval_out_with_setup, eval_with_setup};
 use js::error::TypeError;
 use js::gc::scope::Scope;
 use js::Promise;
@@ -62,29 +58,15 @@ fn setup() {
 }
 
 #[test]
-fn setter_ok_assigns() {
-    assert_eq!(
-        eval_with_setup(setup, "const c = new Cell(); c.value = 5; c.value"),
-        "5"
-    );
-}
-
-#[test]
-fn setter_err_throws_not_swallowed() {
-    assert!(throws_with_setup(
-        setup,
-        "const c = new Cell(); c.value = -1;"
-    ));
-}
-
-#[test]
-fn setter_err_leaves_value_unchanged() {
+fn fallible_setter_assigns_ok_and_throws_err() {
     assert_eq!(
         eval_with_setup(
             setup,
-            "const c = new Cell(); c.value = 9; try { c.value = -1; } catch (e) {} c.value"
+            "const c = new Cell(); c.value = 9; let threw = false; \
+             try { c.value = -1; } catch (e) { threw = e instanceof TypeError; } \
+             `${c.value} ${threw}`"
         ),
-        "9"
+        "9 true"
     );
 }
 

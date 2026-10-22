@@ -47,7 +47,6 @@
 //! | [`date`] | Date object creation and queries |
 //! | [`compile`] | Script compilation and evaluation |
 //! | [`module`] | ES module compilation, linking, evaluation |
-//! | [`realm`] | Realm context trait, utilities, and built-in prototypes |
 //! | [`gc`] | Garbage collection control |
 //! | [`exception`] | Pending exception management |
 //! | [`class`] | JSClass definition and standard classes |
@@ -154,7 +153,7 @@ pub mod engine {
 /// The monotonic clock the engine reads.
 ///
 /// Only on wasm, where the clock is scoped to the instance and an instance resuming from a Wizer
-/// snapshot has to be given the reading the snapshot ended at.
+/// snapshot has to be given the clock reading at which the snapshot ended.
 #[cfg(target_arch = "wasm32")]
 pub mod clock {
     /// Add `nanoseconds` to every monotonic clock reading the engine takes afterwards.
@@ -222,15 +221,10 @@ pub mod heap {
     pub use mozjs::rust::Trace;
 }
 
-/// Module compilation and source text utilities.
-///
-/// Re-exports of low-level module compilation functions that are not
-/// (yet) wrapped by the higher-level `js::module` API.
+/// Module and source text functions that `js::module` doesn't wrap.
 pub mod module_raw {
-    pub use mozjs::jsapi::{
-        CompileModule1, GetModuleRequestSpecifier, JSRuntime, SetModulePrivate,
-    };
-    pub use mozjs::rust::{transform_str_to_source_text, wrappers2::GetModuleEnvironment};
+    pub use mozjs::jsapi::SetModulePrivate;
+    pub use mozjs::rust::transform_str_to_source_text;
 }
 
 pub use macros::must_root;

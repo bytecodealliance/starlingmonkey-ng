@@ -96,7 +96,6 @@ pub struct EnteredRealm(());
 /// `'cx` is the lifetime of the parent context or scope.
 ///
 /// [`ScopeAlloc`]: mozjs::gc::pool::ScopeAlloc
-/// [`HandlePool`]: mozjs::gc::pool::HandlePool
 pub struct Scope<'cx> {
     /// Raw pointer to the JSContext, wrapped in `UnsafeCell` for interior
     /// mutability (same rationale as `RootScope`).

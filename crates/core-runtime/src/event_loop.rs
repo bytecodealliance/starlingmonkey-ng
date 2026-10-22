@@ -55,7 +55,7 @@ pub mod timer;
 use platform::clock::Instant;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use event_listener::{Event, EventListener};
@@ -78,7 +78,7 @@ js::instance_local! {
     /// [`with_active_event_loop`].
     ///
     /// The pointee is only ever accessed through shared references, so re-entrant access from JS
-    /// callbacks aliases nothing.
+    /// callbacks doesn't alias a mutable reference.
     static CURRENT_EVENT_LOOP: Cell<Option<*const EventLoop>> = const { Cell::new(None) };
 }
 
@@ -112,33 +112,45 @@ pub fn with_event_loop<R>(event_loop: &EventLoop, f: impl FnOnce(&EventLoop) -> 
     f(event_loop)
 }
 
+/// The closure passed to [`without_event_loop`] that returns why no event loop
+/// is active.
+type NoLoopReason = dyn Fn() -> String;
+
 js::instance_local! {
-    /// Why no event loop is active, set by [`without_event_loop`] for the
-    /// duration of its closure.
-    static NO_LOOP_REASON: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Pointer to the reason closure of the innermost [`without_event_loop`]
+    /// call, set for the duration of its `f`.
+    static NO_LOOP_REASON: Cell<Option<*const NoLoopReason>> = const { Cell::new(None) };
 }
 
-/// Run `f` with no active event loop, and `reason` as the explanation
-/// [`throw_no_event_loop`] gives for work that needs one. The previous state is
-/// restored afterwards.
+/// Run `f` with no active event loop. `reason` returns the explanation that
+/// [`throw_no_event_loop`] gives for work that needs one. It is called only
+/// when that explanation is needed, and can be called more than once. The
+/// previous state is restored afterwards.
 ///
 /// This is mainly useful for running code in sync exports, which mustn't block, and hence
 /// can't perform async operations.
-pub fn without_event_loop<R>(reason: String, f: impl FnOnce() -> R) -> R {
+pub fn without_event_loop<R>(reason: impl Fn() -> String, f: impl FnOnce() -> R) -> R {
     /// Restores the previous active loop and reason.
     struct Restore {
         prev_loop: Option<*const EventLoop>,
-        prev_reason: Option<String>,
+        prev_reason: Option<*const NoLoopReason>,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
             CURRENT_EVENT_LOOP.with(|el| el.set(self.prev_loop));
-            NO_LOOP_REASON.with(|cell| *cell.borrow_mut() = self.prev_reason.take());
+            NO_LOOP_REASON.with(|cell| cell.set(self.prev_reason));
         }
     }
 
+    let reason: &(dyn Fn() -> String + '_) = &reason;
+    // SAFETY: only the lifetime bound changes. `Restore` removes the pointer
+    // before `reason` goes out of scope, so it is only dereferenced while
+    // `reason` is alive.
+    let reason = unsafe {
+        std::mem::transmute::<*const (dyn Fn() -> String + '_), *const NoLoopReason>(reason)
+    };
     let prev_loop = CURRENT_EVENT_LOOP.with(|el| el.replace(None));
-    let prev_reason = NO_LOOP_REASON.with(|cell| cell.borrow_mut().replace(reason));
+    let prev_reason = NO_LOOP_REASON.with(|cell| cell.replace(Some(reason)));
     let _restore = Restore {
         prev_loop,
         prev_reason,
@@ -146,14 +158,23 @@ pub fn without_event_loop<R>(reason: String, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Throw a `TypeError` whose message is that `what` needs an active event loop,
-/// followed by the reason [`without_event_loop`] set, if any.
-pub fn throw_no_event_loop(scope: &Scope<'_>, what: &str) -> ExnThrown {
-    let message = NO_LOOP_REASON.with(|cell| match &*cell.borrow() {
-        Some(reason) => format!("{what} needs an active event loop, and {reason}"),
+/// The message that `what` needs an active event loop, followed by the reason
+/// [`without_event_loop`] set, if any.
+pub fn no_event_loop_message(what: &str) -> String {
+    match NO_LOOP_REASON.with(|cell| cell.get()) {
+        // SAFETY: the pointer is set only while the closure it points to is
+        // alive (see `without_event_loop`).
+        Some(reason) => {
+            let reason = unsafe { (*reason)() };
+            format!("{what} needs an active event loop, and {reason}")
+        }
         None => format!("{what} needs an active event loop"),
-    });
-    js::error::TypeError(message).throw(scope)
+    }
+}
+
+/// Throw a `TypeError` with the [`no_event_loop_message`] for `what`.
+pub fn throw_no_event_loop(scope: &Scope<'_>, what: &str) -> ExnThrown {
+    js::error::TypeError(no_event_loop_message(what)).throw(scope)
 }
 
 /// Reject `promise` with the `TypeError` [`throw_no_event_loop`] throws for
@@ -164,12 +185,17 @@ pub fn reject_without_event_loop(
     promise: &js::Promise<'_>,
     what: &str,
 ) -> Result<bool, ExnThrown> {
-    if with_active_event_loop(|_| ()).is_some() {
+    if has_active_event_loop() {
         return Ok(false);
     }
     throw_no_event_loop(scope, what);
     promise.reject_with_pending(scope)?;
     Ok(true)
+}
+
+/// Whether an event loop is active.
+pub fn has_active_event_loop() -> bool {
+    CURRENT_EVENT_LOOP.with(|el| el.get().is_some())
 }
 
 /// Run a closure with a reference to the active event loop.
@@ -182,7 +208,7 @@ pub fn with_active_event_loop<R>(f: impl FnOnce(&EventLoop) -> R) -> Option<R> {
             // SAFETY: the pointer was installed by `with_event_loop`, whose
             // shared borrow of the loop spans the closure currently on the
             // stack. The loop is alive, and all its state is behind cells,
-            // so shared access from here aliases nothing.
+            // so shared access from here doesn't alias a mutable reference.
             f(unsafe { &*ptr })
         })
     })
@@ -198,24 +224,6 @@ pub fn with_active_event_loop<R>(f: impl FnOnce(&EventLoop) -> R) -> Option<R> {
 /// reused.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TaskId(u64);
-
-impl TaskId {
-    /// Create a `TaskId` from a raw `u64` value.
-    ///
-    /// Test-only, since in production code it'd be a footgun.
-    #[cfg(test)]
-    pub fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// Returns the raw `u64` value.
-    ///
-    /// Test-only, since in production code it'd be a footgun.
-    #[cfg(test)]
-    pub fn as_raw(self) -> u64 {
-        self.0
-    }
-}
 
 impl std::fmt::Display for TaskId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -248,10 +256,30 @@ pub enum StepOutcome {
     Progressed,
 }
 
-/// A `setTimeout`/`setInterval` timer, keyed by the id JS sees.
-struct JsTimer {
+/// A global's `setTimeout` and `setInterval` timers.
+#[derive(Default)]
+struct GlobalTimers {
+    /// The last timer id the global's `setTimeout` or `setInterval` returned.
+    last_id: Cell<u64>,
+    /// HTML's "map of setTimeout and setInterval IDs": the timer ids JS sees, mapped to the
+    /// loop and task each controls.
+    timers: RefCell<HashMap<u64, GlobalTimer>>,
+}
+
+/// An entry of [`GlobalTimers::timers`].
+struct GlobalTimer {
+    /// The tasks of the loop that holds the timer.
+    tasks: Weak<LoopTasks>,
     /// The task the timer controls. An interval re-queues itself under the same one.
     task: TaskId,
+}
+
+/// A JS timer an [`EventLoop`] holds, keyed by the task it controls.
+struct LoopTimer {
+    /// The timers of the global that created the timer.
+    global: Weak<GlobalTimers>,
+    /// The id JS sees.
+    timer_id: u64,
     /// Where the timer was created, kept for each re-queue of an interval.
     origin: Option<Rc<str>>,
 }
@@ -420,11 +448,35 @@ impl TaskQueue {
 // EventLoop
 // ---------------------------------------------------------------------------
 
-/// Namespace token for the per-global setTimeout/setInterval id counter. Its
-/// address is a process-unique, stable `usize` key for
-/// [`js::class::next_global_counter`], mirroring how shared functions key on
-/// their native pointer.
-static TIMER_ID_COUNTER_KEY: u8 = 0;
+/// The tasks and JS timers of an [`EventLoop`], shared with [`GlobalTimers`] so that a timer can
+/// be cleared while another loop is active.
+struct LoopTasks {
+    /// All live tasks.
+    tasks: RefCell<TaskQueue>,
+    /// The JS timers this loop holds, by the task each controls.
+    js_timers: RefCell<HashMap<TaskId, LoopTimer>>,
+    /// The owning loop's driver notification.
+    notify: Rc<Event>,
+}
+
+impl LoopTasks {
+    /// Remove the JS timer that controls `task` from this loop and from its global's map.
+    fn release_js_timer(&self, task: TaskId) {
+        let removed = self.js_timers.borrow_mut().remove(&task);
+        if let Some(timer) = removed {
+            timer.release();
+        }
+    }
+}
+
+impl LoopTimer {
+    /// Remove the timer from its global's map.
+    fn release(self) {
+        if let Some(global) = self.global.upgrade() {
+            global.timers.borrow_mut().remove(&self.timer_id);
+        }
+    }
+}
 
 /// The event loop task registry.
 ///
@@ -432,9 +484,10 @@ static TIMER_ID_COUNTER_KEY: u8 = 0;
 /// drivers (`native`, `wasi`) call into this struct to advance the
 /// loop.
 ///
-/// The `EventLoop` is stored on the [`Runtime`](crate::runtime::Runtime)
-/// and its [`trace`](EventLoop::trace) method is called during GC to keep
-/// JS references inside tasks alive.
+/// The `EventLoop` is held by an
+/// [`InvocationState`](crate::invocation::InvocationState), and its
+/// [`trace`](EventLoop::trace) method is called during GC to keep JS
+/// references inside tasks alive.
 /// All mutable state lives in cells, so every method takes `&self`: JS
 /// callbacks re-entering through [`with_active_event_loop`] while the driver
 /// is mid-[`step`](Self::step) only ever alias shared references.
@@ -448,11 +501,8 @@ pub struct EventLoop {
     loop_id: u64,
     /// Monotonically increasing counter for generating unique [`TaskId`]s.
     next_id: Cell<u64>,
-    /// All live tasks.
-    tasks: RefCell<TaskQueue>,
-    /// HTML's per-loop "map of setTimeout and setInterval IDs": the timer ids
-    /// JS sees, mapped to the internal task they control.
-    js_timers: RefCell<HashMap<u64, JsTimer>>,
+    /// All live tasks and JS timers.
+    shared: Rc<LoopTasks>,
     /// Scratch buffer for [`step`](Self::step)'s per-batch dispatch list,
     /// reused across steps so the hot path stays allocation-free.
     batch_buf: RefCell<Vec<TaskId>>,
@@ -468,15 +518,16 @@ pub struct EventLoop {
     /// Shared with this loop's [`InterestHandle`]s, whose release
     /// must wake this loop even when it happens during another loop's turn.
     notify: Rc<Event>,
-    /// Sends [`register_pending_send`](Self::register_pending_send) registered,
-    /// for the loop's driver to take, each with the JS call stack that
-    /// registered it, if origins recording was active during registration.
+    /// Sends registered by
+    /// [`register_pending_send`](Self::register_pending_send), for the loop's
+    /// driver to take, each with the JS call stack that registered it, if
+    /// origins recording was active during registration.
     pending_sends: RefCell<Vec<(PendingSend, Option<Rc<str>>)>>,
 }
 
-/// A send, such as a response body's, that the loop's work can feed. The loop's
-/// driver awaits `done` while the loop has work, and calls `abandon` once no more
-/// work is left, after which `done` completes as well.
+/// A send that the loop's work can feed, such as sending a response body. The
+/// loop's driver awaits `done` while the loop has work, and calls `abandon` once
+/// no more work is left, after which `done` completes as well.
 pub struct PendingSend {
     pub done: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
     pub abandon: Box<dyn FnOnce()>,
@@ -490,8 +541,11 @@ impl EventLoop {
         Self {
             loop_id: NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             next_id: Cell::new(0),
-            tasks: RefCell::new(TaskQueue::default()),
-            js_timers: RefCell::new(HashMap::new()),
+            shared: Rc::new(LoopTasks {
+                tasks: RefCell::new(TaskQueue::default()),
+                js_timers: RefCell::new(HashMap::new()),
+                notify: Rc::clone(&notify),
+            }),
             batch_buf: RefCell::new(Vec::new()),
             stop_requested: Cell::new(false),
             interest: InterestTracker::new(Rc::clone(&notify)),
@@ -507,17 +561,7 @@ impl EventLoop {
     ///
     /// Returns the [`TaskId`] assigned to this task.
     pub fn queue(&self, task: Box<dyn Task>) -> TaskId {
-        let id = self.next_task_id();
-        // Read before `tasks` is borrowed: recording the origin can GC, which traces the loop.
-        let origin = js::stack::current_origin();
-        self.tasks.borrow_mut().insert(TaskEntry {
-            id,
-            task,
-            ready: false,
-            deadline: None,
-            origin,
-        });
-        id
+        self.insert_task(task, false)
     }
 
     /// Queue a task that is immediately ready to run.
@@ -525,17 +569,24 @@ impl EventLoop {
     /// This is a convenience for tasks that don't need to wait for an
     /// external event (e.g. resolved promises, `queueMicrotask` work).
     pub fn queue_ready(&self, task: Box<dyn Task>) -> TaskId {
+        self.insert_task(task, true)
+    }
+
+    /// Queue a task without a deadline, and wake the driver if it is `ready`.
+    fn insert_task(&self, task: Box<dyn Task>, ready: bool) -> TaskId {
         let id = self.next_task_id();
         // Read before `tasks` is borrowed: recording the origin can GC, which traces the loop.
         let origin = js::stack::current_origin();
-        self.tasks.borrow_mut().insert(TaskEntry {
+        self.shared.tasks.borrow_mut().insert(TaskEntry {
             id,
             task,
-            ready: true,
+            ready,
             deadline: None,
             origin,
         });
-        self.notify.notify(1);
+        if ready {
+            self.notify.notify(1);
+        }
         id
     }
 
@@ -559,7 +610,7 @@ impl EventLoop {
         deadline: Instant,
         origin: Option<Rc<str>>,
     ) {
-        self.tasks.borrow_mut().insert(TaskEntry {
+        self.shared.tasks.borrow_mut().insert(TaskEntry {
             id,
             task,
             ready: false,
@@ -575,77 +626,93 @@ impl EventLoop {
     /// in the queue (already run, or currently being executed by the driver)
     /// is left alone.
     pub fn cancel_if_queued(&self, id: TaskId) -> bool {
-        self.tasks.borrow_mut().remove(id).is_some()
+        self.shared.tasks.borrow_mut().remove(id).is_some()
     }
 
-    /// Queue a `setTimeout`/`setInterval` task under a fresh JS timer id.
+    /// Queue a `setTimeout`/`setInterval` task of the scope's global under a fresh JS timer id,
+    /// greater than zero and unique among the global's timers.
     pub fn queue_js_timer(
         &self,
         scope: &Scope<'_>,
         deadline: Instant,
         make_task: impl FnOnce(u64) -> Box<dyn Task>,
     ) -> u64 {
-        let timer_id = self.allocate_js_timer_id(scope);
+        let global = js::class::global_state::<GlobalTimers>(scope);
+        let timer_id = global.last_id.get() + 1;
+        assert!(
+            timer_id < js::conversion::Number::MAX,
+            "JS timer ids wrapped around"
+        );
+        global.last_id.set(timer_id);
         let task = self.next_task_id();
         let origin = js::stack::current_origin();
         self.insert_timer(task, make_task(timer_id), deadline, origin.clone());
-        self.js_timers
-            .borrow_mut()
-            .insert(timer_id, JsTimer { task, origin });
+        global.timers.borrow_mut().insert(
+            timer_id,
+            GlobalTimer {
+                tasks: Rc::downgrade(&self.shared),
+                task,
+            },
+        );
+        self.shared.js_timers.borrow_mut().insert(
+            task,
+            LoopTimer {
+                global: Rc::downgrade(&global),
+                timer_id,
+                origin,
+            },
+        );
         timer_id
     }
 
-    /// Re-queue an interval timer with the same JS timer id and [`TaskId`].
+    /// Re-queue the interval timer that controls the task `id`, under the same JS timer id and
+    /// [`TaskId`].
     ///
     /// If the timer was cleared while its callback ran (via `clearInterval`
-    /// from within the callback), the id no longer maps to this task and the
+    /// from within the callback), this loop no longer holds it, and the
     /// task is silently dropped instead of re-queued.
-    pub fn requeue_js_timer(
-        &self,
-        timer_id: u64,
-        id: TaskId,
-        task: Box<dyn Task>,
-        deadline: Instant,
-    ) {
-        let origin = match self.js_timers.borrow().get(&timer_id) {
-            Some(timer) if timer.task == id => timer.origin.clone(),
-            _ => return,
+    pub fn requeue_js_timer(&self, id: TaskId, task: Box<dyn Task>, deadline: Instant) {
+        let Some(origin) = self
+            .shared
+            .js_timers
+            .borrow()
+            .get(&id)
+            .map(|timer| timer.origin.clone())
+        else {
+            return;
         };
         self.insert_timer(id, task, deadline, origin);
     }
 
-    /// Cancel a JS timer by its `setTimeout`/`setInterval` id.
+    /// Cancel the JS timer of the scope's global with the `setTimeout`/`setInterval` id
+    /// `timer_id`, on the event loop that holds it. The driver of a loop other than this one is
+    /// woken afterwards.
     ///
     /// Invalid IDs are silently ignored per spec.
-    pub fn clear_js_timer(&self, timer_id: u64) {
-        let removed = self.js_timers.borrow_mut().remove(&timer_id);
-        if let Some(timer) = removed {
-            // If the task is still queued, remove it. If it is currently
-            // running (an interval clearing itself from its own callback),
-            // the now-missing map entry suppresses the re-queue instead.
-            self.cancel_if_queued(timer.task);
+    pub fn clear_js_timer(&self, scope: &Scope<'_>, timer_id: u64) {
+        let global = js::class::global_state::<GlobalTimers>(scope);
+        let Some(timer) = global.timers.borrow_mut().remove(&timer_id) else {
+            return;
+        };
+        let Some(tasks) = timer.tasks.upgrade() else {
+            return;
+        };
+        tasks.js_timers.borrow_mut().remove(&timer.task);
+        // If the task is still queued, remove it. If it is currently
+        // running (an interval clearing itself from its own callback),
+        // the now-missing timer suppresses the re-queue instead.
+        tasks.tasks.borrow_mut().remove(timer.task);
+        if !Rc::ptr_eq(&tasks, &self.shared) {
+            tasks.notify.notify(1);
         }
     }
 
-    /// Release a one-shot JS timer's id after it fired.
+    /// Release the id of the one-shot JS timer that controls the task `id`, after it fired.
     ///
     /// Mirrors HTML's "remove global's map of `setTimeout` and `setInterval`
     /// `IDs[id]`" task substep for non-repeating timers.
-    pub fn js_timer_fired(&self, timer_id: u64) {
-        self.js_timers.borrow_mut().remove(&timer_id);
-    }
-
-    /// Allocate the next JS timer id: greater than zero and not currently in
-    /// this loop's timer map.
-    fn allocate_js_timer_id(&self, scope: &Scope<'_>) -> u64 {
-        let key = &TIMER_ID_COUNTER_KEY as *const u8 as usize;
-        let js_timers = self.js_timers.borrow();
-        loop {
-            let id = js::class::next_global_counter(scope, key);
-            if id != 0 && !js_timers.contains_key(&id) {
-                return id;
-            }
-        }
+    pub fn js_timer_fired(&self, id: TaskId) {
+        self.shared.release_js_timer(id);
     }
 
     /// Mark a queued task as ready to run.
@@ -653,7 +720,7 @@ impl EventLoop {
     /// Has no effect if the task ID is not found (the task may have
     /// already been cancelled or run).
     pub fn signal_ready(&self, id: TaskId) {
-        if self.tasks.borrow_mut().mark_ready(id) {
+        if self.shared.tasks.borrow_mut().mark_ready(id) {
             self.notify.notify(1);
         }
     }
@@ -665,7 +732,7 @@ impl EventLoop {
     /// "Next" follows [`step`](Self::step)'s dispatch order: ready non-timer
     /// tasks in allocation order, then expired timers by deadline.
     pub fn pop_ready(&self) -> Option<(TaskId, Box<dyn Task>)> {
-        let mut tasks = self.tasks.borrow_mut();
+        let mut tasks = self.shared.tasks.borrow_mut();
         let &(_, id) = tasks.ready.first()?;
         let entry = tasks.remove(TaskId(id)).expect("ready tasks are live");
         Some((entry.id, entry.task))
@@ -677,7 +744,7 @@ impl EventLoop {
     /// Returns the number of timers that became ready.
     // TODO: consider merging with `time_to_next_timer` and returning the tasks directly.
     pub fn advance_timers(&self) -> usize {
-        self.tasks.borrow_mut().expire_timers(Instant::now())
+        self.shared.tasks.borrow_mut().expire_timers(Instant::now())
     }
 
     /// Returns the duration until the next timer fires, or `None` if
@@ -687,28 +754,28 @@ impl EventLoop {
     /// is already expired and [`advance_timers`](Self::advance_timers)
     /// should be called.
     pub fn time_to_next_timer(&self) -> Option<Duration> {
-        let &(deadline, _) = self.tasks.borrow().timers.first()?;
+        let &(deadline, _) = self.shared.tasks.borrow().timers.first()?;
         Some(deadline.saturating_duration_since(Instant::now()))
     }
 
     /// Returns `true` if there are any tasks (ready or not) in the queue.
     pub fn has_pending(&self) -> bool {
-        !self.tasks.borrow().entries.is_empty()
+        !self.shared.tasks.borrow().entries.is_empty()
     }
 
     /// Returns `true` if at least one task is in the ready state.
     pub fn has_ready(&self) -> bool {
-        !self.tasks.borrow().ready.is_empty()
+        !self.shared.tasks.borrow().ready.is_empty()
     }
 
     /// Returns the number of tasks currently queued (ready or not).
     pub fn len(&self) -> usize {
-        self.tasks.borrow().entries.len()
+        self.shared.tasks.borrow().entries.len()
     }
 
     /// Returns `true` if the event loop has no tasks.
     pub fn is_empty(&self) -> bool {
-        self.tasks.borrow().entries.is_empty()
+        self.shared.tasks.borrow().entries.is_empty()
     }
 
     // -----------------------------------------------------------------------
@@ -803,7 +870,7 @@ impl EventLoop {
     ///
     /// Tasks come first, in the order they were queued, then interest, then futures, then sends.
     pub fn pending_work(&self) -> Vec<PendingWork> {
-        let tasks = self.tasks.borrow();
+        let tasks = self.shared.tasks.borrow();
         let mut entries: Vec<&TaskEntry> = tasks.entries.values().collect();
         entries.sort_unstable_by_key(|entry| entry.id.0);
         let mut work: Vec<PendingWork> = entries
@@ -960,7 +1027,7 @@ unsafe fn settle_completed_futures(
         // SAFETY: guaranteed by this function's caller.
         let scope = unsafe { js::gc::scope::RootScope::from_current_realm(raw_cx) };
         if completed.is_empty() {
-            // A poll that completed nothing can still have run JS, such as the
+            // A poll that didn't complete a future can still have run JS, such as the
             // lowering of a stream nested in a stream element, which queues
             // microtasks.
             if jobs::has_pending_jobs(&scope) {
@@ -1191,14 +1258,21 @@ impl EventLoop {
         // ties broken the same way, which is the order of the ready set. The batch buffer is
         // reused to keep the path allocation-free.
         let mut batch = self.batch_buf.take();
-        batch.extend(self.tasks.borrow().ready.iter().map(|&(_, id)| TaskId(id)));
+        batch.extend(
+            self.shared
+                .tasks
+                .borrow()
+                .ready
+                .iter()
+                .map(|&(_, id)| TaskId(id)),
+        );
         let mut ran_any = false;
         for &id in &batch {
             // Take the task out before running it, ending the borrow: the
             // task's JS can re-enter this loop (setTimeout, clearTimeout)
             // through `with_active_event_loop`. Re-locate by id — an earlier
             // task in the batch may have cancelled this one.
-            let Some(entry) = self.tasks.borrow_mut().remove(id) else {
+            let Some(entry) = self.shared.tasks.borrow_mut().remove(id) else {
                 continue;
             };
             if entry.task.run(scope, id).is_err() {
@@ -1239,7 +1313,7 @@ impl EventLoop {
     /// allocation points, and no `tasks` borrow is held across a call into JS, so the borrow here
     /// cannot conflict.
     pub unsafe fn trace(&self, trc: *mut JSTracer) {
-        for entry in self.tasks.borrow().entries.values() {
+        for entry in self.shared.tasks.borrow().entries.values() {
             entry.task.trace(trc);
         }
     }
@@ -1255,6 +1329,15 @@ impl EventLoop {
 impl Default for EventLoop {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for EventLoop {
+    fn drop(&mut self) {
+        let timers = std::mem::take(&mut *self.shared.js_timers.borrow_mut());
+        for timer in timers.into_values() {
+            timer.release();
+        }
     }
 }
 

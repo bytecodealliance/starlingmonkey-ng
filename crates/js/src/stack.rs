@@ -29,8 +29,8 @@ use std::rc::Rc;
 use super::error::ExnThrown;
 
 crate::instance_local! {
-    /// The context [`current_origin`] captures stacks on, and null while origins are not being
-    /// recorded.
+    /// The context on which [`current_origin`] captures stacks, and null while origins are not
+    /// being recorded.
     static ORIGIN_CX: Cell<*mut RawJSContext> = const { Cell::new(std::ptr::null_mut()) };
 }
 
@@ -44,14 +44,14 @@ pub unsafe fn record_origins(cx: Option<*mut RawJSContext>) {
     ORIGIN_CX.with(|cell| cell.set(cx.unwrap_or(std::ptr::null_mut())));
 }
 
-/// The current JS call stack, formatted as `Error.prototype.stack` formats one, for describing
+/// The current JS call stack, in the format of `Error.prototype.stack`, for describing
 /// where asynchronous work being created comes from.
 ///
 /// Returns `None` while [`record_origins`] is not recording, when no realm is entered or no
 /// script is running, and when capturing the stack fails. A failed capture's exception is
 /// cleared.
 pub fn current_origin() -> Option<Rc<str>> {
-    // The most frames an origin holds, counted from the call that created the work.
+    // The maximum number of frames an origin holds, counted from the call that created the work.
     const MAX_FRAMES: u32 = 16;
 
     let cx = ORIGIN_CX.with(Cell::get);

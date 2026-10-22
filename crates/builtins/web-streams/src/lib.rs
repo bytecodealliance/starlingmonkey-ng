@@ -43,6 +43,7 @@ pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     readable::algorithms::PipeState::add_to_global(scope, global);
     readable::algorithms::FromIterableState::add_to_global(scope, global);
     readable::read_all_bytes::ReadAllBytesState::add_to_global(scope, global);
+    js::iteration::AsyncIteratorRecord::add_to_global(scope, global);
 
     // Chain the async iterator's prototype under `%AsyncIteratorPrototype%` so it
     // inherits `[Symbol.asyncIterator]` (returning `this`).

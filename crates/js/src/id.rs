@@ -57,7 +57,7 @@ pub fn mark_cross_zone_id(scope: &Scope<'_>, id: jsid) {
     unsafe { wrappers2::JS_MarkCrossZoneId(scope.cx(), id) }
 }
 
-/// Convert getter/setter property ids.
+/// Convert to getter property id.
 pub fn to_getter_id(scope: &Scope<'_>, id: Handle<PropertyKey>) -> Result<PropertyKey, ExnThrown> {
     rooted!(in(unsafe { scope.raw_cx_no_gc() }) let mut getter_id = PropertyKey::default());
     let ok = unsafe { wrappers2::ToGetterId(scope.cx_mut(), id, getter_id.handle_mut()) };

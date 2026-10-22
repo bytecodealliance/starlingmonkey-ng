@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! Regression test for `#[jsglobals]` class registration via `pub use`.
-//!
-//! Only `pub use Foo;` (a plain name) was registered; a grouped
-//! `pub use {A, B};` or a renamed `pub use Foo as Bar;` was silently skipped,
-//! so the class was never installed on the global. All forms are now handled.
+//! `#[jsglobals]` registers each class a grouped `pub use {A, B};` names.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
@@ -57,8 +53,8 @@ fn setup() {
 
 #[test]
 fn grouped_use_registers_all_classes() {
-    assert_eq!(eval_with_setup(setup, "typeof Alpha"), "function");
-    assert_eq!(eval_with_setup(setup, "typeof Beta"), "function");
-    assert_eq!(eval_with_setup(setup, "new Alpha().tag"), "alpha");
-    assert_eq!(eval_with_setup(setup, "new Beta().tag"), "beta");
+    assert_eq!(
+        eval_with_setup(setup, "[new Alpha().tag, new Beta().tag].join()"),
+        "alpha,beta"
+    );
 }

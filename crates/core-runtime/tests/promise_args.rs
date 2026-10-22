@@ -102,11 +102,11 @@ impl PromiseArgs {
     ) -> Result<Promise<'r>, ExnThrown> {
         match members.unchecked {
             Some(p) => Ok(p),
-            None => Promise::new_resolved_with_value(scope, js::value::undefined()),
+            None => Promise::new_resolved_with_value(scope, js::prelude::HandleValue::undefined()),
         }
     }
 
-    /// The checked member, likewise — its `Payload` check runs the same way an argument's does.
+    /// The checked member, whose `Payload` check runs the same way as for an argument.
     #[method]
     fn checked_member<'r>(
         &self,
@@ -115,7 +115,7 @@ impl PromiseArgs {
     ) -> Result<Promise<'r>, ExnThrown> {
         match members.checked {
             Some(p) => Ok(p.promise()),
-            None => Promise::new_resolved_with_value(scope, js::value::undefined()),
+            None => Promise::new_resolved_with_value(scope, js::prelude::HandleValue::undefined()),
         }
     }
 
@@ -129,7 +129,7 @@ impl PromiseArgs {
     ) -> Result<Promise<'r>, ExnThrown> {
         match p {
             Some(p) => Ok(p.promise()),
-            None => Promise::new_resolved_with_value(scope, js::value::undefined()),
+            None => Promise::new_resolved_with_value(scope, js::prelude::HandleValue::undefined()),
         }
     }
 }
@@ -156,8 +156,6 @@ fn eval_then_drain(code: &str, probe: &str) -> String {
     String::from_jsval(&scope, value, ()).expect("probe value is not a string")
 }
 
-/// The whole surface in one process: `JSEngine` initializes once per test
-/// binary, so the cases share a run and report through a single log.
 #[test]
 fn promise_arguments_wrap_any_value_and_check_the_type_later() {
     let log = eval_then_drain(
@@ -236,7 +234,7 @@ fn promise_arguments_wrap_any_value_and_check_the_type_later() {
     );
 }
 
-/// A missing required argument is an error at the call, not a value to wrap:
+/// A missing required argument fails at the call rather than being wrapped:
 /// WebIDL counts arguments before it converts any of them. Which *kind* of
 /// error is the ordinary rule for any operation — a promise-returning one
 /// rejects, everything else throws.

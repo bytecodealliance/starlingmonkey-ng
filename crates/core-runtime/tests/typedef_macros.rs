@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! Integration tests for the `js` API.
-//!
-//! Tests that need a JS runtime are grouped in a single test because
-//! `JSEngine` can only be initialized once per process.
+//! Tests of the class, namespace and dictionary macros.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
@@ -45,57 +42,35 @@ mod js_proto_tests {
     }
 
     #[test]
-    fn inherits_from_error_prototype() {
-        assert_eq!(eval("new CustomError('x') instanceof Error"), "true");
-    }
-
-    #[test]
-    fn is_custom_error_instance() {
-        assert_eq!(eval("new CustomError('x') instanceof CustomError"), "true");
-    }
-
-    #[test]
-    fn prototype_chain() {
+    fn js_proto_classes_inherit_from_the_builtin_prototype() {
         assert_eq!(
-            eval("Object.getPrototypeOf(CustomError.prototype) === Error.prototype"),
-            "true"
+            eval(
+                "const e = new CustomError('d');
+                 [e instanceof CustomError, Object.getPrototypeOf(e) === CustomError.prototype,
+                  Object.getPrototypeOf(CustomError.prototype) === Error.prototype,
+                  e.detail, Object.prototype.toString.call(e),
+                  CustomError.prototype[Symbol.toStringTag]].join()"
+            ),
+            "true,true,true,d,[object CustomError],CustomError"
         );
     }
 
+    /// `#[jsclass]` accessors are non-enumerable. A call of the constructor without `new` throws
+    /// the same `TypeError` as a JS class constructor.
     #[test]
-    fn getter_works() {
-        assert_eq!(eval("new CustomError('test detail').detail"), "test detail");
-    }
-
-    #[test]
-    fn not_array_instance() {
-        assert_eq!(eval("new CustomError('x') instanceof Array"), "false");
-    }
-
-    #[test]
-    fn to_string_tag() {
+    fn jsclass_accessors_are_not_enumerable_and_constructors_require_new() {
         assert_eq!(
-            eval("Object.prototype.toString.call(new CustomError('x'))"),
-            "[object CustomError]"
+            eval(
+                "class Plain {}
+                 const error = (f) => {
+                     try { f(); return 'no throw'; } catch (e) { return `${e.constructor.name}: ${e.message}`; }
+                 };
+                 const own = error(() => CustomError('x'));
+                 [Object.getOwnPropertyDescriptor(CustomError.prototype, 'detail').enumerable,
+                  own, own === error(() => Plain())].join('|')"
+            ),
+            "false|TypeError: class constructors must be invoked with 'new'|true"
         );
-    }
-
-    #[test]
-    fn to_string_tag_on_prototype() {
-        assert_eq!(
-            eval("CustomError.prototype[Symbol.toStringTag]"),
-            "CustomError"
-        );
-    }
-
-    #[test]
-    fn has_stack_property() {
-        assert_eq!(eval("typeof new CustomError('x').stack"), "string");
-    }
-
-    #[test]
-    fn stack_is_nonempty() {
-        assert_eq!(eval("new CustomError('x').stack.length > 0"), "true");
     }
 
     /// The stack is the one at construction, formatted when it is first read.
@@ -113,7 +88,8 @@ mod js_proto_tests {
     }
 
     /// Like `Error.prototype.stack`, `stack` is an accessor on the prototype: instances have no
-    /// own `stack` until one is assigned, and the getter returns `undefined` for other objects.
+    /// own `stack` until one is assigned, and the getter returns `undefined` for other objects and
+    /// throws for primitives.
     #[test]
     fn stack_is_a_prototype_accessor() {
         assert_eq!(
@@ -123,22 +99,13 @@ mod js_proto_tests {
                  const own = Object.getOwnPropertyDescriptor(e, 'stack');
                  e.stack = 'replaced';
                  const after = Object.getOwnPropertyDescriptor(e, 'stack');
+                 let primitive;
+                 try { d.get.call(1); primitive = 'no throw'; } catch (e) { primitive = e.constructor.name; }
                  [typeof d.get, typeof d.set, d.enumerable, d.configurable, own,
                   after.value, after.enumerable, after.writable,
-                  d.get.call(CustomError.prototype), d.get.call({})].join()"
+                  d.get.call(CustomError.prototype), d.get.call({}), primitive].join()"
             ),
-            "function,function,false,true,,replaced,true,true,,"
-        );
-    }
-
-    #[test]
-    fn stack_getter_throws_on_primitives() {
-        assert_eq!(
-            eval(
-                "const get = Object.getOwnPropertyDescriptor(CustomError.prototype, 'stack').get;
-                 try { get.call(1); 'no throw' } catch (e) { e.constructor.name }"
-            ),
-            "TypeError"
+            "function,function,false,true,,replaced,true,true,,,TypeError"
         );
     }
 }
@@ -175,57 +142,34 @@ mod constant_tests {
         )
     }
 
+    /// Constants are read-only, enumerable properties of the constructor only.
     #[test]
-    fn constant_on_constructor() {
-        assert_eq!(eval("StatusCode.OK"), "200");
-    }
-
-    #[test]
-    fn constant_not_found() {
-        assert_eq!(eval("StatusCode.NOT_FOUND"), "404");
-    }
-
-    #[test]
-    fn constant_internal_server_error() {
-        assert_eq!(eval("StatusCode.INTERNAL_SERVER_ERROR"), "500");
-    }
-
-    #[test]
-    fn constant_is_readonly() {
+    fn constants_are_defined_on_the_constructor() {
         assert_eq!(
-            eval("'use strict'; try { StatusCode.OK = 999; 'changed' } catch(e) { 'error' }"),
-            "error"
+            eval(
+                "'use strict';
+                 let assigned;
+                 try { StatusCode.OK = 999; assigned = 'changed'; } catch (e) { assigned = 'error'; }
+                 [StatusCode.OK, StatusCode.NOT_FOUND, StatusCode.INTERNAL_SERVER_ERROR, assigned,
+                  Object.keys(StatusCode).includes('OK'), StatusCode.prototype.OK,
+                  new StatusCode().OK].map(String).join()"
+            ),
+            "200,404,500,error,true,undefined,undefined"
         );
-    }
-
-    #[test]
-    fn constant_is_enumerable() {
-        assert_eq!(eval("Object.keys(StatusCode).includes('OK')"), "true");
-    }
-
-    #[test]
-    fn constant_not_on_prototype() {
-        assert_eq!(eval("StatusCode.prototype.OK"), "undefined");
-    }
-
-    #[test]
-    fn constant_not_on_instance() {
-        assert_eq!(eval("new StatusCode().OK"), "undefined");
     }
 }
 
 /// Tests for `#[webidl_interface]`: auto Symbol.toStringTag and
 /// constants on both constructor AND prototype.
 mod webidl_interface_tests {
-    use core_runtime::jsmethods;
     use core_runtime::test_util::eval_with_setup;
-    use core_runtime::webidl_interface;
+    use core_runtime::{webidl_interface, webidl_methods};
 
-    /// A WebIDL-style interface with constants and methods.
+    /// A WebIDL-style interface with constants and an attribute.
     #[webidl_interface]
     struct MediaError {}
 
-    #[jsmethods]
+    #[webidl_methods]
     impl MediaError {
         pub const MEDIA_ERR_ABORTED: u16 = 1;
         pub const MEDIA_ERR_NETWORK: u16 = 2;
@@ -235,6 +179,11 @@ mod webidl_interface_tests {
         #[constructor]
         fn construct() -> Self {
             Self {}
+        }
+
+        #[getter]
+        fn code(&self) -> u16 {
+            1
         }
     }
 
@@ -249,82 +198,38 @@ mod webidl_interface_tests {
         )
     }
 
-    // --- Auto Symbol.toStringTag ---
-
+    /// The constants are read-only properties of the constructor and of the prototype (WebIDL
+    /// §3.7.3), so instances inherit them.
     #[test]
-    fn auto_to_string_tag() {
-        assert_eq!(
-            eval("Object.prototype.toString.call(new MediaError())"),
-            "[object MediaError]"
-        );
-    }
-
-    #[test]
-    fn to_string_tag_on_prototype() {
-        assert_eq!(
-            eval("MediaError.prototype[Symbol.toStringTag]"),
-            "MediaError"
-        );
-    }
-
-    // --- Constants on constructor ---
-
-    #[test]
-    fn constant_on_constructor() {
-        assert_eq!(eval("MediaError.MEDIA_ERR_ABORTED"), "1");
-    }
-
-    #[test]
-    fn constant_network_on_constructor() {
-        assert_eq!(eval("MediaError.MEDIA_ERR_NETWORK"), "2");
-    }
-
-    // --- Constants on prototype (WebIDL §3.7.3) ---
-
-    #[test]
-    fn constant_on_prototype() {
-        assert_eq!(eval("MediaError.prototype.MEDIA_ERR_ABORTED"), "1");
-    }
-
-    #[test]
-    fn constant_decode_on_prototype() {
-        assert_eq!(eval("MediaError.prototype.MEDIA_ERR_DECODE"), "3");
-    }
-
-    #[test]
-    fn constant_src_not_supported_on_prototype() {
-        assert_eq!(
-            eval("MediaError.prototype.MEDIA_ERR_SRC_NOT_SUPPORTED"),
-            "4"
-        );
-    }
-
-    // --- Constants on instances (inherited via prototype) ---
-
-    #[test]
-    fn constant_on_instance() {
-        assert_eq!(eval("new MediaError().MEDIA_ERR_ABORTED"), "1");
-    }
-
-    // --- Constants are read-only ---
-
-    #[test]
-    fn constant_readonly_on_constructor() {
+    fn interfaces_get_a_to_string_tag_and_constants_on_the_prototype() {
         assert_eq!(
             eval(
-                "'use strict'; try { MediaError.MEDIA_ERR_ABORTED = 99; 'changed' } catch(e) { 'error' }"
+                "'use strict';
+                 const assign = (target) => {
+                     try { target.MEDIA_ERR_ABORTED = 99; return 'changed'; } catch (e) { return 'error'; }
+                 };
+                 [Object.prototype.toString.call(new MediaError()),
+                  MediaError.prototype[Symbol.toStringTag], MediaError.MEDIA_ERR_ABORTED,
+                  MediaError.MEDIA_ERR_NETWORK, MediaError.prototype.MEDIA_ERR_DECODE,
+                  MediaError.prototype.MEDIA_ERR_SRC_NOT_SUPPORTED, new MediaError().MEDIA_ERR_ABORTED,
+                  assign(MediaError), assign(MediaError.prototype)].join()"
             ),
-            "error"
+            "[object MediaError],MediaError,1,2,3,4,1,error,error"
         );
     }
 
+    /// Attributes are enumerable (WebIDL §3.7.6), and a call of the constructor without `new`
+    /// throws a `TypeError`.
     #[test]
-    fn constant_readonly_on_prototype() {
+    fn interface_attributes_are_enumerable_and_constructors_require_new() {
         assert_eq!(
             eval(
-                "'use strict'; try { MediaError.prototype.MEDIA_ERR_ABORTED = 99; 'changed' } catch(e) { 'error' }"
+                "let call;
+                 try { MediaError(); call = 'no throw'; } catch (e) { call = e.constructor.name; }
+                 [Object.getOwnPropertyDescriptor(MediaError.prototype, 'code').enumerable,
+                  new MediaError().code, call].join()"
             ),
-            "error"
+            "true,1,TypeError"
         );
     }
 }
@@ -365,55 +270,19 @@ mod jsnamespace_tests {
         )
     }
 
+    /// The namespace is a plain object without a `Symbol.toStringTag`, and a non-enumerable
+    /// property of the global (WebIDL §3.13). Its functions aren't constructors.
     #[test]
-    fn namespace_exists() {
-        assert_eq!(eval("typeof math"), "object");
-    }
-
-    #[test]
-    fn namespace_function_call() {
-        assert_eq!(eval("math.add(2, 3)"), "5");
-    }
-
-    #[test]
-    fn namespace_multiply() {
-        assert_eq!(eval("math.multiply(4, 5)"), "20");
-    }
-
-    #[test]
-    fn namespace_function_with_scope() {
-        assert_eq!(eval("math.greet('World')"), "Hello, World!");
-    }
-
-    #[test]
-    fn namespace_not_constructable() {
+    fn namespaces_are_plain_objects_with_functions() {
         assert_eq!(
-            eval("try { new math.add(); 'ok' } catch(e) { 'error' }"),
-            "error"
-        );
-    }
-
-    #[test]
-    fn namespace_no_to_string_tag() {
-        assert_eq!(
-            eval("Object.prototype.toString.call(math)"),
-            "[object Object]"
-        );
-    }
-
-    #[test]
-    fn namespace_constant_exposed() {
-        // `pub const` items are installed on the namespace object.
-        assert_eq!(eval("math.PI"), "3.5");
-    }
-
-    #[test]
-    fn namespace_object_is_not_enumerable() {
-        // WebIDL §3.13: the namespace object is a non-enumerable property of
-        // the global (installed via define, not [[Set]]).
-        assert_eq!(
-            eval("Object.getOwnPropertyDescriptor(globalThis, 'math').enumerable"),
-            "false"
+            eval(
+                "let constructed;
+                 try { new math.add(); constructed = 'ok'; } catch (e) { constructed = 'error'; }
+                 [typeof math, math.add(2, 3), math.multiply(4, 5), math.greet('World'), math.PI,
+                  constructed, Object.prototype.toString.call(math),
+                  Object.getOwnPropertyDescriptor(globalThis, 'math').enumerable].join()"
+            ),
+            "object,5,20,Hello, World!,3.5,error,[object Object],false"
         );
     }
 }
@@ -442,23 +311,14 @@ mod webidl_namespace_tests {
     }
 
     #[test]
-    fn namespace_exists() {
-        assert_eq!(eval("typeof CSS"), "object");
-    }
-
-    #[test]
-    fn namespace_function_call() {
-        assert_eq!(eval("CSS.escape('hello')"), "hello");
-    }
-
-    #[test]
-    fn auto_to_string_tag() {
-        assert_eq!(eval("Object.prototype.toString.call(CSS)"), "[object CSS]");
-    }
-
-    #[test]
-    fn to_string_tag_on_namespace() {
-        assert_eq!(eval("CSS[Symbol.toStringTag]"), "CSS");
+    fn webidl_namespaces_get_a_to_string_tag() {
+        assert_eq!(
+            eval(
+                "[typeof CSS, CSS.escape('hello'), Object.prototype.toString.call(CSS),
+                  CSS[Symbol.toStringTag]].join()"
+            ),
+            "object,hello,[object CSS],CSS"
+        );
     }
 }
 
@@ -541,48 +401,24 @@ mod setup_style_inheritance {
     }
 
     #[test]
-    fn pet_constructor() {
-        assert_eq!(eval("new Pet('Cat').kind"), "Cat");
-    }
-
-    #[test]
-    fn pet_method() {
-        assert_eq!(eval("new Pet('Some dog').sound()"), "<generic pet sound>");
-    }
-
-    #[test]
-    fn lily_constructor() {
-        assert_eq!(eval("new Lily(5).kind"), "The very cutest");
-    }
-
-    #[test]
-    fn lily_payload() {
-        assert_eq!(eval("new Lily(5).cuteness"), "5");
-    }
-
-    #[test]
-    fn lily_overrides_method() {
-        assert_eq!(eval("new Lily(5).sound()"), "The cutest sound!");
-    }
-
-    #[test]
-    fn lily_instanceof() {
-        assert_eq!(eval("new Lily(5) instanceof Pet"), "true");
-    }
-
-    #[test]
-    fn lily_describe() {
+    fn setup_style_constructors_initialize_subclasses() {
         assert_eq!(
-            eval("new Lily(5).describe()"),
-            "The very cutest Lily, cuteness: 5/5"
+            eval(
+                "const pet = new Pet('Cat');
+                 const lily = new Lily(5);
+                 [pet.kind, pet.sound(), lily.kind, lily.cuteness, lily.sound(), lily instanceof Pet,
+                  lily.describe()].join('|')"
+            ),
+            "Cat|<generic pet sound>|The very cutest|5|The cutest sound!|true|\
+             The very cutest Lily, cuteness: 5/5"
         );
     }
 }
 
 /// Tests for `#[webidl_dictionary]` — WebIDL dictionary conversion.
 mod webidl_dictionary_tests {
-    use core_runtime::test_util::{eval_with_setup, throws_with_setup};
-    use core_runtime::{jsmethods, webidl_dictionary, webidl_interface};
+    use core_runtime::test_util::eval_with_setup;
+    use core_runtime::{webidl_dictionary, webidl_interface, webidl_methods};
     use js::gc::scope::Scope;
     use js::Object;
 
@@ -663,7 +499,7 @@ mod webidl_dictionary_tests {
         members: String,
     }
 
-    #[jsmethods]
+    #[webidl_methods]
     impl Inherited {
         #[constructor]
         fn new(init: &DerivedInit<'_>) -> Self {
@@ -713,8 +549,8 @@ mod webidl_dictionary_tests {
             self.data_mut().members.push('!');
         }
 
-        /// `&str` parameters. A call from JS still has to copy the string out of the engine, so
-        /// this buys nothing there; what it buys is Rust callers, which can pass a borrow.
+        /// `&str` parameters. A call from JS still has to copy the string out of the engine. Rust
+        /// callers can pass a borrow.
         #[method]
         fn label(&self, prefix: &str, suffix: Option<&str>) -> String {
             format!("{prefix}{}{}", self.data().members, suffix.unwrap_or(""))
@@ -740,7 +576,7 @@ mod webidl_dictionary_tests {
         }
     }
 
-    #[jsmethods]
+    #[webidl_methods]
     impl Greeter {
         #[constructor]
         fn new(person: PersonInit, options: Option<GreetingOptions>) -> Self {
@@ -768,7 +604,7 @@ mod webidl_dictionary_tests {
         label: String,
     }
 
-    #[jsmethods]
+    #[webidl_methods]
     impl Config {
         #[constructor]
         fn new(init: ConfigInit) -> Self {
@@ -801,87 +637,62 @@ mod webidl_dictionary_tests {
         eval_with_setup(setup, code)
     }
 
-    fn throws(code: &str) -> bool {
-        throws_with_setup(setup, code)
-    }
-
-    // Required members
-
+    /// A `null` optional dictionary argument converts like an absent one.
     #[test]
-    fn required_members_extracted() {
+    fn dictionary_members_are_extracted() {
         assert_eq!(
-            eval("new Greeter({ name: 'Alice', age: 30 }).greeting"),
-            "Hello, Alice (age 30)."
+            eval(
+                "[new Greeter({ name: 'Alice', age: 30 }).greeting,
+                  new Greeter({ name: 'Bob', age: 25 }, { prefix: 'Hi', excited: true }).greeting,
+                  new Greeter({ name: 'Dana', age: 18 }, null).greeting].join('|')"
+            ),
+            "Hello, Alice (age 30).|Hi, Bob (age 25)!|Hello, Dana (age 18)."
         );
     }
 
     #[test]
-    fn required_member_missing_throws() {
-        // Missing 'age' should throw.
-        assert!(throws("new Greeter({ name: 'Alice' })"));
-    }
-
-    #[test]
-    fn required_member_all_missing_throws() {
-        assert!(throws("new Greeter({})"));
-    }
-
-    #[test]
-    fn non_object_dict_throws() {
-        assert!(throws("new Greeter(42)"));
-    }
-
-    // Optional members
-
-    #[test]
-    fn optional_members_present() {
+    fn missing_required_members_and_non_objects_throw() {
         assert_eq!(
-            eval("new Greeter({ name: 'Bob', age: 25 }, { prefix: 'Hi', excited: true }).greeting"),
-            "Hi, Bob (age 25)!"
+            eval(
+                "[{ name: 'Alice' }, {}, 42].map(init => {
+                     try { new Greeter(init); return 'no throw'; } catch (e) { return e.constructor.name; }
+                 }).join()"
+            ),
+            "TypeError,TypeError,TypeError"
         );
     }
 
+    /// A `null` or `undefined` dictionary converts like an empty one.
     #[test]
-    fn optional_members_absent() {
+    fn absent_members_take_their_defaults() {
         assert_eq!(
-            eval("new Greeter({ name: 'Charlie', age: 20 }).greeting"),
-            "Hello, Charlie (age 20)."
+            eval(
+                "[new Config({}).timeout, new Config({ timeout: 42 }).timeout, new Config({}).label,
+                  new Config({ label: 'custom' }).label, new Config(null).timeout,
+                  new Config(undefined).timeout].join()"
+            ),
+            "10,42,default,custom,10,10"
         );
     }
-
-    #[test]
-    fn optional_dict_param_null() {
-        // Second param (GreetingOptions) is optional and null → treated as None.
-        assert_eq!(
-            eval("new Greeter({ name: 'Dana', age: 18 }, null).greeting"),
-            "Hello, Dana (age 18)."
-        );
-    }
-
-    // Inheritance
 
     #[test]
     fn inherited_members_are_read_through_the_chain() {
         assert_eq!(
             eval(
-                "new Inherited({ top: 'T', base: 'B', middle: 'M', bottom: 'b', extra: {} })
-                    .members"
+                "[new Inherited({ top: 'T', base: 'B', middle: 'M', bottom: 'b', extra: {} }).members,
+                  new Inherited({}).members].join('|')"
             ),
-            "T B M b true"
+            "T B M b true|    false"
         );
-    }
-
-    #[test]
-    fn inherited_members_absent_take_their_defaults() {
-        assert_eq!(eval("new Inherited({}).members"), "    false");
     }
 
     #[test]
     fn inherited_dictionaries_convert_least_derived_first() {
         // Every member is a property get, so an accessor on the source object records the order
-        // the conversion reads them in. WebIDL: the inherited dictionaries first, least derived
-        // first, each one's own members lexicographically. Sorting all five as one flat set would
-        // give `base, bottom, extra, middle, top` — this asserts the chain is walked instead.
+        // in which the conversion reads them. WebIDL: the inherited dictionaries first, least
+        // derived first, each one's own members lexicographically. Sorting all five as one flat
+        // set would give `base, bottom, extra, middle, top`. This asserts the chain is walked
+        // instead.
         assert_eq!(
             eval(
                 r#"
@@ -902,114 +713,36 @@ mod webidl_dictionary_tests {
         );
     }
 
+    /// Operations take dictionaries, `&str` and `&[T]` parameters by reference, plain and in an
+    /// `Option`, and a promise-returning operation takes a dictionary by reference too. A
+    /// non-string argument to a `&str` parameter still coerces.
     #[test]
-    fn dictionaries_can_be_taken_by_reference() {
-        // Both the plain and the `Option` form, and the absent case for the latter.
-        assert_eq!(
-            eval("new Inherited({}).describe({ top: 'T', base: 'B' }, { top: 't', base: 'b' })"),
-            "T/B t/b"
-        );
-        assert_eq!(
-            eval("new Inherited({}).describe({ top: 'T', base: 'B' })"),
-            "T/B"
-        );
-        assert_eq!(
-            eval("new Inherited({}).describe({ top: 'T', base: 'B' }, undefined)"),
-            "T/B"
-        );
-    }
-
-    #[test]
-    fn a_getter_can_lend_a_string_instead_of_copying_it() {
-        // What script sees is an ordinary JS string, identical to the copying getter's.
-        assert_eq!(
-            eval(
-                "const i = new Inherited({ top: 'T', base: 'B' });
-                 `${typeof i.borrowedMembers} ${i.borrowedMembers === i.members}`"
-            ),
-            "string true"
-        );
-    }
-
-    #[test]
-    fn methods_can_take_str_by_reference() {
-        // The `Option<&str>` form covers both present and absent, since `as_deref` is what makes
-        // the present case type-check at all.
-        assert_eq!(
-            eval("new Inherited({ top: 'T' }).label('[', ']')"),
-            "[T    false]"
-        );
-        assert_eq!(
-            eval("new Inherited({ top: 'T' }).label('[')"),
-            "[T    false"
-        );
-        // Conversion is unchanged by the borrow: a non-string argument still coerces.
-        assert_eq!(eval("new Inherited({}).label(1, 2)"), "1    false2");
-    }
-
-    #[test]
-    fn methods_can_take_slices_by_reference() {
-        assert_eq!(
-            eval("new Inherited({}).tally([1, 2, 3], ['a', 'b'])"),
-            "3 6 2"
-        );
-        assert_eq!(eval("new Inherited({}).tally([])"), "0 0 0");
-    }
-
-    #[test]
-    fn lending_a_string_gives_the_borrow_back() {
-        // `touch` borrows the data mutably, which panics if the projected guard held its shared
-        // borrow open past the call that lent it.
+    fn parameters_can_be_taken_by_reference() {
         assert_eq!(
             eval(
                 "const i = new Inherited({ top: 'T' });
-                 i.borrowedMembers;
-                 i.touch();
-                 i.borrowedMembers.endsWith('!')"
+                 [i.describe({ top: 'T', base: 'B' }, { top: 't', base: 'b' }),
+                  i.describe({ top: 'T', base: 'B' }), i.describe({ top: 'T', base: 'B' }, undefined),
+                  i.label('[', ']'), i.label('['), i.label(1, 2), i.tally([1, 2, 3], ['a', 'b']),
+                  i.tally([]), i.describeLater({ top: 'T' }) instanceof Promise].join('|')"
             ),
-            "true"
+            "T/B t/b|T/B|T/B|[T    false]|[T    false|1T    false2|3 6 2|0 0 0|true"
         );
     }
 
+    /// The lent string is an ordinary JS string, and the shared borrow is released after the
+    /// call: `touch` borrows the data mutably, which panics otherwise.
     #[test]
-    fn a_lent_dictionary_survives_a_promise_returning_call() {
-        // The value is extracted inside the closure that turns a failure into a rejection; the
-        // borrow of it has to reach the call in the same block.
+    fn a_getter_can_lend_a_string_instead_of_copying_it() {
         assert_eq!(
-            eval("new Inherited({}).describeLater({ top: 'T' }) instanceof Promise"),
-            "true"
+            eval(
+                "const i = new Inherited({ top: 'T', base: 'B' });
+                 const lent = i.borrowedMembers;
+                 i.touch();
+                 [typeof lent, lent === 'T B   false', i.borrowedMembers.endsWith('!')].join()"
+            ),
+            "string,true,true"
         );
-    }
-
-    // Default values
-
-    #[test]
-    fn default_value_used_when_missing() {
-        assert_eq!(eval("new Config({}).timeout"), "10");
-    }
-
-    #[test]
-    fn default_value_overridden() {
-        assert_eq!(eval("new Config({ timeout: 42 }).timeout"), "42");
-    }
-
-    #[test]
-    fn default_and_optional_combined() {
-        assert_eq!(eval("new Config({}).label"), "default");
-        assert_eq!(eval("new Config({ label: 'custom' }).label"), "custom");
-    }
-
-    // Empty/null/undefined dictionaries
-
-    #[test]
-    fn null_dict_uses_defaults() {
-        // null → all members get their defaults.
-        assert_eq!(eval("new Config(null).timeout"), "10");
-    }
-
-    #[test]
-    fn undefined_dict_uses_defaults() {
-        assert_eq!(eval("new Config(undefined).timeout"), "10");
     }
 }
 
@@ -1062,6 +795,91 @@ mod implicit_factory_tests {
         assert_eq!(
             captured.message.as_deref(),
             Some("value must be non-negative")
+        );
+    }
+}
+
+/// Tests of class registration.
+mod registration_tests {
+    use core_runtime::config::RuntimeConfig;
+    use core_runtime::runtime::Runtime;
+    use core_runtime::test_util::eval_with_setup;
+    use core_runtime::{jsclass, jsmethods};
+    use js::conversion::ToJSVal;
+
+    #[jsclass]
+    struct Registered {
+        value: i32,
+    }
+
+    #[jsmethods]
+    impl Registered {
+        #[constructor]
+        fn construct() -> Self {
+            Self { value: 1 }
+        }
+    }
+
+    #[test]
+    fn class_constructor_ignores_a_replaced_prototype_constructor() {
+        core_runtime::runtime::register_global_initializer(|scope, global| {
+            Registered::add_to_global(scope, global);
+        });
+        let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+        let scope = rt.default_global();
+        let original = js::compile::evaluate(
+            &scope,
+            "const original = Registered;
+             Registered.prototype.constructor = function Replaced() {};
+             original",
+        )
+        .expect("the script runs");
+        let ctor = js::class::class_constructor::<RegisteredImpl>(&scope).expect("registered");
+        let ctor = ctor.to_jsval(&scope).expect("an object converts");
+        assert!(js::comparison::same_value(&scope, ctor, original).expect("comparing succeeds"));
+    }
+
+    #[jsclass]
+    struct Visible {}
+
+    #[jsmethods]
+    impl Visible {
+        #[constructor]
+        fn construct() -> Self {
+            Self {}
+        }
+    }
+
+    #[jsclass(hidden, extends = Visible)]
+    struct HiddenChild {
+        parent: VisibleImpl,
+    }
+
+    #[jsmethods]
+    impl HiddenChild {
+        #[constructor]
+        fn construct() -> Self {
+            Self {
+                parent: VisibleImpl::construct(),
+            }
+        }
+    }
+
+    /// Registering a hidden class before its parent defines the parent's constructor on the
+    /// global and leaves the hidden class's constructor off it.
+    #[test]
+    fn a_hidden_class_registered_first_leaves_its_parent_visible() {
+        assert_eq!(
+            eval_with_setup(
+                || {
+                    core_runtime::runtime::register_global_initializer(|scope, global| {
+                        HiddenChild::add_to_global(scope, global);
+                        Visible::add_to_global(scope, global);
+                    });
+                },
+                "[typeof Visible, typeof HiddenChild].join()"
+            ),
+            "function,undefined"
         );
     }
 }
