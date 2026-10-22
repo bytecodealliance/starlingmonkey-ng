@@ -146,17 +146,18 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # `just check-gc` also checks the wasm32-wasip2 build, which needs the target's std and the
+      # WASI SDK, and runs crown's own tests.
       - uses: ./.github/actions/setup
         with:
-          target: native
+          target: wasm32-wasip2
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Crown static analysis
-        run: |
-          ./scripts/check-crown.sh --workspace --examples
+        run: just check-gc
 
       - name: GC Zeal tests
         run: just gc-zeal --zeal full --examples --workspace
