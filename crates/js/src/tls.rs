@@ -11,6 +11,7 @@
 
 use crate::class::ClassTls;
 use crate::gc::pool::PoolTls;
+use crate::gc::rooted::RootedTls;
 use crate::module::ModuleTls;
 use crate::promise::PromiseTls;
 
@@ -21,6 +22,7 @@ pub(crate) struct JsTls {
     pub(crate) class: ClassTls,
     pub(crate) pool: PoolTls,
     pub(crate) module: ModuleTls,
+    pub(crate) rooted: RootedTls,
 }
 
 crate::instance_local! {
@@ -30,6 +32,7 @@ crate::instance_local! {
             class: ClassTls::new(),
             pool: PoolTls::new(),
             module: ModuleTls::new(),
+            rooted: RootedTls::new(),
         }
     };
 }
@@ -37,4 +40,9 @@ crate::instance_local! {
 /// Run `f` against this thread's state.
 pub(crate) fn with<R>(f: impl FnOnce(&JsTls) -> R) -> R {
     JS_TLS.with(f)
+}
+
+/// Run `f` against this thread's state, or return `None` once the thread destroyed it.
+pub(crate) fn try_with<R>(f: impl FnOnce(&JsTls) -> R) -> Option<R> {
+    JS_TLS.try_with(f).ok()
 }

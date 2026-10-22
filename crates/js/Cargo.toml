@@ -34,5 +34,6 @@ mozjs = { git = "https://github.com/tschneidereit/mozjs.git", branch = "main", d
 mozjs_sys = { git = "https://github.com/tschneidereit/mozjs.git", branch = "main" }
 num-traits = "0.2"
 rustc-hash = "2.1"
+slab.workspace = true
 smallvec.workspace = true
 starling-macro.workspace = true

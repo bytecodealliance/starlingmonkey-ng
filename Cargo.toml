@@ -40,6 +40,7 @@ oxc_resolver = "11"
 platform = { path = "crates/platform" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 serve-test-support = { path = "crates/serve-test-support" }
+slab = "0.4.12"
 smallvec = "1.16"
 starling-macro = { path = "crates/starling-macro" }
 tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }

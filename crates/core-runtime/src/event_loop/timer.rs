@@ -16,8 +16,7 @@ use platform::clock::Instant;
 use std::time::Duration;
 
 use js::error::ExnThrown;
-use js::gc::handle::Heap;
-use js::heap::RootedTraceableBox;
+use js::gc::handle::RootedHeap;
 use js::native::Value;
 use js::prelude::HandleValue;
 
@@ -29,11 +28,11 @@ use super::{with_active_event_loop, Task, TaskId};
 /// a string to evaluate as a classic script when the timer fires.
 enum TimerHandler {
     Function {
-        callback: RootedTraceableBox<Heap<js::function::Callable>>,
+        callback: RootedHeap<js::function::Callable>,
         /// The `setTimeout`/`setInterval` arguments after the timeout, passed
         /// to the callback on every invocation (HTML timer initialization
         /// steps: "invoke handler given arguments").
-        args: Vec<RootedTraceableBox<Heap<Value>>>,
+        args: Vec<RootedHeap<Value>>,
     },
     Code(String),
 }
@@ -237,10 +236,10 @@ fn timer_initialization_steps(
     // HTML timer initialization steps: "Let arguments be... the rest of the arguments"
     // For the handler form, everything after the timeout is forwarded to the callback on every
     // invocation. For the string form, additional arguments are ignored.
-    let extra_args: Vec<RootedTraceableBox<Heap<Value>>> = match &callable {
+    let extra_args: Vec<RootedHeap<Value>> = match &callable {
         Some(_) => arguments
             .iter()
-            .map(|arg| RootedTraceableBox::new(Heap::from(arg.get())))
+            .map(|arg| RootedHeap::from(arg.get()))
             .collect(),
         None => Vec::new(),
     };
@@ -250,7 +249,7 @@ fn timer_initialization_steps(
         el.queue_js_timer(scope, deadline, |timer_id| {
             let handler = match callable {
                 Some(callback) => TimerHandler::Function {
-                    callback: RootedTraceableBox::new(Heap::from(callback)),
+                    callback: RootedHeap::new(callback),
                     args: extra_args,
                 },
                 // Not callable: run the handler's string as code. The HTML timer initialization

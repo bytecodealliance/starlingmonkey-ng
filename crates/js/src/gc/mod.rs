@@ -12,6 +12,7 @@
 
 pub mod handle;
 pub mod pool;
+pub(crate) mod rooted;
 pub mod scope;
 
 use mozjs::context::JSContext;

@@ -163,11 +163,16 @@ others traced, so rooting one field can't invalidate another.
 Don't use `ScopeRoot` for a type that is mutated and re-queued in place, such as a pull-into
 descriptor. Keep such a value in a `RootedTraceableBox` instead.
 
-### `RootedTraceableBox`: keeping `impl Trace` values traced across a GC
+### `RootedHeap` and `RootedTraceableBox`: traced GC references outside a traced container
 
-To keep a value that holds `Heap`s outside any traced container while code that can GC runs,
-without consuming it, wrap it in a `RootedTraceableBox`. The box registers itself with the tracer
-for its lifetime, so the GC updates its `Heap`s in place.
+To hold one GC reference outside any traced container, such as in a timer's state, use a
+`RootedHeap<T>`, where `T` is an object type or `Value`. It roots itself for its lifetime, and
+creating and dropping one takes constant time. `RootedHeap::new(object)` creates one for an object,
+`RootedHeap::from(value)` creates one for a `Value`, and `.get(scope)` reads it.
+
+To keep an `impl Trace` value with several `Heap` fields outside any traced container while code
+that can GC runs, without consuming it, wrap it in a `RootedTraceableBox`. The box registers itself
+with the tracer for its lifetime, so the GC updates its `Heap`s in place.
 
 ### `#[allow_unrooted]`
 
@@ -236,5 +241,6 @@ a compacting GC on every allocation, which exposes stale references that release
 | A struct to construct | `Heap::from(x)` for each `Heap` field |
 | An `Option<Heap<T>>` field | `OptionHeapExt::{get, set, take_rooted}` |
 | A bundle of `Heap`s settled once | `#[must_root] #[derive(js::ScopeRoot)]`, settled through `.root(scope)` |
-| A value with `Heap`s to keep across a GC without consuming it | `RootedTraceableBox::new(x)` |
+| One reference to hold outside a traced container | `RootedHeap::new(x)` |
+| An `impl Trace` value with several `Heap`s to keep across a GC without consuming it | `RootedTraceableBox::new(x)` |
 | A crown error you don't understand | Root the value as described above. Don't use `allow_unrooted` |

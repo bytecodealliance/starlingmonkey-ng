@@ -817,3 +817,61 @@ fn named_property_writes_store_a_value_that_interning_the_name_moves() {
         assert_eq!(stored.to_object(), value.as_raw(), "{name:?}");
     }
 }
+
+/// `RootedHeap`s keep their referents alive and current across a compacting GC
+/// when other `RootedHeap`s were dropped oldest first or in no particular order
+/// before it, and when new ones took the slots of dropped ones.
+#[test]
+fn rooted_heaps_survive_a_compacting_gc_after_drops_in_any_order() {
+    use js::gc::handle::RootedHeap;
+    use js::gc::{GCOptions, GCReason};
+    use js::native::Value;
+
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+
+    let mut objects: Vec<Option<RootedHeap<js::object::Object>>> = Vec::new();
+    let mut strings: Vec<Option<RootedHeap<Value>>> = Vec::new();
+    let new_roots = |index: i32| {
+        let inner = scope.inner_scope();
+        let object = Object::new(&inner, None).unwrap();
+        let marker = inner.root_value(value::from_i32(index));
+        object.set_property(&inner, c"marker", marker).unwrap();
+        let string = js::JSString::from_str(&inner, &format!("value {index}")).unwrap();
+        (RootedHeap::new(object), RootedHeap::from(string.as_value()))
+    };
+    for index in 0..32 {
+        let (object, string) = new_roots(index);
+        objects.push(Some(object));
+        strings.push(Some(string));
+    }
+    let dropped: Vec<usize> = (0..8).chain((8..32).step_by(3)).collect();
+    for &index in &dropped {
+        objects[index] = None;
+        strings[index] = None;
+    }
+    for index in 32..40 {
+        let (object, string) = new_roots(index);
+        objects.push(Some(object));
+        strings.push(Some(string));
+    }
+
+    js::gc::prepare_for_full_gc(&scope);
+    js::gc::non_incremental_gc(&scope, GCOptions::Shrink, GCReason::API);
+
+    for (index, object) in objects.iter().enumerate() {
+        let Some(object) = object else {
+            assert!(dropped.contains(&index));
+            continue;
+        };
+        let marker = object.get(&scope).get_property(&scope, c"marker").unwrap();
+        assert_eq!(marker.to_int32(), index as i32);
+    }
+    for (index, string) in strings.iter().enumerate() {
+        let Some(string) = string else {
+            continue;
+        };
+        let string = String::from_jsval(&scope, string.get(&scope), ()).unwrap();
+        assert_eq!(string, format!("value {index}"));
+    }
+}
