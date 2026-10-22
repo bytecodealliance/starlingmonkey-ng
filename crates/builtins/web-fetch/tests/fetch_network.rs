@@ -820,7 +820,7 @@ fn a_reused_abort_signal_does_not_accumulate_fetch_abort_algorithms() {
     let signal_value =
         js::compile::evaluate_with_filename(&scope, "globalThis.__controller.signal", "<sig>", 1)
             .unwrap();
-    let signal = js::Object::from_value(&scope, signal_value.get())
+    let signal = js::Object::from_raw_value(&scope, signal_value.get())
         .unwrap()
         .cast::<web_globals::signals::AbortSignal>()
         .unwrap();

@@ -1639,7 +1639,7 @@ fn a_response_body_timeout_truncates_a_body_that_never_ends() {
             eval_script: Some(handler.to_string()),
             legacy_script: true,
             serve: Some(18217),
-            response_body_timeout: Some(1),
+            response_body_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18217,
@@ -1700,7 +1700,7 @@ fn a_response_body_timeout_aborts_the_request_signal() {
             eval_script: Some(handler.to_string()),
             legacy_script: true,
             serve: Some(18219),
-            response_body_timeout: Some(1),
+            response_body_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18219,
@@ -1752,10 +1752,10 @@ fn wait_until_gets_its_own_window_after_the_body_is_truncated() {
             eval_script: Some(handler.to_string()),
             legacy_script: true,
             serve: Some(18233),
-            response_body_timeout: Some(1),
+            response_body_timeout: Some(Duration::from_secs(1)),
             // The bound only has to clear the 2s of lifetime work, with room for a loaded
             // machine. We're testing that truncating the body left the window intact.
-            waituntil_timeout: Some(20),
+            waituntil_timeout: Some(Duration::from_secs(20)),
             ..Default::default()
         },
         18233,
@@ -1794,7 +1794,7 @@ fn a_response_body_timeout_truncates_a_response_the_client_will_not_read() {
             eval_script: Some(handler),
             legacy_script: true,
             serve: Some(18221),
-            response_body_timeout: Some(1),
+            response_body_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18221,
@@ -1833,7 +1833,7 @@ fn a_response_body_timeout_truncates_an_endless_proxied_body() {
             eval_script: Some(handler),
             legacy_script: true,
             serve: Some(18235),
-            response_body_timeout: Some(1),
+            response_body_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18235,
@@ -1872,7 +1872,7 @@ fn an_end_to_end_timeout_truncates_a_streaming_body() {
             eval_script: Some(handler.to_string()),
             legacy_script: true,
             serve: Some(18223),
-            end_to_end_timeout: Some(1),
+            end_to_end_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18223,
@@ -1902,7 +1902,7 @@ fn an_end_to_end_timeout_answers_a_never_settling_dispatch() {
             eval_script: Some(handler.to_string()),
             legacy_script: true,
             serve: Some(18225),
-            end_to_end_timeout: Some(1),
+            end_to_end_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18225,
@@ -1943,7 +1943,7 @@ fn an_end_to_end_timeout_stops_leftover_lifetime_work() {
             eval_script: Some(handler.to_string()),
             legacy_script: true,
             serve: Some(18227),
-            end_to_end_timeout: Some(1),
+            end_to_end_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18227,
@@ -1984,7 +1984,7 @@ fn an_end_to_end_timeout_bounds_isolated_startup() {
             legacy_script: true,
             serve: Some(18231),
             serve_isolated: true,
-            end_to_end_timeout: Some(1),
+            end_to_end_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18231,
@@ -2074,8 +2074,8 @@ fn a_contradictory_timeout_config_refuses_to_serve() {
         eval_script: Some("addEventListener('fetch', () => {});".to_string()),
         legacy_script: true,
         serve: Some(18341),
-        end_to_end_timeout: Some(5),
-        waituntil_timeout: Some(6),
+        end_to_end_timeout: Some(Duration::from_secs(5)),
+        waituntil_timeout: Some(Duration::from_secs(6)),
         ..Default::default()
     };
     let error =
@@ -2096,8 +2096,8 @@ fn a_dispatch_timeout_answers_a_never_settling_respond_with() {
             eval_script: Some(handler.to_string()),
             legacy_script: true,
             serve: Some(18213),
-            dispatch_timeout: Some(1),
-            waituntil_timeout: Some(1),
+            dispatch_timeout: Some(Duration::from_secs(1)),
+            waituntil_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18213,
@@ -2129,7 +2129,7 @@ fn a_dispatch_timeout_frees_the_slot_it_held() {
             legacy_script: true,
             serve: Some(18289),
             serve_isolated: true,
-            dispatch_timeout: Some(1),
+            dispatch_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         },
         18289,

@@ -2,9 +2,6 @@
 
 //! `EventLoop::ensure_idle_for_snapshot`, and the origins a runtime configured for a snapshot
 //! records for the work it reports.
-//!
-//! The cases are grouped in a single test function because `JSEngine` can only be initialized
-//! once per process.
 
 use core_runtime::config::RuntimeConfig;
 use core_runtime::event_loop::timer::install_timer_globals;
@@ -31,7 +28,7 @@ fn pending_work_is_reported_with_its_origin() {
     let scope = rt.default_global();
     install_timer_globals(&scope, scope.global());
 
-    // A loop that holds nothing can be wizened.
+    // A loop without tasks or futures can be snapshotted.
     assert!(EventLoop::new().ensure_idle_for_snapshot().is_ok());
 
     // A timer is reported with the stack that created it, and clearing it leaves the loop idle.

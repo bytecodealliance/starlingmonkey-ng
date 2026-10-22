@@ -393,7 +393,7 @@ impl<'s> FetchEvent<'s> {
             return;
         }
         let result = if responded {
-            handled.resolve(scope, value::undefined())
+            handled.resolve(scope, HandleValue::undefined())
         } else {
             let reason = if self.data().respond_with_error {
                 "the promise passed to respondWith did not produce a Response"

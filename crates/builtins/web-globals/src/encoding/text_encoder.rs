@@ -77,18 +77,17 @@ impl TextEncoder<'_> {
         // encode whole scalar values while they fit, replace unpaired surrogates with U+FFFD as
         // step 5's conversion does, and return _read_ in code units and _written_ in bytes.)
         //
-        // SAFETY: the destination slice is only borrowed for the conversion, which cannot run JS
-        // or trigger a GC.
-        let dest_buf = unsafe { destination.as_mut_slice() };
-        // SAFETY: same as above.
+        // SAFETY: the closure doesn't call into SpiderMonkey.
         let (read, written) = unsafe {
-            source.with_chars(scope, |chars| match chars {
-                StrChars::Latin1(chars) => {
-                    encoding_rs::mem::convert_latin1_to_utf8_partial(chars, dest_buf)
-                }
-                StrChars::TwoByte(chars) => {
-                    encoding_rs::mem::convert_utf16_to_utf8_partial(chars, dest_buf)
-                }
+            source.with_chars(scope, |chars| {
+                destination.with_slice_mut(|dest_buf| match chars {
+                    StrChars::Latin1(chars) => {
+                        encoding_rs::mem::convert_latin1_to_utf8_partial(chars, dest_buf)
+                    }
+                    StrChars::TwoByte(chars) => {
+                        encoding_rs::mem::convert_utf16_to_utf8_partial(chars, dest_buf)
+                    }
+                })
             })
         }?;
 

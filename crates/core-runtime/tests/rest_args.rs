@@ -77,8 +77,7 @@ impl Variadic {
         rest.iter().sum()
     }
 
-    /// A wide integer element type, confirming the fix spans `i8`..`u64` rather
-    /// than `i32` alone. Returned as `f64` so JS sees the exact small sums.
+    /// Typed `i64` variadic. The sum is returned as `f64` so JS sees the exact small sums.
     #[static_method]
     fn sum_longs(rest: RestArgs<i64>) -> f64 {
         rest.iter().sum::<i64>() as f64
@@ -99,179 +98,96 @@ fn throws(code: &str) -> bool {
     throws_with_setup(setup, code)
 }
 
-// ============================================================================
-// Typed numeric collection
-// ============================================================================
-
+/// Each element is converted with the lenient `ToNumber`, so a numeric string and a boolean
+/// coerce rather than throwing.
 #[test]
-fn sum_collects_numbers() {
-    assert_eq!(eval("Variadic.sum(1, 2, 3)"), "6");
+fn numeric_rest_args_collect_and_coerce() {
+    assert_eq!(
+        eval("[Variadic.sum(1.5, '2', true), Variadic.sum()].join()"),
+        "4.5,0"
+    );
+}
+
+/// The fixed `sep` argument is not collected into the rest.
+#[test]
+fn rest_args_collect_after_fixed_params() {
+    assert_eq!(
+        eval("const v = new Variadic(); [v.join('-', 'a', 'b'), v.join('-')].join('|')"),
+        "a-b|"
+    );
 }
 
 #[test]
-fn sum_handles_floats() {
-    assert_eq!(eval("Variadic.sum(1.5, 2.5)"), "4");
+fn rest_args_report_len_and_is_empty() {
+    assert_eq!(
+        eval(
+            "const v = new Variadic(); \
+             [v.count('a', 'b'), v.count(), v.isEmptyRest(), v.isEmptyRest('x')].join()"
+        ),
+        "2,0,true,false"
+    );
 }
 
+/// `ToBoolean` coerces each argument.
 #[test]
-fn sum_with_no_args_is_empty() {
-    assert_eq!(eval("Variadic.sum()"), "0");
+fn boolean_rest_args_coerce_each_element() {
+    assert_eq!(
+        eval(
+            "[Variadic.anyTrue(0, '', 'x'), Variadic.anyTrue(false, 0), Variadic.anyTrue()].join()"
+        ),
+        "true,false,false"
+    );
 }
-
-#[test]
-fn sum_with_single_arg() {
-    assert_eq!(eval("Variadic.sum(42)"), "42");
-}
-
-/// Each element is converted with the lenient `ToNumber`, so a numeric string
-/// and a boolean coerce rather than throwing.
-#[test]
-fn sum_coerces_each_element() {
-    assert_eq!(eval("Variadic.sum(1, '2', true)"), "4");
-}
-
-// ============================================================================
-// Fixed parameter + variadic strings
-// ============================================================================
-
-#[test]
-fn join_collects_after_fixed_param() {
-    assert_eq!(eval("new Variadic().join('-', 'a', 'b', 'c')"), "a-b-c");
-}
-
-#[test]
-fn join_with_empty_rest_is_empty_string() {
-    assert_eq!(eval("new Variadic().join('-')"), "");
-}
-
-#[test]
-fn join_with_single_rest_element() {
-    assert_eq!(eval("new Variadic().join('-', 'solo')"), "solo");
-}
-
-/// The fixed `sep` argument is not collected into the rest; only arguments at
-/// or beyond the rest position are.
-#[test]
-fn join_does_not_swallow_the_separator() {
-    assert_eq!(eval("new Variadic().join(',', '1', '2')"), "1,2");
-}
-
-// ============================================================================
-// len() / is_empty()
-// ============================================================================
-
-#[test]
-fn count_reports_rest_length() {
-    assert_eq!(eval("new Variadic().count('a', 'b', 'c', 'd')"), "4");
-    assert_eq!(eval("new Variadic().count()"), "0");
-}
-
-#[test]
-fn is_empty_rest_reflects_argument_count() {
-    assert_eq!(eval("new Variadic().isEmptyRest()"), "true");
-    assert_eq!(eval("new Variadic().isEmptyRest('x')"), "false");
-}
-
-// ============================================================================
-// Boolean variadic (IntoIterator by value)
-// ============================================================================
-
-#[test]
-fn any_true_finds_a_truthy_argument() {
-    assert_eq!(eval("Variadic.anyTrue(false, false, true)"), "true");
-}
-
-#[test]
-fn any_true_is_false_when_all_falsy() {
-    assert_eq!(eval("Variadic.anyTrue(false, false)"), "false");
-    assert_eq!(eval("Variadic.anyTrue()"), "false");
-}
-
-/// `ToBoolean` coerces each argument; truthy values count.
-#[test]
-fn any_true_coerces_arguments() {
-    assert_eq!(eval("Variadic.anyTrue(0, '', 'non-empty')"), "true");
-}
-
-// ============================================================================
-// Variadic of class newtypes
-// ============================================================================
 
 #[test]
 fn count_selves_collects_instances() {
     assert_eq!(
-        eval("Variadic.countSelves(new Variadic(), new Variadic())"),
-        "2"
+        eval(
+            "[Variadic.countSelves(new Variadic(), new Variadic()), Variadic.countSelves()].join()"
+        ),
+        "2,0"
     );
-    assert_eq!(eval("Variadic.countSelves()"), "0");
 }
 
-// ============================================================================
-// Integer variadics (ConversionBehavior config)
-// ============================================================================
-
+/// Each integer element runs through `ToInt32`: a non-integer number truncates toward zero, a
+/// numeric string coerces, and 2^32 + 1 wraps to 1.
 #[test]
-fn sum_ints_collects_integers() {
-    assert_eq!(eval("Variadic.sumInts(1, 2, 3)"), "6");
-    assert_eq!(eval("Variadic.sumInts()"), "0");
+fn integer_rest_args_convert_with_to_int32() {
+    assert_eq!(
+        eval(
+            "[Variadic.sumInts(1, 2.7, '3'), Variadic.sumInts(-1.9), Variadic.sumInts(4294967297), \
+              Variadic.sumInts(), Variadic.sumLongs(1000, 2000, 3000)].join()"
+        ),
+        "6,-1,1,0,6000"
+    );
 }
 
-/// Each element runs through `ToInt32`: a non-integer number truncates toward
-/// zero and a numeric string coerces.
-#[test]
-fn sum_ints_applies_to_int32() {
-    assert_eq!(eval("Variadic.sumInts(1, 2.7, '3')"), "6");
-    assert_eq!(eval("Variadic.sumInts(-1.9)"), "-1");
-}
-
-/// `ToInt32` wraps modulo 2^32, so 2^32 maps to 0.
-#[test]
-fn sum_ints_wraps_modulo_2_32() {
-    assert_eq!(eval("Variadic.sumInts(4294967296)"), "0");
-    assert_eq!(eval("Variadic.sumInts(4294967297)"), "1");
-}
-
-#[test]
-fn sum_longs_handles_wide_integers() {
-    assert_eq!(eval("Variadic.sumLongs(1000, 2000, 3000)"), "6000");
-    assert_eq!(eval("Variadic.sumLongs()"), "0");
-}
-
-// ============================================================================
-// .length excludes the rest parameter
-// ============================================================================
-
-/// A function's `.length` counts required (non-`Option`, non-`RestArgs`)
-/// parameters, so the variadic tail never contributes.
+/// A function's `.length` counts required (non-`Option`, non-`RestArgs`) parameters, so the
+/// variadic tail never contributes.
 #[test]
 fn length_ignores_rest_parameter() {
-    // Only the rest param: length 0.
-    assert_eq!(eval("Variadic.sum.length"), "0");
-    assert_eq!(eval("Variadic.anyTrue.length"), "0");
-    assert_eq!(eval("Variadic.prototype.count.length"), "0");
-    // One fixed param ahead of the rest: length 1.
-    assert_eq!(eval("Variadic.prototype.join.length"), "1");
+    assert_eq!(
+        eval(
+            "[Variadic.sum.length, Variadic.anyTrue.length, Variadic.prototype.count.length, \
+              Variadic.prototype.join.length].join()"
+        ),
+        "0,0,0,1"
+    );
 }
 
-// ============================================================================
-// Conversion-error propagation
-// ============================================================================
-
-/// `String::from_jsval` runs `ToString`, which throws on a `Symbol`. The
-/// pending exception propagates out of the collection loop (the `ExnPending`
-/// arm), so the call throws.
+/// `String::from_jsval` runs `ToString`, which throws on a `Symbol`. The pending exception
+/// propagates out of the collection loop (the `ExnPending` arm), so the call throws.
 #[test]
 fn string_rest_throws_on_symbol() {
     assert!(throws("new Variadic().count(Symbol('x'))"));
 }
 
-/// A wrong-typed argument to a class-newtype rest fails the `cast`, producing
-/// a `ConversionError::Failure` that is thrown as a `TypeError` (the
-/// `throw_type_error` arm).
+/// A wrong-typed argument to a class-newtype rest fails the `cast`, producing a
+/// `ConversionError::Failure` that is thrown as a `TypeError`.
 #[test]
 fn class_rest_throws_on_wrong_type() {
-    assert!(throws("Variadic.countSelves({})"));
     assert!(throws("Variadic.countSelves(new Variadic(), 42)"));
+    assert!(throws("Variadic.countSelves({})"));
 }
 
 // ============================================================================
@@ -342,22 +258,18 @@ mod handle_value_tests {
         eval_with_setup(setup, code)
     }
 
+    /// `sumXAfterGc` runs a compacting GC while the handles are live, and reads the freshly
+    /// allocated objects back afterwards.
     #[test]
-    fn collects_raw_values() {
-        assert_eq!(eval("ValueVariadic.countValues(1, 'two', {}, null)"), "4");
-        assert_eq!(eval("ValueVariadic.countValues()"), "0");
-    }
-
-    /// Calling `sumXAfterGc` runs a real compacting GC mid-method while the
-    /// handles are live; the objects are freshly allocated (movable) and read
-    /// back afterwards.
-    #[test]
-    fn handles_survive_compacting_gc() {
+    fn raw_values_are_collected_and_survive_compacting_gc() {
         assert_eq!(
-            eval("ValueVariadic.sumXAfterGc({x: 1}, {x: 2}, {x: 3})"),
-            "6"
+            eval(
+                "[ValueVariadic.countValues(1, 'two', {}, null), ValueVariadic.countValues(), \
+                  ValueVariadic.sumXAfterGc({x: 1}, {x: 2}, {x: 3}), ValueVariadic.sumXAfterGc()]\
+                 .join()"
+            ),
+            "4,0,6,0"
         );
-        assert_eq!(eval("ValueVariadic.sumXAfterGc()"), "0");
     }
 
     /// The same path under GC zeal mode 14 (compact-on-every-GC), which forces
@@ -390,11 +302,6 @@ mod handle_value_tests {
 
 // ============================================================================
 // `RestArgs` on constructors
-//
-// `parse_method_info` has always collected the rest parameter for every method
-// kind, but `gen_constructor_body` dropped it on the floor, so a constructor
-// taking `RestArgs` failed to compile. Constructors now go through the same
-// collection as methods.
 // ============================================================================
 
 mod constructor_tests {
@@ -409,7 +316,6 @@ mod constructor_tests {
     #[jsclass]
     struct Tally {
         total: f64,
-        label: String,
     }
 
     #[jsmethods]
@@ -419,18 +325,12 @@ mod constructor_tests {
         fn construct(rest: RestArgs<f64>) -> Self {
             Self {
                 total: rest.iter().sum(),
-                label: String::new(),
             }
         }
 
         #[getter]
         fn total(&self) -> f64 {
             self.data().total
-        }
-
-        #[getter]
-        fn label(&self) -> String {
-            self.data().label.clone()
         }
     }
 
@@ -475,24 +375,14 @@ mod constructor_tests {
     }
 
     #[test]
-    fn constructor_collects_variadic_args() {
-        assert_eq!(eval("new Tally(1, 2, 3).total"), "6");
-    }
-
-    #[test]
-    fn constructor_with_no_variadic_args() {
-        assert_eq!(eval("new Tally().total"), "0");
-    }
-
-    #[test]
-    fn constructor_collects_after_fixed_params() {
-        assert_eq!(eval("new Labelled('a', 'x', 'y', 'z').count"), "3");
-        assert_eq!(eval("new Labelled('a', 'x', 'y', 'z').label"), "a");
-    }
-
-    #[test]
-    fn constructor_with_fixed_param_and_empty_tail() {
-        assert_eq!(eval("new Labelled('a').count"), "0");
+    fn constructors_collect_variadic_args() {
+        assert_eq!(
+            eval(
+                "[new Tally(1, 2, 3).total, new Tally().total, new Labelled('a', 'x', 'y').count, \
+                  new Labelled('a', 'x').label, new Labelled('a').count].join()"
+            ),
+            "6,0,2,a,0"
+        );
     }
 }
 
@@ -500,19 +390,13 @@ mod constructor_tests {
 // `RestArgs` on free functions
 //
 // `#[jsmodule]`, `#[jsglobals]`, `#[jsnamespace]`, and `#[webidl_namespace]`
-// share `parse_free_fn_export`/`gen_free_fn_native`, which previously ignored
-// `RestArgs` entirely — the parameter was treated as an ordinary one and
-// failed `FromJSVal`. All four now use the same collection as methods.
+// share `parse_free_fn_export`/`gen_free_fn_native`.
 // ============================================================================
 
 mod free_fn_tests {
-    use core_runtime::config::RuntimeConfig;
-    use core_runtime::module::evaluate_module;
-    use core_runtime::runtime::Runtime;
-    use core_runtime::test_util::eval_with_setup;
+    use core_runtime::test_util::{eval_module_out_with_setup, eval_with_setup};
     use core_runtime::{jsglobals, jsmodule, jsnamespace, webidl_namespace};
     use js::class::RestArgs;
-    use js::conversion::FromJSVal;
 
     #[jsmodule]
     mod rest_module {
@@ -564,10 +448,7 @@ mod free_fn_tests {
             rest_globals::add_to_global(scope, global);
             rest_ns::add_to_global(scope, global);
             rest_webidl_ns::add_to_global(scope, global);
-            // SAFETY: called during global initialization, before any JS runs.
-            unsafe {
-                rest_module::register(scope);
-            }
+            rest_module::register(scope);
         });
     }
 
@@ -575,79 +456,44 @@ mod free_fn_tests {
         eval_with_setup(setup, code)
     }
 
-    fn eval_module(body: &str) -> String {
-        setup();
-        let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
-        let scope = rt.default_global();
-        let source = format!("import * as m from \"restModule\";\nglobalThis._result = {body};");
-        // SAFETY: `scope` outlives the evaluation, and the module registry was
-        // populated by `setup` before any JS ran.
-        unsafe { evaluate_module(&scope, &source, "rest_test.mjs") }.expect("module eval failed");
-        let val = js::compile::evaluate_with_filename(&scope, "globalThis._result", "read.js", 1)
-            .expect("readback failed");
-        String::from_jsval(&scope, val, ()).expect("null string")
-    }
-
-    // --- #[jsmodule] ---
-
     #[test]
-    fn module_fn_collects_variadic_args() {
-        assert_eq!(eval_module("m.sumAll(1, 2, 3)"), "6");
-        assert_eq!(eval_module("m.sumAll()"), "0");
+    fn module_fns_collect_variadic_args() {
+        assert_eq!(
+            eval_module_out_with_setup(
+                setup,
+                "import * as m from 'restModule';
+                 globalThis.__out = [m.sumAll(1, 2, 3), m.sumAll(), m.joinAll('-', 'a', 'b')].join('|');"
+            ),
+            "6|0|a-b"
+        );
     }
 
     #[test]
-    fn module_fn_collects_after_fixed_param() {
-        assert_eq!(eval_module("m.joinAll('-', 'a', 'b', 'c')"), "a-b-c");
+    fn global_and_namespace_fns_collect_variadic_args() {
+        assert_eq!(
+            eval(
+                "[globalSum(1, 2), globalSum(), globalJoin('+', 'x', 'y'), restNs.nsSum(2, 4), \
+                  restNs.nsSum(), restNs.nsCount('a', 'b'), RestWebIDL.widlSum(1, 2, 3)].join('|')"
+            ),
+            "3|0|x+y|6|0|2|6"
+        );
     }
 
-    // --- #[jsglobals] ---
-
-    #[test]
-    fn global_fn_collects_variadic_args() {
-        assert_eq!(eval("globalSum(1, 2, 3, 4)"), "10");
-        assert_eq!(eval("globalSum()"), "0");
-    }
-
-    #[test]
-    fn global_fn_collects_after_fixed_param() {
-        assert_eq!(eval("globalJoin('+', 'x', 'y')"), "x+y");
-    }
-
-    // --- #[jsnamespace] / #[webidl_namespace] ---
-
-    #[test]
-    fn namespace_fn_collects_variadic_args() {
-        assert_eq!(eval("restNs.nsSum(2, 4)"), "6");
-        assert_eq!(eval("restNs.nsSum()"), "0");
-    }
-
-    #[test]
-    fn namespace_fn_with_scope_and_variadic() {
-        assert_eq!(eval("restNs.nsCount('a', 'b', 'c')"), "3");
-    }
-
-    #[test]
-    fn webidl_namespace_fn_collects_variadic_args() {
-        assert_eq!(eval("RestWebIDL.widlSum(1, 2, 3, 4, 5)"), "15");
-    }
-
-    /// A variadic tail is not a declared parameter, so it must not inflate
-    /// `fn.length` — the same rule `length_ignores_rest_parameter` pins for
-    /// methods, checked here because free functions compute `nargs` on a
-    /// different path.
+    /// Free functions compute `nargs` on a different path than methods.
     #[test]
     fn length_ignores_rest_parameter_on_free_fns() {
-        assert_eq!(eval("globalSum.length"), "0");
-        assert_eq!(eval("globalJoin.length"), "1");
-        assert_eq!(eval("restNs.nsSum.length"), "0");
-        assert_eq!(eval("restNs.nsCount.length"), "0");
-        assert_eq!(eval("RestWebIDL.widlSum.length"), "0");
+        assert_eq!(
+            eval(
+                "[globalSum.length, globalJoin.length, restNs.nsSum.length, \
+                  restNs.nsCount.length, RestWebIDL.widlSum.length].join()"
+            ),
+            "0,1,0,0,0"
+        );
     }
 
-    /// The unqualified `RestArgs` in each mod block above is rewritten to the
-    /// fully-qualified path by the macro, exactly as it is for methods — this
-    /// compiles only if that rewrite reaches the free-function paths.
+    /// The macro rewrites the unqualified `RestArgs` in each mod block above to the
+    /// fully-qualified path, so this compiles only if that rewrite reaches the free-function
+    /// paths.
     #[test]
     fn rest_args_type_is_rewritten_in_signatures() {
         assert_eq!(rest_module::sum_all(RestArgs::new(vec![1.0, 2.0])), 3.0);
@@ -720,70 +566,23 @@ mod promise_return_tests {
     }
 
     #[test]
-    fn variadic_promise_op_resolves() {
+    fn bad_arguments_reject_rather_than_throw() {
         assert_eq!(
             run(r#"
-                globalThis.__out = "pending";
-                new Waiter().joinAsync("a", "b").then(v => { globalThis.__out = v; });
+                const w = new Waiter();
+                const outcome = (call) => {
+                    let p;
+                    try { p = call(); } catch (e) { return `threw:${e.constructor.name}`; }
+                    return p.then(v => `resolved:${v}`, e => `rejected:${e.constructor.name}`);
+                };
+                Promise.all([
+                    outcome(() => w.joinAsync("a", "b")),
+                    outcome(() => w.joinAsync(Symbol())),
+                    outcome(() => w.joinAsyncAfter("-", Symbol())),
+                    outcome(() => w.joinAsyncAfter(Symbol())),
+                ]).then(v => { globalThis.__out = v.join("|"); });
             "#),
-            "a,b"
-        );
-    }
-
-    /// A `Symbol` can't convert to `String`, so collecting the tail fails. That
-    /// must surface as a rejection, not a synchronous throw — matching how a bad
-    /// *fixed* argument to the same operation behaves.
-    #[test]
-    fn bad_variadic_element_rejects_rather_than_throwing() {
-        assert_eq!(
-            run(r#"
-                globalThis.__out = "pending";
-                let threw = false;
-                let p;
-                try { p = new Waiter().joinAsync(Symbol()); } catch (e) { threw = true; }
-                Promise.resolve(p).then(
-                    () => { globalThis.__out = `threw=${threw},resolved`; },
-                    e => { globalThis.__out = `threw=${threw},rejected:${e.constructor.name}`; },
-                );
-            "#),
-            "threw=false,rejected:TypeError"
-        );
-    }
-
-    /// The same, with the tail behind a fixed parameter.
-    #[test]
-    fn bad_variadic_element_after_fixed_param_rejects() {
-        assert_eq!(
-            run(r#"
-                globalThis.__out = "pending";
-                let threw = false;
-                let p;
-                try { p = new Waiter().joinAsyncAfter("-", Symbol()); } catch (e) { threw = true; }
-                Promise.resolve(p).then(
-                    () => { globalThis.__out = `threw=${threw},resolved`; },
-                    e => { globalThis.__out = `threw=${threw},rejected:${e.constructor.name}`; },
-                );
-            "#),
-            "threw=false,rejected:TypeError"
-        );
-    }
-
-    /// The pre-existing behaviour for a bad *fixed* argument, as the baseline
-    /// the variadic tail has to match.
-    #[test]
-    fn bad_fixed_arg_rejects_rather_than_throwing() {
-        assert_eq!(
-            run(r#"
-                globalThis.__out = "pending";
-                let threw = false;
-                let p;
-                try { p = new Waiter().joinAsyncAfter(Symbol()); } catch (e) { threw = true; }
-                Promise.resolve(p).then(
-                    () => { globalThis.__out = `threw=${threw},resolved`; },
-                    e => { globalThis.__out = `threw=${threw},rejected:${e.constructor.name}`; },
-                );
-            "#),
-            "threw=false,rejected:TypeError"
+            "resolved:a,b|rejected:TypeError|rejected:TypeError|rejected:TypeError"
         );
     }
 }

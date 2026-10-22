@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! Regression test: a method returning `Self` (the `InstanceValue` codegen
-//! path) must mint instances that carry `[LegacyUnforgeable]` own accessors,
-//! exactly like the constructor and Rust-side factory paths. The JS-native
-//! trampoline used to skip `install_unforgeable`, so an instance returned from
-//! a JS method call lacked the own accessor entirely.
+//! Instances carry `[LegacyUnforgeable]` own accessors whichever path creates them: the
+//! constructor, a method returning `Self` (the `InstanceValue` codegen path), or a JS or Rust
+//! subclass.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
@@ -72,21 +70,9 @@ fn dup_instance_has_unforgeable_own_accessor() {
         eval_with_setup(
             setup,
             "const d = new Widget().dup(); \
-             typeof Object.getOwnPropertyDescriptor(d, 'kind') === 'object'"
+             [typeof Object.getOwnPropertyDescriptor(d, 'kind'), d.kind].join()"
         ),
-        "true"
-    );
-    assert_eq!(eval_with_setup(setup, "new Widget().dup().kind"), "42");
-}
-
-#[test]
-fn unforgeable_accessor_is_not_on_prototype() {
-    assert_eq!(
-        eval_with_setup(
-            setup,
-            "Object.getOwnPropertyDescriptor(Widget.prototype, 'kind') === undefined"
-        ),
-        "true"
+        "object,42"
     );
 }
 
@@ -103,15 +89,17 @@ fn instances_share_one_getter_function() {
     );
 }
 
+/// The accessor is an own property only, not one of the prototype.
 #[test]
-fn unforgeable_accessor_is_enumerable_and_non_configurable() {
+fn unforgeable_accessor_is_an_enumerable_non_configurable_own_property() {
     assert_eq!(
         eval_with_setup(
             setup,
             "const d = Object.getOwnPropertyDescriptor(new Widget(), 'kind'); \
-             [d.enumerable, d.configurable, d.set].join()"
+             [d.enumerable, d.configurable, d.set, \
+              Object.getOwnPropertyDescriptor(Widget.prototype, 'kind')].join()"
         ),
-        "true,false,"
+        "true,false,,"
     );
 }
 

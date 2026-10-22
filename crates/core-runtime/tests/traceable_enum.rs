@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! `#[derive(Traceable)]` on an enum must trace each variant's GC fields.
-//!
-//! The derive previously panicked on enums (builtins hand-wrote `Trace`
-//! impls). It now generates a `match` that traces each variant's non-`#[no_trace]`
-//! fields. A compacting GC relocates the held object; the `Heap` inside the
-//! variant must be traced so its stored pointer is updated, or a later read
-//! returns a stale/wrong object.
+//! `#[derive(Traceable)]` on an enum traces each variant's non-`#[no_trace]` fields. A compacting
+//! GC relocates the held object, so the `Heap` inside the variant must be traced for its stored
+//! pointer to be updated.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
@@ -75,7 +71,7 @@ fn traceable_enum_traces_variant_fields() {
     match &*slot {
         Slot::Held(h) => {
             let rooted = h.get(&scope);
-            let recovered = Object::from_value(&scope, *rooted).expect("still an object");
+            let recovered = Object::from_raw_value(&scope, rooted.get()).expect("still an object");
             let got = recovered.get_property(&scope, c"marker").unwrap();
             assert_eq!(got.to_int32(), 7777);
         }

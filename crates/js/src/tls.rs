@@ -4,8 +4,7 @@
 //!
 //! Each module that needs thread-local state owns a struct of it here and
 //! reaches it through [`with`]. One key for the crate means one destructor, so
-//! the fields below drop in the order they are declared and anything reasoning
-//! about teardown order has one `js` entry to consider rather than eight.
+//! the fields below drop in the order they are declared.
 //!
 //! Every field keeps its own `RefCell` or `Cell`, so a borrow covers one piece
 //! of state rather than all of it.
@@ -16,9 +15,6 @@ use crate::module::ModuleTls;
 use crate::promise::PromiseTls;
 
 /// The whole crate's thread-local state.
-///
-/// The key's destructor drops these fields in declaration order, so ordering
-/// requirements are easy to express and reason about.
 #[crate::allow_unrooted_interior]
 pub(crate) struct JsTls {
     pub(crate) promise: PromiseTls,

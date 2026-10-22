@@ -61,7 +61,7 @@ fn heap_value_survives_move_and_compacting_gc() {
     // Read back through a rooted get; the object must still be reachable and
     // carry its marker, proving the barrier tracked any relocation.
     let rooted = heaps[0].get(&scope);
-    let recovered = Object::from_value(&scope, *rooted).expect("still an object");
+    let recovered = Object::from_raw_value(&scope, rooted.get()).expect("still an object");
     let got = recovered.get_property(&scope, c"marker").unwrap();
     assert_eq!(got.to_int32(), 4242);
 }

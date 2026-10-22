@@ -79,7 +79,7 @@ pub fn parse_js_string_with_reviver<'r>(
 ///
 /// [stringify]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify
 ///
-/// Returns `None` where `JSON.stringify` returns `undefined`.
+/// Returns `None` if `JSON.stringify` returns `undefined`.
 // TODO: consider turning `replacer` and `space` into enums.
 pub fn stringify(
     scope: &Scope<'_>,

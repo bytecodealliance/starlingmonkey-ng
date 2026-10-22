@@ -54,6 +54,11 @@ pub fn eval_and_read_out(scope: &Scope<'_>, code: &str) -> String {
     if js::compile::evaluate_with_filename(scope, code, "test.js", 1).is_err() {
         panic!("evaluation threw: {:?}", ExnThrown::capture(scope));
     }
+    read_out(scope)
+}
+
+/// Drain microtasks and return `String(globalThis.__out)`.
+fn read_out(scope: &Scope<'_>) -> String {
     run_microtasks(scope);
     let out = js::compile::evaluate_with_filename(scope, "globalThis.__out", "out.js", 1)
         .expect("reading __out threw");
@@ -66,4 +71,19 @@ pub fn eval_out_with_setup(setup: impl FnOnce(), code: &str) -> String {
     let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
     let scope = rt.default_global();
     eval_and_read_out(&scope, code)
+}
+
+/// Run setup, create a runtime, evaluate `source` as an ES module, drain microtasks, and return
+/// `String(globalThis.__out)`.
+///
+/// Panics if the module throws.
+pub fn eval_module_out_with_setup(setup: impl FnOnce(), source: &str) -> String {
+    setup();
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    // SAFETY: `Runtime::init` initialized the module loader.
+    if unsafe { crate::module::evaluate_module(&scope, source, "test.mjs") }.is_err() {
+        panic!("module evaluation threw: {:?}", ExnThrown::capture(&scope));
+    }
+    read_out(&scope)
 }

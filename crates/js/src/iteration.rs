@@ -17,7 +17,7 @@
 //! value on the record and chaining the wrap continuation on the shared
 //! resolved trigger ([`Promise::shared_resolved_undefined`]).
 
-use crate::class::{get_or_init_shared_function, get_prototype_for};
+use crate::class::get_or_init_shared_function;
 use crate::conversion::{FromJSVal, ToJSVal};
 use crate::error::ExnThrown;
 use crate::function::{cast_payload, EmptyArgs};
@@ -64,8 +64,8 @@ pub struct AsyncIteratorRecord {
 impl AsyncIteratorRecord<'_> {
     /// `GetIterator(iterable, async)`: populate the iterator record, falling
     /// back to the sync iterator (wrapped via `afs_next`) when there is no
-    /// `Symbol.asyncIterator` method. Use [`get_async_iterator`], which also
-    /// registers this hidden class on the global.
+    /// `Symbol.asyncIterator` method. Use [`get_async_iterator`]. The global
+    /// must have registered this hidden class with `add_to_global`.
     fn new(&self, scope: &Scope<'_>, iterable: HandleValue<'_>) -> Result<(), ExnThrown> {
         // The method lookups use the boxed value (so primitive iterables such as
         // strings work), but each iterator factory is called with the original
@@ -120,15 +120,12 @@ impl AsyncIteratorRecord<'_> {
 
 /// `GetIterator(iterable, async)` with the `CreateAsyncFromSyncIterator`
 /// fallback: build an [`AsyncIteratorRecord`] for `iterable`, throwing a
-/// `TypeError` when it is not (async or sync) iterable. Registers the hidden
-/// record class on the scope's global on first use.
+/// `TypeError` when it is not (async or sync) iterable. The global must have
+/// registered the hidden record class with `AsyncIteratorRecord::add_to_global`.
 pub fn get_async_iterator<'s>(
     scope: &'s Scope<'_>,
     iterable: HandleValue<'_>,
 ) -> Result<AsyncIteratorRecord<'s>, ExnThrown> {
-    if get_prototype_for::<AsyncIteratorRecordImpl>(scope).is_none() {
-        AsyncIteratorRecord::add_to_global(scope, scope.global());
-    }
     AsyncIteratorRecord::new(scope, iterable)
 }
 
@@ -154,9 +151,9 @@ impl<'s> AsyncIteratorRecord<'s> {
         let return_method = iterator.get_property(scope, c"return")?;
         // If undefined, return a promise resolved with undefined.
         if return_method.is_null_or_undefined() {
-            return Promise::new_resolved_with_value(scope, value::undefined());
+            return Promise::new_resolved_with_value(scope, HandleValue::undefined());
         }
-        if !is_callable(scope, return_method) {
+        if !crate::function::is_callable(return_method) {
             crate::error::throw_type_error(scope, c"iterator return is not callable");
             return Promise::new_rejected_with_pending_error(scope);
         }
@@ -203,12 +200,6 @@ fn return_result_check(
     Ok(value::undefined())
 }
 
-/// Whether `v` is callable, without throwing — the `IsCallable` test for the
-/// `GetMethod`-style method lookups.
-fn is_callable(scope: &Scope<'_>, v: HandleValue<'_>) -> bool {
-    Object::from_value(scope, *v).is_ok_and(|o| o.is_callable())
-}
-
 /// `GetMethod`-style check: undefined/null yields `None`; a non-callable
 /// throws a `TypeError`; a callable is returned.
 pub(crate) fn ensure_is_method<'r>(
@@ -218,7 +209,7 @@ pub(crate) fn ensure_is_method<'r>(
     if v.is_null_or_undefined() {
         return Ok(None);
     }
-    if !is_callable(scope, v) {
+    if !crate::function::is_callable(v) {
         return Err(crate::error::throw_type_error(
             scope,
             c"iterator method is not callable",
@@ -331,11 +322,11 @@ fn afs_value_rejected(
     let record = cast_payload::<AsyncIteratorRecord>(scope, payload);
     let error = args.get(0);
     let sync_iter = record.data().iterator.get(scope);
-    // `IteratorClose`: call the iterator's `return` (a missing `return` is a no-op).
+    // `IteratorClose`: call the iterator's `return` (nothing happens if it is missing).
     // Its outcome is discarded — when the incoming completion is a throw, the
     // original error wins, so a throwing or absent `return` cannot mask it.
     if let Ok(return_method) = sync_iter.get_property(scope, c"return") {
-        if is_callable(scope, return_method) {
+        if crate::function::is_callable(return_method) {
             let _ = Function::call(scope, sync_iter, return_method, EmptyArgs);
         }
     }
@@ -402,6 +393,7 @@ pub fn create_iter_result<'r>(
     done: bool,
 ) -> Result<Object<'r>, ExnThrown> {
     let attrs = crate::class_spec::JSPROP_ENUMERATE as std::ffi::c_uint;
+    let value = value.to_jsval_throwing(scope)?;
     let obj = Object::new_plain(scope)?;
     let value_id = crate::class::get_or_init_property_id(scope, c"value")?;
     obj.define_value_by_id(scope, value_id, value, attrs)?;
@@ -507,7 +499,7 @@ pub fn iter_result_object<'r>(
     scope: &'r Scope<'_>,
     result: HandleValue<'_>,
 ) -> Result<Object<'r>, ExnThrown> {
-    Object::from_value(scope, *result)
+    Object::from_raw_value(scope, result.get())
         .map_err(|_| crate::error::throw_type_error(scope, c"iterator result is not an object"))
 }
 

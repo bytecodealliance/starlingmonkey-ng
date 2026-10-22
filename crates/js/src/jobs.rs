@@ -5,16 +5,6 @@
 //! SpiderMonkey requires a job queue to execute promise continuations and other
 //! microtasks. This module provides wrappers for configuring and draining the
 //! queue.
-//!
-//! # Quick Start
-//!
-//! ```ignore
-//! // Use SpiderMonkey's built-in job queue (simplest option):
-//! jobs::use_internal_job_queues(cx)?;
-//!
-//! // After evaluating JS that creates promises, drain the queue:
-//! jobs::run_jobs(cx);
-//! ```
 
 use std::cell::RefCell;
 
@@ -109,7 +99,7 @@ unsafe extern "C" fn track_rejection(
     _data: *mut std::ffi::c_void,
 ) {
     // SAFETY: the engine calls the tracker with a valid context. A realm is entered whenever a
-    // promise is rejected or gets a handler, and the check covers any other call.
+    // promise is rejected or gets a handler. The check covers any other call.
     if unsafe { mozjs::jsapi::GetCurrentRealmOrNull(cx) }.is_null() {
         return;
     }

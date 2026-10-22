@@ -154,7 +154,7 @@ impl Drop for ScopeAlloc {
 /// registered in the pool's intrusive linked list of active allocators so that the GC tracer can
 /// discover its slots.
 pub struct PrivatePages {
-    /// The pool this allocator borrows pages from.
+    /// The pool from which this allocator borrows pages.
     pool: *const HandlePool,
 
     /// Current page being allocated into. `None` until the first allocation.
@@ -392,7 +392,7 @@ pub struct HandlePool {
     /// The number of slots in use on the root stack.
     top: Cell<usize>,
 
-    /// One entry per scope, innermost last. Entries of dropped scopes stay until every scope
+    /// One entry per scope, innermost last. Entries of dropped scopes are kept until every scope
     /// created after them has dropped.
     levels: UnsafeCell<Vec<Level>>,
 
@@ -412,7 +412,7 @@ pub struct HandlePool {
     root_tracers: UnsafeCell<Vec<unsafe fn(*mut JSTracer)>>,
 }
 
-/// The most released private allocations the pool keeps.
+/// The maximum number of released private allocations the pool keeps.
 const MAX_FREE_ALLOCS: usize = 32;
 
 /// This module's share of the crate's thread-local state. See [`crate::tls`].

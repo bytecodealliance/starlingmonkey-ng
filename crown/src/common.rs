@@ -11,17 +11,11 @@ use rustc_lint::{LateContext, Lint, LintContext};
 use rustc_middle::ty::{self, GenericArg, TraitRef, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 use rustc_span::symbol::Symbol;
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::Span;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
 use rustc_type_ir::Upcast as _;
 
-/// Emit a lint whose diagnostic is built by a closure.
-///
-/// rustc dropped the closure-based `LintContext::lint` in favour of
-/// `opt_span_lint`, which takes a value implementing the `Diagnostic` trait.
-/// This restores the ergonomic closure form the lint passes were written
-/// against by wrapping the closure in [`DiagDecorator`]. As before, the span is
-/// set inside the closure via `Diag::span`, so no span is passed here.
+/// Emit a lint whose diagnostic `decorate` builds, including its span.
 pub trait LateContextExt {
     fn lint(&self, lint: &'static Lint, decorate: impl FnOnce(&mut Diag<'_, ()>));
 }
@@ -32,9 +26,6 @@ impl<'tcx> LateContextExt for LateContext<'tcx> {
     }
 }
 
-/// check if a DefId's path matches the given absolute type path
-/// usage e.g. with
-/// `match_def_path(cx, id, &["core", "option", "Option"])`
 /// Attribute lookups on [`TyCtxt`].
 pub trait TyCtxtExt {
     /// Whether the item `did` has an attribute whose path is `attrs`.
@@ -50,13 +41,15 @@ impl TyCtxtExt for TyCtxt<'_> {
 /// The item an alias type names: the associated type, opaque type or type alias.
 pub fn alias_def_id(kind: ty::AliasTyKind<'_>) -> DefId {
     match kind {
-        ty::AliasTyKind::Projection { def_id } => def_id.into(),
-        ty::AliasTyKind::Inherent { def_id } => def_id.into(),
-        ty::AliasTyKind::Opaque { def_id } => def_id.into(),
-        ty::AliasTyKind::Free { def_id } => def_id.into(),
+        ty::AliasTyKind::Projection { def_id }
+        | ty::AliasTyKind::Inherent { def_id }
+        | ty::AliasTyKind::Opaque { def_id }
+        | ty::AliasTyKind::Free { def_id } => def_id,
     }
 }
 
+/// Check if a DefId's path matches the given absolute type path, e.g. with
+/// `match_def_path(cx, id, &["core", "option", "Option"])`.
 pub fn match_def_path(cx: &LateContext, def_id: DefId, path: &[Symbol]) -> bool {
     let def_path = cx.tcx.def_path(def_id);
     let krate = &cx.tcx.crate_name(def_path.krate);
@@ -147,66 +140,23 @@ pub fn trait_in_crate<'tcx>(
 Stuff copied from clippy:
 */
 
-/// Checks whether a type implements a trait.
-/// The function returns false in case the type contains an inference variable.
+/// Checks whether a type implements a trait. Panics if the type contains an inference variable.
 ///
 /// See [Common tools for writing lints] for an example how to use this function and other options.
 ///
 /// [Common tools for writing lints]: https://github.com/rust-lang/rust-clippy/blob/master/book/src/development/common_tools_writing_lints.md#checking-if-a-type-implements-a-specific-trait
-pub fn implements_trait<'tcx>(
-    cx: &LateContext<'tcx>,
-    ty: Ty<'tcx>,
-    trait_id: DefId,
-    args: &[GenericArg<'tcx>],
-) -> bool {
-    implements_trait_with_env_from_iter(
-        cx.tcx,
-        cx.typing_env(),
-        ty,
-        trait_id,
-        None,
-        args.iter().map(|&x| Some(x)),
-    )
-}
-
-/// Same as `implements_trait_from_env` but takes the arguments as an iterator.
-pub fn implements_trait_with_env_from_iter<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    typing_env: ty::TypingEnv<'tcx>,
-    ty: Ty<'tcx>,
-    trait_id: DefId,
-    callee_id: Option<DefId>,
-    args: impl IntoIterator<Item = impl Into<Option<GenericArg<'tcx>>>>,
-) -> bool {
+pub fn implements_trait<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, trait_id: DefId) -> bool {
+    let tcx = cx.tcx;
     // Clippy shouldn't have infer types
     assert!(!ty.has_infer());
-
-    // If a `callee_id` is passed, then we assert that it is a body owner
-    // through calling `body_owner_kind`, which would panic if the callee
-    // does not have a body.
-    if let Some(callee_id) = callee_id {
-        let _ = tcx.hir_body_owner_kind(callee_id);
-    }
 
     let ty = tcx.erase_and_anonymize_regions(ty);
     if ty.has_escaping_bound_vars() {
         return false;
     }
 
-    let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
-    let args = args
-        .into_iter()
-        .map(|arg| {
-            arg.into()
-                .unwrap_or_else(|| infcx.next_ty_var(DUMMY_SP).into())
-        })
-        .collect::<Vec<_>>();
-
-    let trait_ref = TraitRef::new(
-        tcx,
-        trait_id,
-        [GenericArg::from(ty)].into_iter().chain(args),
-    );
+    let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(cx.typing_env());
+    let trait_ref = TraitRef::new(tcx, trait_id, [GenericArg::from(ty)]);
 
     debug_assert!(
         matches!(tcx.def_kind(trait_id), DefKind::Trait | DefKind::TraitAlias),

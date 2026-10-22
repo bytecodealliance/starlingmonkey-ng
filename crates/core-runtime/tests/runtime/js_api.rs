@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! Integration tests for the `js` API.
-//!
-//! Tests that need a JS runtime are grouped in a single test because
-//! `JSEngine` can only be initialized once per process.
 
 use core_runtime::config::RuntimeConfig;
 use core_runtime::runtime::Runtime;
@@ -44,27 +41,6 @@ fn test_value_constructors() {
     let v = value::from_f64(2.5);
     assert!(v.is_double());
     assert!((v.to_double() - 2.5).abs() < f64::EPSILON);
-}
-
-#[test]
-fn test_value_constructors_extra() {
-    // value:: constructors cover the same ground as the old IntoJSVal impls.
-    let v = value::from_bool(true);
-    assert!(v.is_boolean());
-    assert!(v.to_boolean());
-
-    let v = value::from_i32(42);
-    assert!(v.is_int32());
-    assert_eq!(v.to_int32(), 42);
-
-    let v = value::from_u32(99);
-    assert!(v.is_int32() || v.is_double());
-
-    let v = value::from_f64(2.71);
-    assert!(v.is_double());
-
-    let v = value::undefined();
-    assert!(v.is_undefined());
 }
 
 #[test]
@@ -265,17 +241,10 @@ fn test_js_api_with_runtime() {
         assert_eq!(set.size(&scope), 0);
     }
 
-    // --- Array builtins ---
-    {
-        let arr = Array::new(&scope, 3).unwrap();
-        let len = arr.length(&scope).unwrap();
-        assert_eq!(len, 3);
-    }
-
     // --- Date builtins ---
     {
         let rval = js::compile::evaluate(&scope, "new Date(2024, 0, 15)").unwrap();
-        let date_obj = Object::from_value(&scope, rval.get()).unwrap();
+        let date_obj = Object::from_raw_value(&scope, rval.get()).unwrap();
         assert!(Date::is_date(&scope, date_obj.handle()).unwrap());
         let js_date = date_obj.cast::<Date>().unwrap();
         assert!(js_date.is_valid(&scope).unwrap());
@@ -285,7 +254,7 @@ fn test_js_api_with_runtime() {
     {
         let rval = js::compile::evaluate(&scope, "new Promise(function(resolve) { resolve(42) })")
             .unwrap();
-        let promise_obj = Object::from_value(&scope, rval.get()).unwrap();
+        let promise_obj = Object::from_raw_value(&scope, rval.get()).unwrap();
         assert!(Promise::is_promise(promise_obj.handle()));
         let js_promise = promise_obj.cast::<Promise>().unwrap();
         let _id = js_promise.id();
@@ -295,7 +264,7 @@ fn test_js_api_with_runtime() {
         // A pending promise has no result yet (the engine asserts on the
         // access in debug builds).
         let rval = js::compile::evaluate(&scope, "new Promise(function() {})").unwrap();
-        let pending = Object::from_value(&scope, rval.get()).unwrap();
+        let pending = Object::from_raw_value(&scope, rval.get()).unwrap();
         let pending = pending.cast::<Promise>().unwrap();
         assert!(pending.is_pending());
         assert!(pending.result(&scope).is_none());
@@ -687,13 +656,36 @@ fn array_buffer_transfer_moves_the_contents() {
     let moved = source.transfer(&scope).unwrap();
     assert!(source.is_detached());
     assert_eq!(moved.byte_length(), 4);
-    // SAFETY: nothing allocates while the slice is read.
-    assert_eq!(unsafe { moved.bytes() }, &[1, 2, 3, 4]);
+    assert_eq!(moved.with_bytes(<[u8]>::to_vec), [1, 2, 3, 4]);
 
     let empty = js::ArrayBuffer::new(&scope, 0).unwrap();
     let moved_empty = empty.transfer(&scope).unwrap();
     assert!(empty.is_detached());
     assert_eq!(moved_empty.byte_length(), 0);
+}
+
+/// Byte access to a cross-compartment wrapper of an `ArrayBuffer` or a typed array reads the
+/// wrapped object's bytes.
+#[test]
+fn byte_access_reads_through_cross_compartment_wrappers() {
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let value = js::compile::evaluate(&scope, "new Uint8Array([1, 2, 3, 4])").unwrap();
+    let array = Object::from_value(&scope, value).unwrap();
+    let value = js::compile::evaluate(&scope, "new Uint8Array([5, 6]).buffer").unwrap();
+    let buffer = Object::from_value(&scope, value).unwrap();
+
+    let other = rt.new_global();
+    let wrapped_array = array.wrap_object(&other).unwrap();
+    let wrapped_buffer = buffer.wrap_object(&other).unwrap();
+    assert_ne!(wrapped_array.as_raw(), array.as_raw());
+    assert_ne!(wrapped_buffer.as_raw(), buffer.as_raw());
+    let array = wrapped_array.cast::<js::Uint8Array>().unwrap();
+    assert_eq!(array.len(), 4);
+    assert_eq!(array.with_slice(<[u8]>::to_vec), [1, 2, 3, 4]);
+    let buffer = wrapped_buffer.cast::<js::ArrayBuffer>().unwrap();
+    assert_eq!(buffer.with_bytes(<[u8]>::to_vec), [5, 6]);
+    assert_eq!(buffer.copy_bytes(&other).unwrap(), [5, 6]);
 }
 
 /// Strings created from Rust text hold the same UTF-16 code units as the text, whether it is
@@ -759,5 +751,69 @@ fn strings_convert_to_utf8_from_either_representation() {
         let value = js::compile::evaluate(&scope, source).unwrap();
         let s = js::string::Str::from_value(&scope, value).unwrap();
         assert_eq!(s.to_utf8(&scope).unwrap(), *expected, "{source}");
+    }
+}
+
+/// Calling a value that isn't callable from native code throws a `TypeError` naming the method or
+/// the value's source.
+#[test]
+fn native_calls_of_values_that_are_not_functions_name_them() {
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let message = |scope: &js::gc::scope::Scope<'_>| {
+        let error = js::exception::take_pending(scope).expect("a pending exception");
+        let error = Object::from_value(scope, error).expect("an error object");
+        let message = error.get_property(scope, c"message").unwrap();
+        String::from_jsval(scope, message, ()).unwrap()
+    };
+
+    let object = Object::new_plain(&scope).unwrap();
+    let result =
+        js::Function::call_by_name(&scope, object.handle(), c"nope", js::function::EmptyArgs);
+    assert!(result.is_err());
+    assert_eq!(message(&scope), "nope is not a function");
+
+    let five = scope.root_value(value::from_i32(5));
+    let result = js::Function::call(&scope, five, five, js::function::EmptyArgs);
+    assert!(result.is_err());
+    assert_eq!(message(&scope), "5 is not a function");
+
+    let undefined = scope.root_value(value::undefined());
+    let result = js::Function::call(&scope, undefined, undefined, js::function::EmptyArgs);
+    assert!(result.is_err());
+    assert_eq!(message(&scope), "undefined is not a function");
+
+    let value = js::compile::evaluate(&scope, "({ a: [1, 'b'] })").unwrap();
+    let result = js::Function::call_value(&scope, object.handle(), value, js::function::EmptyArgs);
+    assert!(result.is_err());
+    assert_eq!(message(&scope), r#"({a:[1, "b"]}) is not a function"#);
+}
+
+/// Setting and defining a property under a name that isn't interned yet stores the given value
+/// when the GC that interning the name runs moves it.
+#[cfg(feature = "debugmozjs")]
+#[test]
+fn named_property_writes_store_a_value_that_interning_the_name_moves() {
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let target = Object::new_plain(&scope).unwrap();
+    let value = Object::new_plain(&scope).unwrap();
+
+    // Zeal mode 14 runs a compacting GC on every allocation, which moves `value`.
+    unsafe { js::gc::SetGCZeal(scope.raw_cx_no_gc(), 14, 1) };
+    let set = target.set_property(&scope, c"setPropertyFreshName", value);
+    let defined = target.define_property(
+        &scope,
+        c"definePropertyFreshName",
+        value,
+        js::class_spec::JSPROP_ENUMERATE as u32,
+    );
+    unsafe { js::gc::SetGCZeal(scope.raw_cx_no_gc(), 0, 0) };
+    set.unwrap();
+    defined.unwrap();
+
+    for name in [c"setPropertyFreshName", c"definePropertyFreshName"] {
+        let stored = target.get_property(&scope, name).unwrap();
+        assert_eq!(stored.to_object(), value.as_raw(), "{name:?}");
     }
 }

@@ -53,7 +53,7 @@ fn event_listener_argument<'s>(
     if callback.is_null_or_undefined() {
         return Ok(None);
     }
-    Object::from_value(scope, *callback)
+    Object::from_raw_value(scope, callback.get())
         .map(Some)
         .map_err(|_| throw_type_error(scope, c"event listener must be an object"))
 }

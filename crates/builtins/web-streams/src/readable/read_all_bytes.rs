@@ -157,10 +157,10 @@ pub(crate) fn read_all_bytes_chunk_steps(
         return promise.reject_with_pending(scope);
     };
     // Step 2: Append the bytes represented by chunk to bytes.
-    // SAFETY: the slice is consumed immediately; appending to the Rust-side
-    // accumulator cannot trigger a GC or detach the chunk's buffer.
-    let chunk_bytes = unsafe { array.as_slice() };
-    state.data_mut().bytes.extend_from_slice(chunk_bytes);
+    let mut data = state.data_mut();
+    let bytes = &mut data.bytes;
+    array.with_slice(|chunk_bytes| bytes.extend_from_slice(chunk_bytes));
+    drop(data);
     // Step 3: Read-loop — deferred one microtask (see above): queue the
     // state's deferred-read callback directly on the job queue.
     let microtask = state

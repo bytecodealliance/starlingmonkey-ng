@@ -83,7 +83,7 @@ fn options_dictionary<'s>(
     match options {
         None => OptionsArgument::Dictionary(None),
         Some(val) if val.is_null_or_undefined() => OptionsArgument::Dictionary(None),
-        Some(val) => match Object::from_value(scope, *val) {
+        Some(val) => match Object::from_raw_value(scope, val.get()) {
             Ok(obj) => OptionsArgument::Dictionary(Some(obj)),
             Err(_) => OptionsArgument::Boolean(
                 bool::from_jsval(scope, val, ()).expect("ToBoolean cannot fail"),
@@ -96,7 +96,7 @@ fn options_dictionary<'s>(
 fn read_bool_option(
     scope: &Scope<'_>,
     dictionary: Option<&Object<'_>>,
-    name: &std::ffi::CStr,
+    name: &'static std::ffi::CStr,
 ) -> Result<bool, ExnThrown> {
     let Some(dictionary) = dictionary else {
         return Ok(false);

@@ -109,7 +109,7 @@ fn find_jstraceable<'tcx>(cx: &LateContext<'tcx>) -> Option<DefId> {
 
 fn is_jstraceable<'tcx>(cx: &LateContext<'tcx>, ty: ty::Ty<'tcx>) -> bool {
     if let Some(trait_id) = find_jstraceable(cx) {
-        return implements_trait(cx, ty, trait_id, &[]);
+        return implements_trait(cx, ty, trait_id);
     }
     panic!("JSTraceable not found");
 }
@@ -168,11 +168,6 @@ jsmanaged inside on {pos}-th position. Consider removing the wrapper."
 // as these are the only ones that are actually traced
 impl<'tcx> LateLintPass<'tcx> for NotracePass {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item) {
-        // TODO: better performance if we limit with lint attr???
-        /*let attrs = cx.tcx.hir().attrs(item.hir_id());
-        if has_lint_attr(&self.symbols, &attrs, self.symbols.must_root) {
-            return;
-        }*/
         if let hir::ItemKind::Struct(_, _, variant_data) = &item.kind {
             for field in variant_data.fields() {
                 let field_type = cx.tcx.type_of(field.def_id);
@@ -182,15 +177,11 @@ impl<'tcx> LateLintPass<'tcx> for NotracePass {
     }
 
     fn check_variant(&mut self, cx: &LateContext, var: &hir::Variant) {
-        #[allow(clippy::single_match)]
-        match var.data {
-            hir::VariantData::Tuple(fields, ..) => {
-                for field in fields {
-                    let field_type = cx.tcx.type_of(field.def_id);
-                    incorrect_no_trace(&self.symbols, cx, field_type.skip_binder(), field.ty.span);
-                }
-            },
-            _ => (), // Struct variants already caught by check_struct_def
+        if let hir::VariantData::Tuple(fields, ..) = var.data {
+            for field in fields {
+                let field_type = cx.tcx.type_of(field.def_id);
+                incorrect_no_trace(&self.symbols, cx, field_type.skip_binder(), field.ty.span);
+            }
         }
     }
 }

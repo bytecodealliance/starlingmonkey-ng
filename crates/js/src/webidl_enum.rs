@@ -5,8 +5,7 @@
 
 /// Define a WebIDL enumeration: the Rust enum plus `as_str`, `Display`,
 /// `FromStr`, and the JS value conversions (`FromJSVal`/`ToJSVal`), all
-/// generated from a single `Variant => "string"` list — so the four string
-/// tables cannot drift, and adding a variant is a one-line change.
+/// generated from a single `Variant => "string"` list.
 ///
 /// ```ignore
 /// js::webidl_enum! {

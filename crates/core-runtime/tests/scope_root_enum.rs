@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! `#[derive(ScopeRoot)]` must handle a unit enum variant.
-//!
-//! The mirror/pattern builder treated a unit variant as the parenthesized
-//! (tuple) case, emitting `Variant()` patterns that fail to compile against a
-//! unit variant (E0532). A unit variant now carries no field group.
+//! `#[derive(ScopeRoot)]` handles a unit enum variant. A `Variant()` pattern for one fails to
+//! compile (E0532).
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]

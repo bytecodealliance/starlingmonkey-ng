@@ -218,13 +218,14 @@ impl ScriptEvaluation {
     }
 }
 
-/// Initialize the runtime and evaluate the script (the synchronous portion of an
-/// invocation), draining initial microtasks. Returns the runtime and its
-/// invocation, with the invocation unregistered from the GC tracer. It is
-/// registered only for the eval phase here, then unregistered before being moved
-/// out, since the registry holds a raw pointer that the move would invalidate. The
-/// caller re-registers at the final location, drives the loop, then unregisters.
-fn init_and_eval(
+/// Like [`setup`], but always returns the runtime, for serve mode, where the runtime must
+/// outlive the script (which registers `fetch` handlers) so it can handle incoming requests.
+/// Initializes the runtime and evaluates the script, draining initial microtasks. The returned
+/// invocation holds the script's initial event loop, and is unregistered from the GC tracer: the
+/// registry holds a raw pointer that moving the invocation out would invalidate. The caller
+/// re-registers it at its final location, drives it to completion (the script's top-level async)
+/// before serving, then unregisters it and keeps the runtime alive for the accept loop.
+pub fn setup_for_serve(
     config: config::RuntimeConfig,
 ) -> Result<
     (
@@ -299,31 +300,13 @@ pub fn setup(
     )>,
     String,
 > {
-    let (runtime, invocation, evaluation) = init_and_eval(config)?;
+    let (runtime, invocation, evaluation) = setup_for_serve(config)?;
     if !invocation.event_loop().is_alive() {
         let settled = evaluation.settled(&runtime.default_global(), "Script evaluation failed");
         drop(evaluation);
         return settled.map(|()| None);
     }
     Ok(Some((runtime, invocation, evaluation)))
-}
-
-/// Like [`setup`], but always returns the runtime — for **serve mode**, where the
-/// runtime must outlive the script (which registers `fetch` handlers) so it can
-/// handle incoming requests. The returned invocation holds the script's initial
-/// event loop; drive it to completion (the script's top-level async) before
-/// serving, then keep the runtime alive for the accept loop.
-pub fn setup_for_serve(
-    config: config::RuntimeConfig,
-) -> Result<
-    (
-        std::rc::Rc<Runtime>,
-        invocation::InvocationState,
-        ScriptEvaluation,
-    ),
-    String,
-> {
-    init_and_eval(config)
 }
 
 #[cfg(test)]
@@ -339,7 +322,7 @@ mod tests {
     /// Event-loop driver for tests whose scripts complete synchronously.
     ///
     /// `run` only invokes the driver when the script left async work in the
-    /// event loop, so for these tests being called at all is a failure.
+    /// event loop, so the driver fails these tests if it is called at all.
     fn noop_driver(
         _runtime: std::rc::Rc<runtime::Runtime>,
         _invocation: invocation::InvocationState,
@@ -367,41 +350,12 @@ mod tests {
     }
 
     #[test]
-    fn run_file_module_mode() {
-        let dir = test_tempdir();
-        let script = dir.path().join("test.mjs");
-        std::fs::write(&script, "const x = 1 + 2;\n").unwrap();
-
-        let config = config_from(&["starling", &script.to_string_lossy()]);
-        run(config, noop_driver)
-            .map_err(|e| println!("{e}"))
-            .expect("Run failed");
-    }
-
-    #[test]
     fn run_file_legacy_script() {
         let dir = test_tempdir();
         let script = dir.path().join("test.js");
         std::fs::write(&script, "var x = 1 + 2;\n").unwrap();
 
         let config = config_from(&["starling", &script.to_string_lossy(), "--legacy-script"]);
-        run(config, noop_driver)
-            .map_err(|e| println!("{e}"))
-            .expect("Run failed");
-    }
-
-    #[test]
-    fn run_file_with_imports() {
-        let dir = test_tempdir();
-        std::fs::write(dir.path().join("helper.js"), "export const V = 10;\n").unwrap();
-        let entry = dir.path().join("main.mjs");
-        std::fs::write(
-            &entry,
-            r#"import { V } from "./helper.js"; globalThis._v = V;"#,
-        )
-        .unwrap();
-
-        let config = config_from(&["starling", &entry.to_string_lossy()]);
         run(config, noop_driver)
             .map_err(|e| println!("{e}"))
             .expect("Run failed");

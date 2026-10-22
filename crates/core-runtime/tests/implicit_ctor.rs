@@ -6,8 +6,8 @@
 //! that is not constructible from JS: `new Foo()` throws a `TypeError`
 //! ("Illegal constructor"). An unannotated constructor-shaped fn — either
 //! `fn any_name() -> Self` or the setup-style `fn new(&self, ...)` — is still
-//! treated as a Rust-side constructor, so `Foo::new(scope, ...)` keeps
-//! working.
+//! treated as a Rust-side constructor, so `Foo::new(scope, ...)` works.
+
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -16,7 +16,7 @@ use core_runtime::runtime::Runtime;
 use core_runtime::test_util::eval_with_setup;
 use core_runtime::{jsclass, jsmethods};
 
-/// Old-style Rust constructor (`fn new() -> Self`), no `#[constructor]`.
+/// A class with a Rust constructor (`fn new() -> Self`) and no `#[constructor]`.
 #[jsclass]
 struct RustOnly {
     n: i32,
@@ -153,97 +153,36 @@ fn setup() {
     });
 }
 
-/// `new Foo()` must throw a `TypeError` when no `#[constructor]` is present.
+/// `new Foo()` throws a `TypeError` when no `#[constructor]` is present. The interface object is
+/// installed regardless. An extra factory next to a `#[constructor]` is not exposed to JS.
 #[test]
-fn js_construction_throws() {
-    for class in [
-        "RustOnly",
-        "RenamedCtor",
-        "ManyFactories",
-        "RustOnlySetup",
-        "NoCtorAtAll",
-    ] {
-        let result = eval_with_setup(
-            setup,
-            &format!(
-                "try {{ new {class}(); 'no-throw' }} \
-                 catch (e) {{ (e instanceof TypeError) + ':' + e.message }}"
-            ),
-        );
-        assert_eq!(result, "true:Illegal constructor", "for class {class}");
-    }
+fn only_explicit_constructors_are_js_constructible() {
+    let result = eval_with_setup(
+        setup,
+        "const outcomes = ['RustOnly', 'RenamedCtor', 'ManyFactories', 'RustOnlySetup', 'NoCtorAtAll']
+             .map(name => {
+                 try { new globalThis[name](); return `${name}:no-throw`; }
+                 catch (e) { return `${e instanceof TypeError}:${e.message}`; }
+             });
+         [...new Set(outcomes), NoCtorAtAll.answer(), new Constructible(5).n,
+          new CtorPlusFactory(5).n, typeof CtorPlusFactory.doubled].join()",
+    );
+    assert_eq!(result, "true:Illegal constructor,42,5,5,undefined");
 }
 
-/// The interface object is still installed and usable (statics, prototype).
+/// Every constructor-shaped fn gets a Rust-side factory under its own name.
 #[test]
-fn interface_object_still_installed() {
-    let result = eval_with_setup(setup, "NoCtorAtAll.answer()");
-    assert_eq!(result, "42");
-}
-
-/// A class that does declare a `#[constructor]` stays constructible from JS.
-#[test]
-fn explicit_constructor_still_works() {
-    let result = eval_with_setup(setup, "new Constructible(5).n");
-    assert_eq!(result, "5");
-}
-
-/// `Foo::new(scope)` still works from Rust for the old-style shape.
-#[test]
-fn rust_side_new_works() {
+fn rust_side_factories_construct_instances() {
     setup();
     let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
     let scope = rt.default_global();
     let obj = RustOnly::new(&scope).unwrap();
-    assert_eq!(obj.data().n, 7);
-    assert_eq!(obj.n(), 7);
-}
-
-/// The factory keeps the source fn's name: `fn from_parts` becomes
-/// `Foo::from_parts(scope, …)`, and no `Foo::new` is conjured up.
-#[test]
-fn rust_side_renamed_ctor_works() {
-    setup();
-    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
-    let scope = rt.default_global();
-    let obj = RenamedCtor::from_parts(&scope, 3).unwrap();
-    assert_eq!(obj.data().n, 3);
-}
-
-/// Every constructor-shaped fn gets a factory under its own name.
-#[test]
-fn rust_side_multiple_factories() {
-    setup();
-    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
-    let scope = rt.default_global();
+    assert_eq!((obj.data().n, obj.n()), (7, 7));
+    assert_eq!(RenamedCtor::from_parts(&scope, 3).unwrap().data().n, 3);
     assert_eq!(ManyFactories::new(&scope).unwrap().data().n, 0);
     assert_eq!(ManyFactories::from_n(&scope, 6).unwrap().data().n, 6);
     assert_eq!(ManyFactories::doubled(&scope, 6).unwrap().data().n, 12);
-}
-
-/// An extra factory coexists with a JS constructor: `new` is the
-/// `#[constructor]`'s, and the extra is reachable only from Rust.
-#[test]
-fn rust_side_factory_alongside_js_constructor() {
-    let js = eval_with_setup(
-        setup,
-        "new CtorPlusFactory(5).n + ':' + typeof CtorPlusFactory.doubled",
-    );
-    assert_eq!(js, "5:undefined");
-
-    setup();
-    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
-    let scope = rt.default_global();
     assert_eq!(CtorPlusFactory::new(&scope, 5).unwrap().data().n, 5);
     assert_eq!(CtorPlusFactory::doubled(&scope, 5).unwrap().data().n, 10);
-}
-
-/// `Foo::new(scope, args)` still works from Rust for the setup-style shape.
-#[test]
-fn rust_side_setup_new_works() {
-    setup();
-    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
-    let scope = rt.default_global();
-    let obj = RustOnlySetup::new(&scope, 11).unwrap();
-    assert_eq!(obj.data().n, 11);
+    assert_eq!(RustOnlySetup::new(&scope, 11).unwrap().data().n, 11);
 }

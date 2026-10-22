@@ -121,7 +121,14 @@ impl<'s> Stack<'s, Object> {
         scope: &'s Scope<'_>,
         val: impl ToJSVal<'s>,
     ) -> Result<Self, ConversionError> {
-        let val = val.to_jsval_raw(scope)?;
+        Self::from_raw_value(scope, val.to_jsval_raw(scope)?)
+    }
+
+    /// Root the object `val` holds, or fail if it holds something else.
+    ///
+    /// `val` must be read from a rooted location, such as a handle, right before the call, with
+    /// nothing that can GC in between, or hold no GC thing.
+    pub fn from_raw_value(scope: &'s Scope<'_>, val: Value) -> Result<Self, ConversionError> {
         if val.is_object() {
             // SAFETY: the value holds an object, so the pointer is a non-null JSObject.
             Ok(unsafe { Self::from_raw(scope, val.to_object()) }.unwrap())
@@ -146,9 +153,22 @@ impl<'s> Stack<'s, Object> {
     // Property access
     // -----------------------------------------------------------------------
 
-    /// Get a property by name.
+    /// Get a property by name, through the global's interned key for `name` (see
+    /// [`get_or_init_property_id`](crate::class::get_or_init_property_id)). Panics if `name` is an
+    /// array index.
     #[inline]
     pub fn get_property<'a>(
+        &self,
+        scope: &'a Scope<'_>,
+        name: &'static CStr,
+    ) -> Result<HandleValue<'a>, ExnThrown> {
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        self.get_property_by_id(scope, id)
+    }
+
+    /// Get a property by a name that isn't `'static`. The name is atomized on each call.
+    #[inline]
+    pub fn get_property_by_name<'a>(
         &self,
         scope: &'a Scope<'_>,
         name: &CStr,
@@ -196,9 +216,23 @@ impl<'s> Stack<'s, Object> {
         Ok(rval.handle())
     }
 
-    /// Set a property by name.
+    /// Set a property by name, through the global's interned key for `name` (see
+    /// [`get_or_init_property_id`](crate::class::get_or_init_property_id)). Panics if `name` is an
+    /// array index.
     #[inline]
     pub fn set_property<'v>(
+        &self,
+        scope: &'v Scope<'_>,
+        name: &'static CStr,
+        value: impl ToJSVal<'v>,
+    ) -> Result<(), ExnThrown> {
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        self.set_property_by_id(scope, id, value)
+    }
+
+    /// Set a property by a name that isn't `'static`. The name is atomized on each call.
+    #[inline]
+    pub fn set_property_by_name<'v>(
         &self,
         scope: &'v Scope<'_>,
         name: &CStr,
@@ -253,9 +287,19 @@ impl<'s> Stack<'s, Object> {
         ExnThrown::check(ok)
     }
 
-    /// Check whether this object has a property with the given name.
+    /// Check whether this object has a property with the given name, through the global's
+    /// interned key for `name` (see [`get_or_init_property_id`](crate::class::get_or_init_property_id)).
+    /// Panics if `name` is an array index.
     #[inline]
-    pub fn has_property(&self, scope: &Scope<'_>, name: &CStr) -> Result<bool, ExnThrown> {
+    pub fn has_property(&self, scope: &Scope<'_>, name: &'static CStr) -> Result<bool, ExnThrown> {
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        self.has_property_by_id(scope, id)
+    }
+
+    /// Check whether this object has a property with a name that isn't `'static`. The name is
+    /// atomized on each call.
+    #[inline]
+    pub fn has_property_by_name(&self, scope: &Scope<'_>, name: &CStr) -> Result<bool, ExnThrown> {
         let mut found = false;
         let ok = unsafe {
             wrappers2::JS_HasProperty(scope.cx_mut(), self.handle(), name.as_ptr(), &mut found)
@@ -284,9 +328,27 @@ impl<'s> Stack<'s, Object> {
         Ok(found)
     }
 
-    /// Check whether this object has an own property with the given name.
+    /// Check whether this object has an own property with the given name, through the global's
+    /// interned key for `name` (see [`get_or_init_property_id`](crate::class::get_or_init_property_id)).
+    /// Panics if `name` is an array index.
     #[inline]
-    pub fn has_own_property(&self, scope: &Scope<'_>, name: &CStr) -> Result<bool, ExnThrown> {
+    pub fn has_own_property(
+        &self,
+        scope: &Scope<'_>,
+        name: &'static CStr,
+    ) -> Result<bool, ExnThrown> {
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        self.has_own_property_by_id(scope, id)
+    }
+
+    /// Check whether this object has an own property with a name that isn't `'static`. The name
+    /// is atomized on each call.
+    #[inline]
+    pub fn has_own_property_by_name(
+        &self,
+        scope: &Scope<'_>,
+        name: &CStr,
+    ) -> Result<bool, ExnThrown> {
         let mut found = false;
         let ok = unsafe {
             wrappers2::JS_HasOwnProperty(scope.cx_mut(), self.handle(), name.as_ptr(), &mut found)
@@ -310,9 +372,23 @@ impl<'s> Stack<'s, Object> {
         Ok(found)
     }
 
-    /// Delete a property by name.
+    /// Delete a property by key.
+    pub fn delete_property_by_id(&self, scope: &Scope<'_>, id: HandleId) -> Result<(), ExnThrown> {
+        let ok = unsafe { wrappers2::JS_DeletePropertyById1(scope.cx_mut(), self.handle(), id) };
+        ExnThrown::check(ok)
+    }
+
+    /// Delete a property by name, through the global's interned key for `name`. Panics if `name`
+    /// is an array index.
     #[inline]
-    pub fn delete_property(&self, scope: &Scope<'_>, name: &CStr) -> Result<(), ExnThrown> {
+    pub fn delete_property(&self, scope: &Scope<'_>, name: &'static CStr) -> Result<(), ExnThrown> {
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        self.delete_property_by_id(scope, id)
+    }
+
+    /// Delete a property by a name that isn't `'static`. The name is atomized on each call.
+    #[inline]
+    pub fn delete_property_by_name(&self, scope: &Scope<'_>, name: &CStr) -> Result<(), ExnThrown> {
         let ok =
             unsafe { wrappers2::JS_DeleteProperty1(scope.cx_mut(), self.handle(), name.as_ptr()) };
         ExnThrown::check(ok)
@@ -343,9 +419,24 @@ impl<'s> Stack<'s, Object> {
     // Property definition
     // -----------------------------------------------------------------------
 
-    /// Define a property with a JS value and attribute flags.
+    /// Define a property with a JS value and attribute flags, through the global's interned key
+    /// for `name`. Panics if `name` is an array index.
     #[inline]
     pub fn define_property<'v>(
+        &self,
+        scope: &'v Scope<'_>,
+        name: &'static CStr,
+        value: impl ToJSVal<'v>,
+        attrs: c_uint,
+    ) -> Result<(), ExnThrown> {
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        self.define_value_by_id(scope, id, value, attrs)
+    }
+
+    /// Like [`define_property`](Self::define_property), for a name that isn't
+    /// `'static`. The name is atomized on each call.
+    #[inline]
+    pub fn define_property_by_name<'v>(
         &self,
         scope: &'v Scope<'_>,
         name: &CStr,
@@ -640,21 +731,6 @@ impl<'s> Stack<'s, Object> {
         ExnThrown::check(ok)
     }
 
-    /// Get the property keys of this object.
-    ///
-    /// `flags` controls which properties to include (e.g.,
-    /// `JSITER_OWNONLY`, `JSITER_HIDDEN`).
-    // TODO: this should return a vector of ids instead of taking a MutableHandle outparam.
-    pub fn get_property_keys(
-        &self,
-        scope: &Scope<'_>,
-        flags: c_uint,
-        props: mozjs::jsapi::MutableHandleIdVector,
-    ) -> Result<(), ExnThrown> {
-        let ok = unsafe { wrappers2::GetPropertyKeys(scope.cx_mut(), self.handle(), flags, props) };
-        ExnThrown::check(ok)
-    }
-
     /// Wrap this object for use in the current compartment.
     pub fn wrap_object(&self, scope: &'s Scope<'_>) -> Result<crate::Object<'s>, ExnThrown> {
         let mut wrapped = scope.root_object_mut(self.handle().get());
@@ -684,7 +760,7 @@ impl<'s, 'v> FromJSVal<'s, 'v> for Stack<'s, Object> {
         val: HandleValue<'v>,
         _option: Self::Config,
     ) -> Result<Self, ConversionError> {
-        Self::from_value(scope, *val)
+        Self::from_raw_value(scope, val.get())
     }
 }
 

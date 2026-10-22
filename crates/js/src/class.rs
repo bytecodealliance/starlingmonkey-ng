@@ -311,8 +311,7 @@ impl<T: ClassDef> JSType for T {
 ///
 /// Each element is converted through `FromJSVal`, so a `Promise<'_>` element is
 /// a *brand check*, unlike a `Promise<'_>` parameter, which is the WebIDL
-/// `Promise<T>` conversion that accepts any value (see [`PromiseOf`]). WebIDL
-/// has no variadic promise argument, so nothing needs the other behavior.
+/// `Promise<T>` conversion that accepts any value (see [`PromiseOf`]).
 ///
 /// Note that instead of `HandleValue<'_>`, you can also use `&CallArgs`, which gives you access
 /// to the raw, already rooted, arguments vector and count.
@@ -845,16 +844,12 @@ struct ClassRegistry {
     /// plumbing objects reused across calls (e.g. a resolved promise serving
     /// as a microtask trigger). Traced like prototypes.
     shared_objects: FxHashMap<usize, Box<MozHeap<*mut JSObject>>>,
-    /// Per-global monotonic `u64` counters keyed by an arbitrary `usize`. Used
-    /// where a spec requires ids unique across a whole global rather than per
-    /// call site — e.g. HTML's setTimeout/setInterval ids, which must not
-    /// collide across the concurrent event loops that share one global. Plain
-    /// integers, so no GC tracing.
-    counters: FxHashMap<usize, u64>,
     /// Per-global interned property names keyed by an arbitrary `usize` (by
     /// convention the address of a `static` unique to the call site), so a hot
     /// property name is interned once per global. Traced like prototypes.
     property_atoms: FxHashMap<usize, Box<MozHeap<*mut crate::native::JSString>>>,
+    /// Per-global Rust state that holds no GC things, keyed by its type (see [`global_state`]).
+    state: FxHashMap<TypeId, std::rc::Rc<dyn std::any::Any>>,
     /// Type-erased GC glue for the global's private data,
     /// installed by [`set_global_private`].
     ///
@@ -874,19 +869,10 @@ impl ClassRegistry {
         Self {
             map: FxHashMap::default(),
             shared_objects: FxHashMap::default(),
-            counters: FxHashMap::default(),
             property_atoms: FxHashMap::default(),
+            state: FxHashMap::default(),
             global_private: None,
         }
-    }
-
-    /// Return the counter for `key` and advance it by one (wrapping on
-    /// overflow). Counters start at 0.
-    fn bump_counter(&mut self, key: usize) -> u64 {
-        let slot = self.counters.entry(key).or_insert(0);
-        let value = *slot;
-        *slot = slot.wrapping_add(1);
-        value
     }
 
     fn register(&mut self, type_id: TypeId, proto: *mut JSObject) {
@@ -1127,7 +1113,7 @@ unsafe extern "C" fn global_private_trace(trc: *mut JSTracer, global: *mut JSObj
 ///
 /// Must be called on the [`RealmOptions`](crate::engine::RealmOptions) used to
 /// create a [`STARLING_GLOBAL_CLASS`] global, before `JS_NewGlobalObject`. The
-/// op is a no-op until [`set_global_private`] populates the global, so it is
+/// op does nothing until [`set_global_private`] populates the global, so it is
 /// safe to install unconditionally for Starling globals.
 pub fn install_global_private_trace(options: &mut crate::engine::RealmOptions) {
     options.creationOptions_.traceGlobal_ = Some(global_private_trace);
@@ -1167,14 +1153,12 @@ pub(crate) fn inherits_from(concrete_tag: usize, target_tag: usize) -> bool {
     })
 }
 
-// Registry mapping child type tag → parent info.
-// Thread-local because the SpiderMonkey runtime is single-threaded.
 /// Register a child→parent derivation in the inheritance registry, keyed by the
 /// child's runtime `JSClass` tag.
 ///
 /// `accessor`/`accessor_mut` map a pointer to the child's private data onto a
-/// pointer to the embedded parent data, so [`get_private_or_ancestor`] can reach
-/// a `Parent`'s data through a concrete child instance.
+/// pointer to the embedded parent data, so [`borrow`] can reach a `Parent`'s data through a
+/// concrete child instance.
 fn register_parent_info_raw(
     child_tag: usize,
     parent_tag: usize,
@@ -1343,33 +1327,6 @@ fn step_to_parent_mut(info: &InheritanceInfo, ptr: *mut c_void) -> *mut c_void {
     unsafe { (info.accessor_mut)(ptr) }
 }
 
-/// Inheritance-aware immutable private data access.
-///
-/// If the object's concrete type matches T, returns a direct reference.
-/// If the concrete type derives from T (via HasParent chain), walks the
-/// parent accessor chain to find the T reference within the concrete data.
-/// Returns `None` for any other object, and for objects without private data.
-///
-/// # Safety
-///
-/// - `obj` must be a valid JS object.
-/// - The returned reference is only valid as long as the JS object is alive.
-pub unsafe fn get_private_or_ancestor<'a, T: ClassDef>(obj: *mut JSObject) -> Option<&'a T> {
-    private_data_ptr::<T>(obj, step_to_parent).map(|ptr| &*(ptr as *const T))
-}
-
-/// Inheritance-aware mutable private data access.
-///
-/// # Safety
-///
-/// - `obj` must be a valid JS object.
-/// - No other references to the data may exist simultaneously.
-pub unsafe fn get_private_or_ancestor_mut<'a, T: ClassDef>(
-    obj: *mut JSObject,
-) -> Option<&'a mut T> {
-    private_data_ptr::<T>(obj, step_to_parent_mut).map(|ptr| &mut *(ptr as *mut T))
-}
-
 // ============================================================================
 // ClassDef trait
 // ============================================================================
@@ -1409,6 +1366,10 @@ pub trait ClassDef: Sized + Trace + 'static {
     /// Pre-formatted error message for method/getter calls on the prototype.
     /// Generated by the proc macro as a compile-time C string literal.
     const PROTOTYPE_CALL_ERROR: &'static CStr;
+
+    /// The message of the `TypeError` a call of the constructor without `new` throws.
+    /// `#[jsclass]` overrides it with the message SpiderMonkey throws for a JS class constructor.
+    const CALL_WITHOUT_NEW_ERROR: &'static CStr = c"Constructor must be called with 'new'";
 
     /// Return the `JSClass` descriptor for this type.
     ///
@@ -1491,11 +1452,12 @@ pub trait ClassDef: Sized + Trace + 'static {
     /// Override by using `#[jsclass(extends = ParentType)]`.
     fn register_inheritance() {}
 
-    /// Ensure the parent class is registered on `global` before `Self` is.
+    /// Ensure the parent class is registered on the current global before `Self` is. The
+    /// parent's constructor is defined on the global object unless the parent is hidden.
     ///
     /// Called automatically by [`register_class`] — you never need to call
     /// this directly.  Override by using `#[jsclass(extends = ParentType)]`.
-    fn ensure_parent_registered(_scope: &Scope<'_>, _global: Object<'_>) {}
+    fn ensure_parent_registered(_scope: &Scope<'_>) {}
 
     /// The `Symbol.toStringTag` value for this class (empty = none).
     ///
@@ -1674,17 +1636,19 @@ impl<T: ClassDef> ClassBuilder<T> {
     /// `name` must be a null-terminated C string (use `c"name"`).
     /// `getter` is the getter callback (`JSNative` is `Option<fn>`: pass `None` for write-only).
     /// `setter` is the setter callback (`JSNative` is `Option<fn>`: pass `None` for read-only).
+    /// `flags` are the property attributes, such as `JSPROP_ENUMERATE`.
     pub fn property(
         mut self,
         name: &'static std::ffi::CStr,
         getter: JSNative,
         setter: JSNative,
+        flags: u8,
     ) -> Self {
         self.properties.push(JSPropertySpec {
             name: crate::class_spec::JSPropertySpec_Name {
                 string_: name.as_ptr(),
             },
-            attributes_: crate::class_spec::JSPROP_ENUMERATE,
+            attributes_: flags,
             kind_: crate::class_spec::JSPropertySpec_Kind::NativeAccessor,
             u: crate::class_spec::JSPropertySpec_AccessorsOrValue {
                 accessors: crate::class_spec::JSPropertySpec_AccessorsOrValue_Accessors {
@@ -1773,14 +1737,45 @@ fn spec_tables_for<T: ClassDef>() -> SpecTables {
     })
 }
 
-/// Register a class on the global object, making it available as a constructor.
+/// The registry key of the constructor of class `T`.
+struct ConstructorOf<T>(PhantomData<T>);
+
+/// The constructor of class `T` in the current realm, or a `TypeError` if `T` isn't registered in
+/// it. The constructor is the one [`register_class`] created, whatever the prototype's
+/// `constructor` property holds.
+pub fn class_constructor<'s, T: ClassDef>(scope: &'s Scope<'_>) -> Result<Object<'s>, ExnThrown> {
+    registered_prototype::<T>(scope)?;
+    let ctor = get_prototype::<ConstructorOf<T>>(scope.global())
+        .expect("a registered class has a constructor");
+    // SAFETY: the registry holds live objects, which the global's trace keeps alive.
+    Ok(unsafe { Object::from_raw(scope, ctor) }.expect("the constructor is non-null"))
+}
+
+/// Register class `T` on the current global without defining its constructor on the global
+/// object, and return its prototype. A class registered before keeps whatever global property it
+/// has.
+///
+/// # Safety
+///
+/// The same as for [`register_class`].
+pub unsafe fn register_hidden_class<'s, T: ClassDef>(scope: &'s Scope<'s>) -> Object<'s> {
+    // An unregistered class's constructor is defined on a new object that nothing else
+    // references, so the global's properties stay as they are. Its parent class is registered on
+    // the global by `ensure_parent_registered`.
+    let target = Object::new_plain(scope).expect("creating an object succeeds outside of OOM");
+    // SAFETY: the caller upholds `register_class`'s requirements.
+    unsafe { register_class::<T>(scope, target) }
+}
+
+/// Register a class on the current global, and define its constructor as a property of
+/// `global`, which is the global object unless [`register_hidden_class`] registers the class.
 ///
 /// This creates the class's JSClass, constructor, prototype, and methods,
 /// and stores the prototype for later use with [`create_instance`].
 ///
 /// # Safety
 ///
-/// - `global` must be a global object.
+/// - `global` must be the current global or an ordinary object.
 /// - Must be called within an appropriate realm/compartment.
 ///
 /// # Returns
@@ -1801,7 +1796,7 @@ pub unsafe fn register_class<'s, T: ClassDef>(
     }
 
     // Ensure the parent class is registered before we register ourselves.
-    T::ensure_parent_registered(scope, global);
+    T::ensure_parent_registered(scope);
 
     // The leaked method/property tables, shared across globals.
     let tables = spec_tables_for::<T>();
@@ -1844,7 +1839,8 @@ pub unsafe fn register_class<'s, T: ClassDef>(
     )
     .expect("Constructor was just installed");
 
-    register_prototype::<T>(global, proto.handle().get());
+    register_prototype::<T>(scope.global(), proto.handle().get());
+    register_prototype::<ConstructorOf<T>>(scope.global(), ctor.as_raw());
 
     // Define Symbol.toStringTag if the class specifies one.
     if !T::TO_STRING_TAG.is_empty() {
@@ -1905,7 +1901,7 @@ unsafe extern "C" fn generic_constructor<T: ClassDef>(
     let args = CallArgs::from_vp(vp, argc);
 
     if !args.is_constructing() {
-        crate::error::throw_type_error(&scope, c"Constructor must be called with 'new'");
+        crate::error::throw_type_error(&scope, T::CALL_WITHOUT_NEW_ERROR);
         return false;
     }
 
@@ -2089,8 +2085,8 @@ pub unsafe fn get_arg_with_config<'s, 'v, T: FromJSVal<'s, 'v>>(
 /// Extract a WebIDL `Promise<T>` argument from CallArgs.
 ///
 /// Performs an eager argc check that throws on missing arguments, and then
-/// registers a type check for `T` on the value a promise resolved with the
-/// argument resolves to.
+/// registers a type check for `T` on the value to which a promise resolved
+/// with the argument resolves.
 ///
 /// # Safety
 ///
@@ -2139,54 +2135,14 @@ unsafe fn promise_arg_value<'s>(
     Ok(Handle::from_raw(args.get(index)))
 }
 
-/// Extract a stack newtype argument from CallArgs.
-///
-/// Verifies that the argument is an object with the correct class, roots it,
-/// and wraps it in the stack newtype `T`. Used by generated constructor and
-/// method trampolines for parameters typed as stack newtypes (e.g. `Item<'_>`).
-///
-/// # Safety
-///
-/// - `scope` must be in a valid realm.
-/// - `args` must be from a valid JSNative call.
-#[doc(hidden)]
-pub unsafe fn get_stack_arg<'s, T: StackType<'s>>(
-    scope: &'s Scope<'_>,
-    args: &CallArgs,
-    index: u32,
-) -> Result<T, ExnThrown> {
-    if index >= args.argc_ {
-        return Err(crate::error::throw_type_error(
-            scope,
-            c"Not enough arguments",
-        ));
-    }
-    let val = *args.get(index);
-    if !val.is_object() || !<T::Inner as JSType>::is_instance(val.to_object()) {
-        let msg = CString::new(format!(
-            "argument {} is not an instance of {}",
-            index,
-            T::Inner::NAME,
-        ))
-        .unwrap_or_else(|_| c"argument is not the expected class".into());
-        return Err(crate::error::throw_type_error(scope, &msg));
-    }
-    let obj = val.to_object();
-    let nn = NonNull::new(obj).unwrap();
-    Ok(unsafe { T::from_handle_unchecked(scope.root_object(nn)) })
-}
-
 /// Resolve a WebIDL operation's receiver object from the call's `this`.
 ///
-/// Returns the `this` value as an object, except that — per WebIDL `[Global]`
-/// operation semantics — a null or undefined `this` resolves to the global
-/// object when the global implements `target_tag`. This is what lets a bare,
-/// unqualified `addEventListener('fetch', …)` in a ServiceWorker script reach
-/// the global's own `EventTarget` data: an unqualified sloppy-mode call passes
-/// `this = undefined`, and SpiderMonkey performs no global substitution for
-/// native callees. The substitution is gated on the same inheritance registry
-/// the brand check uses, so for any interface the global does not implement, a
-/// non-object `this` is rejected exactly as before.
+/// Returns the `this` value as an object, except that a null or undefined `this` resolves to the
+/// global object when the global implements `target_tag`, per WebIDL `[Global]` operation
+/// semantics. An unqualified sloppy-mode call, such as `addEventListener('fetch', …)` in a
+/// ServiceWorker script, passes `this = undefined`, and SpiderMonkey performs no global
+/// substitution for native callees. For an interface the global does not implement, a non-object
+/// `this` is rejected.
 ///
 /// # Safety
 ///
@@ -2535,8 +2491,25 @@ pub fn try_create_instance_with<'s, T: ClassDef>(
     init: impl FnOnce(Object<'s>) -> Result<T, ExnThrown>,
 ) -> Result<T::Rooted<'s>, ExnThrown> {
     let proto = registered_prototype::<T>(scope)?;
-    let class = T::class();
-    let obj = Object::new_with_proto(scope, class, proto)?;
+    create_instance_in(scope, proto, init)
+}
+
+/// Like [`create_instance_with`], for an object whose prototype is `proto` instead of `T`'s
+/// registered prototype.
+pub fn create_instance_with_proto<'s, T: ClassDef>(
+    scope: &'s Scope<'_>,
+    proto: Object<'s>,
+    init: impl FnOnce(Object<'s>) -> T,
+) -> Result<T::Rooted<'s>, ExnThrown> {
+    create_instance_in(scope, proto, |obj| Ok(init(obj)))
+}
+
+fn create_instance_in<'s, T: ClassDef>(
+    scope: &'s Scope<'_>,
+    proto: Object<'s>,
+    init: impl FnOnce(Object<'s>) -> Result<T, ExnThrown>,
+) -> Result<T::Rooted<'s>, ExnThrown> {
+    let obj = Object::new_with_proto(scope, T::class(), proto)?;
     T::install_unforgeable(scope, obj)?;
     let data = init(obj)?;
     unsafe {
@@ -2584,7 +2557,10 @@ pub fn get_or_init_shared_object<'s>(
 
 /// Return, and create on the first call in a given global, an interned property key for `name`.
 ///
-/// `name` must not be an array index, whose property key is an integer rather than a string.
+/// # Panics
+///
+/// Panics if `name` is an array index, whose property key is an integer rather than a string, or
+/// isn't UTF-8.
 pub fn get_or_init_property_id<'s>(
     scope: &'s Scope<'_>,
     name: &'static CStr,
@@ -2632,34 +2608,22 @@ pub fn get_or_init_shared_function<'s>(
     unsafe { crate::Function::from_raw(scope, obj.as_raw()) }.ok_or(ExnThrown)
 }
 
-/// Read-and-increment a per-global monotonic `u64` counter keyed by `key`.
+/// Return the scope's global's `T`, which the first call on the global creates with
+/// `T::default()`.
 ///
-/// Returns the counter's current value and advances it (wrapping on overflow);
-/// counters start at 0. The counter lives on the global's [`ClassRegistry`], so
-/// every caller on a given global draws from one sequence — use this for ids a
-/// spec requires to be unique per global rather than per call site, such as
-/// HTML's setTimeout/setInterval ids, which must not collide across the
-/// concurrent event loops that share a single global.
-///
-/// `key` is an arbitrary namespace token; pass the address of a dedicated
-/// `static` to get a process-unique key, mirroring how shared functions key on
-/// their native pointer.
-///
-/// Note: the counter is a u64 instead of a u32 because otherwise it'd be possible
-/// (though implausible) for a long-running script to wrap the counter and reuse ids,
-/// which would violate the uniqueness guarantee. We convert the id to a JS value,
-/// which can represent about 53 bits of integer precision, making wrap-around
-/// effectively impossible.
-pub fn next_global_counter(scope: &Scope<'_>, key: usize) -> u64 {
-    // The bump is a HashMap entry plus an integer add — no JS-GC-capable call
-    // in between — so briefly holding the `&mut ClassRegistry` aliases nothing.
+/// The global holds the `T` until it is finalized. `T` must not hold GC things, since the global
+/// doesn't trace it.
+pub fn global_state<T: Default + 'static>(scope: &Scope<'_>) -> std::rc::Rc<T> {
+    // SAFETY: the scope's global is a live StarlingMonkey global. Nothing in between can run JS
+    // or GC, so the `&mut ClassRegistry` isn't aliased.
     let registry = unsafe { get_or_init_class_registry(scope.global().as_raw()) };
-    let counter = registry.bump_counter(key);
-    assert!(
-        counter < crate::conversion::Number::MAX,
-        "counter for key {key} wrapped around"
-    );
-    counter
+    let state = registry
+        .state
+        .entry(TypeId::of::<T>())
+        .or_insert_with(|| std::rc::Rc::new(T::default()));
+    std::rc::Rc::clone(state)
+        .downcast::<T>()
+        .expect("global state is keyed by its type")
 }
 
 // ---------------------------------------------------------------------------
@@ -2810,8 +2774,11 @@ unsafe extern "C" fn error_stack_getter<T: ClassDef>(
         return false;
     }
     let formatted = unsafe { mozjs::jsval::StringValue(&*formatted.get()) };
-    // SAFETY: as above.
-    unsafe { crate::object::set_reserved_slot(obj, ERROR_STACK_SLOT, &formatted) };
+    // SAFETY: as above. `obj` is read again from the rooted `this`, since formatting the stack can
+    // move it.
+    unsafe {
+        crate::object::set_reserved_slot(args.thisv().to_object(), ERROR_STACK_SLOT, &formatted)
+    };
     args.rval().set(formatted);
     true
 }
@@ -2831,7 +2798,7 @@ unsafe extern "C" fn error_stack_setter(cx: *mut RawJSContext, argc: u32, vp: *m
     let obj = Object::from_raw(&scope, this.to_object()).expect("objects are non-null");
     let attrs = crate::class_spec::JSPROP_ENUMERATE as std::ffi::c_uint;
     if obj
-        .define_property(&scope, c"stack", *args.get(0), attrs)
+        .define_property(&scope, c"stack", Handle::from_raw(args.get(0)), attrs)
         .is_err()
     {
         return false;
@@ -2929,7 +2896,7 @@ pub fn define_well_known_symbol_property<'s>(
 
 /// Adds an alias to the property given by `property` under the symbol `symbol` to the
 /// prototype of the builtin class `T`.
-pub fn add_symbol_alias<T: ClassDef>(scope: &Scope, property: &CStr, symbol: SymbolCode) {
+pub fn add_symbol_alias<T: ClassDef>(scope: &Scope, property: &'static CStr, symbol: SymbolCode) {
     let proto = get_prototype_object_for::<T>(scope).expect("prototype not found");
     let values = proto
         .get_property(scope, property)

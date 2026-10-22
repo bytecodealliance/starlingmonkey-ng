@@ -386,6 +386,7 @@ dependencies = [
  "shlex 2.0.1",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]

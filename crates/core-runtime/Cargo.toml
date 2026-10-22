@@ -20,6 +20,7 @@ oxc_resolver.workspace = true
 platform.workspace = true
 shlex = "2"
 tempfile = "3"
+url.workspace = true
 
 [lints]
 workspace = true

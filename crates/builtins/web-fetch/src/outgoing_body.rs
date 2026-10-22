@@ -374,16 +374,16 @@ fn pump_chunk_step(
     match Uint8Array::from_jsval(scope, chunk, ()) {
         // The spec's "a copy of chunk": the chunk's bytes are copied once, into the batch.
         Ok(array) => {
-            // SAFETY: the view's bytes are only read by the copy, which cannot run JS or trigger a
-            // GC.
-            let bytes = unsafe { array.as_array_buffer_view().bytes() };
-            // Appending to a batch reserves room up to the limit, so the batch is copied once
-            // rather than through every doubling of its capacity.
-            if !data.batch.is_empty() && data.batch.capacity() - data.batch.len() < bytes.len() {
-                let wanted = BATCH_LIMIT.max(data.batch.len() + bytes.len()) - data.batch.len();
-                data.batch.reserve_exact(wanted);
-            }
-            data.batch.extend_from_slice(bytes);
+            let batch = &mut data.batch;
+            array.as_array_buffer_view().with_bytes(|bytes| {
+                // Appending to a batch reserves room up to the limit, so the batch is copied once
+                // rather than through every doubling of its capacity.
+                if !batch.is_empty() && batch.capacity() - batch.len() < bytes.len() {
+                    let wanted = BATCH_LIMIT.max(batch.len() + bytes.len()) - batch.len();
+                    batch.reserve_exact(wanted);
+                }
+                batch.extend_from_slice(bytes);
+            });
         }
         Err(_) => {
             data.end = Some(StreamEnd::Errored(

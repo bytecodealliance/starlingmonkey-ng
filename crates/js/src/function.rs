@@ -38,7 +38,7 @@ use std::ffi::CStr;
 use std::os::raw::c_uint;
 use std::ptr::NonNull;
 
-use super::error::{report_error_ascii, ExnThrown};
+use super::error::{report_error_ascii, ExnThrown, ThrowException};
 use crate::builtins::JSType;
 use crate::conversion::ToJSVal;
 use crate::gc::handle::Stack;
@@ -181,13 +181,17 @@ impl<'s> Stack<'s, Function> {
     // Function calling
     // ---------------------------------------------------------------------------
 
-    /// Call a function value with the given `this` object and arguments.
+    /// Call a function value with the given `this` object and arguments. A `fval` that isn't
+    /// callable throws the `TypeError` of [`throw_not_callable`].
     pub fn call_value<'a>(
         scope: &'a Scope<'_>,
         this: HandleObject,
         fval: HandleValue,
         args: &[impl ToJSVal<'a>],
     ) -> Result<HandleValue<'a>, ExnThrown> {
+        if !is_callable(fval) {
+            return Err(throw_not_callable(scope, fval));
+        }
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
         let mut rval = scope.root_value_mut(UndefinedValue());
@@ -204,21 +208,32 @@ impl<'s> Stack<'s, Function> {
         Ok(rval.handle())
     }
 
-    /// Call a named method on an object.
+    /// Call a named method on an object. The method is looked up through the global's interned
+    /// key for `name` (see [`get_or_init_property_id`](crate::class::get_or_init_property_id)). A
+    /// property that isn't callable throws a `TypeError` that `name` is not a function. Panics if
+    /// `name` is an array index.
     pub fn call_by_name<'a>(
         scope: &'a Scope<'_>,
         obj: HandleObject,
-        name: &CStr,
+        name: &'static CStr,
         args: &[impl ToJSVal<'a>],
     ) -> Result<HandleValue<'a>, ExnThrown> {
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
+        let id = crate::class::get_or_init_property_id(scope, name)?;
+        let mut fval = scope.root_value_mut(UndefinedValue());
+        let ok = unsafe { wrappers2::JS_GetPropertyById(scope.cx_mut(), obj, id, fval.reborrow()) };
+        ExnThrown::check(ok)?;
+        if !is_callable(fval.handle()) {
+            let message = format!("{} is not a function", name.to_string_lossy());
+            return Err(crate::error::TypeError(message).throw(scope));
+        }
         let mut rval = scope.root_value_mut(UndefinedValue());
         let ok = unsafe {
-            wrappers2::JS_CallFunctionName(
+            wrappers2::JS_CallFunctionValue(
                 scope.cx_mut(),
                 obj,
-                name.as_ptr(),
+                fval.handle(),
                 &args.handles(),
                 rval.reborrow(),
             )
@@ -227,25 +242,24 @@ impl<'s> Stack<'s, Function> {
         Ok(rval.handle())
     }
 
-    /// Call a function object with a given `this` value.
+    /// Call a function object with a given `this` value. A `fun` that isn't callable throws the
+    /// `TypeError` of [`throw_not_callable`].
     pub fn call<'a>(
         scope: &'a Scope<'_>,
         this: impl ToJSVal<'a>,
         fun: impl ToJSVal<'a>,
         args: &[impl ToJSVal<'a>],
     ) -> Result<HandleValue<'a>, ExnThrown> {
+        let this = this.to_jsval_throwing(scope)?;
+        let fun = fun.to_jsval_throwing(scope)?;
+        if !is_callable(fun) {
+            return Err(throw_not_callable(scope, fun));
+        }
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
         let mut rval = scope.root_value_mut(UndefinedValue());
-        let ok = unsafe {
-            wrappers2::Call(
-                scope.cx_mut(),
-                this.to_jsval_throwing(scope)?,
-                fun.to_jsval_throwing(scope)?,
-                &args.handles(),
-                rval.reborrow(),
-            )
-        };
+        let ok =
+            unsafe { wrappers2::Call(scope.cx_mut(), this, fun, &args.handles(), rval.reborrow()) };
         ExnThrown::check(ok)?;
         Ok(rval.handle())
     }
@@ -256,16 +270,12 @@ impl<'s> Stack<'s, Function> {
         fun: impl ToJSVal<'s>,
         args: &[impl ToJSVal<'s>],
     ) -> Result<Object<'s>, ExnThrown> {
+        let fun = fun.to_jsval_throwing(scope)?;
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
         let mut result = scope.root_object_mut(std::ptr::null_mut());
         let ok = unsafe {
-            wrappers2::Construct1(
-                scope.cx_mut(),
-                fun.to_jsval_throwing(scope)?,
-                &args.handles(),
-                result.reborrow(),
-            )
+            wrappers2::Construct1(scope.cx_mut(), fun, &args.handles(), result.reborrow())
         };
         ExnThrown::check(ok)?;
         Object::from_handle(result.handle()).ok_or(ExnThrown)
@@ -278,13 +288,14 @@ impl<'s> Stack<'s, Function> {
         new_target: HandleObject,
         args: &[impl ToJSVal<'s>],
     ) -> Result<Object<'s>, ExnThrown> {
+        let fun = fun.to_jsval_throwing(scope)?;
         let mut args_root = ValueArrayRooter::new(args.len());
         let args = args_root.root(scope, args)?;
         let mut result = scope.root_object_mut(std::ptr::null_mut());
         let ok = unsafe {
             wrappers2::Construct(
                 scope.cx_mut(),
-                fun.to_jsval_throwing(scope)?,
+                fun,
                 new_target,
                 &args.handles(),
                 result.reborrow(),
@@ -383,6 +394,7 @@ impl<'s> Stack<'s, Function> {
         cb: Callback,
         payload: impl ToJSVal<'s>,
     ) -> Result<Self, ExnThrown> {
+        let payload = payload.to_jsval_throwing(scope)?;
         let fun = Self::new_with_reserved(scope, Some(callback_trampoline), nargs, flags, name)?;
 
         unsafe {
@@ -390,7 +402,7 @@ impl<'s> Stack<'s, Function> {
                 ReservedSlot::Slot0,
                 mozjs::jsval::PrivateValue(cb as *const std::ffi::c_void),
             );
-            fun.set_reserved(ReservedSlot::Slot1, payload.to_jsval_raw_throwing(scope)?);
+            fun.set_reserved(ReservedSlot::Slot1, payload.get());
         }
 
         Ok(fun)
@@ -569,6 +581,29 @@ impl<'a> CallbackArgs<'a> {
     }
 }
 
+/// Whether `value` is a callable object, as ECMAScript's `IsCallable` tests.
+#[inline]
+pub fn is_callable(value: HandleValue<'_>) -> bool {
+    // SAFETY: `value` is rooted, so an object it holds is live.
+    value.is_object() && unsafe { mozjs::jsapi::JS::IsCallable(value.to_object()) }
+}
+
+/// Throw the `TypeError` for a call of `value`, which isn't callable: `undefined`, or `value`'s
+/// source as `JS_ValueToSource` gives it, followed by `is not a function`.
+pub fn throw_not_callable(scope: &Scope<'_>, value: HandleValue<'_>) -> ExnThrown {
+    let source = if value.is_undefined() {
+        "undefined".to_string()
+    } else {
+        // SAFETY: `value` is rooted.
+        let source = unsafe { wrappers2::JS_ValueToSource(scope.cx_mut(), value) };
+        let Some(source) = NonNull::new(source) else {
+            return ExnThrown;
+        };
+        crate::conversion::jsstr_to_string(scope, source)
+    };
+    crate::error::TypeError(format!("{source} is not a function")).throw(scope)
+}
+
 /// Type-erased callback stored in a helper function's reserved slot.
 pub type Callback = fn(&Scope<'_>, CallbackArgs<'_>, HandleValue) -> Result<Value, ExnThrown>;
 
@@ -577,12 +612,12 @@ pub type Callback = fn(&Scope<'_>, CallbackArgs<'_>, HandleValue) -> Result<Valu
 /// # Panics
 ///
 /// Panics if `payload` is not an instance of `T`. The code that creates a
-/// callback also sets its payload, so a mismatch is a bug in that code.
+/// callback also sets its payload, so a mismatch indicates a bug in that code.
 pub fn cast_payload<'r, T>(scope: &'r Scope<'_>, payload: HandleValue<'_>) -> T
 where
     T: crate::builtins::CastTarget<'r, Output = T>,
 {
-    Object::from_value(scope, *payload)
+    Object::from_raw_value(scope, payload.get())
         .expect("callback payload is an object")
         .cast::<T>()
         .unwrap_or_else(|e| panic!("callback payload: {e}"))

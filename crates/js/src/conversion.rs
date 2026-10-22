@@ -50,7 +50,7 @@ use std::{mem, ptr};
 
 use crate::error::{throw_type_error, ExnThrown, ThrowException};
 use crate::gc::handle::Heap;
-use crate::heap::{MozHeap, Trace};
+use crate::heap::Trace;
 use crate::prelude::Scope;
 use crate::value;
 
@@ -132,6 +132,17 @@ impl_num!(f32, 0.0, f32::MIN, f32::MAX);
 impl_num!(f64, 0.0, f64::MIN, f64::MAX);
 
 /// A trait to convert Rust types to `JSVal`s.
+///
+/// Every implementing type is rooted or holds no GC thing, so a function that takes
+/// `impl ToJSVal` may run code that can GC before it converts the value. A raw `Value` doesn't
+/// implement it: root it first, or pass it to a function that takes a raw value, such as
+/// [`Object::from_raw_value`](crate::Object::from_raw_value).
+///
+/// ```compile_fail,E0277
+/// fn store(scope: &js::gc::scope::Scope<'_>, obj: js::Object<'_>, value: js::native::Value) {
+///     obj.set_property(scope, c"name", value).unwrap();
+/// }
+/// ```
 pub trait ToJSVal<'s> {
     /// Convert `self` to a rooted `HandleValue`.
     ///
@@ -283,7 +294,7 @@ where
 
     let rounded = d.signum() * d.abs().floor();
     if D::MIN.cast() <= rounded && rounded <= D::MAX.cast() {
-        Ok(rounded.cast())
+        Ok(As::<D>::cast(rounded))
     } else {
         throw_type_error(scope, c"value out of range in an EnforceRange argument");
         Err(())
@@ -325,7 +336,7 @@ where
     // the correct result. If N is even, plus or minus N is the correct result.
     let to_truncate = if d < 0.0 { d - 0.5 } else { d + 0.5 };
 
-    let mut truncated: D = to_truncate.cast();
+    let mut truncated: D = As::<D>::cast(to_truncate);
 
     if truncated.cast() == to_truncate {
         // It was a tie (since moving away from 0 by 0.5 gave us the exact integer
@@ -362,13 +373,6 @@ impl FromJSVal<'_, '_> for JSVal {
     }
 }
 
-impl<'s> ToJSVal<'s> for JSVal {
-    #[inline]
-    fn to_jsval_raw(&self, _scope: &'_ Scope<'_>) -> Result<JS::Value, ConversionError> {
-        Ok(*self)
-    }
-}
-
 impl<'s> FromJSVal<'s, 's> for HandleValue<'s> {
     type Config = ();
     fn from_jsval(
@@ -384,18 +388,6 @@ impl<'s> ToJSVal<'s> for HandleValue<'s> {
     #[inline]
     fn to_jsval(&self, _scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ConversionError> {
         Ok(*self)
-    }
-
-    #[inline]
-    fn to_jsval_raw(&self, _scope: &'_ Scope<'_>) -> Result<JS::Value, ConversionError> {
-        Ok(self.get())
-    }
-}
-
-impl<'s> ToJSVal<'s> for MozHeap<JSVal> {
-    #[inline]
-    fn to_jsval(&self, scope: &'s Scope<'_>) -> Result<HandleValue<'s>, ConversionError> {
-        Ok(scope.root_value(self.get()))
     }
 
     #[inline]
@@ -1004,10 +996,8 @@ fn for_of_iterator_slot(scope: &Scope<'_>) -> ForOfIterator {
 
 /// Drive the ES `for...of` protocol over `value`, calling `f` for each element.
 ///
-/// This owns the backing [`ForOfIterator`], so it pins and roots it correctly
-/// for the whole iteration; callers never touch the raw rooting machinery and
-/// cannot observe a half-rooted iterator. SpiderMonkey's array fast path is
-/// preserved, since the engine's own iterator is used.
+/// SpiderMonkey's array fast path applies, since the engine's own iterator is
+/// used.
 ///
 /// Returns `Ok(true)` once iteration completes, or `Ok(false)` if `value` is
 /// not iterable. `f` receives a handle to a value slot that is reused across

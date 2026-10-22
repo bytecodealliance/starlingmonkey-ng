@@ -84,25 +84,22 @@ fn evaluate_with_options<'s>(
     lineno: u32,
     non_syntactic_scope: bool,
 ) -> Result<HandleValue<'s>, ExnThrown> {
-    let filename_cstr =
-        CString::new(filename).unwrap_or_else(|_| CString::new("<unknown>").unwrap());
-    let options = options(scope, filename_cstr, lineno);
+    let options = options(scope, filename_or_unknown(filename), lineno);
     if non_syntactic_scope {
-        // SAFETY: `options.ptr` is a valid pointer created by `NewCompileOptions`.
-        // We are setting the `nonSyntacticScope` field on the base
-        // `TransitiveCompileOptions` struct, which is safe because the pointer
-        // is valid and we own it exclusively.
+        // SAFETY: `options.ptr` is a valid pointer created by `NewCompileOptions`, owned by
+        // `options`.
         unsafe {
             (*options.ptr)._base.nonSyntacticScope = non_syntactic_scope;
         }
     }
     let mut source = transform_str_to_source_text(script);
-    // SAFETY: we're calling into SpiderMonkey with valid compile options and source.
-    let mut rval = scope.root_value_mut(crate::value::undefined());
-    let ok =
-        unsafe { wrappers2::Evaluate2(scope.cx_mut(), options.ptr, &mut source, rval.reborrow()) };
-    ExnThrown::check(ok)?;
-    Ok(rval.handle())
+    // SAFETY: the options and the source are valid.
+    unsafe { evaluate_utf8_raw(scope, options.ptr, &mut source) }
+}
+
+/// Returns `filename` as a C string, or `<unknown>` if it contains a NUL.
+fn filename_or_unknown(filename: &str) -> CString {
+    CString::new(filename).unwrap_or_else(|_| c"<unknown>".into())
 }
 
 /// Evaluate a UTF-16 script and return its completion value.
@@ -190,14 +187,10 @@ pub fn compile_with_filename<'s>(
     filename: &str,
     lineno: u32,
 ) -> Result<Handle<'s, *mut JSScript>, ExnThrown> {
-    let filename_cstr =
-        CString::new(filename).unwrap_or_else(|_| CString::new("<unknown>").unwrap());
-    let options = options(scope, filename_cstr, lineno);
+    let options = options(scope, filename_or_unknown(filename), lineno);
     let mut source = transform_str_to_source_text(script);
-    let script = unsafe { wrappers2::Compile1(scope.cx_mut(), options.ptr, &mut source) };
-    NonNull::new(script)
-        .map(|p| scope.root_script(p))
-        .ok_or(ExnThrown)
+    // SAFETY: the options and the source are valid.
+    unsafe { compile_raw(scope, options.ptr, &mut source) }
 }
 
 /// Compile a UTF-16 script into a `JSScript` without executing it.

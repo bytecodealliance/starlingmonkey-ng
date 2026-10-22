@@ -39,13 +39,6 @@ use mozjs::rust::Runtime;
 /// This error type carries no data — it simply signals that a SpiderMonkey
 /// operation failed and an exception is pending. Use [`ExnThrown::capture`] to
 /// extract details into a [`CapturedError`].
-///
-/// # Why a unit struct?
-///
-/// Most code only needs to propagate errors with `?`. The heavy lifting of
-/// extracting error messages, filenames, and stack traces is deferred to the
-/// few call sites that actually need it (e.g., error reporters, REPL shells).
-/// This keeps `Result<T, ExnThrown>` zero-cost in the common case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExnThrown;
 

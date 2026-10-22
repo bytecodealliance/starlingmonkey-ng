@@ -6,17 +6,25 @@
 //! - `#[webidl_union]` (union)
 //! - `AsyncSequence` (async iterable)
 
+// This file contains nothing platform-specific, so skip it on wasm32.
+#![cfg(not(target_arch = "wasm32"))]
+
+/// Run [`eval_with_setup`](core_runtime::test_util::eval_with_setup) on `code` with `r(f)`
+/// defined. `r(f)` returns `String(f())`, or `throws:` followed by the constructor name of the
+/// exception `f` threw.
+fn eval_outcomes(setup: impl FnOnce(), code: &str) -> String {
+    let prelude =
+        "const r = f => { try { return String(f()); } catch (e) { return `throws:${e.constructor.name}`; } };";
+    core_runtime::test_util::eval_with_setup(setup, &format!("{prelude}\n{code}"))
+}
+
 // ============================================================================
 // Vec<T> (sequence) tests
 // ============================================================================
 
-// This file contains nothing platform-specific, so skip it on wasm32.
-#![cfg(not(target_arch = "wasm32"))]
-
 mod sequence_tests {
     use core_runtime::jsclass;
     use core_runtime::jsmethods;
-    use core_runtime::test_util::{eval_with_setup, throws_with_setup};
 
     #[jsclass]
     struct SeqAcceptor {}
@@ -57,18 +65,7 @@ mod sequence_tests {
     }
 
     fn eval(code: &str) -> String {
-        eval_with_setup(
-            || {
-                core_runtime::runtime::register_global_initializer(|scope, global| {
-                    SeqAcceptor::add_to_global(scope, global);
-                });
-            },
-            code,
-        )
-    }
-
-    fn throws(code: &str) -> bool {
-        throws_with_setup(
+        super::eval_outcomes(
             || {
                 core_runtime::runtime::register_global_initializer(|scope, global| {
                     SeqAcceptor::add_to_global(scope, global);
@@ -79,61 +76,30 @@ mod sequence_tests {
     }
 
     #[test]
-    fn join_string_array() {
+    fn sequences_convert_from_any_iterable() {
         assert_eq!(
-            eval("new SeqAcceptor().joinStrings(['a', 'b', 'c'])"),
-            "a,b,c"
+            eval(
+                "const s = new SeqAcceptor();
+                 [r(() => s.joinStrings(['a', 'b'])), r(() => s.joinStrings([])),
+                  r(() => s.sumInts([1, 2, 3])), r(() => s.joinStrings(new Set(['x', 'y']))),
+                  r(() => SeqAcceptor.count(['a', 'b'])), r(() => s.joinStrings(42))].join('|')"
+            ),
+            "a,b||6|x,y|2|throws:TypeError"
         );
     }
 
+    /// `null` is a present value, which isn't iterable. Only `undefined` makes the argument
+    /// absent.
     #[test]
-    fn join_empty_array() {
-        assert_eq!(eval("new SeqAcceptor().joinStrings([])"), "");
-    }
-
-    #[test]
-    fn sum_int_array() {
-        assert_eq!(eval("new SeqAcceptor().sumInts([1, 2, 3])"), "6");
-    }
-
-    #[test]
-    fn sum_empty_array() {
-        assert_eq!(eval("new SeqAcceptor().sumInts([])"), "0");
-    }
-
-    #[test]
-    fn optional_seq_present() {
-        assert_eq!(eval("new SeqAcceptor().optionalSeq(['x', 'y'])"), "x,y");
-    }
-
-    #[test]
-    fn optional_seq_null_throws() {
-        // `null` is a present value (not absent); converting it to a sequence throws (not iterable).
-        assert!(throws("new SeqAcceptor().optionalSeq(null)"));
-    }
-
-    #[test]
-    fn optional_seq_undefined() {
-        assert_eq!(eval("new SeqAcceptor().optionalSeq(undefined)"), "none");
-    }
-
-    #[test]
-    fn static_count() {
-        assert_eq!(eval("SeqAcceptor.count(['a', 'b'])"), "2");
-    }
-
-    #[test]
-    fn iterable_protocol() {
-        // Any iterable should work, not just arrays.
+    fn optional_sequences_are_absent_only_for_undefined() {
         assert_eq!(
-            eval("new SeqAcceptor().joinStrings(new Set(['x', 'y']))"),
-            "x,y"
+            eval(
+                "const s = new SeqAcceptor();
+                 [r(() => s.optionalSeq(['x', 'y'])), r(() => s.optionalSeq(undefined)),
+                  r(() => s.optionalSeq(null))].join('|')"
+            ),
+            "x,y|none|throws:TypeError"
         );
-    }
-
-    #[test]
-    fn non_iterable_throws() {
-        assert!(throws("new SeqAcceptor().joinStrings(42)"));
     }
 }
 
@@ -144,7 +110,6 @@ mod sequence_tests {
 mod record_tests {
     use core_runtime::jsclass;
     use core_runtime::jsmethods;
-    use core_runtime::test_util::{eval_with_setup, throws_with_setup};
     use js::Record;
 
     #[jsclass]
@@ -186,7 +151,7 @@ mod record_tests {
     }
 
     fn eval(code: &str) -> String {
-        eval_with_setup(
+        super::eval_outcomes(
             || {
                 core_runtime::runtime::register_global_initializer(|scope, global| {
                     RecordAcceptor::add_to_global(scope, global);
@@ -196,113 +161,35 @@ mod record_tests {
         )
     }
 
-    fn throws(code: &str) -> bool {
-        throws_with_setup(
-            || {
-                core_runtime::runtime::register_global_initializer(|scope, global| {
-                    RecordAcceptor::add_to_global(scope, global);
-                });
-            },
-            code,
-        )
-    }
-
+    /// Every enumerable own key is converted to the key type, integer keys first in ascending
+    /// order, and a symbol key throws. Non-enumerable keys are skipped. `null` is a present value,
+    /// which isn't an object.
     #[test]
-    fn record_keys() {
-        assert_eq!(eval("new RecordAcceptor().keys({a: '1', b: '2'})"), "a,b");
-    }
-
-    #[test]
-    fn record_values() {
-        assert_eq!(
-            eval("new RecordAcceptor().values({x: 'hello', y: 'world'})"),
-            "hello,world"
-        );
-    }
-
-    #[test]
-    fn record_preserves_insertion_order() {
-        assert_eq!(
-            eval("new RecordAcceptor().keys({z: '1', a: '2', m: '3'})"),
-            "z,a,m"
-        );
-    }
-
-    #[test]
-    fn empty_record() {
-        assert_eq!(eval("new RecordAcceptor().keys({})"), "");
-    }
-
-    #[test]
-    fn optional_record_present() {
-        assert_eq!(eval("new RecordAcceptor().optionalRecord({k: 'v'})"), "k");
-    }
-
-    #[test]
-    fn optional_record_null_throws() {
-        // Per WebIDL, only `undefined`/a missing argument makes an optional argument absent; `null`
-        // is a present value, and converting it to a record throws (record conversion requires an
-        // object).
-        assert!(throws("new RecordAcceptor().optionalRecord(null)"));
-    }
-
-    #[test]
-    fn record_roundtrip_non_ascii_keys() {
-        // Keys must survive the JS→Rust→JS round trip; a Latin-1 write of
-        // the UTF-8 key bytes would mojibake the property name.
+    fn records_convert_enumerable_own_keys_in_order() {
         assert_eq!(
             eval(
-                "const r = new RecordAcceptor().echo({'é🦊': 'vé'}); \
-                 Object.keys(r).join(',') + ':' + r['é🦊']"
+                "const a = new RecordAcceptor();
+                 const sym = {a: '1'}; sym[Symbol('x')] = '2';
+                 const hidden = {a: '1'};
+                 Object.defineProperty(hidden, 'b', {value: '2', enumerable: false});
+                 [r(() => a.keys({z: '1', a: '2', m: '3'})), r(() => a.values({x: 'hi', y: 'yo'})),
+                  r(() => a.keys({})), r(() => a.keys({1: 'a', 0: 'b'})), r(() => a.keys(hidden)),
+                  r(() => a.keys(sym)), r(() => a.keys(42)), r(() => a.optionalRecord({k: 'v'})),
+                  r(() => a.optionalRecord(null))].join('|')"
             ),
-            "é🦊:vé"
+            "z,a,m|hi,yo||0,1|a|throws:TypeError|throws:TypeError|k|throws:TypeError"
         );
     }
 
+    /// Non-ASCII and NUL code units in keys survive the round trip through Rust.
     #[test]
-    fn record_roundtrip_interior_nul_key() {
-        // A NUL is a legal property-name code unit; a C-string write would
-        // fail and surface as a phantom exception.
+    fn record_keys_round_trip() {
         assert_eq!(
             eval(
-                "const r = new RecordAcceptor().echo({'a\\u0000b': 'v'}); \
-                 Object.keys(r).map(k => k.length).join(',') + ':' + r['a\\u0000b']"
+                "const e = new RecordAcceptor().echo({'é🦊': 'vé', 'a\\u0000b': 'v'}); \
+                 Object.keys(e).map(k => k.length).join(',') + ':' + e['é🦊'] + e['a\\u0000b']"
             ),
-            "3:v"
-        );
-    }
-
-    #[test]
-    fn non_object_throws() {
-        assert!(throws("new RecordAcceptor().keys(42)"));
-    }
-
-    #[test]
-    fn symbol_keys_throw() {
-        // Per WebIDL es-record, every enumerable own key — including symbols — is converted to the
-        // key type. Converting a Symbol to a string throws a TypeError, so an enumerable
-        // symbol-keyed property makes the whole conversion throw.
-        assert!(throws(
-            "let o = {a: '1'}; o[Symbol('x')] = '2'; new RecordAcceptor().keys(o)"
-        ));
-    }
-
-    #[test]
-    fn integer_keys_kept() {
-        // Integer-index property keys are own enumerable keys; per WebIDL they are converted to
-        // their string form and kept (the [[OwnPropertyKeys]] order lists them first, in ascending
-        // numeric order), not skipped.
-        assert_eq!(eval("new RecordAcceptor().keys({1: 'a', 0: 'b'})"), "0,1");
-    }
-
-    #[test]
-    fn skips_non_enumerable_keys() {
-        assert_eq!(
-            eval(
-                "let o = {a: '1'}; Object.defineProperty(o, 'b', {value: '2', enumerable: false}); \
-                 new RecordAcceptor().keys(o)"
-            ),
-            "a"
+            "3,3:vév"
         );
     }
 }
@@ -314,7 +201,6 @@ mod record_tests {
 mod union_tests {
     use core_runtime::jsclass;
     use core_runtime::jsmethods;
-    use core_runtime::test_util::eval_with_setup;
     use core_runtime::webidl_union;
 
     #[webidl_union]
@@ -396,7 +282,7 @@ mod union_tests {
     }
 
     fn eval(code: &str) -> String {
-        eval_with_setup(
+        super::eval_outcomes(
             || {
                 core_runtime::runtime::register_global_initializer(|scope, global| {
                     UnionAcceptor::add_to_global(scope, global);
@@ -406,86 +292,21 @@ mod union_tests {
         )
     }
 
+    /// A number picks the numeric member and a boolean the boolean member over a string member.
+    /// `null` is a present value, which the string member converts. Without a string member, the
+    /// numeric member is the fallback, and without either, the boolean member is.
     #[test]
-    fn string_or_long_with_number() {
-        assert_eq!(eval("new UnionAcceptor().stringOrLong(42)"), "long:42");
-    }
-
-    #[test]
-    fn string_or_long_with_string() {
+    fn unions_pick_the_member_the_value_converts_to() {
         assert_eq!(
-            eval("new UnionAcceptor().stringOrLong('hello')"),
-            "string:hello"
-        );
-    }
-
-    #[test]
-    fn string_or_bool_with_true() {
-        assert_eq!(eval("new UnionAcceptor().stringOrBool(true)"), "bool:true");
-    }
-
-    #[test]
-    fn string_or_bool_with_string() {
-        assert_eq!(
-            eval("new UnionAcceptor().stringOrBool('test')"),
-            "string:test"
-        );
-    }
-
-    #[test]
-    fn optional_union_null() {
-        // `null` is a present value (not absent); a union with a string member converts null via
-        // that member, yielding "null".
-        assert_eq!(
-            eval("new UnionAcceptor().optionalUnion(null)"),
-            "string:null"
-        );
-    }
-
-    #[test]
-    fn optional_union_undefined() {
-        assert_eq!(eval("new UnionAcceptor().optionalUnion(undefined)"), "none");
-    }
-
-    #[test]
-    fn optional_union_with_value() {
-        assert_eq!(eval("new UnionAcceptor().optionalUnion(99)"), "long:99");
-    }
-
-    #[test]
-    fn number_priority_over_string() {
-        // When a value is a number and union includes both numeric and string,
-        // numeric should take priority per spec.
-        assert_eq!(eval("new UnionAcceptor().stringOrLong(3.14)"), "long:3");
-    }
-
-    #[test]
-    fn boolean_priority_over_string() {
-        // Boolean should take priority over string per spec.
-        assert_eq!(
-            eval("new UnionAcceptor().stringOrBool(false)"),
-            "bool:false"
-        );
-    }
-
-    #[test]
-    fn numeric_fallback_without_string_member() {
-        // BoolOrLong has no string member, so a non-boolean value coerces to the
-        // numeric member via ToNumber (WebIDL §3.2.25 fallback).
-        assert_eq!(eval("new UnionAcceptor().boolOrLong('5')"), "long:5");
-        assert_eq!(eval("new UnionAcceptor().boolOrLong(7)"), "long:7");
-        assert_eq!(eval("new UnionAcceptor().boolOrLong(true)"), "bool:true");
-    }
-
-    #[test]
-    fn boolean_fallback_without_string_or_numeric_member() {
-        // SeqOrBool has neither a string nor a numeric member, so a non-iterable
-        // value coerces to the boolean member via ToBoolean.
-        assert_eq!(eval("new UnionAcceptor().seqOrBool(5)"), "flag:true");
-        assert_eq!(eval("new UnionAcceptor().seqOrBool(0)"), "flag:false");
-        assert_eq!(
-            eval("new UnionAcceptor().seqOrBool(['a', 'b', 'c'])"),
-            "seq:3"
+            eval(
+                "const u = new UnionAcceptor();
+                 [u.stringOrLong(3.14), u.stringOrLong('hello'), u.stringOrBool(false),
+                  u.stringOrBool('test'), u.optionalUnion(null), u.optionalUnion(undefined),
+                  u.optionalUnion(99), u.boolOrLong('5'), u.boolOrLong(true), u.seqOrBool(5),
+                  u.seqOrBool(0), u.seqOrBool(['a', 'b'])].join('|')"
+            ),
+            "long:3|string:hello|bool:false|string:test|string:null|none|long:99|long:5|bool:true|\
+             flag:true|flag:false|seq:2"
         );
     }
 }
@@ -493,7 +314,6 @@ mod union_tests {
 mod union_lifetime_tests {
     use core_runtime::jsclass;
     use core_runtime::jsmethods;
-    use core_runtime::test_util::{eval_with_setup, throws_with_setup};
     use core_runtime::webidl_union;
     use js::ArrayBuffer;
     use js::Object;
@@ -551,7 +371,7 @@ mod union_lifetime_tests {
     }
 
     fn eval(code: &str) -> String {
-        eval_with_setup(
+        super::eval_outcomes(
             || {
                 core_runtime::runtime::register_global_initializer(|scope, global| {
                     LifetimeUnionAcceptor::add_to_global(scope, global);
@@ -561,99 +381,23 @@ mod union_lifetime_tests {
         )
     }
 
-    fn throws(code: &str) -> bool {
-        throws_with_setup(
-            || {
-                core_runtime::runtime::register_global_initializer(|scope, global| {
-                    LifetimeUnionAcceptor::add_to_global(scope, global);
-                });
-            },
-            code,
-        )
-    }
-
+    /// A value that doesn't match the `ArrayBuffer` member falls back to the string member. The
+    /// members are tried in declaration order. A union without a fallback member throws.
     #[test]
-    fn buffer_variant_with_array_buffer() {
+    fn unions_with_rooted_members_convert() {
         assert_eq!(
-            eval("new LifetimeUnionAcceptor().bufferOrString(new ArrayBuffer(8))"),
-            "buffer:8"
+            eval(
+                "const u = new LifetimeUnionAcceptor();
+                 [r(() => u.bufferOrString(new ArrayBuffer(8))), r(() => u.bufferOrString(42)),
+                  r(() => u.bufferOrString({})), r(() => u.optionalBufferOrString(null)),
+                  r(() => u.optionalBufferOrString(undefined)),
+                  r(() => u.optionalBufferOrString(new ArrayBuffer(4))),
+                  r(() => u.bufferOrObject(new ArrayBuffer(16))), r(() => u.bufferOrObject({a: 1})),
+                  r(() => u.bufferOrObject('not an object'))].join('|')"
+            ),
+            "buffer:8|string:42|string:[object Object]|string:null|none|buffer:4|buffer:16|object|\
+             throws:TypeError"
         );
-    }
-
-    #[test]
-    fn string_variant_with_string() {
-        assert_eq!(
-            eval("new LifetimeUnionAcceptor().bufferOrString('hello')"),
-            "string:hello"
-        );
-    }
-
-    #[test]
-    fn string_variant_with_number() {
-        // No numeric branch is declared, so the string fallback applies.
-        assert_eq!(
-            eval("new LifetimeUnionAcceptor().bufferOrString(42)"),
-            "string:42"
-        );
-    }
-
-    #[test]
-    fn string_variant_when_object_does_not_match_buffer() {
-        // Plain objects don't satisfy the ArrayBuffer branch and fall through
-        // to the string fallback (after `Object.prototype.toString`).
-        assert_eq!(
-            eval("new LifetimeUnionAcceptor().bufferOrString({})"),
-            "string:[object Object]"
-        );
-    }
-
-    #[test]
-    fn optional_buffer_or_string_null() {
-        // `null` is a present value (not absent); a union with a string member converts null via
-        // that member, yielding "null".
-        assert_eq!(
-            eval("new LifetimeUnionAcceptor().optionalBufferOrString(null)"),
-            "string:null"
-        );
-    }
-
-    #[test]
-    fn optional_buffer_or_string_undefined() {
-        assert_eq!(
-            eval("new LifetimeUnionAcceptor().optionalBufferOrString(undefined)"),
-            "none"
-        );
-    }
-
-    #[test]
-    fn optional_buffer_or_string_with_buffer() {
-        assert_eq!(
-            eval("new LifetimeUnionAcceptor().optionalBufferOrString(new ArrayBuffer(4))"),
-            "buffer:4"
-        );
-    }
-
-    #[test]
-    fn declared_order_picks_buffer_first() {
-        assert_eq!(
-            eval("new LifetimeUnionAcceptor().bufferOrObject(new ArrayBuffer(16))"),
-            "buffer:16"
-        );
-    }
-
-    #[test]
-    fn declared_order_falls_back_to_object() {
-        assert_eq!(
-            eval("new LifetimeUnionAcceptor().bufferOrObject({a: 1})"),
-            "object"
-        );
-    }
-
-    #[test]
-    fn buffer_or_object_throws_on_non_object() {
-        assert!(throws(
-            "new LifetimeUnionAcceptor().bufferOrObject('not an object')"
-        ));
     }
 }
 
@@ -664,7 +408,6 @@ mod union_lifetime_tests {
 mod union_sequence_record_tests {
     use core_runtime::jsclass;
     use core_runtime::jsmethods;
-    use core_runtime::test_util::{eval_with_setup, throws_with_setup};
     use core_runtime::webidl_union;
     use js::conversion::Record;
 
@@ -712,7 +455,7 @@ mod union_sequence_record_tests {
     }
 
     fn eval(code: &str) -> String {
-        eval_with_setup(
+        super::eval_outcomes(
             || {
                 core_runtime::runtime::register_global_initializer(|scope, global| {
                     SeqRecordAcceptor::add_to_global(scope, global);
@@ -722,71 +465,21 @@ mod union_sequence_record_tests {
         )
     }
 
-    fn throws(code: &str) -> bool {
-        throws_with_setup(
-            || {
-                core_runtime::runtime::register_global_initializer(|scope, global| {
-                    SeqRecordAcceptor::add_to_global(scope, global);
-                });
-            },
-            code,
-        )
-    }
-
+    /// An iterable picks the sequence member, and then an element that isn't a sequence, or an
+    /// iterator that throws, makes the conversion throw rather than fall through to the record.
     #[test]
-    fn array_of_pairs_picks_sequence() {
-        assert_eq!(
-            eval("new SeqRecordAcceptor().classify([['a','1'], ['b','2']])"),
-            "pairs:a=1&b=2"
-        );
-    }
-
-    #[test]
-    fn plain_object_picks_record() {
-        assert_eq!(
-            eval("new SeqRecordAcceptor().classify({a:'1', b:'2'})"),
-            "record:a=1&b=2"
-        );
-    }
-
-    #[test]
-    fn string_picks_string() {
-        assert_eq!(
-            eval("new SeqRecordAcceptor().classify('hello')"),
-            "string:hello"
-        );
-    }
-
-    #[test]
-    fn custom_iterable_picks_sequence() {
-        // A non-Array iterable with @@iterator must still be routed to the
-        // sequence branch.
+    fn sequence_or_record_unions_pick_by_iterability() {
         assert_eq!(
             eval(
-                "let it = { [Symbol.iterator]: function*() { yield ['a','1']; yield ['b','2']; } };\
-                 new SeqRecordAcceptor().classify(it)"
+                "const a = new SeqRecordAcceptor();
+                 const it = { [Symbol.iterator]: function*() { yield ['a','1']; yield ['b','2']; } };
+                 const bad = { [Symbol.iterator]() { return { next() { throw new Error('boom'); } }; } };
+                 [r(() => a.classify([['a','1'], ['b','2']])), r(() => a.classify({a:'1', b:'2'})),
+                  r(() => a.classify('hello')), r(() => a.classify(it)), r(() => a.classify([1, 2])),
+                  r(() => a.classify(bad))].join('|')"
             ),
-            "pairs:a=1&b=2"
+            "pairs:a=1&b=2|record:a=1&b=2|string:hello|pairs:a=1&b=2|throws:TypeError|throws:Error"
         );
-    }
-
-    #[test]
-    fn iterable_with_non_iterable_element_throws() {
-        // WebIDL §3.2.25: once @@iterator is detected the sequence branch is
-        // selected; if an element can't be converted to the inner sequence
-        // type, the conversion *throws* — it does not silently fall through
-        // to the record branch.
-        assert!(throws("new SeqRecordAcceptor().classify([1, 2])"));
-    }
-
-    #[test]
-    fn iterable_throwing_iterator_propagates() {
-        // If the iterator throws, the failure propagates as an exception
-        // rather than being silently swallowed.
-        assert!(throws(
-            "let it = { [Symbol.iterator]: function() { return { next() { throw new Error('boom'); } }; } };\
-             new SeqRecordAcceptor().classify(it)"
-        ));
     }
 }
 
@@ -797,7 +490,6 @@ mod union_sequence_record_tests {
 mod async_sequence_tests {
     use core_runtime::jsclass;
     use core_runtime::jsmethods;
-    use core_runtime::test_util::{eval_with_setup, throws_with_setup};
     use js::AsyncSequence;
 
     #[jsclass]
@@ -827,7 +519,7 @@ mod async_sequence_tests {
     }
 
     fn eval(code: &str) -> String {
-        eval_with_setup(
+        super::eval_outcomes(
             || {
                 core_runtime::runtime::register_global_initializer(|scope, global| {
                     AsyncAcceptor::add_to_global(scope, global);
@@ -837,82 +529,24 @@ mod async_sequence_tests {
         )
     }
 
-    fn throws(code: &str) -> bool {
-        throws_with_setup(
-            || {
-                core_runtime::runtime::register_global_initializer(|scope, global| {
-                    AsyncAcceptor::add_to_global(scope, global);
-                });
-            },
-            code,
-        )
-    }
-
+    /// A getter of `Symbol.asyncIterator` that throws, and a non-callable `Symbol.asyncIterator`,
+    /// throw rather than fall back to `Symbol.iterator`.
     #[test]
-    fn sync_iterable_detected() {
-        // Arrays have Symbol.iterator but not Symbol.asyncIterator.
-        assert_eq!(eval("new AsyncAcceptor().isAsync([1, 2, 3])"), "false");
-    }
-
-    #[test]
-    fn async_iterable_detected() {
+    fn async_sequences_detect_async_iterables() {
         assert_eq!(
             eval(
-                "let obj = { [Symbol.asyncIterator]() { return { next() { return { done: true } } } } }; \
-                 new AsyncAcceptor().isAsync(obj)"
+                "const a = new AsyncAcceptor();
+                 const sync = { [Symbol.iterator]() { return { next() { return { done: true } } } } };
+                 const asyncIt = { [Symbol.asyncIterator]() { return { next() { return { done: true } } } } };
+                 const trap = { get [Symbol.asyncIterator]() { throw new RangeError('trap') }, \
+                                [Symbol.iterator]: sync[Symbol.iterator] };
+                 const notCallable = { [Symbol.asyncIterator]: 42, [Symbol.iterator]: sync[Symbol.iterator] };
+                 [r(() => a.isAsync([1, 2])), r(() => a.isAsync(asyncIt)), r(() => a.optionalAsync([1])),
+                  r(() => a.optionalAsync(null)), r(() => a.isAsync(42)), r(() => a.isAsync({})),
+                  r(() => a.isAsync(trap)), r(() => a.isAsync(notCallable))].join('|')"
             ),
-            "true"
-        );
-    }
-
-    #[test]
-    fn optional_null_throws() {
-        // Per WebIDL, only `undefined`/a missing argument makes an optional argument absent; `null`
-        // is a present value, and converting it to a sequence/async iterable throws (null is not
-        // iterable).
-        assert!(throws("new AsyncAcceptor().optionalAsync(null)"));
-    }
-
-    #[test]
-    fn optional_with_iterable() {
-        assert_eq!(eval("new AsyncAcceptor().optionalAsync([1])"), "sync");
-    }
-
-    #[test]
-    fn non_iterable_throws() {
-        assert!(throws("new AsyncAcceptor().isAsync(42)"));
-    }
-
-    #[test]
-    fn plain_object_throws() {
-        assert!(throws("new AsyncAcceptor().isAsync({})"));
-    }
-
-    #[test]
-    fn throwing_getter_propagates() {
-        // GetMethod: a Get error propagates; it must not be swallowed and
-        // fall back to Symbol.iterator.
-        assert_eq!(
-            eval(
-                "let o = { get [Symbol.asyncIterator]() { throw new Error('trap') }, \
-                           [Symbol.iterator]() { return { next() { return { done: true } } } } }; \
-                 try { new AsyncAcceptor().isAsync(o); 'no throw' } catch (e) { e.message }"
-            ),
-            "trap"
-        );
-    }
-
-    #[test]
-    fn non_callable_method_throws() {
-        // GetMethod: a present, non-callable method is a TypeError, not a
-        // fallback to Symbol.iterator.
-        assert_eq!(
-            eval(
-                "let o = { [Symbol.asyncIterator]: 42, \
-                           [Symbol.iterator]() { return { next() { return { done: true } } } } }; \
-                 try { new AsyncAcceptor().isAsync(o); 'no throw' } catch (e) { e.constructor.name }"
-            ),
-            "TypeError"
+            "false|true|sync|throws:TypeError|throws:TypeError|throws:TypeError|throws:RangeError|\
+             throws:TypeError"
         );
     }
 }

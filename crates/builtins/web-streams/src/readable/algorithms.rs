@@ -2292,7 +2292,7 @@ fn byte_tee_forward_rejected(
     let r = args.get(0);
     // If _thisReader_ is not _reader_ (the current reader), return.
     let this_reader =
-        Object::from_value(scope, *this_reader_v).expect("payload reader is an object");
+        Object::from_raw_value(scope, this_reader_v.get()).expect("payload reader is an object");
     let current = byte_tee_reader(scope, state).as_object();
     if this_reader.as_raw() != current.as_raw() {
         return Ok(value::undefined());
@@ -4315,14 +4315,7 @@ fn copy_data_block_bytes(
     if count == 0 {
         return;
     }
-    // SAFETY: `dest` and `src` are distinct live, non-detached `ArrayBuffer`s
-    // (the descriptor's buffer and a queue entry's buffer); no GC runs during
-    // the memcpy, and the ranges are bounds-checked by the slice indexing.
-    unsafe {
-        let d = dest.bytes_mut();
-        let s = src.bytes();
-        d[dest_start..dest_start + count].copy_from_slice(&s[src_start..src_start + count]);
-    }
+    dest.copy_region_from(dest_start, src, src_start, count);
 }
 
 /// The descriptor's `buffer` slot as a rooted `ArrayBuffer`.

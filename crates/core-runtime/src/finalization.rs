@@ -70,8 +70,8 @@ pub fn install(cx: &mut JSContext) {
 /// A callback that throws leaves the remaining ones to run: its exception is
 /// reported and cleared.
 pub fn run_pending(scope: &Scope<'_>) {
-    // Taken one at a time so the undrained functions stay in the traced queue
-    // through any GC a callback triggers.
+    // Take the functions one at a time, so the undrained functions stay in the
+    // traced queue through any GC a callback triggers.
     while let Some(fval) =
         with_pending(|cell| cell.borrow_mut().0.pop_front().map(|h| h.get(scope)))
     {

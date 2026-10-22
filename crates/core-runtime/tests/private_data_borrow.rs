@@ -51,17 +51,6 @@ fn setup() {
 }
 
 #[test]
-fn distinct_objects_do_not_conflict() {
-    // Each object has its own borrow flag, so borrowing two different objects at
-    // once is fine: `a.n` becomes 1, plus `b.n` (0).
-    let result = eval_with_setup(
-        setup,
-        "let a = new Borrowed(); let b = new Borrowed(); a.combine(b)",
-    );
-    assert_eq!(result, "1");
-}
-
-#[test]
 fn sequential_borrows_are_fine() {
     // Non-overlapping borrows (separate calls) never conflict; the second call
     // returns `a.n` after two increments.

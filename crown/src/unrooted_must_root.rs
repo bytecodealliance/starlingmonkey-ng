@@ -144,6 +144,35 @@ fn is_unrooted_ty<'tcx>(
     // callers pass `false` for return-type checks.
     flag_value: bool,
 ) -> bool {
+    // Structures which are semantically similar to an &ptr.
+    let ref_like: &[&[Symbol]] = &[
+        &[sym::core, sym.cell, sym.Ref],
+        &[sym::core, sym.cell, sym.RefMut],
+        &[sym::core, sym::slice, sym::iter, sym.Iter],
+        &[sym::core, sym::slice, sym::iter, sym.IterMut],
+        &[sym.accountable_refcell, sym.Ref],
+        &[sym.accountable_refcell, sym.RefMut],
+        &[sym.mozjs, sym.gc, sym.root, sym.Handle],
+        &[sym.js, sym.gc, sym.handle, sym.Stack],
+        &[sym.mozjs_sys, sym.generated, sym.root, sym.JS, sym.Handle],
+        &[sym::std, sym.collections, sym.hash, sym.map, sym.Entry],
+        &[
+            sym::std,
+            sym.collections,
+            sym.hash,
+            sym.map,
+            sym.OccupiedEntry,
+        ],
+        &[
+            sym::std,
+            sym.collections,
+            sym.hash,
+            sym.map,
+            sym.VacantEntry,
+        ],
+        &[sym::std, sym.collections, sym.hash, sym.map, sym.Iter],
+        &[sym::std, sym.collections, sym.hash, sym.set, sym.Iter],
+    ];
     let mut ret = false;
     let mut walker = ty.walk();
     while let Some(generic_arg) = walker.next() {
@@ -182,62 +211,10 @@ fn is_unrooted_ty<'tcx>(
                         },
                         _ => true,
                     }
-                } else if match_def_path(cx, did.did(), &[sym::core, sym.cell, sym.Ref])
-                    || match_def_path(cx, did.did(), &[sym::core, sym.cell, sym.RefMut])
-                    || match_def_path(cx, did.did(), &[sym::core, sym::slice, sym::iter, sym.Iter])
-                    || match_def_path(
-                        cx,
-                        did.did(),
-                        &[sym::core, sym::slice, sym::iter, sym.IterMut],
-                    )
-                    || match_def_path(cx, did.did(), &[sym.accountable_refcell, sym.Ref])
-                    || match_def_path(cx, did.did(), &[sym.accountable_refcell, sym.RefMut])
-                    || match_def_path(cx, did.did(), &[sym.mozjs, sym.gc, sym.root, sym.Handle])
-                    || match_def_path(cx, did.did(), &[sym.js, sym.gc, sym.handle, sym.Stack])
-                    || match_def_path(
-                        cx,
-                        did.did(),
-                        &[sym.mozjs_sys, sym.generated, sym.root, sym.JS, sym.Handle],
-                    )
-                    || match_def_path(
-                        cx,
-                        did.did(),
-                        &[sym::std, sym.collections, sym.hash, sym.map, sym.Entry],
-                    )
-                    || match_def_path(
-                        cx,
-                        did.did(),
-                        &[
-                            sym::std,
-                            sym.collections,
-                            sym.hash,
-                            sym.map,
-                            sym.OccupiedEntry,
-                        ],
-                    )
-                    || match_def_path(
-                        cx,
-                        did.did(),
-                        &[
-                            sym::std,
-                            sym.collections,
-                            sym.hash,
-                            sym.map,
-                            sym.VacantEntry,
-                        ],
-                    )
-                    || match_def_path(
-                        cx,
-                        did.did(),
-                        &[sym::std, sym.collections, sym.hash, sym.map, sym.Iter],
-                    )
-                    || match_def_path(
-                        cx,
-                        did.did(),
-                        &[sym::std, sym.collections, sym.hash, sym.set, sym.Iter],
-                    )
+                } else if ref_like
+                    .iter()
+                    .any(|path| match_def_path(cx, did.did(), path))
                 {
-                    // Structures which are semantically similar to an &ptr.
                     false
                 } else if match_def_path(
                     cx,
@@ -493,14 +470,12 @@ impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
     ) {
         let in_new_function = match kind {
             visit::FnKind::ItemFn(n, _, _) | visit::FnKind::Method(n, _) => {
-                n.as_str() == "new"
-                    || n.as_str().starts_with("new_")
-                    || n.as_str() == "from"
-                    || n.as_str().starts_with("from_")
-                    || n.as_str() == "default"
-                    || n.as_str() == "Wrap"
-                    || n.as_str() == "constructor"
-                    || n.as_str() == "construct"
+                let n = n.as_str();
+                matches!(
+                    n,
+                    "new" | "from" | "default" | "Wrap" | "constructor" | "construct"
+                ) || n.starts_with("new_")
+                    || n.starts_with("from_")
             },
             visit::FnKind::Closure => false,
         };
@@ -562,45 +537,18 @@ struct FnDefVisitor<'a, 'tcx: 'a> {
 }
 
 impl<'a, 'tcx> visit::Visitor<'tcx> for FnDefVisitor<'a, 'tcx> {
-    // TODO: https://github.com/servo/servo/issues/37330
-    /*
-    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
-
-    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
-        self.cx.tcx
-    }
-    */
-
     fn visit_expr(&mut self, expr: &'tcx hir::Expr) {
         let cx = self.cx;
 
-        let require_rooted = |cx: &LateContext, in_new_function: bool, subexpr: &hir::Expr| {
+        // Trait casts from #[js::must_root] types are not allowed
+        if let ExprKind::Cast(subexpr, _) = expr.kind {
             let ty = cx.typeck_results().expr_ty(subexpr);
-            if is_unrooted_ty(self.symbols, cx, ty, in_new_function, true) {
+            if is_unrooted_ty(self.symbols, cx, ty, self.in_new_function, true) {
                 cx.lint(UNROOTED_MUST_ROOT, |lint| {
                     lint.primary_message(format!("Expression of type {:?} must be rooted.", ty));
                     lint.span(subexpr.span);
                 })
             }
-        };
-
-        match expr.kind {
-            // Trait casts from #[js::must_root] types are not allowed
-            ExprKind::Cast(subexpr, _) => require_rooted(cx, self.in_new_function, subexpr),
-            // This catches assignments... the main point of this would be to catch mutable
-            // references to `JS<T>`.
-            // FIXME: Enable this? Triggers on certain kinds of uses of DomRefCell.
-            // hir::ExprAssign(_, ref rhs) => require_rooted(cx, self.in_new_function, &*rhs),
-            // This catches calls; basically, this enforces the constraint that only constructors
-            // can call other constructors.
-            // FIXME: Enable this? Currently triggers with constructs involving DomRefCell, and
-            // constructs like Vec<JS<T>> and RootedVec<JS<T>>.
-            // hir::ExprCall(..) if !self.in_new_function => {
-            //     require_rooted(cx, self.in_new_function, expr);
-            // }
-            _ => {
-                // TODO(pcwalton): Check generics with a whitelist of allowed generics.
-            },
         }
 
         visit::walk_expr(self, expr);
