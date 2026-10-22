@@ -10,6 +10,10 @@ pub mod serve_native;
 /// The per-request dispatch core shared by the serve modes.
 mod serve_common;
 
+/// Exported for `tests/wire_response.rs` only.
+#[doc(hidden)]
+pub use serve_common::{prepare_wire_response, WireResponse};
+
 /// Wasm HTTP serve mode: the body of the `wasi:http/handler` export.
 #[cfg(target_arch = "wasm32")]
 pub mod serve_wasm;
@@ -39,9 +43,9 @@ pub fn register_builtins() {
 
 /// Apply CLI options that take effect before the runtime is initialized: the worker location URL
 /// from `--init-location`, and the WPT test globals from `--wpt-mode`. Shared between the native
-/// and wasm32 entry points, and between the CLI and HTTP ones — a WPT run under `--serve` needs
+/// and wasm32 entry points, and between the CLI and HTTP ones: a WPT run under `--serve` needs
 /// the same globals a command-mode run does.
-fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), String> {
+pub fn apply_pre_init_config(config: &config::RuntimeConfig) -> Result<(), String> {
     if let Some(location) = config.init_location.as_deref() {
         let url = url::Url::parse(location)
             .map_err(|e| format!("Invalid --init-location URL {location:?}: {e}"))?;
@@ -113,7 +117,7 @@ pub async fn run(config: config::RuntimeConfig) -> Result<(), String> {
     let raw_cx = unsafe { scope.raw_cx_no_gc() };
     let el = invocation.event_loop();
 
-    // SAFETY: `raw_cx` is valid for the duration of the await — `scope`
+    // SAFETY: `raw_cx` is valid for the duration of the await. `scope`
     // keeps the `Runtime` alive and the realm entered.
     unsafe {
         evaluation
@@ -158,9 +162,8 @@ fn drive_event_loop_native(
     let el = invocation.event_loop();
 
     tokio_rt.block_on(async {
-        // SAFETY: the scope (and its Runtime) must outlive this future.
-        // Since the caller owns both and `block_on` runs synchronously on
-        // the same thread, this is guaranteed.
+        // SAFETY: the scope (and its Runtime) outlives this future. Since the caller owns both
+        // and `block_on` runs synchronously on the same thread, this is guaranteed.
         let raw_cx = unsafe { scope.raw_cx_no_gc() };
         unsafe {
             evaluation

@@ -5,18 +5,19 @@
 //! `send` returns once the response status and headers are available; the body
 //! is a [`IncomingBody`] read lazily from the host (reqwest on native, the
 //! WASIp3 incoming body stream on wasm). Callers either drain it with
-//! [`IncomingBody::read_all`] or pull it chunk by chunk with
-//! [`IncomingBody::next_chunk`].
+//! [`IncomingBody::read_all`] or read it piece by piece with
+//! [`IncomingBody::read_into`]. Natively, `IncomingBody::next_chunk` also returns
+//! each chunk as it was received.
 //!
 //! This module holds the platform-agnostic parts; the backends live in
 //! [`http_native`](crate::http_native) and [`http_wasm`](crate::http_wasm),
 //! whose platform-specific items are re-exported here.
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use crate::http_native::{incoming_body_channel, IncomingBody, IncomingBodySender};
+pub use crate::http_native::{incoming_body_channel, send, IncomingBody, IncomingBodySender};
 #[cfg(target_arch = "wasm32")]
 pub use crate::http_wasm::{
-    build_outgoing_response, read_incoming_request, AbandonBody, BodyDone, BodySendOutcome,
+    build_outgoing_response, read_incoming_request, send, AbandonBody, BodyDone, BodySendOutcome,
     IncomingBody,
 };
 
@@ -26,11 +27,8 @@ pub struct Request {
     pub method: String,
     /// The absolute request URL.
     pub url: String,
-    /// Header (name, value) pairs, in order.
-    ///
-    /// Values are `ByteString`s: every code unit is ≤ 0xFF and stands for one
-    /// byte on the wire, so they are [`isomorphic_encode`]d rather than
-    /// UTF-8-encoded when sent. See [`isomorphic_encode`] for why.
+    /// Header (name, value) pairs, in order. Values are `ByteString`s, which are
+    /// [`isomorphic_encode`]d when sent.
     pub headers: Vec<(String, String)>,
     /// The request body.
     pub body: OutgoingBody,
@@ -38,7 +36,7 @@ pub struct Request {
 
 /// A body chunk a [`Remaining`] budget can trim.
 pub trait BodyChunk {
-    /// How many bytes the chunk carries.
+    /// The chunk's length in bytes.
     fn byte_len(&self) -> usize;
     /// Shorten the chunk to its first `len` bytes.
     fn truncate_to(&mut self, len: usize);
@@ -68,7 +66,7 @@ impl BodyChunk for Vec<u8> {
 /// A response is framed by the `Content-Length` it declares, so content past that never goes on
 /// the wire, and content short of it leaves the message unfinished.
 ///
-/// `None` where no length was declared.
+/// `None` if no length was declared.
 pub struct Remaining(Option<u64>);
 
 impl Remaining {
@@ -107,16 +105,13 @@ pub type OutgoingBodyReceiver = futures_channel::mpsc::Receiver<Result<Vec<u8>, 
 /// from elsewhere (such as a JS `ReadableStream` pumped through a channel), or
 /// a host response body handed straight through.
 pub enum OutgoingBody {
-    /// A complete byte sequence (empty for no body). Refcounted, so replaying
-    /// it across redirects or handing it between layers never copies the bytes.
+    /// A complete byte sequence, empty for no body.
     Bytes(bytes::Bytes),
-    /// Chunks delivered on a bounded channel; a final `Err` aborts the body, and
-    /// the channel closing ends it. Created via [`body_channel`].
+    /// Chunks delivered on a bounded channel. A final `Err` aborts the body, and
+    /// closing the channel ends it. Created via [`body_channel`].
     Stream(OutgoingBodyReceiver),
-    /// A host response body handed straight to the outgoing request. Used for
-    /// incoming bodies that are directly used as outgoing ones, or when
-    /// piped through an identity `TransformStream`. In that case, handling of the
-    /// body is unobservable by JS and can take a shortcut.
+    /// A host body sent unchanged, for an incoming body used directly as an outgoing one or
+    /// piped through an identity `TransformStream`.
     Host(IncomingBody),
     /// No body to send, because none is left or none was ever produced: a stream
     /// body consumed by a previous send (a redirect cannot replay it), or one
@@ -124,9 +119,7 @@ pub enum OutgoingBody {
     Consumed,
 }
 
-/// How many body chunks may sit in a body channel before the producer must wait
-/// — bounds buffering so a fast producer with a slow consumer applies
-/// backpressure rather than buffering the whole body.
+/// How many chunks a body channel holds before the producer waits.
 pub(crate) const BODY_CHANNEL_CAPACITY: usize = 8;
 
 /// The size up to which [`coalesce_queued_chunks`] appends queued chunks.
@@ -160,9 +153,7 @@ pub fn coalesce_queued_chunks(
     None
 }
 
-/// Wait for channel capacity, then enqueue. `futures_channel`'s `Sender` has no
-/// inherent async `send`, so drive `poll_ready` directly (avoids pulling in
-/// `futures-util`'s `SinkExt`). Returns `false` if the receiver was dropped.
+/// Wait for channel capacity, then enqueue `item`. Returns `false` if the receiver was dropped.
 pub(crate) async fn send_on<T>(sender: &mut futures_channel::mpsc::Sender<T>, item: T) -> bool {
     if futures_lite::future::poll_fn(|cx| sender.poll_ready(cx))
         .await
@@ -213,12 +204,9 @@ pub fn body_channel() -> (BodySender, OutgoingBody) {
     (BodySender(sender), OutgoingBody::Stream(receiver))
 }
 
-/// A body that fails as soon as the transport reads it.
-///
-/// For a caller that cannot produce the bytes it promised but is already
-/// committed to sending. The alternative would be sending an empty body, which
-/// the peer cannot tell from a legitimately empty one, so a truncated request
-/// would look successful.
+/// A body that fails as soon as the transport reads it, for a caller that is committed to
+/// sending but cannot produce the bytes. An empty body instead would make the truncated request
+/// look successful.
 pub fn failed_body(message: String) -> OutgoingBody {
     let (mut sender, body) = futures_channel::mpsc::channel(1);
     // The channel is empty and has capacity, so this cannot fail.
@@ -242,13 +230,7 @@ pub struct Response {
 
 /// <https://infra.spec.whatwg.org/#isomorphic-encode>
 ///
-/// Encode a header value to its wire bytes: one byte per code unit.
-///
-/// An HTTP header value is a byte sequence, and the WebIDL `ByteString` a script
-/// supplies maps each code unit one-to-one onto a byte — `"æ"` (U+00E6) is the
-/// single byte 0xE6. Encoding the value as UTF-8 instead would send 0xC3 0xA6,
-/// which is a different header value; a peer echoing it back would return two
-/// code units, and a server matching on it would not match.
+/// Encode a header value to its wire bytes: one byte per code unit, not UTF-8.
 ///
 /// A code unit above 0xFF cannot occur in a `ByteString` and is replaced by `?`
 /// rather than truncated into an unrelated byte.
@@ -261,10 +243,8 @@ pub fn isomorphic_encode(value: &str) -> Vec<u8> {
 
 /// <https://infra.spec.whatwg.org/#isomorphic-decode>
 ///
-/// Decode wire bytes to a header value: one code unit per byte.
-///
-/// The inverse of [`isomorphic_encode`]. This can't fail, since it's not treating
-/// the input as, possibly invalid, UTF-8.
+/// Decode wire bytes to a header value: one code unit per byte. The inverse of
+/// [`isomorphic_encode`].
 pub fn isomorphic_decode(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| char::from(b)).collect()
 }
@@ -281,21 +261,5 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A read-only, refcounted byte sequence from a response body. Derefs to
-/// `&[u8]`. On native it is reqwest's `Bytes` as-is (the body is never copied
-/// into a `Vec` just to be read); on wasm the bytes read from the WASIp3
-/// stream are wrapped without copying.
+/// A read-only, refcounted byte sequence from a body.
 pub type BodyBytes = bytes::Bytes;
-
-/// Send `request` over the host's HTTP transport, returning once the response
-/// status and headers are available.
-pub async fn send(request: Request) -> Result<Response, Error> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        crate::http_native::send(request).await
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        crate::http_wasm::send(request).await
-    }
-}

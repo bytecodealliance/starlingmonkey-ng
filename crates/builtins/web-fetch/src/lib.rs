@@ -29,7 +29,5 @@ pub fn add_to_global(scope: &Scope<'_>, global: Object<'_>) {
     // The internal classes below are registered so instances can be created, and are not
     // web-exposed.
     abort::AbortFetchState::add_to_global(scope, global);
-    incoming_body::HostBodySource::add_to_global(scope, global);
-    outgoing_body::OutgoingBodyPump::add_to_global(scope, global);
     body_proxy::BodyProxySource::add_to_global(scope, global);
 }

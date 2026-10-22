@@ -18,19 +18,33 @@ fn run_module(source: &str) -> Output {
 }
 
 /// `log`, `info` and `debug` print the bare message on stdout. `warn` and
-/// `error` print it on stderr, prefixed with the level.
+/// `error` print it on stderr, prefixed with the level. `log` returns
+/// `undefined`.
 #[test]
 fn console_levels_write_to_their_streams() {
     let out = run_module(
         "console.log('a', 1); console.info('b'); console.debug('c');\n\
-         console.warn('d'); console.error('e');",
+         console.warn('d'); console.error('e');\n\
+         console.log(String(console.log('f')));",
     );
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "a 1\nb\nc\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a 1\nb\nc\nf\nundefined\n"
+    );
     assert_eq!(String::from_utf8_lossy(&out.stderr), "Warn: d\nError: e\n");
 }
 
-/// `console.assert` prints nothing when its condition holds, and otherwise prints
+/// Messages are written whole, including NUL characters in them.
+#[test]
+fn console_messages_keep_nul_characters() {
+    let out = run_module("console.log('a\\0b', 'c'); console.error('d\\0e');");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"a\0b c\n");
+    assert_eq!(out.stderr, b"Error: d\0e\n");
+}
+
+/// `console.assert` doesn't print anything when its condition holds, and otherwise prints
 /// "Assertion failed" and its data on stderr.
 #[test]
 fn console_assert_reports_failed_assertions() {
@@ -93,4 +107,44 @@ fn top_level_rejection_is_reported_once() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("top level"), "{stderr}");
     assert!(!stderr.contains("Uncaught (in promise)"), "{stderr}");
+}
+
+/// `--serve 0` listens on a port the system picks and prints its address on
+/// stderr, where a client can read it and connect.
+#[test]
+fn serve_on_port_zero_prints_the_bound_address() {
+    use std::io::{BufRead, Read, Write};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_starlingmonkey"))
+        .args([
+            "--serve",
+            "0",
+            "--legacy-script",
+            "-e",
+            "addEventListener('fetch', (e) => e.respondWith(new Response('served')))",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run starling");
+    let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let address = stderr
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| Some(line.strip_prefix("serving on http://")?.to_string()))
+        .expect("the server printed its address before closing stderr");
+
+    let mut stream = std::net::TcpStream::connect(&address).unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    let read = stream.read_to_string(&mut response);
+    let _ = child.kill();
+    let _ = child.wait();
+    read.unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200") && response.ends_with("served"),
+        "{response}"
+    );
 }

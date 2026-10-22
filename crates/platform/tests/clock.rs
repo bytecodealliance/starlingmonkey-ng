@@ -23,8 +23,8 @@ fn resuming_advances_the_clock_by_the_recorded_reading() {
         "readings after the resume should sit past the snapshot's"
     );
 
-    // The reading is consumed by the first resume, so a second one is a no-op. Every later call
-    // in a resumed instance takes this path.
+    // The reading is consumed by the first resume, so a second resume does nothing. Every later
+    // call in a resumed instance takes this path.
     assert_eq!(resume_from_snapshot(), 0);
 }
 

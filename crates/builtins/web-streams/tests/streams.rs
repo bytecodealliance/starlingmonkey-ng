@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! Stream behavior that the WPT `streams` suites don't check: the Rust-side
-//! `ReadableStream::from_bytes` API, WebIDL conversion order, chunk adoption by
-//! async iteration, isolation of internal state from `Object.prototype`, and
-//! regressions for specific bugs.
+//! `ReadableStream::from_bytes` and `ReadableByteStreamController::enqueue_bytes`
+//! APIs, WebIDL conversion order, chunk adoption by async iteration, isolation
+//! of internal state from `Object.prototype`, and regressions for specific bugs.
 
 // This file contains nothing platform-specific, so skip it on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
@@ -11,7 +11,8 @@
 use core_runtime::config::RuntimeConfig;
 use core_runtime::runtime::{clear_global_initializers, register_global_initializer, Runtime};
 use core_runtime::test_util::{eval_and_read_out, eval_out_with_setup};
-use web_streams::readable::ReadableStream;
+use js::conversion::FromJSVal;
+use web_streams::readable::{ReadableByteStreamController, ReadableStream};
 
 fn add_globals() {
     clear_global_initializers();
@@ -547,4 +548,46 @@ fn promise_members_reject_a_wrong_this() {
         ]).then(results => { globalThis.__out = results.join("|"); });
         "#);
     assert_eq!(out, "rejected:TypeError|rejected:TypeError");
+}
+
+/// `enqueue_bytes` hands its `Vec`'s allocation to the reader: the chunk read from the stream holds
+/// the bytes at the address they had in the `Vec`.
+#[test]
+fn enqueue_bytes_hands_its_buffer_to_the_reader() {
+    add_globals();
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let controller = js::compile::evaluate_with_filename(
+        &scope,
+        r#"
+        let controller;
+        globalThis.stream = new ReadableStream({ type: "bytes", start(c) { controller = c; } });
+        controller
+        "#,
+        "test.js",
+        1,
+    )
+    .expect("creating the stream");
+    let controller =
+        ReadableByteStreamController::from_jsval(&scope, controller, ()).expect("a controller");
+    let bytes = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let address = bytes.as_ptr() as usize;
+    controller
+        .enqueue_bytes(&scope, bytes)
+        .expect("enqueueing the bytes");
+    let out = eval_and_read_out(
+        &scope,
+        r#"
+        globalThis.__out = "pending";
+        stream.getReader().read().then(({ value }) => {
+            globalThis.chunk = value;
+            globalThis.__out = value.join(",");
+        });
+        "#,
+    );
+    assert_eq!(out, "1,2,3,4,5,6,7,8");
+    let chunk = js::compile::evaluate_with_filename(&scope, "chunk", "chunk.js", 1)
+        .expect("reading the chunk");
+    let chunk = js::Uint8Array::from_jsval(&scope, chunk, ()).expect("a Uint8Array");
+    assert_eq!(chunk.with_slice(|bytes| bytes.as_ptr() as usize), address);
 }

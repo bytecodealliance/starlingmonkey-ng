@@ -17,13 +17,35 @@ use std::time::Duration;
 /// Like [`request`], but gives up after `patience` and returns `None` — for the cases where a
 /// server that fails the test would otherwise leave it hanging rather than failing it.
 pub fn request_within(port: u16, path: &str, patience: Duration) -> Option<String> {
-    let response = full_request_within(port, "GET", path, "", patience)?;
-    Some(
-        response
-            .split_once("\r\n\r\n")
-            .map(|(_, body)| body.to_string())
-            .unwrap_or(response),
-    )
+    full_request_within(port, "GET", path, "", patience).map(body_of)
+}
+
+/// The part of `response` after the header terminator. See [`split_response`].
+fn body_of(response: String) -> String {
+    split_response(&response).1.to_string()
+}
+
+/// The head and the body of `response`, split at the header terminator. A response with no header
+/// terminator is malformed rather than empty. It has no head, and the whole response is its body,
+/// so an assertion on the body cannot pass against nothing at all.
+pub(crate) fn split_response(response: &str) -> (Option<&str>, &str) {
+    match response.split_once("\r\n\r\n") {
+        Some((head, body)) => (Some(head), body),
+        None => (None, response),
+    }
+}
+
+/// The `Content-Length` value in `head`, which must already be lowercase.
+fn content_length(head: &str) -> Option<usize> {
+    head.split("content-length:")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n").next())
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The size on a chunk-size line, with any chunk extension after `;` ignored.
+fn chunk_size(size_line: &str) -> Option<usize> {
+    usize::from_str_radix(size_line.split(';').next()?.trim(), 16).ok()
 }
 
 /// Like [`request_within`], but for any method and body, and returning the whole response — status
@@ -48,14 +70,19 @@ pub fn raw_response_within(
     body: &str,
     patience: Duration,
 ) -> Option<Vec<u8>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len(),
     );
+    send_within(port, req.as_bytes(), patience)
+}
+
+/// Send `raw` on a new connection and read the response to EOF within `patience`.
+fn send_within(port: u16, raw: &[u8], patience: Duration) -> Option<Vec<u8>> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     // A refused request is responded to and its connection closed while this is still writing, so
     // a failed write is part of the outcome rather than an error.
-    let _ = stream.write_all(req.as_bytes());
+    let _ = stream.write_all(raw);
     read_until_eof(&mut stream, patience)
 }
 
@@ -64,32 +91,62 @@ pub fn raw_response_within(
 /// test instead of hanging the run.
 pub const PATIENCE: Duration = Duration::from_secs(30);
 
+/// How long [`eventually`] polls before returning its last result. Finite so that work which never
+/// completes fails its test.
+pub const SETTLE_PATIENCE: Duration = Duration::from_secs(20);
+
+/// Call `poll` every 20 ms until its result satisfies `settled` or [`SETTLE_PATIENCE`] runs out,
+/// and return the last result.
+///
+/// Work a handler leaves behind runs while the request's loop is drained after the response: a
+/// `waitUntil` promise, a signal's reactions, a stream's cancel. Polling until the outcome is there
+/// takes as long as the work does, rather than a fixed span chosen for the slowest machine.
+///
+/// Only for assertions that wait for something to happen. A request drives the loop it is served
+/// on, so an assertion that something does not happen waits a fixed span instead.
+pub fn eventually(mut poll: impl FnMut() -> String, settled: impl Fn(&str) -> bool) -> String {
+    let deadline = std::time::Instant::now() + SETTLE_PATIENCE;
+    loop {
+        let result = poll();
+        if settled(&result) || std::time::Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Make one HTTP/1.1 request and return the response body (after the headers).
 pub fn request(port: u16, method: &str, path: &str, body: &str) -> String {
-    let response = full_request_within(port, method, path, body, PATIENCE)
-        .expect("the server answered within the patience");
-    // A response with no header terminator is malformed rather than empty, so it is handed back
-    // whole — an assertion on the body would otherwise pass against nothing at all.
-    response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or(response)
+    body_of(
+        full_request_within(port, method, path, body, PATIENCE)
+            .expect("the server answered within the patience"),
+    )
+}
+
+/// A listener on a port the system picks on `127.0.0.1`, and that port.
+pub fn bind_local() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+/// A `200` response with `body`, framed by its length, closing the connection.
+fn ok_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    )
 }
 
 /// A minimal upstream HTTP server (multi-connection) that always replies with `body`.
 pub fn start_upstream(body: &'static str) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = bind_local();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len(),
-            );
-            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(ok_response(body).as_bytes());
         }
     });
     port
@@ -98,32 +155,19 @@ pub fn start_upstream(body: &'static str) -> u16 {
 /// An upstream that responds with a chunked body, pausing between chunks, so a handler forwarding it
 /// has to actually stream rather than receive the whole thing at once.
 pub fn start_chunked_upstream(chunks: &'static [&'static str]) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf);
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-            );
-            for chunk in chunks {
-                let _ = stream.write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes());
-                let _ = stream.flush();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let _ = stream.write_all(b"0\r\n\r\n");
-        }
-    });
-    port
+    start_chunked(chunks, true)
 }
 
 /// An upstream whose chunked response is cut off: it sends `chunks` and then closes the connection
 /// without the terminating chunk, so a handler forwarding it is forwarding a truncation.
 pub fn start_truncated_upstream(chunks: &'static [&'static str]) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    start_chunked(chunks, false)
+}
+
+/// An upstream that sends `chunks` as a chunked body, 20 ms apart, and the terminating chunk if
+/// `terminate` is set.
+fn start_chunked(chunks: &'static [&'static str], terminate: bool) -> u16 {
+    let (listener, port) = bind_local();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -137,7 +181,9 @@ pub fn start_truncated_upstream(chunks: &'static [&'static str]) -> u16 {
                 let _ = stream.flush();
                 std::thread::sleep(Duration::from_millis(20));
             }
-            // No terminator: dropping the connection here is the truncation.
+            if terminate {
+                let _ = stream.write_all(b"0\r\n\r\n");
+            }
         }
     });
     port
@@ -146,8 +192,7 @@ pub fn start_truncated_upstream(chunks: &'static [&'static str]) -> u16 {
 /// An upstream that waits `delay` before responding with `body`, so a `fetch` to it is still in
 /// flight while other work — another request, a previous one's drain — runs alongside it.
 pub fn start_slow_upstream(delay: Duration, body: &'static str) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = bind_local();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -155,13 +200,7 @@ pub fn start_slow_upstream(delay: Duration, body: &'static str) -> u16 {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
                 std::thread::sleep(delay);
-                let _ = stream.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len(),
-                    )
-                    .as_bytes(),
-                );
+                let _ = stream.write_all(ok_response(body).as_bytes());
             });
         }
     });
@@ -172,8 +211,7 @@ pub fn start_slow_upstream(delay: Duration, body: &'static str) -> u16 {
 /// handler proxying it sends a *host* body rather than a JS stream, which the serve timeouts have
 /// to bound just the same.
 pub fn start_endless_upstream(every: Duration) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = bind_local();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -230,20 +268,11 @@ impl HeldUpstream {
         self.released
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
-
-    /// Hold again, and forget the arrivals counted so far, so a test that runs its scenario more
-    /// than once gates each run from zero.
-    pub fn rearm(&self) {
-        self.released
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        while self.arrivals.try_recv().is_ok() {}
-    }
 }
 
 /// Start a [`HeldUpstream`] that responds with `body` once released.
 pub fn start_held_upstream(body: &'static str) -> HeldUpstream {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = bind_local();
     let (arrived, arrivals) = std::sync::mpsc::channel();
     let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = released.clone();
@@ -259,13 +288,7 @@ pub fn start_held_upstream(body: &'static str) -> HeldUpstream {
                 while !flag.load(std::sync::atomic::Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                let _ = stream.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len(),
-                    )
-                    .as_bytes(),
-                );
+                let _ = stream.write_all(ok_response(body).as_bytes());
             });
         }
     });
@@ -276,8 +299,8 @@ pub fn start_held_upstream(body: &'static str) -> HeldUpstream {
     }
 }
 
-/// A proxy that holds each request until released, then forwards it to `target` and copies the
-/// response back.
+/// A proxy that holds each request until released, then forwards it to the port passed to
+/// [`ForwardingGate::release`] and copies the response back.
 ///
 /// For the cases where the guest is the client. A handler fetching its own server sends that
 /// request while it is still running, and a test cannot delay it. Forwarding it from here sets
@@ -285,7 +308,8 @@ pub fn start_held_upstream(body: &'static str) -> HeldUpstream {
 pub struct ForwardingGate {
     port: u16,
     arrivals: std::sync::mpsc::Receiver<()>,
-    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The port to forward to, or `0` while requests are held.
+    target: std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl ForwardingGate {
@@ -298,25 +322,24 @@ impl ForwardingGate {
         self.arrivals.recv_timeout(patience).is_ok()
     }
 
-    /// Forward everything held, and everything that arrives from here on.
-    pub fn release(&self) {
-        self.released
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    /// Forward everything held, and everything that arrives from here on, to `target`.
+    pub fn release(&self, target: u16) {
+        self.target
+            .store(target, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// Start a [`ForwardingGate`] in front of `target`.
-pub fn start_forwarding_gate(target: u16) -> ForwardingGate {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+/// Start a [`ForwardingGate`].
+pub fn start_forwarding_gate() -> ForwardingGate {
+    let (listener, port) = bind_local();
     let (arrived, arrivals) = std::sync::mpsc::channel();
-    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = released.clone();
+    let target = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let released = target.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut from) = stream else { continue };
             let arrived = arrived.clone();
-            let flag = flag.clone();
+            let released = released.clone();
             std::thread::spawn(move || {
                 let mut head = Vec::new();
                 let mut buf = [0u8; 1024];
@@ -327,9 +350,12 @@ pub fn start_forwarding_gate(target: u16) -> ForwardingGate {
                     }
                 }
                 let _ = arrived.send(());
-                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                let target = loop {
+                    match released.load(std::sync::atomic::Ordering::SeqCst) {
+                        0 => std::thread::sleep(Duration::from_millis(5)),
+                        target => break target,
+                    }
+                };
                 // Forwarded with `Connection: close`, so the response ends at EOF. The rest of the
                 // request is passed on as it arrived.
                 let text = String::from_utf8_lossy(&head).into_owned();
@@ -355,15 +381,14 @@ pub fn start_forwarding_gate(target: u16) -> ForwardingGate {
     ForwardingGate {
         port,
         arrivals,
-        released,
+        target,
     }
 }
 
 /// An upstream that accepts connections and never responds, holding them open until the process
 /// ends. A `fetch` to it stays in flight for as long as anything is willing to wait for it.
 pub fn start_silent_upstream() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = bind_local();
     std::thread::spawn(move || {
         let mut held = Vec::new();
         for stream in listener.incoming() {
@@ -378,8 +403,7 @@ pub fn start_silent_upstream() -> u16 {
 /// An upstream that reads a request body, chunked or length-delimited, and responds with it, so a
 /// handler forwarding a body upstream can be checked on what actually arrived there.
 pub fn start_echo_upstream() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = bind_local();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -399,12 +423,7 @@ pub fn start_echo_upstream() -> u16 {
                 let complete = if chunked {
                     body.ends_with("0\r\n\r\n")
                 } else {
-                    lower
-                        .split("content-length:")
-                        .nth(1)
-                        .and_then(|rest| rest.split("\r\n").next())
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                        .is_some_and(|length| body.len() >= length)
+                    content_length(&lower).is_some_and(|length| body.len() >= length)
                 };
                 if !complete {
                     continue;
@@ -414,13 +433,7 @@ pub fn start_echo_upstream() -> u16 {
                 } else {
                     body.to_string()
                 };
-                let _ = stream.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                        payload.len(),
-                    )
-                    .as_bytes(),
-                );
+                let _ = stream.write_all(ok_response(&payload).as_bytes());
                 break;
             }
         }
@@ -436,14 +449,14 @@ pub fn start_echo_upstream() -> u16 {
 pub fn dechunk(body: &str) -> String {
     let is_chunked = body
         .split_once("\r\n")
-        .is_some_and(|(size_line, _)| usize::from_str_radix(size_line.trim(), 16).is_ok());
+        .is_some_and(|(size_line, _)| chunk_size(size_line).is_some());
     if !is_chunked {
         return body.to_string();
     }
     let mut out = String::new();
     let mut rest = body;
     while let Some((size_line, after)) = rest.split_once("\r\n") {
-        let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+        let size = chunk_size(size_line).unwrap_or(0);
         if size == 0 {
             break;
         }
@@ -488,22 +501,13 @@ pub fn read_until_eof(stream: &mut TcpStream, patience: Duration) -> Option<Vec<
 /// Like [`raw_request`], but gives up after `patience` and returns `None` — for a server a failing
 /// test would otherwise leave the suite hanging on.
 pub fn raw_request_within(port: u16, raw: &[u8], patience: Duration) -> Option<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    // A refused request is responded to and its connection closed while this is still writing, so
-    // a failed write is part of the outcome rather than an error.
-    let _ = stream.write_all(raw);
-    let response = read_until_eof(&mut stream, patience)?;
+    let response = send_within(port, raw, patience)?;
     Some(String::from_utf8_lossy(&response).into_owned())
 }
 
 /// Send `raw` bytes and return the full response (status line included).
 pub fn raw_request(port: u16, raw: &[u8]) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    // A refused request is responded to and its connection closed while this is still writing, so
-    // a failed write is part of the outcome rather than an error.
-    let _ = stream.write_all(raw);
-    let response = read_until_eof(&mut stream, PATIENCE).unwrap_or_default();
-    String::from_utf8_lossy(&response).into_owned()
+    raw_request_within(port, raw, PATIENCE).unwrap_or_default()
 }
 
 /// Read exactly one HTTP response off a connection that may stay open — framed by its
@@ -543,12 +547,7 @@ fn response_end(bytes: &[u8]) -> Option<usize> {
     if head.contains("transfer-encoding: chunked") {
         return chunked_end(bytes, head_end);
     }
-    let length = head
-        .split("content-length:")
-        .nth(1)
-        .and_then(|rest| rest.split("\r\n").next())
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
+    let length = content_length(&head).unwrap_or(0);
     let end = head_end + length;
     (bytes.len() >= end).then_some(end)
 }
@@ -558,8 +557,7 @@ fn response_end(bytes: &[u8]) -> Option<usize> {
 fn chunked_end(bytes: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let line_end = find(bytes, pos, b"\r\n")?;
-        let size_hex = std::str::from_utf8(&bytes[pos..line_end]).ok()?;
-        let size = usize::from_str_radix(size_hex.trim().split(';').next()?.trim(), 16).ok()?;
+        let size = chunk_size(std::str::from_utf8(&bytes[pos..line_end]).ok()?)?;
         if size == 0 {
             // The zero-size line, then the final empty line.
             let end = line_end + 4;

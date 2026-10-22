@@ -8,9 +8,9 @@
 //! left for what happens after a response is gone — `waitUntil` work, request-signal aborts, the
 //! server's own diagnostics — so a test asserts on it with [`WasmServer::wait_for_marker`].
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The WASI capabilities the component needs: `cli` for `stderr`, the environment its configuration
@@ -64,30 +64,34 @@ pub enum Ready {
 /// suits the common case (a legacy script, no extra configuration, a `/ready` route), so a test
 /// names only what it cares about.
 pub struct Serve {
-    port: u16,
     files: Vec<(String, String)>,
     flags: Vec<String>,
     script: Vec<String>,
     wasmtime_flags: Vec<String>,
     env: Vec<(String, String)>,
     ready: Ready,
-    wizen: bool,
+    wizer_passes: usize,
     no_zeal: bool,
 }
 
+impl Default for Serve {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Serve {
-    /// A server on `port`. Ports are assigned per test from 18400 up, since the suite runs its
-    /// cases in parallel.
-    pub fn new(port: u16) -> Self {
+    /// A server on a port the system picks. The port is read back from `wasmtime serve`'s output
+    /// and reported by [`WasmServer::port`].
+    pub fn new() -> Self {
         Self {
-            port,
             files: Vec::new(),
             flags: Vec::new(),
             script: Vec::new(),
             wasmtime_flags: Vec::new(),
             env: Vec::new(),
             ready: Ready::Route,
-            wizen: false,
+            wizer_passes: 0,
             no_zeal: false,
         }
     }
@@ -157,16 +161,17 @@ impl Serve {
     }
 
     /// Snapshot the configured component with `wasmtime wizer` and serve the snapshot: the shape a
-    /// deployed server has, with the engine stood up and the script evaluated at build time.
+    /// deployed server has, with the engine stood up and the script evaluated at build time. Each
+    /// further call snapshots the previous snapshot again, which runs its init export once more.
     pub fn wizen(mut self) -> Self {
-        self.wizen = true;
+        self.wizer_passes += 1;
         self
     }
 
     /// Start the server, or return `None` when the wasm component or `wasmtime` is missing.
     pub fn start(self) -> Option<WasmServer> {
         let component = component()?;
-        let dir = work_dir(self.port);
+        let dir = work_dir();
         for (name, source) in &self.files {
             std::fs::write(dir.join(name), source).unwrap();
         }
@@ -180,31 +185,16 @@ impl Serve {
 
         // Compiled here rather than by the server below, so every server after the first loads a
         // component that is already compiled.
-        let component = if self.wizen {
-            let snapshot = dir.join("snapshot.wasm");
+        let mut component = component;
+        for pass in 1..=self.wizer_passes {
+            let snapshot = dir.join(format!("snapshot-{pass}.wasm"));
             snapshot_with_wizer(&dir, &component, &snapshot, &config, self.no_zeal);
-            snapshot
-        } else {
-            component
-        };
+            component = snapshot;
+        }
         let (component, ahead_of_time) = match precompiled(&component) {
             Some(cwasm) => (cwasm, true),
             None => (component, false),
         };
-
-        // A leaked child from an earlier run would serve every request below, so refuse the port
-        // rather than test whatever is already on it. A child being reaped still holds its port
-        // for a moment, so wait a little before calling it a leak.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match TcpListener::bind(("127.0.0.1", self.port)) {
-                Ok(listener) => break drop(listener),
-                Err(e) if Instant::now() >= deadline => {
-                    panic!("port {} is still in use ({e})", self.port)
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(100)),
-            }
-        }
 
         let log = std::fs::File::create(dir.join("serve.log")).unwrap();
         let mut command = Command::new("wasmtime");
@@ -215,7 +205,7 @@ impl Serve {
             .args(ahead_of_time.then_some("--allow-precompiled"))
             .args(["--dir=.::/cwd", "--dir=.", WASI_FLAGS])
             .args(&self.wasmtime_flags)
-            .args(["--addr", &format!("127.0.0.1:{}", self.port)])
+            .args(["--addr", "127.0.0.1:0"])
             .arg(&component)
             .env("STARLINGMONKEY_CONFIG", &config)
             // Read by `WasmServer::await_new_idle`.
@@ -233,16 +223,43 @@ impl Serve {
         let child = command.envs(self.env.iter().cloned()).spawn().unwrap();
 
         let mut server = WasmServer {
-            port: self.port,
+            port: 0,
             child,
             dir,
         };
+        server.port = server.await_bound_port();
         server.await_ready(self.ready);
         Some(server)
     }
 }
 
 impl WasmServer {
+    /// Poll the serve log for the address `wasmtime serve` reports once it has bound its
+    /// listener, and return that address's port. Panics with the log if the child exits first.
+    fn await_bound_port(&mut self) -> u16 {
+        const BOUND: &str = "Serving HTTP on http://";
+        let deadline = Instant::now() + READY_PATIENCE;
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "wasmtime serve exited with {status} before listening\n{}",
+                    self.log()
+                );
+            }
+            let log = self.log();
+            let port = log
+                .split_once(BOUND)
+                .and_then(|(_, rest)| rest.split_once('/'))
+                .and_then(|(address, _)| address.rsplit_once(':'))
+                .and_then(|(_, port)| port.parse().ok());
+            if let Some(port) = port {
+                return port;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("wasmtime serve never reported its address\n{}", self.log());
+    }
+
     /// Poll until the server responds, or panic with the serve log. A child that died on a
     /// rejected flag or a runtime that refused its configuration is otherwise a silent hang.
     fn await_ready(&mut self, ready: Ready) {
@@ -255,9 +272,8 @@ impl WasmServer {
                     self.log()
                 );
             }
-            // Probed through a connection of its own: until the server binds, connecting is an
-            // error rather than a slow response, which the request helpers rightly refuse to paper
-            // over.
+            // The server is probed through a separate connection. Until it binds, connecting fails
+            // rather than being slow, and the request helpers don't hide such failures.
             let listening = std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok();
             if listening && ready == Ready::Listening {
                 return;
@@ -296,12 +312,6 @@ impl WasmServer {
 
     pub fn port(&self) -> u16 {
         self.port
-    }
-
-    /// The directory the child runs in: where the content script lives and where a test can leave
-    /// a file for it to read.
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 
     /// Everything the server has written to `stdout`/`stderr` so far, the guest's `console.error`
@@ -354,8 +364,8 @@ impl WasmServer {
         }
     }
 
-    /// The instances the host reports having handed a request to since `from` bytes into the log,
-    /// and the length to read the next batch from.
+    /// The instances to which the host reports having handed a request since `from` bytes into the
+    /// log, and the length from which to read the next batch.
     ///
     /// A serving host hands a request to an instance it counts as free, and raises a fresh one
     /// otherwise. A case whose requests have to meet cannot make it choose, so it reads back what
@@ -419,19 +429,20 @@ impl Drop for WasmServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
 /// A response's message body, with the host's chunked framing decoded. The free-standing form of
 /// [`WasmServer::request`], for the tests that address a server's port from a thread of their own.
 pub fn message_body(response: &str) -> String {
-    let Some((head, body)) = response.split_once("\r\n\r\n") else {
-        return response.to_string();
-    };
-    if head.to_lowercase().contains("transfer-encoding: chunked") {
-        crate::dechunk(body)
-    } else {
-        body.to_string()
+    match crate::split_response(response) {
+        (Some(head), body) if head.to_lowercase().contains("transfer-encoding: chunked") => {
+            crate::dechunk(body)
+        }
+        (_, body) => body.to_string(),
     }
 }
 
@@ -450,17 +461,11 @@ pub fn component() -> Option<PathBuf> {
             "STARLING_WASM_COMPONENT is set, but there is no component at {}",
             component.display()
         );
-    }
-    let have_wasmtime = Command::new("wasmtime")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if let (Some(component), true) = (&configured, have_wasmtime) {
-        // Absolutized: each server runs in a work directory of its own and hands the path to
-        // `wasmtime` from there.
-        return Some(component.canonicalize().unwrap());
+        if wasmtime_version().is_some() {
+            // Absolutized: each server runs in a work directory of its own and hands the path to
+            // `wasmtime` from there.
+            return Some(component.canonicalize().unwrap());
+        }
     }
     NOTED.call_once(|| {
         let missing = if configured.is_some() {
@@ -480,6 +485,21 @@ pub fn component() -> Option<PathBuf> {
     None
 }
 
+/// The output of `wasmtime --version`, or `None` when `wasmtime` is not on PATH. Run once per
+/// process.
+fn wasmtime_version() -> Option<&'static str> {
+    static VERSION: OnceLock<Option<String>> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let output = Command::new("wasmtime").arg("--version").output().ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+        .as_deref()
+}
+
 /// The component compiled ahead of time, or `None` to serve the `.wasm` and let each server
 /// compile it itself.
 ///
@@ -493,13 +513,9 @@ pub fn component() -> Option<PathBuf> {
 fn precompiled(component: &Path) -> Option<PathBuf> {
     let out = component.with_extension("cwasm");
     let stamp_path = component.with_extension("cwasm.stamp");
-    let version = Command::new("wasmtime").arg("--version").output().ok()?;
+    let version = wasmtime_version()?;
     let modified = std::fs::metadata(component).ok()?.modified().ok()?;
-    let stamp = format!(
-        "{}\n{modified:?}\n{}",
-        String::from_utf8_lossy(&version.stdout).trim(),
-        CODEGEN_FLAGS.join(" "),
-    );
+    let stamp = format!("{version}\n{modified:?}\n{}", CODEGEN_FLAGS.join(" "));
     let current = |stamp: &str| {
         out.is_file() && std::fs::read_to_string(&stamp_path).is_ok_and(|found| found == stamp)
     };
@@ -507,8 +523,8 @@ fn precompiled(component: &Path) -> Option<PathBuf> {
         return Some(out);
     }
 
-    // One process compiles. The rest wait for it rather than each compiling the same artifact.
-    // Whoever creates the lock is the one that compiles.
+    // One process or thread compiles. The rest wait for it rather than each compiling the same
+    // artifact. Whoever creates the lock is the one that compiles.
     let lock = component.with_extension("cwasm.lock");
     match std::fs::OpenOptions::new()
         .write(true)
@@ -516,15 +532,25 @@ fn precompiled(component: &Path) -> Option<PathBuf> {
         .open(&lock)
     {
         Ok(_) => {
+            // Checked again, since a compile may have finished and released the lock between the
+            // check above and taking it.
+            if current(&stamp) {
+                let _ = std::fs::remove_file(&lock);
+                return Some(out);
+            }
             eprintln!("Precompiling the wasm component (once for this build) ...");
+            // Written next to `out` and renamed over it, so a server never loads a partly
+            // written artifact.
+            let partial = component.with_extension("cwasm.partial");
             let result = Command::new("wasmtime")
                 .arg("compile")
                 .args(CODEGEN_FLAGS)
                 .arg(component)
                 .arg("-o")
-                .arg(&out)
+                .arg(&partial)
                 .output();
-            let compiled = result.is_ok_and(|result| result.status.success());
+            let compiled = result.is_ok_and(|result| result.status.success())
+                && std::fs::rename(&partial, &out).is_ok();
             if compiled {
                 let _ = std::fs::write(&stamp_path, &stamp);
             }
@@ -546,16 +572,33 @@ fn precompiled(component: &Path) -> Option<PathBuf> {
     }
 }
 
-/// A clean directory for one server to run in, kept after the run so a failure's serve log and
-/// content script can be looked at.
-fn work_dir(port: u16) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("starling-serve-wasm/{port}"));
+/// A clean directory for one server to run in.
+///
+/// The directory is named after the current thread, which the test harness names after the test,
+/// and after the process, so concurrent runs of one suite do not share it. A test's second and
+/// later servers get a numbered suffix. [`WasmServer`]'s drop removes the directory unless the
+/// thread is panicking, so a failure's serve log and content script can be looked at.
+fn work_dir() -> PathBuf {
+    static STARTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let thread = std::thread::current();
+    let test = thread.name().unwrap_or("server").replace("::", "-");
+    let mut started = STARTED.lock().unwrap_or_else(|e| e.into_inner());
+    let earlier = started.iter().filter(|name| **name == test).count();
+    started.push(test.clone());
+    drop(started);
+    let process = std::process::id();
+    let name = match earlier {
+        0 => format!("{test}-{process}"),
+        _ => format!("{test}-{process}-{}", earlier + 1),
+    };
+    let dir = std::env::temp_dir().join("starling-serve-wasm").join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-/// Snapshot `component`, configured with `config`, into `out`.
+/// Snapshot `component`, configured with `config` and run in `dir`, into `out`. With `no_zeal`,
+/// SpiderMonkey runs under its ordinary GC (see [`Serve::without_gc_zeal`]).
 ///
 /// `--keep-init-func` because dropping the init export — wizer's default — leaves the component
 /// referring to a core export that is no longer there, and the snapshot then fails to load at all.

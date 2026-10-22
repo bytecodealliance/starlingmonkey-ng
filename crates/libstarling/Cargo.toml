@@ -7,7 +7,7 @@ authors.workspace = true
 edition.workspace = true
 
 [lib]
-# No unit tests; skip building the (SpiderMonkey-sized) lib test harness binary.
+# No unit tests. This skips building the (SpiderMonkey-sized) lib test harness binary.
 # The integration tests in `tests/` link the lib and are unaffected.
 test = false
 
@@ -46,6 +46,7 @@ wasip3.workspace = true
 [dev-dependencies]
 futures-channel.workspace = true
 serve-test-support.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

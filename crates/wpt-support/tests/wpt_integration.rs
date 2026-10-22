@@ -17,15 +17,10 @@ fn eval_wpt(code: &str) -> String {
     )
 }
 
+/// `evalScript` places `let` bindings in a non-syntactic scope, so they are visible to later
+/// `evalScript` calls.
 #[test]
-fn eval_script_basic() {
-    assert_eq!(eval_wpt("evalScript('1 + 2').toString()"), "3");
-}
-
-#[test]
-fn eval_script_shares_bindings() {
-    // evalScript should place `let` bindings in a non-syntactic scope
-    // so they are visible to subsequent evalScript calls.
+fn eval_script_shares_let_bindings() {
     assert_eq!(
         eval_wpt("evalScript('let wptFoo = 42;'); evalScript('wptFoo.toString()')"),
         "42"
@@ -33,15 +28,19 @@ fn eval_script_shares_bindings() {
 }
 
 #[test]
-fn eval_script_available_in_wpt_mode() {
-    // evalScript should be available as a global function.
-    assert_eq!(eval_wpt("typeof evalScript"), "function");
+fn set_location_rejects_an_invalid_url() {
+    assert_eq!(
+        eval_wpt(
+            "try { __setLocation('not a url'); 'no-throw' } \
+             catch (e) { (e instanceof TypeError) + ',' + e.message.includes('invalid URL') }"
+        ),
+        "true,true"
+    );
 }
 
+/// After `__setLocation` runs, every `WorkerLocation` accessor reports the URL's components.
 #[test]
-fn set_location_configures_worker_location() {
-    // After __setLocation runs, every WorkerLocation accessor must
-    // report the configured URL's components.
+fn set_location_sets_every_location_accessor() {
     assert_eq!(
         eval_wpt(
             "__setLocation('http://web-platform.test:8000/foo/bar.any.js?x=1'); \
@@ -49,16 +48,5 @@ fn set_location_configures_worker_location() {
         ),
         "http://web-platform.test:8000/foo/bar.any.js?x=1|\
          http://web-platform.test:8000|/foo/bar.any.js|?x=1"
-    );
-}
-
-#[test]
-fn set_location_rejects_invalid_url() {
-    assert_eq!(
-        eval_wpt(
-            "try { __setLocation('not a url'); 'no-throw' } \
-             catch(e) { (e instanceof TypeError) + ',' + e.message.includes('invalid URL') }"
-        ),
-        "true,true"
     );
 }
