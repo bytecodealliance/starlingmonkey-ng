@@ -11,6 +11,9 @@
 #   ./scripts/check-crown.sh -p core-runtime # Check a specific package
 #   ./scripts/check-crown.sh --workspace     # Check the entire workspace
 #   ./scripts/check-crown.sh -p starlingmonkey --target wasm32-wasip2  # Check the wasm-only code
+#
+# Crown and the checks use the toolchain `crown/rust-toolchain.toml` pins, which has a std for
+# wasm32-wasip2 and wasm32-wasip3.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +24,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CROWN_DIR="$ROOT_DIR/crown"
 CROWN_BIN="${CARGO_TARGET_DIR:-$CROWN_DIR/target}/release/crown"
 CROWN_SYSROOT="$(cd "$CROWN_DIR" && rustc --print sysroot)"
+CROWN_TOOLCHAIN="$(cd "$CROWN_DIR" && rustup show active-toolchain | cut -d' ' -f1)"
 CROWN_LIB="$CROWN_SYSROOT/lib"
 
 # Step 1: Build crown with the rpath baked in so it always finds librustc_driver
@@ -38,7 +42,7 @@ echo "Crown binary: $CROWN_BIN"
 # Step 2: Run cargo check with crown as the compiler wrapper
 echo ""
 echo "=== Running crown check ==="
-RUSTC_BOOTSTRAP="1" RUSTC_WRAPPER="$CROWN_BIN" cargo check \
+RUSTC_BOOTSTRAP="1" RUSTC_WRAPPER="$CROWN_BIN" cargo "+$CROWN_TOOLCHAIN" check \
     --manifest-path "$ROOT_DIR/Cargo.toml" \
     --features "js/crown" \
     "$@"

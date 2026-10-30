@@ -6,8 +6,8 @@ package test:exported-resource;
 // `counters.counter` in JavaScript and returns counters to the host, which calls
 // their methods through its handles and finally drops them.
 //
-// `read-later` is the one async export: it takes a borrow and reads it after a
-// timer turn.
+// `exported-resource-async` adds `delayed`, whose `read-later` is the one
+// async export: it takes a borrow and reads it after a timer turn.
 
 interface counters {
   resource counter {
@@ -32,6 +32,10 @@ interface counters {
   make-counter: func(start: u32) -> counter;
   // Returns a counter that `Object.preventExtensions` made non-extensible.
   make-sealed-counter: func(start: u32) -> counter;
+}
+
+interface delayed {
+  use counters.{counter};
 
   // Waits for a timer turn, then returns the value of the borrowed counter.
   read-later: async func(c: borrow<counter>) -> u32;
@@ -39,4 +43,10 @@ interface counters {
 
 world exported-resource {
   export counters;
+}
+
+// `exported-resource` with an `async` export, for a runtime built for WASIp3.
+world exported-resource-async {
+  include exported-resource;
+  export delayed;
 }

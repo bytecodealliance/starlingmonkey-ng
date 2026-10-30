@@ -4,8 +4,8 @@
 
 use rustc_hir::{self as hir, intravisit as visit, AmbigArg, ExprKind};
 use rustc_lint::{LateContext, LateLintPass, Lint, LintPass, LintStore};
+use rustc_lint_defs::declare_tool_lint;
 use rustc_middle::ty;
-use rustc_session::declare_tool_lint;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::symbol::{sym, Symbol};
 

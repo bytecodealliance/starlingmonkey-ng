@@ -152,7 +152,7 @@ async fn disabled_features_are_stubbed() -> anyhow::Result<()> {
         .await
         .expect_err("Math.random must trap with random disabled");
     assert!(
-        format!("{err:?}").contains("disabled-features!wasi:random/random@0.3.0#"),
+        format!("{err:?}").contains("disabled-features!wasi:random/random@"),
         "the trap is in the disabled function's stub: {err:?}"
     );
     Ok(())

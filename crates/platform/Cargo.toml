@@ -22,8 +22,14 @@ reqwest.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 http.workspace = true
 url.workspace = true
+
+[target.'cfg(target_env = "p2")'.dependencies]
+async-task.workspace = true
+wasip2.workspace = true
+
+[target.'cfg(target_env = "p3")'.dependencies]
 wasip3.workspace = true
-wit-bindgen.workspace = true
+wit-bindgen = { workspace = true, features = ["async"] }
 
 [lints]
 workspace = true

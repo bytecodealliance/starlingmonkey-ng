@@ -71,6 +71,9 @@ fn store() -> Store<Ctx> {
 /// which yields and returns 44, `+ 3` => 47.
 #[tokio::test]
 async fn async_import_and_export() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let result = store
@@ -95,6 +98,9 @@ async fn async_import_and_export() -> anyhow::Result<()> {
 /// rejects the guest's promise with a `ComponentError`, `+ 3` => `err(48)`.
 #[tokio::test]
 async fn async_import_and_export_result() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let ok = store
@@ -123,6 +129,9 @@ async fn async_import_and_export_result() -> anyhow::Result<()> {
 /// `TypeError` naming the export, rather than throwing.
 #[tokio::test]
 async fn async_import_in_a_sync_export_rejects() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let runner = instance.test_async_import_runner();

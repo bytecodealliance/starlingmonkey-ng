@@ -99,6 +99,9 @@ fn a_host_that_retires_instances_gives_each_request_a_fresh_global() {
 /// (`a_repeating_timer_keeps_running_between_requests`).
 #[test]
 fn a_repeating_timer_keeps_running_between_requests() {
+    if common::wasm_serve::needs_wasip3() {
+        return;
+    }
     const TICKER: &str = r#"globalThis.ticks = 0;
     setInterval(() => { globalThis.ticks += 1; }, 20);
     addEventListener('fetch', (event) => {
@@ -282,6 +285,7 @@ fn a_script_with_no_fetch_listener_reports_itself_and_answers_500s() {
 #[test]
 fn a_late_top_level_rejection_fails_startup() {
     let Some(server) = Serve::new()
+        .reusing_one_instance()
         .module(
             "entry.mjs",
             "addEventListener('fetch', (event) => event.respondWith(new Response('served')));
@@ -511,6 +515,9 @@ fn overlapping_work_handler(upstream: u16) -> String {
 /// is what keeps the second request's in-flight `fetch` out of it.
 #[test]
 fn post_response_work_does_not_disturb_the_next_request() {
+    if common::wasm_serve::needs_wasip3() {
+        return;
+    }
     let upstream = common::start_slow_upstream(Duration::from_millis(1200), "upstream-body");
     let Some(server) = Serve::new()
         .reusing_one_instance()
@@ -542,6 +549,9 @@ fn post_response_work_does_not_disturb_the_next_request() {
 /// on the realm in which the second is running JS. Each has to see only its own outcome.
 #[test]
 fn a_truncated_response_body_does_not_disturb_a_concurrent_request() {
+    if common::wasm_serve::needs_wasip3() {
+        return;
+    }
     let upstream = common::start_slow_upstream(Duration::from_millis(1000), "upstream-body");
     let Some(server) = Serve::new()
         .reusing_one_instance()
@@ -684,6 +694,9 @@ fn spawn_request(port: u16, path: &'static str) -> std::thread::JoinHandle<Strin
 /// alongside, since its pump goes on producing on its own loop while the other request dispatches.
 #[test]
 fn concurrent_requests_in_one_instance_keep_their_own_state() {
+    if common::wasm_serve::needs_wasip3() {
+        return;
+    }
     let gate = common::start_held_upstream("go");
     let handler = format!(
         r#"addEventListener('fetch', (event) => {{
@@ -806,6 +819,9 @@ const PER_ROUND: usize = 1000;
 /// same interleaving under the ordinary collector.
 #[test]
 fn deeply_interleaved_requests_keep_the_realm_stack_intact() {
+    if common::wasm_serve::needs_wasip3() {
+        return;
+    }
     let gate = common::start_held_upstream("go");
     let handler = format!(
         r#"addEventListener('fetch', (event) => {{
@@ -918,6 +934,9 @@ addEventListener('fetch', (event) => {{
 /// all four land in it and one startup serves them all.
 #[test]
 fn concurrent_first_requests_all_wait_out_one_startup() {
+    if common::wasm_serve::needs_wasip3() {
+        return;
+    }
     let gate = common::start_held_upstream("go");
     let Some(server) = Serve::new()
         .reusing_one_instance()
@@ -1462,16 +1481,12 @@ fn serve_proxies_via_fetch() {
     assert!(b.join().unwrap().contains("UPSTREAM-BODY"));
 }
 
-/// A proxied response body is out of `--response-body-timeout`'s reach, and deliberately: the
-/// handler responded with a `fetch` response, whose body is a host stream the host pumps itself, and
-/// holding onto it to bound it would mean copying every chunk of every proxied body through the
-/// guest (see `body_contents`). How long a transfer it is itself performing may take is the host's
-/// to limit — the native path bounds every body only because it performs every write.
-///
-/// The one place this suite asserts a divergence *as* the behavior, so it is written to fail if
-/// that changes silently in either direction.
+/// On WASIp3, a proxied response body is out of `--response-body-timeout`'s reach: the handler
+/// responded with a `fetch` response, whose body is a host stream the host copies itself (see
+/// `body_contents`). On WASIp2, the guest copies every chunk of a proxied body, and the timeout
+/// ends the body, as it does natively.
 #[test]
-fn a_proxied_body_outlives_the_response_body_timeout() {
+fn the_response_body_timeout_ends_a_proxied_body_only_on_wasip2() {
     let upstream = common::start_endless_upstream(Duration::from_millis(50));
     let handler = format!(
         "addEventListener('fetch', (event) => \
@@ -1491,13 +1506,20 @@ fn a_proxied_body_outlives_the_response_body_timeout() {
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
-    // Well over the bound, and still streaming.
+    // Well over the bound.
     let ended = read_until_eof(&mut stream, Duration::from_millis(500));
-    assert!(
-        ended.is_none(),
-        "the guest must not cut a body the host is pumping: {:?}",
-        ended.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-    );
+    if common::wasm_serve::built_for_wasip2() {
+        assert!(
+            ended.is_some(),
+            "the timeout must end a body the guest copies"
+        );
+    } else {
+        assert!(
+            ended.is_none(),
+            "the guest must not cut a body the host copies: {:?}",
+            ended.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        );
+    }
 }
 
 /// `respondWith(response)` consumes the response's body, so `bodyUsed` reads true afterwards.
@@ -1729,6 +1751,9 @@ fn nothing_but_wait_until_extends_the_event_lifetime() {
 /// event loop makes it arrive while that instance is blocked on the fetch.
 #[test]
 fn a_handler_can_fetch_its_own_server() {
+    if common::wasm_serve::needs_wasip3() {
+        return;
+    }
     // The handler addresses its own server through the gate rather than by `request.url`'s
     // origin: what the guest sees there is built from the `Host` header, which has no port
     // here.

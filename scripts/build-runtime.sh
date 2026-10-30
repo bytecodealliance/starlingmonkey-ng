@@ -81,4 +81,18 @@ case "$(wasm_version "$OUT")" in
         ;;
 esac
 
+# A wasm32-wasip2 runtime runs on hosts without WASIp3 and the Component Model's async features, so
+# it may neither import nor export a `0.3` interface, nor use those features.
+if [ "$TARGET" = wasm32-wasip2 ]; then
+    wit=$(wasm-tools component wit "$OUT")
+    if grep -E '^\s*(import|export) [^ ]+@0\.3' <<<"$wit"; then
+        echo "$OUT imports or exports WASIp3 interfaces" >&2
+        exit 1
+    fi
+    if ! wasm-tools validate --features=-cm-async "$OUT"; then
+        echo "$OUT uses the Component Model's async features" >&2
+        exit 1
+    fi
+fi
+
 echo "built $OUT ($(du -h "$OUT" | cut -f1))"

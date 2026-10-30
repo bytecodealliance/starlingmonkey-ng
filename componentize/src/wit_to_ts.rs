@@ -18,8 +18,9 @@
 //!   WIT names. These match the modules created by
 //!   `wit_bridge::imports::synthesize_import_modules`.
 //!
-//! A world exporting `wasi:http/handler` also gets file-level declarations for
-//! the `fetch` event the runtime dispatches to listeners.
+//! A world exporting `wasi:http/handler` or `wasi:http/incoming-handler` also
+//! gets file-level declarations for the `fetch` event the runtime dispatches to
+//! listeners.
 //!
 //! The TypeScript types follow the conversions in `wit_bridge::value`.
 //! Each rendering function names the conversion functions it matches.
@@ -58,11 +59,12 @@ declare var ComponentError: {
 
 ";
 
-/// The globals the runtime provides to a world exporting `wasi:http/handler`,
-/// which the DOM library lacks. Declared by interface merging only, so the file
-/// also compiles against the `webworker` library, which declares `FetchEvent`
-/// itself. Adding `fetch` to `WindowEventMap` types the event of an
-/// `addEventListener('fetch', …)` listener.
+/// The globals the runtime provides to a world exporting `wasi:http/handler` or
+/// `wasi:http/incoming-handler`, which the DOM library lacks. Declared by
+/// interface merging only, so the file also compiles against the `webworker`
+/// library, which declares `FetchEvent` itself. Adding `fetch` to
+/// `WindowEventMap` types the event of an `addEventListener('fetch', …)`
+/// listener.
 const FETCH_EVENT_DECL: &str = "\
 // The event the runtime dispatches to `addEventListener('fetch', …)` listeners.
 interface FetchEvent extends Event {
@@ -76,10 +78,13 @@ interface WindowEventMap {
 
 ";
 
-/// The `wasi:http/types` interface whose `request` resource is accepted by the
-/// runtime's `fetch`. Versions for which [`same_interface`] returns `true` are
-/// accepted as well.
-const WASI_HTTP_TYPES: &str = "wasi:http/types@0.3.0";
+/// The `wasi:http/types` interfaces whose request resources are accepted by the
+/// runtime's `fetch`, each with the name of its request resource. Versions for
+/// which [`same_interface`] returns `true` are accepted as well.
+const WASI_HTTP_REQUESTS: [(&str, &str); 2] = [
+    ("wasi:http/types@0.3.0", "request"),
+    ("wasi:http/types@0.2.0", "incoming-request"),
+];
 
 /// The specifier of the module that declares the JavaScript module's exports.
 ///
@@ -444,10 +449,16 @@ impl<'a> Generator<'a> {
         }
         if let Some(request) = self.wit_request_type() {
             let name = self.decl_name(Decl::Type(request, Side::Import));
+            let wit_name = self.type_name(request);
+            let handler = if wit_name == "incoming-request" {
+                crate::HTTP_INCOMING_HANDLER_INTERFACE_PREFIX
+            } else {
+                crate::HTTP_HANDLER_INTERFACE_PREFIX
+            };
             let _ = write!(
                 out,
-                "// `fetch` also takes a `wasi:http/types` `request`, such as the one a\n\
-                 // `wasi:http/handler` implementation receives, and sends it.\n\
+                "// `fetch` also takes a `wasi:http/types` `{wit_name}`, such as the one a\n\
+                 // `{handler}` implementation receives, and sends it.\n\
                  declare function fetch(\n  \
                    input: import('{types}').{name},\n  \
                    init?: RequestInit,\n\
@@ -1259,16 +1270,16 @@ impl<'a> Generator<'a> {
                 " It fails with an `error-code` by throwing an `ErrorCode` from `{types}`."
             );
         }
+        let interface = crate::unversioned(&group.names.wit_name);
         let mut out = format!(
-            "// The `{handler}` export is served in one of two ways. Either\n\
+            "// The `{interface}` export is served in one of two ways. Either\n\
              // register a listener on the global, and the runtime dispatches each\n\
              // request to it as a `FetchEvent`:\n\
              //\n\
              //   addEventListener('fetch', (event) => {{\n\
              //     event.respondWith(new Response('hello'));\n\
              //   }});\n\
-             //",
-            handler = crate::HTTP_HANDLER_INTERFACE_PREFIX,
+             //"
         );
         // The paragraph, wrapped to lines of at most 76 characters after `// `.
         let mut line = String::new();
@@ -1352,19 +1363,21 @@ impl<'a> Generator<'a> {
         format!("(request: {request}): {returned} | Promise<{returned}>")
     }
 
-    /// The `request` resource of [`WASI_HTTP_TYPES`], or of an interface for
-    /// which [`same_interface`] returns `true`, if the world imports it and the
-    /// declarations name it.
+    /// The request resource of an interface in [`WASI_HTTP_REQUESTS`], or of an
+    /// interface for which [`same_interface`] returns `true`, if the world
+    /// imports it and the declarations name it.
     fn wit_request_type(&self) -> Option<TypeId> {
         let id = self
             .world()
             .imports
             .iter()
             .find_map(|(key, item)| match item {
-                WorldItem::Interface { id, .. }
-                    if same_interface(&self.resolve.name_world_key(key), WASI_HTTP_TYPES) =>
-                {
-                    self.resolve.interfaces[*id].types.get("request").copied()
+                WorldItem::Interface { id, .. } => {
+                    let name = self.resolve.name_world_key(key);
+                    let (_, resource) = WASI_HTTP_REQUESTS
+                        .iter()
+                        .find(|(types, _)| same_interface(&name, types))?;
+                    self.resolve.interfaces[*id].types.get(*resource).copied()
                 }
                 _ => None,
             })?;
@@ -1374,9 +1387,28 @@ impl<'a> Generator<'a> {
             .then_some(id)
     }
 
-    /// The `ok` type of the WIT `handle`'s `result`, if it is a resource.
+    /// The `ok` type of the WIT `handle`'s `result`, if it is a resource. A
+    /// WASIp2 `handle` has no result, so on p2, this is the `outgoing-response`
+    /// of the interface that defines its `response-outparam` parameter.
     fn http_response_type(&self, func: Option<&Function>) -> Option<Type> {
-        let (ok, _) = self.as_result(&func?.result?)?;
+        let func = func?;
+        let Some(result) = &func.result else {
+            let Type::Id(outparam) = func.params.get(1)?.ty else {
+                return None;
+            };
+            let outparam = match self.resolve.types[self.canonical(outparam)].kind {
+                TypeDefKind::Handle(Handle::Own(resource)) => self.canonical(resource),
+                _ => self.canonical(outparam),
+            };
+            let TypeOwner::Interface(types) = self.resolve.types[outparam].owner else {
+                return None;
+            };
+            let response = self.resolve.interfaces[types]
+                .types
+                .get("outgoing-response")?;
+            return Some(Type::Id(*response));
+        };
+        let (ok, _) = self.as_result(result)?;
         let Some(Type::Id(id)) = ok else {
             return None;
         };
@@ -2157,8 +2189,8 @@ struct ExportGroup<'a> {
     /// Whether this is the `wasi:cli/run` export, which has no items and makes
     /// the guest export a bare `run`.
     cli_run: bool,
-    /// Whether this is the `wasi:http/handler` export, whose one item is
-    /// `handle`.
+    /// Whether this is the HTTP handler export, `wasi:http/handler` or
+    /// `wasi:http/incoming-handler`, whose one item is `handle`.
     http_handler: bool,
 }
 
@@ -2190,11 +2222,12 @@ fn world_export_functions(world: &World) -> impl Iterator<Item = &Function> {
 /// [`InterfaceNames::of`]) and items.
 ///
 /// Its items are its freestanding functions and the resources it declares a
-/// constructor, method or static function of. Two interfaces are
+/// constructor, method or static function of. Two kinds of interface are
 /// special-cased. `wasi:cli/run` has no items, since the guest exports a bare
-/// `run`. `wasi:http/handler`, which the componentizer exports as the
-/// plain-named interface [`RAW_HTTP_HANDLER_EXPORT`](crate::RAW_HTTP_HANDLER_EXPORT),
-/// keeps the names of `wasi:http/handler` and has the one item `handle`.
+/// `run`. The HTTP handler, `wasi:http/handler` or `wasi:http/incoming-handler`,
+/// which the componentizer exports as the plain-named interface
+/// [`RAW_HTTP_HANDLER_EXPORT`](crate::RAW_HTTP_HANDLER_EXPORT), keeps the names of
+/// its interface and has the one item `handle`.
 fn export_groups(resolve: &Resolve, world: WorldId) -> Vec<ExportGroup<'_>> {
     let mut groups = Vec::new();
     for (key, item) in &resolve.worlds[world].exports {
@@ -2213,12 +2246,20 @@ fn export_groups(resolve: &Resolve, world: WorldId) -> Vec<ExportGroup<'_>> {
             continue;
         }
         if names_interface(&wit_name, crate::HTTP_HANDLER_INTERFACE_PREFIX)
+            || names_interface(&wit_name, crate::HTTP_INCOMING_HANDLER_INTERFACE_PREFIX)
             || wit_name == crate::RAW_HTTP_HANDLER_EXPORT
         {
             let handle = iface.functions.get("handle");
-            // Comments name the raw export by its interface, `wasi:http/handler`.
+            // Comments name the raw export by its interface: `wasi:http/incoming-handler` for the
+            // WASIp2 export, whose `handle` takes a `response-outparam` and has no result, and
+            // `wasi:http/handler` otherwise.
             let wit_name = if wit_name == crate::RAW_HTTP_HANDLER_EXPORT {
-                crate::HTTP_HANDLER_INTERFACE_PREFIX.to_string()
+                match handle {
+                    Some(handle) if handle.params.len() == 2 && handle.result.is_none() => {
+                        crate::HTTP_INCOMING_HANDLER_INTERFACE_PREFIX.to_string()
+                    }
+                    _ => crate::HTTP_HANDLER_INTERFACE_PREFIX.to_string(),
+                }
             } else {
                 wit_name
             };

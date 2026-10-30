@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! Canonicalizing the interfaces a world imports at several compatible versions, such as
-//! `wasi:io/poll@0.2.0` and `wasi:io/poll@0.2.12` (see [`same_interface`]).
+//! `wasi:io/poll@0.2.0` and `wasi:io/poll@0.2.12` (see [`same_interface`]). A runtime built for
+//! WASIp2 imports such versions from the bindings of its different dependencies.
 
 use anyhow::Context as _;
 use wit_name_mapping::same_interface;

@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:serve;
+
+// The serve world of `serve.wit` for a runtime built for WASIp2, whose builtin HTTP handler export
+// is `wasi:http/incoming-handler`.
+world serve {
+  export wasi:http/incoming-handler@0.2.0;
+}
+
+package wasi:http@0.2.0 {
+  interface incoming-handler {}
+}

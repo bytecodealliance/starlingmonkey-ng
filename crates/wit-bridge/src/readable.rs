@@ -30,7 +30,7 @@
 //! reader, which happens when the source produces its next chunk, and when the
 //! loop has no other work that could make it produce more.
 
-#![cfg(target_arch = "wasm32")]
+#![cfg(target_env = "p3")]
 
 use core_runtime::{jsclass, jsmethods};
 use js::conversion::FromJSVal;

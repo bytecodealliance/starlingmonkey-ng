@@ -115,14 +115,20 @@ jobs:
         run: just ${{ matrix.recipe }} --examples
 
   # ---------------------------------------------------------------------------
-  # Componentization suites against the debug runtime (`just test-componentize`).
-  # That recipe builds the runtime for wasm32-wasip3, the target the componentizer
-  # links against, so this job installs beta and a wasi-sdk with a sysroot for it.
+  # Componentization suites against the debug runtime (`just test-componentize`),
+  # built for each wasm target (`RUNTIME_TARGET`). A wasm32-wasip3 build needs
+  # beta and a wasi-sdk with a sysroot for it, which the setup action installs.
   # ---------------------------------------------------------------------------
   componentize:
-    name: Componentize
+    name: Componentize (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip2, wasm32-wasip3]
     runs-on: ubuntu-latest
     env:
+      RUNTIME_TARGET: ${{ matrix.target }}
+      WASM_TARGET: ${{ matrix.target }}
       WASMTIME_BACKTRACE_DETAILS: '1'
       RUST_BACKTRACE: 'full'
     steps:
@@ -130,7 +136,7 @@ jobs:
 
       - uses: ./.github/actions/setup
         with:
-          target: wasm32-wasip3
+          target: ${{ matrix.target }}
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -149,7 +155,7 @@ jobs:
 
       # Snapshots with `wizer-initialize`, including CLI tools whose `run` export a snapshot calls.
       - name: Test Wizer snapshots
-        run: WASM_TARGET=p3 just test-wizer
+        run: just test-wizer
 
   # ---------------------------------------------------------------------------
   # WPT suite: {native, wasm32-wasip2, wasm32-wasip3}
@@ -205,8 +211,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # `just check-gc` also checks the wasm32-wasip2 build, which needs the target's std and the
-      # WASI SDK, and runs crown's own tests.
+      # `just check-gc` also checks the wasm32-wasip2 and wasm32-wasip3 builds, which need the WASI
+      # SDK, and runs crown's own tests. Crown's toolchain, which rustup installs from
+      # `crown/rust-toolchain.toml`, brings both targets' std.
       - uses: ./.github/actions/setup
         with:
           target: wasm32-wasip2

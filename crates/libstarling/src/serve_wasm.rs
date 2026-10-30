@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-//! Wasm serve mode: the `wasi:http/handler` export's body. The runtime is created once, running
-//! the content script that registers the `fetch` handlers, and reused across requests, each
-//! dispatched as a `fetch` event on its own [`EventLoop`].
+//! Wasm serve mode: the body of the HTTP handler export, `wasi:http/handler` on WASIp3 and
+//! `wasi:http/incoming-handler` on WASIp2. The runtime is created once, running the content
+//! script that registers the `fetch` handlers, and reused across requests, each dispatched as a
+//! `fetch` event on its own [`EventLoop`].
 //!
-//! A WASIp3 host keeps sending requests to an instance rather than retiring one per request:
-//! sequentially, and concurrently whenever every request in flight is parked on I/O or a timer.
-//! Requests therefore share one global, and are separated by their event loops rather than their
-//! realms.
+//! A host can keep sending requests to an instance rather than retiring one per request: a
+//! WASIp3 host sequentially, and concurrently whenever every request in flight is parked on I/O or
+//! a timer, and a WASIp2 host sequentially. Requests therefore share one global, and are separated
+//! by their event loops rather than their realms.
 //!
 //! Shares the dispatch core in `serve_common` with `serve_native`, and the request/response
 //! bridging in `platform::http`.
@@ -20,10 +21,10 @@ use core_runtime::event_loop::{run_until_evaluated, EventLoop};
 use core_runtime::invocation::{InvocationState, OwnedInvocation};
 use core_runtime::runtime::Runtime;
 use platform::http::OutgoingBody;
+use platform::http::{HostErrorCode, HostRequest, HostResponse};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
-use wasip3::http::types::{ErrorCode, Request as WasiRequest, Response as WasiResponse};
 
 js::instance_local! {
     /// The JS runtime and its raw context, created once. The single global's realm is entered for
@@ -174,7 +175,7 @@ pub fn adopt_runtime(
     Ok(())
 }
 
-/// The implementation that serves a componentized application's `wasi:http/handler` export.
+/// The implementation that serves a componentized application's HTTP handler export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpHandler {
     /// The runtime's builtin, which dispatches each request as a `fetch` event.
@@ -183,7 +184,7 @@ pub enum HttpHandler {
     Raw,
 }
 
-/// A componentized application's own export of `wasi:http/handler`.
+/// A componentized application's own export of the HTTP handler interface.
 pub struct RawHttpHandler<'a> {
     /// The JS paths the main module may provide the interface's `handle` under,
     /// such as `handler.handle`.
@@ -193,7 +194,7 @@ pub struct RawHttpHandler<'a> {
 }
 
 /// Select the [`HttpHandler`] of a componentized application whose component exports
-/// `wasi:http/handler`, once its top level has finished evaluating.
+/// the HTTP handler interface, once its top level has finished evaluating.
 ///
 /// Fails if the application both provides `raw` and registers a `fetch` listener, or does
 /// neither.
@@ -214,42 +215,40 @@ pub unsafe fn select_http_handler(
         .map(|path| format!("`{path}`"))
         .collect::<Vec<_>>()
         .join(" or ");
+    let handler = platform::http::HOST_HTTP_HANDLER;
     match (raw.provided, listener) {
         (true, false) => Ok(HttpHandler::Raw),
         (false, true) => Ok(HttpHandler::FetchEvent),
         (true, true) => Err(format!(
-            "the application both exports a `wasi:http/handler` implementation as {paths} and \
-             registers a `fetch` listener. The component's `wasi:http/handler` export is served \
+            "the application both exports a `{handler}` implementation as {paths} and \
+             registers a `fetch` listener. The component's `{handler}` export is served \
              by exactly one of them, so remove the other."
         )),
         (false, false) => Err(format!(
-            "the application neither exports a `wasi:http/handler` implementation as {paths} \
-             nor registers a `fetch` listener, so the component's `wasi:http/handler` export \
+            "the application neither exports a `{handler}` implementation as {paths} \
+             nor registers a `fetch` listener, so the component's `{handler}` export \
              could not serve any request. Export `handle(request)`, or register a listener \
              with `addEventListener('fetch', …)`."
         )),
     }
 }
 
-/// The `wasi:http/types` interface of the `wasi:http` version the runtime links:
-/// the one its `wasip3` bindings target.
-pub const WASI_HTTP_TYPES: &str = "wasi:http/types@0.3.0";
-
 /// A `Request` with the method, URL, headers and body of the incoming
-/// [`WASI_HTTP_TYPES`] `request` `handle`, which it takes ownership of. The body
-/// is not read until the `Request`'s body is. Throws a `TypeError` for a request
-/// whose fields `http` cannot represent.
+/// [`HOST_REQUEST_RESOURCE`](platform::http::HOST_REQUEST_RESOURCE) `handle`,
+/// which it takes ownership of. The body is not read until the `Request`'s body
+/// is. Throws a `TypeError` for a request whose fields `http` cannot represent.
 ///
 /// # Safety
 ///
-/// `handle` must be a live handle of a [`WASI_HTTP_TYPES`] `request` that the
+/// `handle` must be a live handle of a
+/// [`HOST_REQUEST_RESOURCE`](platform::http::HOST_REQUEST_RESOURCE) that the
 /// caller owns, and must not be used after this call.
 pub unsafe fn request_from_handle<'s>(
     scope: &'s js::gc::scope::Scope<'_>,
     handle: u32,
 ) -> Result<web_fetch::request::Request<'s>, js::error::ExnThrown> {
     // SAFETY: guaranteed by the caller.
-    let request = unsafe { WasiRequest::from_handle(handle) };
+    let request = unsafe { HostRequest::from_handle(handle) };
     let (method, url, headers, body) =
         platform::http::read_incoming_request(request).map_err(|code| {
             js::error::ThrowException::throw(
@@ -632,7 +631,7 @@ fn report_missing_fetch_listener(
 /// left nothing behind to the instance's lifetime for one whose `fetch` never responds.
 // TODO: Should reconsider this, it might make more sense to abort async work that's not added to waitUntil.
 fn keep_startup_loop_running(raw_cx: *mut js::native::RawJSContext, invocation: OwnedInvocation) {
-    wasip3::wit_bindgen::spawn_local(async move {
+    platform::task::spawn_background(async move {
         // SAFETY: `runtime` entered the default global's realm for the process lifetime, and
         // `raw_cx` outlives this task, since the runtime is held in a process-lifetime
         // thread-local.
@@ -650,7 +649,7 @@ fn keep_startup_loop_running(raw_cx: *mut js::native::RawJSContext, invocation: 
 
 /// Handle one incoming request: create (or reuse) the runtime, drive the
 /// content script's startup loop, then dispatch the request.
-pub async fn handle(wasi_request: WasiRequest) -> Result<WasiResponse, ErrorCode> {
+pub async fn handle(wasi_request: HostRequest) -> Result<HostResponse, HostErrorCode> {
     let Ok((runtime, raw_cx, timeouts)) = runtime() else {
         // No runtime means no loop to drain, and no config to take a timeout from.
         return Ok(error_response(500, "Internal Server Error", None).0);
@@ -672,9 +671,9 @@ pub async fn handle(wasi_request: WasiRequest) -> Result<WasiResponse, ErrorCode
 async fn dispatch_request(
     runtime: Rc<Runtime>,
     raw_cx: *mut js::native::RawJSContext,
-    wasi_request: WasiRequest,
+    wasi_request: HostRequest,
     timeouts: ServeTimeouts,
-) -> Result<WasiResponse, ErrorCode> {
+) -> Result<HostResponse, HostErrorCode> {
     let clock = timeouts.start_clock();
     let (method, url, headers, body) = match platform::http::read_incoming_request(wasi_request) {
         Ok(parts) => parts,
@@ -745,7 +744,7 @@ async fn dispatch_request(
     };
     // Continue running the event loop until the response body has been fully sent out and all
     // `waitUntil` promises have been settled.
-    wasip3::wit_bindgen::spawn_local(async move {
+    platform::task::spawn(async move {
         // SAFETY: the process-lifetime realm is entered, and `raw_cx` outlives this task.
         unsafe {
             let outcome = drive_body_send(
@@ -877,7 +876,7 @@ fn error_response(
     message: &str,
     body_timeout: Option<std::time::Duration>,
 ) -> (
-    WasiResponse,
+    HostResponse,
     platform::http::BodyDone,
     platform::http::AbandonBody,
 ) {

@@ -21,6 +21,6 @@ pub fn clear_traced_roots() {
     crate::resources::clear_traced_roots();
     crate::exports::clear_traced_roots();
     crate::component_error::clear_traced_roots();
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_env = "p3")]
     crate::streams::clear_traced_roots();
 }

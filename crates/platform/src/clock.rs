@@ -18,7 +18,12 @@ static OFFSET_NS: AtomicU64 = AtomicU64::new(0);
 /// [`resume_from_snapshot`] to apply. Zero for an instance that was never wizened.
 static SNAPSHOT_NS: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_env = "p2")]
+fn host_monotonic_ns() -> u64 {
+    wasip2::clocks::monotonic_clock::now()
+}
+
+#[cfg(target_env = "p3")]
 fn host_monotonic_ns() -> u64 {
     wasip3::clocks::monotonic_clock::now()
 }
@@ -100,9 +105,12 @@ pub fn resume_from_snapshot() -> u64 {
 }
 
 /// Wait for `duration` on the host's monotonic clock.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_env = "p2", target_env = "p3"))]
 pub async fn sleep(duration: std::time::Duration) {
     let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+    #[cfg(target_env = "p2")]
+    crate::task::wait_for(wasip2::clocks::monotonic_clock::subscribe_duration(nanos)).await;
+    #[cfg(target_env = "p3")]
     wasip3::clocks::monotonic_clock::wait_for(nanos).await;
 }
 

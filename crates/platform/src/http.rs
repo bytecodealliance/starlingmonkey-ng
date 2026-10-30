@@ -2,24 +2,36 @@
 
 //! Async HTTP transport.
 //!
-//! `send` returns once the response status and headers are available; the body
-//! is a [`IncomingBody`] read lazily from the host (reqwest on native, the
-//! WASIp3 incoming body stream on wasm). Callers either drain it with
+//! `send` returns once the response status and headers are available. The body
+//! is an [`IncomingBody`] read lazily from the host: reqwest natively, and the
+//! `wasi:http` incoming body stream on wasm. Callers either drain it with
 //! [`IncomingBody::read_all`] or read it piece by piece with
 //! [`IncomingBody::read_into`]. Natively, `IncomingBody::next_chunk` also returns
 //! each chunk as it was received.
 //!
-//! This module holds the platform-agnostic parts; the backends live in
-//! [`http_native`](crate::http_native) and [`http_wasm`](crate::http_wasm),
-//! whose platform-specific items are re-exported here.
+//! This module holds the platform-agnostic parts. The backends are `http_native`, `http_p2` and
+//! `http_p3`, and the two wasm backends share `http_wasm`. Their platform-specific items are
+//! re-exported here.
+//!
+//! On wasm, `HostRequest`, `HostResponse` and `HostErrorCode` are the `wasi:http` types of the
+//! runtime's HTTP handler export.
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::http_native::{incoming_body_channel, send, IncomingBody, IncomingBodySender};
-#[cfg(target_arch = "wasm32")]
-pub use crate::http_wasm::{
-    build_outgoing_response, read_incoming_request, send, AbandonBody, BodyDone, BodySendOutcome,
-    IncomingBody,
+#[cfg(target_env = "p2")]
+pub use crate::http_p2::{
+    build_outgoing_response, read_incoming_request, send, HostErrorCode, HostRequest, HostResponse,
+    IncomingBody, HOST_HTTP_HANDLER, HOST_HTTP_TYPES, HOST_REQUEST_RESOURCE,
+    HOST_RESPONSE_RESOURCE,
 };
+#[cfg(target_env = "p3")]
+pub use crate::http_p3::{
+    build_outgoing_response, read_incoming_request, send, HostErrorCode, HostRequest, HostResponse,
+    IncomingBody, HOST_HTTP_HANDLER, HOST_HTTP_TYPES, HOST_REQUEST_RESOURCE,
+    HOST_RESPONSE_RESOURCE,
+};
+#[cfg(target_arch = "wasm32")]
+pub use crate::http_wasm::{AbandonBody, BodyDone, BodySendOutcome};
 
 /// An outgoing HTTP request.
 pub struct Request {

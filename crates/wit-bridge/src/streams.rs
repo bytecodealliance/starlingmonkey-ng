@@ -22,7 +22,7 @@
 //! `stream` or `future` without a payload type are lifted as `undefined`, and
 //! lowered to nothing.
 
-#![cfg(target_arch = "wasm32")]
+#![cfg(target_env = "p3")]
 
 use std::alloc::Layout;
 use std::cell::RefCell;

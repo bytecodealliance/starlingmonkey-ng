@@ -387,7 +387,7 @@ pub fn dispose_function<'s>(scope: &'s Scope<'_>) -> Result<Function<'s>, ExnThr
 
 /// Move the handle held by `from` to `to`, a wrapper of the same type that
 /// holds no handle. Does nothing if `from` holds no handle.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_env = "p3")]
 pub(crate) fn move_handle(from: ImportedResource<'_>, to: ImportedResource<'_>) {
     let handle = from.data_mut().handle.take();
     if handle.is_some() {

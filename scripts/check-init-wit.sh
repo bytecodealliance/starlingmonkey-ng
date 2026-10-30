@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 #
-# Fail if `starling/wit/init.wit` changed since a release without a version of its package that
-# is not compatible with the release's. `starling-componentize` accepts a runtime whose version of
-# the `init` interface has the same canonical version as its own, so a change to the interface
-# needs a different canonical version. Doc comments are ignored.
+# Fail if `starling/wit/p2/init.wit` differs from `starling/wit/init.wit` in anything but its doc
+# comments and a synchronous `init`, or if `starling/wit/init.wit` changed since a release without
+# a version of its package that is not compatible with the release's. `starling-componentize`
+# accepts a runtime whose version of the `init` interface has the same canonical version as its
+# own, so a change to the interface needs a different canonical version. Doc comments are ignored.
 #
 # Usage: scripts/check-init-wit.sh [<revision>]
 #
@@ -13,6 +14,15 @@
 set -euo pipefail
 
 file=starling/wit/init.wit
+p2_file=starling/wit/p2/init.wit
+
+if ! diff -u --label "$file, with a synchronous init" --label "$p2_file" \
+    <(wasm-tools component wit --no-docs "$file" | sed 's/: async func(/: func(/') \
+    <(wasm-tools component wit --no-docs "$p2_file") >&2; then
+    echo "$p2_file must declare what $file does, with a synchronous \`init\`." >&2
+    exit 1
+fi
+
 base=${1:-}
 if [ -z "$base" ]; then
     if ! base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null); then

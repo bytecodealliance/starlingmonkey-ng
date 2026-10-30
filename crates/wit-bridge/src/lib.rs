@@ -18,15 +18,15 @@ pub mod imports;
 pub mod init;
 #[cfg(target_arch = "wasm32")]
 pub mod interpreter;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_env = "p3")]
 pub mod promises;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_env = "p3")]
 pub mod readable;
 pub mod resources;
 #[cfg(target_arch = "wasm32")]
 pub mod run;
 pub mod stack;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_env = "p3")]
 pub mod streams;
 pub mod tracing;
 pub mod validate;
@@ -50,7 +50,7 @@ pub use tracing::install_tracer;
 pub use value::TypeShape;
 
 /// Install [`ComponentError`] on `global`, and register the internal classes
-/// of the crate: the wrapper class of imported resources and, on wasm, the
+/// of the crate: the wrapper class of imported resources and, on WASIp3, the
 /// classes used to implement `stream` and `future` values.
 pub fn add_to_global(scope: &js::gc::scope::Scope<'_>, global: js::Object<'_>) {
     ComponentError::add_to_global(scope, global);
@@ -58,7 +58,7 @@ pub fn add_to_global(scope: &js::gc::scope::Scope<'_>, global: js::Object<'_>) {
     component_error::install_class_factory(scope)
         .expect("creating the error class factory can only fail due to OOM");
     resources::ImportedResource::add_to_global(scope, global);
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_env = "p3")]
     {
         readable::IncomingStream::add_to_global(scope, global);
         promises::FutureWrite::add_to_global(scope, global);

@@ -117,53 +117,75 @@ mod static_init {
     static INIT_TP: extern "C" fn() = init_tp;
 }
 
-/// The wasm component exports both `wasi:cli/run` and `wasi:http/handler`, so one build serves
-/// HTTP and runs as a command. There is no dispatch between them: the host picks which export to
-/// call. `wasmtime run` calls the former, `wasmtime serve` the latter.
+/// The wasm component exports both `wasi:cli/run` and an HTTP handler (`wasi:http/handler` on
+/// WASIp3, `wasi:http/incoming-handler` on WASIp2), so one build serves HTTP and runs as a
+/// command. There is no dispatch between them: the host picks which export to call.
+/// `wasmtime run` calls the former, `wasmtime serve` the latter.
 ///
 /// The two differ only in where their configuration comes from. The CLI export is handed argv;
 /// the HTTP export is not (`wasmtime serve` passes none), so it reads `STARLINGMONKEY_CONFIG`.
+///
+/// On WASIp2, every export is synchronous and runs its work with [`platform::task::block_on`].
 mod wasm_entry {
     use core_runtime::invocation::{InvocationState, OwnedInvocation};
     use libstarling::config::RuntimeConfig;
     use wit_bridge::run::{report_run_outcome, run_main_export, MainModule};
 
-    struct StarlingCli;
+    /// The body of `wasi:cli/run.run`.
+    ///
+    /// Call the main module's `run` export in an instance whose top level ran before a
+    /// snapshot: a componentized command, or a script wizened with `wizer-initialize`.
+    /// In any other instance, run the script the arguments name.
+    async fn run() -> Result<(), ()> {
+        let snapshot = if wit_bridge::init::is_initialized() {
+            Some((wit_bridge::init::runtime(), MainModule::Bootstrap))
+        } else {
+            libstarling::serve_wasm::installed_runtime()
+                .map(|(runtime, raw_cx)| (runtime, MainModule::Entry(raw_cx)))
+        };
+        let Some((runtime, main)) = snapshot else {
+            let config = match RuntimeConfig::from_args(std::env::args()) {
+                Ok(config) => config,
+                Err(e) => {
+                    let _ = e.print();
+                    return Err(());
+                }
+            };
+            return libstarling::run(config).await.map_err(|e| {
+                eprintln!("{e}");
+            });
+        };
+        // The snapshot's top level left no work behind, since both kinds of snapshot refuse
+        // any, so `run` starts on a fresh loop, after the resume fixups have repaired the
+        // clocks.
+        libstarling::serve_wasm::fix_up_after_resume();
+        let invocation = OwnedInvocation::new(runtime, InvocationState::new());
+        report_run_outcome(run_main_export(&invocation, main).await)
+    }
 
+    /// The body of `wizer-initialize`.
+    async fn wizer_initialize() {
+        // A failure here would otherwise be baked into the snapshot as a runtime that
+        // silently starts from scratch on every request.
+        if let Err(e) = libstarling::serve_wasm::pre_initialize().await {
+            panic!("pre-initialization failed: {e}");
+        }
+        // Last, so that the clock reading it records is past every timestamp the
+        // snapshot holds.
+        libstarling::serve_wasm::prepare_for_snapshot();
+    }
+
+    struct StarlingCli;
+    struct StarlingHttp;
+
+    #[cfg(target_env = "p3")]
     impl wasip3::exports::cli::run::Guest for StarlingCli {
-        /// Call the main module's `run` export in an instance whose top level ran before a
-        /// snapshot: a componentized command, or a script wizened with `wizer-initialize`.
-        /// In any other instance, run the script the arguments name.
         async fn run() -> Result<(), ()> {
-            let snapshot = if wit_bridge::init::is_initialized() {
-                Some((wit_bridge::init::runtime(), MainModule::Bootstrap))
-            } else {
-                libstarling::serve_wasm::installed_runtime()
-                    .map(|(runtime, raw_cx)| (runtime, MainModule::Entry(raw_cx)))
-            };
-            let Some((runtime, main)) = snapshot else {
-                let config = match RuntimeConfig::from_args(std::env::args()) {
-                    Ok(config) => config,
-                    Err(e) => {
-                        let _ = e.print();
-                        return Err(());
-                    }
-                };
-                return libstarling::run(config).await.map_err(|e| {
-                    eprintln!("{e}");
-                });
-            };
-            // The snapshot's top level left no work behind, since both kinds of snapshot refuse
-            // any, so `run` starts on a fresh loop, after the resume fixups have repaired the
-            // clocks.
-            libstarling::serve_wasm::fix_up_after_resume();
-            let invocation = OwnedInvocation::new(runtime, InvocationState::new());
-            report_run_outcome(run_main_export(&invocation, main).await)
+            run().await
         }
     }
 
-    struct StarlingHttp;
-
+    #[cfg(target_env = "p3")]
     impl wasip3::exports::http::handler::Guest for StarlingHttp {
         async fn handle(
             request: wasip3::http::types::Request,
@@ -172,8 +194,37 @@ mod wasm_entry {
         }
     }
 
+    #[cfg(target_env = "p3")]
     wasip3::cli::command::export!(StarlingCli);
+    #[cfg(target_env = "p3")]
     wasip3::http::service::export!(StarlingHttp);
+
+    #[cfg(target_env = "p2")]
+    impl wasip2::exports::cli::run::Guest for StarlingCli {
+        fn run() -> Result<(), ()> {
+            platform::task::block_on(run())
+        }
+    }
+
+    #[cfg(target_env = "p2")]
+    impl wasip2::exports::http::incoming_handler::Guest for StarlingHttp {
+        fn handle(
+            request: wasip2::http::types::IncomingRequest,
+            response_out: wasip2::http::types::ResponseOutparam,
+        ) {
+            platform::task::block_on(async move {
+                let response = libstarling::serve_wasm::handle(request).await;
+                // Set before the tasks writing the response body first run, since the host
+                // reads the body only once the response is set.
+                wasip2::http::types::ResponseOutparam::set(response_out, response);
+            });
+        }
+    }
+
+    #[cfg(target_env = "p2")]
+    wasip2::cli::command::export!(StarlingCli);
+    #[cfg(target_env = "p2")]
+    wasip2::http::proxy::export!(StarlingHttp);
 
     /// Pre-initialization entry point for `wasmtime wizer`, which runs it and snapshots the
     /// initialized instance.
@@ -181,12 +232,14 @@ mod wasm_entry {
     /// Wizer calls a component-level function export, and a component exports only what its world
     /// declares. A bare `#[export_name]` does not survive componentization, so this declares the
     /// smallest possible world containing just that function. Its fragment merges with the two
-    /// `export!`s above into one component exporting all three.
+    /// `export!`s above into one component exporting all three. The function is async on WASIp3,
+    /// and synchronous on WASIp2, which has no async functions.
     ///
     /// The export has to survive the snapshot (`--keep-init-func=true`): dropping it, which is
     /// wizer's default, leaves the component referring to a core export that is no longer there,
     /// and the result fails to load. See `scripts/test-wizer.sh`.
     mod wizer {
+        #[cfg(target_env = "p3")]
         wit_bindgen::generate!({
             inline: r#"
                 package local:wizer;
@@ -197,18 +250,30 @@ mod wasm_entry {
             world: "wizer",
         });
 
+        #[cfg(target_env = "p2")]
+        wit_bindgen::generate!({
+            inline: r#"
+                package local:wizer;
+                world wizer {
+                    export wizer-initialize: func();
+                }
+            "#,
+            world: "wizer",
+        });
+
         struct Init;
 
+        #[cfg(target_env = "p3")]
         impl Guest for Init {
             async fn wizer_initialize() {
-                // A failure here would otherwise be baked into the snapshot as a runtime that
-                // silently starts from scratch on every request.
-                if let Err(e) = libstarling::serve_wasm::pre_initialize().await {
-                    panic!("pre-initialization failed: {e}");
-                }
-                // Last, so that the clock reading it records is past every timestamp the
-                // snapshot holds.
-                libstarling::serve_wasm::prepare_for_snapshot();
+                super::wizer_initialize().await
+            }
+        }
+
+        #[cfg(target_env = "p2")]
+        impl Guest for Init {
+            fn wizer_initialize() {
+                platform::task::block_on(super::wizer_initialize())
             }
         }
 
@@ -217,7 +282,7 @@ mod wasm_entry {
 }
 
 /// The `starling:componentize/init` export, which `starling/wit/init.wit`
-/// declares.
+/// declares, and on WASIp2 `starling/wit/p2/init.wit`.
 ///
 /// `starling-componentize` links this runtime together with the user's wit-dylib
 /// bindings and calls `init` once, under Wizer, to bootstrap the SpiderMonkey
@@ -229,8 +294,9 @@ mod wasm_entry {
 /// The generated `run_ctors_once` shim runs the static constructors before the
 /// body, so SpiderMonkey is safe to use here.
 mod init_export {
-    /// A `Request` for `value` if it is a wrapper of a `wasi:http/types`
-    /// `request`, whose handle the `Request` takes. See
+    /// A `Request` for `value` if it is a wrapper of a
+    /// [`HOST_REQUEST_RESOURCE`](platform::http::HOST_REQUEST_RESOURCE), whose
+    /// handle the `Request` takes. See
     /// [`web_fetch::request::register_request_input_adapter`].
     fn request_input<'s>(
         scope: &'s js::gc::scope::Scope<'_>,
@@ -239,8 +305,8 @@ mod init_export {
         let handle = wit_bridge::interpreter::take_imported_handle(
             scope,
             value,
-            libstarling::serve_wasm::WASI_HTTP_TYPES,
-            "request",
+            platform::http::HOST_HTTP_TYPES,
+            platform::http::HOST_REQUEST_RESOURCE,
         )?;
         handle
             .map(|handle| {
@@ -252,9 +318,17 @@ mod init_export {
     }
 
     mod bindings {
+        #[cfg(target_env = "p3")]
         wit_bindgen::generate!({
             world: "runtime",
             path: "wit/init.wit",
+            generate_all,
+        });
+
+        #[cfg(target_env = "p2")]
+        wit_bindgen::generate!({
+            world: "runtime",
+            path: "wit/p2/init.wit",
             generate_all,
         });
 
@@ -268,9 +342,8 @@ mod init_export {
 
     struct Init;
 
+    #[cfg(target_env = "p3")]
     impl bindings::exports::starling::componentize::init::Guest for Init {
-        /// Bootstrap the runtime and evaluate the application's modules, as
-        /// `init` in `wit/init.wit` describes.
         async fn init(
             main: String,
             main_name: String,
@@ -279,120 +352,156 @@ mod init_export {
             raw_http_handler: Option<String>,
             init_location: Option<String>,
         ) -> Result<bool, String> {
-            // Registered before `initialize_runtime` calls `Runtime::init`, which
-            // fires every global initializer on the default global.
-            libstarling::register_builtins();
-            libstarling::runtime::register_global_initializer(wit_bridge::add_to_global);
-            // A `Response` lowers to an owned `wasi:http/types` `response`, so an
-            // application's own `wasi:http/handler` can return one.
-            wit_bridge::resources::register_own_adapter(
-                libstarling::serve_wasm::WASI_HTTP_TYPES,
-                "response",
-                libstarling::serve_wasm::response_handle,
-                libstarling::serve_wasm::response_accepts,
-            );
-            // `fetch` takes a `wasi:http/types` `request`, such as the one an
-            // application's own `wasi:http/handler` receives.
-            web_fetch::request::register_request_input_adapter(request_input);
-
-            let config = core_runtime::config::RuntimeConfig {
-                pre_initialize: true,
+            init(
+                main,
+                main_name,
+                main_path,
+                cli,
+                raw_http_handler,
                 init_location,
-                ..Default::default()
-            };
-            libstarling::apply_pre_init_config(&config)?;
-            // The host's imports are not linked while the snapshot is taken.
-            wit_bridge::imports::set_imports_unavailable(true);
-            wit_bridge::init::set_before_export(libstarling::serve_wasm::fix_up_after_resume);
-            let initialized = wit_bridge::initialize_runtime(
-                &config,
-                &main,
-                &main_name,
-                main_path.as_deref(),
-                wit_bridge::interpreter::synthesize,
-            )?;
-            let invocation =
-                OwnedInvocation::new(wit_bridge::init::runtime(), initialized.invocation);
-            let raw_cx = wit_bridge::init::raw_cx();
+            )
+            .await
+        }
+    }
 
-            // A top-level `await` settles only once the loop runs the timers and
-            // I/O it waits on, and the application's exports are in their
-            // temporal dead zone until it does. We drive the loop only while the
-            // top level is unfinished, so work it merely queued, such as a timer,
-            // is refused below rather than run under Wizer.
-            if !wit_bridge::init::with_scope(|scope| initialized.evaluation.is_finished(scope)) {
-                // SAFETY: `initialize_runtime` left the default global's realm
-                // entered for the process, and keeps its runtime alive for the
-                // process.
-                unsafe {
-                    libstarling::serve_wasm::drive_startup(
-                        raw_cx,
-                        invocation.state().event_loop(),
-                        &initialized.evaluation,
-                    )
-                    .await;
-                }
-            }
-            wit_bridge::init::with_scope(|scope| {
-                initialized
-                    .evaluation
-                    .rejection(scope, "main module threw during evaluation")?;
-                if initialized.evaluation.is_finished(scope) {
-                    Ok(())
-                } else {
-                    Err(
-                        "the application's top-level `await` never settled: the event loop \
-                         ran out of work while it was still pending"
-                            .to_string(),
-                    )
-                }
-            })?;
-
-            let raw_export = wit_bridge::init::with_main_scope(|scope, ns| {
-                wit_bridge::interpreter::install_exports(
-                    scope,
-                    ns,
-                    cli,
-                    raw_http_handler.as_deref(),
-                )
-            })?;
-
-            wit_bridge::init::with_scope(|scope| {
-                libstarling::serve_wasm::finish_for_snapshot(scope, invocation.state().event_loop())
-            })?;
-            drop(invocation);
-
-            let http_handler = raw_export
-                .map(|raw| {
-                    // SAFETY: `initialize_runtime` left the default global's realm
-                    // of `raw_cx` entered for the process.
-                    unsafe {
-                        libstarling::serve_wasm::select_http_handler(
-                            raw_cx,
-                            RawHttpHandler {
-                                paths: &raw.paths,
-                                provided: raw.provided,
-                            },
-                        )
-                    }
-                })
-                .transpose()?;
-
-            // Hand the runtime to the serve path, so `wasi:http/handler`
-            // dispatches against this global instead of standing up a second
-            // runtime.
-            libstarling::serve_wasm::adopt_runtime(wit_bridge::init::runtime(), raw_cx, &config)?;
-
-            // The instance is wizened as soon as this returns, so everything
-            // above is state a resumed instance inherits. Last, since this
-            // records the clock reading the resumed instance's own clocks are
-            // advanced past.
-            wit_bridge::imports::set_imports_unavailable(false);
-            libstarling::serve_wasm::prepare_for_snapshot();
-            Ok(matches!(
-                http_handler,
-                Some(libstarling::serve_wasm::HttpHandler::Raw)
+    #[cfg(target_env = "p2")]
+    impl bindings::exports::starling::componentize::init::Guest for Init {
+        fn init(
+            main: String,
+            main_name: String,
+            main_path: Option<String>,
+            cli: bool,
+            raw_http_handler: Option<String>,
+            init_location: Option<String>,
+        ) -> Result<bool, String> {
+            platform::task::block_on(init(
+                main,
+                main_name,
+                main_path,
+                cli,
+                raw_http_handler,
+                init_location,
             ))
         }
+    }
+
+    /// Bootstrap the runtime and evaluate the application's modules, as
+    /// `init` in `wit/init.wit` describes.
+    async fn init(
+        main: String,
+        main_name: String,
+        main_path: Option<String>,
+        cli: bool,
+        raw_http_handler: Option<String>,
+        init_location: Option<String>,
+    ) -> Result<bool, String> {
+        // Registered before `initialize_runtime` calls `Runtime::init`, which
+        // fires every global initializer on the default global.
+        libstarling::register_builtins();
+        libstarling::runtime::register_global_initializer(wit_bridge::add_to_global);
+        // A `Response` lowers to an owned response resource of the host's
+        // `wasi:http/types`, so an application's own HTTP handler can return one.
+        wit_bridge::resources::register_own_adapter(
+            platform::http::HOST_HTTP_TYPES,
+            platform::http::HOST_RESPONSE_RESOURCE,
+            libstarling::serve_wasm::response_handle,
+            libstarling::serve_wasm::response_accepts,
+        );
+        // `fetch` takes a request resource of the host's `wasi:http/types`, such as
+        // the one an application's own HTTP handler receives.
+        web_fetch::request::register_request_input_adapter(request_input);
+
+        let config = core_runtime::config::RuntimeConfig {
+            pre_initialize: true,
+            init_location,
+            ..Default::default()
+        };
+        libstarling::apply_pre_init_config(&config)?;
+        // The host's imports are not linked while the snapshot is taken.
+        wit_bridge::imports::set_imports_unavailable(true);
+        wit_bridge::init::set_before_export(libstarling::serve_wasm::fix_up_after_resume);
+        let initialized = wit_bridge::initialize_runtime(
+            &config,
+            &main,
+            &main_name,
+            main_path.as_deref(),
+            wit_bridge::interpreter::synthesize,
+        )?;
+        let invocation = OwnedInvocation::new(wit_bridge::init::runtime(), initialized.invocation);
+        let raw_cx = wit_bridge::init::raw_cx();
+
+        // A top-level `await` settles only once the loop runs the timers and
+        // I/O it waits on, and the application's exports are in their
+        // temporal dead zone until it does. We drive the loop only while the
+        // top level is unfinished, so work it merely queued, such as a timer,
+        // is refused below rather than run under Wizer.
+        if !wit_bridge::init::with_scope(|scope| initialized.evaluation.is_finished(scope)) {
+            // SAFETY: `initialize_runtime` left the default global's realm
+            // entered for the process, and keeps its runtime alive for the
+            // process.
+            unsafe {
+                libstarling::serve_wasm::drive_startup(
+                    raw_cx,
+                    invocation.state().event_loop(),
+                    &initialized.evaluation,
+                )
+                .await;
+            }
+        }
+        wit_bridge::init::with_scope(|scope| {
+            initialized
+                .evaluation
+                .rejection(scope, "main module threw during evaluation")?;
+            if initialized.evaluation.is_finished(scope) {
+                Ok(())
+            } else {
+                Err(
+                    "the application's top-level `await` never settled: the event loop \
+                     ran out of work while it was still pending"
+                        .to_string(),
+                )
+            }
+        })?;
+
+        let raw_export = wit_bridge::init::with_main_scope(|scope, ns| {
+            wit_bridge::interpreter::install_exports(scope, ns, cli, raw_http_handler.as_deref())
+        })?;
+
+        wit_bridge::init::with_scope(|scope| {
+            libstarling::serve_wasm::finish_for_snapshot(scope, invocation.state().event_loop())
+        })?;
+        drop(invocation);
+
+        let http_handler = raw_export
+            .map(|raw| {
+                // SAFETY: `initialize_runtime` left the default global's realm
+                // of `raw_cx` entered for the process.
+                unsafe {
+                    libstarling::serve_wasm::select_http_handler(
+                        raw_cx,
+                        RawHttpHandler {
+                            paths: &raw.paths,
+                            provided: raw.provided,
+                        },
+                    )
+                }
+            })
+            .transpose()?;
+
+        // Hand the runtime to the serve path, so `wasi:http/handler`
+        // dispatches against this global instead of standing up a second
+        // runtime.
+        libstarling::serve_wasm::adopt_runtime(wit_bridge::init::runtime(), raw_cx, &config)?;
+
+        // The instance is wizened as soon as this returns, so everything
+        // above is state a resumed instance inherits. Last, since this
+        // records the clock reading the resumed instance's own clocks are
+        // advanced past.
+        wit_bridge::imports::set_imports_unavailable(false);
+        libstarling::serve_wasm::prepare_for_snapshot();
+        Ok(matches!(
+            http_handler,
+            Some(libstarling::serve_wasm::HttpHandler::Raw)
+        ))
     }
 }

@@ -47,7 +47,8 @@ const CLI_WORLD_NAME: &str = "command";
 /// The name of the world selected by `--export-http`, which exports
 /// `wasi:http/handler`. The interface is implemented by the application, or by
 /// the runtime, which dispatches each request to the `fetch` listeners that the
-/// application added while it was initialized.
+/// application added while it was initialized. A runtime built for WASIp2
+/// exports `wasi:http/incoming-handler` instead.
 const SERVE_WORLD_NAME: &str = "serve";
 
 /// The WIT sources of the worlds selected by `--export-cli` and
@@ -81,7 +82,11 @@ impl BuiltinWorlds {
             serve: builtin_world_wit(
                 "starling:serve",
                 SERVE_WORLD_NAME,
-                &interface(crate::HTTP_HANDLER_INTERFACE_PREFIX)?,
+                &interface(
+                    runtime
+                        .map_or(crate::WasiVersion::P3, crate::Runtime::wasi_version)
+                        .http_handler_prefix(),
+                )?,
             ),
         })
     }

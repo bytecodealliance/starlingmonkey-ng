@@ -73,11 +73,9 @@ pub fn run(config: config::RuntimeConfig) -> Result<(), String> {
 
 /// Run a JavaScript script or module on wasm32 targets.
 ///
-/// Must be `.await`ed from inside an async-lifted `wasi:cli/run.run` task
-/// — the event loop awaits WASIp3 async-lowered imports (e.g.
-/// `monotonic_clock::wait_for`), and those are only valid inside an
-/// async-lifted task. The cdylib in the `starling` package provides such a
-/// task via `wasip3::cli::command::export!`.
+/// On WASIp3, it must be `.await`ed from inside an async-lifted `wasi:cli/run.run` task, since
+/// the event loop awaits async-lowered imports such as `monotonic_clock::wait_for`. On WASIp2, it
+/// must run inside [`platform::task::block_on`].
 #[cfg(target_arch = "wasm32")]
 pub async fn run(config: config::RuntimeConfig) -> Result<(), String> {
     apply_pre_init_config(&config)?;

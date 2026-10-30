@@ -1,6 +1,8 @@
 [toolchain]
-# Keep this in sync with the project workspace's channel.
-channel = "1.98"
+# The 1.100 beta that `STARLING_BETA` in `.github/tool-versions.env` names. 1.100 is the first
+# toolchain whose wasm32-wasip3 std crown can check the wasm32-wasip3 build with. Keep the two in
+# sync.
+channel = "beta-2026-10-18"
 
 components = [
     "clippy",
@@ -10,5 +12,9 @@ components = [
     "rustc-dev",
     # For formatting
     "rustfmt",
+]
+targets = [
+    "wasm32-wasip2",
+    "wasm32-wasip3",
 ]
 profile = "minimal"

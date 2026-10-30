@@ -26,6 +26,7 @@ JavaScript application and a WIT world.
   - [Components that serve and run](#components-that-serve-and-run)
   - [Initialization](#initialization)
   - [Refused worlds](#refused-worlds)
+  - [WASIp2 runtimes](#wasip2-runtimes)
   - [Disabling WASI features](#disabling-wasi-features)
   - [The interfaces the runtime imports](#the-interfaces-the-runtime-imports)
   - [WIT values in JavaScript](#wit-values-in-javascript)
@@ -415,6 +416,24 @@ Componentizing these worlds fails with an error naming the function or export:
 - a world that imports an interface at several compatible versions, from its own WIT or the
   runtime's, where a version lacks a type or function that a lower one declares.
 
+### WASIp2 support
+
+StarlingMonkey has full WASIp2 support, enabling it to run on hosts that don't support WASIp3
+interfaces or the Component Model's async functions, `future`s, and `stream`s.
+
+Besides using WASIp2 APIs and `wasi:io` for streaming, a key implication is that such a build
+doesn't support concurrent reuse, since incoming event handlers only return from the stack once
+they have fully finished processing the event, including any post-return work, such as 
+body-streaming and promises passed to `waitUntil`.
+
+The componentizer's CLI options, such as `--export-http`, automatically use the interface version
+the runtime targets. That is, a runtime built for `wasm32-wasip2` will export 
+`wasi:http/incoming-handler@0.2.0` with `--export-http` set.
+
+Trying to target a world with `async` functions, or using `stream` or `future`, will fail with a
+`wasm32-wasip2` runtime. That limitation could be lifted, though it's advisable to use a P3 runtime
+when targeting host environments that support WASIp3.
+
 ### Disabling WASI features
 
 `--disable` takes a comma-separated list of `stdio`, `random`, `clocks`, `http` and `filesystem`,
@@ -467,9 +486,11 @@ highest otherwise. Its types then have their plain names. A version that lacks a
 of a lower compatible version is [refused](#refused-worlds).
 
 A module specifier names an interface by its canonical version, as in `wasi:cli/environment@0.3`,
-and `starling-componentize imports` and the
-[TypeScript declarations](#typescript-declarations-for-a-world) name it that way. A specifier with
-any compatible full version, such as `wasi:cli/environment@0.3.0`, resolves to the same module.
+and `starling-componentize imports` and the [TypeScript
+declarations](#typescript-declarations-for-a-world) name it that way. A specifier with any
+compatible full version, such as `wasi:cli/environment@0.3.0`, resolves to the same module. A
+runtime built for WASIp2 imports its WASI interfaces at `0.2` versions, so the same import is
+spelled `wasi:cli/environment@0.2`.
 
 ### WIT values in JavaScript
 
@@ -1189,13 +1210,17 @@ just check-all         # more extensive tests, including GC checks
 `--workspace` by default. It accepts all additional arguments to `cargo test`,
 so to test specific packages, pass `-p [package name]`.
 
-**For WebAssembly (WASIp2):**
+**For WebAssembly:**
 
 ```bash
 just build-wasm        # debug build for wasm32-wasip2
 just test-wasm         # all Rust tests, on wasm32-wasip2
 just check-wasm        # fmt-check + clippy + wasm tests
 ```
+
+A wasm32-wasip2 build imports and exports only WASI 0.2 interfaces and uses none of the Component
+Model's async features. It runs on WASIp2 hosts, with the restrictions [WASIp2
+runtimes](#wasip2-runtimes) lists. A wasm32-wasip3 build imports and exports WASI 0.3 interfaces.
 
 `WASM_TARGET` selects the wasm target of the recipes above, the wasm WPT recipes and
 `just test-wizer`, as `p2`, `p3` or a full triple. It defaults to `p2`:
@@ -1218,8 +1243,8 @@ component `target/wasm32-wasip2/debug/starling.wasm` from the crate's `cdylib` t
 `target/wasm32-wasip3/release/starling.wasm`, with SpiderMonkey, libc and libc++ statically linked
 and dead-code eliminated. `just build-runtime-debug` builds it with `debugmozjs`, at
 `target/wasm32-wasip3/debug/starling.wasm`. `RUNTIME_TARGET` selects their target as `WASM_TARGET`
-does, and defaults to `p3`. `RUNTIME_TARGET=p2` builds for wasm32-wasip2 from the stable toolchain
-and an older SDK.
+does, and defaults to `p3`. `RUNTIME_TARGET=p2` builds the runtime for WASIp2 hosts, from the
+stable toolchain.
 
 The component runs scripts under `wasmtime run`, serves under `wasmtime serve`, and is the runtime
 `starling-componentize` links against. `just test-runtime` builds the debug component and runs two

@@ -155,6 +155,13 @@ const FIXTURES: &[Fixture] = &[
         source: Source::Wit("serve", "serve"),
         guests: &["serve.handler.ts"],
     },
+    // The world of an application implementing the `wasi:http/incoming-handler` of a runtime
+    // built for WASIp2 itself.
+    Fixture {
+        name: "serve_p2",
+        source: Source::Wit("serve_p2", "serve-p2"),
+        guests: &["serve_p2.handler.ts"],
+    },
     Fixture {
         name: "builtin_cli",
         source: Source::Builtin("--export-cli"),
@@ -166,6 +173,31 @@ const FIXTURES: &[Fixture] = &[
         guests: &["builtin_serve.listener.ts", "builtin_serve.handler.ts"],
     },
 ];
+
+/// Guests of [`FIXTURES`] type-checked only against a runtime built for WASIp3:
+/// an application's own `wasi:http/handler`, which a WASIp2 component can't have.
+const WASIP3_GUESTS: &[&str] = &["builtin_serve.handler.ts"];
+
+/// The guests of `fixture` to type-check against the runtime's WASI version.
+fn guests(fixture: &Fixture) -> impl Iterator<Item = &'static str> {
+    let wasip2 = shared::wasi_version() == componentize::WasiVersion::P2;
+    fixture
+        .guests
+        .iter()
+        .copied()
+        .filter(move |guest| !(wasip2 && WASIP3_GUESTS.contains(guest)))
+}
+
+/// The snapshot of `fixture`'s declaration: `<name>.d.ts.expected`, or for a
+/// built-in world of a runtime built for WASIp2, `<name>.p2.d.ts.expected`.
+fn snapshot_path(fixture: &Fixture) -> PathBuf {
+    let stem = fixture.name;
+    let wasip2 = shared::wasi_version() == componentize::WasiVersion::P2;
+    match fixture.source {
+        Source::Builtin(_) if wasip2 => fixtures_dir().join(format!("{stem}.p2.d.ts.expected")),
+        _ => fixtures_dir().join(format!("{stem}.d.ts.expected")),
+    }
+}
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/wit_to_ts")
@@ -210,6 +242,18 @@ struct SuiteFixture {
     world: &'static [&'static str],
     /// The guests, as paths relative to `tests/fixtures`.
     guests: &'static [&'static str],
+    /// How the fixture is checked against a runtime built for WASIp2.
+    on_wasip2: OnWasip2,
+}
+
+/// How a [`SuiteFixture`] is checked against a runtime built for WASIp2.
+enum OnWasip2 {
+    /// As against a runtime built for WASIp3.
+    Same,
+    /// Not at all, since its world needs a runtime built for WASIp3.
+    Skip,
+    /// With the world these flags select, and these guests.
+    With(&'static [&'static str], &'static [&'static str]),
 }
 
 /// Every suite world with its guests.
@@ -218,16 +262,19 @@ const SUITE_FIXTURES: &[SuiteFixture] = &[
         name: "async_export",
         world: &["-w", "async_export.wit"],
         guests: &["async_export.js"],
+        on_wasip2: OnWasip2::Skip,
     },
     SuiteFixture {
         name: "async_import",
         world: &["-w", "async_import.wit"],
         guests: &["async_import.js"],
+        on_wasip2: OnWasip2::Skip,
     },
     SuiteFixture {
         name: "cli_and_serve",
         world: &["--export-cli", "--export-http"],
         guests: &["cli_and_serve.js"],
+        on_wasip2: OnWasip2::Same,
     },
     SuiteFixture {
         name: "cli_merged",
@@ -242,31 +289,48 @@ const SUITE_FIXTURES: &[SuiteFixture] = &[
             "two",
         ],
         guests: &["cli/app/lib.js", "cli/app/src/main.js"],
+        on_wasip2: OnWasip2::Same,
     },
     SuiteFixture {
         name: "cli_run",
         world: &["-w", "cli_run.wit"],
         guests: &["cli_run.js", "cli_run_no_run.js"],
+        on_wasip2: OnWasip2::With(
+            &["-w", "cli_run_p2.wit"],
+            &["cli_run.js", "cli_run_no_run.js"],
+        ),
     },
     SuiteFixture {
         name: "exported_resource",
-        world: &["-w", "exported_resource.wit"],
+        world: &[
+            "-w",
+            "exported_resource.wit",
+            "-n",
+            "exported-resource-async",
+        ],
         guests: &["exported_resource.js"],
+        on_wasip2: OnWasip2::With(
+            &["-w", "exported_resource.wit", "-n", "exported-resource"],
+            &["exported_resource.js"],
+        ),
     },
     SuiteFixture {
         name: "fetch_streams",
         world: &["-w", "fetch_streams.wit"],
         guests: &["fetch_streams.js"],
+        on_wasip2: OnWasip2::Skip,
     },
     SuiteFixture {
         name: "lowering",
         world: &["-w", "lowering.wit"],
         guests: &["lowering.js"],
+        on_wasip2: OnWasip2::Skip,
     },
     SuiteFixture {
         name: "resources",
         world: &["-w", "resources.wit"],
         guests: &["resources.js"],
+        on_wasip2: OnWasip2::Same,
     },
     SuiteFixture {
         name: "serve",
@@ -279,21 +343,33 @@ const SUITE_FIXTURES: &[SuiteFixture] = &[
             "serve_raw_response.js",
             "serve_wasi_imports.js",
         ],
+        on_wasip2: OnWasip2::With(
+            &["-w", "serve_p2.wit"],
+            &[
+                "serve.js",
+                "serve_no_listener.js",
+                "serve_raw_p2.js",
+                "serve_raw_response_p2.js",
+            ],
+        ),
     },
     SuiteFixture {
         name: "streams",
         world: &["-w", "streams.wit"],
         guests: &["streams.js"],
+        on_wasip2: OnWasip2::Skip,
     },
     SuiteFixture {
         name: "surface",
         world: &["-w", "surface.wit"],
         guests: &["surface.js"],
+        on_wasip2: OnWasip2::Same,
     },
     SuiteFixture {
         name: "sync_suite",
         world: &["-w", "sync_suite.wit"],
         guests: &["sync_suite.js"],
+        on_wasip2: OnWasip2::Same,
     },
     SuiteFixture {
         name: "top_level",
@@ -305,21 +381,25 @@ const SUITE_FIXTURES: &[SuiteFixture] = &[
             "top_level/lib/late.js",
             "top_level/lib/name.js",
         ],
+        on_wasip2: OnWasip2::Same,
     },
     SuiteFixture {
         name: "values",
-        world: &["-w", "values.wit"],
+        world: &["-w", "values.wit", "-n", "values-async"],
         guests: &["values.js"],
+        on_wasip2: OnWasip2::With(&["-w", "values.wit", "-n", "values"], &["values.js"]),
     },
     SuiteFixture {
         name: "wit_dir",
         world: &["-w", "wit_dir"],
         guests: &["wit_dir.js"],
+        on_wasip2: OnWasip2::Same,
     },
     SuiteFixture {
         name: "world_resource",
         world: &["-w", "world_resource.wit"],
         guests: &["world_resource.js"],
+        on_wasip2: OnWasip2::Same,
     },
 ];
 
@@ -330,7 +410,7 @@ fn snapshots_match() {
 
     for (fixture, actual) in FIXTURES.iter().zip(GENERATED.iter()) {
         let stem = fixture.name;
-        let snapshot = fixtures_dir().join(format!("{stem}.d.ts.expected"));
+        let snapshot = snapshot_path(fixture);
 
         if bless {
             std::fs::write(&snapshot, actual).expect("writing blessed snapshot");
@@ -378,12 +458,7 @@ fn generated_dts_is_valid_typescript() {
         std::fs::write(&consumer_path, consumer_for(dts)).expect("writing consumer for tsc");
 
         let mut files = vec![dts_path, consumer_path];
-        files.extend(
-            fixture
-                .guests
-                .iter()
-                .map(|guest| fixtures_dir().join(guest)),
-        );
+        files.extend(guests(fixture).map(|guest| fixtures_dir().join(guest)));
         checks.push((stem.to_string(), files));
     }
     let failures = run_tsc_all(&tsc, checks, Guests::TypeScript);
@@ -411,7 +486,14 @@ fn suite_guests_type_check() {
 
     let mut checks = Vec::new();
     for fixture in SUITE_FIXTURES {
-        let args: Vec<&str> = fixture.world.iter().copied().chain(["types"]).collect();
+        let (world, guests) = match (shared::wasi_version(), &fixture.on_wasip2) {
+            (componentize::WasiVersion::P3, _) | (_, OnWasip2::Same) => {
+                (fixture.world, fixture.guests)
+            }
+            (componentize::WasiVersion::P2, OnWasip2::Skip) => continue,
+            (componentize::WasiVersion::P2, OnWasip2::With(world, guests)) => (*world, *guests),
+        };
+        let args: Vec<&str> = world.iter().copied().chain(["types"]).collect();
         let output = shared::run_cli(&args, Some(&suite_fixtures));
         assert!(
             output.status.success(),
@@ -425,12 +507,7 @@ fn suite_guests_type_check() {
         std::fs::write(&dts_path, &dts).expect("writing generated .d.ts for tsc");
 
         let mut files = vec![dts_path];
-        files.extend(
-            fixture
-                .guests
-                .iter()
-                .map(|guest| suite_fixtures.join(guest)),
-        );
+        files.extend(guests.iter().map(|guest| suite_fixtures.join(guest)));
         checks.push((stem.to_string(), files));
     }
     let failures = run_tsc_all(&tsc, checks, Guests::JavaScript);
@@ -465,7 +542,13 @@ fn every_suite_guest_is_type_checked() {
     modules(&base, &base, &mut found);
     let checked: Vec<&str> = SUITE_FIXTURES
         .iter()
-        .flat_map(|fixture| fixture.guests.iter().copied())
+        .flat_map(|fixture| {
+            let wasip2_guests: &[&str] = match fixture.on_wasip2 {
+                OnWasip2::With(_, guests) => guests,
+                OnWasip2::Same | OnWasip2::Skip => &[],
+            };
+            fixture.guests.iter().chain(wasip2_guests).copied()
+        })
         .collect();
     let unchecked: Vec<&String> = found
         .iter()
