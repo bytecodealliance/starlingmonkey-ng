@@ -20,9 +20,13 @@ web-streams.workspace = true
 
 # Only the wasm-only modules name `wit-dylib-ffi`. The rev is a `wasm-tools`
 # 1.262.0 commit, matching the `wit-dylib` 0.262 the componentizer uses, so both
-# sides agree on the wit-dylib ABI. `async-runtime` runs async-declared exports
-# on wit-bindgen's executor, the one the wasip3 builtins run on.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# sides agree on the wit-dylib ABI.
+[target.'cfg(target_env = "p2")'.dependencies]
+wit-dylib-ffi = { git = "https://github.com/bytecodealliance/wasm-tools/", rev = "e22db44da4eaf17a0e46ec55b911c7539589a3cc" }
+
+# `async-runtime` runs async-declared exports on wit-bindgen's executor, the one
+# the wasip3 builtins run on.
+[target.'cfg(target_env = "p3")'.dependencies]
 wit-dylib-ffi = { git = "https://github.com/bytecodealliance/wasm-tools/", rev = "e22db44da4eaf17a0e46ec55b911c7539589a3cc", features = [
     "async-runtime",
 ] }

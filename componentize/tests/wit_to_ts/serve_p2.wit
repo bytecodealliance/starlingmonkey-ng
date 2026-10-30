@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+//
+// The world the componentizer gives an application that implements the
+// `wasi:http/incoming-handler` of a runtime built for WASIp2 itself, against a minimal stub of
+// `wasi:http/types@0.2.0`.
+//
+// The guest implements `handle` under `wasiHttp.incomingHandler`, under `incomingHandler`, or as a
+// bare export. `handle` receives the `incoming-request`, but not the `response-outparam`, which
+// the runtime sets. It returns a `Response` or the `outgoing-response` the WIT declares, and fails
+// with the `ErrorCode` class of `wasi:http/types`.
+package test:serve-p2;
+
+world serve-p2 {
+  import wasi:http/types@0.2.0;
+  export wasi-http-handler: interface {
+    use wasi:http/types@0.2.0.{incoming-request, response-outparam};
+
+    handle: func(request: incoming-request, response-out: response-outparam);
+  }
+}
+
+package wasi:http@0.2.0 {
+  interface types {
+    variant error-code {
+      internal-error(option<string>),
+    }
+
+    resource incoming-request {
+      path-with-query: func() -> option<string>;
+    }
+
+    resource outgoing-response {
+      constructor();
+    }
+
+    resource outgoing-body {
+      finish: static func(this: outgoing-body) -> result<_, error-code>;
+    }
+
+    resource response-outparam {
+      set: static func(param: response-outparam, response: result<outgoing-response, error-code>);
+    }
+  }
+}

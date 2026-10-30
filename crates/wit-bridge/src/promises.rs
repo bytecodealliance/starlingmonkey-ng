@@ -34,7 +34,7 @@
 //! still writes its value. If the promise is garbage-collected without
 //! settling, the future is never written, and a warning is reported.
 
-#![cfg(target_arch = "wasm32")]
+#![cfg(target_env = "p3")]
 
 use std::future::{Future, IntoFuture};
 use std::mem::ManuallyDrop;

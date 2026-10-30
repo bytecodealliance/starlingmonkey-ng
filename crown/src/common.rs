@@ -17,11 +17,11 @@ use rustc_type_ir::Upcast as _;
 
 /// Emit a lint whose diagnostic `decorate` builds, including its span.
 pub trait LateContextExt {
-    fn lint(&self, lint: &'static Lint, decorate: impl FnOnce(&mut Diag<'_, ()>));
+    fn lint(&self, lint: &'static Lint, decorate: impl FnOnce(&mut Diag<'_>));
 }
 
 impl<'tcx> LateContextExt for LateContext<'tcx> {
-    fn lint(&self, lint: &'static Lint, decorate: impl FnOnce(&mut Diag<'_, ()>)) {
+    fn lint(&self, lint: &'static Lint, decorate: impl FnOnce(&mut Diag<'_>)) {
         self.opt_span_lint(lint, None::<Span>, DiagDecorator(decorate));
     }
 }

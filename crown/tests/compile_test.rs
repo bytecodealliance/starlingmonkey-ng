@@ -26,7 +26,7 @@ fn run_mode(mode: &'static str, bless: bool) {
     let cfg_mode = mode.parse().expect("Invalid mode");
     config.mode = cfg_mode;
     config.src_base = PathBuf::from("tests").join(mode);
-    config.rustc_path = PROFILE_PATH.join("crown");
+    config.rustc_path = PathBuf::from(env!("CARGO_BIN_EXE_crown"));
     config.target_rustcflags = Some(format!(
         "-L {} -L {}",
         PROFILE_PATH.display(),

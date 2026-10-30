@@ -467,12 +467,14 @@ enum StubBody {
 }
 
 /// The body of the stub of `func` in the interface named `interface`: zeroes
-/// for a clock's `now`, the seed for `get-insecure-seed` if `insecure_seed` is
-/// set, and a trap for everything else.
+/// for a clock's `now`, the seed for `get-insecure-seed` (`insecure-seed` in
+/// WASI 0.2) if `insecure_seed` is set, and a trap for everything else.
 fn stub_body(interface: &str, func: &Function, insecure_seed: Option<u128>) -> StubBody {
     match (func.name.as_str(), insecure_seed) {
         ("now", _) if interface.starts_with("wasi:clocks/") => StubBody::Zero,
-        ("get-insecure-seed", Some(seed)) if interface.starts_with(INSECURE_SEED_INTERFACE) => {
+        ("get-insecure-seed" | "insecure-seed", Some(seed))
+            if interface.starts_with(INSECURE_SEED_INTERFACE) =>
+        {
             StubBody::Seed(seed)
         }
         _ => StubBody::Trap,

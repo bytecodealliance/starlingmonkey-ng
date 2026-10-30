@@ -119,13 +119,14 @@ gc-zeal *ARGS:
     ./scripts/test-gc-zeal.sh {{ARGS}}
 
 # It checks every workspace library and example natively, then the runtime and its dependencies
-# for wasm32-wasip2, which includes the code only wasm builds compile. Then it runs crown's own
-# tests.
+# for wasm32-wasip2 and for wasm32-wasip3, which between them include the code only wasm builds
+# compile. Then it runs crown's own tests.
 #
 # Run crown static GC analysis.
 check-gc:
     ./scripts/check-crown.sh --workspace --lib --examples
     ./scripts/check-crown.sh -p starlingmonkey --target wasm32-wasip2
+    ./scripts/check-crown.sh -p starlingmonkey --target wasm32-wasip3
     cd crown && RUSTC_BOOTSTRAP=1 cargo test
 
 # Run basic checks: formatting, clippy, tests, and the componentizer's unit tests.

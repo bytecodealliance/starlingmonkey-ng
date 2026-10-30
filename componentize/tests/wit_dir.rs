@@ -199,26 +199,35 @@ package wasi:filesystem@0.3.0 {
 fn wit_dir_world_imports_what_the_runtime_imports() {
     let wit = shared::workspace_root().join("componentize/tests/fixtures/wit_dir");
     let wit = wit.to_string_lossy();
+    // The runtime imports its WASI interfaces at a version of its WASI version, and `wasi:http`'s
+    // client interface under a name of that version.
+    let (version, http_client) = match shared::wasi_version() {
+        componentize::WasiVersion::P2 => ("0.2", "wasi:http/outgoing-handler"),
+        componentize::WasiVersion::P3 => ("0.3", "wasi:http/client"),
+    };
     let modules = shared::cli_output(&["-w", &wit, "imports"]);
     let modules: Vec<&str> = modules.lines().collect();
     for module in [
-        "local:hello/hello@1",
-        "wasi:cli/environment@0.3",
-        "wasi:random/random@0.3",
-        "wasi:http/client@0.3",
+        "local:hello/hello@1".to_string(),
+        format!("wasi:cli/environment@{version}"),
+        format!("wasi:random/random@{version}"),
+        format!("{http_client}@{version}"),
     ] {
-        assert!(modules.contains(&module), "`{module}` in {modules:?}");
+        assert!(
+            modules.contains(&module.as_str()),
+            "`{module}` in {modules:?}"
+        );
     }
     assert!(!modules.contains(&"local:b/foo"), "{modules:?}");
 
     let modules = shared::cli_output(&["-w", &wit, "--disable", "random", "imports"]);
     let modules: Vec<&str> = modules.lines().collect();
     assert!(
-        !modules.contains(&"wasi:random/random@0.3"),
+        !modules.contains(&format!("wasi:random/random@{version}").as_str()),
         "no `wasi:random/random` in {modules:?}"
     );
     assert!(
-        modules.contains(&"wasi:random/insecure-seed@0.3"),
+        modules.contains(&format!("wasi:random/insecure-seed@{version}").as_str()),
         "`wasi:random/insecure-seed` in {modules:?}"
     );
 }

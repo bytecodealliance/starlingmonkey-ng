@@ -4,12 +4,13 @@
 
 use rustc_ast::token::TokenKind;
 use rustc_ast::tokenstream::TokenTree;
+use rustc_attr_ir::AttrArgs;
 use rustc_error_messages::MultiSpan;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{self as hir};
 use rustc_lint::{LateContext, LateLintPass, Lint, LintPass, LintStore};
+use rustc_lint_defs::declare_tool_lint;
 use rustc_middle::ty;
-use rustc_session::declare_tool_lint;
 use rustc_span::symbol::Symbol;
 
 use crate::common::{find_first_crate, implements_trait, trait_in_crate, LateContextExt};
@@ -77,8 +78,8 @@ fn get_must_not_have_traceable(sym: &Symbols, attrs: &[hir::Attribute]) -> Optio
             ])
         })
         .map(|x| match &x.get_normal_item().args {
-            hir::AttrArgs::Empty => 0,
-            hir::AttrArgs::Delimited(a) => match a
+            AttrArgs::Empty => 0,
+            AttrArgs::Delimited(a) => match a
                 .tokens
                 .iter()
                 .next()

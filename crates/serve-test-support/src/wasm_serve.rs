@@ -99,9 +99,15 @@ impl Serve {
     /// Keep the host on one instance for the whole test. `--idle-instance-timeout` defaults to a
     /// second, so an instance that idles longer than that between two requests is dropped and the
     /// second request starts a fresh script — indistinguishable, from the test's side, from state
-    /// that failed to carry over.
+    /// that failed to carry over. `--max-instance-reuse-count` defaults to 1 for a WASIp2
+    /// component, and is raised to the WASIp3 default of 128.
     pub fn reusing_one_instance(self) -> Self {
-        self.wasmtime_flags(["--idle-instance-timeout", "30s"])
+        self.wasmtime_flags([
+            "--idle-instance-timeout",
+            "30s",
+            "--max-instance-reuse-count",
+            "128",
+        ])
     }
 
     /// Serve `source` as the content script, in the classic-script shape most handlers here take.
@@ -483,6 +489,32 @@ pub fn component() -> Option<PathBuf> {
         );
     });
     None
+}
+
+/// Whether the case that calls this has to be skipped, because it tests what only a WASIp3 host
+/// does, such as sending an instance concurrent requests or letting it run between requests, and
+/// the component under test was built for WASIp2. Prints that it was skipped if so.
+pub fn needs_wasip3() -> bool {
+    let wasip2 = built_for_wasip2();
+    if wasip2 {
+        eprintln!("skipped: needs a component built for WASIp3");
+    }
+    wasip2
+}
+
+/// Whether the component under test was built for WASIp2, which exports
+/// `wasi:http/incoming-handler`. `false` if there is no component.
+pub fn built_for_wasip2() -> bool {
+    static WASIP2: OnceLock<bool> = OnceLock::new();
+    *WASIP2.get_or_init(|| {
+        let Some(component) = component() else {
+            return false;
+        };
+        let bytes = std::fs::read(&component).expect("reading the component");
+        bytes
+            .windows(b"wasi:http/incoming-handler".len())
+            .any(|window| window == b"wasi:http/incoming-handler")
+    })
 }
 
 /// The output of `wasmtime --version`, or `None` when `wasmtime` is not on PATH. Run once per

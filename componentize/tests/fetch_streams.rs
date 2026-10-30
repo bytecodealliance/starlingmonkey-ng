@@ -49,6 +49,9 @@ fn store() -> Store<Ctx> {
 /// echoes back.
 #[tokio::test]
 async fn stream_as_request_body() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -68,6 +71,9 @@ async fn stream_as_request_body() -> anyhow::Result<()> {
 /// A response's body is returned as a `stream<u8>`.
 #[tokio::test]
 async fn response_body_as_stream() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -90,6 +96,9 @@ async fn response_body_as_stream() -> anyhow::Result<()> {
 /// directly.
 #[tokio::test]
 async fn piped_response_body_as_stream() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let settled = store
@@ -119,6 +128,9 @@ async fn piped_response_body_as_stream() -> anyhow::Result<()> {
 /// `stream` can't hold an error.
 #[tokio::test]
 async fn aborted_response_body_as_stream() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = shared::http_store_capturing_stderr(&ENGINE, SERVED_BODY);
     let instance = pre().await.instantiate_async(&mut store).await?;
     let text = store
@@ -154,6 +166,9 @@ async fn aborted_response_body_as_stream() -> anyhow::Result<()> {
 /// response body, which is returned as a `stream<u8>`.
 #[tokio::test]
 async fn stream_through_fetch() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -176,6 +191,9 @@ async fn stream_through_fetch() -> anyhow::Result<()> {
 /// reader, rejects with a `TypeError` naming the export.
 #[tokio::test]
 async fn body_reads_in_a_sync_export_reject() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let fetching = instance.test_fetch_streams_fetching();
@@ -211,6 +229,9 @@ async fn body_reads_in_a_sync_export_reject() -> anyhow::Result<()> {
 /// through the WASIp3 HTTP client, all under the call's one event loop.
 #[tokio::test]
 async fn combined_builtins_export_runs() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let result = store
@@ -234,6 +255,9 @@ async fn combined_builtins_export_runs() -> anyhow::Result<()> {
 /// serialized run would not.
 #[tokio::test]
 async fn concurrent_async_exports_interleave() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let (first, second) = store

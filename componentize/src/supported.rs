@@ -33,6 +33,28 @@ pub(crate) fn check_supported_types(resolve: &Resolve, world: WorldId) -> anyhow
     Ok(())
 }
 
+/// Fail if any function the world imports or exports is `async`, or takes or
+/// returns a `stream` or `future`, naming the first such function. A runtime
+/// built for WASIp2 can't lift or lower any of them.
+pub(crate) fn check_wasip2_types(resolve: &Resolve, world: WorldId) -> anyhow::Result<()> {
+    let world = &resolve.worlds[world];
+    for (name, func) in functions(resolve, world.imports.iter().chain(world.exports.iter())) {
+        if func.kind.is_async() {
+            bail!(
+                "`{name}` is an `async` function, which needs a runtime built for WASIp3. \
+                 This runtime was built for WASIp2."
+            );
+        }
+        if types(func).any(|ty| has_stream_or_future(resolve, ty)) {
+            bail!(
+                "`{name}` takes or returns a `stream` or `future`, which need a runtime built for \
+                 WASIp3. This runtime was built for WASIp2."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The functions of the world items `items`, each with its name in error
 /// messages: `<interface>#<function>`, or the function's own name for a
 /// world-level function.

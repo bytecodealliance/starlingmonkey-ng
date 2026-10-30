@@ -69,6 +69,9 @@ fn store() -> Store<Ctx> {
 /// on the same instance afterwards still complete.
 #[tokio::test]
 async fn perpetual_trailing_work_does_not_hang() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let result = tokio::time::timeout(
@@ -115,6 +118,9 @@ async fn perpetual_trailing_work_does_not_hang() -> anyhow::Result<()> {
 /// export, is printed to stderr.
 #[tokio::test]
 async fn deadlocked_async_export_traps() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = shared::store_capturing_stderr(&ENGINE);
     let instance = pre().await.instantiate_async(&mut store).await?;
     let result = store
@@ -145,6 +151,9 @@ async fn deadlocked_async_export_traps() -> anyhow::Result<()> {
 /// as unhandled.
 #[tokio::test]
 async fn rejected_async_export_returns_err() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = shared::store_capturing_stderr(&ENGINE);
     let instance = pre().await.instantiate_async(&mut store).await?;
     let result = store
@@ -164,6 +173,9 @@ async fn rejected_async_export_returns_err() -> anyhow::Result<()> {
 /// `setTimeout` in a sync export throws a `TypeError` naming the export.
 #[tokio::test]
 async fn timers_in_a_sync_export_throw() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let message = instance
@@ -182,6 +194,9 @@ async fn timers_in_a_sync_export_throw() -> anyhow::Result<()> {
 /// the export.
 #[tokio::test]
 async fn fetch_in_a_sync_export_rejects() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let simple = instance.test_async_export_simple_export();
@@ -198,6 +213,9 @@ async fn fetch_in_a_sync_export_rejects() -> anyhow::Result<()> {
 /// The microtasks a sync export queues run before the call returns.
 #[tokio::test]
 async fn sync_export_microtasks_run_before_it_returns() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let simple = instance.test_async_export_simple_export();
@@ -212,6 +230,9 @@ async fn sync_export_microtasks_run_before_it_returns() -> anyhow::Result<()> {
 /// they return, and `setTimeout` throws in them.
 #[tokio::test]
 async fn sync_exports_run_while_an_async_export_is_parked() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre()
         .await
@@ -261,4 +282,24 @@ async fn sync_exports_run_while_an_async_export_is_parked() -> anyhow::Result<()
         "both microtasks ran while the async export waited"
     );
     Ok(())
+}
+
+/// A runtime built for WASIp2 refuses the world, naming its first `async` function.
+#[tokio::test]
+async fn async_exports_need_a_wasip3_runtime() {
+    if shared::wasi_version() != componentize::WasiVersion::P2 {
+        return;
+    }
+    let error = shared::try_componentize(
+        include_str!("fixtures/async_export.wit"),
+        "async-export",
+        include_str!("fixtures/async_export.js"),
+    )
+    .await
+    .expect_err("an `async` export needs a WASIp3 runtime");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("is an `async` function, which needs a runtime built for WASIp3"),
+        "{message}"
+    );
 }

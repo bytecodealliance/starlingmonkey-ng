@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! `wasi:cli/run` components: JS modules that export `run`, componentized against the world of
-//! `fixtures/cli_run.wit` and run through `wasi:cli/run.run()`.
+//! `fixtures/cli_run.wit`, or `fixtures/cli_run_p2.wit` for a runtime built for WASIp2, and run
+//! through `wasi:cli/run.run()`.
 
 mod shared;
 
@@ -14,7 +15,6 @@ use {
     },
     wasmtime_wasi::{
         p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
-        p3::bindings::Command,
         WasiCtxBuilder, WasiCtxView, WasiView,
     },
 };
@@ -35,11 +35,25 @@ impl WasiView for Ctx {
 
 static ENGINE: std::sync::LazyLock<Engine> = std::sync::LazyLock::new(shared::engine);
 
-const WIT: &str = include_str!("fixtures/cli_run.wit");
+/// The CLI world for the runtime's WASI version.
+fn wit() -> &'static str {
+    match shared::wasi_version() {
+        componentize::WasiVersion::P2 => include_str!("fixtures/cli_run_p2.wit"),
+        componentize::WasiVersion::P3 => include_str!("fixtures/cli_run.wit"),
+    }
+}
+
+/// The name under which a component built for [`wit`] exports `wasi:cli/run`.
+fn cli_run_export() -> &'static str {
+    match shared::wasi_version() {
+        componentize::WasiVersion::P2 => "wasi:cli/run@0.2.5",
+        componentize::WasiVersion::P3 => "wasi:cli/run@0.3.5",
+    }
+}
 
 /// Componentize a CLI application against the fixed CLI world and compile it.
 async fn componentize_cli(js: &'static str) -> Component {
-    shared::compile_fixture(&ENGINE, WIT, "command", js).await
+    shared::compile_fixture(&ENGINE, wit(), "command", js).await
 }
 
 /// The componentized CLI app that exports `run`, built once.
@@ -106,10 +120,7 @@ fn linker(component: &Component) -> Linker<Ctx> {
 /// the captured stdout/stderr.
 async fn run_cli(component: &Component) -> anyhow::Result<(Result<(), ()>, String, String)> {
     let mut store = store();
-    let command = Command::instantiate_async(&mut store, component, &linker(component)).await?;
-    let result = store
-        .run_concurrent(async move |store| command.wasi_cli_run().call_run(store).await)
-        .await??;
+    let result = shared::call_cli_run(&mut store, component, &linker(component)).await?;
     let stdout = String::from_utf8_lossy(&store.data().stdout.contents()).into_owned();
     let stderr = String::from_utf8_lossy(&store.data().stderr.contents()).into_owned();
     Ok((result, stdout, stderr))
@@ -130,7 +141,7 @@ async fn cli_run_forwards_to_js_run() -> anyhow::Result<()> {
         .map(|(name, _)| name.to_string())
         .collect();
     assert!(
-        exports.contains(&"wasi:cli/run@0.3.5".to_string()),
+        exports.contains(&cli_run_export().to_string()),
         "{exports:?}"
     );
     let (result, stdout, _stderr) = run_cli(run_exporting_app().await).await?;
@@ -179,7 +190,7 @@ async fn cli_run_forwards_to_js_run() -> anyhow::Result<()> {
 #[tokio::test]
 async fn cli_run_without_run_export_fails_componentization() {
     let error =
-        shared::try_componentize(WIT, "command", include_str!("fixtures/cli_run_no_run.js"))
+        shared::try_componentize(wit(), "command", include_str!("fixtures/cli_run_no_run.js"))
             .await
             .expect_err("an app without `run` must not componentize as a CLI tool");
     let message = format!("{error:#}");
@@ -194,27 +205,25 @@ async fn cli_run_without_run_export_fails_componentization() {
 /// the builtin's version.
 #[tokio::test]
 async fn cli_run_version_mismatch_is_rejected() {
-    const OLD_WIT: &str = "\
-package test:cli-run-old;
+    // A synchronous `run` at a version neither runtime provides, and the start of the name the
+    // runtime gives its builtin.
+    let (version, builtin) = match shared::wasi_version() {
+        componentize::WasiVersion::P2 => ("0.1.3", "wasi:cli/run@0.2."),
+        componentize::WasiVersion::P3 => ("0.2.3", "wasi:cli/run@0.3.0"),
+    };
+    let old_wit = format!(
+        "package test:cli-run-old;\n\n\
+         world command {{\n  export wasi:cli/run@{version};\n}}\n\n\
+         package wasi:cli@{version} {{\n  interface run {{\n    run: func() -> result;\n  }}\n}}\n"
+    );
 
-world command {
-  export wasi:cli/run@0.2.3;
-}
-
-package wasi:cli@0.2.3 {
-  interface run {
-    run: func() -> result;
-  }
-}
-";
-
-    let error = shared::try_componentize(OLD_WIT, "command", include_str!("fixtures/cli_run.js"))
+    let error = shared::try_componentize(&old_wit, "command", include_str!("fixtures/cli_run.js"))
         .await
         .expect_err("a mismatched cli/run version should be rejected");
 
     let message = format!("{error:#}");
     assert!(
-        message.contains("wasi:cli/run@0.2.3") && message.contains("wasi:cli/run@0.3.0"),
+        message.contains(&format!("wasi:cli/run@{version}")) && message.contains(builtin),
         "the error should name both the world's version and the runtime's; got: {message}"
     );
 }

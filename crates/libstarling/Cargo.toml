@@ -40,9 +40,6 @@ hyper.workspace = true
 hyper-util.workspace = true
 tokio.workspace = true
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasip3.workspace = true
-
 [dev-dependencies]
 futures-channel.workspace = true
 serve-test-support.workspace = true

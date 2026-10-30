@@ -39,22 +39,28 @@ libc-alloc = ['dep:libc']
 core-runtime.workspace = true
 js.workspace = true
 libstarling.workspace = true
-wasip3.workspace = true
-# The workspace pins `wit-bindgen` to the version `wasip3` uses, so the component contains one
-# wit-bindgen, and so one `run_ctors_once` guard. `__wrap___wasm_call_ctors` in `lib.rs` makes the
-# C++ constructors run once.
-#
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bridge.workspace = true
+platform.workspace = true
+web-fetch.workspace = true
+
+# The workspace pins `wit-bindgen` to the version `wasip2` and `wasip3` use, so the component
+# contains one wit-bindgen, and so one `run_ctors_once` guard. `__wrap___wasm_call_ctors` in
+# `lib.rs` makes the C++ constructors run once.
+[target.'cfg(target_env = "p2")'.dependencies]
+wasip2.workspace = true
+wit-bindgen.workspace = true
+
 # `inter-task-wakeup` lets one wit task wake another through plain Rust wakers, which the serve
 # path needs: the response-body writer task parks on a Rust channel the request's event-loop
 # drain task feeds (and the drain's body-done signal crosses back the other way). Without it, the
 # executor panics when such a task is the only one left to wait on, as in a long-lived streamed
 # response such as server-sent events.
-wit-bindgen = { workspace = true, features = ["macros", "inter-task-wakeup"] }
-libc = { version = "0.2", optional = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wit-bridge.workspace = true
-web-fetch.workspace = true
+[target.'cfg(target_env = "p3")'.dependencies]
+wasip3.workspace = true
+wit-bindgen = { workspace = true, features = ["inter-task-wakeup"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempfile = "3"

@@ -196,7 +196,8 @@ interface checks {
   shifting-import-argument: func() -> string;
 
   // Implemented as an `async` method, so it returns a promise, which a
-  // function WIT does not declare `async` cannot return.
+  // function WIT does not declare `async` cannot return on WASIp3. On WASIp2,
+  // where no function is `async`, the call returns the promise's value.
   promised: func() -> string;
 
   // The guest returns, as JSON, members of the objects the `flags` and
@@ -236,7 +237,16 @@ world values {
 
   // The guest returns `key` for "present", throws an `Error` whose message is
   // `notFound` for "missing", and throws a `KvError` holding `denied` for
-  // "secret". `lookup-async` rejects the same ways.
+  // "secret".
   export lookup: func(key: string) -> result<string, kv-error>;
-  export lookup-async: async func(key: string) -> result<string, kv-error>;
+}
+
+// `values` with an `async` export, for a runtime built for WASIp3.
+world values-async {
+  include values;
+  // `values` already imports `kv-error` under that name.
+  use errors.{kv-error as lookup-error};
+
+  // Rejects the same ways `lookup` throws.
+  export lookup-async: async func(key: string) -> result<string, lookup-error>;
 }

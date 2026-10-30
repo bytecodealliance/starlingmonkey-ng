@@ -82,6 +82,23 @@ pub fn runtime() -> anyhow::Result<componentize::Runtime> {
     componentize::Runtime::new(bytes)
 }
 
+/// The WASI version of the runtime build [`runtime`] reads.
+pub fn wasi_version() -> componentize::WasiVersion {
+    static VERSION: std::sync::OnceLock<componentize::WasiVersion> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| runtime().expect("reading the runtime build").wasi_version())
+}
+
+/// Whether the case that calls this has to be skipped, because it needs a
+/// runtime built for WASIp3 and the runtime build [`runtime`] reads was built
+/// for WASIp2. Prints that it was skipped if so.
+pub fn needs_wasip3() -> bool {
+    let skip = wasi_version() == componentize::WasiVersion::P2;
+    if skip {
+        eprintln!("skipped: needs a runtime built for WASIp3");
+    }
+    skip
+}
+
 /// The WASI context and resource table a suite's store data holds.
 ///
 /// A suite that needs host state of its own (a captured log, an HTTP context)
@@ -633,9 +650,9 @@ pub fn linker<T: WasiView + 'static>(
     linker
 }
 
-/// Like [`linker`], for a component that exports `wasi:http/handler`, and with
-/// the p3 `wasi:http` host, which defines the handler's request and response
-/// resources.
+/// Like [`linker`], for a component that exports the runtime's HTTP handler
+/// interface, and with the `wasi:http` host of the runtime's WASI version, which
+/// defines the handler's request and response resources.
 pub fn http_linker(
     engine: &wasmtime::Engine,
     component: &wasmtime::component::Component,
@@ -656,8 +673,156 @@ pub fn http_linker_with(
         .chain(provided.iter().copied())
         .collect();
     linker(engine, component, &provided, |linker| {
-        wasmtime_wasi_http::p3::add_to_linker(linker)?;
+        match wasi_version() {
+            componentize::WasiVersion::P2 => {
+                wasmtime_wasi_http::p2::add_only_http_to_linker_async(linker)?
+            }
+            componentize::WasiVersion::P3 => wasmtime_wasi_http::p3::add_to_linker(linker)?,
+        }
         add(linker)
+    })
+}
+
+/// An instance's HTTP handler export: `wasi:http/incoming-handler` for a
+/// runtime built for WASIp2, `wasi:http/handler` for one built for WASIp3.
+pub enum HttpService {
+    P2(wasmtime_wasi_http::p2::bindings::Proxy),
+    P3(wasmtime_wasi_http::p3::bindings::Service),
+}
+
+impl HttpService {
+    /// Instantiate `component` in `store` with `linker`, which [`http_linker`]
+    /// or [`http_linker_with`] made.
+    pub async fn instantiate(
+        store: &mut Store<HttpCtx>,
+        component: &wasmtime::component::Component,
+        linker: &wasmtime::component::Linker<HttpCtx>,
+    ) -> anyhow::Result<HttpService> {
+        Ok(match wasi_version() {
+            componentize::WasiVersion::P2 => HttpService::P2(
+                wasmtime_wasi_http::p2::bindings::Proxy::instantiate_async(
+                    store, component, linker,
+                )
+                .await?,
+            ),
+            componentize::WasiVersion::P3 => HttpService::P3(
+                wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
+                    store, component, linker,
+                )
+                .await?,
+            ),
+        })
+    }
+}
+
+/// Like [`handle_on`], for an instance of either WASI version. The handler's
+/// `error-code` is returned as its debug representation.
+pub async fn serve_on(
+    store: &mut Store<HttpCtx>,
+    service: &HttpService,
+    method: &str,
+    path: &str,
+    body: &'static str,
+) -> anyhow::Result<Result<(u16, String), String>> {
+    match service {
+        HttpService::P2(proxy) => handle_on_p2(store, proxy, method, path, body).await,
+        HttpService::P3(service) => Ok(handle_on(store, service, method, path, body)
+            .await?
+            .map_err(|code| format!("{code:?}"))),
+    }
+}
+
+/// [`serve_on`] for a `wasi:http/incoming-handler` export.
+///
+/// The response is read while `handle` runs, since the guest writes the body
+/// before `handle` returns, and the host holds only a chunk of it at a time. A
+/// `handle` that traps is returned as an error at once, since the host keeps the
+/// response outparam of a trapped instance, so the response never arrives.
+async fn handle_on_p2(
+    store: &mut Store<HttpCtx>,
+    proxy: &wasmtime_wasi_http::p2::bindings::Proxy,
+    method: &str,
+    path: &str,
+    body: &'static str,
+) -> anyhow::Result<Result<(u16, String), String>> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt as _, Full};
+    use wasmtime_wasi_http::WasiHttpView as _;
+
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("http://example.com{path}"))
+        .header(http::header::CONTENT_LENGTH, body.len())
+        .body(Full::new(Bytes::from_static(body.as_bytes())).map_err(
+            |never: std::convert::Infallible| -> wasmtime_wasi_http::Error { match never {} },
+        ))
+        .expect("building the request");
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let (request, response_out) = {
+        let mut http = store.data_mut().http();
+        (
+            http.new_incoming_request(
+                wasmtime_wasi_http::p2::bindings::http::types::Scheme::Http,
+                request,
+            )?,
+            http.new_response_outparam(sender)?,
+        )
+    };
+    let handled =
+        proxy
+            .wasi_http_incoming_handler()
+            .call_handle(&mut *store, request, response_out);
+    let response = async {
+        match receiver.await {
+            Ok(Ok(response)) => {
+                let status = response.status().as_u16();
+                let body = response.into_body().collect().await?.to_bytes();
+                anyhow::Ok(Ok((status, String::from_utf8_lossy(&body).into_owned())))
+            }
+            Ok(Err(code)) => Ok(Err(format!("{code:?}"))),
+            Err(_) => anyhow::bail!("the handler set no response"),
+        }
+    };
+    match futures::future::select(std::pin::pin!(handled), std::pin::pin!(response)).await {
+        futures::future::Either::Left((handled, response)) => {
+            handled?;
+            response.await
+        }
+        futures::future::Either::Right((response, handled)) => {
+            handled.await?;
+            response
+        }
+    }
+}
+
+/// Call `wasi:cli/run.run()` on a fresh instance of `component` in `store`, with
+/// the bindings of the runtime's WASI version.
+pub async fn call_cli_run<T: WasiView + 'static>(
+    store: &mut Store<T>,
+    component: &wasmtime::component::Component,
+    linker: &wasmtime::component::Linker<T>,
+) -> anyhow::Result<Result<(), ()>> {
+    Ok(match wasi_version() {
+        componentize::WasiVersion::P2 => {
+            let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
+                &mut *store,
+                component,
+                linker,
+            )
+            .await?;
+            command.wasi_cli_run().call_run(&mut *store).await?
+        }
+        componentize::WasiVersion::P3 => {
+            let command = wasmtime_wasi::p3::bindings::Command::instantiate_async(
+                &mut *store,
+                component,
+                linker,
+            )
+            .await?;
+            store
+                .run_concurrent(async move |store| command.wasi_cli_run().call_run(store).await)
+                .await??
+        }
     })
 }
 

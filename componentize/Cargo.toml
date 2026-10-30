@@ -59,7 +59,7 @@ mimalloc = "0.1.52"
 tokio = { version = "1", features = ["macros", "rt"] }
 proptest = "1.11"
 # `default-features = false` drops `default-send-request`, so no request reaches a real network.
-wasmtime-wasi-http = { version = "50", features = ["p3"], default-features = false }
+wasmtime-wasi-http = { version = "50", features = ["p2", "p3"], default-features = false }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"

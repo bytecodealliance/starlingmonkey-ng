@@ -3,6 +3,9 @@
 //! Value shapes beyond the sync suite's echoes: the world of `fixtures/values.{wit,js}`. Every
 //! interface but `errors`, `strings` and `checks` is imported and exported, so each value is
 //! passed in both directions.
+//!
+//! For a runtime built for WASIp3, the component is built from `values-async`, which adds an
+//! `async` export to `values`.
 
 mod shared;
 
@@ -30,10 +33,14 @@ static ENGINE: LazyLock<Engine> = LazyLock::new(shared::engine);
 async fn pre() -> &'static ValuesPre<Ctx> {
     static PRE: OnceCell<Result<ValuesPre<Ctx>, String>> = OnceCell::const_new();
     shared::build_once(&PRE, async {
+        let world = match shared::wasi_version() {
+            componentize::WasiVersion::P2 => "values",
+            componentize::WasiVersion::P3 => "values-async",
+        };
         let component = shared::compile_fixture(
             &ENGINE,
             include_str!("fixtures/values.wit"),
-            "values",
+            world,
             include_str!("fixtures/values.js"),
         )
         .await;
@@ -345,8 +352,7 @@ async fn result_with_bytes_error() -> anyhow::Result<()> {
 }
 
 /// An `enum` `err` lowers from an `Error` whose message names a case and from an
-/// instance of the enum's error class, for a sync export and for a rejected
-/// async one.
+/// instance of the enum's error class.
 #[tokio::test]
 async fn enum_err_lowers_from_errors() -> anyhow::Result<()> {
     let mut store = store();
@@ -364,11 +370,32 @@ async fn enum_err_lowers_from_errors() -> anyhow::Result<()> {
         instance.call_lookup(&mut store, "secret").await?,
         Err(errors::KvError::Denied)
     );
+    Ok(())
+}
+
+/// An `enum` `err` lowers from the reasons a rejected async export rejects with,
+/// as [`enum_err_lowers_from_errors`] describes. The export is `values-async`'s,
+/// which the world's bindings don't name, so it is called through a typed function.
+#[tokio::test]
+async fn enum_err_lowers_from_async_rejections() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
+    let mut store = store();
+    let instance = pre()
+        .await
+        .instance_pre()
+        .instantiate_async(&mut store)
+        .await?;
+    let lookup = instance.get_typed_func::<(String,), (Result<String, errors::KvError>,)>(
+        &mut store,
+        "lookup-async",
+    )?;
     let results = store
         .run_concurrent(async |store| {
             let mut results = Vec::new();
             for key in ["present", "missing", "secret"] {
-                results.push(instance.call_lookup_async(store, key.to_string()).await?);
+                results.push(lookup.call_concurrent(store, (key.to_string(),)).await?.0);
             }
             anyhow::Ok(results)
         })
@@ -612,6 +639,9 @@ async fn mismatched_import_argument_throws() -> anyhow::Result<()> {
 /// the function `async`.
 #[tokio::test]
 async fn sync_export_returning_a_promise_traps_with_a_hint() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = shared::store_capturing_stderr(&ENGINE);
     let instance = pre().await.instantiate_async(&mut store).await?;
     let result = instance
@@ -623,6 +653,25 @@ async fn sync_export_returning_a_promise_traps_with_a_hint() -> anyhow::Result<(
     assert!(
         stderr.contains("got a Promise") && stderr.contains("Declare it `async`"),
         "{stderr}"
+    );
+    Ok(())
+}
+
+/// On WASIp2, a sync export that returns a promise returns its value once it has
+/// settled.
+#[tokio::test]
+async fn sync_export_returning_a_promise_returns_its_value_on_wasip2() -> anyhow::Result<()> {
+    if shared::wasi_version() != componentize::WasiVersion::P2 {
+        return Ok(());
+    }
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    assert_eq!(
+        instance
+            .test_values_checks()
+            .call_promised(&mut store)
+            .await?,
+        "settled"
     );
     Ok(())
 }

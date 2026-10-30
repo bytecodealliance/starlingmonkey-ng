@@ -30,10 +30,21 @@ use {
     wit_parser::{Resolve, WorldId, WorldKey},
 };
 
-/// Host bindings of the runtime's `init` interface, `starling/wit/init.wit`.
+/// Host bindings of the `init` interface of a runtime built for WASIp3,
+/// `starling/wit/init.wit`.
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../starling/wit/init.wit",
+        world: "runtime",
+        exports: { default: async },
+    });
+}
+
+/// Host bindings of the `init` interface of a runtime built for WASIp2,
+/// `starling/wit/p2/init.wit`.
+mod bindings_p2 {
+    wasmtime::component::bindgen!({
+        path: "../starling/wit/p2/init.wit",
         world: "runtime",
         exports: { default: async },
     });
@@ -127,6 +138,26 @@ pub enum Wit<'a, P = PathBuf> {
 /// sections.
 pub struct Runtime {
     module: Vec<u8>,
+    wasi_version: WasiVersion,
+}
+
+/// The WASI version a [`Runtime`] was built for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasiVersion {
+    /// WASIp2: a runtime that imports and exports `0.2` interfaces and has no async functions.
+    P2,
+    /// WASIp3: a runtime that imports and exports `0.3` interfaces.
+    P3,
+}
+
+impl WasiVersion {
+    /// The interface of the runtime's builtin HTTP handler export, without a version.
+    pub(crate) fn http_handler_prefix(self) -> &'static str {
+        match self {
+            WasiVersion::P2 => HTTP_INCOMING_HANDLER_INTERFACE_PREFIX,
+            WasiVersion::P3 => HTTP_HANDLER_INTERFACE_PREFIX,
+        }
+    }
 }
 
 impl Runtime {
@@ -140,7 +171,7 @@ impl Runtime {
     /// a component has no such copies.
     pub fn new(bytes: Vec<u8>) -> anyhow::Result<Runtime> {
         if !wasmparser::Parser::is_component(&bytes) {
-            return Ok(Runtime { module: bytes });
+            return Runtime::from_module(bytes);
         }
         let mut main: Option<&[u8]> = None;
         for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
@@ -164,7 +195,28 @@ impl Runtime {
                 preserve_component_type::PREFIX
             );
         }
-        Ok(Runtime { module })
+        Runtime::from_module(module)
+    }
+
+    /// The runtime whose core module is `module`.
+    ///
+    /// Its WASI version is that of its builtin `wasi:cli/run` export: WASIp2 for a `0.2` version
+    /// of the interface, WASIp3 otherwise.
+    fn from_module(module: Vec<u8>) -> anyhow::Result<Runtime> {
+        let cli_run = find_builtin_export(&module, CLI_RUN_INTERFACE_PREFIX)?;
+        let wasi_version = match cli_run {
+            Some((_, _, name)) if same_interface(&name, "wasi:cli/run@0.2.0") => WasiVersion::P2,
+            _ => WasiVersion::P3,
+        };
+        Ok(Runtime {
+            module,
+            wasi_version,
+        })
+    }
+
+    /// The WASI version the runtime was built for.
+    pub fn wasi_version(&self) -> WasiVersion {
+        self.wasi_version
     }
 
     /// The runtime's core module.
@@ -183,15 +235,20 @@ impl Runtime {
 pub(crate) const CLI_RUN_INTERFACE_PREFIX: &str = "wasi:cli/run";
 
 /// Like [`CLI_RUN_INTERFACE_PREFIX`], for the runtime's own `wasi:http/handler`
-/// export. The application can also implement the interface itself (see
-/// [`RAW_HTTP_HANDLER_EXPORT`]).
+/// export, which a runtime built for WASIp3 has. The application can also
+/// implement the interface itself (see [`RAW_HTTP_HANDLER_EXPORT`]).
 pub(crate) const HTTP_HANDLER_INTERFACE_PREFIX: &str = "wasi:http/handler";
 
-/// The name of a second export of the runtime's `wasi:http/handler` interface,
-/// which is added to a world that exports `wasi:http/handler`, so that the
-/// application can implement the interface itself. The main module exports its
-/// `handle` under the names for `wasi:http/handler`: `wasiHttp.handler.handle`,
-/// `handler.handle` or `handle`.
+/// Like [`HTTP_HANDLER_INTERFACE_PREFIX`], for the runtime's own
+/// `wasi:http/incoming-handler` export, which a runtime built for WASIp2 has.
+pub(crate) const HTTP_INCOMING_HANDLER_INTERFACE_PREFIX: &str = "wasi:http/incoming-handler";
+
+/// The name of a second export of the runtime's HTTP handler interface (see
+/// [`WasiVersion::http_handler_prefix`]), which is added to a world that exports
+/// that interface, so that the application can implement the interface itself.
+/// The main module exports its `handle` under the names for the interface, such
+/// as `wasiHttp.handler.handle`, `handler.handle` or `handle` for
+/// `wasi:http/handler`.
 pub(crate) const RAW_HTTP_HANDLER_EXPORT: &str = "wasi-http-handler";
 
 /// The worlds selected by [`load_world`]: the worlds in `worlds`, or the default
@@ -434,6 +491,8 @@ pub fn runtime_imports_world(
 /// is replaced as in [`componentize`], by an export named
 /// `RAW_HTTP_HANDLER_EXPORT` with the runtime's declaration of the interface.
 /// The declarations then describe the `handle` implemented by the application.
+/// For a runtime built for WASIp2, the same applies to a world's
+/// `wasi:http/incoming-handler` export.
 pub fn load_world_for_types<'a>(
     wit: Wit<'_, impl AsRef<Path>>,
     world: impl Into<WorldSelection<'a>>,
@@ -442,19 +501,29 @@ pub fn load_world_for_types<'a>(
     runtime: Option<&Runtime>,
 ) -> anyhow::Result<(Resolve, WorldId)> {
     let (mut resolve, world) = load_world(wit, world, features, all_features)?;
+    if runtime.is_some_and(|runtime| runtime.wasi_version() == WasiVersion::P2) {
+        supported::check_wasip2_types(&resolve, world)?;
+    }
     supported::check_supported_types(&resolve, world)?;
     let Some(runtime) = runtime else {
         return canonicalize_compatible_versions(resolve, world);
     };
-    let Some(removed) = remove_world_export(&mut resolve, world, HTTP_HANDLER_INTERFACE_PREFIX)
+    let prefix = runtime.wasi_version().http_handler_prefix();
+    let Some(removed) = remove_world_export(&mut resolve, world, prefix)
         .into_iter()
         .next()
     else {
         return canonicalize_compatible_versions(resolve, world);
     };
-    match builtin_export(runtime.module(), HTTP_HANDLER_INTERFACE_PREFIX)? {
+    match builtin_export(runtime.module(), prefix)? {
         Some((builtin, name)) if same_interface(&name, &removed) => {
-            add_raw_http_handler_export(&mut resolve, world, builtin, &name)?;
+            add_raw_http_handler_export(
+                &mut resolve,
+                world,
+                builtin,
+                &name,
+                runtime.wasi_version(),
+            )?;
             canonicalize_compatible_versions(resolve, world)
         }
         builtin => anyhow::bail!(
@@ -543,7 +612,11 @@ pub async fn componentize(
         cache,
     } = *options;
     check_runtime_interface(runtime)?;
+    let wasi_version = runtime.wasi_version();
     let (mut resolve, world) = load_world(wit, world, features, all_features)?;
+    if wasi_version == WasiVersion::P2 {
+        supported::check_wasip2_types(&resolve, world)?;
+    }
     supported::check_supported_types(&resolve, world)?;
     supported::reject_world_level_borrows(&resolve, world)?;
     check_export_names(&resolve, world)?;
@@ -556,14 +629,15 @@ pub async fn componentize(
         .map(finalize::KeptExport::unrenamed)
         .collect();
 
-    // The world's name for its `wasi:http/handler` export, if it has one.
+    // The world's name for its HTTP handler export, if it has one.
     let mut http_handler = None;
     let mut cli = false;
-    // A world's `wasi:cli/run` and `wasi:http/handler` exports are implemented
-    // by the runtime's own exports. They are removed from the world before the
+    // A world's `wasi:cli/run` and HTTP handler exports are implemented by the
+    // runtime's own exports. They are removed from the world before the
     // bindings and the metadata section below are generated, because they would
     // otherwise be duplicate exports.
-    for prefix in [CLI_RUN_INTERFACE_PREFIX, HTTP_HANDLER_INTERFACE_PREFIX] {
+    let http_handler_prefix = wasi_version.http_handler_prefix();
+    for prefix in [CLI_RUN_INTERFACE_PREFIX, http_handler_prefix] {
         if let Some(removed) = remove_world_export(&mut resolve, world, prefix).first() {
             cli |= prefix == CLI_RUN_INTERFACE_PREFIX;
             // The output component exports the runtime's builtin, so the world
@@ -588,8 +662,8 @@ pub async fn componentize(
                     }
                 }
             }
-            if let (HTTP_HANDLER_INTERFACE_PREFIX, Some((builtin, name))) = (prefix, builtin) {
-                add_raw_http_handler_export(&mut resolve, world, builtin, &name)?;
+            if let (true, Some((builtin, name))) = (prefix == http_handler_prefix, builtin) {
+                add_raw_http_handler_export(&mut resolve, world, builtin, &name, wasi_version)?;
                 http_handler = Some(removed.clone());
             }
         }
@@ -670,7 +744,10 @@ pub async fn componentize(
     let engine = Engine::new(&config)?;
     let mut store = Store::new(&engine, Ctx { wasi, table });
 
-    let wizer = Wizer::new();
+    let mut wizer = Wizer::new();
+    // The runtime's `wizer-initialize` export stays in the component's type, so its core function
+    // is kept. The function isn't called: `init` initializes the instance.
+    wizer.keep_init_func(true);
     let (cx, component) = wizer.instrument_component(&component)?;
     let component = Component::new(&engine, &component)?;
 
@@ -687,7 +764,6 @@ pub async fn componentize(
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let init_output;
     {
-        let instance = bindings::Runtime::new(&mut store, &instance)?;
         // `init` builds the import modules from the wit-dylib `Wit` metadata, so
         // no module sources are passed to it. It reads the application's own
         // dependency modules through the preopened `base_directory`, and the
@@ -695,25 +771,47 @@ pub async fn componentize(
         let raw_http_handler = http_handler
             .as_ref()
             .map(|_| RAW_HTTP_HANDLER_EXPORT.to_string());
-        // `init` is an async export, so it runs as a concurrent task, which
-        // lets the application's top-level `await` complete.
-        let result = store
-            .run_concurrent(async |accessor| {
+        let init_location = init_location.map(str::to_string);
+        let result = match wasi_version {
+            // `init` is an async export, so it runs as a concurrent task, which
+            // lets the application's top-level `await` complete.
+            WasiVersion::P3 => {
+                let instance = bindings::Runtime::new(&mut store, &instance)?;
+                store
+                    .run_concurrent(async |accessor| {
+                        instance
+                            .starling_componentize_init()
+                            .call_init(
+                                accessor,
+                                js.text.to_string(),
+                                js.name.to_string(),
+                                main_path,
+                                cli,
+                                raw_http_handler,
+                                init_location,
+                            )
+                            .await
+                    })
+                    .await
+                    .and_then(|call| call)
+            }
+            // `init` blocks until the application's top-level `await` has settled.
+            WasiVersion::P2 => {
+                let instance = bindings_p2::Runtime::new(&mut store, &instance)?;
                 instance
                     .starling_componentize_init()
                     .call_init(
-                        accessor,
-                        js.text.to_string(),
-                        js.name.to_string(),
-                        main_path,
+                        &mut store,
+                        js.text,
+                        js.name,
+                        main_path.as_deref(),
                         cli,
-                        raw_http_handler,
-                        init_location.map(str::to_string),
+                        raw_http_handler.as_deref(),
+                        init_location.as_deref(),
                     )
                     .await
-            })
-            .await
-            .and_then(|call| call);
+            }
+        };
         let printed = format!(
             "{}{}",
             String::from_utf8_lossy(&stdout.contents()),
@@ -821,8 +919,9 @@ impl<'a> From<&'a str> for JsSource<'a> {
 }
 
 /// Add the export [`RAW_HTTP_HANDLER_EXPORT`] to `world`: an interface with the
-/// same types and function as the runtime's builtin `wasi:http/handler`, which
-/// `builtin` exports as `handler`.
+/// same types and function as the runtime's builtin HTTP handler, which
+/// `builtin` exports as `handler`: `wasi:http/handler` for a runtime built for
+/// WASIp3, `wasi:http/incoming-handler` for one built for WASIp2.
 ///
 /// `builtin`'s packages are merged into `resolve` first, so that the export uses
 /// the `wasi:http/types` resources imported by the runtime. If `resolve`
@@ -833,36 +932,44 @@ fn add_raw_http_handler_export(
     world: WorldId,
     builtin: Resolve,
     handler: &str,
+    wasi_version: WasiVersion,
 ) -> anyhow::Result<()> {
     resolve.merge(builtin).with_context(|| {
         format!(
             "merging the runtime's `{handler}` into the world. A world declaring \
-             `{HTTP_HANDLER_INTERFACE_PREFIX}` must declare it as the runtime does, or leave \
-             the interface empty."
+             `{}` must declare it as the runtime does, or leave the interface empty.",
+            wasi_version.http_handler_prefix()
         )
     })?;
     let version = handler
         .split_once('@')
         .map(|(_, version)| format!("@{version}"))
         .unwrap_or_default();
+    let interface = match wasi_version {
+        WasiVersion::P2 => format!(
+            "use wasi:http/types{version}.{{incoming-request, response-outparam}};\n\
+             handle: func(request: incoming-request, response-out: response-outparam);\n"
+        ),
+        WasiVersion::P3 => format!(
+            "use wasi:http/types{version}.{{request, response, error-code}};\n\
+             handle: async func(request: request) -> result<response, error-code>;\n"
+        ),
+    };
     let raw = resolve
         .push_str(
             "raw-http-handler.wit",
             &format!(
                 "package starling:raw-http-handler;\n\
                  world raw {{\n\
-                   export {RAW_HTTP_HANDLER_EXPORT}: interface {{\n\
-                     use wasi:http/types{version}.{{request, response, error-code}};\n\
-                     handle: async func(request: request) -> result<response, error-code>;\n\
-                   }}\n\
+                   export {RAW_HTTP_HANDLER_EXPORT}: interface {{\n{interface}}}\n\
                  }}\n"
             ),
         )
-        .context("declaring the raw `wasi:http/handler` export")?;
+        .context("declaring the raw HTTP handler export")?;
     let raw = resolve.select_world(&[raw], Some("raw"))?;
     resolve
         .merge_worlds(raw, world, &mut wit_parser::CloneMaps::default())
-        .context("adding the raw `wasi:http/handler` export to the world")
+        .context("adding the raw HTTP handler export to the world")
 }
 
 /// Remove from `world` every export of the interface `prefix` at any version,

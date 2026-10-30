@@ -4,6 +4,9 @@
 //! `counters.counter`. The host calls the methods and statics of counters the guest constructs,
 //! and the `live-count` and `dispose-calls` statics observe the `[Symbol.dispose]()` a host-side
 //! drop runs.
+//!
+//! For a runtime built for WASIp3, the component is built from `exported-resource-async`, which
+//! adds the `async` export `delayed.read-later`.
 
 mod shared;
 
@@ -29,10 +32,14 @@ static ENGINE: LazyLock<Engine> = LazyLock::new(shared::engine);
 async fn pre() -> &'static ExportedResourcePre<Ctx> {
     static PRE: OnceCell<Result<ExportedResourcePre<Ctx>, String>> = OnceCell::const_new();
     shared::build_once(&PRE, async {
+        let world = match shared::wasi_version() {
+            componentize::WasiVersion::P2 => "exported-resource",
+            componentize::WasiVersion::P3 => "exported-resource-async",
+        };
         let component = shared::compile_fixture(
             &ENGINE,
             include_str!("fixtures/exported_resource.wit"),
-            "exported-resource",
+            world,
             include_str!("fixtures/exported_resource.js"),
         )
         .await;
@@ -125,18 +132,30 @@ async fn non_extensible_object_backs_a_resource() -> anyhow::Result<()> {
 /// borrow ending leaves the resource to its owner.
 #[tokio::test]
 async fn async_export_reads_a_borrow_after_a_timer() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
-    let instance = pre().await.instantiate_async(&mut store).await?;
+    let component_instance = pre()
+        .await
+        .instance_pre()
+        .instantiate_async(&mut store)
+        .await?;
+    let instance = ExportedResource::new(&mut store, &component_instance)?;
     let counters = instance.test_exported_resource_counters();
     let counter = counters.call_make_counter(&mut store, 10).await?;
 
-    let value = store
-        .run_concurrent(async |accessor| {
-            instance
-                .test_exported_resource_counters()
-                .call_read_later(accessor, counter)
-                .await
-        })
+    // `exported-resource-async`'s export, which the world's bindings don't name.
+    let delayed = component_instance
+        .get_export_index(&mut store, None, "test:exported-resource/delayed")
+        .expect("the component exports `delayed`");
+    let read_later = component_instance
+        .get_export_index(&mut store, Some(&delayed), "read-later")
+        .expect("`delayed` exports `read-later`");
+    let read_later = component_instance
+        .get_typed_func::<(wasmtime::component::ResourceAny,), (u32,)>(&mut store, &read_later)?;
+    let (value,) = store
+        .run_concurrent(async |accessor| read_later.call_concurrent(accessor, (counter,)).await)
         .await??;
     assert_eq!(value, 10);
     assert_eq!(1, counters.counter().call_live_count(&mut store).await?);

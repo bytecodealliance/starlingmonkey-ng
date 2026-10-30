@@ -4,6 +4,12 @@
 //! `fixtures/serve.wit`, served either by the runtime's handler, which dispatches each request as
 //! a `fetch` event to the application's listeners, or by the application's own `handle`. The
 //! tests drive `wasi:http/handler.handle()` through wasmtime's p3 `wasi:http` bindings.
+//!
+//! Against a runtime built for WASIp2, the serve world is `fixtures/serve_p2.wit`, which exports
+//! `wasi:http/incoming-handler`, the tests drive it through wasmtime's p2 bindings, and the
+//! applications implementing the handler themselves are the `_p2` fixtures, which use the WASI 0.2
+//! API. The cases of `async` imports, `future`s and `Response.consumeBody` need a runtime built
+//! for WASIp3.
 
 mod shared;
 
@@ -12,7 +18,6 @@ use shared::HttpCtx as Ctx;
 use {
     tokio::sync::OnceCell,
     wasmtime::{component::Component, Engine, Store},
-    wasmtime_wasi_http::p3::bindings::{http::types::ErrorCode, Service},
 };
 
 /// The body of the harness's response to every outgoing request.
@@ -20,11 +25,40 @@ const UPSTREAM_BODY: &str = "from upstream";
 
 static ENGINE: std::sync::LazyLock<Engine> = std::sync::LazyLock::new(shared::engine);
 
-const SERVE_WIT: &str = include_str!("fixtures/serve.wit");
+/// The serve world for the runtime's WASI version.
+fn serve_wit() -> &'static str {
+    match shared::wasi_version() {
+        componentize::WasiVersion::P2 => include_str!("fixtures/serve_p2.wit"),
+        componentize::WasiVersion::P3 => include_str!("fixtures/serve.wit"),
+    }
+}
+
+/// The HTTP handler interface of the runtime's WASI version, and the JS paths an
+/// application may implement its `handle` under.
+fn handler_interface() -> (&'static str, &'static str) {
+    match shared::wasi_version() {
+        componentize::WasiVersion::P2 => (
+            "wasi:http/incoming-handler",
+            "`wasiHttp.incomingHandler.handle` or `incomingHandler.handle` or `handle`",
+        ),
+        componentize::WasiVersion::P3 => (
+            "wasi:http/handler",
+            "`wasiHttp.handler.handle` or `handler.handle` or `handle`",
+        ),
+    }
+}
+
+/// The name of the HTTP handler export of a component built from [`serve_wit`].
+fn handler_export_name() -> &'static str {
+    match shared::wasi_version() {
+        componentize::WasiVersion::P2 => "wasi:http/incoming-handler@0.2.0",
+        componentize::WasiVersion::P3 => "wasi:http/handler@0.3.0",
+    }
+}
 
 /// Componentize a serve application against the serve world and compile it.
 async fn componentize_serve(js: &'static str) -> Component {
-    shared::compile_fixture(&ENGINE, SERVE_WIT, "serve", js).await
+    shared::compile_fixture(&ENGINE, serve_wit(), "serve", js).await
 }
 
 /// The componentized serve app that registers a `fetch` listener, and the
@@ -32,9 +66,10 @@ async fn componentize_serve(js: &'static str) -> Component {
 async fn listener_build() -> &'static (Vec<u8>, Component) {
     static LISTENER: OnceCell<Result<(Vec<u8>, Component), String>> = OnceCell::const_new();
     shared::build_once(&LISTENER, async {
-        let bytes = shared::try_componentize(SERVE_WIT, "serve", include_str!("fixtures/serve.js"))
-            .await
-            .expect("componentizing the serve world");
+        let bytes =
+            shared::try_componentize(serve_wit(), "serve", include_str!("fixtures/serve.js"))
+                .await
+                .expect("componentizing the serve world");
         let component = Component::new(&ENGINE, &bytes).expect("compiling component");
         (bytes, component)
     })
@@ -46,11 +81,11 @@ async fn listener() -> &'static Component {
     &listener_build().await.1
 }
 
-/// The `wasi:http/handler` export of a component built from the serve world, for
+/// The HTTP handler export of a component built from the serve world, for
 /// finalizing it again.
 fn handler_export() -> [componentize::finalize::KeptExport; 1] {
     [componentize::finalize::KeptExport::unrenamed(
-        "wasi:http/handler@0.3.0".to_string(),
+        handler_export_name().to_string(),
     )]
 }
 
@@ -76,7 +111,10 @@ async fn raw() -> &'static Component {
     static RAW: OnceCell<Result<Component, String>> = OnceCell::const_new();
     shared::build_once(
         &RAW,
-        componentize_serve(include_str!("fixtures/serve_raw.js")),
+        componentize_serve(match shared::wasi_version() {
+            componentize::WasiVersion::P2 => include_str!("fixtures/serve_raw_p2.js"),
+            componentize::WasiVersion::P3 => include_str!("fixtures/serve_raw.js"),
+        }),
     )
     .await
 }
@@ -86,22 +124,23 @@ fn store() -> Store<Ctx> {
     shared::http_store(&ENGINE, UPSTREAM_BODY)
 }
 
-/// Drive `wasi:http/handler.handle()` on a fresh instance of a component with a
+/// Drive the HTTP handler export on a fresh instance of a component with a
 /// bodyless `method` request to `path`. Returns the response status and the
-/// collected body as a string, or the `error-code` the handler returned.
+/// collected body as a string, or the `error-code` the handler returned (see
+/// [`shared::serve_on`]).
 async fn handle_request(
     component: &Component,
     method: &str,
     path: &str,
-) -> anyhow::Result<Result<(u16, String), ErrorCode>> {
+) -> anyhow::Result<Result<(u16, String), String>> {
     let mut store = store();
-    let service = Service::instantiate_async(
+    let service = shared::HttpService::instantiate(
         &mut store,
         component,
         &shared::http_linker(&ENGINE, component),
     )
     .await?;
-    shared::handle_on(&mut store, &service, method, path, "").await
+    shared::serve_on(&mut store, &service, method, path, "").await
 }
 
 /// `--export-cli` and `--export-http` together build one component that serves
@@ -134,7 +173,7 @@ async fn cli_and_serve_component_serves_and_runs() -> anyhow::Result<()> {
     let component = Component::new(&ENGINE, std::fs::read(&output)?)?;
 
     assert_eq!(
-        handle_request(&component, "GET", "/both").await??,
+        serve_request(&component, "GET", "/both").await?,
         (200, "hello from one component, serving /both".to_string())
     );
 
@@ -153,15 +192,8 @@ async fn cli_and_serve_component_serves_and_runs() -> anyhow::Result<()> {
             },
         },
     );
-    let command = wasmtime_wasi::p3::bindings::Command::instantiate_async(
-        &mut store,
-        &component,
-        &shared::http_linker(&ENGINE, &component),
-    )
-    .await?;
-    let result = store
-        .run_concurrent(async move |store| command.wasi_cli_run().call_run(store).await)
-        .await??;
+    let linker = shared::http_linker(&ENGINE, &component);
+    let result = shared::call_cli_run(&mut store, &component, &linker).await?;
     assert_eq!(result, Ok(()));
     assert_eq!(
         shared::pipe_text(&stdout),
@@ -183,10 +215,21 @@ async fn wasi_imports() -> &'static (Vec<u8>, Component) {
             resolved: vec![componentize::runtime_imports_world(&runtime, &[])
                 .expect("the runtime's imports world")],
         };
+        // The fixture imports the `0.3` interfaces. A runtime built for WASIp2 imports them at
+        // `0.2`, where `get-insecure-seed` is named `insecure-seed`. We import them at a full
+        // patch version there, which resolves to the module of the version the world imports.
+        let js = match shared::wasi_version() {
+            componentize::WasiVersion::P2 => include_str!("fixtures/serve_wasi_imports.js")
+                .replace("@0.3\"", "@0.2.12\"")
+                .replace("getInsecureSeed", "insecureSeed"),
+            componentize::WasiVersion::P3 => {
+                include_str!("fixtures/serve_wasi_imports.js").to_string()
+            }
+        };
         let bytes = componentize::componentize(
-            componentize::Wit::<std::path::PathBuf>::String(SERVE_WIT),
+            componentize::Wit::<std::path::PathBuf>::String(serve_wit()),
             selection,
-            include_str!("fixtures/serve_wasi_imports.js"),
+            js.as_str(),
             &runtime,
             &Default::default(),
         )
@@ -206,7 +249,7 @@ async fn wasi_imports() -> &'static (Vec<u8>, Component) {
 async fn serve_world_imports_what_the_runtime_imports() -> anyhow::Result<()> {
     let component = &wasi_imports().await.1;
     assert_eq!(
-        handle_request(component, "GET", "/").await??,
+        serve_request(component, "GET", "/").await?,
         (
             200,
             r#"{"arguments":true,"random":16,"clock":"bigint"}"#.to_string()
@@ -252,7 +295,7 @@ async fn deterministic_insecure_seed_is_returned() -> anyhow::Result<()> {
     for disabled in [&[][..], &[WasiApiSet::Random][..]] {
         let component = finalize(disabled, Some(seed))?;
         assert_eq!(
-            handle_request(&component, "GET", "/seed").await??,
+            serve_request(&component, "GET", "/seed").await?,
             (200, "1,2".to_string()),
             "{disabled:?}"
         );
@@ -322,7 +365,7 @@ async fn runtime_imports_world_leaves_out_disabled_features() -> anyhow::Result<
 async fn one_instance_serves_several_requests() -> anyhow::Result<()> {
     let component = listener().await;
     let mut store = store();
-    let service = Service::instantiate_async(
+    let service = shared::HttpService::instantiate(
         &mut store,
         component,
         &shared::http_linker(&ENGINE, component),
@@ -334,7 +377,7 @@ async fn one_instance_serves_several_requests() -> anyhow::Result<()> {
         ("GET", "/hello", "GET /hello"),
         ("POST", "/other", "POST /other"),
     ] {
-        let response = shared::handle_on(&mut store, &service, method, path, "")
+        let response = shared::serve_on(&mut store, &service, method, path, "")
             .await?
             .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
         assert_eq!(response, (200, expected.to_string()), "{method} {path}");
@@ -347,13 +390,13 @@ async fn one_instance_serves_several_requests() -> anyhow::Result<()> {
 async fn listener_reads_the_request_body() -> anyhow::Result<()> {
     let component = listener().await;
     let mut store = store();
-    let service = Service::instantiate_async(
+    let service = shared::HttpService::instantiate(
         &mut store,
         component,
         &shared::http_linker(&ENGINE, component),
     )
     .await?;
-    let response = shared::handle_on(&mut store, &service, "POST", "/echo-body", "a body")
+    let response = shared::serve_on(&mut store, &service, "POST", "/echo-body", "a body")
         .await?
         .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
     assert_eq!(response, (200, "a body".to_string()));
@@ -366,15 +409,15 @@ async fn listener_reads_the_request_body() -> anyhow::Result<()> {
 async fn listener_without_respond_with_gets_500() -> anyhow::Result<()> {
     let component = listener().await;
     let mut store = store();
-    let service = Service::instantiate_async(
+    let service = shared::HttpService::instantiate(
         &mut store,
         component,
         &shared::http_linker(&ENGINE, component),
     )
     .await?;
-    let response = shared::handle_on(&mut store, &service, "GET", "/no-response", "").await?;
+    let response = shared::serve_on(&mut store, &service, "GET", "/no-response", "").await?;
     assert!(matches!(response, Ok((500, _))), "{response:?}");
-    let response = shared::handle_on(&mut store, &service, "GET", "/count", "")
+    let response = shared::serve_on(&mut store, &service, "GET", "/count", "")
         .await?
         .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))?;
     assert_eq!(response, (200, "2".to_string()));
@@ -392,7 +435,7 @@ async fn serve_request(
         .map_err(|code| anyhow::anyhow!("handler errored: {code:?}"))
 }
 
-/// An application that implements `wasi:http/handler` itself serves the
+/// An application that implements the HTTP handler itself serves the
 /// component's export: its `handle` receives the request and builds the response,
 /// or fails with an `error-code`, which reaches the host.
 #[tokio::test]
@@ -406,7 +449,7 @@ async fn serve_dispatches_to_raw_handler() -> anyhow::Result<()> {
 
     let result = handle_request(raw().await, "GET", "/fail").await?;
     assert!(
-        matches!(&result, Err(ErrorCode::InternalError(Some(message))) if message == "raw get /fail"),
+        matches!(&result, Err(code) if code.contains("InternalError(Some(\"raw get /fail\"))")),
         "the application's handler should fail with the error naming the request; got: {result:?}"
     );
     Ok(())
@@ -418,7 +461,10 @@ async fn raw_response() -> &'static Component {
     static RAW_RESPONSE: OnceCell<Result<Component, String>> = OnceCell::const_new();
     shared::build_once(
         &RAW_RESPONSE,
-        componentize_serve(include_str!("fixtures/serve_raw_response.js")),
+        componentize_serve(match shared::wasi_version() {
+            componentize::WasiVersion::P2 => include_str!("fixtures/serve_raw_response_p2.js"),
+            componentize::WasiVersion::P3 => include_str!("fixtures/serve_raw_response.js"),
+        }),
     )
     .await
 }
@@ -458,13 +504,13 @@ async fn stalled_and_read_response_bodies_fail_the_request() -> anyhow::Result<(
     let component = raw_response().await;
     let request = async |path: &str| {
         let (mut store, stderr) = store_capturing_stderr();
-        let service = Service::instantiate_async(
+        let service = shared::HttpService::instantiate(
             &mut store,
             component,
             &shared::http_linker(&ENGINE, component),
         )
         .await?;
-        let result = shared::handle_on(&mut store, &service, "GET", path, "").await;
+        let result = shared::serve_on(&mut store, &service, "GET", path, "").await;
         anyhow::Ok((result, shared::pipe_text(&stderr)))
     };
 
@@ -509,19 +555,25 @@ async fn listener_added_after_top_level_await_serves_the_first_request() -> anyh
 /// `fetch` listener fails to componentize, naming the export.
 #[tokio::test]
 async fn serve_with_raw_handler_and_listener_is_rejected() {
-    let error = shared::try_componentize(
-        SERVE_WIT,
-        "serve",
-        include_str!("fixtures/serve_raw_and_listener.js"),
-    )
-    .await
-    .expect_err("an application with both handlers must not componentize");
+    // The fixture's handler is in the interface layer, which names WASIp2's interface
+    // `incomingHandler`.
+    let js = match shared::wasi_version() {
+        componentize::WasiVersion::P2 => include_str!("fixtures/serve_raw_and_listener.js")
+            .replace("export const handler =", "export const incomingHandler ="),
+        componentize::WasiVersion::P3 => {
+            include_str!("fixtures/serve_raw_and_listener.js").to_string()
+        }
+    };
+    let error = shared::try_componentize(serve_wit(), "serve", &js)
+        .await
+        .expect_err("an application with both handlers must not componentize");
     let message = format!("{error:#}");
+    let (interface, paths) = handler_interface();
     assert!(
-        message.contains(
-            "both exports a `wasi:http/handler` implementation as `wasiHttp.handler.handle` or \
-             `handler.handle` or `handle` and registers a `fetch` listener"
-        ),
+        message.contains(&format!(
+            "both exports a `{interface}` implementation as {paths} and registers a `fetch` \
+             listener"
+        )),
         "the error should name both handlers; got: {message}"
     );
 }
@@ -532,18 +584,19 @@ async fn serve_with_raw_handler_and_listener_is_rejected() {
 #[tokio::test]
 async fn serve_without_handler_is_rejected() {
     let error = shared::try_componentize(
-        SERVE_WIT,
+        serve_wit(),
         "serve",
         include_str!("fixtures/serve_no_listener.js"),
     )
     .await
     .expect_err("an application with no handler must not componentize");
     let message = format!("{error:#}");
+    let (interface, paths) = handler_interface();
     assert!(
-        message.contains(
-            "neither exports a `wasi:http/handler` implementation as `wasiHttp.handler.handle` \
-             or `handler.handle` or `handle` nor registers a `fetch` listener"
-        ),
+        message.contains(&format!(
+            "neither exports a `{interface}` implementation as {paths} nor registers a `fetch` \
+             listener"
+        )),
         "the error should name both ways to serve requests; got: {message}"
     );
 }
@@ -638,8 +691,8 @@ async fn serve_imports_app(path: &str) -> anyhow::Result<(u16, String)> {
                 )
     });
     let (mut store, stderr) = store_capturing_stderr();
-    let service = Service::instantiate_async(&mut store, component, &linker).await?;
-    shared::handle_on(&mut store, &service, "GET", path, "")
+    let service = shared::HttpService::instantiate(&mut store, component, &linker).await?;
+    shared::serve_on(&mut store, &service, "GET", path, "")
         .await?
         .map_err(|code| anyhow::anyhow!("{code:?}: {}", shared::pipe_text(&stderr)))
 }
@@ -649,6 +702,9 @@ async fn serve_imports_app(path: &str) -> anyhow::Result<(u16, String)> {
 /// `get` and `has`, which a raw handler calls on the request's headers.
 #[tokio::test]
 async fn world_imports_extend_the_runtime_wasi_http_types() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(
         serve_imports_app("/").await?,
         (200, "content-length=0 absent=false".to_string())
@@ -670,7 +726,10 @@ async fn disabling_http_for_a_serve_component_is_refused() {
     .expect_err("a serve component cannot go without `http`");
     let message = format!("{error:#}");
     assert!(
-        message.contains("is used by `wasi:http/handler@0.3.0`, which the component exports"),
+        message.contains(&format!(
+            "is used by `{}`, which the component exports",
+            handler_export_name()
+        )),
         "{message}"
     );
     assert_eq!(message.matches("is used by").count(), 1, "{message}");
@@ -683,20 +742,23 @@ async fn disabling_http_for_a_serve_component_is_refused() {
 async fn failing_raw_handler_is_named_as_the_handler() -> anyhow::Result<()> {
     let component = raw().await;
     let (mut store, stderr) = store_capturing_stderr();
-    let service = Service::instantiate_async(
+    let service = shared::HttpService::instantiate(
         &mut store,
         component,
         &shared::http_linker(&ENGINE, component),
     )
     .await?;
-    let result = shared::handle_on(&mut store, &service, "GET", "/throw", "").await;
+    let result = shared::serve_on(&mut store, &service, "GET", "/throw", "").await;
     assert!(
         !matches!(result, Ok(Ok(_))),
         "a throwing handler cannot answer"
     );
     let stderr = shared::pipe_text(&stderr);
+    let (interface, _) = handler_interface();
     assert!(
-        stderr.contains("export `wasi:http/handler#handle` threw: boom from handle"),
+        stderr.contains(&format!(
+            "export `{interface}#handle` threw: boom from handle"
+        )),
         "{stderr}"
     );
     Ok(())
@@ -706,20 +768,26 @@ async fn failing_raw_handler_is_named_as_the_handler() -> anyhow::Result<()> {
 /// componentize, saying it must match the runtime's declaration.
 #[tokio::test]
 async fn mismatched_wasi_http_declaration_is_rejected() {
-    const WIT: &str = "\
-package test:serve-mismatch;
-
-world serve {
-  export wasi:http/handler@0.3.0;
-}
-
-package wasi:http@0.3.0 {
-  interface handler {
-    handle: func(n: u32) -> u32;
-  }
-}
-";
-    let error = shared::try_componentize(WIT, "serve", include_str!("fixtures/serve.js"))
+    // At the version of the runtime's builtin: a declaration at another patch version is of
+    // another package, which merges without a conflict.
+    let (interface, _) = handler_interface();
+    let (package, name) = interface
+        .split_once('/')
+        .expect("an interface has a package");
+    let runtime = std::fs::read(shared::runtime_path()).expect("reading the runtime build");
+    let (_, exports) = shared::surface(&runtime);
+    let builtin = exports
+        .iter()
+        .find(|export| export.starts_with(&format!("{interface}@")))
+        .expect("the runtime exports its HTTP handler");
+    let (_, version) = builtin.split_once('@').expect("the export has a version");
+    let wit = format!(
+        "package test:serve-mismatch;\n\n\
+         world serve {{\n  export {interface}@{version};\n}}\n\n\
+         package {package}@{version} {{\n  interface {name} {{\n    \
+         handle: func(n: u32) -> u32;\n  }}\n}}\n"
+    );
+    let error = shared::try_componentize(&wit, "serve", include_str!("fixtures/serve.js"))
         .await
         .expect_err("a mismatched `wasi:http` declaration must not componentize");
     let message = format!("{error:#}");
@@ -733,6 +801,9 @@ package wasi:http@0.3.0 {
 /// with a `TypeError`, rather than moving the request while it is lent.
 #[tokio::test]
 async fn fetch_of_a_lent_request_rejects() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(
         serve_imports_app("/lend").await?,
         (
@@ -748,6 +819,9 @@ async fn fetch_of_a_lent_request_rejects() -> anyhow::Result<()> {
 /// reads it only after the request has finished.
 #[tokio::test]
 async fn listener_future_is_written_after_the_request() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     const WIT: &str = "\
 package test:serve-future;
 
@@ -784,8 +858,8 @@ addEventListener('fetch', (event) => {
         )
     });
     let (mut store, stderr) = store_capturing_stderr();
-    let service = Service::instantiate_async(&mut store, &component, &linker).await?;
-    let (status, _) = shared::handle_on(&mut store, &service, "GET", "/", "")
+    let service = shared::HttpService::instantiate(&mut store, &component, &linker).await?;
+    let (status, _) = shared::serve_on(&mut store, &service, "GET", "/", "")
         .await?
         .map_err(|code| anyhow::anyhow!("{code:?}"))?;
     assert_eq!(status, 200);
@@ -810,13 +884,13 @@ addEventListener('fetch', (event) => {
 async fn listener_unhandled_rejection_is_reported() -> anyhow::Result<()> {
     let component = listener().await;
     let (mut store, stderr) = store_capturing_stderr();
-    let service = Service::instantiate_async(
+    let service = shared::HttpService::instantiate(
         &mut store,
         component,
         &shared::http_linker(&ENGINE, component),
     )
     .await?;
-    let (status, _) = shared::handle_on(&mut store, &service, "GET", "/reject", "")
+    let (status, _) = shared::serve_on(&mut store, &service, "GET", "/reject", "")
         .await?
         .map_err(|code| anyhow::anyhow!("{code:?}"))?;
     assert_eq!(status, 200);
@@ -832,6 +906,9 @@ async fn listener_unhandled_rejection_is_reported() -> anyhow::Result<()> {
 /// `response` throws a `TypeError` the guest can catch.
 #[tokio::test]
 async fn plain_object_for_an_owned_response_throws() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (status, body) = serve_request(raw_response().await, "GET", "/plain-object").await?;
     assert_eq!(status, 200);
     assert_eq!(
@@ -847,6 +924,9 @@ async fn plain_object_for_an_owned_response_throws() -> anyhow::Result<()> {
 /// catch.
 #[tokio::test]
 async fn unusable_response_for_an_owned_response_throws() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (status, body) = serve_request(raw_response().await, "GET", "/unusable").await?;
     assert_eq!(status, 200);
     let unusable = "TypeError: argument 1 of `Response.consumeBody`: the Response has an \

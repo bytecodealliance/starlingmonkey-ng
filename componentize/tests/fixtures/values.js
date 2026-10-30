@@ -92,7 +92,7 @@ export const checks = {
     throw new Error("bigArgument accepted a number for a string field");
   },
   async promised() {
-    return "never lowered";
+    return "settled";
   },
   enumObjects: () =>
     JSON.stringify([

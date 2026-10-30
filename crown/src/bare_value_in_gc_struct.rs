@@ -21,8 +21,8 @@
 
 use rustc_hir::{self as hir};
 use rustc_lint::{LateContext, LateLintPass, Lint, LintPass, LintStore};
+use rustc_lint_defs::declare_tool_lint;
 use rustc_middle::ty;
-use rustc_session::declare_tool_lint;
 use rustc_span::symbol::Symbol;
 
 use crate::common::TyCtxtExt as _;

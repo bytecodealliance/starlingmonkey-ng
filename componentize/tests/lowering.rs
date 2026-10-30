@@ -162,6 +162,9 @@ async fn run_in(store: &mut Store<Ctx>, which: &str) -> anyhow::Result<String> {
 /// dispose right after it does nothing.
 #[tokio::test]
 async fn dispose_after_an_own_argument_does_nothing() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(run("disposeAfterConsume").await?, "ok 5");
     Ok(())
 }
@@ -170,6 +173,9 @@ async fn dispose_after_an_own_argument_does_nothing() -> anyhow::Result<()> {
 /// second with a `TypeError`.
 #[tokio::test]
 async fn own_argument_to_two_pending_calls_rejects_the_second() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(
         run("consumeTwice").await?,
         "TypeError: argument 1 of `consume`: the resource was disposed of, or moved to the host"
@@ -181,6 +187,9 @@ async fn own_argument_to_two_pending_calls_rejects_the_second() -> anyhow::Resul
 /// call returns.
 #[tokio::test]
 async fn dispose_waits_for_a_pending_borrow() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, _) = store();
     assert_eq!(run_in(&mut store, "disposeWhilePeeked").await?, "ok 6");
     assert_eq!(store.data().thing_drops, 1);
@@ -191,6 +200,9 @@ async fn dispose_waits_for_a_pending_borrow() -> anyhow::Result<()> {
 /// call returns.
 #[tokio::test]
 async fn own_argument_while_borrowed_rejects() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(
         run("consumeWhilePeeked").await?,
         "TypeError: argument 1 of `consume`: the resource is lent to an import call that has \
@@ -203,6 +215,9 @@ async fn own_argument_while_borrowed_rejects() -> anyhow::Result<()> {
 /// with a `TypeError`.
 #[tokio::test]
 async fn stream_argument_to_two_pending_calls_rejects_the_second() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(
         run("drainTwice").await?,
         "TypeError: argument 1 of `drain`: the stream is locked"
@@ -214,6 +229,9 @@ async fn stream_argument_to_two_pending_calls_rejects_the_second() -> anyhow::Re
 /// not change what the host receives.
 #[tokio::test]
 async fn typed_array_argument_is_read_when_the_call_starts() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(run("changeBufferAfterCall").await?, "ok 1");
     Ok(())
 }
@@ -222,6 +240,9 @@ async fn typed_array_argument_is_read_when_the_call_starts() -> anyhow::Result<(
 /// it cannot dispose of a later argument before the host receives it.
 #[tokio::test]
 async fn stream_source_runs_after_the_arguments_are_lowered() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(run("pullDisposesArgument").await?, "ok 9");
     Ok(())
 }
@@ -230,6 +251,9 @@ async fn stream_source_runs_after_the_arguments_are_lowered() -> anyhow::Result<
 /// class, and its wrappers have `[Symbol.dispose]()`.
 #[tokio::test]
 async fn bare_imported_resource_has_a_class() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(run("bareResource").await?, "function true 77");
     Ok(())
 }
@@ -239,6 +263,9 @@ async fn bare_imported_resource_has_a_class() -> anyhow::Result<()> {
 /// together are written together, and a later chunk finds the wrapper moved.
 #[tokio::test]
 async fn repeated_resource_in_a_stream_ends_it_early() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     for (together, reason) in [
         (true, "the resource is used elsewhere in the same call"),
         (false, "the resource was disposed of, or moved to the host"),
@@ -267,6 +294,9 @@ async fn repeated_resource_in_a_stream_ends_it_early() -> anyhow::Result<()> {
 /// write it. The import call throws a `TypeError` naming the export.
 #[tokio::test]
 async fn future_argument_in_a_sync_export_throws() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, _) = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let described = instance
@@ -287,6 +317,9 @@ async fn future_argument_in_a_sync_export_throws() -> anyhow::Result<()> {
 /// override runs.
 #[tokio::test]
 async fn exported_method_dispatches_on_the_instance() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, _) = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let widget = instance.test_lowering_runner().widget();

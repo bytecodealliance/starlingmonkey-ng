@@ -59,7 +59,6 @@ declare module 'starling:guest' {
     counters: {
       makeCounter(start: number): $t.Counter;
       makeSealedCounter(start: number): $t.Counter;
-      readLater(c: $t.Counter): number | Promise<number>;
       Counter: typeof $t.Counter;
     };
   };
@@ -68,14 +67,12 @@ declare module 'starling:guest' {
   export const counters: {
     makeCounter(start: number): $t.Counter;
     makeSealedCounter(start: number): $t.Counter;
-    readLater(c: $t.Counter): number | Promise<number>;
     Counter: typeof $t.Counter;
   };
 
   // Items of the exported interface `test:exported-resource/counters`.
   export function makeCounter(start: number): $t.Counter;
   export function makeSealedCounter(start: number): $t.Counter;
-  export function readLater(c: $t.Counter): number | Promise<number>;
   export {
     Counter,
   } from 'starling:types/test:exported-resource/exported-resource';

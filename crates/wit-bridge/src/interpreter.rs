@@ -321,10 +321,16 @@ pub fn world_desc_opt() -> Option<WorldDesc> {
 /// `run`.
 ///
 /// `raw_http_handler` is the name of the exported interface that has the
-/// runtime's own declaration of `wasi:http/handler`. Its functions are looked
-/// up under the names for `wasi:http/handler`, and the main module may leave
+/// runtime's own declaration of its HTTP handler interface, `wasi:http/handler`
+/// on WASIp3 and `wasi:http/incoming-handler` on WASIp2. Its functions are
+/// looked up under the names for that interface, and the main module may leave
 /// them out. Returns whether and where the main module provides them, or `None`
 /// if `raw_http_handler` is `None`.
+///
+/// On WASIp2, the export's `handle` takes the `incoming-request` and a
+/// `response-outparam`. The JavaScript `handle` gets only the request, and its
+/// result or failure sets the outparam (see [`call_export_on_loop`]). Fails if the
+/// world does not import `[static]response-outparam.set`, which sets it.
 ///
 /// A world without exports has no metadata, so its table is empty.
 pub fn install_exports(
@@ -360,7 +366,7 @@ pub fn install_exports(
         .map(|func| {
             let names = func.interface().map(|interface| {
                 if Some(interface) == raw_http_handler {
-                    InterfaceNames::of(HTTP_HANDLER_INTERFACE)
+                    InterfaceNames::of(platform::http::HOST_HTTP_HANDLER)
                 } else {
                     InterfaceNames::of(interface)
                 }
@@ -370,6 +376,18 @@ pub fn install_exports(
         .collect();
     let fixed: &[&str] = if cli { &["run"] } else { &[] };
     let shapes = wit_name_mapping::possible_export_names(&items, fixed)?;
+    #[cfg(target_env = "p2")]
+    let outparam_result = match raw_http_handler {
+        Some(_) => {
+            let (set, shape) = response_outparam_set().ok_or(
+                "the world imports no `[static]response-outparam.set` of `wasi:http/types`, \
+                 which a raw HTTP handler's response is set with",
+            )?;
+            RESPONSE_OUTPARAM_SET.with(|cell| cell.set(Some(set)));
+            Some(shape)
+        }
+        None => None,
+    };
     let mut raw_paths = Vec::new();
     let specs: Vec<ExportSpec> = wit
         .iter_export_funcs()
@@ -380,11 +398,19 @@ pub fn install_exports(
                 let item = wit_name_mapping::item_js_name(func.name());
                 raw_paths.extend(shapes.iter().map(|shape| shape.path(&item)));
             }
+            // On WASIp2, the raw handler's result is that of the outparam it sets.
+            #[cfg(target_env = "p2")]
+            let result = match &outparam_result {
+                Some(shape) if raw => shape.clone(),
+                _ => result_shape(func.result()),
+            };
+            #[cfg(target_env = "p3")]
+            let result = result_shape(func.result());
             ExportSpec {
                 interface: names.map(|names| names.wit_name),
                 name: func.name().to_string(),
                 shapes,
-                result: result_shape(func.result()),
+                result,
                 optional: raw,
             }
         })
@@ -400,7 +426,7 @@ pub fn install_exports(
 }
 
 /// Whether and where the main module provides the functions of the runtime's
-/// own `wasi:http/handler` export (see [`install_exports`]).
+/// own HTTP handler export (see [`install_exports`]).
 pub struct RawHttpHandlerExport {
     /// Whether the main module provides it.
     pub provided: bool,
@@ -409,9 +435,34 @@ pub struct RawHttpHandlerExport {
     pub paths: Vec<String>,
 }
 
-/// The interface whose export names are used for the runtime's own
-/// `wasi:http/handler` export (see [`install_exports`]).
-const HTTP_HANDLER_INTERFACE: &str = "wasi:http/handler";
+/// The `[static]response-outparam.set` import of the world's
+/// `wasi:http/types@0.2`, which completes a call of the raw HTTP handler export:
+/// its index, and the shape of the `result` it takes.
+#[cfg(target_env = "p2")]
+fn response_outparam_set() -> Option<(u32, ResultShape)> {
+    let world = world_desc_opt()?;
+    let set = world
+        .interfaces
+        .iter()
+        .filter(|interface| {
+            interface.wit_name.as_deref().is_some_and(|name| {
+                wit_name_mapping::same_interface(name, platform::http::HOST_HTTP_TYPES)
+            })
+        })
+        .flat_map(|interface| &interface.resources)
+        .filter(|resource| resource.name == "response-outparam")
+        .flat_map(|resource| &resource.statics)
+        .find(|(name, _)| name == "set")
+        .map(|(_, set)| set)?;
+    let Some(value::TypeShape::Result(ok, err)) = set.params.get(1) else {
+        return None;
+    };
+    let shape = ResultShape::Result {
+        ok: ok.is_some(),
+        err: err.as_deref().cloned().map(Rc::new),
+    };
+    Some((set.index, shape))
+}
 
 /// The [`ResultShape`] of a WIT result type, resolving aliases.
 fn result_shape(ty: Option<Type>) -> ResultShape {
@@ -490,6 +541,7 @@ impl Interpreter for StarlingInterpreter {
     /// The export runs without an event loop, so timers and async imports throw
     /// a `TypeError` naming the export. Microtasks queued by the export run
     /// before its result is lowered.
+    #[cfg(target_env = "p3")]
     fn export_call(_wit: Wit, func: ExportFunction, cx: &mut CallCx<'_>) {
         init::before_export();
         let index = func.index();
@@ -525,6 +577,21 @@ impl Interpreter for StarlingInterpreter {
         });
     }
 
+    /// Dispatch one exported call on a per-call event loop, and block until the
+    /// promise the JS export returns has settled and the loop's async work is
+    /// done (see [`call_export_on_loop`]).
+    #[cfg(target_env = "p2")]
+    fn export_call(_wit: Wit, func: ExportFunction, cx: &mut CallCx<'_>) {
+        init::before_export();
+        platform::task::block_on(async {
+            let invocation =
+                core_runtime::invocation::OwnedInvocation::new(init::runtime(), Default::default());
+            call_export_on_loop(func, cx, &invocation).await;
+            crate::run::drain_async_work(init::raw_cx(), &invocation).await;
+            drop(invocation);
+        });
+    }
+
     /// Call an async export: create an event loop for the call, call the export
     /// with the lifted arguments on `cx`'s stack, run the loop until the
     /// returned promise settles, and lower the result with `task-return`.
@@ -534,6 +601,7 @@ impl Interpreter for StarlingInterpreter {
     /// the timers, `fetch` calls and async imports of concurrent calls are kept
     /// apart. The returned promise is kept on the call's stack, because no
     /// [`Scope`] can be held across an `await`.
+    #[cfg(target_env = "p3")]
     #[allow(clippy::manual_async_fn)]
     fn export_call_async(
         _wit: Wit,
@@ -543,77 +611,9 @@ impl Interpreter for StarlingInterpreter {
         async move {
             init::before_export();
             let mut cx = cx;
-            let index = func.index();
-            let result = crate::exports::with_export_table(|table| table.result(index));
-
             let invocation =
                 core_runtime::invocation::OwnedInvocation::new(init::runtime(), Default::default());
-
-            // Phase 1: call the export, and keep its result on the call stack,
-            // which is traced during the awaits below.
-            //
-            // The result isn't necessarily a promise: a plain function returns a
-            // value, and an exception converted into an `err` value is returned
-            // as `Outcome::Threw`. The event loop isn't run for either.
-            let name = func.name();
-            let pending = init::with_scope(|scope| {
-                core_runtime::event_loop::with_event_loop(invocation.state().event_loop(), |_| {
-                    let outcome = dispatch_export(scope, index, name, cx.stack(), &result);
-                    core_runtime::event_loop::run_microtasks(scope);
-                    match outcome {
-                        // For a `future` result, the returned promise is
-                        // lowered as the future, without waiting for it.
-                        crate::exports::Outcome::Returned(v)
-                            if result == crate::exports::ResultShape::Future =>
-                        {
-                            cx.stack().push_value(v.get());
-                            StackTop::Future
-                        }
-                        crate::exports::Outcome::Returned(v) => {
-                            let pending = !crate::exports::promise_is_settled(scope, v);
-                            cx.stack().push_value(v.get());
-                            // The event loop only runs if the value is a
-                            // pending promise.
-                            StackTop::Returned { pending }
-                        }
-                        crate::exports::Outcome::Threw(v) => {
-                            // An exception thrown synchronously and converted
-                            // into an `err` value.
-                            cx.stack().push_value(v.get());
-                            StackTop::Threw
-                        }
-                    }
-                })
-            });
-
-            // Phase 2: run this call's event loop until the promise on top of
-            // the stack settles.
-            if matches!(pending, StackTop::Returned { pending: true }) {
-                let stack = cx.stack_ref();
-                crate::run::drive_until_settled(init::raw_cx(), &invocation, |scope| {
-                    scope.root_value(stack.last())
-                })
-                .await;
-            }
-
-            // Phase 3: convert the value on top of the stack into an `Outcome`,
-            // and push the result in the form expected by the generated lowering
-            // code.
-            init::with_scope(|scope| {
-                let top = scope.root_value(cx.stack().pop_value());
-                let outcome = match pending {
-                    StackTop::Threw => crate::exports::Outcome::Threw(top),
-                    StackTop::Future => crate::exports::Outcome::Returned(top),
-                    StackTop::Returned { .. } => settled_outcome(scope, top, &result, func),
-                };
-                push_export_result(cx.stack(), scope, &result, outcome);
-                keep_lowering_source(cx.stack(), &result, index);
-                // Dropping a borrow calls the `[resource-drop]` import, which is
-                // legal here but would trap after `task-return`.
-                if resources::release_borrows(cx.stack(), scope, &drop_exported_handle).is_err() {
-                    trap(scope, "releasing borrows at async export end failed")
-                }
-            });
+            call_export_on_loop(func, &mut cx, &invocation).await;
 
             // Lowering a stream or future result starts the pump or write that
             // fills it on this call's event loop, so the loop is active during
@@ -754,6 +754,7 @@ impl Call for CallCx<'_> {
         let flags = ty.names().len() as u32;
         self.pop(|s, sc| value::pop_flags(s, sc, flags), "pop_flags")
     }
+    #[cfg(target_env = "p3")]
     fn pop_future(&mut self, ty: Future) -> u32 {
         // Lowering a `future` passes its readable end to the host.
         let index = ty.index() as u32;
@@ -762,6 +763,7 @@ impl Call for CallCx<'_> {
             "pop_future",
         )
     }
+    #[cfg(target_env = "p3")]
     fn pop_stream(&mut self, ty: Stream) -> u32 {
         // Lowering a `stream` passes its readable end to the host.
         let index = ty.index() as u32;
@@ -769,6 +771,16 @@ impl Call for CallCx<'_> {
             |s, sc| crate::readable::stream_to_handle(sc, sc.root_value(s.pop_value()), index),
             "pop_stream",
         )
+    }
+    // `starling-componentize` refuses worlds with `future` and `stream` types for
+    // a WASIp2 runtime, so its bindings never lift or lower one.
+    #[cfg(target_env = "p2")]
+    fn pop_future(&mut self, _ty: Future) -> u32 {
+        unreachable!("a WASIp2 runtime has no `future` values")
+    }
+    #[cfg(target_env = "p2")]
+    fn pop_stream(&mut self, _ty: Stream) -> u32 {
+        unreachable!("a WASIp2 runtime has no `stream` values")
     }
     fn pop_option(&mut self, ty: WitOption) -> u32 {
         let nested = inner_is_option(ty);
@@ -919,6 +931,7 @@ impl Call for CallCx<'_> {
             self.push(|s, sc| resources::push_own(s, sc, desc, handle), "push_own")
         });
     }
+    #[cfg(target_env = "p3")]
     fn push_future(&mut self, ty: Future, handle: u32) {
         let index = ty.index() as u32;
         self.push(
@@ -929,6 +942,7 @@ impl Call for CallCx<'_> {
             "push_future",
         );
     }
+    #[cfg(target_env = "p3")]
     fn push_stream(&mut self, ty: Stream, handle: u32) {
         let index = ty.index() as u32;
         self.push(
@@ -938,6 +952,14 @@ impl Call for CallCx<'_> {
             },
             "push_stream",
         );
+    }
+    #[cfg(target_env = "p2")]
+    fn push_future(&mut self, _ty: Future, _handle: u32) {
+        unreachable!("a WASIp2 runtime has no `future` values")
+    }
+    #[cfg(target_env = "p2")]
+    fn push_stream(&mut self, _ty: Stream, _handle: u32) {
+        unreachable!("a WASIp2 runtime has no `stream` values")
     }
     fn push_variant(&mut self, ty: Variant, discr: u32) {
         let cases = variant_cases(ty);
@@ -1062,12 +1084,14 @@ impl ImportInvoker for WasmImportInvoker {
         Ok(())
     }
 
+    #[cfg(target_env = "p3")]
     fn supports_async(&self) -> bool {
         true
     }
 
     /// Call an async import on the wit-bindgen executor. The future captures
     /// only the import's index, so it doesn't borrow `self`.
+    #[cfg(target_env = "p3")]
     fn invoke_async(
         &self,
         stack: CallStack,
@@ -1603,7 +1627,7 @@ fn wit_function_name(interface: Option<&str>, name: &str) -> String {
         RAW_HTTP_HANDLER.with(|cell| cell.borrow().as_deref() == Some(interface))
     });
     let interface = if raw {
-        Some(HTTP_HANDLER_INTERFACE)
+        Some(platform::http::HOST_HTTP_HANDLER)
     } else {
         interface
     };
@@ -1612,6 +1636,7 @@ fn wit_function_name(interface: Option<&str>, name: &str) -> String {
 
 /// Return `ty` as it is written in WIT, such as `future<list<string>>`. Named
 /// types are written as their name, without their interface.
+#[cfg(target_env = "p3")]
 pub(crate) fn wit_type_name(ty: Type) -> String {
     let named = |name: Option<&str>, spelled: &dyn Fn() -> String| match name {
         Some(name) => name.to_string(),
@@ -1678,12 +1703,161 @@ pub(crate) fn wit_type_name(ty: Type) -> String {
 
 js::instance_local! {
     /// The name of the exported interface that has the runtime's own
-    /// declaration of `wasi:http/handler` (see [`install_exports`]).
+    /// declaration of its HTTP handler interface (see [`install_exports`]).
     static RAW_HTTP_HANDLER: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// The kind of value left on top of the call stack by phase 1 of an async
-/// export call.
+#[cfg(target_env = "p2")]
+js::instance_local! {
+    /// The index of the `[static]response-outparam.set` import, if the world has a raw HTTP
+    /// handler export (see [`install_exports`]).
+    static RESPONSE_OUTPARAM_SET: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Phases 1 to 3 of an exported call that runs on `invocation`'s event loop:
+/// call the JS export with the lifted arguments on `cx`'s stack, drive the
+/// loop until the promise it returns settles, and leave the result on the
+/// stack in the shape the generated lowering expects.
+///
+/// On WASIp2, a call of the raw HTTP handler's `handle` passes the JS function
+/// only the request. The settled result instead sets the `response-outparam`
+/// argument through `[static]response-outparam.set`, with the event loop active,
+/// so a `Response`'s body is a pending send of the loop.
+///
+/// No [`Scope`] can be held across an `await`, so the returned promise stays
+/// alive on the call's stack instead.
+async fn call_export_on_loop(
+    func: ExportFunction,
+    cx: &mut CallCx<'_>,
+    invocation: &core_runtime::invocation::OwnedInvocation,
+) {
+    let index = func.index();
+    let result = crate::exports::with_export_table(|table| table.result(index));
+    #[cfg(target_env = "p2")]
+    let outparam_set = raw_http_handler_call(func)
+        .then(|| RESPONSE_OUTPARAM_SET.with(std::cell::Cell::get))
+        .flatten();
+    #[cfg(target_env = "p3")]
+    let outparam_set: Option<u32> = None;
+
+    // Phase 1: call the export, and keep its result on the call stack,
+    // which is traced during the awaits below.
+    //
+    // The result isn't necessarily a promise: a plain function returns a
+    // value, and an exception converted into an `err` value is returned
+    // as `Outcome::Threw`. The event loop isn't run for either.
+    let name = func.name();
+    let pending = init::with_scope(|scope| {
+        core_runtime::event_loop::with_event_loop(invocation.state().event_loop(), |_| {
+            // The outparam stays on the stack, under the returned value.
+            let outparam = outparam_set.map(|_| scope.root_value(cx.stack().pop_value()));
+            let outcome = dispatch_export(scope, index, name, cx.stack(), &result);
+            if let Some(outparam) = outparam {
+                cx.stack().push_value(outparam.get());
+            }
+            core_runtime::event_loop::run_microtasks(scope);
+            match outcome {
+                // For a `future` result, the returned promise is
+                // lowered as the future, without waiting for it.
+                crate::exports::Outcome::Returned(v)
+                    if result == crate::exports::ResultShape::Future =>
+                {
+                    cx.stack().push_value(v.get());
+                    StackTop::Future
+                }
+                crate::exports::Outcome::Returned(v) => {
+                    let pending = !crate::exports::promise_is_settled(scope, v);
+                    cx.stack().push_value(v.get());
+                    // The event loop only runs if the value is a
+                    // pending promise.
+                    StackTop::Returned { pending }
+                }
+                crate::exports::Outcome::Threw(v) => {
+                    // An exception thrown synchronously and converted
+                    // into an `err` value.
+                    cx.stack().push_value(v.get());
+                    StackTop::Threw
+                }
+            }
+        })
+    });
+
+    // Phase 2: run this call's event loop until the promise on top of
+    // the stack settles.
+    if matches!(pending, StackTop::Returned { pending: true }) {
+        let stack = cx.stack_ref();
+        crate::run::drive_until_settled(init::raw_cx(), invocation, |scope| {
+            scope.root_value(stack.last())
+        })
+        .await;
+    }
+
+    // Phase 3: convert the value on top of the stack into an `Outcome`,
+    // and push the result in the form expected by the generated lowering
+    // code.
+    init::with_scope(|scope| {
+        let top = scope.root_value(cx.stack().pop_value());
+        let outcome = match pending {
+            StackTop::Threw => crate::exports::Outcome::Threw(top),
+            StackTop::Future => crate::exports::Outcome::Returned(top),
+            StackTop::Returned { .. } => settled_outcome(scope, top, &result, func),
+        };
+        if let Some(set) = outparam_set {
+            let outparam = scope.root_value(cx.stack().pop_value());
+            core_runtime::event_loop::with_event_loop(invocation.state().event_loop(), |_| {
+                if set_response_outparam(scope, set, outparam, outcome).is_err() {
+                    trap_with(
+                        &format!(
+                            "setting the response of `{}#handle` failed",
+                            platform::http::HOST_HTTP_HANDLER
+                        ),
+                        ExnThrown::capture(scope),
+                    )
+                }
+                core_runtime::event_loop::run_microtasks(scope);
+            });
+        } else {
+            push_export_result(cx.stack(), scope, &result, outcome);
+            keep_lowering_source(cx.stack(), &result, index);
+        }
+        // Dropping a borrow calls the `[resource-drop]` import, which is
+        // legal here but would trap after `task-return`.
+        if resources::release_borrows(cx.stack(), scope, &drop_exported_handle).is_err() {
+            trap(scope, "releasing borrows at async export end failed")
+        }
+    });
+}
+
+/// Whether `func` is the `handle` of the raw HTTP handler export.
+#[cfg(target_env = "p2")]
+fn raw_http_handler_call(func: ExportFunction) -> bool {
+    func.name() == "handle"
+        && RAW_HTTP_HANDLER.with(|cell| cell.borrow().as_deref() == func.interface())
+}
+
+/// Call the `[static]response-outparam.set` import with index `set` on
+/// `outparam`, with `{tag: "ok", val}` for a value the handler returned and
+/// `{tag: "err", val}` for an `err` payload a failure produced.
+fn set_response_outparam(
+    scope: &Scope<'_>,
+    set: u32,
+    outparam: HandleValue<'_>,
+    outcome: crate::exports::Outcome<'_>,
+) -> Result<(), ExnThrown> {
+    let (tag, val) = match outcome {
+        crate::exports::Outcome::Returned(val) => ("ok", val),
+        crate::exports::Outcome::Threw(val) => ("err", val),
+    };
+    let result = js::Object::new_plain(scope)?;
+    let tag = js::JSString::from_str(scope, tag)?;
+    result.set_property(scope, c"tag", tag)?;
+    result.set_property(scope, c"val", val)?;
+    let result = scope.root_value(result.as_value());
+    imports::call_import_from_js(scope, set, &[outparam, result]).map(drop)
+}
+
+/// The kind of value left on top of the call stack by phase 1 of
+/// [`call_export_on_loop`].
 enum StackTop {
     /// The value returned by the export. `pending` is set if it is a pending
     /// promise.

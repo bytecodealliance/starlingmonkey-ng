@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package test:cli-run;
+
+// The CLI world of `cli_run.wit` for a runtime built for WASIp2, whose `wasi:cli/run` is the
+// synchronous `0.2` version.
+world command {
+  export wasi:cli/run@0.2.5;
+}
+
+package wasi:cli@0.2.5 {
+  interface run {
+    run: func() -> result;
+  }
+}

@@ -227,6 +227,9 @@ where
 /// batch, in chunks larger than one batch, arrives whole and in order.
 #[tokio::test]
 async fn large_byte_stream() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let data: Vec<u8> = (0..210_000u32).map(|i| (i % 251) as u8).collect();
@@ -251,6 +254,9 @@ async fn large_byte_stream() -> anyhow::Result<()> {
 /// order.
 #[tokio::test]
 async fn many_elements() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -274,6 +280,9 @@ async fn many_elements() -> anyhow::Result<()> {
 /// straight back to the host.
 #[tokio::test]
 async fn pass_stream_u8() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -296,6 +305,9 @@ async fn pass_stream_u8() -> anyhow::Result<()> {
 /// its value.
 #[tokio::test]
 async fn echo_futures() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -320,6 +332,9 @@ async fn echo_futures() -> anyhow::Result<()> {
 /// per read, which forces the guest's writes into a sequence of partial writes.
 #[tokio::test]
 async fn short_reads_string() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -353,6 +368,9 @@ async fn short_reads_string() -> anyhow::Result<()> {
 /// A `stream<point>` round-trips its records through the guest.
 #[tokio::test]
 async fn echo_stream_point() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     use exports::test::streams::echoes::Point;
 
     let mut store = store();
@@ -380,6 +398,9 @@ async fn echo_stream_point() -> anyhow::Result<()> {
 /// and each echoed handle still reaches the same `thing`.
 #[tokio::test]
 async fn echo_stream_thing() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     use wasmtime::component::ResourceAny;
 
     let mut store = store();
@@ -425,6 +446,9 @@ async fn echo_stream_thing() -> anyhow::Result<()> {
 /// own buffers, here smaller than the chunks the host delivers.
 #[tokio::test]
 async fn byob_read() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -447,6 +471,9 @@ async fn byob_read() -> anyhow::Result<()> {
 /// generator waits on between chunks.
 #[tokio::test]
 async fn async_generator_chunks_across_timers() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -468,6 +495,9 @@ async fn async_generator_chunks_across_timers() -> anyhow::Result<()> {
 /// what the guest left unread.
 #[tokio::test]
 async fn partly_read_stream_returns_the_rest() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -490,6 +520,9 @@ async fn partly_read_stream_returns_the_rest() -> anyhow::Result<()> {
 /// producer being dropped, even though the producer never ends by itself.
 #[tokio::test]
 async fn cancel_after_first_chunk() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -515,6 +548,9 @@ async fn cancel_after_first_chunk() -> anyhow::Result<()> {
 /// the instance then streams again.
 #[tokio::test]
 async fn host_stops_reading() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let cancelled = store
@@ -555,6 +591,9 @@ async fn host_stops_reading() -> anyhow::Result<()> {
 /// and the runtime reports why on stderr.
 #[tokio::test]
 async fn wrong_chunks_end_the_stream() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -581,6 +620,9 @@ async fn wrong_chunks_end_the_stream() -> anyhow::Result<()> {
 /// `stream<u8>` traps.
 #[tokio::test]
 async fn not_a_stream_traps() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let outcome = store
@@ -606,6 +648,9 @@ async fn not_a_stream_traps() -> anyhow::Result<()> {
 /// `err`, since a `string` can hold it.
 #[tokio::test]
 async fn future_result() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -636,6 +681,9 @@ async fn future_result() -> anyhow::Result<()> {
 /// rejects with a `ComponentError` holding its `err` payload.
 #[tokio::test]
 async fn future_result_settles_with_ok_or_component_error() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -662,6 +710,9 @@ async fn future_result_settles_with_ok_or_component_error() -> anyhow::Result<()
 /// names the type through `use`, so the class is the one `failing` exports.
 #[tokio::test]
 async fn future_result_rejects_with_the_named_error_class() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let described = store
@@ -686,6 +737,9 @@ async fn future_result_rejects_with_the_named_error_class() -> anyhow::Result<()
 /// read.
 #[tokio::test]
 async fn stream_of_host_resources_round_trips() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let strings = ["a", "b", "c", "d", "e"];
@@ -736,6 +790,9 @@ async fn stream_of_host_resources_round_trips() -> anyhow::Result<()> {
 /// extends `ComponentError`.
 #[tokio::test]
 async fn import_errors_are_error_class_instances() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -764,6 +821,9 @@ async fn import_errors_are_error_class_instances() -> anyhow::Result<()> {
 /// that case.
 #[tokio::test]
 async fn error_classes_lower_to_err() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -792,6 +852,9 @@ async fn error_classes_lower_to_err() -> anyhow::Result<()> {
 /// stream and the future imported functions return.
 #[tokio::test]
 async fn import_streams_and_futures() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let described = store
@@ -810,6 +873,9 @@ async fn import_streams_and_futures() -> anyhow::Result<()> {
 /// before it, and the runtime reports the failing field and the reason on stderr.
 #[tokio::test]
 async fn wrong_element_ends_the_stream() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let points = store
@@ -837,6 +903,9 @@ async fn wrong_element_ends_the_stream() -> anyhow::Result<()> {
 /// something else on a later read does not change what is sent.
 #[tokio::test]
 async fn chunk_is_read_once() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let points = store
@@ -865,6 +934,9 @@ async fn chunk_is_read_once() -> anyhow::Result<()> {
 /// timeout interrupts, so the calls run on a thread of their own.
 #[test]
 fn dropped_readers_leave_the_instance_intact() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("creating a runtime");
@@ -916,6 +988,9 @@ async fn drop_readers_and_ping() -> anyhow::Result<()> {
 /// A `stream<u8>` takes `ArrayBuffer` chunks as well as views.
 #[tokio::test]
 async fn array_buffer_chunks() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -936,6 +1011,9 @@ async fn array_buffer_chunks() -> anyhow::Result<()> {
 /// Empty chunks a guest's `stream<u8>` source yields are skipped.
 #[tokio::test]
 async fn empty_chunks_are_skipped() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -957,6 +1035,9 @@ async fn empty_chunks_are_skipped() -> anyhow::Result<()> {
 /// since nothing else can read it.
 #[tokio::test]
 async fn locked_stream_traps() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let outcome = store
@@ -981,6 +1062,9 @@ async fn locked_stream_traps() -> anyhow::Result<()> {
 /// future's value.
 #[tokio::test]
 async fn plain_value_as_future() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let result = store
@@ -999,6 +1083,9 @@ async fn plain_value_as_future() -> anyhow::Result<()> {
 /// call with a `TypeError`, and an iterable object is read as the stream.
 #[tokio::test]
 async fn stream_argument_misuse_rejects() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let messages = store
@@ -1030,6 +1117,9 @@ async fn stream_argument_misuse_rejects() -> anyhow::Result<()> {
 /// export.
 #[tokio::test]
 async fn stream_read_in_a_sync_export_rejects() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let echoes = instance.test_streams_echoes();
@@ -1054,6 +1144,9 @@ async fn stream_read_in_a_sync_export_rejects() -> anyhow::Result<()> {
 /// future has no way to deliver the rejection.
 #[tokio::test]
 async fn rejected_future_traps() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let outcome = store
@@ -1081,6 +1174,9 @@ async fn rejected_future_traps() -> anyhow::Result<()> {
 /// traps the instance, because the `Error` can't be converted into a `u32` `err` value.
 #[tokio::test]
 async fn rejected_result_future_traps() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let outcome = store
@@ -1108,6 +1204,9 @@ async fn rejected_result_future_traps() -> anyhow::Result<()> {
 /// leaves the instance usable: the guest's write fails quietly.
 #[tokio::test]
 async fn host_drops_future_reader() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -1127,6 +1226,9 @@ async fn host_drops_future_reader() -> anyhow::Result<()> {
 /// object the guest created.
 #[tokio::test]
 async fn future_of_a_resource() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     use wasmtime::component::ResourceAny;
 
     let mut store = store();
@@ -1154,6 +1256,9 @@ async fn future_of_a_resource() -> anyhow::Result<()> {
 /// read and drops the host's producer.
 #[tokio::test]
 async fn cancel_with_a_read_in_flight() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -1187,6 +1292,9 @@ async fn cancel_with_a_read_in_flight() -> anyhow::Result<()> {
 /// readable end. A pump writes its bytes instead.
 #[tokio::test]
 async fn pass_stream_as_another_type() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -1210,6 +1318,9 @@ async fn pass_stream_as_another_type() -> anyhow::Result<()> {
 /// source is cancelled.
 #[tokio::test]
 async fn idle_source_is_cancelled() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let cancelled = store
@@ -1239,6 +1350,9 @@ async fn idle_source_is_cancelled() -> anyhow::Result<()> {
 /// finishes.
 #[tokio::test]
 async fn never_settling_future_lets_the_call_finish() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let echoes = instance.test_streams_echoes();
@@ -1280,6 +1394,9 @@ async fn never_settling_future_lets_the_call_finish() -> anyhow::Result<()> {
 /// cleared.
 #[tokio::test]
 async fn collected_unsettled_future_is_reported() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let echoes = instance.test_streams_echoes();
@@ -1307,6 +1424,9 @@ async fn collected_unsettled_future_is_reported() -> anyhow::Result<()> {
 /// of right after that is still delivered.
 #[tokio::test]
 async fn future_value_is_lowered_when_the_promise_settles() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let value =
@@ -1391,6 +1511,9 @@ async fn settle_held_future(sync_settle: bool, read_first: bool) -> anyhow::Resu
 /// the next async call, whether the host reads the future before or after that.
 #[tokio::test]
 async fn future_settled_by_a_sync_export_is_written() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(settle_held_future(true, false).await?, Some(7));
     assert_eq!(settle_held_future(true, true).await?, Some(7));
     Ok(())
@@ -1400,6 +1523,9 @@ async fn future_settled_by_a_sync_export_is_written() -> anyhow::Result<()> {
 /// whether the host reads the future before or after that.
 #[tokio::test]
 async fn future_settled_by_an_async_export_is_written() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     assert_eq!(settle_held_future(false, false).await?, Some(7));
     assert_eq!(settle_held_future(false, true).await?, Some(7));
     Ok(())
@@ -1409,6 +1535,9 @@ async fn future_settled_by_an_async_export_is_written() -> anyhow::Result<()> {
 /// delivers later, both finish: each call's event loop reads its own future.
 #[tokio::test]
 async fn concurrent_calls_with_future_arguments_finish() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let delayed = |store: &Accessor<Ctx>, ms: u64| -> anyhow::Result<_> {
@@ -1441,6 +1570,9 @@ async fn concurrent_calls_with_future_arguments_finish() -> anyhow::Result<()> {
 /// returned. The stream is longer than the pump's 64-element batch.
 #[tokio::test]
 async fn payloadless_echo() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -1472,6 +1604,9 @@ async fn payloadless_echo() -> anyhow::Result<()> {
 /// fulfilled with `undefined`.
 #[tokio::test]
 async fn payloadless_consumed() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -1496,6 +1631,9 @@ async fn payloadless_consumed() -> anyhow::Result<()> {
 /// `future` without one.
 #[tokio::test]
 async fn payloadless_produced() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     store
@@ -1534,6 +1672,9 @@ async fn payloadless_produced() -> anyhow::Result<()> {
 /// and a host-written future, and reads the stream and future the host returns.
 #[tokio::test]
 async fn payloadless_imports() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let described = store
@@ -1552,6 +1693,9 @@ async fn payloadless_imports() -> anyhow::Result<()> {
 /// the chunks before it, and the runtime reports why on stderr.
 #[tokio::test]
 async fn wrong_tick_ends_the_stream() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let ticks = store
@@ -1578,6 +1722,9 @@ async fn wrong_tick_ends_the_stream() -> anyhow::Result<()> {
 /// value other than `undefined` traps the instance.
 #[tokio::test]
 async fn valued_payloadless_future_traps() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let outcome = store
@@ -1608,6 +1755,9 @@ async fn valued_payloadless_future_traps() -> anyhow::Result<()> {
 /// the instance.
 #[tokio::test]
 async fn rejected_payloadless_future_traps() -> anyhow::Result<()> {
+    if shared::needs_wasip3() {
+        return Ok(());
+    }
     let (mut store, stderr) = store_capturing_stderr();
     let instance = pre().await.instantiate_async(&mut store).await?;
     let outcome = store
@@ -1629,4 +1779,25 @@ async fn rejected_payloadless_future_traps() -> anyhow::Result<()> {
         "stderr must name the rejection; got: {stderr}"
     );
     Ok(())
+}
+
+/// A runtime built for WASIp2 refuses a world with a `stream`, even in a synchronous function.
+#[tokio::test]
+async fn streams_need_a_wasip3_runtime() {
+    if shared::wasi_version() != componentize::WasiVersion::P2 {
+        return;
+    }
+    let error = shared::try_componentize(
+        "package test:sync-stream;\n\
+         world sync-stream {\n  import produce: func() -> stream<u8>;\n}\n",
+        "sync-stream",
+        "export {};",
+    )
+    .await
+    .expect_err("a `stream` needs a WASIp3 runtime");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("`produce` takes or returns a `stream` or `future`, which need a runtime"),
+        "{message}"
+    );
 }
