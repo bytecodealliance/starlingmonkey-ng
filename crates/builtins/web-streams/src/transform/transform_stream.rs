@@ -185,7 +185,7 @@ impl TransformStream {
     }
 }
 
-/// Helpers for the encoding crate — not part of the WebIDL interface.
+/// Helpers for native consumers of TransformStreams.
 impl TransformStream<'_> {
     /// <https://streams.spec.whatwg.org/#transformstream-set-up>
     ///

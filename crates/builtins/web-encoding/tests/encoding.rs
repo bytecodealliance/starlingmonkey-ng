@@ -4,11 +4,8 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use core_runtime::config::RuntimeConfig;
-use core_runtime::event_loop::run_microtasks;
-use core_runtime::runtime::{clear_global_initializers, register_global_initializer, Runtime};
-use core_runtime::test_util::eval_with_setup;
-use js::conversion::FromJSVal;
+use core_runtime::runtime::{clear_global_initializers, register_global_initializer};
+use core_runtime::test_util::{eval_out_with_setup, eval_with_setup};
 
 fn setup() {
     clear_global_initializers();
@@ -19,17 +16,6 @@ fn setup() {
 
 fn eval(code: &str) -> String {
     eval_with_setup(setup, code)
-}
-
-fn run_async(code: &str) -> String {
-    setup();
-    let runtime = Runtime::init(&RuntimeConfig::default()).expect("initialize test runtime");
-    let scope = runtime.default_global();
-    js::compile::evaluate_with_filename(&scope, code, "test.js", 1).unwrap();
-    run_microtasks(&scope);
-    let output =
-        js::compile::evaluate_with_filename(&scope, "globalThis.__out", "out.js", 1).unwrap();
-    String::from_jsval(&scope, output, ()).unwrap()
 }
 
 #[test]
@@ -113,7 +99,8 @@ fn text_decoder_latin1_fast_paths_gc_safe() {
 
 #[test]
 fn text_decoder_stream_windows_1252_gc_safe() {
-    let output = run_async(
+    let output = eval_out_with_setup(
+        setup,
         r#"
         globalThis.__out = "pending";
         const inputs = [];

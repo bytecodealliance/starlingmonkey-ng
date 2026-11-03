@@ -83,14 +83,18 @@ impl TextDecoderStream {
         // Step 4: Set up a text decoder stream with this, encoding, errorMode, and
         // options["ignoreBOM"].
         // Step 4.1: Assert: encoding is not replacement.
-        // Step 4.2: Set stream's encoding to encoding.
-        self.data_mut().encoding = Some(encoding);
-        // Step 4.3: Set stream's error mode to errorMode.
-        self.data_mut().fatal = fatal;
-        // Step 4.4: Set stream's ignore BOM to ignoreBOM.
-        self.data_mut().ignore_bom = ignore_bom;
-        // Step 4.5: Set stream’s decoder to a new instance of encoding’s decoder.
-        self.data_mut().decoder = Some(new_decoder(encoding, ignore_bom));
+        // Release the mutable borrow before JS allocations below can trigger GC and trace self.
+        {
+            let mut data = self.data_mut();
+            // Step 4.2: Set stream's encoding to encoding.
+            data.encoding = Some(encoding);
+            // Step 4.3: Set stream's error mode to errorMode.
+            data.fatal = fatal;
+            // Step 4.4: Set stream's ignore BOM to ignoreBOM.
+            data.ignore_bom = ignore_bom;
+            // Step 4.5: Set stream’s decoder to a new instance of encoding’s decoder.
+            data.decoder = Some(new_decoder(encoding, ignore_bom));
+        }
         // Step 4.6: Set stream's I/O queue to a new I/O queue.
         // Implementation note: this is not stored separately because `encoding_rs::Decoder`
         // buffers incomplete sequences internally; see the comment on the struct definition.

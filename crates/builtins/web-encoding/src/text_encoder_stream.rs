@@ -9,6 +9,7 @@ use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::{CallbackArgs, HandleValue};
+use js::string::StrChars;
 use js::{value, JSString, Uint8Array};
 
 use web_streams::readable::ReadableStream;
@@ -78,9 +79,8 @@ fn encoder_transform_cb(
     payload: HandleValue<'_>,
 ) -> Result<Value, ExnThrown> {
     let stream = cast_payload::<TextEncoderStream>(scope, payload);
-
     // Step 1: Let input be the result of converting chunk to a DOMString.
-    let js_string = JSString::from_value(scope, args.get(0))?;
+    let input = JSString::from_value(scope, args.get(0))?;
     // Step 2: Convert input to an I/O queue of code units.
     // Step 3: Let output be the I/O queue of bytes « end-of-queue ».
     // Step 4: While true:
@@ -96,57 +96,84 @@ fn encoder_transform_cb(
     // algorithm with encoder, item, and input.
     // Step 4.4: If result is not continue, then process an item with result, encoder’s encoder,
     // input, output, and "fatal".
-    // Implementation note: a surrogate pair can only be split at the chunk's edges, so only the
-    // first and last code units need the [[pending high surrogate]] handling. Everything between
-    // is encoded in bulk by `to_utf8`, which replaces lone surrogates with U+FFFD exactly as
-    // steps 4.3 and 4.4 do.
-    let mut start = 0;
-    let mut end = js_string.len();
-    if end == 0 {
+    //
+    // (`encoding_rs` runs this loop over the whole chunk, and replaces unpaired surrogates with
+    // U+FFFD. It doesn't keep a high surrogate between calls, so we encode the pending one
+    // together with the chunk's first code unit, and hold back a high surrogate that ends the
+    // chunk.)
+    if input.is_empty() {
         return Ok(value::undefined());
     }
-    let mut output = Vec::new();
     let pending = stream.data_mut().leading_surrogate.take();
-    if let Some(leading) = pending {
-        let first = js_string.char_at(scope, 0)?;
-        if is_trailing_surrogate(first) {
-            let c = 0x10000 + ((u32::from(leading) - 0xD800) << 10) + (u32::from(first) - 0xDC00);
-            push_scalar_value(&mut output, c);
-            start = 1;
-        } else {
-            push_scalar_value(&mut output, 0xFFFD);
-        }
-    }
-    if start < end {
-        let last = js_string.char_at(scope, end - 1)?;
-        if is_leading_surrogate(last) {
-            stream.data_mut().leading_surrogate = Some(last);
-            end -= 1;
-        }
-    }
-    if start < end {
-        let middle = if start == 0 && end == js_string.len() {
-            js_string
-        } else {
-            js_string.substring(scope, start, end - start)?
-        };
-        let utf8 = middle.to_utf8(scope)?.into_bytes();
-        if output.is_empty() {
-            output = utf8;
-        } else {
-            output
-                .try_reserve(utf8.len())
-                .map_err(|_| OutOfMemory.throw(scope))?;
-            output.extend_from_slice(&utf8);
-        }
-    }
-
+    // SAFETY: the closure doesn't call into SpiderMonkey.
+    let (output, pending) = unsafe {
+        input.with_chars(scope, |chars| match chars {
+            StrChars::Latin1(chars) => (encode_latin1(pending, chars), None),
+            StrChars::TwoByte(chars) => encode_utf16(pending, chars),
+        })
+    }?;
+    stream.data_mut().leading_surrogate = pending;
+    let output = output.ok_or_else(|| OutOfMemory.throw(scope))?;
     if !output.is_empty() {
-        let u8array = Uint8Array::with_data(scope, &output)?;
-        enqueue_to_transform(scope, &stream, u8array)?;
+        let chunk = Uint8Array::with_data(scope, &output)?;
+        enqueue_to_transform(scope, &stream, chunk)?;
     }
-
     Ok(value::undefined())
+}
+/// Returns the UTF-8 encoding of `chars`, preceded by U+FFFD if `pending` is set, or `None` if
+/// allocating it fails. Latin-1 characters aren't surrogates, so `pending` is always unpaired.
+fn encode_latin1(pending: Option<u16>, chars: &[u8]) -> Option<Vec<u8>> {
+    let head = pending.as_slice();
+    let mut output = zeroed_buffer(head.len() * 3 + chars.len() * 2)?;
+    let mut written = encoding_rs::mem::convert_utf16_to_utf8(head, &mut output);
+    written += encoding_rs::mem::convert_latin1_to_utf8(chars, &mut output[written..]);
+    output.truncate(written);
+    Some(output)
+}
+/// Returns the UTF-8 encoding of `chars` preceded by the high surrogate `pending`, or `None` if
+/// allocating it fails. A high surrogate at the end of `chars` isn't encoded. It is returned as
+/// the new pending high surrogate.
+fn encode_utf16(pending: Option<u16>, chars: &[u16]) -> (Option<Vec<u8>>, Option<u16>) {
+    let mut head = [0; 2];
+    let mut head_len = 0;
+    let mut rest = chars;
+    if let Some(high) = pending {
+        head[0] = high;
+        head_len = 1;
+        if let Some((&first, tail)) = rest.split_first() {
+            if is_trailing_surrogate(first) {
+                head[1] = first;
+                head_len = 2;
+                rest = tail;
+            }
+        }
+    }
+    let mut new_pending = None;
+    if let Some((&last, init)) = rest.split_last() {
+        if is_leading_surrogate(last) {
+            new_pending = Some(last);
+            rest = init;
+        }
+    }
+    let Some(mut output) = zeroed_buffer((head_len + rest.len()) * 3) else {
+        return (None, new_pending);
+    };
+    let mut written = encoding_rs::mem::convert_utf16_to_utf8(&head[..head_len], &mut output);
+    written += encoding_rs::mem::convert_utf16_to_utf8(rest, &mut output[written..]);
+    output.truncate(written);
+    (Some(output), new_pending)
+}
+/// Returns `len` zero bytes, or `None` if allocating them fails.
+fn zeroed_buffer(len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(len).ok()?;
+    // SAFETY: `layout` has a non-zero size.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    // SAFETY: `ptr` was allocated by the global allocator with `layout`, and its `len` bytes are
+    // initialized to zero.
+    (!ptr.is_null()).then(|| unsafe { Vec::from_raw_parts(ptr, len, len) })
 }
 
 fn is_leading_surrogate(unit: u16) -> bool {
@@ -155,12 +182,6 @@ fn is_leading_surrogate(unit: u16) -> bool {
 
 fn is_trailing_surrogate(unit: u16) -> bool {
     (0xDC00..=0xDFFF).contains(&unit)
-}
-
-/// Append the UTF-8 encoding of the scalar value `sv` to `output`.
-fn push_scalar_value(output: &mut Vec<u8>, sv: u32) {
-    let c = char::from_u32(sv).expect("a scalar value");
-    output.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
 }
 
 /// The <https://encoding.spec.whatwg.org/#encode-and-flush> algorithm.
