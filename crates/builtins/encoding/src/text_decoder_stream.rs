@@ -8,7 +8,7 @@
 
 use core_runtime::{webidl_interface, webidl_methods};
 use js::conversion::FromJSVal;
-use js::error::ExnThrown;
+use js::error::{ExnThrown, ThrowException};
 use js::function::cast_payload;
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
@@ -20,8 +20,9 @@ use web_streams::readable::ReadableStream;
 use web_streams::writable::WritableStream;
 use web_streams::{AlgorithmArg, TransformStream, TransformStreamImpl};
 
-use crate::decoder_common::{new_decoder, TextDecoderOptions};
-use crate::text_decoder::{decode_bytes_to_js_string, ArrayBufferViewOrArrayBuffer};
+use crate::decoder_common::{
+    decode_bytes, get_encoding, new_decoder, ArrayBufferViewOrArrayBuffer, TextDecoderOptions,
+};
 
 /// <https://encoding.spec.whatwg.org/#textdecoderstream>
 #[webidl_interface]
@@ -72,11 +73,7 @@ impl TextDecoderStream {
     ) -> Result<(), ExnThrown> {
         // Step 1: Let encoding be the result of getting an encoding from label.
         // Step 2: If encoding is failure or replacement, then throw a RangeError.
-        let label = label.as_deref().unwrap_or("utf-8");
-        let encoding = encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
-            .ok_or_else(|| {
-                js::error::throw_range_error(scope, c"The encoding label provided is invalid.")
-            })?;
+        let encoding = get_encoding(label.as_deref()).map_err(|error| error.throw(scope))?;
 
         // Step 3: Let errorMode be "fatal" if options["fatal"] is true; otherwise "replacement".
         let options = options.unwrap_or_default();
@@ -172,22 +169,17 @@ fn decoder_transform_cb(
         // Step 4.3: Let result be the result of processing an item with item, decoder’s decoder,
         // decoder’s I/O queue, output, and decoder’s error mode.
         // Step 4.4: If result is error, then throw a TypeError.
-        // Implementation note: the Encoding Standard permits avoiding the copy when input cannot
-        // affect future decode calls. The slice is consumed synchronously here and
-        // `encoding_rs::Decoder` retains only its own state. `decode_bytes_to_js_string` performs
-        // steps 3-4 with `last = false`, preserving decoder state for the next chunk.
-        // SAFETY: `buffer_source` is rooted, and the helper consumes the slice or copies it into
-        // Rust-owned output before any JS allocation can GC and move the input buffer.
-        let bytes = match buffer_source {
-            ArrayBufferViewOrArrayBuffer::View(view) => unsafe { view.bytes() },
-            ArrayBufferViewOrArrayBuffer::Buffer(buffer) => unsafe { buffer.bytes() },
-        };
         let mut data = stream.data_mut();
         let encoding = data.encoding.expect("encoding must be initialized");
         let fatal = data.fatal;
         let decoder = data.decoder.as_mut().expect("decoder must be initialized");
-        decode_bytes_to_js_string(scope, encoding, decoder, fatal, bytes, false, false)?
-    };
+        let decode = |bytes: &[u8]| decode_bytes(encoding, decoder, fatal, bytes, false, false);
+        match buffer_source {
+            ArrayBufferViewOrArrayBuffer::View(view) => view.with_bytes(decode),
+            ArrayBufferViewOrArrayBuffer::Buffer(buffer) => buffer.with_bytes(decode),
+        }
+    }
+    .into_js_string(scope)?;
 
     if !output.is_empty() {
         enqueue_to_transform(scope, &stream, output)?;
@@ -224,8 +216,9 @@ fn decoder_flush_cb(
         let encoding = data.encoding.expect("encoding must be initialized");
         let fatal = data.fatal;
         let decoder = data.decoder.as_mut().expect("decoder must be initialized");
-        decode_bytes_to_js_string(scope, encoding, decoder, fatal, &[], true, false)?
-    };
+        decode_bytes(encoding, decoder, fatal, &[], true, false)
+    }
+    .into_js_string(scope)?;
 
     if !output.is_empty() {
         enqueue_to_transform(scope, &stream, output)?;

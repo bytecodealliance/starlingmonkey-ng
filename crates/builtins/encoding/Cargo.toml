@@ -1,10 +1,13 @@
 [package]
-name = "encoding"
+name = "web-encoding"
 version.workspace = true
 repository.workspace = true
 license.workspace = true
 authors.workspace = true
 edition.workspace = true
+
+[features]
+debugmozjs = ["js/debugmozjs"]
 
 [dependencies]
 core-runtime.workspace = true
@@ -13,10 +16,7 @@ js.workspace = true
 web-streams.workspace = true
 
 [dev-dependencies]
-js.workspace = true
-libstarling.workspace = true
 web-globals.workspace = true
-web-streams.workspace = true
 
 [lints]
 workspace = true

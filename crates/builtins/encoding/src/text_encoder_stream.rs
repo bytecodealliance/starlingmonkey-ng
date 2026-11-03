@@ -3,7 +3,7 @@
 //! <https://encoding.spec.whatwg.org/#textencoderstream>
 
 use core_runtime::{webidl_interface, webidl_methods};
-use js::error::ExnThrown;
+use js::error::{ExnThrown, OutOfMemory, ThrowException};
 use js::function::cast_payload;
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
@@ -134,6 +134,9 @@ fn encoder_transform_cb(
         if output.is_empty() {
             output = utf8;
         } else {
+            output
+                .try_reserve(utf8.len())
+                .map_err(|_| OutOfMemory.throw(scope))?;
             output.extend_from_slice(&utf8);
         }
     }
