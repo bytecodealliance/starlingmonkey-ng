@@ -123,51 +123,51 @@
     "status": "PASS"
   },
   "TextDecoderStream interface: existence and properties of interface object": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextDecoderStream interface object length": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextDecoderStream interface object name": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextDecoderStream interface: existence and properties of interface prototype object": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextDecoderStream interface: existence and properties of interface prototype object's \"constructor\" property": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextDecoderStream interface: existence and properties of interface prototype object's @@unscopables property": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextDecoderStream interface: attribute encoding": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextDecoderStream interface: attribute fatal": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextDecoderStream interface: attribute ignoreBOM": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextEncoderStream interface: existence and properties of interface object": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextEncoderStream interface object length": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextEncoderStream interface object name": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextEncoderStream interface: existence and properties of interface prototype object": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextEncoderStream interface: existence and properties of interface prototype object's \"constructor\" property": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextEncoderStream interface: existence and properties of interface prototype object's @@unscopables property": {
-    "status": "FAIL"
+    "status": "PASS"
   },
   "TextEncoderStream interface: attribute encoding": {
-    "status": "FAIL"
+    "status": "PASS"
   }
 }

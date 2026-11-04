@@ -89,7 +89,7 @@ done
 if [[ "$PACKAGE_SELECTED" == false ]]; then
     CARGO_ARGS=(
         -p js -p core-runtime -p wit-bridge
-        -p cpp-builtins -p fetch-event -p web-fetch -p web-globals -p web-streams -p web-url
+        -p cpp-builtins -p fetch-event -p web-encoding -p web-fetch -p web-globals -p web-streams -p web-url
         ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
     )
 fi

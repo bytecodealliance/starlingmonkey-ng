@@ -1524,6 +1524,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "web-encoding",
  "web-fetch",
  "web-globals",
  "web-streams",
@@ -3079,6 +3080,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-encoding"
+version = "0.3.0"
+dependencies = [
+ "core-runtime",
+ "encoding_rs",
+ "js",
+ "web-globals",
+ "web-streams",
+]
+
+[[package]]
 name = "web-fetch"
 version = "0.3.0"
 dependencies = [
@@ -3103,7 +3115,6 @@ dependencies = [
  "bitflags",
  "core-runtime",
  "data-url",
- "encoding_rs",
  "js",
  "libstarling",
  "platform",

@@ -1,0 +1,22 @@
+[package]
+name = "web-encoding"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[features]
+debugmozjs = ["js/debugmozjs"]
+
+[dependencies]
+core-runtime.workspace = true
+encoding_rs.workspace = true
+js.workspace = true
+web-streams.workspace = true
+
+[dev-dependencies]
+web-globals.workspace = true
+
+[lints]
+workspace = true

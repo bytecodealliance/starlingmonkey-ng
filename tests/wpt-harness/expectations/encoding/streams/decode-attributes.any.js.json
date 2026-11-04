@@ -1,0 +1,86 @@
+{
+  "encoding attribute should have correct value for 'unicode-1-1-utf-8'": {
+    "status": "PASS"
+  },
+  "encoding attribute should have correct value for 'iso-8859-2'": {
+    "status": "PASS"
+  },
+  "encoding attribute should have correct value for 'ascii'": {
+    "status": "PASS"
+  },
+  "encoding attribute should have correct value for 'utf-16'": {
+    "status": "PASS"
+  },
+  "setting fatal to 'false' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to 'false' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting fatal to '0' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to '0' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting fatal to '' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to '' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting fatal to 'undefined' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to 'undefined' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting fatal to 'null' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to 'null' should set the attribute to false": {
+    "status": "PASS"
+  },
+  "setting fatal to 'true' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to 'true' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting fatal to '1' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to '1' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting fatal to '[object Object]' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to '[object Object]' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting fatal to '' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to '' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting fatal to 'yes' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "setting ignoreBOM to 'yes' should set the attribute to true": {
+    "status": "PASS"
+  },
+  "constructing with an invalid encoding should throw": {
+    "status": "PASS"
+  },
+  "constructing with a non-stringifiable encoding should throw": {
+    "status": "PASS"
+  },
+  "a throwing fatal member should cause the constructor to throw": {
+    "status": "PASS"
+  },
+  "a throwing ignoreBOM member should cause the constructor to throw": {
+    "status": "PASS"
+  }
+}
