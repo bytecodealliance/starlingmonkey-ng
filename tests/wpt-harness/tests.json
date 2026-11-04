@@ -107,6 +107,8 @@
   "url/url-statics-parse.any.js",
   "url/url-tojson.any.js",
   "url/urlencoded-parser.any.js",
+  "NET urlpattern/urlpattern.any.js",
+  "urlpattern/urlpattern-hasregexpgroups.any.js",
   "url/urlsearchparams-append.any.js",
   "url/urlsearchparams-constructor.any.js",
   "url/urlsearchparams-delete.any.js",
