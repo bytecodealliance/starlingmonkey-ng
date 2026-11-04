@@ -1,0 +1,21 @@
+[package]
+name = "web-url-pattern"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+# No unit tests. This skips building the (SpiderMonkey-sized) lib test harness binary.
+test = false
+
+[dependencies]
+core-runtime.workspace = true
+indexmap.workspace = true
+js.workspace = true
+url.workspace = true
+urlpattern.workspace = true
+
+[lints]
+workspace = true
