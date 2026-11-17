@@ -232,6 +232,68 @@ mod throw_exception {
     }
 }
 
+/// `QuotaExceededError`'s constructor validation. WPT's `webidl/idlharness.any.js` covers its
+/// shape, but not the `RangeError`s or the values the constructor stores.
+mod quota_exceeded_error {
+    use core_runtime::{runtime, test_util::eval_with_setup};
+
+    fn eval(code: &str) -> String {
+        eval_with_setup(
+            || {
+                runtime::clear_global_initializers();
+                runtime::register_global_initializer(web_globals::add_to_global);
+            },
+            code,
+        )
+    }
+
+    #[test]
+    fn construct_and_inherit() {
+        assert_eq!(
+            eval(
+                r#"
+                const e = new QuotaExceededError("msg", { quota: 1, requested: 2 });
+                const d = new QuotaExceededError();
+                [e instanceof DOMException, e instanceof Error, e.name, e.message, e.code,
+                 e.quota, e.requested, d.message === "", d.quota, d.requested,
+                 Object.prototype.toString.call(e)].join()
+                "#
+            ),
+            "true,true,QuotaExceededError,msg,22,1,2,true,,,[object QuotaExceededError]"
+        );
+    }
+
+    #[test]
+    fn constructor_validates_range() {
+        assert_eq!(
+            eval(
+                r#"
+                const bad = [{ quota: -1 }, { requested: -1 }, { quota: 5, requested: 4 }];
+                bad.map(o => { try { new QuotaExceededError("", o); return "no"; }
+                               catch (e) { return e.constructor.name; } }).join()
+                "#
+            ),
+            "RangeError,RangeError,RangeError"
+        );
+    }
+
+    /// `quota` and `requested` are restricted `double`s: non-finite values fail dictionary
+    /// conversion with a `TypeError` before the constructor steps run.
+    #[test]
+    fn constructor_rejects_non_finite() {
+        assert_eq!(
+            eval(
+                r#"
+                const bad = [{ quota: NaN }, { requested: Infinity }, { quota: -Infinity }];
+                bad.map(o => { try { new QuotaExceededError("", o); return "no"; }
+                               catch (e) { return e.constructor.name; } }).join()
+                "#
+            ),
+            "TypeError,TypeError,TypeError"
+        );
+    }
+}
+
 mod performance {
     use core_runtime::{runtime, test_util::eval_with_setup};
 
