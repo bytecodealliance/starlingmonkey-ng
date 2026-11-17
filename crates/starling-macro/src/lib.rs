@@ -295,6 +295,13 @@ fn process_class_def(attr: TokenStream, item: TokenStream, config: ClassConfig) 
             // [[Prototype]] chains to the parent interface object.
             const INHERITS_INTERFACE: bool = true;
 
+            // The parent's methods read the parent's reserved slots on instances
+            // of this class.
+            const RESERVED_SLOTS: u32 =
+                <#inner_parent_name as ::js::class::ClassDef>::RESERVED_SLOTS;
+            const HAS_ERROR_DATA: bool =
+                <#inner_parent_name as ::js::class::ClassDef>::HAS_ERROR_DATA;
+
             // Returns a raw prototype pointer that the caller passes straight
             // to SpiderMonkey; it is never held across an allocation.
             #[cfg_attr(crown, allow(crown::unrooted_must_root))]
