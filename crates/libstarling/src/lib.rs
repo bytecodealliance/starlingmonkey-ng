@@ -26,6 +26,7 @@ pub fn register_builtins() {
     runtime::register_global_initializer(web_globals::add_to_global);
     runtime::register_global_initializer(web_streams::add_to_global);
     runtime::register_global_initializer(web_encoding::add_to_global);
+    runtime::register_global_initializer(web_crypto::add_to_global);
     runtime::register_global_initializer(web_url::add_to_global);
     runtime::register_global_initializer(web_fetch::add_to_global);
     runtime::register_global_initializer(fetch_event::add_to_global);
