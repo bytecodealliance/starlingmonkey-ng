@@ -1483,7 +1483,8 @@ pub trait ClassDef: Sized + Trace + 'static {
     /// call stack (via a temporary `Error` object) and sets it as the `stack`
     /// property on each new instance.
     ///
-    /// Set automatically by `#[jsclass(js_proto = "Error")]`.
+    /// Set automatically by `#[jsclass(js_proto = "Error")]`, and for a class that `extends` a
+    /// class that has it set.
     const HAS_ERROR_DATA: bool = false;
 
     /// Whether constants should also be installed on the prototype.
@@ -1847,7 +1848,9 @@ pub unsafe fn register_class<'s, T: ClassDef>(
         define_to_string_tag(scope, proto.handle(), T::TO_STRING_TAG);
     }
 
-    if T::HAS_ERROR_DATA {
+    // A class that inherits its error data inherits the `stack` accessor through its prototype
+    // chain.
+    if T::HAS_ERROR_DATA && !T::INHERITS_INTERFACE {
         define_error_stack_accessor::<T>(scope, proto);
     }
 

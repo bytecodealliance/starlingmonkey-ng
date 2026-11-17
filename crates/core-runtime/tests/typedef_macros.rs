@@ -30,11 +30,28 @@ mod js_proto_tests {
         }
     }
 
+    /// A class that extends a class with `js_proto = "Error"`.
+    #[jsclass(extends = CustomError)]
+    struct DerivedError {
+        parent: CustomErrorImpl,
+    }
+
+    #[jsmethods]
+    impl DerivedError {
+        #[constructor]
+        fn construct(detail: String) -> Self {
+            Self {
+                parent: CustomErrorImpl { detail },
+            }
+        }
+    }
+
     fn eval(code: &str) -> String {
         eval_with_setup(
             || {
                 core_runtime::runtime::register_global_initializer(|scope, global| {
                     CustomError::add_to_global(scope, global);
+                    DerivedError::add_to_global(scope, global);
                 });
             },
             code,
@@ -106,6 +123,22 @@ mod js_proto_tests {
                   d.get.call(CustomError.prototype), d.get.call({}), primitive].join()"
             ),
             "function,function,false,true,,replaced,true,true,,,TypeError"
+        );
+    }
+
+    /// An instance of a class that extends an error class captures its stack at construction. The
+    /// `stack` accessor is defined on the prototype of the extended class only.
+    #[test]
+    fn classes_extending_an_error_class_have_a_stack() {
+        assert_eq!(
+            eval(
+                "function make() { return new DerivedError('x'); }
+                 const e = make();
+                 [e instanceof CustomError, e.detail, e.stack.includes('make@'),
+                  Object.hasOwn(DerivedError.prototype, 'stack'),
+                  Object.hasOwn(CustomError.prototype, 'stack')].join()"
+            ),
+            "true,x,true,false,true"
         );
     }
 }
