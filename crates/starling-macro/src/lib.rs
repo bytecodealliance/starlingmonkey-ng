@@ -1606,6 +1606,31 @@ fn process_methods(_attr: TokenStream, item: TokenStream, config: ClassConfig) -
                 unsafe { ::js::class::register_class::<#inner_name>(scope, global); }
             }
         }
+
+        /// The JS class name as registered, matching `#[jsclass(name = "...")]`
+        /// or the Rust struct name when no override is set.
+        pub const NAME: &'static str = <#inner_name as ::js::class::ClassDef>::NAME;
+
+        /// Register this class hidden on the current global, so its
+        /// constructor is reachable through [`constructor`](Self::constructor)
+        /// without being installed as a property of the global object. A
+        /// subsequent `#[jsmodule]` export uses this to expose the class
+        /// under the module's namespace alone.
+        pub fn register_hidden(scope: &::js::gc::scope::Scope<'_>) {
+            // SAFETY: `register_hidden_class` has the same requirements as
+            // `register_class` (an active realm), which the caller holds when
+            // installing module exports or populating globals.
+            unsafe { ::js::class::register_hidden_class::<#inner_name>(scope); }
+        }
+
+        /// The class constructor in the current realm, if the class has been
+        /// registered there via [`add_to_global`](Self::add_to_global) or
+        /// [`register_hidden`](Self::register_hidden). Returns `None` otherwise.
+        pub fn constructor<'scope>(
+            scope: &'scope ::js::gc::scope::Scope<'_>,
+        ) -> Option<::js::Object<'scope>> {
+            ::js::class::class_constructor::<#inner_name>(scope).ok()
+        }
     };
 
     // Generate `impl<'s> Foo<'s>` containing constructors and add_to_global().
@@ -2017,6 +2042,18 @@ fn gen_rest_setup(
             ::js::class::RestArgs::new(__rest_vec)
         };
     }
+}
+
+/// Does an item carry a `#[jsclass]` attribute? Used by `collect_mod_exports`
+/// to pick up classes declared inline in a `#[jsmodule]` body. The attribute's
+/// own expansion runs afterward, since outer macros process their input first.
+fn has_jsclass_attribute(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "jsclass")
+    })
 }
 
 /// Collect the class identifiers a `pub use` brings into scope, for
@@ -3796,6 +3833,18 @@ fn collect_mod_exports(
                 out.consts.push(parse_const_export(const_item));
                 out.items.push(quote! { #const_item });
             }
+            // `#[jsclass] pub struct Foo { ... }` declared directly in the module.
+            // The `#[jsclass]` attribute hasn't been expanded yet (outer macro
+            // runs first), so we recognize it by its syntactic form and treat
+            // it like a `pub use Foo;` for registration purposes.
+            syn::Item::Struct(struct_item)
+                if collect_classes
+                    && matches!(struct_item.vis, syn::Visibility::Public(_))
+                    && has_jsclass_attribute(&struct_item.attrs) =>
+            {
+                out.class_reexports.push(struct_item.ident.clone());
+                out.items.push(quote! { #struct_item });
+            }
             other => out.items.push(quote! { #other }),
         }
     }
@@ -3840,6 +3889,12 @@ fn gen_free_fn_native(
 /// remaining callable from Rust under their original name.
 /// Public `const` items become value exports without camelCasing:
 /// `PI` is exported as `PI`, not `pi`.
+/// `#[jsclass] pub struct ClassName { ... }` declared directly in the
+/// module, and `pub use ClassName;` items for classes defined elsewhere,
+/// are both exported under the class's JS name (`#[jsclass(name = "...")]`
+/// or the Rust struct name). The class is registered hidden on the
+/// global, so its constructor is reachable only through the module
+/// import.
 ///
 /// The import specifier is the `mod` name camelCased, unless overridden with
 /// `#[jsmodule(name = "...")]`.
@@ -3879,9 +3934,9 @@ pub fn jsmodule(attr: TokenStream, item: TokenStream) -> TokenStream {
     let ModExports {
         fns: fn_exports,
         consts: const_exports,
+        class_reexports,
         items: original_items,
-        ..
-    } = match collect_mod_exports(&input, "#[jsmodule]", false) {
+    } = match collect_mod_exports(&input, "#[jsmodule]", true) {
         Ok(exports) => exports,
         Err(e) => return e.to_compile_error().into(),
     };
@@ -3921,6 +3976,17 @@ pub fn jsmodule(attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
+    // Classes brought in by `pub use` are `Value` exports named after the
+    // class's `ClassDef::NAME` (see the `NAME` and `add_to_module`
+    // associated items the `#[jsclass]` macro adds to the stack newtype).
+    for class_name in &class_reexports {
+        declaration_entries.push(quote! {
+            ::core_runtime::module::ModuleExport::Value {
+                js_name: #class_name::NAME,
+            }
+        });
+    }
+
     // Generate the evaluate function that sets constant values
     let mut value_setters: Vec<proc_macro2::TokenStream> = Vec::new();
     for exp in &const_exports {
@@ -3929,6 +3995,19 @@ pub fn jsmodule(attr: TokenStream, item: TokenStream) -> TokenStream {
         value_setters.push(quote! {
             if !::core_runtime::module::set_module_export(
                 scope, env, #js_name, #value_expr,
+            ) {
+                return false;
+            }
+        });
+    }
+    for class_name in &class_reexports {
+        value_setters.push(quote! {
+            #class_name::register_hidden(scope);
+            let Some(__ctor) = #class_name::constructor(scope) else {
+                return false;
+            };
+            if !::core_runtime::module::set_module_export(
+                scope, env, #class_name::NAME, &__ctor,
             ) {
                 return false;
             }
