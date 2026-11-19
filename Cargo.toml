@@ -103,7 +103,9 @@ cpp-builtins = { path = "crates/builtins/cpp-builtins" }
 wit-bindgen = { path = "../wit-bindgen-block-on/crates/guest-rust" }
 
 # The mozjs fork's `starling-glue` branch: private name symbols, objects created with their
-# properties' slot capacity, and a settable WASI recursion depth limit. The prebuilt engine
+# properties' slot capacity, and a settable WASI recursion depth limit. Wasm builds also need
+# `scripts/patches/mozjs-0001-Expose-the-address-of-the-interrupt-bits.patch` applied to it,
+# for the address of the interrupt bits that the debugger publishes. The prebuilt engine
 # archives don't contain these yet, so `.cargo/config.toml` builds SpiderMonkey from source.
 # Replace the paths with the git dependency once the branch is merged and its archives are
 # published.

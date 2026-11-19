@@ -7,8 +7,10 @@
 //! pumps record the waker of the last non-blocking poll in `driver`, which a caller wakes after a
 //! blocking poll so that task polls the operation again.
 
-use std::future::Future;
-use std::pin::Pin;
+use std::cell::Cell;
+use std::future::{poll_fn, Future};
+use std::pin::{pin, Pin};
+use std::rc::Rc;
 use std::task::{ready, Context, Poll, Waker};
 
 use wit_bindgen::{StreamReader, StreamResult, StreamWriter};
@@ -24,6 +26,8 @@ pub struct ReadPump<T: 'static> {
     /// The capacity of each read.
     capacity: usize,
     eof: bool,
+    /// Set while [`ReadPump::take_ready`] polls the read in flight, which cancels the read.
+    cancel: Rc<Cell<bool>>,
     /// The waker of the last non-blocking poll.
     pub driver: Option<Waker>,
 }
@@ -36,6 +40,7 @@ impl<T: 'static> ReadPump<T> {
             op: None,
             capacity,
             eof: false,
+            cancel: Rc::default(),
             driver: None,
         }
     }
@@ -61,12 +66,24 @@ impl<T: 'static> ReadPump<T> {
         }
         let capacity = self.capacity;
         let rx = &mut self.rx;
+        let cancel = &self.cancel;
         let op = self.op.get_or_insert_with(|| {
             let mut rx = rx
                 .take()
                 .expect("a stream that has not ended has a reader or a read in flight");
+            let cancel = Rc::clone(cancel);
             Box::pin(async move {
-                let (result, values) = rx.read(Vec::with_capacity(capacity)).await;
+                let (result, values) = {
+                    let mut read = pin!(rx.read(Vec::with_capacity(capacity)));
+                    poll_fn(|cx| {
+                        if cancel.get() {
+                            Poll::Ready(read.as_mut().cancel())
+                        } else {
+                            read.as_mut().poll(cx)
+                        }
+                    })
+                    .await
+                };
                 (rx, result, values)
             })
         });
@@ -81,6 +98,25 @@ impl<T: 'static> ReadPump<T> {
             self.rx = Some(rx);
         }
         Poll::Ready(Some(values))
+    }
+
+    /// Cancel the read in flight, and return the values the host had delivered for it, which can
+    /// be none, or `None` once the stream ended. Returns no values if no read is in flight. No
+    /// read is in flight afterwards, so the task that polled the read is not woken for it.
+    pub fn take_ready(&mut self) -> Option<Vec<T>> {
+        if self.eof {
+            return None;
+        }
+        if self.op.is_none() {
+            return Some(Vec::new());
+        }
+        self.cancel.set(true);
+        let taken = self.poll_read(&mut Context::from_waker(Waker::noop()));
+        self.cancel.set(false);
+        match taken {
+            Poll::Ready(values) => values,
+            Poll::Pending => unreachable!("a cancelled read completes when it is polled"),
+        }
     }
 }
 

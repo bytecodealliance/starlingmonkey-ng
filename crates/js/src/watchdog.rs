@@ -89,42 +89,41 @@ pub fn with_time_limit<R>(scope: &Scope<'_>, limit: Duration, f: impl FnOnce() -
 struct Timer {
     stop: std::sync::mpsc::Sender<()>,
     thread: std::thread::JoinHandle<()>,
+    /// The handle the thread requests the interrupt with.
+    interrupt: crate::context::InterruptHandle,
 }
 
 /// No timer runs on wasm, which has no threads.
 #[cfg(target_family = "wasm")]
 enum Timer {}
 
-/// The address of a context, which the timer thread passes to `JS_RequestInterruptCallback`,
-/// which may be called from another thread.
-#[cfg(not(target_family = "wasm"))]
-struct ContextAddress(*mut RawJSContext);
-
-// SAFETY: the timer thread only passes the address to `JS_RequestInterruptCallback`.
-#[cfg(not(target_family = "wasm"))]
-unsafe impl Send for ContextAddress {}
-
 impl Timer {
     /// Start a timer for the context of `scope`. Returns `None` if no thread could be started.
     #[cfg(not(target_family = "wasm"))]
     fn start(scope: &Scope<'_>, limit: Duration, state: Arc<Limit>) -> Option<Timer> {
-        // SAFETY: the address is only used to request an interrupt, and the thread is joined
-        // before `with_time_limit` returns, while the context is alive.
-        let cx = ContextAddress(unsafe { scope.raw_cx_no_gc() });
+        // SAFETY: `stop` closes the handle before `with_time_limit` returns, while the context
+        // is alive. If no thread starts, the only handle is dropped here without being used.
+        let interrupt = unsafe { crate::context::InterruptHandle::new(scope) };
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("js-time-limit".into())
-            .spawn(move || {
-                let cx = cx;
-                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(limit)
-                {
-                    state.reached.store(true, Ordering::SeqCst);
-                    // SAFETY: the context is alive until this thread is joined.
-                    unsafe { mozjs::jsapi::JS_RequestInterruptCallback(cx.0) };
+            .spawn({
+                let interrupt = interrupt.clone();
+                move || {
+                    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        stopped.recv_timeout(limit)
+                    {
+                        state.reached.store(true, Ordering::SeqCst);
+                        interrupt.request();
+                    }
                 }
             })
             .ok()?;
-        Some(Timer { stop, thread })
+        Some(Timer {
+            stop,
+            thread,
+            interrupt,
+        })
     }
 
     #[cfg(target_family = "wasm")]
@@ -138,6 +137,7 @@ impl Timer {
         {
             drop(self.stop);
             let _ = self.thread.join();
+            self.interrupt.close();
         }
         #[cfg(target_family = "wasm")]
         match self {}

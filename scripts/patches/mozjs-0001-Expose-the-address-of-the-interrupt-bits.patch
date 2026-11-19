@@ -1,0 +1,162 @@
+From b27534d76535bc2a71ca728e4c38b75ec19c6207 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 10:32:02 +0000
+Subject: [PATCH] Expose the address of the interrupt bits
+
+`JS_GetInterruptBitsAddress` returns the address of the word that holds a
+context's pending interrupt requests, and `JS_GetInterruptCallbackBit` the bit
+of it that `JS_RequestInterruptCallback` sets.
+
+A debugger that can stop the thread running a context and write its memory, but
+cannot call into it, requests the interrupt callbacks by setting that bit. The
+host of a single-threaded WebAssembly build of the engine is such a debugger:
+StarlingMonkey publishes the address to a debugger component that `wasmtime`
+runs next to the instance.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017QdSz3AQTgo1rPS48HJ1SE
+---
+ .../patches/0111-interrupt-bits-address.patch | 62 +++++++++++++++++++
+ mozjs-sys/mozjs/js/public/Interrupt.h         | 19 ++++++
+ mozjs-sys/mozjs/js/src/jsapi.cpp              |  8 +++
+ mozjs/src/jsapi2_wrappers.in.rs               |  1 +
+ 4 files changed, 90 insertions(+)
+ create mode 100644 mozjs-sys/etc/patches/0111-interrupt-bits-address.patch
+
+diff --git a/mozjs-sys/etc/patches/0111-interrupt-bits-address.patch b/mozjs-sys/etc/patches/0111-interrupt-bits-address.patch
+new file mode 100644
+index 0000000..7ca4dcd
+--- /dev/null
++++ b/mozjs-sys/etc/patches/0111-interrupt-bits-address.patch
+@@ -0,0 +1,62 @@
++From: Claude <noreply@anthropic.com>
++Subject: [PATCH] Expose the address of the interrupt bits
++
++A debugger that can stop the thread running a context and write its memory,
++but cannot call into it, requests the interrupt callbacks by setting a bit in
++the context's pending interrupt requests. The host of a single-threaded
++WebAssembly build of the engine is such a debugger.
++---
++diff --git a/js/public/Interrupt.h b/js/public/Interrupt.h
++index a746217..8455233 100644
++--- a/js/public/Interrupt.h
+++++ b/js/public/Interrupt.h
++@@ -5,6 +5,8 @@
++ #ifndef js_Interrupt_h
++ #define js_Interrupt_h
++ 
+++#include <stdint.h>
+++
++ #include "jstypes.h"
++ 
++ struct JS_PUBLIC_API JSContext;
++@@ -37,4 +39,21 @@ extern JS_PUBLIC_API void JS_RequestInterruptCallback(JSContext* cx);
++ 
++ extern JS_PUBLIC_API void JS_RequestInterruptCallbackCanWait(JSContext* cx);
++ 
+++/*
+++ * The address of the 32-bit word that holds the context's pending interrupt
+++ * requests, and the bit of that word that JS_RequestInterruptCallback sets.
+++ *
+++ * Setting the bit in the word requests the interrupt callbacks like
+++ * JS_RequestInterruptCallback, without the further steps that function takes:
+++ * it does not reset the JIT stack limit, wake a thread waiting in Atomics.wait,
+++ * or interrupt running wasm code.
+++ *
+++ * This is for a debugger that can stop the thread running the context and
+++ * write its memory but cannot call into it, such as the host of a
+++ * single-threaded WebAssembly build of the engine.
+++ */
+++extern JS_PUBLIC_API uint32_t* JS_GetInterruptBitsAddress(JSContext* cx);
+++
+++extern JS_PUBLIC_API uint32_t JS_GetInterruptCallbackBit();
+++
++ #endif  // js_Interrupt_h
++diff --git a/js/src/jsapi.cpp b/js/src/jsapi.cpp
++index 4afa343..68f449b 100644
++--- a/js/src/jsapi.cpp
+++++ b/js/src/jsapi.cpp
++@@ -3280,6 +3280,14 @@ JS_PUBLIC_API void JS_RequestInterruptCallbackCanWait(JSContext* cx) {
++   cx->requestInterrupt(InterruptReason::CallbackCanWait);
++ }
++ 
+++JS_PUBLIC_API uint32_t* JS_GetInterruptBitsAddress(JSContext* cx) {
+++  return static_cast<uint32_t*>(cx->addressOfInterruptBits());
+++}
+++
+++JS_PUBLIC_API uint32_t JS_GetInterruptCallbackBit() {
+++  return uint32_t(InterruptReason::CallbackUrgent);
+++}
+++
++ JS::AutoSetAsyncStackForNewCalls::AutoSetAsyncStackForNewCalls(
++     JSContext* cx, JSObject* stack, const char* asyncCause,
++     JS::AutoSetAsyncStackForNewCalls::AsyncCallKind kind)
+diff --git a/mozjs-sys/mozjs/js/public/Interrupt.h b/mozjs-sys/mozjs/js/public/Interrupt.h
+index a746217..8455233 100644
+--- a/mozjs-sys/mozjs/js/public/Interrupt.h
++++ b/mozjs-sys/mozjs/js/public/Interrupt.h
+@@ -5,6 +5,8 @@
+ #ifndef js_Interrupt_h
+ #define js_Interrupt_h
+ 
++#include <stdint.h>
++
+ #include "jstypes.h"
+ 
+ struct JS_PUBLIC_API JSContext;
+@@ -37,4 +39,21 @@ extern JS_PUBLIC_API void JS_RequestInterruptCallback(JSContext* cx);
+ 
+ extern JS_PUBLIC_API void JS_RequestInterruptCallbackCanWait(JSContext* cx);
+ 
++/*
++ * The address of the 32-bit word that holds the context's pending interrupt
++ * requests, and the bit of that word that JS_RequestInterruptCallback sets.
++ *
++ * Setting the bit in the word requests the interrupt callbacks like
++ * JS_RequestInterruptCallback, without the further steps that function takes:
++ * it does not reset the JIT stack limit, wake a thread waiting in Atomics.wait,
++ * or interrupt running wasm code.
++ *
++ * This is for a debugger that can stop the thread running the context and
++ * write its memory but cannot call into it, such as the host of a
++ * single-threaded WebAssembly build of the engine.
++ */
++extern JS_PUBLIC_API uint32_t* JS_GetInterruptBitsAddress(JSContext* cx);
++
++extern JS_PUBLIC_API uint32_t JS_GetInterruptCallbackBit();
++
+ #endif  // js_Interrupt_h
+diff --git a/mozjs-sys/mozjs/js/src/jsapi.cpp b/mozjs-sys/mozjs/js/src/jsapi.cpp
+index 4afa343..68f449b 100644
+--- a/mozjs-sys/mozjs/js/src/jsapi.cpp
++++ b/mozjs-sys/mozjs/js/src/jsapi.cpp
+@@ -3280,6 +3280,14 @@ JS_PUBLIC_API void JS_RequestInterruptCallbackCanWait(JSContext* cx) {
+   cx->requestInterrupt(InterruptReason::CallbackCanWait);
+ }
+ 
++JS_PUBLIC_API uint32_t* JS_GetInterruptBitsAddress(JSContext* cx) {
++  return static_cast<uint32_t*>(cx->addressOfInterruptBits());
++}
++
++JS_PUBLIC_API uint32_t JS_GetInterruptCallbackBit() {
++  return uint32_t(InterruptReason::CallbackUrgent);
++}
++
+ JS::AutoSetAsyncStackForNewCalls::AutoSetAsyncStackForNewCalls(
+     JSContext* cx, JSObject* stack, const char* asyncCause,
+     JS::AutoSetAsyncStackForNewCalls::AsyncCallKind kind)
+diff --git a/mozjs/src/jsapi2_wrappers.in.rs b/mozjs/src/jsapi2_wrappers.in.rs
+index 9be6eb8..751bfed 100644
+--- a/mozjs/src/jsapi2_wrappers.in.rs
++++ b/mozjs/src/jsapi2_wrappers.in.rs
+@@ -418,6 +418,7 @@ wrap!(jsapi: pub fn JS_DisableInterruptCallback(cx: &JSContext) -> bool);
+ wrap!(jsapi: pub fn JS_ResetInterruptCallback(cx: &JSContext, enable: bool));
+ wrap!(jsapi: pub fn JS_RequestInterruptCallback(cx: &JSContext));
+ wrap!(jsapi: pub fn JS_RequestInterruptCallbackCanWait(cx: &JSContext));
++wrap!(jsapi: pub fn JS_GetInterruptBitsAddress(cx: &JSContext) -> *mut u32);
+ wrap!(jsapi: pub fn JS_malloc(cx: &JSContext, nbytes: usize) -> *mut ::std::os::raw::c_void);
+ wrap!(jsapi: pub fn JS_realloc(cx: &JSContext, p: *mut ::std::os::raw::c_void, oldBytes: usize, newBytes: usize) -> *mut ::std::os::raw::c_void);
+ wrap!(jsapi: pub fn JS_free(cx: &JSContext, p: *mut ::std::os::raw::c_void));
+-- 
+2.43.0
+

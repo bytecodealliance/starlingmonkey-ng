@@ -222,6 +222,79 @@ pub unsafe fn request_interrupt_callback_raw(cx: *mut crate::native::RawJSContex
     unsafe { mozjs::jsapi::JS_RequestInterruptCallback(cx) }
 }
 
+/// Requests the interrupt callbacks of a context from any thread, until it is closed.
+///
+/// Clones share one handle: closing one closes all of them.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone)]
+pub struct InterruptHandle(std::sync::Arc<std::sync::Mutex<Option<ContextAddress>>>);
+
+/// The address of a context, which [`InterruptHandle`] passes to `JS_RequestInterruptCallback`
+/// on other threads.
+#[cfg(not(target_family = "wasm"))]
+struct ContextAddress(*mut crate::native::RawJSContext);
+
+// SAFETY: the address is only passed to `JS_RequestInterruptCallback`, which any thread may call.
+#[cfg(not(target_family = "wasm"))]
+unsafe impl Send for ContextAddress {}
+
+#[cfg(not(target_family = "wasm"))]
+impl InterruptHandle {
+    /// A handle for the context of `scope`.
+    ///
+    /// # Safety
+    ///
+    /// No clone of the handle may call [`request`](Self::request) once the context is destroyed:
+    /// [`close`](Self::close) is called before then, unless every clone was dropped.
+    pub unsafe fn new(scope: &Scope<'_>) -> Self {
+        // SAFETY: reading the context pointer performs no GC.
+        let cx = ContextAddress(unsafe { scope.raw_cx_no_gc() });
+        InterruptHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(cx))))
+    }
+
+    /// Request the interrupt callbacks. Does nothing once the handle is closed.
+    pub fn request(&self) {
+        if let Some(cx) = &*self.lock() {
+            // SAFETY: the context is alive until `close` clears the address, which waits for
+            // this lock.
+            unsafe { request_interrupt_callback_raw(cx.0) };
+        }
+    }
+
+    /// Make later [`request`](Self::request) calls do nothing. A request another thread is
+    /// making has finished when this returns.
+    pub fn close(&self) {
+        self.lock().take();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ContextAddress>> {
+        // Nothing panics while the lock is held.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The address of the 32-bit word that holds the context's pending interrupt requests. Setting
+/// [`interrupt_callback_bit`] in the word requests the interrupt callbacks from code the
+/// interpreter runs, as [`request_interrupt_callback`] does.
+///
+/// A debugger outside a wasm instance, which can stop the instance and write its memory but
+/// cannot call into it, requests the callbacks with that write.
+#[cfg(target_family = "wasm")]
+pub fn interrupt_bits_address(scope: &Scope<'_>) -> *mut u32 {
+    // SAFETY: the context is valid while `scope` is, and the getter only computes the address
+    // of one of its fields.
+    unsafe { wrappers2::JS_GetInterruptBitsAddress(scope.cx()) }
+}
+
+/// The bit of the word at [`interrupt_bits_address`] that requests the interrupt callbacks.
+#[cfg(target_family = "wasm")]
+pub fn interrupt_callback_bit() -> u32 {
+    // SAFETY: the getter returns a constant.
+    unsafe { mozjs::jsapi::JS_GetInterruptCallbackBit() }
+}
+
 /// Allocate memory tracked by the GC.
 ///
 /// # Safety
