@@ -8,7 +8,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
-use std::task::{ready, Context, Poll};
+use std::task::{ready, Context, Poll, Waker};
 use std::time::Duration;
 
 use platform::block_on;
@@ -77,19 +77,26 @@ impl PumpConnection {
             let Some(bytes) = ready!(self.read.borrow_mut().poll_read(cx)) else {
                 return Poll::Ready(());
             };
-            let mut framer = self.framer.borrow_mut();
-            framer.push(&bytes);
-            loop {
-                match framer.next_message() {
-                    Ok(Some(message)) => self.messages.borrow_mut().push_back(message),
-                    Ok(None) => break,
-                    Err(error) if error.ends_input() => {
-                        eprintln!("debugger: ended the connection: {error}");
-                        self.read.borrow_mut().end();
-                        break;
-                    }
-                    Err(error) => eprintln!("debugger: discarded a malformed DAP message: {error}"),
+            self.frame(&bytes);
+        }
+    }
+
+    /// Queue the messages that `bytes` complete. A malformed message is discarded, except one
+    /// for which [`FrameError::ends_input`](crate::transport::FrameError::ends_input) is `true`,
+    /// which ends the input. Both are reported on stderr.
+    fn frame(&self, bytes: &[u8]) {
+        let mut framer = self.framer.borrow_mut();
+        framer.push(bytes);
+        loop {
+            match framer.next_message() {
+                Ok(Some(message)) => self.messages.borrow_mut().push_back(message),
+                Ok(None) => break,
+                Err(error) if error.ends_input() => {
+                    eprintln!("debugger: ended the connection: {error}");
+                    self.read.borrow_mut().end();
+                    break;
                 }
+                Err(error) => eprintln!("debugger: discarded a malformed DAP message: {error}"),
             }
         }
     }
@@ -123,6 +130,36 @@ impl Connection for PumpConnection {
             None if self.read.borrow().eof() => Received::Closed,
             None => Received::Empty,
         }
+    }
+
+    fn has_received(&self) -> bool {
+        !self.messages.borrow().is_empty() || self.read.borrow().eof()
+    }
+
+    /// Starts a read if none is in flight, yields to the host so that it can deliver the bytes
+    /// that have arrived to the read, then cancels the read and frames what it received. The
+    /// running-mode future is woken to start the next read. Does nothing while a framed message
+    /// is queued.
+    fn poll(&self) {
+        if !self.messages.borrow().is_empty() {
+            return;
+        }
+        // The read is cancelled below, so no task has to be woken for it.
+        let started = self
+            .read
+            .borrow_mut()
+            .poll_read(&mut Context::from_waker(Waker::noop()));
+        let bytes = match started {
+            Poll::Ready(bytes) => bytes,
+            Poll::Pending => {
+                wit_bindgen::yield_blocking();
+                self.read.borrow_mut().take_ready()
+            }
+        };
+        if let Some(bytes) = bytes {
+            self.frame(&bytes);
+        }
+        self.wake_driver();
     }
 
     /// Records the polling task's waker in both pumps, and writes queued messages while it

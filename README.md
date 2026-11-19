@@ -102,6 +102,14 @@ reaction it queues while paused, as in `Promise.resolve().then(f)`, runs at the 
 checkpoint after the debuggee resumes. An `evaluate` before `configurationDone` can start timers
 and `fetch`, but only serve modes run them (see [Serving](#serving)).
 
+A request that arrives while JavaScript runs without returning to the event loop, such as in a
+long loop, is handled at the loop's next iteration or the next function call or return: `pause`
+stops there, a breakpoint set in the running code is hit, and an `evaluate` runs between two
+iterations. A promise reaction such an `evaluate` queues runs at the running code's next microtask
+checkpoint. A client cannot attach to a `listen` session while such code runs. In the wasm
+component, these requests need a debugger outside the instance (see
+[Requests while JavaScript runs](#requests-while-javascript-runs)).
+
 ### Transports
 
 `--debug` takes one of these forms:
@@ -192,6 +200,35 @@ A component built with `starling-componentize --debug` reads `STARLING_DEBUG` wh
 export runs, and one built without `--debug` ignores the variable (see
 [Componentizing JavaScript](#componentizing-javascript)). Top-level code in a snapshot ran when
 the snapshot was taken, so it cannot be debugged there.
+
+### Requests while JavaScript runs
+
+Natively, a thread reads the client's messages and interrupts running JavaScript for each. A wasm
+instance has no such thread, so a request that arrives while JavaScript runs waits until the
+script returns to the event loop, unless something outside the instance interrupts it. The
+`starling-debug-interrupter` component does that when `wasmtime` runs it as the debugger of the
+instance. `just build-debug-interrupter` builds it as
+`target/wasm32-wasip2/release/debug_interrupter.wasm`:
+
+```sh
+wasmtime run -Ddebugger=debug_interrupter.wasm -Darg=127.0.0.1:9231 \
+    -Shttp=y,inherit-network=y,allow-ip-name-lookup=y,p3=y -Wcomponent-model-async=y \
+    --dir .::/ starling.wasm --debug=listen:9229 /main.js
+```
+
+The component listens on the address in `-Darg`, and `wasmtime` prints
+`Debugger: debug interrupter listening on <addr>:<port>` to stderr once it listens. Each
+connection to that address is a request to interrupt: the component closes the connection, stops
+the instance, sets the bit that requests SpiderMonkey's interrupt callback in the instance's
+memory, and resumes the instance. The session then handles the messages that have arrived on its
+own connection, and writes the output the script has logged since it last returned to the event
+loop. So a client sends its DAP request to the session, and connects to the interrupter's address
+if the response does not arrive.
+
+`-Ddebugger` makes `wasmtime` compile the component with instrumentation for debugging, which
+costs performance. The instance publishes where the bit is in the core module's exported global
+`starling_debug_interrupt` (see `crates/debugger/src/wasm/interrupt.rs`), which any debugger that
+can stop the instance and write its memory can use.
 
 ### The relay for `connect`
 

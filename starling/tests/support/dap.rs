@@ -504,7 +504,12 @@ impl Lines {
     /// Wait for the next line that starts with `prefix`, and return the rest of that line. Panics
     /// if no such line arrives within [`TIMEOUT`].
     pub fn after(&mut self, prefix: &str) -> String {
-        let deadline = Instant::now() + TIMEOUT;
+        self.after_within(prefix, TIMEOUT)
+    }
+
+    /// [`Lines::after`] with `timeout` in place of [`TIMEOUT`].
+    pub fn after_within(&mut self, prefix: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.lines.recv_timeout(remaining) {

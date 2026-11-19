@@ -7,10 +7,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use event_listener::Event;
+use js::context::InterruptHandle;
 
 use super::check;
 use crate::connection::{Connection, LocalFuture, Received};
@@ -104,7 +105,7 @@ impl<T> NotifyingReceiver<T> {
     }
 
     /// Whether a receive would return without blocking. Moves an arrived value into `peeked`.
-    fn peek(&self) -> bool {
+    pub(crate) fn peek(&self) -> bool {
         let mut peeked = self.peeked.borrow_mut();
         if peeked.is_some() {
             return true;
@@ -124,6 +125,9 @@ impl<T> NotifyingReceiver<T> {
 pub(crate) struct ThreadConnection {
     /// Incoming message bodies in arrival order. Closed once the reader reaches its end.
     incoming: NotifyingReceiver<String>,
+    /// The handle the reader thread requests the interrupt callbacks with, once
+    /// `interrupt_on_arrival` set it.
+    interrupt: Arc<OnceLock<InterruptHandle>>,
     /// Outgoing message bodies without `seq`. `None` after `close`.
     outgoing: RefCell<Option<Sender<String>>>,
     writer_thread: RefCell<Option<JoinHandle<()>>>,
@@ -148,12 +152,17 @@ impl ThreadConnection {
             .spawn(move || write_loop(writer, outgoing_rx))?;
 
         let (incoming_tx, incoming) = notifying_channel();
+        let interrupt = Arc::new(OnceLock::new());
         std::thread::Builder::new()
             .name("dap-reader".into())
-            .spawn(move || read_loop(BufReader::new(reader), incoming_tx))?;
+            .spawn({
+                let interrupt = Arc::clone(&interrupt);
+                move || read_loop(BufReader::new(reader), incoming_tx, &interrupt)
+            })?;
 
         Ok(ThreadConnection {
             incoming,
+            interrupt,
             outgoing: RefCell::new(Some(outgoing)),
             writer_thread: RefCell::new(Some(writer_thread)),
             capture: RefCell::new(capture),
@@ -174,8 +183,17 @@ impl Connection for ThreadConnection {
         }
     }
 
+    fn has_received(&self) -> bool {
+        self.incoming.peek()
+    }
+
     fn ready(&self) -> LocalFuture<'_> {
         Box::pin(self.incoming.ready())
+    }
+
+    /// The first handle set is kept. A message that arrived before is not followed by a request.
+    fn interrupt_on_arrival(&self, interrupt: InterruptHandle) {
+        let _ = self.interrupt.set(interrupt);
     }
 
     /// Queue an outgoing message. Dropped after `close`.
@@ -361,16 +379,43 @@ fn write_loop(mut out: impl Write, bodies: Receiver<String>) {
     }
 }
 
-/// Pass the messages read from `reader` to `incoming` until the input ends or fails. A malformed
-/// message is discarded, except one for which [`FrameError::ends_input`] is `true`, which ends the
-/// input. Both are reported on stderr, as is input that ends inside a message or is not UTF-8.
-fn read_loop(mut reader: impl BufRead, incoming: NotifyingSender<String>) {
+/// Pass the messages read from `reader` to `incoming` until the input ends or fails, and then
+/// close `incoming`. The interrupt callbacks are requested through `interrupt`, once it is set,
+/// after each message and after `incoming` is closed.
+fn read_loop(
+    reader: impl BufRead,
+    incoming: NotifyingSender<String>,
+    interrupt: &OnceLock<InterruptHandle>,
+) {
+    read_messages(reader, &incoming, interrupt);
+    // The channel is closed before the request, so the interrupt callback sees it closed.
+    drop(incoming);
+    request_interrupt(interrupt);
+}
+
+/// Request the interrupt callbacks through `interrupt` if it is set.
+fn request_interrupt(interrupt: &OnceLock<InterruptHandle>) {
+    if let Some(interrupt) = interrupt.get() {
+        interrupt.request();
+    }
+}
+
+/// Pass the messages read from `reader` to `incoming` until the input ends or fails, with a
+/// request through `interrupt` after each. A malformed message is discarded, except one for
+/// which [`FrameError::ends_input`] is `true`, which ends the input. Both are reported on
+/// stderr, as is input that ends inside a message or is not UTF-8.
+fn read_messages(
+    mut reader: impl BufRead,
+    incoming: &NotifyingSender<String>,
+    interrupt: &OnceLock<InterruptHandle>,
+) {
     loop {
         let error = match read_message(&mut reader) {
             Ok(Some(body)) => {
                 if !incoming.send(body) {
                     return;
                 }
+                request_interrupt(interrupt);
                 continue;
             }
             Ok(None) => return,

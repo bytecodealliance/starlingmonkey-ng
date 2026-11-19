@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+package starling:debug-interrupter;
+
+/// A debugger component for `wasmtime -Ddebugger=` that listens on a TCP socket.
+world interrupter {
+  include bytecodealliance:wasmtime/debug-main@44.0.0;
+
+  import wasi:clocks/monotonic-clock@0.2.12;
+  import wasi:sockets/instance-network@0.2.12;
+  import wasi:sockets/tcp-create-socket@0.2.12;
+  import wasi:sockets/tcp@0.2.12;
+}

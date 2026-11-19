@@ -30,6 +30,18 @@ pub const LOOP: &[&str] = &[
     "console.log(`total ${total}`);",
 ];
 
+/// Logs `looping`, then runs the loop on lines 4 to 6 until `globalThis.run` is false, without
+/// returning to the event loop, and logs `done`.
+pub const BUSY: &[&str] = &[
+    "globalThis.run = true;",
+    "let turns = 0;",
+    "console.log('looping');",
+    "while (globalThis.run) {",
+    "  turns++;",
+    "}",
+    "console.log('done');",
+];
+
 /// Line 3 awaits a 50 ms timer inside `work`. The script logs `3`.
 pub const AWAIT: &[&str] = &[
     "async function work() {",
@@ -200,6 +212,16 @@ pub fn dap_relay() -> Option<PathBuf> {
         "STARLING_DAP_RELAY",
         "the relay tests",
         "just test-dap-relay",
+    )
+}
+
+/// The interrupter component under test, or `None` to skip the interrupter tests. See
+/// [`serve_test_support::wasm_serve::component`].
+pub fn debug_interrupter() -> Option<PathBuf> {
+    wasm_serve::component_for(
+        "STARLING_DEBUG_INTERRUPTER",
+        "the interrupter tests",
+        "just test-debug-interrupter",
     )
 }
 

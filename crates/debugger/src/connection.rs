@@ -22,8 +22,19 @@ pub(crate) trait Connection {
     fn recv_blocking(&self) -> Option<String>;
     /// The next message if one has arrived.
     fn try_recv(&self) -> Received;
+    /// Whether [`Connection::try_recv`] would return something other than `Empty`.
+    fn has_received(&self) -> bool;
     /// Resolves once [`Connection::try_recv`] would return something other than `Empty`.
     fn ready(&self) -> LocalFuture<'_>;
+    /// Request the interrupt callbacks through `interrupt` after each message that arrives, and
+    /// once the peer closed the connection. Connections that take in messages only while they
+    /// are polled keep this default, which does nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn interrupt_on_arrival(&self, _interrupt: js::context::InterruptHandle) {}
+    /// Take in the messages that have arrived, without waiting for more, so that
+    /// [`Connection::try_recv`] returns them. Connections that take in messages without being
+    /// polled keep this default, which does nothing.
+    fn poll(&self) {}
     /// Queue an outgoing message.
     fn send(&self, body: String);
     /// Block until every queued message is written. Connections that write without being polled

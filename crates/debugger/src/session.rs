@@ -56,6 +56,23 @@ pub(crate) struct Session {
     /// Set when a `connect` session reported running without debugging, and cleared when a client
     /// configures the session.
     undebugged_reported: Cell<bool>,
+    /// The handle the connections' reader threads request [`on_interrupt`] with.
+    #[cfg(not(target_arch = "wasm32"))]
+    interrupt: js::context::InterruptHandle,
+    /// Set while a thread [`Session::retry_interrupt`] started waits to request the interrupt.
+    #[cfg(not(target_arch = "wasm32"))]
+    retrying: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long after an interrupt that found the adapter running the interrupt is requested again.
+#[cfg(not(target_arch = "wasm32"))]
+const INTERRUPT_RETRY_DELAY: Duration = Duration::from_millis(1);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.interrupt.close();
+    }
 }
 
 /// A DAP client attached to the session.
@@ -226,6 +243,12 @@ fn debugger_loop(runtime: &Runtime) -> Rc<InvocationState> {
 /// Release the debugger global, and unregister the debugger's event loop and cancel its pending
 /// futures. Runs when `runtime` is dropped, while the context is alive.
 fn release(runtime: &Runtime) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(session) = current_session() {
+        session.interrupt.close();
+    }
+    #[cfg(target_arch = "wasm32")]
+    crate::wasm::interrupt::unpublish();
     if let Some(client) = current_client() {
         client.global.borrow_mut().take();
     }
@@ -274,12 +297,29 @@ fn start(runtime: &Runtime, debug: &DebugConfig) -> Result<(), String> {
             None,
         ),
     };
-    let session = Rc::new(Session {
-        source,
-        client: RefCell::new(None),
-        client_waker: RefCell::new(None),
-        undebugged_reported: Cell::new(false),
-    });
+    let session = {
+        let content = runtime.default_global();
+        // SAFETY: the callback is a valid function for the life of the process.
+        if !unsafe { js::context::add_interrupt_callback(&content, Some(on_interrupt)) } {
+            return Err("Adding the debugger's interrupt callback failed".to_string());
+        }
+        #[cfg(target_arch = "wasm32")]
+        crate::wasm::interrupt::publish(&content);
+        Rc::new(Session {
+            source,
+            client: RefCell::new(None),
+            client_waker: RefCell::new(None),
+            undebugged_reported: Cell::new(false),
+            // SAFETY: `release` closes the handle of the session in `SESSION` when the runtime
+            // is dropped, while the context is alive. A session taken out of `SESSION` before
+            // that closes its handle when it is dropped, which code running on the context
+            // does.
+            #[cfg(not(target_arch = "wasm32"))]
+            interrupt: unsafe { js::context::InterruptHandle::new(&content) },
+            #[cfg(not(target_arch = "wasm32"))]
+            retrying: Default::default(),
+        })
+    };
     SESSION.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&session)));
     platform::process::set_exit_hook(finish_on_exit);
     STARTED_SINCE_EXPORT.with(|started| started.set(true));
@@ -369,6 +409,36 @@ impl Session {
         if !self.undebugged_reported.replace(true) {
             eprintln!("debugger: {reason}, running without debugging");
         }
+    }
+
+    /// Have the interrupt requested again later, for an interrupt that left messages queued
+    /// because the adapter was the interrupted code. An immediate request would interrupt the
+    /// adapter again.
+    ///
+    /// Natively, a thread requests it after [`INTERRUPT_RETRY_DELAY`], unless one is waiting to.
+    /// On wasm, the debugger outside the instance requests it (see `crate::wasm::interrupt`).
+    fn retry_interrupt(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::sync::atomic::Ordering;
+            if self.retrying.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let interrupt = self.interrupt.clone();
+            let retrying = std::sync::Arc::clone(&self.retrying);
+            let started = std::thread::Builder::new()
+                .name("dap-interrupt".into())
+                .spawn(move || {
+                    std::thread::sleep(INTERRUPT_RETRY_DELAY);
+                    retrying.store(false, Ordering::SeqCst);
+                    interrupt.request();
+                });
+            if started.is_err() {
+                self.retrying.store(false, Ordering::SeqCst);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        crate::wasm::interrupt::set_deferred(true);
     }
 
     /// Resolves once the session has a client whose connection has not ended.
@@ -487,6 +557,10 @@ pub(crate) fn attach_client(
             disconnected: Cell::new(false),
             detached: Cell::new(false),
         });
+        #[cfg(not(target_arch = "wasm32"))]
+        client
+            .connection
+            .interrupt_on_arrival(session.interrupt.clone());
         *session.client.borrow_mut() = Some(Rc::clone(&client));
         session.wake_client_waker();
         forward_output(true);
@@ -640,12 +714,7 @@ impl Client {
         event_loop: &EventLoop,
     ) -> bool {
         let mut dispatched = false;
-        while !self.disconnected.get() {
-            let message = match self.connection.try_recv() {
-                Received::Empty => break,
-                Received::Message(message) => Some(message),
-                Received::Closed => None,
-            };
+        while let Some(message) = self.take_received() {
             // SAFETY: guaranteed by this function's caller.
             unsafe {
                 self.in_debugger_realm(raw_cx, event_loop, |client, scope| match message {
@@ -656,6 +725,75 @@ impl Client {
             dispatched = true;
         }
         dispatched
+    }
+
+    /// The next message that has arrived, or `Some(None)` if the connection closed instead.
+    /// `None` if nothing has arrived, and once the client is disconnected.
+    fn take_received(&self) -> Option<Option<String>> {
+        if self.disconnected.get() {
+            return None;
+        }
+        match self.connection.try_recv() {
+            Received::Empty => None,
+            Received::Message(message) => Some(Some(message)),
+            Received::Closed => Some(None),
+        }
+    }
+
+    /// Pass every message that has arrived to the adapter from the interrupt callback, with the
+    /// debugger realm entered. A closed connection passes [`DISCONNECT`] instead, once.
+    ///
+    /// The event loop that is active stays active, and no microtasks are drained: the reactions
+    /// a message queues run at the interrupted code's next microtask checkpoint.
+    ///
+    /// Does nothing while the client is paused, since the pause receives the messages. If the
+    /// adapter is the code that was interrupted, the messages stay queued, and the interrupt is
+    /// requested again later (see [`Session::retry_interrupt`]).
+    ///
+    /// If blocking is allowed, the connection is flushed before this returns, since a connection
+    /// that writes only while it is polled is not polled while the interrupted code runs. That
+    /// writes the responses to the messages passed, and the output the interrupted code queued.
+    ///
+    /// # Safety
+    ///
+    /// `raw_cx` must be valid, with the interrupted code's realm entered.
+    unsafe fn dispatch_interrupting(&self, raw_cx: *mut js::native::RawJSContext) {
+        if self.paused.get() || self.disconnected.get() {
+            return;
+        }
+        // SAFETY: guaranteed by this function's caller.
+        let interrupted = unsafe { RootScope::from_current_realm(raw_cx) };
+        let Some(global) = self.global_ptr() else {
+            return;
+        };
+        let may_block = blocking_allowed();
+        if may_block {
+            self.connection.poll();
+        }
+        if interrupted.global().as_raw() == global.as_ptr() {
+            if self.connection.has_received() {
+                if let Some(session) = current_session() {
+                    session.retry_interrupt();
+                }
+            }
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        crate::wasm::interrupt::set_deferred(false);
+        while let Some(message) = self.take_received() {
+            // A collection during the previous message can have moved the global.
+            let Some(global) = self.global_ptr() else {
+                break;
+            };
+            let scope = RootScope::new_with_realm(interrupted.cx_mut(), global);
+            match message {
+                Some(message) => self.dispatch(&scope, message),
+                None => self.disconnect(&scope),
+            }
+        }
+        if may_block {
+            self.connection.flush();
+        }
     }
 
     /// Run `f` with the debugger realm entered and `event_loop` active, then drain microtasks.
@@ -770,6 +908,21 @@ impl Client {
         last.push(json!({ "type": "event", "event": "terminated" }).to_string());
         self.connection.close(last);
     }
+}
+
+/// The interrupt callback of a context with a session: pass the messages that arrived while
+/// JavaScript runs to the adapter (see [`Client::dispatch_interrupting`]). Returns `true`, which
+/// lets the interrupted JavaScript continue.
+///
+/// Natively, a connection's reader thread requests the interrupt for each message. On wasm, a
+/// debugger outside the instance requests it (see `crate::wasm::interrupt`).
+unsafe extern "C" fn on_interrupt(raw_cx: *mut js::native::RawJSContext) -> bool {
+    if let Some(client) = current_client() {
+        // SAFETY: the engine calls interrupt callbacks with a valid context that has the
+        // interrupted code's realm entered.
+        unsafe { client.dispatch_interrupting(raw_cx) };
+    }
+    true
 }
 
 /// Block in the adapter's hook, passing messages to it, until it calls `resume` or the client

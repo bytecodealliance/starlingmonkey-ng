@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+[package]
+name = "debug-interrupter"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[target.'cfg(all(target_arch = "wasm32", target_env = "p2"))'.dependencies]
+wasmparser = { version = "0.259.0", default-features = false, features = ["std"] }
+wit-bindgen.workspace = true
+
+[lints]
+workspace = true

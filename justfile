@@ -238,6 +238,20 @@ test-debugger-wasm *ARGS:
     STARLING_WASM_COMPONENT="${CARGO_TARGET_DIR:-{{justfile_directory()}}/target}/wasm32-wasip3/debug/starling.wasm" \
         cargo test --features debugmozjs -p starlingmonkey --test debugger_wasm {{ARGS}}
 
+# Build the `starling-debug-interrupter` component for wasm32-wasip2 in release mode.
+build-debug-interrupter:
+    cargo build -p debug-interrupter --target wasm32-wasip2 --release
+
+# Run the interrupter tests: a DAP client pauses a busy loop in the p3 component, which
+# `wasmtime run` runs with the interrupter component as its debugger. Builds both components
+# first. Needs wasmtime on PATH, and `WASI_SDK_PATH` naming a wasi-sdk that builds p3.
+test-debug-interrupter *ARGS:
+    @WASM_TARGET=p3 just build-wasm -p starlingmonkey
+    @just build-debug-interrupter
+    STARLING_WASM_COMPONENT="${CARGO_TARGET_DIR:-{{justfile_directory()}}/target}/wasm32-wasip3/debug/starling.wasm" \
+    STARLING_DEBUG_INTERRUPTER="${CARGO_TARGET_DIR:-{{justfile_directory()}}/target}/wasm32-wasip2/release/debug_interrupter.wasm" \
+        cargo test --features debugmozjs -p starlingmonkey --test debugger_interrupter {{ARGS}}
+
 # Build the `starling-dap-relay` component for wasm32-wasip3 in release mode.
 build-dap-relay:
     cargo +{{NIGHTLY}} build -p dap-relay --target wasm32-wasip3 --release

@@ -40,6 +40,8 @@ declare class Debugger {
   addDebuggee(global: unknown): Debugger.Object;
   removeAllDebuggees(): void;
   findScripts(query?: { url?: string; line?: number; global?: Debugger.Object }): Debugger.Script[];
+  /** The newest debuggee frame on the stack, or `null` if no debuggee code is running. */
+  getNewestFrame(): Debugger.Frame | null;
   /** The frame of this debugger that refers to the same stack frame as `frame`. */
   adoptFrame(frame: Debugger.Frame): Debugger.Frame;
   onNewScript: ((script: Debugger.Script) => void) | undefined;

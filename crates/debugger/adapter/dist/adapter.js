@@ -693,7 +693,7 @@
       this.on("attach", (request) => this.attach(request));
       this.on("configurationDone", () => {
         if (this.launchArguments.stopOnEntry) {
-          this.stopAtNextFrame("entry");
+          this.stopSoon("entry");
         }
         configured();
         return void 0;
@@ -774,10 +774,12 @@
       }
       this.on("pause", () => {
         if (this.pausedFrame === void 0) {
-          this.stopAtNextFrame("pause");
+          this.stopSoon("pause");
         }
         return void 0;
       });
+      this.onStop(() => this.cancelPendingStop?.());
+      this.onDetach(() => this.cancelPendingStop?.());
       this.on("stackTrace", (request) => {
         const args = request.arguments;
         const frames = this.frames();
@@ -842,6 +844,8 @@
     resumeActions = [];
     refs = new References();
     stepper;
+    /** Removes the hooks of a stop `stopSoon` set up that has not happened yet. */
+    cancelPendingStop;
     /** The frame the debuggee is paused in, while a pause is active. */
     pausedFrame;
     launchArguments = {};
@@ -957,13 +961,42 @@
       resume();
       return void 0;
     }
-    /** Stop in the next content frame that runs. */
-    stopAtNextFrame(reason) {
-      this.dbg.onEnterFrame = (frame) => {
+    /**
+     * Stop in the next content frame that is entered. If content code is running, which is the
+     * case for a request that arrives while it runs, also stop at the next step of its newest
+     * frame, whichever comes first. A stop for another reason replaces the stop.
+     */
+    stopSoon(reason) {
+      this.cancelPendingStop?.();
+      const running = this.newestFrame();
+      const cancel = () => {
+        this.cancelPendingStop = void 0;
         this.dbg.onEnterFrame = void 0;
+        if (running !== null && !running.terminated) {
+          running.onStep = void 0;
+        }
+      };
+      this.cancelPendingStop = cancel;
+      this.dbg.onEnterFrame = (frame) => {
+        cancel();
         this.stop(frame, reason);
         return void 0;
       };
+      if (running !== null) {
+        running.onStep = () => {
+          cancel();
+          this.stop(running, reason);
+          return void 0;
+        };
+      }
+    }
+    /** The newest content frame on the stack, or `null` if there is none or it cannot be inspected. */
+    newestFrame() {
+      try {
+        return this.dbg.getNewestFrame();
+      } catch {
+        return null;
+      }
     }
     scriptLoaded(script) {
       if (script.source.introductionType === "debugger eval") {

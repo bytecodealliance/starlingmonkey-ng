@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use support::dap::{values, Dap};
-use support::{write_script, AWAIT, INSPECT, LOOP};
+use support::{write_script, AWAIT, BUSY, INSPECT, LOOP};
 
 #[test]
 fn session_runs_the_script_after_configuration_and_reports_its_exit() {
@@ -671,6 +671,88 @@ fn pause_request_stops_the_next_callback() {
     assert_eq!(dap.event("stopped")["reason"], "pause");
     dap.request("continue", json!({ "threadId": 1 }));
     assert_eq!(dap.run_to_end().output, "tick\n");
+}
+
+/// A session whose script is [`BUSY`], configured and inside the loop.
+fn in_busy_loop(dir: &Path) -> (Dap, PathBuf) {
+    let script = write_script(dir, "main.mjs", BUSY);
+    let mut dap = Dap::spawn(&script);
+    dap.start(json!({}));
+    dap.request("configurationDone", json!({}));
+    dap.wait_for_output("looping\n");
+    (dap, script)
+}
+
+/// End [`BUSY`]'s loop from a pause, resume, and return the output of the rest of the script.
+fn end_busy_loop(mut dap: Dap) -> String {
+    assert_eq!(dap.evaluate("globalThis.run = false")["result"], "false");
+    dap.request("continue", json!({ "threadId": 1 }));
+    dap.run_to_end().output
+}
+
+#[test]
+fn pause_request_stops_a_busy_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut dap, _) = in_busy_loop(dir.path());
+    dap.request("pause", json!({ "threadId": 1 }));
+    assert_eq!(dap.event("stopped")["reason"], "pause");
+    let (name, line) = dap.top_frame();
+    assert_eq!(name, "(module)");
+    assert!((4..=6).contains(&line), "paused on line {line}");
+    let turns = dap.evaluate("turns")["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(turns.parse::<u64>().unwrap() > 0, "{turns}");
+    assert_eq!(end_busy_loop(dap), "done\n");
+}
+
+#[test]
+fn breakpoint_set_while_a_busy_loop_runs_is_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut dap, script) = in_busy_loop(dir.path());
+    let breakpoints = dap.set_breakpoints(&script, &[5]);
+    assert_eq!(breakpoints[0]["verified"], true, "{breakpoints:?}");
+    assert_eq!(dap.event("stopped")["reason"], "breakpoint");
+    assert_eq!(dap.top_frame().1, 5);
+    dap.set_breakpoints(&script, &[]);
+    assert_eq!(end_busy_loop(dap), "done\n");
+}
+
+#[test]
+fn evaluate_runs_while_a_busy_loop_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut dap, _) = in_busy_loop(dir.path());
+    assert_eq!(dap.evaluate("globalThis.run = false")["result"], "false");
+    assert_eq!(dap.run_to_end().output, "done\n");
+}
+
+#[test]
+fn step_follows_a_pause_in_a_busy_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut dap, _) = in_busy_loop(dir.path());
+    dap.request("pause", json!({ "threadId": 1 }));
+    dap.event("stopped");
+    let paused_on = dap.top_frame().1;
+    assert_eq!(step(&mut dap, "next")["reason"], "step");
+    let stepped_to = dap.top_frame().1;
+    assert!(
+        (4..=6).contains(&stepped_to),
+        "stepped to line {stepped_to}"
+    );
+    assert_ne!(stepped_to, paused_on);
+    assert_eq!(end_busy_loop(dap), "done\n");
+}
+
+/// A reaction an `evaluate` queues while a loop runs waits for the loop's task to end.
+#[test]
+fn evaluate_while_a_busy_loop_runs_drains_no_microtasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut dap, _) = in_busy_loop(dir.path());
+    dap.evaluate("Promise.resolve().then(() => console.log('job')); 1");
+    dap.evaluate("console.log('second')");
+    assert_eq!(dap.evaluate("globalThis.run = false")["result"], "false");
+    assert_eq!(dap.run_to_end().output, "second\ndone\njob\n");
 }
 
 #[test]
