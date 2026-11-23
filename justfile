@@ -252,8 +252,8 @@ install-componentize:
     export STARLING_EMBED_RUNTIME="{{_runtime_out}}/release/starling.wasm" && \
         {{_componentize}} install --path . --locked
 
-# The componentizer is built from this checkout, and embeds the wasm32-wasip3 runtime
-# `just build-runtime` writes, or none if there is no such build. ARGS are passed through
+# The componentizer is built from this checkout, and uses the runtime STARLING_RUNTIME names, or
+# else the one `just build-runtime` writes for wasm32-wasip3, if any. ARGS are passed through
 # unchanged, and it runs in the directory `just` was invoked from, so relative paths in them
 # resolve there. For example:
 #
@@ -265,23 +265,31 @@ install-componentize:
 [positional-arguments]
 componentize *ARGS:
     @{{_componentize}} build -q --bin starling-componentize
-    @"{{_target}}/debug/starling-componentize" "$@"
+    @runtime="{{_runtime_out}}/release/starling.wasm"; \
+        if [ -z "${STARLING_RUNTIME:-}" ] && [ -f "$runtime" ]; then export STARLING_RUNTIME="$runtime"; fi; \
+        "{{_target}}/debug/starling-componentize" "$@"
 
-# The packages are the one that resolves the binary and the one for this platform, which holds a
-# release build with the release runtime embedded. `componentize/npm/package.mjs` documents the
-# layout, and `.github/workflows/release.yml` builds and publishes every platform's packages.
-# VERSION defaults to the workspace's version, in `Cargo.toml`. The packages' tarballs go to
-# `target/npm/tarballs`.
+# The packages are the one that resolves the binary, holds the release runtime and records the
+# debug runtime's digest, and the one for this platform, which holds a release build.
+# `componentize/npm/package.mjs` documents the layout, and `.github/workflows/release.yml` builds
+# and publishes every platform's packages. VERSION defaults to the workspace's version, in
+# `Cargo.toml`. The packages' tarballs go to `target/npm/tarballs`.
 #
 # Assemble the npm packages of `starling-componentize` for this platform in `target/npm`.
 npm-componentize VERSION="":
     ./scripts/build-runtime.sh
-    export STARLING_EMBED_RUNTIME="{{_runtime_out}}/release/starling.wasm" && \
-        {{_componentize}} build --release --locked --bin starling-componentize
+    ./scripts/build-runtime.sh --debug
+    {{_componentize}} build --release --locked --bin starling-componentize
     rm -rf "{{_target}}/npm"
     node componentize/npm/package.mjs {{ if VERSION == "" { "" } else { "--version " + VERSION } }} \
         --out "{{_target}}/npm" --pack "{{_target}}/npm/tarballs" \
+        --runtime "{{_runtime_out}}/release/starling.wasm" \
+        --debug-runtime "{{_runtime_out}}/debug/starling.wasm" \
         "$(node -p 'process.platform + "-" + process.arch')={{_target}}/release/starling-componentize"
+
+# Smoke-test the packages `npm-componentize` assembled (see `scripts/check-npm-packages.sh`).
+npm-componentize-check:
+    ./scripts/check-npm-packages.sh "{{_target}}/npm/tarballs" "{{_runtime_out}}/debug/starling.wasm"
 
 # End-to-end test of the debug runtime component (build, run scripts under wasmtime).
 test-runtime:
@@ -313,7 +321,7 @@ test-componentize-unit:
     {{_componentize}} test --workspace --lib
 
 # For a world exporting `wasi:http/handler`, the interface's declarations come from the runtime
-# build STARLING_RUNTIME names, or else from the one the componentizer embeds.
+# build STARLING_RUNTIME names, or else from the one `just build-runtime` writes.
 #
 #   just ts-bindings <wit-path> [<world>]   # print the .d.ts to stdout
 #   just ts-bindings --export-cli           # the built-in cli/run world

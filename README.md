@@ -201,10 +201,12 @@ starling-componentize -w <wit-dir> -n <world> componentize <app.js> -o out.wasm
   platform from an optional dependency, one package per platform, and runs as
   `npx @bytecodealliance/starling-componentize`. Its `binaryPath()` export returns the binary's
   path. There are packages for macOS (arm64 and x64), Linux (arm64 and x64) and Windows (x64).
+  It bundles the release runtime, and downloads the debug one when `STARLING_RUNTIME_BUILD=debug`.
   The Linux binaries are statically linked, so they run with any C library.
 - Each GitHub release has `starling.wasm`, a `starling-componentize` binary per platform and a
   `SHA256SUMS` file of their digests. The runtime and `starling-componentize` are
-  released together, under the same version.
+  released together, under the same version. It also has the debug runtime, `starling-debug.wasm`.
+  The binaries embed no runtime: pass `--runtime` or set `STARLING_RUNTIME`.
 - In a checkout, `just install-componentize` builds the release runtime and installs
   `starling-componentize` with it embedded, so the installed binary needs no other file.
   [The componentizer](#the-componentizer) describes the other recipes.
@@ -251,7 +253,7 @@ Repeated `-n`s target several worlds, merged into one, `starling:componentize/me
 imports and exports everything they do.
 
 The runtime is the one `--runtime` names, or else the one the `STARLING_RUNTIME` environment
-variable names, or else the one embedded in `starling-componentize`. It must be a `starling.wasm`
+variable names, or else the one embedded in `starling-componentize`, if it embeds one: the released binaries do not. It must be a `starling.wasm`
 that `scripts/build-runtime.sh` built ([The runtime component](#the-runtime-component)). The
 componentizer refuses one that a plain `cargo build` wrote, since it lacks the metadata the script
 adds. The
@@ -1273,12 +1275,12 @@ read, is not detected. Its handle is not valid in an instance resumed from the s
 `componentize` is a Cargo workspace of its own, so its recipes run cargo from its directory.
 
 `just componentize <args>` builds `starling-componentize` from the checkout and runs it with
-`<args>` in the directory you run it from. It embeds `target/wasm32-wasip3/release/starling.wasm`,
-the runtime `just build-runtime` writes, or no runtime if there is none. `STARLING_EMBED_RUNTIME`
-names another runtime to embed at build time, and the build fails if that file can't be read.
-`just install-componentize` and `just npm-componentize [VERSION]` build the release runtime for
-`RUNTIME_TARGET` and embed it. `npm-componentize` assembles the npm packages for the current
-platform in `target/npm`, and their tarballs in `target/npm/tarballs`.
+`<args>` in the directory you run it from, with `target/wasm32-wasip3/release/starling.wasm`, the
+runtime `just build-runtime` writes, unless `STARLING_RUNTIME` is set. `STARLING_EMBED_RUNTIME`
+names a runtime to embed at build time, and the build fails if that file can't be read.
+`just install-componentize` builds the release runtime for `RUNTIME_TARGET` and embeds it.
+`just npm-componentize [VERSION]` assembles the npm packages for the current platform in
+`target/npm`, and their tarballs in `target/npm/tarballs`, which `just npm-componentize-check` tests.
 `just ts-bindings <wit-path> [<world>]` prints the TypeScript declarations for a world.
 
 ```bash
