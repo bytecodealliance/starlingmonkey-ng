@@ -7,7 +7,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use core_runtime::config::RuntimeConfig;
-use core_runtime::event_loop::{run_microtasks, run_to_completion, with_event_loop, EventLoop};
+use core_runtime::event_loop::{run_microtasks, run_to_completion, with_event_loop};
+use core_runtime::invocation::{InvocationGuard, InvocationState};
 use core_runtime::runtime::{clear_global_initializers, register_global_initializer, Runtime};
 use core_runtime::test_util::eval_out_with_setup;
 use js::conversion::FromJSVal;
@@ -25,8 +26,14 @@ fn eval_out(code: &str) -> String {
     setup();
     let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
     let scope = rt.default_global();
-    let el = EventLoop::new();
-    with_event_loop(&el, |_| {
+    // The loop's tasks hold GC things (`digest()`'s promise), so it has to belong to an
+    // invocation registered with the runtime for the GC to trace them.
+    let invocation = InvocationState::new();
+    // SAFETY: `invocation` stays at this address until the guard drops at the end of this
+    // function.
+    let _guard = unsafe { InvocationGuard::new(&rt, &invocation) };
+    let el = invocation.event_loop();
+    with_event_loop(el, |_| {
         js::compile::evaluate_with_filename(&scope, code, "test.js", 1).expect("evaluating code");
         run_microtasks(&scope);
     });
@@ -36,7 +43,7 @@ fn eval_out(code: &str) -> String {
         .expect("a tokio runtime");
     tokio.block_on(async {
         let raw_cx = unsafe { scope.raw_cx_no_gc() };
-        unsafe { run_to_completion(raw_cx, &el, tokio::time::sleep).await }
+        unsafe { run_to_completion(raw_cx, el, tokio::time::sleep).await }
     });
     run_microtasks(&scope);
     let out = js::compile::evaluate_with_filename(&scope, "String(globalThis.__out)", "out.js", 1)
