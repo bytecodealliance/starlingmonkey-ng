@@ -14,15 +14,14 @@ use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::native::Value;
 use js::prelude::{CallbackArgs, HandleValue};
+use js::typedarray::BufferSource;
 use js::{value, JSString};
 
 use web_streams::readable::ReadableStream;
 use web_streams::writable::WritableStream;
 use web_streams::{AlgorithmArg, TransformStream, TransformStreamImpl};
 
-use crate::decoder_common::{
-    decode_bytes, get_encoding, new_decoder, ArrayBufferViewOrArrayBuffer, TextDecoderOptions,
-};
+use crate::decoder_common::{decode_bytes, get_encoding, new_decoder, TextDecoderOptions};
 
 /// <https://encoding.spec.whatwg.org/#textdecoderstream>
 #[webidl_interface]
@@ -158,7 +157,7 @@ fn decoder_transform_cb(
     let stream = cast_payload::<TextDecoderStream>(scope, payload);
 
     // Step 1: Let bufferSource be the result of converting chunk to an AllowSharedBufferSource.
-    let buffer_source = ArrayBufferViewOrArrayBuffer::from_jsval_throwing(scope, args.get(0), ())?;
+    let buffer_source = BufferSource::from_jsval_throwing(scope, args.get(0), ())?;
     let output = {
         // Step 2: Push a copy of bufferSource to decoder’s I/O queue.
         // Step 3: Let output be the I/O queue of scalar values « end-of-queue ».
@@ -178,10 +177,7 @@ fn decoder_transform_cb(
         let fatal = data.fatal;
         let decoder = data.decoder.as_mut().expect("decoder must be initialized");
         let decode = |bytes: &[u8]| decode_bytes(encoding, decoder, fatal, bytes, false, false);
-        match buffer_source {
-            ArrayBufferViewOrArrayBuffer::View(view) => view.with_bytes(decode),
-            ArrayBufferViewOrArrayBuffer::Buffer(buffer) => buffer.with_bytes(decode),
-        }
+        buffer_source.with_bytes(decode)
     }
     .into_js_string(scope)?;
 

@@ -31,6 +31,7 @@ form_urlencoded = "1.2"
 futures-channel = "0.3"
 futures-lite = "2"
 futures-util = "0.3"
+getrandom = "0.4"
 heck = "0.5"
 http = "1"
 http-body = "1"
@@ -44,6 +45,8 @@ platform = { path = "crates/platform" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 semver = "1.0.28"
 serve-test-support = { path = "crates/serve-test-support" }
+sha1 = "0.11"
+sha2 = "0.11"
 slab = "0.4.12"
 smallvec = "1.16"
 starling-macro = { path = "crates/starling-macro" }
@@ -67,6 +70,7 @@ web-globals = { path = "crates/builtins/web-globals" }
 web-streams = { path = "crates/builtins/web-streams" }
 web-url = { path = "crates/builtins/web-url" }
 cpp-builtins = { path = "crates/builtins/cpp-builtins" }
+web-crypto = { path = "crates/builtins/web-crypto" }
 web-encoding = { path = "crates/builtins/web-encoding" }
 
 [profile.release]

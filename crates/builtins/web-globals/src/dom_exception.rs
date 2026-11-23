@@ -13,7 +13,6 @@ use js::class::Ref;
 use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
 use js::native::ExceptionStackBehavior;
-use js::prelude::ToJSVal;
 
 /// https://webidl.spec.whatwg.org/#dfn-error-names-table
 ///
@@ -144,11 +143,7 @@ pub fn throw_dom_exception(scope: &Scope<'_>, name: &str, message: &str) -> ExnT
         Ok(exc) => exc,
         Err(_) => return ExnThrown,
     };
-
-    let exc_val = exception
-        .to_jsval(scope)
-        .expect("Value conversion doesn't fail");
-    js::exception::set_pending(scope, exc_val, ExceptionStackBehavior::Capture)
+    js::exception::set_pending(scope, exception, ExceptionStackBehavior::Capture)
 }
 
 /// A typed error representing a `DOMException` to be thrown.

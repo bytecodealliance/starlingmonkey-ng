@@ -7,8 +7,8 @@
 //! platform-agnostic parts in one module and its backends in `<capability>_native`,
 //! `<capability>_p2` and `<capability>_p3` modules, selected with `#[cfg]` on
 //! `target_arch` and `target_env`. The capabilities are HTTP ([`http`]), used by `fetch`,
-//! the monotonic clock ([`clock`]), and on wasm, running futures on the host's executor
-//! ([`task`]).
+//! the monotonic clock ([`clock`]), random bytes ([`random`]), and on wasm, running futures on the
+//! host's executor ([`task`]).
 
 pub mod clock;
 pub mod http;
@@ -20,6 +20,7 @@ mod http_p2;
 mod http_p3;
 #[cfg(target_arch = "wasm32")]
 mod http_wasm;
+pub mod random;
 #[cfg(target_arch = "wasm32")]
 pub mod task;
 #[cfg(target_env = "p2")]
