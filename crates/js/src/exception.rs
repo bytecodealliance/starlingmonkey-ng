@@ -6,6 +6,7 @@
 //! `JSContext`. For the higher-level error type that wraps these operations,
 //! see [`super::error::ExnThrown`].
 
+use crate::conversion::ToJSVal;
 use crate::gc::scope::Scope;
 use mozjs::jsapi::ExceptionStackBehavior;
 use mozjs::jsval::UndefinedValue;
@@ -63,14 +64,21 @@ pub fn take_pending_or_undefined<'r>(scope: &'r Scope<'_>) -> HandleValue<'r> {
     take_pending(scope).unwrap_or(HandleValue::undefined())
 }
 
-/// Set a pending exception on the context.
-pub fn set_pending(
-    scope: &Scope<'_>,
-    v: HandleValue,
+/// Set a pending exception on the context, with `v` as the value thrown.
+///
+/// If converting `v` fails, the exception from that failure is pending instead.
+pub fn set_pending<'s>(
+    scope: &'s Scope<'_>,
+    v: impl ToJSVal<'s>,
     behavior: ExceptionStackBehavior,
 ) -> ExnThrown {
-    unsafe { wrappers2::JS_SetPendingException(scope.cx_mut(), v, behavior) };
-    ExnThrown
+    match v.to_jsval_throwing(scope) {
+        Ok(v) => {
+            unsafe { wrappers2::JS_SetPendingException(scope.cx_mut(), v, behavior) };
+            ExnThrown
+        }
+        Err(thrown) => thrown,
+    }
 }
 
 /// Clear any pending exception on the context.

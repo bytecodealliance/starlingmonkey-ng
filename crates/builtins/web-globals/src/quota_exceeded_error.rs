@@ -5,7 +5,9 @@
 
 use core_runtime::{webidl_dictionary, webidl_interface, webidl_methods};
 use js::conversion::Finite;
-use js::error::RangeError;
+use js::error::{ExnThrown, RangeError, ThrowException};
+use js::gc::scope::Scope;
+use js::native::ExceptionStackBehavior;
 
 use crate::dom_exception::{DOMException, DOMExceptionImpl};
 
@@ -35,53 +37,16 @@ impl QuotaExceededError {
     ///
     /// `constructor(optional DOMString message = "", optional QuotaExceededErrorOptions options = {})`
     #[constructor]
-    fn new(
+    pub fn new(
         message: Option<String>,
         options: Option<QuotaExceededErrorOptions>,
     ) -> Result<Self, RangeError> {
+        let message = message.unwrap_or_default();
         let options = options.unwrap_or_default();
-        Self::create(
-            message.unwrap_or_default(),
-            options.quota,
-            options.requested,
-        )
-    }
-
-    /// <https://webidl.spec.whatwg.org/#dom-quotaexceedederror-quota>
-    #[getter]
-    fn quota(&self) -> Option<f64> {
-        // Step 1: Return `this`'s `quota`.
-        self.data().quota
-    }
-
-    /// <https://webidl.spec.whatwg.org/#dom-quotaexceedederror-requested>
-    #[getter]
-    fn requested(&self) -> Option<f64> {
-        // Step 1: Return `this`'s `requested`.
-        self.data().requested
-    }
-}
-
-impl QuotaExceededErrorImpl {
-    /// Run the constructor steps: validate _quota_ and _requested_, then build the object's
-    /// state, whose `DOMException` name is "QuotaExceededError".
-    ///
-    /// TODO: Rust code can't yet throw a `QuotaExceededError` with a quota or requested. The only
-    /// way to throw one is `DOMExceptionError::new("QuotaExceededError", ..)`, which goes through
-    /// `throw_dom_exception`, and that always passes `None` for both. That's right for
-    /// `getRandomValues`, whose spec gives no values. When a spec says to "throw a
-    /// `QuotaExceededError` whose quota is _q_ and requested is _r_" (storage APIs, for example),
-    /// add an error type such as `QuotaExceededErrorError { message, quota, requested }` that
-    /// implements `ThrowException`: call `create_instance_with::<QuotaExceededErrorImpl>` with
-    /// `create(message, quota, requested)` and set the result as the pending exception, as
-    /// `throw_dom_exception` does. WebIDL forbids specs from passing a _requested_ that is less
-    /// than _quota_, so that type can `expect` that `create` succeeds.
-    pub fn create(
-        message: String,
-        quota: Option<Finite<f64>>,
-        requested: Option<Finite<f64>>,
-    ) -> Result<Self, RangeError> {
-        let (quota, requested) = (quota.map(Finite::get), requested.map(Finite::get));
+        let (quota, requested) = (
+            options.quota.map(Finite::get),
+            options.requested.map(Finite::get),
+        );
         // Step 1: Set `this`'s `name` to "QuotaExceededError".
         // Step 2: Set `this`'s `message` to _message_.
         //         (Both are the `DOMException` state built at the end. Throwing before it is
@@ -111,5 +76,26 @@ impl QuotaExceededErrorImpl {
             quota,
             requested,
         })
+    }
+
+    /// <https://webidl.spec.whatwg.org/#dom-quotaexceedederror-quota>
+    #[getter]
+    fn quota(&self) -> Option<f64> {
+        // Step 1: Return `this`'s `quota`.
+        self.data().quota
+    }
+
+    /// <https://webidl.spec.whatwg.org/#dom-quotaexceedederror-requested>
+    #[getter]
+    fn requested(&self) -> Option<f64> {
+        // Step 1: Return `this`'s `requested`.
+        self.data().requested
+    }
+}
+
+/// Throw this error, as when a spec says to "throw a `QuotaExceededError`".
+impl ThrowException for QuotaExceededError<'_> {
+    fn throw(self, scope: &Scope<'_>) -> ExnThrown {
+        js::exception::set_pending(scope, self, ExceptionStackBehavior::Capture)
     }
 }

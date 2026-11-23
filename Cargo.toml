@@ -45,8 +45,8 @@ platform = { path = "crates/platform" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 semver = "1.0.28"
 serve-test-support = { path = "crates/serve-test-support" }
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 slab = "0.4.12"
 smallvec = "1.16"
 starling-macro = { path = "crates/starling-macro" }

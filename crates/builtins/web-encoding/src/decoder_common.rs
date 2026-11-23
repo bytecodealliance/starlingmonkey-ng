@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
-use core_runtime::webidl_union;
 use js::error::{ExnThrown, OutOfMemory, ThrowException};
 use js::gc::scope::Scope;
-use js::{ArrayBuffer, ArrayBufferView, JSString};
+use js::JSString;
 
 pub(crate) fn get_encoding(
     label: Option<&str>,
@@ -155,12 +154,6 @@ fn decode_to_utf16(
     };
     output.truncate(written);
     Ok(output)
-}
-
-#[webidl_union]
-pub enum ArrayBufferViewOrArrayBuffer<'a> {
-    View(ArrayBufferView<'a>),
-    Buffer(ArrayBuffer<'a>),
 }
 
 /// Options dictionary for TextDecoder and TextDecoderStream constructors.

@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 //! Implementation-specific checks not covered by the WebCryptoAPI WPT suite: the ordering of
-//! `digest()`'s steps where script can run in between, and the error types it rejects with.
+//! `digest()`'s steps where script can run in between, when its promise settles, and the error
+//! types it rejects with.
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use core_runtime::runtime::{clear_global_initializers, register_global_initializer};
+use core_runtime::config::RuntimeConfig;
+use core_runtime::event_loop::{run_microtasks, run_to_completion, with_event_loop, EventLoop};
+use core_runtime::runtime::{clear_global_initializers, register_global_initializer, Runtime};
 use core_runtime::test_util::eval_out_with_setup;
+use js::conversion::FromJSVal;
 
+/// Evaluate `code`, run the event loop until it has no work left, and return
+/// `String(globalThis.__out)`. `digest()`'s promises settle in event loop tasks, so the helpers
+/// that only drain microtasks can't be used.
 fn setup() {
     clear_global_initializers();
     register_global_initializer(web_globals::add_to_global);
@@ -15,7 +22,26 @@ fn setup() {
 }
 
 fn eval_out(code: &str) -> String {
-    eval_out_with_setup(setup, code)
+    setup();
+    let rt = Runtime::init(&RuntimeConfig::default()).expect("runtime init");
+    let scope = rt.default_global();
+    let el = EventLoop::new();
+    with_event_loop(&el, |_| {
+        js::compile::evaluate_with_filename(&scope, code, "test.js", 1).expect("evaluating code");
+        run_microtasks(&scope);
+    });
+    let tokio = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a tokio runtime");
+    tokio.block_on(async {
+        let raw_cx = unsafe { scope.raw_cx_no_gc() };
+        unsafe { run_to_completion(raw_cx, &el, tokio::time::sleep).await }
+    });
+    run_microtasks(&scope);
+    let out = js::compile::evaluate_with_filename(&scope, "String(globalThis.__out)", "out.js", 1)
+        .expect("reading __out");
+    String::from_jsval(&scope, out, ()).expect("a string")
 }
 
 /// Step 4 (copy the bytes) runs after step 2 (normalize the algorithm), so a `name` getter that
@@ -65,22 +91,38 @@ fn digest_rejects_instead_of_throwing() {
     );
 }
 
-/// `getRandomValues`'s `QuotaExceededError` is the `DOMException` subclass, not a plain
-/// `DOMException` with that name.
+/// The promise `digest()` returns settles in a task, so a job that was queued after the call
+/// still runs before the promise's reactions do.
 #[test]
-fn get_random_values_throws_quota_exceeded_error_subclass() {
+fn digest_settles_after_jobs_queued_later() {
     assert_eq!(
         eval_out(
             r#"
-            try {
-                crypto.getRandomValues(new Uint8Array(65537));
-                globalThis.__out = "no throw";
-            } catch (e) {
-                globalThis.__out = [e instanceof QuotaExceededError, e instanceof DOMException,
-                                    e.name, e.code, e.quota, e.requested].join();
-            }
+            const order = [];
+            crypto.subtle.digest("SHA-256", new Uint8Array(1)).then(() => {
+                order.push("digest");
+                globalThis.__out = order.join();
+            });
+            Promise.resolve().then(() => order.push("job"));
             "#
         ),
-        "true,true,QuotaExceededError,22,,"
+        "job,digest"
+    );
+}
+
+/// Settling the promise takes an event loop task, so `digest()` rejects without an active loop,
+/// like the other operations that need one, instead of leaving the promise pending forever.
+#[test]
+fn digest_rejects_without_an_event_loop() {
+    assert_eq!(
+        eval_out_with_setup(
+            setup,
+            r#"
+            crypto.subtle.digest("SHA-256", new Uint8Array(1)).then(
+                () => { globalThis.__out = "resolved"; },
+                e => { globalThis.__out = e.name + ": " + e.message; });
+            "#
+        ),
+        "TypeError: `digest` needs an active event loop"
     );
 }

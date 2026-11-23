@@ -5,10 +5,12 @@
 use std::fmt::Write as _;
 
 use core_runtime::{webidl_interface, webidl_methods};
+use js::error::{ExnThrown, ThrowException};
 use js::gc::handle::Heap;
 use js::gc::scope::Scope;
 use js::{ArrayBufferView, Object};
 use web_globals::dom_exception::DOMExceptionError;
+use web_globals::quota_exceeded_error::QuotaExceededError;
 
 use crate::subtle_crypto::{SubtleCrypto, SubtleCryptoImpl};
 
@@ -36,8 +38,9 @@ impl Crypto<'_> {
     #[method]
     fn get_random_values<'r>(
         &self,
+        scope: &'r Scope<'_>,
         array: ArrayBufferView<'r>,
-    ) -> Result<ArrayBufferView<'r>, DOMExceptionError> {
+    ) -> Result<ArrayBufferView<'r>, ExnThrown> {
         // Step 1: If _array_ is not an `Int8Array`, `Uint8Array`, `Uint8ClampedArray`,
         //         `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `BigInt64Array`, or
         //         `BigUint64Array`, then `throw` a `TypeMismatchError` and terminate the
@@ -50,25 +53,33 @@ impl Crypto<'_> {
             return Err(DOMExceptionError::new(
                 "TypeMismatchError",
                 "The data argument must be an integer-type TypedArray",
-            ));
+            )
+            .throw(scope));
         }
         // Step 2: Let _byteLength_ be the byte length of _array_.
         // Step 3: If _byteLength_ is greater than 65536, `throw` a `QuotaExceededError` and
         //         terminate the algorithm.
-        //         (`throw_dom_exception` turns this name into the `QuotaExceededError` subclass.
+        //         (The spec gives no quota or requested, so both stay null, and WPT's "Large
+        //         length" tests check for exactly that: don't fill in 65536 and _byteLength_.)
         if array.byte_length() > MAX_RANDOM_BYTES {
-            return Err(DOMExceptionError::new(
-                "QuotaExceededError",
-                "The ArrayBufferView's byte length exceeds the number of bytes of entropy available via this API (65536)",
-            ));
+            return Err(QuotaExceededError::new(
+                scope,
+                Some(
+                    "The ArrayBufferView's byte length exceeds the number of bytes of entropy \
+                     available via this API (65536)"
+                        .into(),
+                ),
+                None,
+            )?
+            .throw(scope));
         }
         // Step 4: Let _bytes_ be a byte sequence of length _byteLength_.
         // Step 5: Fill _bytes_ with cryptographically secure random bytes.
         // Step 6: Write _bytes_ into _array_.
         // (Filling _array_'s own bytes in place is the same without the intermediate copy.)
-        let mut result = Ok(());
-        array.with_bytes_mut(|bytes| result = getrandom::fill(bytes));
-        result.map_err(|e| DOMExceptionError::new("OperationError", e.to_string()))?;
+        array
+            .with_bytes_mut(platform::random::fill)
+            .map_err(|e| DOMExceptionError::new("OperationError", e.to_string()).throw(scope))?;
         // Step 7: Return _array_.
         Ok(array)
     }
@@ -79,7 +90,7 @@ impl Crypto<'_> {
         // Step 1: Let _bytes_ be a byte sequence of length 16.
         let mut bytes = [0u8; 16];
         // Step 2: Fill _bytes_ with cryptographically secure random bytes.
-        getrandom::fill(&mut bytes)
+        platform::random::fill(&mut bytes)
             .map_err(|e| DOMExceptionError::new("OperationError", e.to_string()))?;
         // Step 3: Set the 4 most significant bits of _bytes_[6], which represent the UUID
         //         version, to 0100.

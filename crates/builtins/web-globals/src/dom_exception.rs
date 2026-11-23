@@ -13,9 +13,6 @@ use js::class::Ref;
 use js::error::{ExnThrown, ThrowException};
 use js::gc::scope::Scope;
 use js::native::ExceptionStackBehavior;
-use js::prelude::ToJSVal;
-
-use crate::quota_exceeded_error::QuotaExceededErrorImpl;
 
 /// https://webidl.spec.whatwg.org/#dfn-error-names-table
 ///
@@ -141,24 +138,12 @@ impl DOMException {
 /// Throw a DOMException with the given name and message.
 ///
 /// This creates a new DOMException object and sets it as the pending exception.
-///
-/// A "QuotaExceededError" is created as a `QuotaExceededError`, the `DOMException` subclass, with a
-/// `null` `quota` and `requested`.
 pub fn throw_dom_exception(scope: &Scope<'_>, name: &str, message: &str) -> ExnThrown {
-    let exc_val = if name == "QuotaExceededError" {
-        js::class::create_instance_with::<QuotaExceededErrorImpl>(scope, |_| {
-            QuotaExceededErrorImpl::create(message.into(), None, None)
-                .expect("no quota or requested to validate")
-        })
-        .map(|exc| exc.to_jsval(scope))
-    } else {
-        DOMException::new(scope, message.into(), name.into()).map(|exc| exc.to_jsval(scope))
+    let exception = match DOMException::new(scope, message.into(), name.into()) {
+        Ok(exc) => exc,
+        Err(_) => return ExnThrown,
     };
-    let Ok(exc_val) = exc_val else {
-        return ExnThrown;
-    };
-    let exc_val = exc_val.expect("Value conversion doesn't fail");
-    js::exception::set_pending(scope, exc_val, ExceptionStackBehavior::Capture)
+    js::exception::set_pending(scope, exception, ExceptionStackBehavior::Capture)
 }
 
 /// A typed error representing a `DOMException` to be thrown.

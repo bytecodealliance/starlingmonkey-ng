@@ -648,6 +648,29 @@ crate::gc::handle::deref_to_object!(ArrayBufferView);
 
 crate::gc::handle::from_jsval_via_cast!(ArrayBufferView, c"Value isn't a typed array or DataView");
 
+/// <https://webidl.spec.whatwg.org/#BufferSource>
+///
+/// `(ArrayBufferView or ArrayBuffer)`. This is the union of the two types that APIs take their
+/// input bytes from.
+#[crate::macros::webidl_union]
+pub enum BufferSource<'a> {
+    /// A typed array or `DataView`.
+    View(crate::ArrayBufferView<'a>),
+    /// An `ArrayBuffer`.
+    Buffer(crate::ArrayBuffer<'a>),
+}
+
+impl BufferSource<'_> {
+    /// Call `f` with the bytes the value holds, which are empty for a detached buffer or a view
+    /// of one. See the [module docs](self#byte-access).
+    pub fn with_bytes<R>(self, f: impl FnOnce(&[u8]) -> R + Send) -> R {
+        match self {
+            BufferSource::View(view) => view.with_bytes(f),
+            BufferSource::Buffer(buffer) => buffer.with_bytes(f),
+        }
+    }
+}
+
 /// A copy of `bytes`, or `None` if allocating it fails.
 pub fn try_copy(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut copy = Vec::new();

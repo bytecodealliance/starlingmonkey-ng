@@ -5,11 +5,10 @@
 use core_runtime::{webidl_dictionary, webidl_interface, webidl_methods};
 use js::error::{ExnThrown, RangeError};
 use js::gc::scope::Scope;
+use js::typedarray::BufferSource;
 use js::JSString;
 
-use crate::decoder_common::{
-    decode_bytes, get_encoding, new_decoder, ArrayBufferViewOrArrayBuffer, TextDecoderOptions,
-};
+use crate::decoder_common::{decode_bytes, get_encoding, new_decoder, TextDecoderOptions};
 
 /// <https://encoding.spec.whatwg.org/#textdecoder>
 #[webidl_interface]
@@ -84,7 +83,7 @@ impl TextDecoder<'_> {
     fn decode<'r>(
         &self,
         scope: &'r Scope<'_>,
-        input: Option<ArrayBufferViewOrArrayBuffer<'_>>,
+        input: Option<BufferSource<'_>>,
         options: Option<TextDecodeOptions>,
     ) -> Result<JSString<'r>, ExnThrown> {
         let mut data = self.data_mut();
@@ -107,8 +106,7 @@ impl TextDecoder<'_> {
         //         (We decode directly from _input_'s bytes. Nothing retains them after this call.)
         let mut decode = |bytes: &[u8]| decode_bytes(encoding, decoder, fatal, bytes, last, fresh);
         let decoded = match input {
-            Some(ArrayBufferViewOrArrayBuffer::Buffer(input)) => input.with_bytes(decode),
-            Some(ArrayBufferViewOrArrayBuffer::View(input)) => input.with_bytes(decode),
+            Some(input) => input.with_bytes(decode),
             None => decode(&[]),
         };
         drop(data);

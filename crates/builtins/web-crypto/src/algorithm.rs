@@ -5,19 +5,24 @@
 //! "digest" operation, the only one implemented so far. (Numbers like "Step 2.5" count the
 //! items of the spec's nested list in order.)
 
-use core_runtime::webidl_union;
-use js::conversion::FromJSVal;
-use js::error::{throw_type_error, ExnThrown};
+use core_runtime::{webidl_dictionary, webidl_union};
+use js::conversion::{FromJSVal, ToJSVal};
+use js::error::ExnThrown;
 use js::gc::scope::Scope;
 use js::Object;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use web_globals::dom_exception::throw_dom_exception;
 
+/// <https://w3c.github.io/webcrypto/#dfn-Algorithm>
+#[webidl_dictionary]
+pub struct Algorithm {
+    pub name: String,
+}
+
 /// <https://w3c.github.io/webcrypto/#dfn-AlgorithmIdentifier>
 ///
-/// `(object or DOMString)`. An object stands for an `Algorithm` dictionary, whose only member is
-/// the required `name`.
+/// `(object or DOMString)`. An object stands for an [`Algorithm`] dictionary.
 #[webidl_union]
 pub enum AlgorithmIdentifier<'a> {
     Object(Object<'a>),
@@ -79,15 +84,8 @@ pub fn normalize_digest_algorithm(
             //           represented by _alg_ to the IDL dictionary type `Algorithm`.
             // Step 2.3: If an error occurred, return the error and terminate this algorithm.
             //           (`name` is a required member, so a missing one is a `TypeError`.)
-            let value = object.get_property(scope, c"name")?;
-            if value.is_undefined() {
-                return Err(throw_type_error(
-                    scope,
-                    c"Algorithm: Missing required property 'name'",
-                ));
-            }
             // Step 2.4: Let _algName_ be the value of the `name` attribute of _initialAlg_.
-            String::from_jsval_throwing(scope, value, Default::default())?
+            Algorithm::from_jsval_throwing(scope, object.to_jsval_throwing(scope)?, ())?.name
         }
     };
     // Step 2.5: If _registeredAlgorithms_ contains a key that is a `case-insensitive` string
