@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
+
+# Build the npm packages for this platform as the release workflow does, and check that the
+# installed command runs with the bundled release runtime, a user-provided one, and the debug
+# runtime it downloads and verifies. It builds both runtimes, so it runs only for changes that can
+# affect the packages.
+
+name: npm packages
+
+on:
+  push:
+    branches: [main]
+    # The binary's sources are included, since the packages depend on how it reads
+    # `STARLING_RUNTIME` and on what `--version` prints. The runtime's are not: the packages only
+    # carry it, and the other workflows test it.
+    paths: &paths
+      - componentize/npm/**
+      - componentize/src/**
+      - componentize/Cargo.toml
+      - componentize/Cargo.lock
+      - componentize/build.rs
+      - rust-toolchain.toml
+      - scripts/build-runtime.sh
+      - scripts/wasm-target.sh
+      - scripts/check-npm-packages.sh
+      - justfile
+      - .github/actions/setup/**
+      - .github/tool-versions.env
+      - .github/workflows/npm-packages.yml
+      - .github/workflows/release.yml
+  pull_request:
+    branches: [main]
+    paths: *paths
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The setup action adds the tool versions of `.github/tool-versions.env`.
+  RUSTC_WRAPPER: sccache
+  CCACHE: sccache
+  # Bump to purge the sccache GHA cache.
+  SCCACHE_GHA_VERSION: 1
+
+jobs:
+  npm-packages:
+    name: npm packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup
+        with:
+          target: wasm32-wasip3
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Assemble the packages
+        run: just npm-componentize
+
+      - name: Smoke-test the packages
+        run: just npm-componentize-check
