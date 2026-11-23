@@ -275,8 +275,9 @@ pub struct Imports {
 /// The runtime used by a subcommand.
 #[derive(clap::Args, Debug)]
 pub struct RuntimeArg {
-    /// Path to the StarlingMonkey runtime to use. If not provided, the runtime embedded in this
-    /// tool is used.
+    /// Path to the StarlingMonkey runtime to use. If not provided, the one `$STARLING_RUNTIME`
+    /// names is used, or else the runtime embedded in this tool, if any. Released binaries embed
+    /// none.
     ///
     /// [env: STARLING_RUNTIME=]
     // `$STARLING_RUNTIME` is read by [`RuntimeArg::load`], which `--version` uses without a

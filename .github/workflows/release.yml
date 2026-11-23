@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 # Release the runtime and `starling-componentize` together, under the workspace's version in the
-# repository's `Cargo.toml`, which `componentize/Cargo.toml` repeats. Build the release runtime,
-# `starling-componentize` for every platform of `componentize/npm/platforms.json` with that runtime
-# embedded, and the npm packages `componentize/npm/package.mjs` assembles from them. The
-# assembly fails unless the matrix below built a binary for every platform.
+# repository's `Cargo.toml`, which `componentize/Cargo.toml` repeats. Build the release and debug
+# runtimes, `starling-componentize` for every platform of `componentize/npm/platforms.json`, and
+# the npm packages `componentize/npm/package.mjs` assembles from them. The assembly fails unless
+# the matrix below built a binary for every platform.
 #
-# A `v<version>` tag, which must name the workspace's version, publishes the npm packages and
-# creates a GitHub release with `starling.wasm`, each platform's `starling-componentize` and a
-# `SHA256SUMS` file of their digests. A manual run publishes the npm packages only with `publish`
-# set, and otherwise runs `npm publish --dry-run`. Every run uploads the packages' tarballs as the
-# `npm-tarballs` artifact.
+# A `v<version>` tag, which must name the workspace's version, creates a GitHub release with
+# `starling.wasm`, `starling-debug.wasm`, each platform's `starling-componentize` and a
+# `SHA256SUMS` file of their digests, and then publishes the npm packages, which download
+# `starling-debug.wasm` from the release on first use. A manual run publishes the npm
+# packages only with `publish` set, and only if the GitHub release of their version already has
+# that `starling-debug.wasm`, and otherwise runs `npm publish --dry-run`. Every run uploads
+# the packages' tarballs as the `npm-tarballs` artifact.
 
 name: Release
 
@@ -75,10 +77,18 @@ jobs:
       - name: Build the release runtime
         run: just build-runtime
 
+      # Attached to the GitHub release, from which the npm package downloads it on first use. The
+      # package records its digest.
+      - name: Build the debug runtime
+        run: just build-runtime-debug
+
+      # The artifact holds `release/starling.wasm` and `debug/starling.wasm`.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime
-          path: target/wasm32-wasip3/release/starling.wasm
+          path: |
+            target/wasm32-wasip3/release/starling.wasm
+            target/wasm32-wasip3/debug/starling.wasm
           if-no-files-found: error
 
   binaries:
@@ -116,10 +126,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      # TODO: Should we also build a binary with the release runtime embedded
       - name: Build starling-componentize
         working-directory: componentize
         env:
-          STARLING_EMBED_RUNTIME: ${{ github.workspace }}/runtime/starling.wasm
           TARGET: ${{ matrix.target }}
         run: |
           if [ -n "$TARGET" ]; then
@@ -137,7 +147,7 @@ jobs:
         run: |
           exe=target/release/starling-componentize
           if [ "${{ runner.os }}" = Windows ]; then exe="$exe.exe"; fi
-          "$exe" --version
+          STARLING_RUNTIME=runtime/release/starling.wasm "$exe" --version
           mkdir -p out
           cp "$exe" out/
 
@@ -147,9 +157,58 @@ jobs:
           path: out/
           if-no-files-found: error
 
+  npm-packages:
+    name: Assemble the npm packages
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Add the tool versions to the environment
+        run: grep -v '^#' .github/tool-versions.env >>"$GITHUB_ENV"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          path: binaries
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: runtime
+          path: runtime
+
+      - name: Assemble the packages
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          binaries=()
+          for dir in binaries/binary-*; do
+            platform=${dir#binaries/binary-}
+            binaries+=("$platform=$(ls "$dir"/starling-componentize*)")
+          done
+          node componentize/npm/package.mjs ${INPUT_VERSION:+--version "$INPUT_VERSION"} \
+            --out npm --pack npm-tarballs --all-platforms \
+            --runtime runtime/release/starling.wasm --debug-runtime runtime/debug/starling.wasm \
+            "${binaries[@]}"
+
+      - name: Smoke-test the packages
+        run: ./scripts/check-npm-packages.sh npm-tarballs runtime/debug/starling.wasm
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-tarballs
+          path: npm-tarballs/
+          if-no-files-found: error
+
   publish:
     name: Publish the npm packages
-    needs: binaries
+    # After the GitHub release on a tag, since the package downloads its debug runtime from it.
+    needs: [npm-packages, github-release]
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -168,26 +227,29 @@ jobs:
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: binary-*
-          path: binaries
-
-      - name: Assemble the packages
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          binaries=()
-          for dir in binaries/binary-*; do
-            platform=${dir#binaries/binary-}
-            binaries+=("$platform=$(ls "$dir"/starling-componentize*)")
-          done
-          node componentize/npm/package.mjs ${INPUT_VERSION:+--version "$INPUT_VERSION"} \
-            --out npm --pack npm-tarballs --all-platforms "${binaries[@]}"
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
           name: npm-tarballs
-          path: npm-tarballs/
-          if-no-files-found: error
+          path: npm-tarballs
+
+      # A manual run can name a version without a GitHub release, whose package would then fail
+      # to download its debug runtime, so a real publish first checks that the URL the package
+      # records serves the runtime with the digest it records.
+      - name: Check the debug runtime is downloadable
+        if: ${{ github.ref_type == 'tag' || inputs.publish }}
+        run: |
+          main=$(ls npm-tarballs/*.tgz | grep -Ev -- '-(darwin|linux|win32)-')
+          read -r url sha256 < <(tar -xOzf "$main" package/package.json | node -e '
+            const { debugRuntime } = JSON.parse(require("fs").readFileSync(0, "utf8")).starlingComponentize;
+            console.log(debugRuntime.url, debugRuntime.sha256);
+          ')
+          if ! curl -fsSL --retry 3 -o debug.wasm "$url"; then
+            echo "The package's debug runtime $url is not downloadable. Is there a GitHub release of this version?" >&2
+            exit 1
+          fi
+          actual=$(sha256sum debug.wasm | cut -d' ' -f1)
+          if [ "$actual" != "$sha256" ]; then
+            echo "The debug runtime at $url has SHA-256 $actual, not $sha256 as the package records" >&2
+            exit 1
+          fi
 
       - name: Publish
         env:
@@ -199,14 +261,19 @@ jobs:
           fi
           # The platform packages go first, so the package depending on them never
           # names an unpublished version.
-          for dir in npm/starling-componentize-* npm/starling-componentize; do
-            (cd "$dir" && npm publish --provenance $dry_run)
+          for tarball in npm-tarballs/*.tgz; do
+            case "$tarball" in
+              *-darwin-* | *-linux-* | *-win32-*) npm publish "$tarball" --provenance $dry_run ;;
+              *) main=$tarball ;;
+            esac
           done
+          npm publish "$main" --provenance $dry_run
 
   github-release:
     name: Create the GitHub release
     if: github.ref_type == 'tag'
-    needs: publish
+    # After the npm packages passed their smoke test, and before they are published.
+    needs: npm-packages
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -214,7 +281,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: runtime
-          path: assets
+          path: runtime
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -226,6 +293,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          mkdir assets
+          cp runtime/release/starling.wasm assets/starling.wasm
+          cp runtime/debug/starling.wasm assets/starling-debug.wasm
           for dir in binaries/binary-*; do
             platform=${dir#binaries/binary-}
             for exe in "$dir"/starling-componentize*; do

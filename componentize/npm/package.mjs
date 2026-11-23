@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0-WITH-LLVM-exception
 
 // Assemble the npm packages of `starling-componentize`: the package in
-// `starling-componentize/`, which resolves the binary, and one package per
-// platform holding it, named `<scope>/starling-componentize-<platform>`.
+// `starling-componentize/`, which holds the release runtime and resolves the
+// binary, and one package per platform holding it, named
+// `<scope>/starling-componentize-<platform>`.
 //
 // Usage:
 //
 //   node package.mjs --out <dir> [--version 0.3.0] [--scope @bytecodealliance] \
+//     --runtime <release starling.wasm> --debug-runtime <debug starling.wasm> \
 //     [--pack <tarballs dir>] [--all-platforms] <platform>=<binary> [<platform>=<binary> ...]
 //
 // `<platform>` is a key of `platforms.json`, such as `linux-x64`, and
-// `<binary>` the `starling-componentize` built for it. Each package is written
+// `<binary>` the `starling-componentize` built for it. The debug runtime is not
+// packaged: the resolver package records its SHA-256 digest, and downloads it
+// from the GitHub release on first use. Each package is written
 // to `<dir>/<package directory name>`, ready for `npm pack` or `npm publish`.
 // The resolver package lists every platform of `platforms.json` as an optional
 // dependency, whether or not a binary for it was given, and `--all-platforms`
@@ -19,6 +23,7 @@
 // tarball to `<tarballs dir>`.
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,12 +33,17 @@ const NAME = 'starling-componentize';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const platforms = JSON.parse(readFileSync(path.join(here, 'platforms.json'), 'utf8'));
 const cargoToml = readFileSync(path.join(here, '..', 'Cargo.toml'), 'utf8');
+// The GitHub repository whose release of each version has the debug runtime, and which the
+// packages name as theirs. It is not read from `Cargo.toml`, whose `repository` is the upstream's.
+const repository = 'https://github.com/bytecodealliance/starlingmonkey-ng';
 
 const { values, positionals } = parseArgs({
   options: {
     version: { type: 'string', default: cargoToml.match(/^version = "(.*)"$/m)[1] },
     out: { type: 'string' },
     scope: { type: 'string', default: '@bytecodealliance' },
+    runtime: { type: 'string' },
+    'debug-runtime': { type: 'string' },
     pack: { type: 'string' },
     'all-platforms': { type: 'boolean', default: false },
   },
@@ -41,6 +51,9 @@ const { values, positionals } = parseArgs({
 });
 if (!values.out) {
   throw new Error('--out is required');
+}
+if (!values.runtime || !values['debug-runtime']) {
+  throw new Error('--runtime and --debug-runtime are required');
 }
 const { version, out, scope, pack } = values;
 const given = new Set(positionals.map(arg => arg.split('=')[0]));
@@ -54,7 +67,7 @@ const common = {
   license: 'Apache-2.0 WITH LLVM-exception',
   repository: {
     type: 'git',
-    url: `git+${cargoToml.match(/^repository = "(.*)"$/m)[1]}.git`,
+    url: `git+${repository}.git`,
     directory: 'componentize',
   },
   publishConfig: { access: 'public', provenance: true },
@@ -92,19 +105,32 @@ for (const arg of positionals) {
 const main = path.join(out, NAME);
 cpSync(path.join(here, NAME), main, { recursive: true });
 chmodSync(path.join(main, 'bin', `${NAME}.js`), 0o755);
+// npm packs only what is in the package's directory, so the release runtime is
+// copied in, for `runtimePath()` in `index.js`. The debug runtime is not: only
+// its digest is recorded below, and `index.js` downloads it on first use.
+copyFileSync(values.runtime, path.join(main, 'starling.wasm'));
 writeJson(path.join(main, 'package.json'), {
   name: `${scope}/${NAME}`,
   description: 'Build WebAssembly components from JavaScript on the StarlingMonkey runtime',
   ...common,
   main: 'index.js',
   bin: { [NAME]: `bin/${NAME}.js` },
-  files: ['index.js', 'bin'],
+  files: ['index.js', 'bin', 'starling.wasm'],
   engines: { node: '>=22' },
   optionalDependencies: Object.fromEntries(
     Object.keys(platforms).map(platform => [`${scope}/${NAME}-${platform}`, version]),
   ),
   // Read by `index.js` to name the platform packages.
-  starlingComponentize: { scope, name: NAME },
+  starlingComponentize: {
+    scope,
+    name: NAME,
+    // Read by `index.js` to download and verify the debug runtime, which the
+    // release workflow attaches to the GitHub release.
+    debugRuntime: {
+      url: `${repository}/releases/download/v${version}/starling-debug.wasm`,
+      sha256: createHash('sha256').update(readFileSync(values['debug-runtime'])).digest('hex'),
+    },
+  },
 });
 
 if (pack) {
