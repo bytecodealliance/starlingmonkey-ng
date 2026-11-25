@@ -15,7 +15,10 @@ test = false
 
 [dependencies]
 core-runtime.workspace = true
+ed25519-dalek.workspace = true
+hmac.workspace = true
 js.workspace = true
+md-5.workspace = true
 platform.workspace = true
 sha1.workspace = true
 sha2.workspace = true
