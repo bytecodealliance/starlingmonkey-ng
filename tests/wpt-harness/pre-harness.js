@@ -29,3 +29,12 @@ globalThis.__wptReportResults ??= function(json) {
   // Stop the event loop, since a finished test may have left a timer running.
   if (typeof __wptDone === "function") __wptDone();
 };
+
+// Some WebCryptoAPI tests call `subtle.generateKey` while setting up, outside any test, to make a
+// key for a few of their cases. Until it's implemented, a stub that rejects lets those cases fail
+// individually instead of the whole file erroring.
+if (globalThis.crypto?.subtle && !("generateKey" in globalThis.crypto.subtle)) {
+  globalThis.crypto.subtle.generateKey = function generateKey() {
+    return Promise.reject(new Error("crypto.subtle.generateKey is not implemented"));
+  };
+}

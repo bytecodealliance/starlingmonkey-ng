@@ -25,6 +25,7 @@ bytes = "1"
 clap = { version = "4.5.60", features = ["derive"] }
 core-runtime = { path = "crates/core-runtime" }
 data-url = "0.3"
+ed25519-dalek = { version = "3.0.0", features = ["pkcs8"] }
 encoding_rs = "0.8"
 event-listener = "5"
 form_urlencoded = "1.2"
@@ -33,6 +34,7 @@ futures-lite = "2"
 futures-util = "0.3"
 getrandom = "0.4"
 heck = "0.5"
+hmac = "0.13"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
@@ -40,6 +42,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 js = { path = "crates/js" }
 libstarling = { path = "crates/libstarling" }
+md-5 = "0.11.0"
 oxc_resolver = "11"
 platform = { path = "crates/platform" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
